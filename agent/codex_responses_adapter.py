@@ -844,7 +844,22 @@ def _normalize_codex_response(response: Any) -> tuple[Any, str]:
         # The Codex backend can return empty output when the answer was
         # delivered entirely via stream events. Check output_text as a
         # last-resort fallback before raising.
-        out_text = getattr(response, "output_text", None)
+        #
+        # NOTE: ``Response.output_text`` is a *computed property* in the OpenAI
+        # SDK that does ``for output in self.output:`` with no None-guard.  When
+        # the Codex backend returns ``output=None`` on the completed event (its
+        # streaming variant carries content in events, not the aggregated
+        # ``output`` field), reading this property raises
+        # ``TypeError: 'NoneType' object is not iterable``.  ``getattr(...,
+        # default)`` only swallows ``AttributeError`` — NOT exceptions raised
+        # inside the property getter — so the TypeError would escape, arrive at
+        # run_agent with no status_code, get misclassified as a non-retryable
+        # local programming error, and surface to the user as
+        # "⚠️ Non-retryable error (HTTP None) — trying fallback...".  Guard it.
+        try:
+            out_text = getattr(response, "output_text", None)
+        except TypeError:
+            out_text = None
         if isinstance(out_text, str) and out_text.strip():
             logger.debug(
                 "Codex response has empty output but output_text is present (%d chars); "

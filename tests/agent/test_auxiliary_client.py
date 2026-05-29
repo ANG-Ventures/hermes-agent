@@ -2045,6 +2045,110 @@ class TestVisionAutoSkipsKimiCoding:
         })
 
 
+class TestCodexNoneOutputRecovery:
+    """Regression: the Codex streaming backend returns the aggregated
+    ``response.output`` field as ``None`` (content is delivered via stream
+    events).  Two crash sites resulted, both raising
+    ``TypeError: 'NoneType' object is not iterable`` with no HTTP status:
+
+      1. The OpenAI SDK stream accumulator / ``get_final_response()`` runs
+         ``parse_response`` -> ``for output in response.output:``.
+      2. The adapter's backfill guard only matched an empty list ``[]`` (not
+         ``None``), and the downstream ``output_text`` property / output
+         iteration then choked on ``None``.
+
+    run_agent classified the bare ``TypeError`` (a ValueError/TypeError
+    sibling) as a *local* programming error -> non-retryable -> the
+    user-facing "Non-retryable error (HTTP None) - trying fallback...".
+    This hit every Codex consumer: main inference, context summarization,
+    web_extract, and image_gen.
+
+    These tests reproduce both crash sites and assert the response is
+    *recovered* from the manually-collected stream events instead of aborting.
+    """
+
+    @staticmethod
+    def _adapter_with_stream(events, *, final, raise_on_final=None):
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+
+        class _FakeStream:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def __iter__(self): return iter(events)
+            def get_final_response(self):
+                if raise_on_final is not None:
+                    raise raise_on_final
+                return final
+
+        def _stream(**kwargs):
+            return _FakeStream()
+
+        real_client = MagicMock()
+        real_client.responses.stream = _stream
+        return _CodexCompletionsAdapter(real_client, "gpt-5.5")
+
+    @staticmethod
+    def _output_item_done_event(text):
+        return SimpleNamespace(
+            type="response.output_item.done",
+            item=SimpleNamespace(
+                type="message",
+                role="assistant",
+                status="completed",
+                content=[SimpleNamespace(type="output_text", text=text)],
+            ),
+        )
+
+    def test_final_response_output_none_backfilled_from_items(self):
+        events = [self._output_item_done_event("pong")]
+        final = SimpleNamespace(
+            output=None,
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1, total_tokens=2),
+        )
+        adapter = self._adapter_with_stream(events, final=final)
+        resp = adapter.create(messages=[{"role": "user", "content": "ping"}])
+        assert resp.choices[0].message.content == "pong"
+
+    def test_final_response_output_none_backfilled_from_deltas(self):
+        events = [
+            SimpleNamespace(type="response.output_text.delta", delta="po"),
+            SimpleNamespace(type="response.output_text.delta", delta="ng"),
+        ]
+        final = SimpleNamespace(output=None, usage=None)
+        adapter = self._adapter_with_stream(events, final=final)
+        resp = adapter.create(messages=[{"role": "user", "content": "ping"}])
+        assert resp.choices[0].message.content == "pong"
+
+    def test_sdk_parse_typeerror_recovered_from_collected_items(self):
+        events = [self._output_item_done_event("pong")]
+        adapter = self._adapter_with_stream(
+            events,
+            final=None,
+            raise_on_final=TypeError("'NoneType' object is not iterable"),
+        )
+        resp = adapter.create(messages=[{"role": "user", "content": "ping"}])
+        assert resp.choices[0].message.content == "pong"
+
+    def test_empty_list_output_still_backfills(self):
+        events = [self._output_item_done_event("pong")]
+        final = SimpleNamespace(output=[], usage=None)
+        adapter = self._adapter_with_stream(events, final=final)
+        resp = adapter.create(messages=[{"role": "user", "content": "ping"}])
+        assert resp.choices[0].message.content == "pong"
+
+    def test_normal_output_unchanged(self):
+        final = SimpleNamespace(
+            output=[SimpleNamespace(
+                type="message", role="assistant", status="completed",
+                content=[SimpleNamespace(type="output_text", text="hello")],
+            )],
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1, total_tokens=2),
+        )
+        adapter = self._adapter_with_stream([], final=final)
+        resp = adapter.create(messages=[{"role": "user", "content": "ping"}])
+        assert resp.choices[0].message.content == "hello"
+
+
 class TestCodexAuxiliaryAdapterTimeout:
     def test_forwards_timeout_to_responses_stream(self):
         class FakeStream:

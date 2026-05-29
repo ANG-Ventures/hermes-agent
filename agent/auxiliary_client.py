@@ -744,26 +744,63 @@ class _CodexCompletionsAdapter:
                 timeout_timer.daemon = True
                 timeout_timer.start()
             _check_cancelled()
+            # ``response.output`` arriving as ``None`` (Codex streaming variant)
+            # makes the OpenAI SDK's own stream accumulator crash inside
+            # ``parse_response`` (``for output in response.output:`` at
+            # ``openai/lib/_parsing/_responses.py``) and ``get_final_response``.
+            # That TypeError escapes with no status_code, gets misclassified as
+            # a non-retryable local error, and surfaces as
+            # "HTTP None — trying fallback".  We already collect every output
+            # item and text delta manually below, so a parse-time TypeError is
+            # recoverable: synthesize ``final`` from the collected events
+            # instead of letting the SDK abort the whole call.
+            final = None
+            stream_parse_failed = False
             with self._client.responses.stream(**resp_kwargs) as stream:
-                for _event in stream:
+                try:
+                    for _event in stream:
+                        _check_cancelled()
+                        _etype = getattr(_event, "type", "")
+                        if _etype == "response.output_item.done":
+                            _done = getattr(_event, "item", None)
+                            if _done is not None:
+                                collected_output_items.append(_done)
+                        elif "output_text.delta" in _etype:
+                            _delta = getattr(_event, "delta", "")
+                            if _delta:
+                                collected_text_deltas.append(_delta)
+                        elif "function_call" in _etype:
+                            has_function_calls = True
                     _check_cancelled()
-                    _etype = getattr(_event, "type", "")
-                    if _etype == "response.output_item.done":
-                        _done = getattr(_event, "item", None)
-                        if _done is not None:
-                            collected_output_items.append(_done)
-                    elif "output_text.delta" in _etype:
-                        _delta = getattr(_event, "delta", "")
-                        if _delta:
-                            collected_text_deltas.append(_delta)
-                    elif "function_call" in _etype:
-                        has_function_calls = True
-                _check_cancelled()
-                final = stream.get_final_response()
+                    final = stream.get_final_response()
+                except TypeError as _parse_exc:
+                    # SDK accumulator/parser choked on a None output field.
+                    stream_parse_failed = True
+                    logger.warning(
+                        "Codex auxiliary: SDK stream parse raised %s — "
+                        "recovering from %d collected items / %d text deltas",
+                        _parse_exc, len(collected_output_items),
+                        len(collected_text_deltas),
+                    )
 
-            # Backfill empty output from collected stream events
+            if final is None or stream_parse_failed:
+                # Build a minimal response stand-in from the collected events.
+                final = SimpleNamespace(output=None, status="completed", error=None)
+
+            # Backfill empty output from collected stream events.
+            #
+            # The Codex backend returns the aggregated ``output`` field as
+            # either an empty list ``[]`` OR ``None`` on the completed event
+            # (content is delivered via stream events, not the aggregate).
+            # The original guard only matched ``[]`` (``isinstance(list) and
+            # not _output``); a ``None`` output slipped through unbackfilled,
+            # leaving ``final.output is None``.  Downstream this triggers
+            # ``Response.output_text`` (``for output in self.output:``) →
+            # ``TypeError: 'NoneType' object is not iterable`` → no status_code
+            # → misclassified as non-retryable → "HTTP None — trying fallback".
+            # Treat None the same as an empty list so the backfill runs.
             _output = getattr(final, "output", None)
-            if isinstance(_output, list) and not _output:
+            if _output is None or (isinstance(_output, list) and not _output):
                 if collected_output_items:
                     final.output = list(collected_output_items)
                     logger.debug(
@@ -793,7 +830,11 @@ class _CodexCompletionsAdapter:
                     val = obj.get(key, default)
                 return val if val is not None else default
 
-            for item in getattr(final, "output", []):
+            # ``getattr(final, "output", [])`` returns None when the attribute
+            # exists but IS None (the default only applies to a *missing*
+            # attribute), so guard with ``or []`` to avoid iterating None when
+            # the backfill above found nothing to synthesize.
+            for item in (getattr(final, "output", None) or []):
                 item_type = _item_get(item, "type")
                 if item_type == "message":
                     for part in (_item_get(item, "content") or []):
