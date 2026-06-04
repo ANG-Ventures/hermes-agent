@@ -1,0 +1,8 @@
+name: blackbox
+version: "1.0"
+description: Turn telemetry and cost alert cards.
+author: Aegis
+provides_hooks:
+  - on_session_start
+  - post_tool_call
+  - on_session_end
