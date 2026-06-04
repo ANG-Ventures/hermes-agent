@@ -344,3 +344,43 @@ def sweep(retention_days: int, max_deletes: int = 10000) -> int:
         )
         conn.commit()
         return deleted
+
+
+def debug_stats() -> dict[str, Any]:
+    """Operational snapshot for the /cost debug command.
+
+    Surfaces the on-disk DB path, whether it exists, row/side-table counts,
+    alerted count, oldest/newest turn timestamps, and the last sweep date.
+    Read-only; never raises — returns an ``error`` key on failure so the
+    debug command can show *why* telemetry looks empty.
+    """
+    path = _db_path()
+    out: dict[str, Any] = {
+        "db_path": str(path),
+        "db_exists": path.exists(),
+        "db_size_bytes": path.stat().st_size if path.exists() else 0,
+    }
+    try:
+        with _connect() as conn:
+            out["turns"] = conn.execute("SELECT COUNT(*) FROM turns").fetchone()[0]
+            out["tool_calls"] = conn.execute(
+                "SELECT COUNT(*) FROM turn_tool_calls"
+            ).fetchone()[0]
+            out["alerted"] = conn.execute(
+                "SELECT COUNT(*) FROM turns WHERE alerted = 1"
+            ).fetchone()[0]
+            out["subagent_turns"] = conn.execute(
+                "SELECT COUNT(*) FROM turns WHERE is_subagent = 1"
+            ).fetchone()[0]
+            row = conn.execute(
+                "SELECT MIN(ts_end), MAX(ts_end) FROM turns"
+            ).fetchone()
+            out["oldest_ts"] = row[0]
+            out["newest_ts"] = row[1]
+            sweep_row = conn.execute(
+                "SELECT value FROM meta WHERE key = 'last_sweep_date'"
+            ).fetchone()
+            out["last_sweep_date"] = sweep_row["value"] if sweep_row else None
+    except Exception as exc:  # pragma: no cover - defensive
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out

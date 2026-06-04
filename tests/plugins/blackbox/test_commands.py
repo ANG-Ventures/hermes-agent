@@ -35,6 +35,20 @@ class FakeStore:
         self.top_args = (n, since_days)
         return self.top[:n]
 
+    def debug_stats(self):
+        return {
+            "db_path": "/tmp/hh/blackbox/turns.db",
+            "db_exists": True,
+            "db_size_bytes": 4096,
+            "turns": 7,
+            "subagent_turns": 2,
+            "alerted": 1,
+            "tool_calls": 19,
+            "oldest_ts": 1_700_000_000.0,
+            "newest_ts": 1_700_100_000.0,
+            "last_sweep_date": "2026-06-04",
+        }
+
 
 @pytest.fixture
 def fake_store(monkeypatch):
@@ -136,3 +150,48 @@ def test_handler_never_raises_when_store_errors(fake_store):
     fake_store.get_turn = boom
 
     assert commands.handle_cost("turn_boom").startswith("⚠️ /cost error: database unavailable")
+
+
+def test_cost_debug_reports_store_health(fake_store, monkeypatch):
+    # Simulate enabled config so the debug card shows the ENABLED branch.
+    import plugins.blackbox as bb
+    monkeypatch.setattr(bb, "_config", lambda: {
+        "enabled": True, "cost_alert_threshold_usd": 1.0, "always_card": False,
+        "store_text": True, "record_subagents": True, "retention_days": 30,
+    })
+
+    out = commands.handle_cost("debug")
+
+    assert "🩺 blackbox debug" in out
+    assert "Config: ENABLED" in out
+    assert "threshold=$1.0" in out
+    assert "Channel: platform=telegram chat_id=chat-1" in out
+    assert "turns.db" in out
+    assert "Turns: 7 (2 subagent)" in out
+    assert "alerted=1" in out
+    assert "tool_calls=19" in out
+    assert "Last sweep: 2026-06-04" in out
+
+
+def test_cost_debug_shows_disabled_gate(fake_store, monkeypatch):
+    import plugins.blackbox as bb
+    monkeypatch.setattr(bb, "_config", lambda: None)
+
+    out = commands.handle_cost("debug")
+
+    assert "Config: DISABLED" in out
+    # Store health still reported even when the feature gate is off.
+    assert "Turns: 7" in out
+
+
+def test_cost_debug_surfaces_store_error(fake_store, monkeypatch):
+    import plugins.blackbox as bb
+    monkeypatch.setattr(bb, "_config", lambda: None)
+    fake_store.debug_stats = lambda: {
+        "db_path": "/tmp/hh/blackbox/turns.db", "db_exists": False,
+        "db_size_bytes": 0, "error": "OperationalError: no such table: turns",
+    }
+
+    out = commands.handle_cost("debug")
+
+    assert "Store error: OperationalError" in out

@@ -296,3 +296,11 @@ def register(ctx) -> None:
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("post_tool_call", _on_post_tool_call)
     ctx.register_hook("on_session_end", _on_session_end)
+    # The slash command lives in commands.py; the loader only calls this
+    # package-level register(), so delegate explicitly or /cost never wires in.
+    try:
+        from plugins.blackbox import commands
+
+        commands.register(ctx)
+    except Exception:
+        logger.warning("blackbox: failed to register /cost command", exc_info=True)

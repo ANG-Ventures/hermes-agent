@@ -160,6 +160,63 @@ def _handle_top(parts: list[str]) -> str:
     return "\n".join(lines)
 
 
+def _handle_debug() -> str:
+    """Operational diagnostics: config gate state + store health.
+
+    Answers 'why am I not seeing cards / turns?' — shows whether the feature
+    gate is on, the DB path + counts, the current channel the command resolves
+    to, and any store error. Read-only.
+    """
+    lines = ["🩺 blackbox debug"]
+
+    # Config gate — show why the plugin may be inert.
+    try:
+        from plugins.blackbox import _config, _DEFAULTS  # type: ignore
+
+        cfg = _config()
+        if cfg is None:
+            lines.append("• Config: DISABLED or no `blackbox:` block (hooks are no-ops)")
+        else:
+            thr = cfg.get("cost_alert_threshold_usd", _DEFAULTS["cost_alert_threshold_usd"])
+            lines.append("• Config: ENABLED")
+            lines.append(f"    threshold=${thr} always_card={cfg.get('always_card')} "
+                         f"store_text={cfg.get('store_text')} "
+                         f"record_subagents={cfg.get('record_subagents')} "
+                         f"retention_days={cfg.get('retention_days')}")
+    except Exception as exc:
+        lines.append(f"• Config: <error reading: {exc}>")
+
+    # Resolved channel for no-arg /cost.
+    platform, chat_id = _current_channel()
+    lines.append(f"• Channel: platform={platform or '(none)'} chat_id={chat_id or '(none)'}")
+
+    # Store health.
+    try:
+        stats = store.debug_stats()
+    except Exception as exc:
+        return "\n".join(lines + [f"• Store: <error: {exc}>"])
+
+    lines.append(f"• DB: {stats.get('db_path')} "
+                 f"(exists={stats.get('db_exists')}, {stats.get('db_size_bytes', 0)} bytes)")
+    if stats.get("error"):
+        lines.append(f"• Store error: {stats['error']}")
+    else:
+        lines.append(f"• Turns: {stats.get('turns', 0)} "
+                     f"({stats.get('subagent_turns', 0)} subagent) · "
+                     f"alerted={stats.get('alerted', 0)} · "
+                     f"tool_calls={stats.get('tool_calls', 0)}")
+        oldest, newest = stats.get("oldest_ts"), stats.get("newest_ts")
+        if newest:
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+            pt = ZoneInfo("America/Los_Angeles")
+            n = datetime.fromtimestamp(newest, tz=pt).strftime("%Y/%m/%d %H:%M:%S")
+            o = datetime.fromtimestamp(oldest, tz=pt).strftime("%Y/%m/%d %H:%M:%S") if oldest else "?"
+            lines.append(f"• Range: {o} → {n} PT")
+        lines.append(f"• Last sweep: {stats.get('last_sweep_date') or '(never)'}")
+    return "\n".join(lines)
+
+
 def handle_cost(raw_args: str) -> str:
     """Handle the /cost gateway slash command without raising."""
     try:
@@ -176,6 +233,8 @@ def handle_cost(raw_args: str) -> str:
             return _handle_session()
         if subcommand == "top":
             return _handle_top(parts)
+        if subcommand == "debug":
+            return _handle_debug()
         return _handle_turn(parts[0])
     except Exception as exc:
         return f"⚠️ /cost error: {exc}"
@@ -185,5 +244,7 @@ def register(ctx) -> None:
     ctx.register_command(
         "cost",
         handler=handle_cost,
-        description="Show blackbox telemetry costs for this channel.",
+        description="Show blackbox telemetry costs for this channel. "
+                    "Subcommands: <turn_id> | session | top [N] | debug.",
+        args_hint="[id|session|top N|debug]",
     )

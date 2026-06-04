@@ -202,3 +202,37 @@ def test_session_rollup_and_top_turns(tmp_path, monkeypatch):
 
     top = store.top_turns(n=2, since_days=30)
     assert [row["turn_id"] for row in top] == ["other-chat", "expensive"]
+
+
+def test_debug_stats_reports_counts_and_paths(tmp_path, monkeypatch):
+    """Real-DB operational snapshot for /cost debug — no mocks."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    now = time.time()
+    # 2 top-level + 1 subagent; mark one alerted.
+    store.insert_turn(make_record("t-top", is_subagent=False, ts_end=now - 5))
+    store.insert_turn(make_record("t-sub", is_subagent=True, ts_end=now - 3))
+    store.insert_turn(make_record("t-alert", is_subagent=False, ts_end=now))
+    store.mark_alerted("t-alert")
+
+    stats = store.debug_stats()
+
+    assert stats["db_exists"] is True
+    assert stats["db_path"].endswith("blackbox/turns.db")
+    assert stats["turns"] == 3
+    assert stats["subagent_turns"] == 1
+    assert stats["alerted"] == 1
+    # Each make_record carries 2 tool_calls → 3 turns × 2 = 6 side rows.
+    assert stats["tool_calls"] == 6
+    assert stats["newest_ts"] == pytest.approx(now)
+    assert "error" not in stats
+
+
+def test_debug_stats_on_missing_db_is_graceful(tmp_path, monkeypatch):
+    """Before any turn is recorded, debug must still report (db absent)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    stats = store.debug_stats()
+    # _connect() creates the schema on first touch, so the DB exists but is
+    # empty; the key contract is: no exception, zero counts.
+    assert stats["turns"] == 0
+    assert stats["tool_calls"] == 0
+    assert "error" not in stats
