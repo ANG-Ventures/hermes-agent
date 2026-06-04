@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from plugins.blackbox.record import TurnRecord, tools_summary
@@ -147,12 +148,32 @@ def render(record: "dict | TurnRecord", threshold_usd: float | None = None) -> s
     """Dict-or-TurnRecord facade used by the /cost command path.
 
     store.get_turn / get_last_turn return dict rows; this hydrates them into a
-    TurnRecord and renders. The threshold defaults to the stored cost (so the
-    card shows a sensible threshold even when invoked outside the alert path).
+    TurnRecord and renders. The threshold defaults to the configured alert
+    threshold (so the Threshold line on a /cost lookup matches what would have
+    fired an alert), falling back to the turn's own cost only if config is
+    unreadable.
     """
     rec = record if isinstance(record, TurnRecord) else _record_from_row(record)
     if threshold_usd is None:
-        # No alert threshold context on a /cost lookup — fall back to the
-        # turn's own cost so the Threshold line is non-misleading.
-        threshold_usd = float(rec.cost_usd) if rec.cost_usd is not None else 0.0
+        threshold_usd = _configured_threshold()
+        if threshold_usd is None:
+            threshold_usd = float(rec.cost_usd) if rec.cost_usd is not None else 0.0
     return render_card(rec, threshold_usd)
+
+
+def _configured_threshold() -> float | None:
+    """Best-effort read of blackbox.cost_alert_threshold_usd from config.yaml."""
+    try:
+        import yaml
+        from hermes_constants import get_hermes_home
+
+        path = Path(get_hermes_home()) / "config.yaml"
+        if not path.exists():
+            return None
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        block = data.get("blackbox")
+        if isinstance(block, dict) and block.get("cost_alert_threshold_usd") is not None:
+            return float(block["cost_alert_threshold_usd"])
+    except Exception:
+        return None
+    return None

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import re
 import types
 from datetime import datetime
 from decimal import Decimal
@@ -60,6 +61,35 @@ def test_cost_all_included(monkeypatch):
 
     assert amount == 0.0
     assert status == "included"
+
+
+def test_cost_status_vocabulary_pinned():
+    """RC7: pin the real usage_pricing status values so a provider/library
+    change that introduces a new status is caught here (compute_turn_cost
+    ranks unknown statuses as worst-of → would silently mark turns unknown).
+    The real estimate_usage_cost returns one of: actual, estimated, included,
+    unknown. cost.compute_turn_cost maps 'actual'→'estimated' for ranking.
+    """
+    import agent.usage_pricing as up
+    import inspect
+    src = inspect.getsource(up)
+    produced = set(re.findall(r'status\s*=\s*"([a-z]+)"', src))
+    # Every status the library can produce must be handled by cost._STATUS_RANK
+    # (or be the 'actual' alias we remap). Unhandled → ranks as 3 (unknown).
+    handled = set(cost._STATUS_RANK) | {"actual"}
+    unhandled = produced - handled
+    assert not unhandled, f"usage_pricing emits unhandled status(es): {unhandled}"
+
+
+def test_cost_actual_maps_to_estimated(monkeypatch):
+    """'actual' status must be reconciled as 'estimated', not ranked unknown."""
+    monkeypatch.setattr(
+        cost, "estimate_usage_cost",
+        lambda *a, **k: CostResult(Decimal("0.50"), "actual"),
+    )
+    amount, status = cost.compute_turn_cost("m", "p", "", [{"input_tokens": 1}])
+    assert amount == 0.5
+    assert status == "estimated"
 
 
 def _record(**overrides):
