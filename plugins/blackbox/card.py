@@ -58,14 +58,30 @@ def cache_health(cache_pct: float) -> str:
 def _session_line(platform: str, chat_id: str, chat_name: str) -> str:
     label = (platform or "").strip()
     key = label.lower()
+    name = (chat_name or "").strip()
+    cid = (chat_id or "").strip()
     if key == "discord":
-        return f"Discord <#{chat_id}>"
+        # `<#id>` renders as a clickable channel mention in Discord; append the
+        # human channel name when we have it so the card is readable elsewhere
+        # too (and not just an empty `Discord <#>` when chat_id is missing).
+        if cid and name:
+            return f"Discord #{name} (<#{cid}>)"
+        if cid:
+            return f"Discord <#{cid}>"
+        if name:
+            return f"Discord #{name}"
+        return "Discord"
     if key == "telegram":
-        return f"Telegram #{chat_name}"
+        detail = name or cid
+        return f"Telegram #{detail}".rstrip(" #") or "Telegram"
     if key == "slack":
-        return f"Slack <#{chat_id}|{chat_name}>"
-    detail = chat_name or chat_id
-    return f"{label} {detail}".strip()
+        if cid and name:
+            return f"Slack <#{cid}|{name}>"
+        if cid:
+            return f"Slack <#{cid}>"
+        return f"Slack #{name}" if name else "Slack"
+    detail = name or cid
+    return f"{label} {detail}".strip() or (label or "—")
 
 
 def _context_line(record: TurnRecord) -> str:
@@ -80,14 +96,34 @@ def _context_line(record: TurnRecord) -> str:
     )
 
 
-def _cache_line(record: TurnRecord) -> str:
-    input_tokens = int(record.input_tokens or 0)
-    cache_read = int(record.cache_read_tokens or 0)
-    if input_tokens <= 0:
-        return "n/a"
-    pct = cache_read / input_tokens * 100
+def _prompt_total(record: TurnRecord) -> int:
+    """Total input billed for the turn.
+
+    `record.input_tokens` is only the FRESH (uncached) input remainder. Under
+    prompt caching almost all input arrives as cache reads/writes, so the bare
+    field reads as a tiny leftover (e.g. 12) while the real input is hundreds of
+    thousands. The true total is fresh + cache_read + cache_write, mirroring
+    agent.usage_pricing.CanonicalUsage.prompt_tokens.
+    """
     return (
-        f"{humanize_tokens(cache_read)}/{humanize_tokens(input_tokens)} "
+        int(record.input_tokens or 0)
+        + int(record.cache_read_tokens or 0)
+        + int(record.cache_write_tokens or 0)
+    )
+
+
+def _cache_line(record: TurnRecord) -> str:
+    cache_read = int(record.cache_read_tokens or 0)
+    # Cache hit rate = fraction of the full prompt served from cache. The
+    # denominator is the TOTAL prompt (fresh input + cache read + cache write),
+    # NOT the bare fresh-input count — otherwise a cache-heavy turn (12 fresh
+    # input, 669k cached) divides 669k/12 and reports a nonsense 5,576,942%.
+    prompt_total = _prompt_total(record)
+    if prompt_total <= 0:
+        return "n/a"
+    pct = cache_read / prompt_total * 100
+    return (
+        f"{humanize_tokens(cache_read)}/{humanize_tokens(prompt_total)} "
         f"{cache_health(pct)} {pct:.0f}%"
     )
 
@@ -105,7 +141,7 @@ def render_card(record: TurnRecord, threshold_usd: float) -> str:
             f"• Threshold: {_money(threshold_usd)}",
             f"• API Calls: {record.api_calls}",
             f"• Tool Calls: {len(record.tools)} ({tools_summary(record.tools)})",
-            f"• Tokens: {humanize_tokens(record.input_tokens)} in + {humanize_tokens(record.output_tokens)} out",
+            f"• Tokens: {humanize_tokens(_prompt_total(record))} in + {humanize_tokens(record.output_tokens)} out",
             f"• Context: {_context_line(record)}",
             f"• Cached: {_cache_line(record)}",
             f"• Agent: {record.profile}",

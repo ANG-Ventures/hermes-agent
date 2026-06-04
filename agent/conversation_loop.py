@@ -4907,6 +4907,8 @@ def run_conversation(
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
             provider=getattr(agent, "provider", None) or "",
+            chat_id=getattr(agent, "_chat_id", None) or "",
+            chat_name=getattr(agent, "_chat_name", None) or "",
             user_message=original_user_message,
             final_response=final_response,
             turn_usage=_turn_usage,
