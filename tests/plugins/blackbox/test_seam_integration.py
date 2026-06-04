@@ -105,3 +105,70 @@ def test_real_seam_disabled_is_noop(temp_home, monkeypatch):
     monkeypatch.setitem(sys.modules, "plugins.blackbox.store", store)
     bb._on_session_end(**_payload())
     assert store.top_turns(5, 30) == [], "disabled plugin must not persist"
+
+
+def test_real_seam_tool_args_results_dig_in(temp_home, monkeypatch):
+    """End-to-end: post_tool_call args/result previews flow into the side table
+    and are retrievable via store.get_tool_calls (the /cost <id> dig-in path),
+    with secrets scrubbed. No mocks of the store or card."""
+    home, store = temp_home
+    import plugins.blackbox as bb
+    importlib.reload(bb)
+    bb._sessions.clear()
+
+    monkeypatch.setattr(bb, "_config", lambda: {
+        "enabled": True, "cost_alert_threshold_usd": 999.0,
+        "store_text": True, "record_subagents": True,
+    })
+    monkeypatch.setattr(bb, "compute_turn_cost", lambda *a, **k: (1.26, "estimated"))
+    monkeypatch.setattr(bb, "store", store, raising=False)
+    monkeypatch.setitem(sys.modules, "plugins.blackbox.store", store)
+    monkeypatch.setattr(bb, "_turn_id", lambda: "turn_digin")
+
+    bb._on_session_start(session_id="s-real")
+    bb._on_post_tool_call(
+        session_id="s-real",
+        tool_name="terminal",
+        args={"command": "deploy --token ghp_0123456789abcdefghij0123456789abcdef"},
+        result="ran ok",
+    )
+    bb._on_post_tool_call(
+        session_id="s-real",
+        tool_name="read_file",
+        args={"path": "/etc/hosts"},
+        result={"content": "127.0.0.1 localhost"},
+    )
+    bb._on_session_end(**_payload())
+
+    calls = store.get_tool_calls("turn_digin")
+    assert [c["name"] for c in calls] == ["terminal", "read_file"]
+    # args/result previews persisted and ordered.
+    assert "deploy --token" in calls[0]["args_preview"]
+    assert calls[0]["result_preview"] == "ran ok"
+    assert "/etc/hosts" in calls[1]["args_preview"]
+    assert "127.0.0.1" in calls[1]["result_preview"]
+    # Secret in a tool arg must be scrubbed before persist.
+    assert "ghp_0123456789abcdefghij0123456789abcdef" not in calls[0]["args_preview"]
+
+
+def test_real_seam_store_text_false_skips_tool_calls(temp_home, monkeypatch):
+    """store_text:false must not persist tool args/results (privacy gate)."""
+    home, store = temp_home
+    import plugins.blackbox as bb
+    importlib.reload(bb)
+    bb._sessions.clear()
+
+    monkeypatch.setattr(bb, "_config", lambda: {
+        "enabled": True, "cost_alert_threshold_usd": 999.0,
+        "store_text": False, "record_subagents": True,
+    })
+    monkeypatch.setattr(bb, "compute_turn_cost", lambda *a, **k: (1.26, "estimated"))
+    monkeypatch.setattr(bb, "store", store, raising=False)
+    monkeypatch.setitem(sys.modules, "plugins.blackbox.store", store)
+    monkeypatch.setattr(bb, "_turn_id", lambda: "turn_notext")
+
+    bb._on_session_start(session_id="s-real")
+    bb._on_post_tool_call(session_id="s-real", tool_name="terminal", args={"x": 1}, result="y")
+    bb._on_session_end(**_payload())
+
+    assert store.get_tool_calls("turn_notext") == []

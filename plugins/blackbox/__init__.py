@@ -2,12 +2,33 @@
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 import logging
 from pathlib import Path
 from threading import Lock
 from typing import Any
+
+_PREVIEW_CHARS = 2000
+
+
+def _preview(value: Any) -> str:
+    """Compact string preview of a tool arg/result for the side table.
+
+    The store scrubs secrets and truncates again before persisting; this just
+    coerces dict/list/other into a bounded string so the hook stays cheap.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            text = str(value)
+    return text[:_PREVIEW_CHARS]
 
 import yaml
 
@@ -80,7 +101,9 @@ def _float_value(value: Any) -> float:
 
 def _session_state(session_id: str) -> dict[str, Any]:
     with _lock:
-        return _sessions.setdefault(session_id or "", {"ts_start": time.time(), "tools": []})
+        return _sessions.setdefault(
+            session_id or "", {"ts_start": time.time(), "tools": [], "tool_calls": []}
+        )
 
 
 def _on_session_start(session_id: str = "", **_: Any) -> None:
@@ -88,14 +111,26 @@ def _on_session_start(session_id: str = "", **_: Any) -> None:
         if _config() is None:
             return
         with _lock:
-            _sessions[session_id or ""] = {"ts_start": time.time(), "tools": []}
+            _sessions[session_id or ""] = {
+                "ts_start": time.time(),
+                "tools": [],
+                "tool_calls": [],
+            }
     except Exception:
         return
 
 
-def _on_post_tool_call(tool_name: str = "", name: str = "", session_id: str = "", **_: Any) -> None:
+def _on_post_tool_call(
+    tool_name: str = "",
+    name: str = "",
+    session_id: str = "",
+    args: Any = None,
+    result: Any = None,
+    **_: Any,
+) -> None:
     try:
-        if _config() is None:
+        cfg = _config()
+        if cfg is None:
             return
         tool = tool_name or name
         if not tool:
@@ -103,6 +138,14 @@ def _on_post_tool_call(tool_name: str = "", name: str = "", session_id: str = ""
         state = _session_state(session_id)
         with _lock:
             state.setdefault("tools", []).append(str(tool))
+            if bool(cfg.get("store_text", True)):
+                state.setdefault("tool_calls", []).append(
+                    {
+                        "name": str(tool),
+                        "args_preview": _preview(args),
+                        "result_preview": _preview(result),
+                    }
+                )
     except Exception:
         return
 
@@ -131,6 +174,7 @@ def _build_record(
         state = _sessions.pop(session_id or "", state)
     ts_start = _float_value(state.get("ts_start")) or now - _float_value(usage.get("latency_s"))
     ts_end = now
+    tool_calls = list(state.get("tool_calls") or [])
 
     cost_usd, cost_status = compute_turn_cost(
         model,
@@ -179,6 +223,7 @@ def _build_record(
         interrupted=bool(interrupted),
         user_text=str(user_message or "") if store_text else "",
         final_text=str(final_response or "") if store_text else "",
+        tool_calls=tool_calls if store_text else [],
     )
 
 
