@@ -203,8 +203,10 @@ def blackbox(monkeypatch):
     store = types.SimpleNamespace(
         records=[],
         marked=[],
+        swept=[],
         insert_turn=lambda record: store.records.append(record),
         mark_alerted=lambda turn_id: store.marked.append(turn_id) or True,
+        sweep=lambda retention_days, **kw: store.swept.append(retention_days) or 0,
     )
     monkeypatch.setitem(sys.modules, "plugins.blackbox.store", store)
     # The hook does a lazy `from plugins.blackbox import store`, which resolves
@@ -361,3 +363,31 @@ def test_hook_chat_fields_from_kwargs_populate_record(blackbox, monkeypatch):
     rec = store.records[0]
     assert rec.chat_id == "C99"
     assert rec.chat_name == "aegis-ops"
+
+
+def test_hook_runs_retention_sweep_with_configured_days(blackbox, monkeypatch):
+    """Every recorded turn triggers a self-throttling retention sweep using the
+    configured retention_days (default 30 when unset)."""
+    bb, store, sent = blackbox
+    monkeypatch.setattr(bb, "_config", lambda: {"enabled": True, "cost_alert_threshold_usd": 1.0, "retention_days": 14})
+    monkeypatch.setattr(bb, "compute_turn_cost", lambda *args, **kwargs: (0.1, "estimated"))
+
+    bb._on_session_end(session_id="s1", model="m", platform="discord", provider="p", turn_usage=_usage())
+
+    assert store.swept == [14]
+
+
+def test_hook_sweep_failure_does_not_block_recording(blackbox, monkeypatch):
+    """A sweep exception must never prevent the turn from being recorded."""
+    bb, store, sent = blackbox
+
+    def _boom(*a, **k):
+        raise RuntimeError("sweep blew up")
+
+    store.sweep = _boom
+    monkeypatch.setattr(bb, "_config", lambda: {"enabled": True, "cost_alert_threshold_usd": 1.0})
+    monkeypatch.setattr(bb, "compute_turn_cost", lambda *args, **kwargs: (0.1, "estimated"))
+
+    bb._on_session_end(session_id="s1", model="m", platform="discord", provider="p", turn_usage=_usage())
+
+    assert len(store.records) == 1   # recording survived the sweep failure
