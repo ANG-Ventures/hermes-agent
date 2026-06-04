@@ -56,7 +56,13 @@ def test_cost_latest_renders_real_card(real_env, monkeypatch):
     assert "/cost error" not in out
     assert "Turn Cost: $1.26" in out
     assert "Tool Calls: 4 (exec×3, read)" in out
-    assert "Session: Discord <#C1>" in out
+    assert "Session: Discord #general (<#C1>)" in out
+    # "Tokens in" must be the TOTAL prompt (fresh + cache read + cache write),
+    # not the bare uncached `input_tokens` remainder — with caching that leftover
+    # is tiny (e.g. 12) and previously rendered as a bogus "12 in".
+    assert "Tokens: 1000k in + 559 out" in out
+    # Cache-hit ratio divides by the total prompt, not the fresh remainder.
+    assert "Cached: 499k/1000k" in out
 
 
 def test_cost_turn_digin_real_card_and_acl(real_env, monkeypatch):

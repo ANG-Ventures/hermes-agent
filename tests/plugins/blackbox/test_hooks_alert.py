@@ -128,12 +128,12 @@ def test_card_renders_expected_bullets():
         "• Threshold: $1.00",
         "• API Calls: 1",
         "• Tool Calls: 4 (exec×3, read)",
-        "• Tokens: 500k in + 559 out",
+        "• Tokens: 999k in + 559 out",
         "• Context: 500k/1050k 🟢 (48% of model max)",
-        "• Cached: 499k/500k 🟢 100%",
+        "• Cached: 499k/999k 🔴 50%",
         "• Agent: Aegis",
         "• Model: openai-codex/gpt-5.4",
-        "• Session: Discord <#1488602178305130546>",
+        "• Session: Discord #ops (<#1488602178305130546>)",
         "• Latency: 23s",
         "• Datetime: 2026/04/15 15:50:21 PT",
         "• Investigate: /cost turn_abc",
@@ -151,6 +151,31 @@ def test_card_div_zero_and_platform_session_lines():
         _record(platform="Slack", chat_id="C123", chat_name="alerts"),
         1.0,
     )
+
+
+def test_cache_line_uses_total_prompt_denominator():
+    """Cache % must divide cache_read by the TOTAL prompt (input+read+write),
+    not by bare fresh-input — otherwise a cache-heavy turn reports a nonsense
+    >100% (regression: 669.2k/12 → 5,576,942%)."""
+    # 12 fresh input, 669,200 cached read, 0 write → prompt 669,212; 100% rounded.
+    line = card._cache_line(_record(input_tokens=12, cache_read_tokens=669_200, cache_write_tokens=0))
+    assert line == "669.2k/669.2k 🟢 100%"
+    # Mixed: 500k input, 499k read → 999k prompt → ~50% (NOT 100%).
+    line2 = card._cache_line(_record(input_tokens=500_000, cache_read_tokens=499_000, cache_write_tokens=0))
+    assert line2 == "499k/999k 🔴 50%"
+    # No prompt at all → n/a (no div-by-zero).
+    assert card._cache_line(_record(input_tokens=0, cache_read_tokens=0, cache_write_tokens=0)) == "n/a"
+
+
+def test_session_line_discord_shows_name_and_mention():
+    # Both id + name → name plus clickable mention.
+    assert card._session_line("discord", "C1", "ops") == "Discord #ops (<#C1>)"
+    # id only → bare mention (back-compat).
+    assert card._session_line("discord", "C1", "") == "Discord <#C1>"
+    # name only (id missing) → readable name, no empty `<#>`.
+    assert card._session_line("discord", "", "ops") == "Discord #ops"
+    # neither → bare platform label, never `Discord <#>`.
+    assert card._session_line("discord", "", "") == "Discord"
 
 
 def test_card_health_colour_boundaries():
@@ -281,3 +306,58 @@ def test_hook_config_off_or_missing_noop(blackbox, monkeypatch):
     assert store.records == []
     assert store.marked == []
     assert sent == []
+
+
+def test_hook_alerts_disabled_records_but_does_not_push(blackbox, monkeypatch):
+    """alerts_enabled=False: the turn is still recorded (visible to /cost and
+    /context) but NO card is pushed even when cost exceeds the threshold."""
+    bb, store, sent = blackbox
+    monkeypatch.setattr(
+        bb,
+        "_config",
+        lambda: {"enabled": True, "alerts_enabled": False, "cost_alert_threshold_usd": 1.0},
+    )
+    monkeypatch.setattr(bb, "compute_turn_cost", lambda *args, **kwargs: (5.0, "estimated"))
+
+    bb._on_session_end(session_id="s1", model="m", platform="discord", provider="p", turn_usage=_usage())
+
+    assert len(store.records) == 1            # recorded
+    assert store.records[0].cost_usd == 5.0
+    assert store.marked == []                  # never marked alerted
+    assert sent == []                          # never pushed
+
+
+def test_hook_alerts_disabled_ignores_always_card(blackbox, monkeypatch):
+    """alerts_enabled=False suppresses pushes even when always_card is set."""
+    bb, store, sent = blackbox
+    monkeypatch.setattr(
+        bb,
+        "_config",
+        lambda: {"enabled": True, "alerts_enabled": False, "always_card": True, "cost_alert_threshold_usd": 1.0},
+    )
+    monkeypatch.setattr(bb, "compute_turn_cost", lambda *args, **kwargs: (0.01, "estimated"))
+
+    bb._on_session_end(session_id="s1", model="m", platform="discord", provider="p", turn_usage=_usage())
+
+    assert len(store.records) == 1
+    assert sent == []
+
+
+def test_hook_chat_fields_from_kwargs_populate_record(blackbox, monkeypatch):
+    """chat_id/chat_name passed as hook kwargs (gateway path) land on the record
+    so the session line is not an empty 'Discord <#>'."""
+    bb, store, sent = blackbox
+    monkeypatch.setattr(bb, "_config", lambda: {"enabled": True, "alerts_enabled": True, "cost_alert_threshold_usd": 1.0})
+    monkeypatch.setattr(bb, "compute_turn_cost", lambda *args, **kwargs: (0.1, "estimated"))
+
+    # turn_usage._usage() carries no chat fields here; pass them as kwargs.
+    usage = {k: v for k, v in _usage().items() if k not in ("chat_id", "chat_name")}
+    bb._on_session_end(
+        session_id="s1", model="m", platform="discord", provider="p",
+        chat_id="C99", chat_name="aegis-ops", turn_usage=usage,
+    )
+
+    assert len(store.records) == 1
+    rec = store.records[0]
+    assert rec.chat_id == "C99"
+    assert rec.chat_name == "aegis-ops"

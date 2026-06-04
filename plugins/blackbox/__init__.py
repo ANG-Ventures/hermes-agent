@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULTS = {
     "enabled": False,
+    "alerts_enabled": True,
     "cost_alert_threshold_usd": 1.00,
     "always_card": False,
     "store_text": True,
@@ -269,6 +270,10 @@ def _on_session_end(
 
         store.insert_turn(record)
         threshold = float(cfg.get("cost_alert_threshold_usd", 1.0) or 1.0)
+        # The turn is always recorded above (visible to /cost and /context);
+        # alerts_enabled only gates the proactive card PUSH to the channel.
+        if not bool(cfg.get("alerts_enabled", True)):
+            return
         should_alert = (
             bool(cfg.get("always_card"))
             or (record.cost_usd is not None and record.cost_usd >= threshold and not record.interrupted)
