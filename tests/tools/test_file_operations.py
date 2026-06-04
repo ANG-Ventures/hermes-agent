@@ -704,3 +704,99 @@ class _DeletedTestGitBaselineCheck:
     helper is restored or replaced.
     """
     pass
+
+
+# =========================================================================
+# write_file post-write verification
+# =========================================================================
+
+class TestWriteFilePostWriteVerification:
+    """Tests for the post-write read-back verification in write_file.
+
+    write_file historically reported success based only on the write
+    command's exit code plus a ``wc -c`` byte count, with no content
+    comparison. That meant a silent persistence failure — the write
+    command exits 0 but the bytes on disk don't match what we sent (an
+    third-party editor/sync process clobbering the file right after the
+    write, a truncated stdin pipe, a backend FS oddity) — was reported
+    as a successful write. This mirrors the read-back check patch_replace
+    already has.
+    """
+
+    def test_write_file_fails_when_content_clobbered(self, mock_env):
+        """Write command succeeds but the file on disk holds different
+        content (e.g. a third-party process overwrote it): write_file must
+        return an error, not a success WriteResult."""
+        # The mock NEVER stores what we write — the verify read returns
+        # stale content, simulating a clobber-after-write race.
+        stale = "ORIGINAL CONTENT THAT WAS NOT REPLACED\n"
+
+        def side_effect(command, stdin_data=None, **kwargs):
+            if command.startswith("cat >"):  # the write itself — pretend success
+                return {"output": "", "returncode": 0}
+            if command.startswith("cat ") or command.startswith("head "):  # reads return stale
+                return {"output": stale, "returncode": 0}
+            if command.startswith("mkdir "):
+                return {"output": "", "returncode": 0}
+            if command.startswith("wc -c"):
+                return {"output": str(len(stale.encode())), "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        result = ops.write_file("/tmp/test/note.md", "BRAND NEW CONTENT\n")
+        assert result.error is not None, (
+            "Silent clobber after write must surface as error, got: "
+            f"bytes_written={result.bytes_written}, error={result.error}"
+        )
+        assert "verification failed" in result.error.lower()
+        assert "did not persist" in result.error.lower()
+
+    def test_write_file_succeeds_when_content_persisted(self, mock_env):
+        """Normal success path: the write persists, verify read returns
+        exactly what we wrote."""
+        state = {"content": ""}
+
+        def side_effect(command, stdin_data=None, **kwargs):
+            if command.startswith("cat >"):  # write
+                if stdin_data is not None:
+                    state["content"] = stdin_data
+                return {"output": "", "returncode": 0}
+            if command.startswith("cat ") or command.startswith("head "):  # read
+                return {"output": state["content"], "returncode": 0}
+            if command.startswith("mkdir "):
+                return {"output": "", "returncode": 0}
+            if command.startswith("wc -c"):
+                return {"output": str(len(state["content"].encode())), "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        result = ops.write_file("/tmp/test/note.md", "BRAND NEW CONTENT\n")
+        assert result.error is None, f"Unexpected error: {result.error}"
+        assert state["content"] == "BRAND NEW CONTENT\n"
+        assert result.bytes_written == len("BRAND NEW CONTENT\n".encode())
+
+    def test_write_file_fails_when_verify_read_errors(self, mock_env):
+        """If the verify read step itself fails (exit code != 0), return
+        an error rather than silently claiming success."""
+        state = {"content": ""}
+
+        def side_effect(command, stdin_data=None, **kwargs):
+            if command.startswith("cat >"):  # write
+                if stdin_data is not None:
+                    state["content"] = stdin_data
+                return {"output": "", "returncode": 0}
+            if command.startswith("cat ") or command.startswith("head "):  # verify read fails
+                return {"output": "", "returncode": 1}
+            if command.startswith("mkdir "):
+                return {"output": "", "returncode": 0}
+            if command.startswith("wc -c"):
+                return {"output": str(len(state["content"].encode())), "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        result = ops.write_file("/tmp/test/note.md", "BRAND NEW CONTENT\n")
+        assert result.error is not None
+        assert "could not re-read" in result.error.lower()
