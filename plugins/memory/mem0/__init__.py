@@ -127,6 +127,7 @@ class Mem0MemoryProvider(MemoryProvider):
         self._user_id = "hermes-user"
         self._agent_id = "hermes"
         self._rerank = True
+        self._capture = "auto"
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
@@ -163,6 +164,7 @@ class Mem0MemoryProvider(MemoryProvider):
             {"key": "user_id", "description": "User identifier", "default": "hermes-user"},
             {"key": "agent_id", "description": "Agent identifier", "default": "hermes"},
             {"key": "rerank", "description": "Enable reranking for recall", "default": "true", "choices": ["true", "false"]},
+            {"key": "capture", "description": "Per-turn auto-capture mode (auto=capture every turn; off=recall-only, no per-turn writes)", "default": "auto", "choices": ["auto", "off"], "env_var": "MEM0_CAPTURE"},
         ]
 
     def _get_client(self):
@@ -208,6 +210,15 @@ class Mem0MemoryProvider(MemoryProvider):
         self._user_id = kwargs.get("user_id") or self._config.get("user_id", "hermes-user")
         self._agent_id = self._config.get("agent_id", "hermes")
         self._rerank = self._config.get("rerank", True)
+        # Capture mode: "auto" (default) syncs every completed turn to Mem0 for
+        # server-side extraction. "off"/"manual" keeps recall (prefetch + search)
+        # and explicit mem0_conclude writes, but skips per-turn auto-capture —
+        # used for latency-sensitive / high-traffic agents (e.g. voice agents)
+        # where we want shared recall without paying a write on every turn.
+        self._capture = str(
+            os.environ.get("MEM0_CAPTURE")
+            or self._config.get("capture", "auto")
+        ).strip().lower()
 
     def _read_filters(self) -> Dict[str, Any]:
         """Filters for search/get_all — scoped to user only for cross-session recall."""
@@ -271,6 +282,10 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Send the turn to Mem0 for server-side fact extraction (non-blocking)."""
+        # Recall-only mode: skip per-turn auto-capture. Explicit mem0_conclude
+        # writes and prefetch/search recall still work.
+        if self._capture not in ("auto", "on", "true", "1"):
+            return
         if self._is_breaker_open():
             return
 
