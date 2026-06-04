@@ -26,6 +26,19 @@ CostSource = Literal[
 ]
 
 
+# Local subscription proxies / bridges that front the Anthropic API. Their
+# marginal cash cost is $0 (flat Claude subscription / tailnet failover), but we
+# price them at official Anthropic API rates for fleet cost *visibility* and
+# label the result "estimated". Provider names match the `provider:` keys used
+# in ~/.hermes/config.yaml across the fleet. Add new bridge/proxy aliases here.
+NOTIONAL_ANTHROPIC_PROVIDERS = frozenset({
+    "claude-api-proxy",
+    "claude-api-proxy-f1",
+    "claude-bridge",
+    "claude-bridge-f1",
+})
+
+
 @dataclass(frozen=True)
 class CanonicalUsage:
     input_tokens: int = 0
@@ -565,6 +578,20 @@ def resolve_billing_route(
         if inferred_provider in {"anthropic", "openai", "google"}:
             provider_name = inferred_provider
             model = bare_model
+
+    # Notional pricing for local subscription proxies/bridges that front the
+    # Anthropic API (Claude Code OAuth billing, tailnet failovers, etc.). The
+    # marginal cash cost is $0 (covered by a flat subscription), but for fleet
+    # cost *visibility* we price these at official Anthropic API rates and label
+    # the result "estimated" so /cost cards, top, and session rollups carry
+    # meaningful numbers. See NOTIONAL_ANTHROPIC_PROVIDERS.
+    if provider_name in NOTIONAL_ANTHROPIC_PROVIDERS:
+        return BillingRoute(
+            provider="anthropic",
+            model=model.split("/")[-1],
+            base_url=base_url or "",
+            billing_mode="official_docs_snapshot",
+        )
 
     if provider_name == "openai-codex":
         return BillingRoute(provider="openai-codex", model=model, base_url=base_url or "", billing_mode="subscription_included")

@@ -2,9 +2,12 @@ from types import SimpleNamespace
 
 from agent.usage_pricing import (
     CanonicalUsage,
+    NOTIONAL_ANTHROPIC_PROVIDERS,
     estimate_usage_cost,
     get_pricing_entry,
+    has_known_pricing,
     normalize_usage,
+    resolve_billing_route,
 )
 
 
@@ -141,6 +144,65 @@ def test_estimate_usage_cost_marks_subscription_routes_included():
         base_url="https://chatgpt.com/backend-api/codex",
     )
 
+    assert result.status == "included"
+    assert float(result.amount_usd) == 0.0
+
+
+def test_notional_anthropic_providers_price_at_official_rates():
+    """The 4 Claude subscription proxies/bridges must price claude-opus-4-8 at
+    official Anthropic rates ($5/$25 per M, $0.50 cache-read, $6.25 cache-write)
+    and label the result 'estimated' — NOT 'unknown' (which suppresses /cost
+    cards) and NOT 'included'/$0 (which hides spend in rollups)."""
+    usage = CanonicalUsage(
+        input_tokens=500_000, output_tokens=559,
+        cache_read_tokens=499_000, cache_write_tokens=1000,
+    )
+    # 500000*5/1e6 + 559*25/1e6 + 499000*0.5/1e6 + 1000*6.25/1e6 = 2.769725
+    expected = 2.769725
+    for provider in sorted(NOTIONAL_ANTHROPIC_PROVIDERS):
+        result = estimate_usage_cost("claude-opus-4-8", usage, provider=provider)
+        assert result.status == "estimated", f"{provider}: {result.status}"
+        assert result.amount_usd is not None, f"{provider} priced None"
+        assert float(result.amount_usd) == round(expected, 6), (
+            f"{provider}: {result.amount_usd}"
+        )
+
+
+def test_notional_anthropic_route_resolves_to_anthropic_billing():
+    """resolve_billing_route must rewrite the proxy provider to 'anthropic' with
+    the docs-snapshot billing mode so all downstream pricing lookups work."""
+    for provider in NOTIONAL_ANTHROPIC_PROVIDERS:
+        route = resolve_billing_route("claude-opus-4-8", provider=provider)
+        assert route.provider == "anthropic", provider
+        assert route.billing_mode == "official_docs_snapshot", provider
+        assert route.model == "claude-opus-4-8", provider
+
+
+def test_notional_anthropic_accepts_dot_notation_and_prefixed_model():
+    """Dot-notation (claude-opus-4.8) and anthropic/ prefix must still resolve
+    through the normal Anthropic normalization once the provider is remapped."""
+    usage = CanonicalUsage(input_tokens=1000, output_tokens=1000)
+    for model in ("claude-opus-4.8", "anthropic/claude-opus-4-8", "claude-opus-4-7"):
+        result = estimate_usage_cost(model, usage, provider="claude-bridge")
+        assert result.status == "estimated", f"{model}: {result.status}"
+        assert result.amount_usd is not None and float(result.amount_usd) > 0  # type: ignore[arg-type]
+
+
+def test_notional_anthropic_has_known_pricing():
+    """has_known_pricing must return True for the proxy providers (used by
+    callers to decide whether to attempt cost display)."""
+    for provider in NOTIONAL_ANTHROPIC_PROVIDERS:
+        assert has_known_pricing("claude-opus-4-8", provider=provider), provider
+
+
+def test_openai_codex_still_subscription_included():
+    """Regression guard: the codex remap was intentionally NOT changed here
+    (no authoritative gpt-5.x token pricing). It must stay 'included'/$0."""
+    result = estimate_usage_cost(
+        "gpt-5.5",
+        CanonicalUsage(input_tokens=1000, output_tokens=500),
+        provider="openai-codex",
+    )
     assert result.status == "included"
     assert float(result.amount_usd) == 0.0
 
