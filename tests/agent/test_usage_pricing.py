@@ -136,16 +136,24 @@ def test_openrouter_models_api_pricing_is_converted_from_per_token_to_per_millio
     assert float(entry.cache_write_cost_per_million) == 6.25
 
 
-def test_estimate_usage_cost_marks_subscription_routes_included():
-    result = estimate_usage_cost(
-        "gpt-5.3-codex",
-        CanonicalUsage(input_tokens=1000, output_tokens=500),
-        provider="openai-codex",
-        base_url="https://chatgpt.com/backend-api/codex",
-    )
+def test_estimate_usage_cost_marks_true_subscription_routes_included(monkeypatch):
+    """The included short-circuit must still fire for any route whose
+    billing_mode is 'subscription_included'. (Codex is no longer such a route —
+    it's now notional-OpenRouter — so we force the mode via the resolver to keep
+    covering the included code path.)"""
+    from agent import usage_pricing as up
 
+    monkeypatch.setattr(
+        "agent.usage_pricing.resolve_billing_route",
+        lambda *a, **k: up.BillingRoute(
+            provider="flat-sub", model="x", billing_mode="subscription_included"
+        ),
+    )
+    result = estimate_usage_cost(
+        "x", CanonicalUsage(input_tokens=1000, output_tokens=500), provider="flat-sub"
+    )
     assert result.status == "included"
-    assert float(result.amount_usd) == 0.0
+    assert result.amount_usd is not None and float(result.amount_usd) == 0.0  # type: ignore[arg-type]
 
 
 def test_notional_anthropic_providers_price_at_official_rates():
@@ -195,16 +203,72 @@ def test_notional_anthropic_has_known_pricing():
         assert has_known_pricing("claude-opus-4-8", provider=provider), provider
 
 
-def test_openai_codex_still_subscription_included():
-    """Regression guard: the codex remap was intentionally NOT changed here
-    (no authoritative gpt-5.x token pricing). It must stay 'included'/$0."""
-    result = estimate_usage_cost(
-        "gpt-5.5",
-        CanonicalUsage(input_tokens=1000, output_tokens=500),
-        provider="openai-codex",
+_CODEX_STUB_METADATA = {
+    "gpt-5.5": {"pricing": {"prompt": "0.000005", "completion": "0.00003"}},
+    "gpt-5.4": {"pricing": {"prompt": "0.0000025", "completion": "0.000015"}},
+    "gpt-5.3-codex": {"pricing": {"prompt": "0.00000175", "completion": "0.000014"}},
+}
+
+
+def test_openai_codex_route_resolves_to_notional_openrouter():
+    """openai-codex must resolve to an OpenRouter-priced route (notional cost
+    visibility), NOT subscription_included/$0 — so /cost cards can fire."""
+    from agent.usage_pricing import NOTIONAL_OPENROUTER_PROVIDERS
+
+    assert "openai-codex" in NOTIONAL_OPENROUTER_PROVIDERS
+    route = resolve_billing_route("gpt-5.5", provider="openai-codex")
+    assert route.provider == "openrouter"
+    assert route.billing_mode == "official_models_api"
+    assert route.model == "gpt-5.5"
+
+
+def test_openai_codex_priced_from_openrouter_catalog(monkeypatch):
+    """A codex turn is priced at the underlying OpenAI model's live OpenRouter
+    rate and labelled 'estimated'."""
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_model_metadata", lambda: _CODEX_STUB_METADATA
     )
-    assert result.status == "included"
-    assert float(result.amount_usd) == 0.0
+    usage = CanonicalUsage(input_tokens=120_000, output_tokens=8_000)
+    # 120000*5/1e6 + 8000*30/1e6 = 0.6 + 0.24 = 0.84
+    result = estimate_usage_cost("gpt-5.5", usage, provider="openai-codex")
+    assert result.status == "estimated"
+    assert result.amount_usd is not None and float(result.amount_usd) == 0.84  # type: ignore[arg-type]
+    assert result.source == "provider_models_api"
+
+
+def test_openai_codex_minus_codex_suffix_falls_back_to_base_model(monkeypatch):
+    """gpt-5.5-codex is absent from the OpenRouter catalog while gpt-5.5 is
+    present; the '-codex' fallback must price it as the base model."""
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_model_metadata", lambda: _CODEX_STUB_METADATA
+    )
+    usage = CanonicalUsage(input_tokens=120_000, output_tokens=8_000)
+    result = estimate_usage_cost("gpt-5.5-codex", usage, provider="openai-codex")
+    assert result.status == "estimated"
+    assert result.amount_usd is not None and float(result.amount_usd) == 0.84  # type: ignore[arg-type]
+
+
+def test_openai_codex_exact_codex_id_preferred_over_fallback(monkeypatch):
+    """When the exact '-codex' id IS in the catalog, use it directly (no strip)."""
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_model_metadata", lambda: _CODEX_STUB_METADATA
+    )
+    entry = get_pricing_entry("gpt-5.3-codex", provider="openai-codex")
+    assert entry is not None
+    assert float(entry.input_cost_per_million) == 1.75  # type: ignore[arg-type]
+    assert float(entry.output_cost_per_million) == 14.0  # type: ignore[arg-type]
+
+
+def test_openai_codex_unknown_model_stays_unknown(monkeypatch):
+    """A codex model absent from the catalog with no base fallback must degrade
+    to 'unknown' (NOT fabricate a price)."""
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_model_metadata", lambda: _CODEX_STUB_METADATA
+    )
+    usage = CanonicalUsage(input_tokens=1000, output_tokens=500)
+    result = estimate_usage_cost("gpt-9-imaginary", usage, provider="openai-codex")
+    assert result.status == "unknown"
+    assert result.amount_usd is None
 
 
 def test_estimate_usage_cost_refuses_cache_pricing_without_official_cache_rate(monkeypatch):
