@@ -255,7 +255,7 @@ def session_rollup(platform: str, chat_id: str, limit: int = 50) -> dict[str, An
     with _connect() as conn:
         rows = conn.execute(
             """
-            SELECT turn_id, cost_usd
+            SELECT turn_id, cost_usd, is_subagent
             FROM turns
             WHERE platform = ? AND chat_id = ?
             ORDER BY ts_end DESC
@@ -266,11 +266,17 @@ def session_rollup(platform: str, chat_id: str, limit: int = 50) -> dict[str, An
     costs = [float(row["cost_usd"] or 0.0) for row in rows]
     total = sum(costs)
     max_row = max(rows, key=lambda row: float(row["cost_usd"] or 0.0), default=None)
+    # Split main vs subagent turns so the caller can show an honest breakdown
+    # (the total already INCLUDES subagent spend — they are real rows here).
+    sub_rows = [r for r in rows if int(r["is_subagent"] or 0) == 1]
+    sub_total = sum(float(r["cost_usd"] or 0.0) for r in sub_rows)
     return {
         "total_usd": total,
         "count": len(rows),
         "avg_usd": total / len(rows) if rows else 0.0,
         "max_turn": dict(max_row) if max_row else None,
+        "subagent_count": len(sub_rows),
+        "subagent_usd": sub_total,
     }
 
 
@@ -288,6 +294,61 @@ def top_turns(n: int = 5, since_days: int = 30) -> list[dict[str, Any]]:
             (cutoff, int(n)),
         ).fetchall()
     return [_row_to_dict(row) for row in rows]
+
+
+def subagent_rollup(platform: str, chat_id: str, limit: int = 200) -> dict[str, Any]:
+    """Aggregate subagent turns spawned within a channel (platform + chat_id).
+
+    Subagent turns are recorded as their own rows with ``is_subagent = 1`` and
+    carry the PARENT's channel identity (``platform``/``chat_id`` are stamped
+    from ``_blackbox_parent_platform``/``_blackbox_parent_chat_id`` by
+    delegate_tool). They are NOT reliably linkable to a single parent *turn* —
+    ``parent_turn_id`` holds the parent's session KEY, and parent turns don't
+    store their own session key — so we roll up by channel, the same axis every
+    other /cost view (session/latest/turn) resolves on.
+
+    Returns counts + summed cost/tokens across the channel's subagent turns,
+    plus how many are unpriced (cost_usd IS NULL) so the caller can show an
+    honest "+N unpriced" note instead of silently undercounting.
+    """
+    if not platform or not chat_id:
+        return {"count": 0, "total_usd": 0.0, "unpriced": 0,
+                "input_tokens": 0, "output_tokens": 0, "models": []}
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT cost_usd, input_tokens, output_tokens, cache_read, model
+            FROM turns
+            WHERE is_subagent = 1 AND platform = ? AND chat_id = ?
+            ORDER BY ts_end DESC
+            LIMIT ?
+            """,
+            (platform or "", chat_id or "", int(limit)),
+        ).fetchall()
+    total = 0.0
+    unpriced = 0
+    in_tok = 0
+    out_tok = 0
+    models: list[str] = []
+    for r in rows:
+        c = r["cost_usd"]
+        if c is None:
+            unpriced += 1
+        else:
+            total += float(c or 0.0)
+        in_tok += int(r["input_tokens"] or 0)
+        out_tok += int(r["output_tokens"] or 0)
+        m = r["model"]
+        if m and m not in models:
+            models.append(str(m))
+    return {
+        "count": len(rows),
+        "total_usd": total,
+        "unpriced": unpriced,
+        "input_tokens": in_tok,
+        "output_tokens": out_tok,
+        "models": models,
+    }
 
 
 def sweep(retention_days: int, max_deletes: int = 10000) -> int:

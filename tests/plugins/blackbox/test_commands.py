@@ -13,6 +13,7 @@ class FakeStore:
         self.turn = None
         self.tool_calls = []
         self.rollup = {}
+        self.sub_rollup = {}
         self.top = []
 
     def get_last_turn(self, platform, chat_id):
@@ -30,6 +31,10 @@ class FakeStore:
     def session_rollup(self, platform, chat_id, limit=50):
         self.rollup_args = (platform, chat_id, limit)
         return self.rollup
+
+    def subagent_rollup(self, platform, chat_id, limit=200):
+        self.sub_args = (platform, chat_id, limit)
+        return self.sub_rollup
 
     def top_turns(self, n, since_days):
         self.top_args = (n, since_days)
@@ -125,6 +130,30 @@ def test_cost_session_rollup(fake_store):
         "Session spend: $1.25 over 4 turns (avg $0.3125). "
         "Priciest: turn_expensive $0.75"
     )
+
+
+def test_cost_session_rollup_with_subagents(fake_store):
+    """When the session has subagent turns, /cost session appends a breakdown
+    line with the subagent spend, an unpriced note, and the models seen."""
+    fake_store.rollup = {
+        "total_usd": 2.00,
+        "count": 5,
+        "avg_usd": 0.40,
+        "max_turn": {"turn_id": "turn_x", "cost_usd": 1.0},
+        "subagent_count": 3,
+        "subagent_usd": 0.60,
+    }
+    fake_store.sub_rollup = {
+        "count": 3, "total_usd": 0.60, "unpriced": 1,
+        "input_tokens": 100, "output_tokens": 50, "models": ["gpt-5.5"],
+    }
+
+    result = commands.handle_cost("session")
+
+    assert "Session spend: $2 over 5 turns" in result
+    assert "↳ Subagents: $0.6 across 3 turn(s), +1 unpriced [gpt-5.5]" in result
+    # subagent_rollup queried on the resolved channel.
+    assert fake_store.sub_args == ("telegram", "chat-1", 200)
 
 
 def test_cost_top_three(fake_store):

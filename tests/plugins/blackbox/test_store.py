@@ -204,6 +204,51 @@ def test_session_rollup_and_top_turns(tmp_path, monkeypatch):
     assert [row["turn_id"] for row in top] == ["other-chat", "expensive"]
 
 
+def test_session_rollup_splits_subagent_spend(tmp_path, monkeypatch):
+    """session_rollup must report subagent_count/subagent_usd as a SUBSET of the
+    total (subagent turns are real rows already included in total_usd)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    now = time.time()
+    store.insert_turn(make_record("main-1", is_subagent=False, ts_end=now - 3, cost_usd=1.00))
+    store.insert_turn(make_record("sub-1", is_subagent=True, ts_end=now - 2, cost_usd=0.25))
+    store.insert_turn(make_record("sub-2", is_subagent=True, ts_end=now - 1, cost_usd=0.15))
+
+    rollup = store.session_rollup("telegram", "chat-1", limit=50)
+    assert rollup["count"] == 3
+    assert rollup["total_usd"] == pytest.approx(1.40)        # includes subagents
+    assert rollup["subagent_count"] == 2
+    assert rollup["subagent_usd"] == pytest.approx(0.40)
+
+
+def test_subagent_rollup_aggregates_by_channel_with_unpriced(tmp_path, monkeypatch):
+    """subagent_rollup sums cost/tokens of is_subagent rows in a channel, counts
+    unpriced (cost_usd IS NULL) separately, and ignores other channels + main
+    turns."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    now = time.time()
+    # 2 priced + 1 unpriced subagent in chat-1; a main turn and a foreign-chat
+    # subagent that must NOT be counted.
+    store.insert_turn(make_record("s1", is_subagent=True, ts_end=now - 4, cost_usd=0.10, model="gpt-5.5"))
+    store.insert_turn(make_record("s2", is_subagent=True, ts_end=now - 3, cost_usd=0.20, model="gpt-5.5"))
+    store.insert_turn(make_record("s3-unpriced", is_subagent=True, ts_end=now - 2, cost_usd=None, model="claude-opus-4-8"))
+    store.insert_turn(make_record("main", is_subagent=False, ts_end=now - 1, cost_usd=5.0))
+    store.insert_turn(make_record("s-other", is_subagent=True, chat_id="chat-2", ts_end=now, cost_usd=9.0))
+
+    roll = store.subagent_rollup("telegram", "chat-1", limit=200)
+    assert roll["count"] == 3
+    assert roll["total_usd"] == pytest.approx(0.30)   # unpriced excluded from sum
+    assert roll["unpriced"] == 1
+    assert set(roll["models"]) == {"gpt-5.5", "claude-opus-4-8"}
+
+
+def test_subagent_rollup_empty_for_blank_channel(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    assert store.subagent_rollup("", "") == {
+        "count": 0, "total_usd": 0.0, "unpriced": 0,
+        "input_tokens": 0, "output_tokens": 0, "models": [],
+    }
+
+
 def test_debug_stats_reports_counts_and_paths(tmp_path, monkeypatch):
     """Real-DB operational snapshot for /cost debug — no mocks."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

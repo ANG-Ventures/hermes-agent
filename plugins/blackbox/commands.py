@@ -133,7 +133,21 @@ def _handle_session() -> str:
     else:
         turn_id = "none"
         max_cost = "$0"
-    return f"Session spend: {total} over {count} turns (avg {avg}). Priciest: {turn_id} {max_cost}"
+    line = f"Session spend: {total} over {count} turns (avg {avg}). Priciest: {turn_id} {max_cost}"
+
+    # Subagent breakdown — the session total already INCLUDES subagent spend;
+    # surface how much of it came from delegated subagents (with an honest
+    # "+N unpriced" note when some subagent turns lack a cost).
+    sub_count = int(rollup.get("subagent_count") or 0)
+    if sub_count:
+        sub = store.subagent_rollup(platform, chat_id, limit=200) or {}
+        sub_usd = _fmt_usd(rollup.get("subagent_usd"))
+        unpriced = int(sub.get("unpriced") or 0)
+        unpriced_note = f", +{unpriced} unpriced" if unpriced else ""
+        models = sub.get("models") or []
+        models_note = f" [{', '.join(models)}]" if models else ""
+        line += f"\n↳ Subagents: {sub_usd} across {sub_count} turn(s){unpriced_note}{models_note}"
+    return line
 
 
 def _parse_top_n(parts: list[str]) -> int:

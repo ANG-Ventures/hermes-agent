@@ -269,6 +269,17 @@ def _on_session_end(
         from plugins.blackbox import store
 
         store.insert_turn(record)
+
+        # Retention sweep — prune turns older than retention_days. sweep() is
+        # self-throttling (a 'last_sweep_date' sentinel makes it a no-op after
+        # the first call each UTC day), so calling it every turn costs one
+        # indexed SELECT/day and keeps the store from growing unbounded. Guard
+        # it so a sweep failure never blocks recording/alerting.
+        try:
+            store.sweep(int(cfg.get("retention_days", 30) or 30))
+        except Exception:
+            logger.warning("blackbox retention sweep failed", exc_info=True)
+
         threshold = float(cfg.get("cost_alert_threshold_usd", 1.0) or 1.0)
         # The turn is always recorded above (visible to /cost and /context);
         # alerts_enabled only gates the proactive card PUSH to the channel.
