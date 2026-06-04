@@ -1082,6 +1082,35 @@ class ShellFileOperations(FileOperations):
         except ValueError:
             bytes_written = len(content.encode('utf-8'))
 
+        # Post-write verification — re-read the file and confirm the bytes we
+        # intended to write actually landed. Catches silent persistence
+        # failures (a third-party editor/sync process clobbering the file right
+        # after the write, a truncated stdin pipe, backend FS oddities) that
+        # would otherwise return a success WriteResult while the file on disk
+        # differs from what we sent. Mirrors the read-back check patch_replace
+        # already performs.
+        verify_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
+        verify_result = self._exec(verify_cmd)
+        if verify_result.exit_code != 0:
+            return WriteResult(error=f"Post-write verification failed: could not re-read {path}")
+        # Normalize line endings before comparing. On Windows, the file on
+        # disk may legitimately hold CRLFs (either from a pre-existing CRLF
+        # file we converted to above, or backend translation) while our
+        # ``content`` string has bare LFs. Without this normalization a
+        # correctly-persisted write would report a bogus mismatch. POSIX
+        # backends don't translate, so this is a no-op there.
+        _verify_normalized = verify_result.stdout.replace("\r\n", "\n").replace("\r", "\n")
+        _content_normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+        if _verify_normalized != _content_normalized:
+            return WriteResult(error=(
+                f"Post-write verification failed for {path}: on-disk content "
+                f"differs from intended write "
+                f"(wrote {len(_content_normalized)} chars, read back "
+                f"{len(_verify_normalized)} chars after normalizing line endings). "
+                "The write did not persist — another process may have clobbered "
+                "the file (e.g. an open editor or sync client). Re-read the file and try again."
+            ))
+
         # Post-write lint with delta refinement.
         lint_result = self._check_lint_delta(path, pre_content=pre_content, post_content=content)
 
