@@ -128,7 +128,7 @@ def test_card_renders_expected_bullets():
         "• Threshold: $1.00",
         "• API Calls: 1",
         "• Tool Calls: 4 (exec×3, read)",
-        "• Tokens: 500k in + 559 out",
+        "• Tokens: 999k in + 559 out",
         "• Context: 500k/1050k 🟢 (48% of model max)",
         "• Cached: 499k/999k 🔴 50%",
         "• Agent: Aegis",
