@@ -26,6 +26,31 @@ CostSource = Literal[
 ]
 
 
+# Local subscription proxies / bridges that front the Anthropic API. Their
+# marginal cash cost is $0 (flat Claude subscription / tailnet failover), but we
+# price them at official Anthropic API rates for fleet cost *visibility* and
+# label the result "estimated". Provider names match the `provider:` keys used
+# in ~/.hermes/config.yaml across the fleet. Add new bridge/proxy aliases here.
+NOTIONAL_ANTHROPIC_PROVIDERS = frozenset({
+    "claude-api-proxy",
+    "claude-api-proxy-f1",
+    "claude-bridge",
+    "claude-bridge-f1",
+})
+
+# Notional pricing for ChatGPT-subscription Codex providers (openai-codex).
+# Marginal cash cost is $0 (covered by a flat ChatGPT subscription), but for
+# fleet cost *visibility* we price these at OpenRouter's live catalog rates for
+# the underlying OpenAI model and label the result "estimated". Unlike the
+# Anthropic proxies (which fall back to a static docs snapshot), OpenAI models
+# are priced purely from the live OpenRouter models API — the same dynamic
+# source that already powers `provider: openrouter` routes fleet-wide. See
+# resolve_billing_route() and _openrouter_pricing_entry().
+NOTIONAL_OPENROUTER_PROVIDERS = frozenset({
+    "openai-codex",
+})
+
+
 @dataclass(frozen=True)
 class CanonicalUsage:
     input_tokens: int = 0
@@ -566,6 +591,34 @@ def resolve_billing_route(
             provider_name = inferred_provider
             model = bare_model
 
+    # Notional pricing for local subscription proxies/bridges that front the
+    # Anthropic API (Claude Code OAuth billing, tailnet failovers, etc.). The
+    # marginal cash cost is $0 (covered by a flat subscription), but for fleet
+    # cost *visibility* we price these at official Anthropic API rates and label
+    # the result "estimated" so /cost cards, top, and session rollups carry
+    # meaningful numbers. See NOTIONAL_ANTHROPIC_PROVIDERS.
+    if provider_name in NOTIONAL_ANTHROPIC_PROVIDERS:
+        return BillingRoute(
+            provider="anthropic",
+            model=model.split("/")[-1],
+            base_url=base_url or "",
+            billing_mode="official_docs_snapshot",
+        )
+
+    # Notional pricing for ChatGPT-subscription Codex routes. Marginal cash cost
+    # is $0, but for cost *visibility* we resolve to the underlying OpenAI model
+    # and price it from the live OpenRouter catalog (status "estimated"). The
+    # OpenRouter catalog lists base + dated families (gpt-5.5, gpt-5.3-codex,
+    # ...) but not every "-codex" variant (e.g. gpt-5.5-codex is absent while
+    # gpt-5.5 is present), so _normalize_codex_model_name() strips a trailing
+    # "-codex" as a fallback when the exact id is missing.
+    if provider_name in NOTIONAL_OPENROUTER_PROVIDERS:
+        return BillingRoute(
+            provider="openrouter",
+            model=model.split("/")[-1],
+            base_url=base_url or "",
+            billing_mode="official_models_api",
+        )
     if provider_name == "openai-codex":
         return BillingRoute(provider="openai-codex", model=model, base_url=base_url or "", billing_mode="subscription_included")
     if provider_name == "openrouter" or base_url_host_matches(base_url or "", "openrouter.ai"):
@@ -614,13 +667,40 @@ def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]
     return None
 
 
+def _normalize_codex_model_name(model: str) -> Optional[str]:
+    """Map a Codex model id to its underlying OpenAI catalog id when they differ.
+
+    OpenRouter lists base/dated OpenAI families (gpt-5.5, gpt-5.3-codex, ...) but
+    not every "-codex" variant. When an exact id is missing we strip a trailing
+    "-codex" segment so e.g. gpt-5.5-codex falls back to gpt-5.5. Returns None if
+    no normalization applies (i.e. the name has no "-codex" suffix to strip).
+    """
+    name = model.lower().strip()
+    if name.endswith("-codex"):
+        return name[: -len("-codex")]
+    return None
+
+
 def _openrouter_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
-    return _pricing_entry_from_metadata(
-        fetch_model_metadata(),
+    metadata = fetch_model_metadata()
+    entry = _pricing_entry_from_metadata(
+        metadata,
         route.model,
         source_url="https://openrouter.ai/docs/api/api-reference/models/get-models",
         pricing_version="openrouter-models-api",
     )
+    if entry is not None:
+        return entry
+    # Fallback: a "-codex" variant absent from the catalog → price the base model.
+    fallback = _normalize_codex_model_name(route.model)
+    if fallback:
+        return _pricing_entry_from_metadata(
+            metadata,
+            fallback,
+            source_url="https://openrouter.ai/docs/api/api-reference/models/get-models",
+            pricing_version="openrouter-models-api",
+        )
+    return None
 
 
 def _pricing_entry_from_metadata(

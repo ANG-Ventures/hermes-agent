@@ -106,7 +106,7 @@ _model_metadata_cache: Dict[str, Dict[str, Any]] = {}
 _model_metadata_cache_time: float = 0
 _novita_metadata_cache: Dict[str, Dict[str, Any]] = {}
 _novita_metadata_cache_time: float = 0
-_MODEL_CACHE_TTL = 3600
+_MODEL_CACHE_TTL = 21600  # 6h — model pricing/context rarely change; long cache keeps notional cost cheap & resilient to OpenRouter blips
 _endpoint_model_metadata_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
 _endpoint_model_metadata_cache_time: Dict[str, float] = {}
 _ENDPOINT_MODEL_CACHE_TTL = 300
@@ -615,7 +615,7 @@ def _add_model_aliases(cache: Dict[str, Dict[str, Any]], model_id: str, entry: D
 
 
 def fetch_model_metadata(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
-    """Fetch model metadata from OpenRouter (cached for 1 hour)."""
+    """Fetch model metadata from OpenRouter (cached for _MODEL_CACHE_TTL seconds)."""
     global _model_metadata_cache, _model_metadata_cache_time
 
     if not force_refresh and _model_metadata_cache and (time.time() - _model_metadata_cache_time) < _MODEL_CACHE_TTL:
