@@ -2627,3 +2627,178 @@ class TestSendMediaTimeoutCancelsFuture:
         # 2. Second file still got dispatched — one timeout doesn't abort the batch
         adapter.send_video.assert_called_once()
         assert adapter.send_video.call_args[1]["video_path"] == str(fast.resolve())
+
+
+class TestFilterFallbackChainForPinnedJob:
+    """A cron job that pins a provider must never silently fall back to a
+    different provider (the recurring codex→opus 'Model fallback detected' alert).
+    """
+
+    def setup_method(self):
+        # Ensure the revert override is OFF for the default-behavior tests.
+        os.environ.pop("HERMES_CRON_ALLOW_CROSS_PROVIDER_FALLBACK", None)
+
+    def teardown_method(self):
+        os.environ.pop("HERMES_CRON_ALLOW_CROSS_PROVIDER_FALLBACK", None)
+
+    @property
+    def _fn(self):
+        from cron.scheduler import _filter_fallback_chain_for_pinned_job
+        return _filter_fallback_chain_for_pinned_job
+
+    # The exact production config.yaml chain that caused the morning-digest alert.
+    GLOBAL_CHAIN = [
+        {"provider": "claude-api-proxy-f1", "model": "claude-opus-4-8"},
+        {"provider": "openai-codex", "model": "gpt-5.5"},
+    ]
+
+    def test_codex_pinned_job_strips_opus_fallback(self):
+        """morning-digest pins openai-codex → the Opus fallback entry is removed."""
+        job = {"id": "7a94d27271af", "provider": "openai-codex", "model": "gpt-5.5"}
+        out = self._fn(job, list(self.GLOBAL_CHAIN), job["id"])
+        assert out == [{"provider": "openai-codex", "model": "gpt-5.5"}]
+        # Crucially, no Opus entry survives.
+        assert all("opus" not in (e.get("model") or "").lower() for e in out)
+        assert all(e["provider"] == "openai-codex" for e in out)
+
+    def test_codex_pinned_with_only_opus_fallback_yields_no_chain(self):
+        """If the only fallback is a different provider, the job gets an EMPTY
+        chain (None) → it runs on codex or fails loudly, never silently on opus."""
+        job = {"id": "j1", "provider": "openai-codex", "model": "gpt-5.5"}
+        chain = [{"provider": "claude-api-proxy-f1", "model": "claude-opus-4-8"}]
+        out = self._fn(job, chain, job["id"])
+        assert out is None
+
+    def test_unpinned_job_keeps_full_chain(self):
+        """A job with no pinned provider keeps the global fallback chain intact."""
+        job = {"id": "j2", "provider": None, "model": None}
+        out = self._fn(job, list(self.GLOBAL_CHAIN), job["id"])
+        assert out == self.GLOBAL_CHAIN
+
+    def test_override_env_restores_permissive_behavior(self):
+        """The documented revert switch restores the old cross-provider chain."""
+        os.environ["HERMES_CRON_ALLOW_CROSS_PROVIDER_FALLBACK"] = "1"
+        job = {"id": "j3", "provider": "openai-codex", "model": "gpt-5.5"}
+        out = self._fn(job, list(self.GLOBAL_CHAIN), job["id"])
+        assert out == self.GLOBAL_CHAIN  # unfiltered
+
+    def test_single_dict_fallback_matching_provider_kept(self):
+        job = {"id": "j4", "provider": "openai-codex", "model": "gpt-5.5"}
+        out = self._fn(job, {"provider": "openai-codex", "model": "gpt-5.5"}, job["id"])
+        assert out == [{"provider": "openai-codex", "model": "gpt-5.5"}]
+
+    def test_single_dict_fallback_other_provider_dropped(self):
+        job = {"id": "j5", "provider": "openai-codex", "model": "gpt-5.5"}
+        out = self._fn(job, {"provider": "claude-api-proxy-f1", "model": "claude-opus-4-8"}, job["id"])
+        assert out is None
+
+    def test_empty_chain_passthrough(self):
+        job = {"id": "j6", "provider": "openai-codex"}
+        assert self._fn(job, None, job["id"]) is None
+        assert self._fn(job, [], job["id"]) == []
+
+    def test_provider_match_is_case_insensitive(self):
+        job = {"id": "j7", "provider": "OpenAI-Codex"}
+        chain = [{"provider": "openai-codex", "model": "gpt-5.5"}]
+        out = self._fn(job, chain, job["id"])
+        assert out == [{"provider": "openai-codex", "model": "gpt-5.5"}]
+
+    def test_logs_warning_when_dropping(self, caplog):
+        job = {"id": "logjob", "provider": "openai-codex", "model": "gpt-5.5"}
+        with caplog.at_level(logging.WARNING):
+            self._fn(job, list(self.GLOBAL_CHAIN), job["id"])
+        assert any("dropped" in r.message and "logjob" in r.message for r in caplog.records)
+
+
+class TestRunJobE2EFallbackProviderPinning:
+    """End-to-end: drive the real run_job() with the production config.yaml
+    fallback chain and the real morning-digest job dict, and assert on the
+    fallback_model chain that actually reaches AIAgent.
+
+    This is the regression guard for the recurring 'Model fallback detected'
+    (codex→opus) alert. A module-level unit test on the helper is necessary but
+    NOT sufficient — this exercises the full scheduler path the bug lived in.
+    """
+
+    # The exact production config.yaml chain (opus first, codex second).
+    PROD_FALLBACK = [
+        {"provider": "claude-api-proxy-f1", "model": "claude-opus-4-8"},
+        {"provider": "openai-codex", "model": "gpt-5.5"},
+    ]
+
+    def _write_config(self, tmp_path):
+        import yaml as _yaml
+        cfg = {
+            "model": {"default": "claude-api-proxy/claude-opus-4-8", "provider": "claude-api-proxy"},
+            "fallback_model": self.PROD_FALLBACK,
+        }
+        (tmp_path / "config.yaml").write_text(_yaml.safe_dump(cfg))
+
+    def _run(self, tmp_path, job, runtime_provider):
+        self._write_config(tmp_path)
+        fake_db = MagicMock()
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": runtime_provider,
+                     "api_mode": "codex_responses" if runtime_provider == "openai-codex" else "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, output, final_response, error = run_job(job)
+        assert success is True, error
+        return mock_agent_cls.call_args.kwargs
+
+    def test_codex_pinned_morning_digest_never_gets_opus_fallback(self, tmp_path):
+        """The real morning-digest job shape → AIAgent receives a fallback chain
+        with ZERO opus entries; codex is the only survivor."""
+        job = {
+            "id": "7a94d27271af",
+            "name": "morning-digest",
+            "prompt": "hello",
+            "model": "gpt-5.5",
+            "provider": "openai-codex",
+        }
+        kwargs = self._run(tmp_path, job, runtime_provider="openai-codex")
+        fb = kwargs["fallback_model"]
+        # The model handed to AIAgent is the codex pin.
+        assert kwargs["model"] == "gpt-5.5"
+        assert kwargs["provider"] == "openai-codex"
+        # Whatever the chain is, it can NEVER contain a non-codex provider.
+        chain = fb if isinstance(fb, list) else ([fb] if fb else [])
+        assert all(
+            str(e.get("provider")).lower() == "openai-codex"
+            for e in chain
+        ), f"codex-pinned job must not have cross-provider fallback, got {fb!r}"
+        assert all(
+            "opus" not in str(e.get("model")).lower()
+            for e in chain
+        ), f"codex-pinned job must never fall back to opus, got {fb!r}"
+
+    def test_unpinned_job_keeps_full_global_chain(self, tmp_path):
+        """A job with no provider pin still receives the full global chain."""
+        job = {"id": "freejob", "name": "free", "prompt": "hello"}
+        kwargs = self._run(tmp_path, job, runtime_provider="openrouter")
+        assert kwargs["fallback_model"] == self.PROD_FALLBACK
+
+    def test_revert_env_restores_cross_provider_fallback(self, tmp_path, monkeypatch):
+        """The documented revert switch brings the opus fallback back."""
+        monkeypatch.setenv("HERMES_CRON_ALLOW_CROSS_PROVIDER_FALLBACK", "1")
+        job = {
+            "id": "7a94d27271af",
+            "name": "morning-digest",
+            "prompt": "hello",
+            "model": "gpt-5.5",
+            "provider": "openai-codex",
+        }
+        kwargs = self._run(tmp_path, job, runtime_provider="openai-codex")
+        assert kwargs["fallback_model"] == self.PROD_FALLBACK

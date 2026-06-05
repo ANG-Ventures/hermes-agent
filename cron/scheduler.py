@@ -110,6 +110,53 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
         )
         return None
 
+def _filter_fallback_chain_for_pinned_job(
+    job: dict, fallback_model, job_id: str
+):
+    """Restrict a cron job's fallback chain to its pinned provider.
+
+    Root cause of the recurring "Model fallback detected" alerts (morning-digest
+    et al.): a cron job pins ``provider=openai-codex`` and STARTS on Codex
+    correctly, but the GLOBAL ``config.yaml`` fallback chain — whose first entry
+    is Opus — gets handed to every job. When Codex hiccups mid-run (rate-limit,
+    empty-TTFB watchdog) the agent walks that chain and silently finishes the
+    "codex-only" job on Opus.
+
+    Fix: if a job pins a provider, drop every fallback entry whose provider
+    doesn't match. A Codex-pinned job then either runs on Codex or FAILS LOUDLY
+    (→ the job error surfaces as an alert) — it can never silently become Opus.
+
+    Jobs that don't pin a provider are unchanged (full global chain preserved).
+    Honoured by both the init-time fallback (agent_init) and the mid-run
+    fallback chain, since both consume this same list.
+
+    Override: set ``HERMES_CRON_ALLOW_CROSS_PROVIDER_FALLBACK=1`` to restore the
+    old permissive behavior (revert switch Ace asked for).
+    """
+    if os.getenv("HERMES_CRON_ALLOW_CROSS_PROVIDER_FALLBACK", "").strip() in ("1", "true", "yes"):
+        return fallback_model
+
+    pinned = str(job.get("provider") or "").strip().lower()
+    if not pinned or not fallback_model:
+        return fallback_model
+
+    chain = fallback_model if isinstance(fallback_model, list) else [fallback_model]
+    filtered = [
+        f for f in chain
+        if isinstance(f, dict)
+        and str(f.get("provider") or "").strip().lower() == pinned
+    ]
+    dropped = len(chain) - len(filtered)
+    if dropped:
+        logger.warning(
+            "Job '%s': pinned provider '%s' — dropped %d cross-provider fallback "
+            "entr%s to prevent silent off-provider fallback (e.g. codex→opus). "
+            "Set HERMES_CRON_ALLOW_CROSS_PROVIDER_FALLBACK=1 to revert.",
+            job_id, pinned, dropped, "y" if dropped == 1 else "ies",
+        )
+    return filtered or None
+
+
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
@@ -1625,6 +1672,11 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             raise RuntimeError(message) from exc
 
         fallback_model = _cfg.get("fallback_providers") or _cfg.get("fallback_model") or None
+        # Hard rule: a cron job that PINS a provider must never silently fall back
+        # to a different provider (the recurring codex→opus alert). Strip any
+        # cross-provider fallback entries so a pinned job runs on its provider or
+        # fails loudly. Revert with HERMES_CRON_ALLOW_CROSS_PROVIDER_FALLBACK=1.
+        fallback_model = _filter_fallback_chain_for_pinned_job(job, fallback_model, job_id)
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
         if runtime_provider:
