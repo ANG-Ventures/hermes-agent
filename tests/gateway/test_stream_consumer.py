@@ -9,6 +9,24 @@ import pytest
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 
 
+async def _wait_for(predicate, timeout: float = 5.0, interval: float = 0.005):
+    """Poll ``predicate`` until truthy or ``timeout`` elapses.
+
+    Replaces fixed ``asyncio.sleep`` pacing in streaming tests. A blind
+    sleep assumes the consumer's async edit-loop runs within a fixed wall
+    window; under a loaded CI runner the loop can slip, coalescing what
+    should be two sends into one (``assert 1 == 2`` flakes). Waiting on the
+    actual condition makes the test deterministic regardless of host load.
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(interval)
+    return predicate()
+
+
 # ── _clean_for_display unit tests ────────────────────────────────────────
 
 
@@ -524,9 +542,17 @@ class TestSegmentBreakOnToolBoundary:
 
         consumer.on_delta("Hello")
         task = asyncio.create_task(consumer.run())
-        await asyncio.sleep(0.08)
+        # Wait for the first message to actually be sent (mid-stream edit
+        # fails → initial content is delivered via send) before pushing more
+        # text, instead of assuming a fixed wall-clock window.
+        await _wait_for(lambda: adapter.send.call_count >= 1)
         consumer.on_delta(" world")
-        await asyncio.sleep(0.08)
+        # After the tail arrives the loop must attempt (and fail) two edits
+        # before the undelivered-tail state is established; finish() then
+        # flushes that tail as the second send. Waiting on the edit count is
+        # deterministic, unlike a fixed sleep that a loaded runner can slip
+        # past — which coalesced the two sends into one (assert 1 == 2).
+        await _wait_for(lambda: adapter.edit_message.call_count >= 2)
         consumer.finish()
         await task
 
