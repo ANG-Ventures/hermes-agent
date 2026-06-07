@@ -18,7 +18,7 @@ def fake_job():
 def _patch_pipeline(monkeypatch, *, success=True, final_response="done", output="full-doc",
                     error=None, job=None):
     """Patch the scheduler's execute/save/deliver/mark seams and record calls."""
-    calls = {"run_job": 0, "save": 0, "deliver": [], "mark": []}
+    calls = {"run_job": 0, "save": 0, "deliver": [], "deliver_success": [], "mark": []}
 
     def fake_run_job(j):
         calls["run_job"] += 1
@@ -28,8 +28,9 @@ def _patch_pipeline(monkeypatch, *, success=True, final_response="done", output=
         calls["save"] += 1
         return f"/tmp/{job_id}.md"
 
-    def fake_deliver(j, content, adapters=None, loop=None):
+    def fake_deliver(j, content, success=True, adapters=None, loop=None):
         calls["deliver"].append(content)
+        calls["deliver_success"].append(success)
         return None  # no delivery error
 
     def fake_mark(job_id, ok, err, delivery_error=None):
@@ -63,9 +64,11 @@ class TestRunJobNow:
         result = scheduler.run_job_now("abc123", verbose=False)
         assert result["success"] is False
         assert result["error"] == "boom"
-        # failed jobs still deliver a ⚠️ alert
+        # failed jobs still deliver; the delivery wrapper gets the raw error plus
+        # success=False so it can own the ⚠️ failure framing.
         assert calls["deliver"], "failure should still deliver an alert"
-        assert "failed" in calls["deliver"][0].lower()
+        assert calls["deliver"] == ["boom"]
+        assert calls["deliver_success"] == [False]
         assert calls["mark"][0][1] is False
 
     def test_unknown_job_id_returns_error_without_running(self, monkeypatch):

@@ -751,7 +751,7 @@ def _send_media_via_adapter(
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(job: dict, content: str, success: bool = True, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -759,6 +759,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     use the live adapter first — this supports E2EE rooms (e.g. Matrix) where
     the standalone HTTP path cannot encrypt.  Falls back to standalone send if
     the adapter path fails or is unavailable.
+
+    ``success`` selects the framing of the wrapped delivery (clean ✅ header for
+    successful runs, ⚠️ failure header carrying the error as the body).
 
     Returns None on success, or an error string on failure.
     """
@@ -786,13 +789,28 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     if wrap_response:
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+        manage_hint = (
+            f'To stop or manage this job, send me a new message '
+            f'(e.g. "stop reminder {task_name}").'
         )
+        if success:
+            delivery_content = (
+                f"✅ Cronjob Response: {task_name}\n"
+                f"(job_id: {job_id})\n"
+                f"-------------\n\n"
+                f"{content}\n\n"
+                f"{manage_hint}"
+            )
+        else:
+            # Failure framing: a single ⚠️ header carrying the error as the body,
+            # instead of nesting a "Cron job failed" line inside the success header.
+            delivery_content = (
+                f"⚠️ Cronjob Failed: {task_name}\n"
+                f"(job_id: {job_id})\n"
+                f"-------------\n\n"
+                f"{content}\n\n"
+                f"{manage_hint}"
+            )
     else:
         delivery_content = content
 
@@ -2080,7 +2098,10 @@ def _process_one_job(job: dict, *, verbose: bool = True, adapters=None, loop=Non
         # Deliver the final response to the origin/target chat.
         # If the agent responded with [SILENT], skip delivery (but
         # output is already saved above).  Failed jobs always deliver.
-        deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+        # On failure, hand the raw error to _deliver_result and let the wrapper
+        # own the status framing (avoids the old double-wrap: a "Cron job failed"
+        # body nested inside a separate "Cronjob Response" header).
+        deliver_content = final_response if success else (error or "unknown error")
         # Treat whitespace-only final responses the same as empty
         # responses: do not deliver a blank message, and let the
         # empty-response guard below mark the run as a soft failure.
@@ -2092,7 +2113,7 @@ def _process_one_job(job: dict, *, verbose: bool = True, adapters=None, loop=Non
         delivery_error = None
         if should_deliver:
             try:
-                delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                delivery_error = _deliver_result(job, deliver_content, success=success, adapters=adapters, loop=loop)
             except Exception as de:
                 delivery_error = str(de)
                 logger.error("Delivery failed for job %s: %s", job["id"], de)
