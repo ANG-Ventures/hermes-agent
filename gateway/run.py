@@ -8395,9 +8395,32 @@ class GatewayRunner:
                 plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
                 if plugin_handler:
                     user_args = event.get_command_args().strip()
-                    result = plugin_handler(user_args)
-                    if asyncio.iscoroutine(result):
-                        result = await result
+                    # Bind the originating channel into session contextvars for
+                    # the duration of the handler. Plugin commands run BEFORE the
+                    # agent-run path that normally calls _set_session_env (further
+                    # down), so without this a handler that resolves "the current
+                    # turn" (e.g. /context reading per-channel telemetry) has no
+                    # way to know which channel it was invoked from and falls back
+                    # to a global most-recent lookup — leaking another channel's
+                    # numbers. Best-effort: never let context binding break dispatch.
+                    from gateway.session_context import (
+                        set_session_vars,
+                        clear_session_vars,
+                    )
+                    _plugin_ctx_tokens = set_session_vars(
+                        platform=source.platform.value if source.platform else "",
+                        chat_id=str(source.chat_id or ""),
+                        chat_name=str(source.chat_name or ""),
+                        thread_id=str(source.thread_id) if source.thread_id else "",
+                        user_id=str(source.user_id) if source.user_id else "",
+                        user_name=str(source.user_name) if source.user_name else "",
+                    )
+                    try:
+                        result = plugin_handler(user_args)
+                        if asyncio.iscoroutine(result):
+                            result = await result
+                    finally:
+                        clear_session_vars(_plugin_ctx_tokens)
                     return str(result) if result else None
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)
