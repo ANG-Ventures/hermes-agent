@@ -161,6 +161,40 @@ def _on_post_tool_call(
         return
 
 
+def _comp_get(usage: dict[str, Any], key: str) -> int | None:
+    """Read one bucket from the final-call request composition (or None).
+
+    ``usage["last_composition"]`` is the char/4 fixed-vs-non-fixed breakdown of
+    the last API call (see agent.model_metadata.compose_request_breakdown).
+    Returns None when composition is absent (old turns / capture failed) so the
+    column stays NULL and renderers fall back instead of showing a fake 0.
+    """
+    comp = usage.get("last_composition")
+    if not isinstance(comp, dict):
+        return None
+    val = comp.get(key)
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _comp_calls_json(usage: dict[str, Any]) -> str | None:
+    """Serialize per-call composition history to a compact JSON blob (or None)."""
+    calls = usage.get("composition_calls")
+    if not calls:
+        return None
+    try:
+        cleaned = [c for c in calls if isinstance(c, dict)]
+        if not cleaned:
+            return None
+        return json.dumps(cleaned, separators=(",", ":"))
+    except Exception:
+        return None
+
+
 def _build_record(
     *,
     session_id: str,
@@ -232,6 +266,13 @@ def _build_record(
         last_cache_read_tokens=_int_or_none_value(usage.get("last_cache_read_tokens")),
         last_cache_write_tokens=_int_or_none_value(usage.get("last_cache_write_tokens")),
         last_uncached_tokens=_int_or_none_value(usage.get("last_uncached_tokens")),
+        comp_sys_tokens=_comp_get(usage, "sys_tokens"),
+        comp_tool_schema_tokens=_comp_get(usage, "tool_schema_tokens"),
+        comp_history_tokens=_comp_get(usage, "history_tokens"),
+        comp_tool_result_tokens=_comp_get(usage, "tool_result_tokens"),
+        comp_tool_arg_tokens=_comp_get(usage, "tool_arg_tokens"),
+        comp_tool_result_count=_comp_get(usage, "tool_result_count"),
+        comp_calls_json=_comp_calls_json(usage),
         cost_usd=cost_usd,
         cost_status=cost_status,
         interrupted=bool(interrupted),

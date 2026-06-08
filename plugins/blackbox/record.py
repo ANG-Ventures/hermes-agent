@@ -41,6 +41,18 @@ class TurnRecord:
     last_cache_read_tokens: Optional[int] = None
     last_cache_write_tokens: Optional[int] = None
     last_uncached_tokens: Optional[int] = None
+    # Request composition of the FINAL call (char/4 fixed vs non-fixed buckets).
+    # Distinct from the cache split above: this decomposes the request PAYLOAD
+    # by source (system / tool schemas / history / tool results / tool args),
+    # not by cache state. Nullable: old rows / blackbox-pre-composition → None.
+    comp_sys_tokens: Optional[int] = None
+    comp_tool_schema_tokens: Optional[int] = None
+    comp_history_tokens: Optional[int] = None
+    comp_tool_result_tokens: Optional[int] = None
+    comp_tool_arg_tokens: Optional[int] = None
+    comp_tool_result_count: Optional[int] = None
+    # Per-call composition history JSON (list of breakdown dicts) for forensics.
+    comp_calls_json: Optional[str] = None
     cost_usd: Optional[float] = None
     cost_status: str = "unknown"                   # estimated|included|unknown|partial
     interrupted: bool = False

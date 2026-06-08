@@ -45,6 +45,7 @@ from agent.message_sanitization import (
 )
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
+    compose_request_breakdown,
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
     get_context_length_from_provider_error,
@@ -1094,6 +1095,19 @@ def run_conversation(
         approx_request_tokens = estimate_request_tokens_rough(
             api_messages, tools=agent.tools or None
         )
+        # Real per-call request composition (char/4 over the EXACT payload being
+        # sent this call): fixed (system+tool schemas) vs non-fixed (history,
+        # tool results, tool-call args). Captured here, attached to the per-call
+        # _turn_calls entry below; the FINAL call's composition becomes the
+        # turn's recorded breakdown. Telemetry must never break the loop.
+        try:
+            _call_composition = compose_request_breakdown(
+                api_messages,
+                system_prompt=effective_system or "",
+                tools=agent.tools or None,
+            )
+        except Exception:
+            _call_composition = None
 
         _runtime_context_error = _ollama_context_limit_error(
             agent, approx_request_tokens
@@ -1936,6 +1950,7 @@ def run_conversation(
                         "output_tokens": canonical_usage.output_tokens,
                         "cache_read_tokens": canonical_usage.cache_read_tokens,
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
+                        "last_composition": _call_composition,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
@@ -1961,6 +1976,7 @@ def run_conversation(
                             "completion_tokens": completion_tokens,
                             "total_tokens": total_tokens,
                             "latency_s": api_duration,
+                            "composition": _call_composition,
                         })
                     except Exception:
                         pass  # telemetry must never break the conversation loop
@@ -4940,6 +4956,14 @@ def run_conversation(
                 _last_cache_read = int(_last_call.get("cache_read_tokens", 0) or 0)
                 _last_cache_write = int(_last_call.get("cache_write_tokens", 0) or 0)
                 _last_uncached = int(_last_call.get("input_tokens", 0) or 0)
+                # Request composition of the FINAL call — the char/4 fixed vs
+                # non-fixed breakdown of the exact payload that produced the
+                # window occupancy (context_used). This is the authoritative
+                # "what was in the last request" record /context + /usage read.
+                _last_composition = _last_call.get("composition") or None
+                # Per-call composition history (small ints, ~60B/call) so
+                # /cost <turn_id> can show how the request grew call-by-call.
+                _comp_calls = [c.get("composition") for c in _turn_calls]
                 _turn_usage = {
                     "api_calls": len(_turn_calls),
                     "input_tokens": sum(c["input_tokens"] for c in _turn_calls),
@@ -4960,6 +4984,10 @@ def run_conversation(
                     "last_cache_read_tokens": _last_cache_read,
                     "last_cache_write_tokens": _last_cache_write,
                     "last_uncached_tokens": _last_uncached,
+                    # Real request composition (fixed vs non-fixed, char/4) of
+                    # the final call + per-call history. See compose_request_breakdown.
+                    "last_composition": _last_composition,
+                    "composition_calls": _comp_calls,
                     # Subagent attribution (set by delegate_tool before run; absent at top level).
                     "parent_turn_id": getattr(agent, "_blackbox_parent_turn_id", None),
                     "parent_platform": getattr(agent, "_blackbox_parent_platform", None),

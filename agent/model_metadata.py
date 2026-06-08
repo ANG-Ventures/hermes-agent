@@ -1906,3 +1906,88 @@ def estimate_request_tokens_rough(
     if tools:
         total += (len(str(tools)) + 3) // 4
     return total
+
+
+def compose_request_breakdown(
+    messages: List[Dict[str, Any]],
+    *,
+    system_prompt: str = "",
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, int]:
+    """Decompose an outgoing request into fixed vs non-fixed token buckets.
+
+    Single source of truth for "what did this request actually contain" --
+    measured at the call site over the EXACT payload being sent (final
+    api_messages + effective_system + agent.tools), so the buckets describe
+    reality, not a re-derived proxy over the stored transcript.
+
+    Buckets (all char/4 estimates, the same method used everywhere):
+      Fixed (stable cacheable prefix):
+        sys_tokens, tool_schema_tokens
+      Non-fixed (grows with the conversation):
+        history_tokens, tool_result_tokens, tool_arg_tokens
+
+    Image parts count at the flat per-image cost (matching
+    estimate_messages_tokens_rough). The system message inside messages is
+    skipped (accounted via system_prompt) to avoid double-counting the prefix.
+
+    total == fixed + nonfixed exactly (no scaling). Distinct from the
+    provider's prompt_tokens (true tokenizer count); surfaces show both.
+    """
+    IMG_COST = 1500
+    sys_chars = len(system_prompt or "")
+    tool_schema_chars = len(str(tools)) if tools else 0
+    history_chars = 0
+    tool_result_chars = 0
+    tool_arg_chars = 0
+    image_tokens = 0
+    tool_result_count = 0
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            history_chars += len(str(msg))
+            continue
+        role = msg.get("role")
+        if role == "system":
+            continue
+        image_tokens += _count_image_tokens(msg, IMG_COST)
+        if role == "tool":
+            tool_result_count += 1
+            tool_result_chars += _estimate_message_chars(msg)
+        else:
+            # History = visible text content only. tool_calls JSON is counted
+            # separately in tool_arg_chars below; counting the whole message
+            # dict here would double-count the args (it serializes tool_calls).
+            tcs = msg.get("tool_calls")
+            if tcs:
+                stripped = {k: v for k, v in msg.items() if k != "tool_calls"}
+                history_chars += _estimate_message_chars(stripped)
+                try:
+                    tool_arg_chars += len(
+                        tcs if isinstance(tcs, str) else json.dumps(tcs)
+                    )
+                except Exception:
+                    tool_arg_chars += len(str(tcs))
+            else:
+                history_chars += _estimate_message_chars(msg)
+
+    def _t(chars: int) -> int:
+        return (chars + 3) // 4 if chars > 0 else 0
+
+    sys_tokens = _t(sys_chars)
+    tool_schema_tokens = _t(tool_schema_chars)
+    history_tokens = _t(history_chars) + image_tokens
+    tool_result_tokens = _t(tool_result_chars)
+    tool_arg_tokens = _t(tool_arg_chars)
+    fixed_tokens = sys_tokens + tool_schema_tokens
+    nonfixed_tokens = history_tokens + tool_result_tokens + tool_arg_tokens
+    return {
+        "sys_tokens": sys_tokens,
+        "tool_schema_tokens": tool_schema_tokens,
+        "history_tokens": history_tokens,
+        "tool_result_tokens": tool_result_tokens,
+        "tool_arg_tokens": tool_arg_tokens,
+        "tool_result_count": tool_result_count,
+        "fixed_tokens": fixed_tokens,
+        "nonfixed_tokens": nonfixed_tokens,
+        "total_tokens": fixed_tokens + nonfixed_tokens,
+    }
