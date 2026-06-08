@@ -13149,6 +13149,35 @@ class GatewayRunner:
                 example = t("gateway.footer.example_line", preview=preview)
         return t("gateway.footer.saved", state=state, example=example)
 
+    def _resolve_fixed_overhead(self, session_key: str):
+        """Return (system_prompt_str, tools_list) for the session's NEXT request.
+
+        The /compress after-line needs the REAL fixed overhead (system prompt +
+        full tool schemas) that the next live request will carry — not the
+        memory-only temp agent's empty prompt. Source of truth: the resident /
+        cached agent that ran this session (its _cached_system_prompt + tools
+        are exactly what gets re-sent). Returns ("", None) when no agent is
+        resident (post-restart / evicted); the caller then falls back to the
+        chat-only estimate. Best-effort, never raises.
+        """
+        try:
+            agent = self._running_agents.get(session_key)
+            if not agent or agent is _AGENT_PENDING_SENTINEL:
+                _cl = getattr(self, "_agent_cache_lock", None)
+                _c = getattr(self, "_agent_cache", None)
+                if _cl is not None and _c is not None:
+                    with _cl:
+                        cached = _c.get(session_key)
+                        if cached:
+                            agent = cached[0]
+            if not agent or agent is _AGENT_PENDING_SENTINEL:
+                return "", None
+            sys_p = getattr(agent, "_cached_system_prompt", "") or ""
+            tools = getattr(agent, "tools", None) or None
+            return sys_p, tools
+        except Exception:
+            return "", None
+
     async def _handle_compress_command(self, event: MessageEvent) -> str:
         """Handle /compress command -- manually compress conversation context.
 
@@ -13289,11 +13318,31 @@ class GatewayRunner:
                 self.session_store.update_session(
                     session_entry.session_key, last_prompt_tokens=0
                 )
-                # After-compression estimates, same two bases as before.
+                # After-compression estimates.
+                #  • chat_after  — user/hermes turns only (headline + Chat size).
+                #  • full_after  — PRE-FLIGHT estimate of the NEXT request: the
+                #    REAL fixed overhead (resident agent's system prompt + full
+                #    tool schemas, resolved below) + the post-compress transcript.
+                #    The old code measured this off the memory-only temp agent,
+                #    whose _cached_system_prompt is empty and tools = [memory] —
+                #    so it under-reported by the entire ~30k fixed overhead
+                #    (e.g. "56,965 -> 3,436"). Now it reflects what's actually
+                #    sent next turn.
                 chat_after_tokens = estimate_messages_tokens_rough(compressed)
-                full_after_tokens = estimate_request_tokens_rough(
-                    compressed, system_prompt=_sys_prompt, tools=_tools
-                )
+                _real_sys, _real_tools = self._resolve_fixed_overhead(session_key)
+                if _real_sys or _real_tools:
+                    full_after_tokens = estimate_request_tokens_rough(
+                        compressed, system_prompt=_real_sys, tools=_real_tools
+                    )
+                    _full_after_has_fixed = True
+                else:
+                    # No resident agent (post-restart / evicted): fall back to
+                    # the transcript-only estimate and flag it so the label is
+                    # honest about the missing fixed overhead.
+                    full_after_tokens = estimate_request_tokens_rough(
+                        compressed, system_prompt=_sys_prompt, tools=_tools
+                    )
+                    _full_after_has_fixed = False
                 # Chat-only before/after drives the headline (message counts)
                 # and the "Chat size" token line.
                 summary = summarize_manual_compression(
@@ -13365,6 +13414,11 @@ class GatewayRunner:
                         after=full_after_tokens,
                     )
                 )
+            # Honesty note: when no resident agent was available to supply the
+            # real fixed overhead, the "after" omits system prompt + tool
+            # schemas (~tens of k tokens). Say so rather than under-report.
+            if not _full_after_has_fixed:
+                lines.append(t("gateway.compress.full_request_no_fixed"))
 
             if summary["note"]:
                 lines.append(summary["note"])
@@ -14258,6 +14312,28 @@ class GatewayRunner:
             if ctx.last_prompt_tokens:
                 pct = min(100, ctx.last_prompt_tokens / ctx.context_length * 100) if ctx.context_length else 0
                 lines.append(t("gateway.usage.label_context", used=f"{ctx.last_prompt_tokens:,}", total=f"{ctx.context_length:,}", pct=f"{pct:.0f}"))
+            # Real last-request composition (char/4 fixed vs non-fixed). Sourced
+            # from the agent's last_turn_usage snapshot captured at the call site
+            # (see agent.model_metadata.compose_request_breakdown). Shown side by
+            # side with the measured occupancy above — the two are independent
+            # (char/4 estimate vs provider tokenizer count), never reconciled.
+            _ltu = getattr(agent, "last_turn_usage", None)
+            _comp = _ltu.get("last_composition") if isinstance(_ltu, dict) else None
+            if isinstance(_comp, dict):
+                _cs = int(_comp.get("sys_tokens", 0) or 0)
+                _ct = int(_comp.get("tool_schema_tokens", 0) or 0)
+                _ch = int(_comp.get("history_tokens", 0) or 0)
+                _cr = int(_comp.get("tool_result_tokens", 0) or 0)
+                _ca = int(_comp.get("tool_arg_tokens", 0) or 0)
+                _fixed = _cs + _ct
+                _nonfixed = _ch + _cr + _ca
+                lines.append(t("gateway.usage.comp_header"))
+                lines.append(t("gateway.usage.comp_fixed",
+                               fixed=f"{_fixed:,}", sys=f"{_cs:,}", tools=f"{_ct:,}"))
+                lines.append(t("gateway.usage.comp_nonfixed",
+                               nonfixed=f"{_nonfixed:,}", hist=f"{_ch:,}",
+                               results=f"{_cr:,}", args=f"{_ca:,}"))
+                lines.append(t("gateway.usage.comp_total", total=f"{_fixed + _nonfixed:,}"))
             if ctx.compression_count:
                 lines.append(t("gateway.usage.label_compressions", count=ctx.compression_count))
 

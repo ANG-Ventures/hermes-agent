@@ -67,6 +67,13 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             last_cache_read INT,
             last_cache_write INT,
             last_uncached INT,
+            comp_sys_tokens INT,
+            comp_tool_schema_tokens INT,
+            comp_history_tokens INT,
+            comp_tool_result_tokens INT,
+            comp_tool_arg_tokens INT,
+            comp_tool_result_count INT,
+            comp_calls_json TEXT,
             cost_usd REAL,
             cost_status TEXT,
             interrupted INT,
@@ -114,6 +121,23 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 conn.execute(f"ALTER TABLE turns ADD COLUMN {_col} INT")
             except sqlite3.OperationalError:
                 pass  # raced with another writer; column now exists
+    # Request-composition columns (fixed vs non-fixed breakdown of the final
+    # call). Same guarded additive pattern. INT for the token buckets, TEXT for
+    # the per-call composition JSON blob.
+    for _col in (
+        "comp_sys_tokens", "comp_tool_schema_tokens", "comp_history_tokens",
+        "comp_tool_result_tokens", "comp_tool_arg_tokens", "comp_tool_result_count",
+    ):
+        if _col not in _existing:
+            try:
+                conn.execute(f"ALTER TABLE turns ADD COLUMN {_col} INT")
+            except sqlite3.OperationalError:
+                pass
+    if "comp_calls_json" not in _existing:
+        try:
+            conn.execute("ALTER TABLE turns ADD COLUMN comp_calls_json TEXT")
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
 
 
@@ -184,9 +208,12 @@ def insert_turn(record: TurnRecord) -> None:
                     api_calls, tools, input_tokens, output_tokens, cache_read,
                     cache_write, reasoning, context_used, context_length,
                     last_cache_read, last_cache_write, last_uncached,
+                    comp_sys_tokens, comp_tool_schema_tokens, comp_history_tokens,
+                    comp_tool_result_tokens, comp_tool_arg_tokens, comp_tool_result_count,
+                    comp_calls_json,
                     cost_usd, cost_status, interrupted, alerted, user_text,
                     final_text
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.turn_id,
@@ -212,6 +239,13 @@ def insert_turn(record: TurnRecord) -> None:
                     _int_or_none(record.last_cache_read_tokens),
                     _int_or_none(record.last_cache_write_tokens),
                     _int_or_none(record.last_uncached_tokens),
+                    _int_or_none(record.comp_sys_tokens),
+                    _int_or_none(record.comp_tool_schema_tokens),
+                    _int_or_none(record.comp_history_tokens),
+                    _int_or_none(record.comp_tool_result_tokens),
+                    _int_or_none(record.comp_tool_arg_tokens),
+                    _int_or_none(record.comp_tool_result_count),
+                    record.comp_calls_json,
                     _cost_float(record.cost_usd),
                     record.cost_status or "unknown",
                     _bool_int(record.interrupted),

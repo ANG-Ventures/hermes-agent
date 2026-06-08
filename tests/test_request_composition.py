@@ -1,0 +1,173 @@
+"""Tests for request-composition telemetry (fixed vs non-fixed token buckets).
+
+Covers:
+  * compose_request_breakdown — bucket sum invariant, system-message skip,
+    tool-result/arg accounting, image flat-cost, empty input.
+  * blackbox store — comp_* column migration idempotency + round-trip,
+    comp_calls_json blob persistence, NULL fallback for old rows.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+
+import pytest
+
+from agent.model_metadata import compose_request_breakdown
+
+
+# --------------------------------------------------------------------------- #
+# compose_request_breakdown
+# --------------------------------------------------------------------------- #
+def test_buckets_sum_exactly_to_total():
+    msgs = [
+        {"role": "user", "content": "U" * 4000},
+        {"role": "assistant", "content": "A" * 2000,
+         "tool_calls": [{"id": "1", "function": {"name": "t", "arguments": "x" * 800}}]},
+        {"role": "tool", "content": "T" * 20000, "tool_call_id": "1"},
+    ]
+    comp = compose_request_breakdown(
+        msgs, system_prompt="S" * 48000, tools=[{"function": {"name": "f"}}] * 10
+    )
+    # No scaling: fixed + nonfixed == total, and each subtotal is its parts.
+    assert comp["fixed_tokens"] == comp["sys_tokens"] + comp["tool_schema_tokens"]
+    assert comp["nonfixed_tokens"] == (
+        comp["history_tokens"] + comp["tool_result_tokens"] + comp["tool_arg_tokens"]
+    )
+    assert comp["total_tokens"] == comp["fixed_tokens"] + comp["nonfixed_tokens"]
+    assert comp["tool_result_count"] == 1
+
+
+def test_system_message_in_list_is_not_double_counted():
+    sys_prompt = "S" * 40000
+    base = [{"role": "user", "content": "hello world"}]
+    with_sys = [{"role": "system", "content": sys_prompt}] + base
+    a = compose_request_breakdown(with_sys, system_prompt=sys_prompt)
+    b = compose_request_breakdown(base, system_prompt=sys_prompt)
+    # The system message embedded in messages must NOT inflate history — it's
+    # already accounted via system_prompt.
+    assert a["history_tokens"] == b["history_tokens"]
+    assert a["sys_tokens"] == b["sys_tokens"]
+
+
+def test_tool_args_counted_separately_from_history():
+    no_args = [{"role": "assistant", "content": "x" * 400}]
+    with_args = [{"role": "assistant", "content": "x" * 400,
+                  "tool_calls": [{"id": "1", "function": {"name": "t", "arguments": "y" * 4000}}]}]
+    a = compose_request_breakdown(no_args)
+    b = compose_request_breakdown(with_args)
+    assert a["tool_arg_tokens"] == 0
+    assert b["tool_arg_tokens"] > 0
+    # History (the assistant text) is identical; only tool_arg differs.
+    assert a["history_tokens"] == b["history_tokens"]
+
+
+def test_image_parts_use_flat_cost_not_raw_length():
+    big_b64 = "Q" * 1_000_000  # 1MB base64 would be ~250k tok if counted raw
+    msg = {"role": "user", "content": [
+        {"type": "text", "text": "look"},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{big_b64}"}},
+    ]}
+    comp = compose_request_breakdown([msg])
+    # Image flat cost is 1500; the raw base64 must not blow up history.
+    assert comp["history_tokens"] < 5000
+    assert comp["history_tokens"] >= 1500
+
+
+def test_empty_inputs_are_all_zero():
+    comp = compose_request_breakdown([], system_prompt="", tools=None)
+    assert comp["total_tokens"] == 0
+    assert comp["fixed_tokens"] == 0
+    assert comp["nonfixed_tokens"] == 0
+    assert comp["tool_result_count"] == 0
+
+
+def test_non_dict_messages_do_not_crash():
+    comp = compose_request_breakdown(["raw string", 123, None])  # type: ignore[list-item]
+    assert comp["total_tokens"] >= 0
+
+
+# --------------------------------------------------------------------------- #
+# blackbox store — comp_* persistence
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def bb_store(tmp_path, monkeypatch):
+    from plugins.blackbox import store as st
+
+    db = tmp_path / "turns.db"
+    monkeypatch.setattr(st, "_db_path", lambda: db)
+    return st
+
+
+def _record(**over):
+    from plugins.blackbox.record import TurnRecord
+
+    base: dict = dict(
+        turn_id="turn_test1", ts_start=1.0, ts_end=2.0, platform="discord",
+        chat_id="c1", chat_name="n", api_calls=3,
+        input_tokens=100, output_tokens=10, cache_read_tokens=50,
+        cache_write_tokens=0, context_used=5000, context_length=200000,
+        comp_sys_tokens=1200, comp_tool_schema_tokens=1800,
+        comp_history_tokens=300, comp_tool_result_tokens=1400,
+        comp_tool_arg_tokens=200, comp_tool_result_count=4,
+        comp_calls_json=json.dumps([{"fixed_tokens": 3000}]),
+    )
+    base.update(over)
+    return TurnRecord(**base)  # type: ignore[arg-type]
+
+
+def test_comp_columns_round_trip(bb_store):
+    bb_store.insert_turn(_record())
+    got = bb_store.get_turn("turn_test1")
+    assert got is not None
+    assert got["comp_sys_tokens"] == 1200
+    assert got["comp_tool_schema_tokens"] == 1800
+    assert got["comp_history_tokens"] == 300
+    assert got["comp_tool_result_tokens"] == 1400
+    assert got["comp_tool_arg_tokens"] == 200
+    assert got["comp_tool_result_count"] == 4
+    assert json.loads(got["comp_calls_json"]) == [{"fixed_tokens": 3000}]
+
+
+def test_comp_columns_null_for_absent(bb_store):
+    bb_store.insert_turn(_record(
+        turn_id="turn_null", comp_sys_tokens=None, comp_tool_schema_tokens=None,
+        comp_history_tokens=None, comp_tool_result_tokens=None,
+        comp_tool_arg_tokens=None, comp_tool_result_count=None, comp_calls_json=None,
+    ))
+    got = bb_store.get_turn("turn_null")
+    assert got["comp_sys_tokens"] is None
+    assert got["comp_calls_json"] is None
+
+
+def test_migration_adds_comp_columns_to_legacy_db(bb_store, tmp_path):
+    # Simulate a pre-composition DB: create the turns table WITHOUT comp_* cols,
+    # then let _ensure_schema migrate it.
+    db = bb_store._db_path()
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db))
+    # Legacy schema: real columns the indexes reference, but NO comp_* columns.
+    conn.execute(
+        "CREATE TABLE turns ("
+        "turn_id TEXT PRIMARY KEY, platform TEXT, chat_id TEXT, ts_end REAL, "
+        "cost_usd REAL, context_used INT, last_uncached INT)"
+    )
+    conn.commit()
+    conn.close()
+    # _connect → _ensure_schema runs the guarded ALTERs.
+    with bb_store._connect() as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(turns)").fetchall()}
+    for c in ("comp_sys_tokens", "comp_tool_schema_tokens", "comp_history_tokens",
+              "comp_tool_result_tokens", "comp_tool_arg_tokens",
+              "comp_tool_result_count", "comp_calls_json"):
+        assert c in cols, f"migration missed {c}"
+
+
+def test_migration_idempotent(bb_store):
+    # Connecting twice must not raise "duplicate column".
+    with bb_store._connect() as conn:
+        cols1 = {r[1] for r in conn.execute("PRAGMA table_info(turns)").fetchall()}
+    with bb_store._connect() as conn:
+        cols2 = {r[1] for r in conn.execute("PRAGMA table_info(turns)").fetchall()}
+    assert cols1 == cols2
