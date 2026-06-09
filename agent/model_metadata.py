@@ -1824,16 +1824,35 @@ def get_model_context_length(
     return DEFAULT_FALLBACK_CONTEXT
 
 
+def _ceil_chars_to_tokens(chars: int) -> int:
+    """Ceiling-divide a char count into tokens by COMPOSITION_CHARS_PER_TOKEN.
+
+    Single shared char->token rule for ALL of Hermes' rough estimators
+    (estimate_tokens_rough / estimate_messages_tokens_rough /
+    estimate_request_tokens_rough) AND the /context composition breakdown.
+    Default divisor 3.5 (tunable via HERMES_COMPOSITION_CHARS_PER_TOKEN); see
+    the COMPOSITION_CHARS_PER_TOKEN comment. Ceiling so short texts never round
+    to 0 tokens (which would let many small tool results vanish from an estimate
+    and undercount). char/3.5 estimates HIGHER than the old char/4, so
+    compression / pre-flight 413 checks fire *sooner*, never later -- strictly
+    safer for context-overrun protection.
+    """
+    if chars <= 0:
+        return 0
+    return int(math.ceil(chars / COMPOSITION_CHARS_PER_TOKEN))
+
+
 def estimate_tokens_rough(text: str) -> int:
-    """Rough token estimate (~4 chars/token) for pre-flight checks.
+    """Rough token estimate (~3.5 chars/token) for pre-flight checks.
 
     Uses ceiling division so short texts (1-3 chars) never estimate as
     0 tokens, which would cause the compressor and pre-flight checks to
     systematically undercount when many short tool results are present.
+    Divisor is the shared, tunable COMPOSITION_CHARS_PER_TOKEN (default 3.5).
     """
     if not text:
         return 0
-    return (len(text) + 3) // 4
+    return _ceil_chars_to_tokens(len(text))
 
 
 def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
@@ -1850,7 +1869,7 @@ def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
     for msg in messages:
         total_chars += _estimate_message_chars(msg)
         image_tokens += _count_image_tokens(msg, _IMAGE_TOKEN_COST)
-    return ((total_chars + 3) // 4) + image_tokens
+    return _ceil_chars_to_tokens(total_chars) + image_tokens
 
 
 def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
@@ -1928,11 +1947,11 @@ def estimate_request_tokens_rough(
     """
     total = 0
     if system_prompt:
-        total += (len(system_prompt) + 3) // 4
+        total += _ceil_chars_to_tokens(len(system_prompt))
     if messages:
         total += estimate_messages_tokens_rough(messages)
     if tools:
-        total += (len(str(tools)) + 3) // 4
+        total += _ceil_chars_to_tokens(len(str(tools)))
     return total
 
 
@@ -2000,12 +2019,9 @@ def compose_request_breakdown(
                 history_chars += _estimate_message_chars(msg)
 
     def _t(chars: int) -> int:
-        # Ceiling division by the tunable chars-per-token divisor
-        # (COMPOSITION_CHARS_PER_TOKEN, default 3.5). Ceiling so a handful of
-        # short tool results never round to 0 and vanish from the estimate.
-        if chars <= 0:
-            return 0
-        return int(math.ceil(chars / COMPOSITION_CHARS_PER_TOKEN))
+        # Shared char->token rule (COMPOSITION_CHARS_PER_TOKEN, default 3.5),
+        # ceiling so short tool results never round to 0 and vanish.
+        return _ceil_chars_to_tokens(chars)
 
     sys_tokens = _t(sys_chars)
     tool_schema_tokens = _t(tool_schema_chars)

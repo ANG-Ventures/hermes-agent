@@ -10,6 +10,7 @@ Coverage levels:
   Persistent cache       — save/load, corruption, update, provider isolation
 """
 
+import math
 import time
 
 import yaml
@@ -43,10 +44,11 @@ class TestEstimateTokensRough:
         assert estimate_tokens_rough(None) == 0
 
     def test_known_length(self):
-        assert estimate_tokens_rough("a" * 400) == 100
+        # 400 chars / 3.5 = ceil(114.3) = 115
+        assert estimate_tokens_rough("a" * 400) == 115
 
     def test_short_text(self):
-        # "hello" = 5 chars → ceil(5/4) = 2
+        # "hello" = 5 chars → ceil(5/3.5) = 2
         assert estimate_tokens_rough("hello") == 2
 
     def test_proportional(self):
@@ -55,9 +57,9 @@ class TestEstimateTokensRough:
         assert long > short
 
     def test_unicode_multibyte(self):
-        """Unicode chars are still 1 Python char each — 4 chars/token holds."""
-        text = "你好世界"  # 4 CJK characters
-        assert estimate_tokens_rough(text) == 1
+        """Unicode chars are still 1 Python char each — char/3.5 holds."""
+        text = "你好世界"  # 4 CJK characters → ceil(4/3.5) = 2
+        assert estimate_tokens_rough(text) == 2
 
 
 class TestEstimateMessagesTokensRough:
@@ -65,11 +67,11 @@ class TestEstimateMessagesTokensRough:
         assert estimate_messages_tokens_rough([]) == 0
 
     def test_single_message_concrete_value(self):
-        """Verify against known str(msg) length (ceiling division)."""
+        """Verify against known str(msg) length (ceiling division by 3.5)."""
         msg = {"role": "user", "content": "a" * 400}
         result = estimate_messages_tokens_rough([msg])
         n = len(str(msg))
-        expected = (n + 3) // 4
+        expected = math.ceil(n / 3.5)
         assert result == expected
 
     def test_multiple_messages_additive(self):
@@ -79,7 +81,7 @@ class TestEstimateMessagesTokensRough:
         ]
         result = estimate_messages_tokens_rough(msgs)
         n = sum(len(str(m)) for m in msgs)
-        expected = (n + 3) // 4
+        expected = math.ceil(n / 3.5)
         assert result == expected
 
     def test_tool_call_message(self):
@@ -88,7 +90,7 @@ class TestEstimateMessagesTokensRough:
                "tool_calls": [{"id": "1", "function": {"name": "terminal", "arguments": "{}"}}]}
         result = estimate_messages_tokens_rough([msg])
         assert result > 0
-        assert result == (len(str(msg)) + 3) // 4
+        assert result == math.ceil(len(str(msg)) / 3.5)
 
     def test_message_with_list_content(self):
         """Vision messages with multimodal content arrays.

@@ -1871,16 +1871,17 @@ class TestTokenBudgetTailProtection:
         for multimodal content. Regression guard for #16087.
 
         Setup: 6 messages, budget=80 (soft_ceiling=120).  The multimodal message
-        at index 1 has 500 chars of text → 135 tokens (correct) or 10 tokens (bug).
+        at index 1 has 500 chars of text → ~150 tokens (correct) or 10 tokens (bug).
 
-        Fixed path: walk stops at the multimodal (44+135=179 > 120), cut stays at 2,
+        Fixed path: walk stops at the multimodal (44+~150 > 120), cut stays at 2,
         tail = messages[2:] = 4 messages.
 
         Bug path: walk counts only 10 tokens for the multimodal, exhausts to head_end,
         the head_end safeguard forces cut = n - min_tail = 3, tail = only 3 messages.
         """
         c = budget_compressor
-        # 500 chars → 500//4 + 10 = 135 tokens; len([text, image]) // 4 + 10 = 10 (bug)
+        # 500 chars of text → ceil(500/3.5)≈143 (+10 framing) tokens (correct);
+        # the bug counted len([text, image])=2 chars → ~10 tokens.
         big_text = "x" * 500
         multimodal_content = [
             {"type": "text", "text": big_text},
