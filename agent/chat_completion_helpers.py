@@ -28,7 +28,7 @@ from typing import Any, Dict, Optional
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
-from agent.model_metadata import is_local_endpoint
+from agent.model_metadata import is_local_endpoint, _ceil_chars_to_tokens
 from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,
@@ -54,7 +54,7 @@ def estimate_request_context_tokens(api_payload: Any) -> int:
     """Estimate context/load tokens from an API payload, dict or messages list.
 
     The stale-call detectors historically assumed a Chat Completions request:
-    they pulled ``api_kwargs["messages"]`` and ran a cheap char/4 estimate.
+    they pulled ``api_kwargs["messages"]`` and ran a cheap char-based estimate.
     Codex / Responses API requests carry the conversational payload in
     ``input`` (with additional load in ``instructions`` and ``tools``), so the
     legacy estimator reported ~0 tokens for every Codex turn and the
@@ -80,7 +80,7 @@ def estimate_request_context_tokens(api_payload: Any) -> int:
         return sum(_chars(item) for item in messages)
 
     if isinstance(api_payload, list):
-        return _message_chars(api_payload) // 4
+        return _ceil_chars_to_tokens(_message_chars(api_payload))
 
     if isinstance(api_payload, dict):
         messages = api_payload.get("messages")
@@ -88,7 +88,7 @@ def estimate_request_context_tokens(api_payload: Any) -> int:
             total_chars = _message_chars(messages)
             if "tools" in api_payload:
                 total_chars += _chars(api_payload.get("tools"))
-            return total_chars // 4
+            return _ceil_chars_to_tokens(total_chars)
 
         if "input" in api_payload:
             total_chars = (
@@ -96,11 +96,13 @@ def estimate_request_context_tokens(api_payload: Any) -> int:
                 + _chars(api_payload.get("instructions"))
                 + _chars(api_payload.get("tools"))
             )
-            return total_chars // 4
+            return _ceil_chars_to_tokens(total_chars)
 
-        return sum(_chars(value) for value in api_payload.values()) // 4
+        return _ceil_chars_to_tokens(
+            sum(_chars(value) for value in api_payload.values())
+        )
 
-    return _chars(api_payload) // 4
+    return _ceil_chars_to_tokens(_chars(api_payload))
 
 
 def _is_openai_codex_backend(agent) -> bool:

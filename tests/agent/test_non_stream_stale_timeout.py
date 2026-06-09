@@ -70,7 +70,7 @@ def test_estimator_responses_api_long_session_triggers_tier():
     from agent.chat_completion_helpers import estimate_request_context_tokens
     payload = {
         "model": "gpt-5.5",
-        "input": "x" * 240_000,  # ~60k tokens (240k chars / 4)
+        "input": "x" * 240_000,  # ~69k tokens (240k chars / 3.5)
         "instructions": "s" * 4000,
     }
     assert estimate_request_context_tokens(payload) > 50_000
