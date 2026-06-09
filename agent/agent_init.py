@@ -74,6 +74,58 @@ def _normalized_custom_base_url(value: Any) -> str:
     return value.strip().rstrip("/")
 
 
+def _resolve_per_model_threshold(
+    per_model: Any, model: Any
+) -> Optional[float]:
+    """Resolve a per-model compression threshold from the config map.
+
+    ``per_model`` is the ``compression.per_model_threshold`` config value -- a
+    mapping of model-id -> threshold fraction. ``model`` is the active model id.
+
+    Lookup is exact-match first, then case-insensitive. The threshold is the
+    fraction of the model's context window that must be consumed before
+    compression triggers; valid values are in (0, 1]. Out-of-range or
+    non-numeric values are ignored (return ``None``) so resolution falls
+    through to the built-in default and then the global config threshold.
+
+    Returns the matched fraction as a float, or ``None`` when there is no
+    usable per-model entry for ``model``.
+    """
+    if not isinstance(per_model, dict) or not per_model:
+        return None
+    if not isinstance(model, str) or not model:
+        return None
+
+    raw = per_model.get(model)
+    if raw is None:
+        lowered = model.lower()
+        for key, value in per_model.items():
+            if isinstance(key, str) and key.lower() == lowered:
+                raw = value
+                break
+    if raw is None:
+        return None
+
+    try:
+        threshold = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring non-numeric compression.per_model_threshold for %r: %r",
+            model,
+            raw,
+        )
+        return None
+    if not (0.0 < threshold <= 1.0):
+        logger.warning(
+            "Ignoring out-of-range compression.per_model_threshold for %r: %r "
+            "(must be in (0, 1])",
+            model,
+            threshold,
+        )
+        return None
+    return threshold
+
+
 def _custom_provider_model_matches(agent_model: str, entry: Dict[str, Any]) -> bool:
     provider_model = str(entry.get("model", "") or "").strip().lower()
     if not provider_model:
@@ -1227,13 +1279,26 @@ def init_agent(
     if not isinstance(_compression_cfg, dict):
         _compression_cfg = {}
     compression_threshold = float(_compression_cfg.get("threshold", 0.50))
-    try:
-        from agent.auxiliary_client import _compression_threshold_for_model as _cthresh_fn
-        _model_cthresh = _cthresh_fn(agent.model)
-        if _model_cthresh is not None:
-            compression_threshold = _model_cthresh
-    except Exception:
-        pass
+    # Per-model threshold override.  Resolution order (first hit wins):
+    #   1. config ``compression.per_model_threshold`` map (user-tunable)
+    #   2. built-in per-model default (``_compression_threshold_for_model``)
+    #   3. global ``compression.threshold`` (set above)
+    #   4. hardcoded 0.50 default (the ``.get`` fallback above)
+    # The threshold is a fraction of the model's context window in (0, 1];
+    # the absolute trigger (context_length * threshold) is already model-aware
+    # and re-derived on every model switch in ContextCompressor.update_model.
+    _per_model = _compression_cfg.get("per_model_threshold")
+    _cfg_model_thresh = _resolve_per_model_threshold(_per_model, agent.model)
+    if _cfg_model_thresh is not None:
+        compression_threshold = _cfg_model_thresh
+    else:
+        try:
+            from agent.auxiliary_client import _compression_threshold_for_model as _cthresh_fn
+            _model_cthresh = _cthresh_fn(agent.model)
+            if _model_cthresh is not None:
+                compression_threshold = _model_cthresh
+        except Exception:
+            pass
     compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
     compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
     compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
