@@ -1,0 +1,8 @@
+name: native_content_slimmer
+version: "0.1.0"
+description: Lossless native tool-result slimming plugin skeleton. Disabled by default; shadow mode is the default when explicitly enabled.
+author: Apollo
+kind: standalone
+provides_hooks:
+  - transform_terminal_output
+  - transform_tool_result
