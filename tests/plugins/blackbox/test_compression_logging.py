@@ -12,7 +12,9 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-RTK_PLUGIN = REPO_ROOT.parent / "plugins" / "rtk-rewrite" / "__init__.py"
+# rtk-rewrite is a home-local (gitignored) plugin; in this isolated worktree its
+# work-in-progress copy lives under staging/ (deployed to ~/.hermes/plugins/ at release).
+RTK_PLUGIN = REPO_ROOT / "staging" / "plugins" / "rtk-rewrite" / "__init__.py"
 
 
 def load_rtk_module():
