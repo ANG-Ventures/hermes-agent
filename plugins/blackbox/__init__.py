@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 import logging
@@ -11,6 +12,29 @@ from threading import Lock
 from typing import Any
 
 _PREVIEW_CHARS = 2000
+_COMPRESSION_EVENT_ARG_KEY = "_hermes_compression"
+_COMPRESSION_OUTCOMES = {"rewritten", "fenced", "passthrough"}
+_COMPRESSION_EVENT_FIELDS = (
+    "source",
+    "cmd",
+    "outcome",
+    "rc",
+    "input_bytes",
+    "output_bytes",
+    "tool_call_id",
+    "error",
+    # PRD #1 savings fields belong in this same event payload later, then the
+    # existing per-tool row write consumes them once. No second INSERT/UPDATE.
+    "input_tokens_before",
+    "input_tokens_after",
+    "saved_tokens",
+)
+_QUOTED_OP_REF_RE = re.compile(r"(['\"])op://.*?\1")
+_OP_REF_RE = re.compile(r"op://[^\s'\"`]+")
+_BEARER_RE = re.compile(r"(?i)\b(Bearer\s+)([A-Za-z0-9._~+/=-]{10,})")
+_SENSITIVE_FLAG_RE = re.compile(
+    r"(?i)(--(?:api-?key|token|secret|password|auth)(?:=|\s+))([^\s'\"]+)"
+)
 
 
 def _preview(value: Any) -> str:
@@ -29,6 +53,115 @@ def _preview(value: Any) -> str:
         except Exception:
             text = str(value)
     return text[:_PREVIEW_CHARS]
+
+
+def _scrub_command(command: Any) -> str:
+    """Scrub a command before it enters either compression telemetry sink."""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        scrubbed = redact_sensitive_text(str(command), force=True)
+    except Exception:
+        scrubbed = str(command)
+    scrubbed = _QUOTED_OP_REF_RE.sub(lambda m: m.group(1) + "op://***" + m.group(1), scrubbed)
+    scrubbed = _OP_REF_RE.sub("op://***", scrubbed)
+    scrubbed = _BEARER_RE.sub(lambda m: m.group(1) + "***", scrubbed)
+    scrubbed = _SENSITIVE_FLAG_RE.sub(lambda m: m.group(1) + "***", scrubbed)
+    return scrubbed
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalise_compression_event(event: Any) -> dict[str, Any]:
+    if not isinstance(event, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in _COMPRESSION_EVENT_FIELDS:
+        if key not in event:
+            continue
+        value = event.get(key)
+        if value is None:
+            out[key] = None
+        elif key in {"cmd", "command"}:
+            out["cmd"] = _scrub_command(value)
+        elif key in {
+            "rc",
+            "input_bytes",
+            "output_bytes",
+            "input_tokens_before",
+            "input_tokens_after",
+            "saved_tokens",
+        }:
+            out[key] = _int_or_none(value)
+        else:
+            out[key] = str(value)
+    outcome = str(out.get("outcome") or "passthrough")
+    out["outcome"] = outcome if outcome in _COMPRESSION_OUTCOMES else "passthrough"
+    out.setdefault("source", "rtk")
+    return out
+
+
+def emit_compression_tool_event(args: Any, event: dict[str, Any]) -> None:
+    """Attach one scrubbed compression event for the Blackbox per-tool row.
+
+    rtk-rewrite calls this from pre_tool_call after it decides rewrite/fence/
+    passthrough. The actual Blackbox sink remains _on_post_tool_call below, so
+    the per-tool record is still written exactly once alongside args/result.
+    """
+    try:
+        if not isinstance(args, dict):
+            return
+        normalised = _normalise_compression_event(event)
+        if normalised:
+            args[_COMPRESSION_EVENT_ARG_KEY] = normalised
+    except Exception:
+        return
+
+
+def _safe_args_for_preview(args: Any) -> tuple[Any, dict[str, Any]]:
+    if not isinstance(args, dict):
+        return args, {}
+    safe_args = dict(args)
+    compression_event = _normalise_compression_event(
+        safe_args.pop(_COMPRESSION_EVENT_ARG_KEY, None)
+    )
+    if isinstance(safe_args.get("command"), str):
+        safe_args["command"] = _scrub_command(safe_args["command"])
+    return safe_args, compression_event
+
+
+def _preview_tool_args(args: Any) -> str:
+    safe_args, compression_event = _safe_args_for_preview(args)
+    if compression_event:
+        return _preview({"args": safe_args, "compression": compression_event})
+    return _preview(safe_args)
+
+
+def _record_tool_call(
+    state: dict[str, Any],
+    tool: str,
+    args: Any,
+    result: Any,
+    store_text: bool,
+) -> None:
+    state.setdefault("tools", []).append(str(tool))
+    if not store_text:
+        return
+    state.setdefault("tool_calls", []).append(
+        {
+            "name": str(tool),
+            "args_preview": _preview_tool_args(args),
+            "result_preview": _preview(result),
+        }
+    )
+
 
 import yaml
 
@@ -148,15 +281,13 @@ def _on_post_tool_call(
             return
         state = _session_state(session_id)
         with _lock:
-            state.setdefault("tools", []).append(str(tool))
-            if bool(cfg.get("store_text", True)):
-                state.setdefault("tool_calls", []).append(
-                    {
-                        "name": str(tool),
-                        "args_preview": _preview(args),
-                        "result_preview": _preview(result),
-                    }
-                )
+            _record_tool_call(
+                state,
+                str(tool),
+                args,
+                result,
+                bool(cfg.get("store_text", True)),
+            )
     except Exception:
         return
 
