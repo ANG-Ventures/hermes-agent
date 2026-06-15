@@ -22,6 +22,8 @@ def test_terminal_uses_pre_truncation_hook_and_generic_hook_skips_terminal(tmp_p
         output=terminal_raw,
         returncode=0,
         task_id="terminal-task",
+        session_id="sess-terminal",
+        tool_call_id="call-terminal-pre",
         env_type="local",
     )
 

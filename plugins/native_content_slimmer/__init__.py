@@ -16,6 +16,7 @@ non-matching secret can still be persisted inside an on-disk artifact. Treat
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import Any, Mapping
 
 from .config import NativeContentSlimmerConfig, load_slimmer_config
@@ -42,10 +43,9 @@ def register(ctx: Any, config: Mapping[str, Any] | None = None) -> NativeContent
                 "falling back to shadow mode: %s",
                 exc,
             )
-            runtime_cfg = NativeContentSlimmerConfig(
-                enabled=True,
+            runtime_cfg = replace(
+                cfg,
                 mode="shadow",
-                valid=cfg.valid,
                 errors=cfg.errors + (f"expand_artifact registration failed: {exc}",),
             )
         else:
@@ -54,6 +54,10 @@ def register(ctx: Any, config: Mapping[str, Any] | None = None) -> NativeContent
     runtime = NativeContentSlimmerHooks(runtime_cfg)
     ctx.register_hook("transform_terminal_output", runtime.transform_terminal_output)
     ctx.register_hook("transform_tool_result", runtime.transform_tool_result)
+    if runtime_cfg.artifact_gc_on_session_end:
+        ctx.register_hook("on_session_end", runtime.on_session_end)
+    if runtime_cfg.artifact_gc_on_session_reset:
+        ctx.register_hook("on_session_reset", runtime.on_session_reset)
     return runtime_cfg
 
 

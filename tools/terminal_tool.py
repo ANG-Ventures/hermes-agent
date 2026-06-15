@@ -1777,6 +1777,10 @@ def terminal_tool(
     background: bool = False,
     timeout: Optional[int] = None,
     task_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    tool_call_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
+    api_request_id: Optional[str] = None,
     force: bool = False,
     workdir: Optional[str] = None,
     pty: bool = False,
@@ -1791,6 +1795,10 @@ def terminal_tool(
         background: Whether to run in background (default: False)
         timeout: Command timeout in seconds (default: from config)
         task_id: Unique identifier for environment isolation (optional)
+        session_id: Conversation/session identity passed to terminal transform hooks
+        tool_call_id: Tool-call identity passed to terminal transform hooks
+        turn_id: Turn identity passed to terminal transform hooks
+        api_request_id: API-request identity passed to terminal transform hooks
         force: If True, skip dangerous command check (use after user confirms)
         workdir: Working directory for this command (optional, uses session cwd if not set)
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
@@ -2320,6 +2328,10 @@ def terminal_tool(
                     output=output,
                     returncode=returncode,
                     task_id=effective_task_id or "",
+                    session_id=session_id or "",
+                    tool_call_id=tool_call_id or "",
+                    turn_id=turn_id or "",
+                    api_request_id=api_request_id or "",
                     env_type=env_type,
                 )
                 for hook_result in hook_results:
@@ -2593,6 +2605,10 @@ def _handle_terminal(args, **kw):
         background=args.get("background", False),
         timeout=args.get("timeout"),
         task_id=kw.get("task_id"),
+        session_id=kw.get("session_id"),
+        tool_call_id=kw.get("tool_call_id"),
+        turn_id=kw.get("turn_id"),
+        api_request_id=kw.get("api_request_id"),
         workdir=args.get("workdir"),
         pty=args.get("pty", False),
         notify_on_complete=args.get("notify_on_complete", False),

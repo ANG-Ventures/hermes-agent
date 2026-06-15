@@ -78,6 +78,115 @@ def test_valid_config_accepts_active_lossless_mode() -> None:
     assert cfg.valid is True
 
 
+def test_config_parses_classifier_and_gc_knobs() -> None:
+    cfg = load_slimmer_config(
+        {
+            "plugins": {
+                "native_content_slimmer": {
+                    "enabled": True,
+                    "mode": "active_lossless",
+                    "artifact_ttl_days": 3,
+                    "artifact_max_bytes_per_profile": 12345,
+                    "artifact_gc_on_start": False,
+                    "artifact_gc_on_session_end": True,
+                    "artifact_gc_on_session_reset": False,
+                    "artifact_gc_after_write_every": 7,
+                    "artifact_gc_mode": "async_best_effort",
+                    "min_bytes": 42,
+                    "preview_bytes": 17,
+                    "allow_tools": ["custom_tool"],
+                    "deny_tools": ["blocked_tool"],
+                    "deny_on_status": ["error", "blocked"],
+                    "secret_policy": "no_store_pass_through",
+                }
+            }
+        }
+    )
+
+    assert cfg.enabled is True
+    assert cfg.mode == "active_lossless"
+    assert cfg.valid is True
+    assert cfg.artifact_ttl_days == 3
+    assert cfg.artifact_max_bytes_per_profile == 12345
+    assert cfg.artifact_gc_on_start is False
+    assert cfg.artifact_gc_on_session_end is True
+    assert cfg.artifact_gc_on_session_reset is False
+    assert cfg.artifact_gc_after_write_every == 7
+    assert cfg.artifact_gc_mode == "async_best_effort"
+    assert cfg.min_bytes == 42
+    assert cfg.preview_bytes == 17
+    assert cfg.allow_tools == frozenset({"custom_tool"})
+    assert cfg.deny_tools == frozenset({"blocked_tool"})
+    assert cfg.deny_on_status == frozenset({"error", "blocked"})
+    assert cfg.secret_policy == "no_store_pass_through"
+
+
+def test_config_knobs_take_effect_in_classifier_path(tmp_path) -> None:
+    cfg = load_slimmer_config(
+        {
+            "plugins": {
+                "native_content_slimmer": {
+                    "enabled": True,
+                    "mode": "active_lossless",
+                    "min_bytes": 10,
+                    "preview_bytes": 40,
+                    "allow_tools": ["custom_tool"],
+                    "deny_tools": [],
+                    "deny_on_status": [],
+                }
+            }
+        }
+    )
+    ctx = FakeContext()
+    assert cfg.valid is True
+    # Use the runtime directly so this test is independent of global plugin discovery.
+    from plugins.native_content_slimmer.hook import NativeContentSlimmerHooks
+    from plugins.native_content_slimmer.store import ArtifactStore
+
+    hooks = NativeContentSlimmerHooks(
+        cfg,
+        store=ArtifactStore(tmp_path / "artifacts"),
+        secret=b"config-knobs-test-secret",
+    )
+    raw = "custom-HEAD\n" + ("custom-middle\n" * 20) + "custom-TAIL\n"
+
+    marker = hooks.transform_tool_result(
+        tool_name="custom_tool",
+        result=raw,
+        status="error",
+        session_id="sess-config",
+        tool_call_id="call-config",
+    )
+
+    assert marker is not None
+    parsed = parse_marker(marker)
+    assert parsed is not None
+    assert int(parsed.fields["shown_bytes"]) <= cfg.preview_bytes + 64
+    assert hooks.telemetry_records[0]["tool_status"] == "error"
+    assert ctx.tools == []
+
+
+def test_invalid_config_knobs_fail_closed_to_disabled() -> None:
+    cfg = load_slimmer_config(
+        {
+            "plugins": {
+                "native_content_slimmer": {
+                    "enabled": True,
+                    "mode": "active_lossless",
+                    "min_bytes": -1,
+                    "artifact_gc_mode": "blocking",
+                }
+            }
+        }
+    )
+
+    assert cfg.enabled is False
+    assert cfg.mode == DEFAULT_MODE
+    assert cfg.valid is False
+    assert "min_bytes must be a non-negative integer" in cfg.errors
+    assert "artifact_gc_mode must be async_best_effort" in cfg.errors
+
+
 def test_non_mapping_plugin_block_fails_closed_to_disabled() -> None:
     cfg = load_slimmer_config({"plugins": {"native_content_slimmer": True}})
 

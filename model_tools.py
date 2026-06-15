@@ -1077,11 +1077,20 @@ def handle_function_call(
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
-                        function_name, next_args,
-                        task_id=task_id,
-                        user_task=user_task,
-                    )
+                    dispatch_kwargs: Dict[str, Any] = {
+                        "task_id": task_id,
+                        "user_task": user_task,
+                    }
+                    if function_name == "terminal":
+                        dispatch_kwargs.update(
+                            {
+                                "session_id": session_id,
+                                "tool_call_id": tool_call_id,
+                                "turn_id": turn_id,
+                                "api_request_id": api_request_id,
+                            }
+                        )
+                    return registry.dispatch(function_name, next_args, **dispatch_kwargs)
             result = _dispatch(function_args)
         finally:
             if _approval_tokens is not None and reset_current_observability_context is not None:

@@ -19,8 +19,9 @@ from plugins.blackbox.native_slimmer_schema import (
 
 from .classifier import Classification, classify_tool_result, deterministic_preview
 from .config import NativeContentSlimmerConfig
+from .gc import collect_garbage
 from .marker import MarkerLedger, build_authenticated_marker, verify_marker_auth
-from .store import ArtifactStore, raw_byte_len, sha256_text
+from .store import ArtifactStore, raw_byte_len, safe_component, sha256_text
 from .telemetry import NativeSlimmerTelemetryBuffer, build_replacement_event, emit_event
 
 logger = logging.getLogger(__name__)
@@ -79,9 +80,14 @@ class NativeContentSlimmerHooks:
         self.telemetry_records = getattr(self.telemetry, "records", [])
         self.shadow_records: list[SlimmerShadowRecord] = []
         self.failures: list[str] = []
+        self.skip_reasons: list[str] = []
+        self.gc_records: list[dict[str, Any]] = []
+        self._write_count = 0
         self._blocked_marker_keys: set[tuple[str, str, str]] = set()
         if ledger is None and self.config.enabled:
             self._rehydrate_ledger_from_artifacts()
+        if self.config.enabled and self.config.artifact_gc_on_start:
+            self._run_gc(active_session_id=None)
 
     def _rehydrate_ledger_from_artifacts(self) -> None:
         """Rebuild marker auth entries from durable artifact records."""
@@ -139,11 +145,14 @@ class NativeContentSlimmerHooks:
             if output is None:
                 return None
             status = "success" if int(returncode or 0) == 0 else "error"
-            session_id = _first_nonempty(kwargs.get("session_id"), task_id, "terminal")
-            tool_call_id = _first_nonempty(
-                kwargs.get("tool_call_id"),
-                _stable_tool_call_id(_TERMINAL_TOOL, output, command),
-            )
+            session_id = _optional_nonempty(kwargs.get("session_id"))
+            if session_id is None:
+                self._record_skip("no_session_scope")
+                return None
+            tool_call_id = _optional_nonempty(kwargs.get("tool_call_id"))
+            if tool_call_id is None:
+                self._record_skip("no_tool_call_id")
+                return None
             raw_source = _raw_source_from_kwargs(
                 kwargs,
                 default=RAW_SOURCE_TERMINAL_PRE_TRUNCATION,
@@ -189,13 +198,18 @@ class NativeContentSlimmerHooks:
                 # Terminal raw belongs to transform_terminal_output; this seam sees
                 # post-truncation terminal_tool output and must not double-count it.
                 return None
-            session = _first_nonempty(session_id, task_id, "session")
-            call_id = _first_nonempty(tool_call_id, _stable_tool_call_id(name or "tool", result))
-            raw_source = (
-                RAW_SOURCE_TOOL_CONTRACT_BOUNDED
-                if name == _READ_FILE_TOOL
-                else _raw_source_from_kwargs(_, default=RAW_SOURCE_TOOL_RESULT_RETURNED)
-            )
+            if name == _READ_FILE_TOOL:
+                self._record_skip("read_file_contract_bounded")
+                return None
+            session = _optional_nonempty(session_id)
+            if session is None:
+                self._record_skip("no_session_scope")
+                return None
+            call_id = _optional_nonempty(tool_call_id)
+            if call_id is None:
+                self._record_skip("no_tool_call_id")
+                return None
+            raw_source = _raw_source_from_kwargs(_, default=RAW_SOURCE_TOOL_RESULT_RETURNED)
             return self._process_result(
                 tool_name=name,
                 raw_text=result,
@@ -232,6 +246,15 @@ class NativeContentSlimmerHooks:
             return None
         if not isinstance(raw_text, str) or raw_text == "":
             return None
+        if not str(session_id or "").strip():
+            self._record_skip("no_session_scope")
+            return None
+        if not str(tool_call_id or "").strip():
+            self._record_skip("no_tool_call_id")
+            return None
+        if tool_name == _READ_FILE_TOOL:
+            self._record_skip("read_file_contract_bounded")
+            return None
 
         raw_sha = sha256_text(raw_text)
         marker_key = (session_id, tool_call_id, raw_sha)
@@ -261,8 +284,14 @@ class NativeContentSlimmerHooks:
             tool_name=tool_name,
             result=raw_text,
             status=status,
+            min_bytes=self.config.min_bytes,
+            preview_bytes=self.config.preview_bytes,
+            allow_tools=self.config.allow_tools,
+            deny_tools=self.config.deny_tools,
+            deny_on_status=self.config.deny_on_status,
         )
         if not classification.eligible:
+            self._record_skip(classification.reason)
             return None
 
         marker = self._persist_and_build_marker(
@@ -313,11 +342,13 @@ class NativeContentSlimmerHooks:
         if duration_ms is not None:
             artifact_metadata["duration_ms"] = duration_ms
         artifact_metadata.update({key: value for key, value in metadata.items() if value not in (None, "")})
+        base_artifact_id = _call_identity_artifact_id(session_id=session_id, tool_call_id=tool_call_id)
 
         record = self.store.write_artifact(
             session_id=session_id,
             tool_call_id=tool_call_id,
             raw_text=raw_text,
+            artifact_id=base_artifact_id,
             task_id=task_id,
             turn_id=turn_id,
             api_request_id=api_request_id,
@@ -338,6 +369,13 @@ class NativeContentSlimmerHooks:
             session_id=session_id,
             raw_text=raw_text,
         )
+        if str(record.get("artifact_id") or "") != base_artifact_id:
+            logger.warning(
+                "native_content_slimmer tool_call_id reused with different raw_sha256; "
+                "stored suffixed artifact_id=%s base_artifact_id=%s",
+                record.get("artifact_id"),
+                base_artifact_id,
+            )
         marker = build_authenticated_marker(
             session_id=session_id,
             tool_call_id=tool_call_id,
@@ -371,7 +409,14 @@ class NativeContentSlimmerHooks:
                 tool_status=status,
             )
         except Exception:
-            self._blocked_marker_keys.add((session_id, tool_call_id, str(record["raw_sha256"])))
+            raw_sha256 = str(record["raw_sha256"])
+            self._blocked_marker_keys.add((session_id, tool_call_id, raw_sha256))
+            self.ledger.discard(session_id=session_id, tool_call_id=tool_call_id, raw_sha256=raw_sha256)
+            self._delete_untelemetried_artifact(
+                artifact_id=str(record["artifact_id"]),
+                session_id=session_id,
+            )
+            self._record_skip("telemetry_emit_failed")
             raise
         if self.config.mode == "shadow":
             self.shadow_records.append(
@@ -389,6 +434,7 @@ class NativeContentSlimmerHooks:
                     classification_reason=classification.reason,
                 )
             )
+        self._maybe_gc_after_write(active_session_id=session_id)
         return marker
 
     def _verify_persisted_artifact(
@@ -487,6 +533,62 @@ class NativeContentSlimmerHooks:
         )
         emit_event(self.telemetry, event)
 
+    def _record_skip(self, reason: str) -> None:
+        self.skip_reasons.append(str(reason or "unknown"))
+
+    def _delete_untelemetried_artifact(self, *, artifact_id: str, session_id: str) -> None:
+        """Best-effort rollback for artifacts whose telemetry emit failed."""
+
+        try:
+            path_for = getattr(self.store, "path_for", None)
+            if callable(path_for):
+                path = path_for(artifact_id, session_id=session_id)
+            else:
+                find_path = getattr(self.store, "find_artifact_path", None)
+                if not callable(find_path):
+                    return
+                path = find_path(artifact_id, session_id=session_id)
+            artifact_path = path if isinstance(path, Path) else Path(str(path))
+            artifact_path.unlink(missing_ok=True)
+            try:
+                _fsync_directory(artifact_path.parent)
+            except Exception:
+                pass
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            self._record_failure(exc)
+
+    def _maybe_gc_after_write(self, *, active_session_id: str) -> None:
+        every = int(self.config.artifact_gc_after_write_every or 0)
+        if every <= 0:
+            return
+        self._write_count += 1
+        if self._write_count % every == 0:
+            self._run_gc(active_session_id=active_session_id)
+
+    def _run_gc(self, *, active_session_id: str | None) -> None:
+        root = getattr(self.store, "root", None)
+        try:
+            result = collect_garbage(
+                root=root,
+                ttl_days=self.config.artifact_ttl_days,
+                max_bytes=self.config.artifact_max_bytes_per_profile,
+                active_session_id=active_session_id,
+            )
+            if isinstance(result, dict):
+                self.gc_records.append(result)
+        except Exception as exc:
+            self._record_failure(exc)
+
+    def on_session_end(self, *, session_id: str | None = None, **_: Any) -> None:
+        if self.config.artifact_gc_on_session_end:
+            self._run_gc(active_session_id=_optional_nonempty(session_id))
+
+    def on_session_reset(self, *, session_id: str | None = None, **_: Any) -> None:
+        if self.config.artifact_gc_on_session_reset:
+            self._run_gc(active_session_id=_optional_nonempty(session_id))
+
     def _record_failure(self, exc: Exception) -> None:
         message = str(exc) or exc.__class__.__name__
         self.failures.append(message)
@@ -508,12 +610,19 @@ def transform_tool_result(**kwargs: Any) -> str | None:
     return _DEFAULT_RUNTIME.transform_tool_result(**kwargs)
 
 
-def _first_nonempty(*values: Any) -> str:
+def _optional_nonempty(*values: Any) -> str | None:
     for value in values:
         text = str(value or "").strip()
         if text:
             return text
-    return "none"
+    return None
+
+
+def _call_identity_artifact_id(*, session_id: str, tool_call_id: str) -> str:
+    return (
+        f"art_{safe_component(session_id, fallback='session')}_"
+        f"{safe_component(tool_call_id, fallback='tool_call')}"
+    )
 
 
 def _raw_source_from_kwargs(kwargs: dict[str, Any], *, default: str) -> str:
@@ -538,11 +647,6 @@ def _raw_source_from_kwargs(kwargs: dict[str, Any], *, default: str) -> str:
     if rtk_applied or rtk_status in {"applied", "compressed", "post-rtk", "rewritten"}:
         return RAW_SOURCE_POST_RTK
     return default
-
-
-def _stable_tool_call_id(tool_name: str, raw_text: str, hint: str | None = None) -> str:
-    seed = "\n".join([tool_name or "tool", hint or "", sha256_text(raw_text)])
-    return f"{tool_name or 'tool'}-{sha256_text(seed)[:12]}"
 
 
 _SIGNING_KEY_NAME = ".signing_key"

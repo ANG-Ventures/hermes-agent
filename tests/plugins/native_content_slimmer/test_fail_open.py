@@ -45,6 +45,8 @@ def test_terminal_hook_fails_open_when_artifact_write_raises() -> None:
         output=_large_payload(),
         returncode=0,
         task_id="task-1",
+        session_id="sess-terminal-fail-open",
+        tool_call_id="call-terminal-fail-open",
         env_type="local",
     )
 

@@ -197,3 +197,49 @@ def test_blackbox_telemetry_emit_failure_fails_open_without_marker(tmp_path) -> 
     assert replacement is None
     assert hooks.failures
     assert "blackbox unavailable" in hooks.failures[-1]
+
+
+def test_telemetry_emit_failure_does_not_reuse_or_rehydrate_untelemetried_marker(tmp_path) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    raw = _large_payload("telemetry-restart-fail")
+
+    process_a = NativeContentSlimmerHooks(
+        NativeContentSlimmerConfig(enabled=True, mode="active_lossless"),
+        store=store,
+        secret=b"telemetry-restart-secret",
+        telemetry=ExplodingTelemetry(),
+    )
+    first = process_a.transform_tool_result(
+        tool_name="web_extract",
+        result=raw,
+        status="success",
+        session_id="sess-telemetry-restart",
+        tool_call_id="call-telemetry-restart",
+    )
+    retry_same_process = process_a.transform_tool_result(
+        tool_name="web_extract",
+        result=raw,
+        status="success",
+        session_id="sess-telemetry-restart",
+        tool_call_id="call-telemetry-restart",
+    )
+
+    assert first is None
+    assert retry_same_process is None
+
+    process_b = NativeContentSlimmerHooks(
+        NativeContentSlimmerConfig(enabled=True, mode="active_lossless"),
+        store=store,
+        secret=b"telemetry-restart-secret",
+        telemetry=ExplodingTelemetry(),
+    )
+    after_restart = process_b.transform_tool_result(
+        tool_name="web_extract",
+        result=raw,
+        status="success",
+        session_id="sess-telemetry-restart",
+        tool_call_id="call-telemetry-restart",
+    )
+
+    assert after_restart is None
+    assert list((tmp_path / "artifacts").glob("**/*.json")) == []

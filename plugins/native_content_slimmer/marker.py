@@ -68,6 +68,9 @@ class MarkerLedger:
     def lookup(self, *, session_id: str, tool_call_id: str, raw_sha256: str) -> MarkerEntry | None:
         return self._entries.get((session_id, tool_call_id, raw_sha256))
 
+    def discard(self, *, session_id: str, tool_call_id: str, raw_sha256: str) -> None:
+        self._entries.pop((session_id, tool_call_id, raw_sha256), None)
+
 
 def make_marker_signature(
     *,
