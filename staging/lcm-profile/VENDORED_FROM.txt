@@ -1,0 +1,1 @@
+github.com/stephenschoettler/hermes-lcm @ 03b74f84440be99164ce3e2cd929917bc9550bfe (main, 2026-06-13) plugin v0.16.2; NO LICENSE upstream (internal fleet run/fork only); ingest-audit PASS (22 HIGH all test/benchmark placeholder secrets, scary-non-test==0)
