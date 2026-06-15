@@ -114,7 +114,7 @@ def validate_artifact_id(artifact_id: str) -> str:
     return text
 
 
-def _fsync_dir(path: Path) -> None:
+def fsync_dir(path: Path) -> None:
     """Best-effort fsync of a directory after rename/unlink operations."""
 
     try:
@@ -127,6 +127,10 @@ def _fsync_dir(path: Path) -> None:
         pass
     finally:
         os.close(fd)
+
+
+# Backward-compatible private alias for older callers/tests.
+_fsync_dir = fsync_dir
 
 
 def atomic_write_json_file(path: Path, payload: Mapping[str, Any], *, mode: int = 0o600) -> None:
@@ -154,7 +158,7 @@ def atomic_write_json_file(path: Path, payload: Mapping[str, Any], *, mode: int 
             os.chmod(path, mode)
         except OSError:
             pass
-        _fsync_dir(path.parent)
+        fsync_dir(path.parent)
     except Exception:
         if fd is not None:
             try:
@@ -399,14 +403,14 @@ class ArtifactStore:
         except Exception:
             try:
                 final_path.unlink()
-                _fsync_dir(final_path.parent)
+                fsync_dir(final_path.parent)
             except OSError:
                 pass
             raise
         if verified.get("raw_sha256") != record.get("raw_sha256"):
             try:
                 final_path.unlink()
-                _fsync_dir(final_path.parent)
+                fsync_dir(final_path.parent)
             except OSError:
                 pass
             raise ArtifactIntegrityError(

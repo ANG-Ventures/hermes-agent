@@ -14,7 +14,9 @@ from plugins.native_content_slimmer.store import (
     atomic_write_json_file,
     default_artifact_root,
     parse_utc_iso,
+    safe_component,
     utc_now_iso,
+    fsync_dir,
 )
 
 SIZE_CAP_RECENT_EXPANSION_GRACE_SECONDS = 60 * 60
@@ -35,6 +37,12 @@ def gc_status_path(root: str | Path | None = None) -> Path:
     return base / ".gc_status.json"
 
 
+def _same_gc_owner(candidate_session_id: str, active_session_id: str | None) -> bool:
+    if not active_session_id:
+        return False
+    return safe_component(candidate_session_id, fallback="session") == safe_component(active_session_id, fallback="session")
+
+
 def artifact_usage(
     root: str | Path | None = None,
     *,
@@ -45,7 +53,7 @@ def artifact_usage(
     candidates = _load_candidates(Path(root) if root is not None else default_artifact_root())
     profile_bytes = sum(candidate.size for candidate in candidates)
     active_bytes = sum(
-        candidate.size for candidate in candidates if active_session_id and candidate.session_id == active_session_id
+        candidate.size for candidate in candidates if _same_gc_owner(candidate.session_id, active_session_id)
     )
     return {
         "profile_bytes": profile_bytes,
@@ -109,7 +117,7 @@ def collect_garbage(
             inactive = [
                 candidate
                 for candidate in candidates
-                if (not active_session_id or candidate.session_id != active_session_id)
+                if not _same_gc_owner(candidate.session_id, active_session_id)
                 and candidate.last_expanded_at <= recent_cutoff
             ]
             inactive.sort(key=lambda c: (c.last_expanded_at, c.created_at, c.artifact_id))
@@ -124,7 +132,7 @@ def collect_garbage(
         active_bytes = sum(
             candidate.size
             for candidate in remaining
-            if active_session_id and candidate.session_id == active_session_id
+            if _same_gc_owner(candidate.session_id, active_session_id)
         )
         bytes_after = sum(candidate.size for candidate in remaining)
         over_cap = bool(max_bytes is not None and bytes_after > int(max_bytes))
@@ -233,14 +241,7 @@ def _delete_candidate(
         metadata=metadata,
     )
     candidate.path.unlink()
-    try:
-        # Best effort directory durability for the unlink; tombstone write also
-        # fsyncs its own rename above.
-        from plugins.native_content_slimmer.store import _fsync_dir  # local private durability helper
-
-        _fsync_dir(candidate.path.parent)
-    except Exception:
-        pass
+    fsync_dir(candidate.path.parent)
     return {
         "artifact_id": candidate.artifact_id,
         "session_id": candidate.session_id,

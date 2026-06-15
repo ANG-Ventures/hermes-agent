@@ -155,21 +155,31 @@ def _authorize_same_session(
 
     try:
         store.find_artifact_path(artifact_id, session_id=session_id)
-        return None
     except ArtifactGoneError as exc:
-        return _gone_error(artifact_id, exc)
-    except ArtifactNotFoundError:
-        pass
-
-    try:
-        store.find_artifact_path(artifact_id, session_id=None)
-    except ArtifactGoneError:
-        return _error(artifact_id, "not_authorized")
+        if str(exc.tombstone.get("session_id") or "") == session_id:
+            return _gone_error(artifact_id, exc)
+        return _error(artifact_id, "not_found")
     except ArtifactNotFoundError:
         return _error(artifact_id, "not_found")
     except Exception as exc:
         return _error(artifact_id, "store_error", message=str(exc))
-    return _error(artifact_id, "not_authorized")
+
+    try:
+        record = store.read_record(artifact_id, session_id=session_id)
+    except ArtifactIntegrityError:
+        return None
+    except ArtifactGoneError as exc:
+        if str(exc.tombstone.get("session_id") or "") == session_id:
+            return _gone_error(artifact_id, exc)
+        return _error(artifact_id, "not_found")
+    except ArtifactNotFoundError:
+        return _error(artifact_id, "not_found")
+    except Exception as exc:
+        return _error(artifact_id, "store_error", message=str(exc))
+
+    if str(record.get("session_id") or "") != session_id:
+        return _error(artifact_id, "not_found")
+    return None
 
 
 def _parse_non_negative_int(value: Any, *, default: int) -> int | dict[str, str]:

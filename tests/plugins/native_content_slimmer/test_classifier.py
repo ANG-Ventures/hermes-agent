@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import base64
+
 import pytest
 
 import plugins.native_content_slimmer as native_content_slimmer
 from plugins.native_content_slimmer.classifier import (
     DEFAULT_ALLOW_TOOLS,
+    UNKNOWN_SECRET_FIXTURES_HARD_GATE,
     Classification,
     classify_tool_result,
     contains_secret,
@@ -36,6 +39,21 @@ def _pem_private_key() -> str:
 
 def _dsn_with_password() -> str:
     return "postgresql" + "://" + "user" + ":" + "pw" + "@" + "db.example/app"
+
+
+def _high_entropy_base64_blob() -> str:
+    raw = bytes(((idx * 37 + 11) % 256 for idx in range(96)))
+    return base64.b64encode(raw).decode("ascii")
+
+
+def _pem_private_key_crlf() -> str:
+    fence = "-" * 5
+    label = "PRIVATE" + " " + "KEY"
+    return "\r\n".join([
+        fence + "BEGIN " + label + fence,
+        "not-a-real-key",
+        fence + "END " + label + fence,
+    ])
 
 
 @pytest.mark.parametrize(
@@ -91,6 +109,30 @@ def test_documented_secret_patterns_are_detected() -> None:
     assert {label: contains_secret(text) for label, text in documented_examples.items()} == {
         label: label for label in documented_examples
     }
+
+
+@pytest.mark.parametrize(
+    ("label", "text"),
+    [
+        ("pem", _pem_private_key_crlf()),
+        ("high_entropy", "blob=" + _high_entropy_base64_blob()),
+        ("authorization", "authorization=" + "tokenvalue123456789"),
+    ],
+)
+def test_unknown_ish_secret_fixtures_are_hard_no_store_gate(label: str, text: str) -> None:
+    classified = classify_tool_result(
+        tool_name="terminal",
+        result=("safe prefix\n" + text + "\n") * 50,
+        status="success",
+        min_bytes=100,
+        preview_bytes=80,
+    )
+
+    assert UNKNOWN_SECRET_FIXTURES_HARD_GATE is True
+    assert classified.eligible is False
+    assert classified.reason == "secret_classified_no_store"
+    assert classified.content_class == "secret"
+    assert classified.secret_match == label
 
 
 def test_contains_secret_returns_first_matching_label() -> None:

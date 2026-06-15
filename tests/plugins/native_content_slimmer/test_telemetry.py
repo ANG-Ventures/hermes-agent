@@ -178,6 +178,18 @@ class ExplodingTelemetry:
         raise RuntimeError("blackbox unavailable")
 
 
+class FailOnceTelemetry:
+    def __init__(self) -> None:
+        self.records: list[dict[str, object]] = []
+        self.calls = 0
+
+    def emit(self, event):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("blackbox transient outage")
+        self.records.append(dict(event))
+
+
 def test_blackbox_telemetry_emit_failure_fails_open_without_marker(tmp_path) -> None:
     hooks = NativeContentSlimmerHooks(
         NativeContentSlimmerConfig(enabled=True, mode="active_lossless"),
@@ -243,3 +255,38 @@ def test_telemetry_emit_failure_does_not_reuse_or_rehydrate_untelemetried_marker
 
     assert after_restart is None
     assert list((tmp_path / "artifacts").glob("**/*.json")) == []
+
+
+def test_transient_telemetry_emit_failure_does_not_permanently_poison_same_result(tmp_path) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    telemetry = FailOnceTelemetry()
+    hooks = NativeContentSlimmerHooks(
+        NativeContentSlimmerConfig(enabled=True, mode="active_lossless"),
+        store=store,
+        secret=b"telemetry-transient-secret",
+        telemetry=telemetry,
+    )
+    raw = _large_payload("telemetry-transient")
+
+    first = hooks.transform_tool_result(
+        tool_name="web_extract",
+        result=raw,
+        status="success",
+        session_id="sess-telemetry-transient",
+        tool_call_id="call-telemetry-transient",
+    )
+    second = hooks.transform_tool_result(
+        tool_name="web_extract",
+        result=raw,
+        status="success",
+        session_id="sess-telemetry-transient",
+        tool_call_id="call-telemetry-transient",
+    )
+
+    assert first is None
+    assert second is not None
+    parsed = parse_marker(second)
+    assert parsed is not None
+    assert store.read_record(parsed.fields["id"], session_id="sess-telemetry-transient")["raw_text"] == raw
+    assert len(telemetry.records) == 1
+    assert telemetry.records[0]["raw_sha256"] == sha256_text(raw)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from typing import Iterable
@@ -16,6 +17,7 @@ DEFAULT_DENY_TOOLS = frozenset({
 DEFAULT_DENY_ON_STATUS = frozenset({"error"})
 DEFAULT_MIN_BYTES = 12_000
 DEFAULT_PREVIEW_BYTES = 2_500
+UNKNOWN_SECRET_FIXTURES_HARD_GATE = True
 
 
 @dataclass(frozen=True)
@@ -31,6 +33,10 @@ class Classification:
 _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("onepassword", re.compile(r"op://", re.IGNORECASE)),
     ("bearer", re.compile(r"\bbearer\s+[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE)),
+    (
+        "authorization",
+        re.compile(r"\bauthorization\s*[:=]\s*(?:bearer\s+)?[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE),
+    ),
     ("aws", re.compile(r"\b(?:A3T|AKIA|ASIA|AGPA|AIDA|AROA)[A-Z0-9]{16}\b")),
     ("pem", re.compile(r"-{5}BEGIN [A-Z0-9 ]*PRIVATE KEY-{5}", re.IGNORECASE)),
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{8,}\b")),
@@ -41,6 +47,10 @@ _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
 )
 
+_HIGH_ENTROPY_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9+/=_-])([A-Za-z0-9+/=_-]{48,})(?![A-Za-z0-9+/=_-])")
+_HIGH_ENTROPY_MIN_UNIQUE_CHARS = 16
+_HIGH_ENTROPY_MIN_BITS_PER_CHAR = 4.5
+
 
 def contains_secret(text: str) -> str | None:
     """Return the first configured no-store secret class present in text."""
@@ -48,6 +58,8 @@ def contains_secret(text: str) -> str | None:
     for label, pattern in _SECRET_PATTERNS:
         if pattern.search(text):
             return label
+    if _contains_high_entropy_token(text):
+        return "high_entropy"
     return None
 
 
@@ -128,6 +140,24 @@ def _decode_utf8_prefix(raw: bytes, byte_count: int) -> str:
 
 def _decode_utf8_suffix(raw: bytes, byte_count: int) -> str:
     return raw[-byte_count:].decode("utf-8", errors="ignore")
+
+
+def _contains_high_entropy_token(text: str) -> bool:
+    for match in _HIGH_ENTROPY_TOKEN_RE.finditer(text):
+        token = match.group(1).strip("=")
+        if len(set(token)) < _HIGH_ENTROPY_MIN_UNIQUE_CHARS:
+            continue
+        if _shannon_entropy_per_char(token) >= _HIGH_ENTROPY_MIN_BITS_PER_CHAR:
+            return True
+    return False
+
+
+def _shannon_entropy_per_char(value: str) -> float:
+    if not value:
+        return 0.0
+    total = len(value)
+    counts = {char: value.count(char) for char in set(value)}
+    return -sum((count / total) * math.log2(count / total) for count in counts.values())
 
 
 def _content_class(text: str) -> str:

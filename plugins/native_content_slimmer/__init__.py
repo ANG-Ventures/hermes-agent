@@ -6,11 +6,11 @@ lossless slimming seams required by PRD #2 v2:
 - ``transform_terminal_output`` for full terminal output before truncation.
 - ``transform_tool_result`` for large non-terminal tool results.
 
-Secret detection is a heuristic guard, not a scanner guarantee. The plugin only
-blocks the documented patterns in ``classifier.contains_secret``; a
-non-matching secret can still be persisted inside an on-disk artifact. Treat
-``active_lossless`` as opt-in only where that limitation is acceptable and the
-``expand_artifact`` tool is reachable.
+Secret detection is a heuristic guard, not a scanner guarantee. The plugin
+blocks documented patterns in ``classifier.contains_secret`` plus a high-entropy
+fallback gate; a non-matching secret can still be persisted inside an on-disk
+artifact. Treat ``active_lossless`` as opt-in only where that limitation is
+acceptable and the ``expand_artifact`` tool is reachable.
 """
 
 from __future__ import annotations

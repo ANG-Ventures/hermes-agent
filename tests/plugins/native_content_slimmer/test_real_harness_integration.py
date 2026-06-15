@@ -14,6 +14,10 @@ def _large_terminal_payload() -> str:
     return "terminal-live-HEAD\n" + (("terminal-live-middle-" + "x" * 80 + "\n") * 650) + "terminal-live-TAIL\n"
 
 
+def _large_web_extract_payload() -> str:
+    return "web-extract-live-HEAD\n" + (("web-extract-live-middle-" + "x" * 80 + "\n") * 650) + "web-extract-live-TAIL\n"
+
+
 def _write_native_slimmer_config(home: Path, *, mode: str = "active_lossless") -> None:
     home.mkdir(parents=True, exist_ok=True)
     (home / "config.yaml").write_text(
@@ -165,3 +169,53 @@ def test_terminal_live_dispatch_consumes_marker_and_records_real_transcript_delt
         with terminal_tool._env_lock:
             terminal_tool._active_environments.clear()
             terminal_tool._last_activity.clear()
+
+
+def test_generic_web_extract_live_dispatch_consumes_marker_and_records_real_delta(monkeypatch, tmp_path) -> None:
+    from hermes_cli.plugins import discover_plugins, get_plugin_manager
+    from model_tools import handle_function_call
+    import tools.web_tools as web_tools
+
+    home = tmp_path / "home"
+    _write_native_slimmer_config(home)
+    token = set_hermes_home_override(home)
+    raw = _large_web_extract_payload()
+    original_result = json.dumps(
+        {"results": [{"url": "https://example.invalid/large", "title": "large", "content": raw, "error": None}]},
+        indent=2,
+        ensure_ascii=False,
+    )
+
+    async def fake_web_extract_tool(urls, format=None, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return original_result
+
+    monkeypatch.setattr(web_tools, "web_extract_tool", fake_web_extract_tool)
+    try:
+        discover_plugins(force=True)
+        manager = get_plugin_manager()
+        result = handle_function_call(
+            "web_extract",
+            {"urls": ["https://example.invalid/large"]},
+            task_id="web-extract-task",
+            session_id="sess-live-web-extract",
+            tool_call_id="call-live-web-extract",
+            turn_id="turn-live-web-extract",
+            api_request_id="api-live-web-extract",
+        )
+
+        assert MARKER_TOKEN in result
+        assert raw not in result
+        parsed = parse_marker(result)
+        assert parsed is not None
+        assert parsed.fields["session_id"] == "sess-live-web-extract"
+        assert parsed.fields["tool_call_id"] == "call-live-web-extract"
+
+        callback = manager._hooks["transform_tool_result"][0]
+        runtime = getattr(callback, "__self__")
+        event = runtime.telemetry_records[-1]
+        assert event["tool_name"] == "web_extract"
+        assert event["raw_source"] == "tool-result-returned"
+        assert event["saved_bytes"] == raw_byte_len(original_result) - raw_byte_len(result)
+    finally:
+        reset_hermes_home_override(token)
+        _clear_plugin_manager()

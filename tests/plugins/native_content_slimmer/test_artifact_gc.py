@@ -170,6 +170,36 @@ def test_gc_size_cap_eviction_never_removes_active_session_artifacts(tmp_path):
     assert result["over_cap"] is False
 
 
+def test_gc_size_cap_protects_active_session_after_path_normalization_collision(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    now = datetime(2026, 6, 14, tzinfo=timezone.utc)
+    active = store.write_artifact(
+        session_id="sess/1",
+        tool_call_id="keep",
+        raw_text="a" * 600,
+        created_at=_iso(now - timedelta(hours=3)),
+    )
+    inactive = store.write_artifact(
+        session_id="ended",
+        tool_call_id="evict",
+        raw_text="b" * 600,
+        created_at=_iso(now - timedelta(hours=2)),
+    )
+    active_size = store.artifact_file_size(active["artifact_id"], session_id="sess/1")
+
+    result = collect_garbage(
+        store.root,
+        max_bytes=active_size,
+        active_session_id="sess_1",
+        now=now,
+    )
+
+    assert store.path_for(active["artifact_id"], session_id="sess/1").exists()
+    assert not store.path_for(inactive["artifact_id"], session_id="ended").exists()
+    assert active["artifact_id"] not in {item["artifact_id"] for item in result["deleted"]}
+    assert inactive["artifact_id"] in {item["artifact_id"] for item in result["deleted"]}
+
+
 def test_gc_reports_over_cap_when_active_session_alone_exceeds_cap(tmp_path):
     store = ArtifactStore(tmp_path / "artifacts")
     active = store.write_artifact(session_id="active", tool_call_id="keep", raw_text="x" * 1000)

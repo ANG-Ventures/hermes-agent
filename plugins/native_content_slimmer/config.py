@@ -88,7 +88,8 @@ def load_slimmer_config(config: Mapping[str, Any] | None = None) -> NativeConten
             deny_on_status: [error]
             secret_policy: no_store_pass_through
 
-    Defaults are disabled + shadow. If the plugin block exists but has an
+    Defaults are disabled + shadow, and the code defaults here are authoritative
+    even where PRD prose shows broader lifecycle examples. If the plugin block exists but has an
     invalid type/value, return a disabled config so the plugin fails closed.
     Unknown keys are ignored to keep future config additions forward-compatible.
     """

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -83,7 +84,8 @@ class NativeContentSlimmerHooks:
         self.skip_reasons: list[str] = []
         self.gc_records: list[dict[str, Any]] = []
         self._write_count = 0
-        self._blocked_marker_keys: set[tuple[str, str, str]] = set()
+        self._blocked_marker_keys: dict[tuple[str, str, str], int] = {}
+        self._gc_threads: list[threading.Thread] = []
         if ledger is None and self.config.enabled:
             self._rehydrate_ledger_from_artifacts()
         if self.config.enabled and self.config.artifact_gc_on_start:
@@ -258,7 +260,7 @@ class NativeContentSlimmerHooks:
 
         raw_sha = sha256_text(raw_text)
         marker_key = (session_id, tool_call_id, raw_sha)
-        if marker_key in self._blocked_marker_keys:
+        if self._consume_blocked_marker_key(marker_key):
             return None
         existing = self.ledger.lookup(
             session_id=session_id,
@@ -273,11 +275,13 @@ class NativeContentSlimmerHooks:
                 artifact_id=existing.artifact_id,
                 marker=existing.marker,
             )
-            if marker is None:
-                self._blocked_marker_keys.add(marker_key)
+            if marker is not None:
+                if self.config.mode == "active_lossless":
+                    return marker
                 return None
-            if self.config.mode == "active_lossless":
-                return marker
+            self.ledger.discard(session_id=session_id, tool_call_id=tool_call_id, raw_sha256=raw_sha)
+            self._blocked_marker_keys[marker_key] = 1
+            self._record_skip("marker_reuse_verification_failed")
             return None
 
         classification = classify_tool_result(
@@ -410,7 +414,6 @@ class NativeContentSlimmerHooks:
             )
         except Exception:
             raw_sha256 = str(record["raw_sha256"])
-            self._blocked_marker_keys.add((session_id, tool_call_id, raw_sha256))
             self.ledger.discard(session_id=session_id, tool_call_id=tool_call_id, raw_sha256=raw_sha256)
             self._delete_untelemetried_artifact(
                 artifact_id=str(record["artifact_id"]),
@@ -536,6 +539,22 @@ class NativeContentSlimmerHooks:
     def _record_skip(self, reason: str) -> None:
         self.skip_reasons.append(str(reason or "unknown"))
 
+    def _consume_blocked_marker_key(self, marker_key: tuple[str, str, str]) -> bool:
+        remaining = self._blocked_marker_keys.get(marker_key)
+        if remaining is None:
+            return False
+        if remaining <= 1:
+            self._blocked_marker_keys.pop(marker_key, None)
+        else:
+            self._blocked_marker_keys[marker_key] = remaining - 1
+        self._record_skip("marker_reuse_suppressed")
+        logger.info(
+            "native_content_slimmer suppressed marker reuse for transiently blocked key session=%s tool_call=%s",
+            marker_key[0],
+            marker_key[1],
+        )
+        return True
+
     def _delete_untelemetried_artifact(self, *, artifact_id: str, session_id: str) -> None:
         """Best-effort rollback for artifacts whose telemetry emit failed."""
 
@@ -565,7 +584,18 @@ class NativeContentSlimmerHooks:
             return
         self._write_count += 1
         if self._write_count % every == 0:
-            self._run_gc(active_session_id=active_session_id)
+            self._run_gc_async(active_session_id=active_session_id)
+
+    def _run_gc_async(self, *, active_session_id: str | None) -> None:
+        self._gc_threads = [thread for thread in self._gc_threads if thread.is_alive()]
+        thread = threading.Thread(
+            target=self._run_gc,
+            kwargs={"active_session_id": active_session_id},
+            name="native-content-slimmer-gc",
+            daemon=True,
+        )
+        self._gc_threads.append(thread)
+        thread.start()
 
     def _run_gc(self, *, active_session_id: str | None) -> None:
         root = getattr(self.store, "root", None)

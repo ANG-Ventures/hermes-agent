@@ -62,7 +62,27 @@ def test_expand_artifact_denies_cross_session_access(tmp_path) -> None:
 
     result = _call({"id": record["artifact_id"]}, session_id="sess-other", store=store)
 
-    assert result == {"id": record["artifact_id"], "ok": False, "error": "not_authorized"}
+    assert result == {"id": record["artifact_id"], "ok": False, "error": "not_found"}
+
+
+def test_expand_artifact_cross_session_probe_is_indistinguishable_from_absent(tmp_path) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    empty_store = ArtifactStore(tmp_path / "empty-artifacts")
+    record = store.write_artifact(session_id="sess-owner", tool_call_id="call-1", raw_text="owned raw")
+
+    existing_elsewhere = _call({"id": record["artifact_id"]}, session_id="sess-other", store=store)
+    truly_absent = _call({"id": record["artifact_id"]}, session_id="sess-other", store=empty_store)
+
+    assert existing_elsewhere == truly_absent == {"id": record["artifact_id"], "ok": False, "error": "not_found"}
+
+
+def test_expand_artifact_denies_session_id_normalization_collision_cross_owner(tmp_path) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    record = store.write_artifact(session_id="sess/1", tool_call_id="call-1", raw_text="owned raw")
+
+    result = _call({"id": record["artifact_id"]}, session_id="sess_1", store=store)
+
+    assert result == {"id": record["artifact_id"], "ok": False, "error": "not_found"}
 
 
 def test_expand_artifact_denies_when_no_trusted_session_context_even_if_args_spoof_owner(tmp_path) -> None:

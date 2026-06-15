@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from typing import Any
 
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
@@ -129,9 +131,72 @@ def test_gc_after_write_every_runs_with_active_session_id(monkeypatch, tmp_path)
 
         assert parse_marker(first) is not None
         assert parse_marker(second) is not None
+        deadline = time.monotonic() + 1.0
+        while len(calls) < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        for thread in getattr(runtime, "_gc_threads", []):
+            thread.join(timeout=1.0)
         assert len(calls) == 1
         assert calls[0]["active_session_id"] == "sess-active-gc"
         assert calls[0]["max_bytes"] == 1
         assert calls[0]["ttl_days"] == 14
     finally:
+        reset_hermes_home_override(token)
+
+
+def test_gc_after_write_every_runs_off_the_tool_return_hot_path(monkeypatch, tmp_path) -> None:
+    import plugins.native_content_slimmer.hook as hook_mod
+
+    calls: list[dict[str, Any]] = []
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_collect_garbage(root=None, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append({"root": root, "thread": threading.current_thread().name, **kwargs})
+        started.set()
+        release.wait(timeout=1.0)
+        return {"ok": True, "over_cap": False, "deleted_count": 0}
+
+    monkeypatch.setattr(hook_mod, "collect_garbage", slow_collect_garbage, raising=False)
+    token = set_hermes_home_override(tmp_path / "home")
+    try:
+        ctx = FakeContext()
+        register(
+            ctx,
+            config={
+                "plugins": {
+                    "native_content_slimmer": {
+                        "enabled": True,
+                        "mode": "active_lossless",
+                        "artifact_ttl_days": 14,
+                        "artifact_max_bytes_per_profile": 1,
+                        "artifact_gc_on_start": False,
+                        "artifact_gc_after_write_every": 1,
+                    }
+                }
+            },
+        )
+        runtime = _runtime_from_hook(ctx)
+
+        t0 = time.monotonic()
+        marker = runtime.transform_tool_result(
+            tool_name="web_extract",
+            result=_large_payload("off-thread-gc"),
+            status="success",
+            session_id="sess-off-thread-gc",
+            tool_call_id="call-off-thread-gc",
+        )
+        elapsed = time.monotonic() - t0
+
+        assert parse_marker(marker) is not None
+        assert elapsed < 0.5
+        assert started.wait(timeout=1.0)
+        assert calls[0]["thread"] != threading.current_thread().name
+        assert calls[0]["active_session_id"] == "sess-off-thread-gc"
+    finally:
+        release.set()
+        runtime = locals().get("runtime")
+        if runtime is not None:
+            for thread in getattr(runtime, "_gc_threads", []):
+                thread.join(timeout=1.0)
         reset_hermes_home_override(token)
