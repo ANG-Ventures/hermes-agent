@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from plugins.native_content_slimmer.config import NativeContentSlimmerConfig
 from plugins.native_content_slimmer.hook import NativeContentSlimmerHooks
+from plugins.native_content_slimmer.store import ArtifactStore
 
 
 class ExplodingStore:
@@ -53,14 +54,17 @@ def test_terminal_hook_fails_open_when_artifact_write_raises() -> None:
     assert "store unavailable" in hooks.failures[-1]
 
 
-def test_hook_fails_open_when_classifier_raises(monkeypatch) -> None:
+def test_hook_fails_open_when_classifier_raises(monkeypatch, tmp_path) -> None:
     import plugins.native_content_slimmer.hook as hook_module
 
     def boom(**_: object) -> object:
         raise RuntimeError("classifier unavailable")
 
     monkeypatch.setattr(hook_module, "classify_tool_result", boom)
-    hooks = NativeContentSlimmerHooks(NativeContentSlimmerConfig(enabled=True, mode="shadow"))
+    hooks = NativeContentSlimmerHooks(
+        NativeContentSlimmerConfig(enabled=True, mode="shadow"),
+        store=ArtifactStore(tmp_path / "artifacts"),
+    )
 
     replacement = hooks.transform_tool_result(
         tool_name="web_extract",

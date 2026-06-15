@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, cast
 
 from plugins.blackbox.native_slimmer_schema import (
@@ -15,7 +17,7 @@ from plugins.blackbox.native_slimmer_schema import (
     VALID_RAW_SOURCES,
 )
 
-from .classifier import Classification, classify_tool_result
+from .classifier import Classification, classify_tool_result, deterministic_preview
 from .config import NativeContentSlimmerConfig
 from .marker import MarkerLedger, build_authenticated_marker, verify_marker_auth
 from .store import ArtifactStore, raw_byte_len, sha256_text
@@ -64,12 +66,62 @@ class NativeContentSlimmerHooks:
         self.config = config or NativeContentSlimmerConfig()
         self.store = store or ArtifactStore()
         self.ledger = ledger or MarkerLedger()
-        self.secret = secret if secret is not None else secrets.token_bytes(32)
+        if secret is not None:
+            self.secret = secret
+        elif self.config.enabled and hasattr(self.store, "root"):
+            self.secret = _load_or_create_signing_key(self.store.root)
+        else:
+            # Disabled module-level hooks and test doubles without a durable
+            # artifact root should stay inert/fail-open without touching profile
+            # storage at import/construction time.
+            self.secret = secrets.token_bytes(32)
         self.telemetry = telemetry if telemetry is not None else NativeSlimmerTelemetryBuffer()
         self.telemetry_records = getattr(self.telemetry, "records", [])
         self.shadow_records: list[SlimmerShadowRecord] = []
         self.failures: list[str] = []
         self._blocked_marker_keys: set[tuple[str, str, str]] = set()
+        if ledger is None and self.config.enabled:
+            self._rehydrate_ledger_from_artifacts()
+
+    def _rehydrate_ledger_from_artifacts(self) -> None:
+        """Rebuild marker auth entries from durable artifact records."""
+
+        try:
+            paths = list(self.store.iter_artifact_paths())
+        except Exception as exc:
+            self._record_failure(exc)
+            return
+        for path in paths:
+            try:
+                record = self.store.read_record(path.stem, session_id=path.parent.name)
+                raw_text = str(record.get("raw_text") or "")
+                raw_sha256 = str(record.get("raw_sha256") or "")
+                artifact_id = str(record.get("artifact_id") or path.stem)
+                session_id = str(record.get("session_id") or path.parent.name)
+                tool_call_id = str(record.get("tool_call_id") or "")
+                if not raw_text or not raw_sha256 or not artifact_id or not session_id or not tool_call_id:
+                    continue
+                original_bytes = int(record.get("raw_bytes") or raw_byte_len(raw_text))
+                shown_bytes = int(record.get("preview_bytes") or 0)
+                omitted_bytes = int(record.get("omitted_bytes") or max(0, original_bytes - shown_bytes))
+                preview = str(record.get("marker_preview") or "")
+                if not preview and shown_bytes > 0:
+                    preview = deterministic_preview(raw_text, preview_bytes=shown_bytes)
+                build_authenticated_marker(
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                    artifact_id=artifact_id,
+                    tool_name=str(record.get("tool_name") or ""),
+                    raw_sha256=raw_sha256,
+                    original_bytes=original_bytes,
+                    shown_bytes=shown_bytes,
+                    omitted_bytes=omitted_bytes,
+                    preview=preview,
+                    secret=self.secret,
+                    ledger=self.ledger,
+                )
+            except Exception as exc:
+                self._record_failure(exc)
 
     def transform_terminal_output(
         self,
@@ -279,6 +331,7 @@ class NativeContentSlimmerHooks:
             classification_reason=classification.reason,
             redaction_applied=False,
             metadata=artifact_metadata,
+            marker_preview=preview,
         )
         record = self._verify_persisted_artifact(
             record,
@@ -490,3 +543,77 @@ def _raw_source_from_kwargs(kwargs: dict[str, Any], *, default: str) -> str:
 def _stable_tool_call_id(tool_name: str, raw_text: str, hint: str | None = None) -> str:
     seed = "\n".join([tool_name or "tool", hint or "", sha256_text(raw_text)])
     return f"{tool_name or 'tool'}-{sha256_text(seed)[:12]}"
+
+
+_SIGNING_KEY_NAME = ".signing_key"
+
+
+def _load_or_create_signing_key(root: str | Path) -> bytes:
+    """Load the durable profile-scoped marker signing key, creating it once."""
+
+    root_path = Path(root)
+    key_path = root_path / _SIGNING_KEY_NAME
+    try:
+        return _read_signing_key(key_path)
+    except FileNotFoundError:
+        pass
+
+    root_path.mkdir(parents=True, exist_ok=True)
+    key = secrets.token_bytes(32)
+    tmp_path = key_path.with_name(f"{key_path.name}.tmp.{os.getpid()}.{secrets.token_hex(8)}")
+    fd: int | None = None
+    try:
+        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="ascii") as handle:
+            fd = None
+            handle.write(key.hex() + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(str(tmp_path), str(key_path))
+        except FileExistsError:
+            tmp_path.unlink()
+            return _read_signing_key(key_path)
+        tmp_path.unlink()
+        try:
+            os.chmod(key_path, 0o600)
+        except OSError:
+            pass
+        _fsync_directory(root_path)
+    except Exception:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return _read_signing_key(key_path)
+
+
+def _read_signing_key(path: Path) -> bytes:
+    text = path.read_text(encoding="ascii").strip()
+    key = bytes.fromhex(text)
+    if len(key) != 32:
+        raise RuntimeError(f"invalid native_content_slimmer signing key at {path}")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return key
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)

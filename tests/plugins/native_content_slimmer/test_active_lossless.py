@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import stat
 
 from plugins.native_content_slimmer.config import NativeContentSlimmerConfig
 from plugins.native_content_slimmer.hook import NativeContentSlimmerHooks
 from plugins.native_content_slimmer.marker import MARKER_TOKEN, parse_marker, verify_marker_auth
 from plugins.native_content_slimmer.store import ArtifactStore, sha256_text
+from plugins.native_content_slimmer.tools import handle_expand_artifact
 
 
 def _large_payload(label: str = "active") -> str:
@@ -136,3 +138,51 @@ def test_active_lossless_reuses_verified_marker_without_duplicate_artifact_or_te
     assert second == first
     assert len(hooks.telemetry_records) == 1
     assert len(list((tmp_path / "artifacts").glob("**/*.json"))) == 1
+
+
+def test_active_lossless_marker_survives_fresh_runtime_with_same_artifact_root(tmp_path) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    raw = _large_payload("durable")
+
+    process_a = NativeContentSlimmerHooks(
+        NativeContentSlimmerConfig(enabled=True, mode="active_lossless"),
+        store=store,
+    )
+    marker = process_a.transform_tool_result(
+        tool_name="web_extract",
+        result=raw,
+        status="success",
+        session_id="sess-durable",
+        tool_call_id="call-durable",
+    )
+
+    assert marker is not None
+    parsed = parse_marker(marker)
+    assert parsed is not None
+    signing_key = store.root / ".signing_key"
+    assert signing_key.exists()
+    assert stat.S_IMODE(signing_key.stat().st_mode) == 0o600
+
+    process_b = NativeContentSlimmerHooks(
+        NativeContentSlimmerConfig(enabled=True, mode="active_lossless"),
+        store=store,
+    )
+
+    assert process_b.secret == process_a.secret
+    verification = verify_marker_auth(marker, secret=process_b.secret, ledger=process_b.ledger)
+    assert verification.ok is True
+
+    reused = process_b.transform_tool_result(
+        tool_name="web_extract",
+        result=raw,
+        status="success",
+        session_id="sess-durable",
+        tool_call_id="call-durable",
+    )
+    assert reused == marker
+
+    expanded = json.loads(
+        handle_expand_artifact({"id": parsed.fields["id"]}, session_id="sess-durable", store=store)
+    )
+    assert expanded["ok"] is True
+    assert expanded["content"] == raw
