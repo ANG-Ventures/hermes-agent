@@ -200,3 +200,50 @@ def test_gc_after_write_every_runs_off_the_tool_return_hot_path(monkeypatch, tmp
             for thread in getattr(runtime, "_gc_threads", []):
                 thread.join(timeout=1.0)
         reset_hermes_home_override(token)
+
+
+def test_gc_async_is_single_flight_no_thread_fanout(monkeypatch, tmp_path) -> None:
+    """RC#3: _run_gc_async must NOT spawn a second GC thread while one is already
+    in flight — prevents daemon-thread fan-out when GC is slower than writes.
+    Drives _run_gc_async directly so the guard is exercised deterministically
+    (the full write path is gated by over-cap/B1 logic and can't prove this)."""
+    release = threading.Event()
+    entered = threading.Event()
+
+    def blocking_gc(*, active_session_id):  # type: ignore[no-untyped-def]
+        entered.set()
+        release.wait(timeout=2.0)
+
+    token = set_hermes_home_override(tmp_path / "home")
+    try:
+        ctx = FakeContext()
+        register(
+            ctx,
+            config={
+                "plugins": {
+                    "native_content_slimmer": {
+                        "enabled": True,
+                        "mode": "active_lossless",
+                        "artifact_gc_after_write_every": 1,
+                    }
+                }
+            },
+        )
+        runtime = _runtime_from_hook(ctx)
+        # Replace the GC body with a blocking stub so the first thread stays alive.
+        monkeypatch.setattr(runtime, "_run_gc", blocking_gc, raising=True)
+
+        runtime._run_gc_async(active_session_id="sess-sf")  # spawns thread #1
+        assert entered.wait(timeout=1.0)
+        runtime._run_gc_async(active_session_id="sess-sf")  # must be a no-op
+        runtime._run_gc_async(active_session_id="sess-sf")  # still a no-op
+
+        alive = [t for t in getattr(runtime, "_gc_threads", []) if t.is_alive()]
+        assert len(alive) == 1, f"expected single in-flight GC thread, got {len(alive)}"
+    finally:
+        release.set()
+        runtime = locals().get("runtime")
+        if runtime is not None:
+            for thread in getattr(runtime, "_gc_threads", []):
+                thread.join(timeout=2.0)
+        reset_hermes_home_override(token)

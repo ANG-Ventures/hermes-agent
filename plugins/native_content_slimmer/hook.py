@@ -634,7 +634,12 @@ class NativeContentSlimmerHooks:
             self._run_gc_async(active_session_id=active_session_id)
 
     def _run_gc_async(self, *, active_session_id: str | None) -> None:
+        # Single-flight: prune finished threads, then skip spawning if a GC pass
+        # is already in flight. Prevents daemon-thread fan-out when GC runs slower
+        # than writes arrive on a large/slow-disk profile (RC#3).
         self._gc_threads = [thread for thread in self._gc_threads if thread.is_alive()]
+        if self._gc_threads:
+            return
         thread = threading.Thread(
             target=self._run_gc,
             kwargs={"active_session_id": active_session_id},
