@@ -111,12 +111,13 @@ def test_user_message_append_clears_redo_only(db):
     hermes_undo.redo(sid, 1)
     state = hermes_undo.get_state(sid)
     assert len(state.redo_stack) == 1
+    state.undo_stack.append(hermes_undo.UndoOp(n=99, rewound_ids=[12345]))
 
     db.append_message(sid, "user", "new branch")
     hermes_undo.on_user_message_appended(sid)
 
     assert state.redo_stack == []
-    assert state.undo_stack == []
+    assert state.undo_stack == [hermes_undo.UndoOp(n=99, rewound_ids=[12345])]
 
 
 def test_new_undo_clears_redo_and_discarded_ops_are_unreachable(db):
@@ -193,3 +194,63 @@ def test_d13_plain_string_control_does_not_lower_target(db):
     assert result["rewound_ids"] == [a2]
     assert result["prefill_text"] == "editable"
     assert _active_ids(db, sid)[-1] == user
+
+
+def test_zero_non_other_none_return_noop_and_redo_stack_survives(db):
+    sid = _make_session(db)
+    db.append_message(sid, "system", "rules only")
+    state = hermes_undo.get_state(sid)
+    state.undo_stack.append(hermes_undo.UndoOp(n=7, rewound_ids=[700]))
+    state.redo_stack.append(hermes_undo.UndoOp(n=8, rewound_ids=[800]))
+
+    assert hermes_undo.compute_half_turn_target(db.get_messages(sid), 1) is None
+    result = hermes_undo.undo(sid, 1)
+
+    assert result["rewound_ids"] == []
+    assert result["prefill_text"] is None
+    assert result["message"] == "nothing to undo"
+    assert state.undo_stack == [hermes_undo.UndoOp(n=7, rewound_ids=[700])]
+    assert state.redo_stack == [hermes_undo.UndoOp(n=8, rewound_ids=[800])]
+    assert [m["active"] for m in db.get_messages(sid, include_inactive=True)] == [1]
+
+
+def test_tool_monotonicity_violation_raises_before_orphaning(db):
+    sid = _make_session(db)
+    db.append_message(sid, "user", "run")
+    assistant = db.append_message(sid, "assistant", None, tool_calls=[{"id": "ok"}])
+    tool = db.append_message(sid, "tool", "result", tool_call_id="ok")
+    assert tool > assistant
+
+    bad = _make_session(db, "bad-tool-order")
+    db.append_message(bad, "user", "run")
+    early_tool = db.append_message(bad, "tool", "too early", tool_call_id="call-1")
+    owner = db.append_message(
+        bad, "assistant", None, tool_calls=[{"id": "call-1"}]
+    )
+    assert early_tool < owner
+
+    with pytest.raises(ValueError, match="orphan"):
+        db.rewind_to_message(bad, owner, require_user_role=False)
+
+    rows = db.get_messages(bad)
+    assert [row["id"] for row in rows] == [m["id"] for m in rows]
+    assert all(row["active"] == 1 for row in rows)
+
+
+def test_redo_fail_loud_requires_each_op_restore_all_rewound_ids(monkeypatch, db):
+    sid = _make_session(db)
+    ids = _seed_three_half_turns(db, sid)
+    hermes_undo.undo(sid, 2)
+    op = hermes_undo.get_state(sid).undo_stack[-1]
+    assert set(op.rewound_ids) == {ids[2], ids[3]}
+
+    calls = []
+
+    def partial_restore(_sid, rewound_ids):
+        calls.append(list(rewound_ids))
+        return len(rewound_ids) - 1
+
+    monkeypatch.setattr(db, "restore_ids", partial_restore)
+    with pytest.raises(RuntimeError, match="restored 1 of 2 rewound rows"):
+        hermes_undo.redo(sid, 1)
+    assert calls == [[ids[2], ids[3]]]
