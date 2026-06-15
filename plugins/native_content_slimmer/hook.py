@@ -5,17 +5,28 @@ from __future__ import annotations
 import logging
 import secrets
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
+
+from plugins.blackbox.native_slimmer_schema import (
+    RAW_SOURCE_POST_RTK as _RAW_SOURCE_POST_RTK,
+    RAW_SOURCE_PRE_TRUNCATION_TERMINAL as _RAW_SOURCE_PRE_TRUNCATION_TERMINAL,
+    RAW_SOURCE_TOOL_CONTRACT_BOUNDED as _RAW_SOURCE_TOOL_CONTRACT_BOUNDED,
+    RAW_SOURCE_TOOL_RESULT_RETURNED as _RAW_SOURCE_TOOL_RESULT_RETURNED,
+    VALID_RAW_SOURCES,
+)
 
 from .classifier import Classification, classify_tool_result
 from .config import NativeContentSlimmerConfig
-from .marker import MarkerLedger, build_authenticated_marker
+from .marker import MarkerLedger, build_authenticated_marker, verify_marker_auth
 from .store import ArtifactStore, raw_byte_len, sha256_text
+from .telemetry import NativeSlimmerTelemetryBuffer, build_replacement_event, emit_event
 
 logger = logging.getLogger(__name__)
 
-RAW_SOURCE_TERMINAL_PRE_TRUNCATION = "pre-truncation-terminal"
-RAW_SOURCE_TOOL_RESULT_RETURNED = "tool-result-returned"
+RAW_SOURCE_TERMINAL_PRE_TRUNCATION = _RAW_SOURCE_PRE_TRUNCATION_TERMINAL
+RAW_SOURCE_POST_RTK = _RAW_SOURCE_POST_RTK
+RAW_SOURCE_TOOL_RESULT_RETURNED = _RAW_SOURCE_TOOL_RESULT_RETURNED
+RAW_SOURCE_TOOL_CONTRACT_BOUNDED = _RAW_SOURCE_TOOL_CONTRACT_BOUNDED
 _READ_FILE_TOOL = "read_file"
 _TERMINAL_TOOL = "terminal"
 _PREVIEW_STRATEGY = "head-tail-lines"
@@ -48,13 +59,17 @@ class NativeContentSlimmerHooks:
         store: ArtifactStore | None = None,
         ledger: MarkerLedger | None = None,
         secret: bytes | str | None = None,
+        telemetry: Any | None = None,
     ) -> None:
         self.config = config or NativeContentSlimmerConfig()
         self.store = store or ArtifactStore()
         self.ledger = ledger or MarkerLedger()
         self.secret = secret if secret is not None else secrets.token_bytes(32)
+        self.telemetry = telemetry if telemetry is not None else NativeSlimmerTelemetryBuffer()
+        self.telemetry_records = getattr(self.telemetry, "records", [])
         self.shadow_records: list[SlimmerShadowRecord] = []
         self.failures: list[str] = []
+        self._blocked_marker_keys: set[tuple[str, str, str]] = set()
 
     def transform_terminal_output(
         self,
@@ -77,10 +92,14 @@ class NativeContentSlimmerHooks:
                 kwargs.get("tool_call_id"),
                 _stable_tool_call_id(_TERMINAL_TOOL, output, command),
             )
+            raw_source = _raw_source_from_kwargs(
+                kwargs,
+                default=RAW_SOURCE_TERMINAL_PRE_TRUNCATION,
+            )
             return self._process_result(
                 tool_name=_TERMINAL_TOOL,
                 raw_text=output,
-                raw_source=RAW_SOURCE_TERMINAL_PRE_TRUNCATION,
+                raw_source=raw_source,
                 status=status,
                 session_id=session_id,
                 tool_call_id=tool_call_id,
@@ -118,16 +137,17 @@ class NativeContentSlimmerHooks:
                 # Terminal raw belongs to transform_terminal_output; this seam sees
                 # post-truncation terminal_tool output and must not double-count it.
                 return None
-            if name == _READ_FILE_TOOL:
-                # read_file is pagination-bounded by contract; no artifact can recover
-                # bytes outside the requested page, so do not emit an artifact marker.
-                return None
             session = _first_nonempty(session_id, task_id, "session")
             call_id = _first_nonempty(tool_call_id, _stable_tool_call_id(name or "tool", result))
+            raw_source = (
+                RAW_SOURCE_TOOL_CONTRACT_BOUNDED
+                if name == _READ_FILE_TOOL
+                else _raw_source_from_kwargs(_, default=RAW_SOURCE_TOOL_RESULT_RETURNED)
+            )
             return self._process_result(
                 tool_name=name,
                 raw_text=result,
-                raw_source=RAW_SOURCE_TOOL_RESULT_RETURNED,
+                raw_source=raw_source,
                 status=status or "success",
                 session_id=session,
                 tool_call_id=call_id,
@@ -159,6 +179,30 @@ class NativeContentSlimmerHooks:
         if not self.config.enabled:
             return None
         if not isinstance(raw_text, str) or raw_text == "":
+            return None
+
+        raw_sha = sha256_text(raw_text)
+        marker_key = (session_id, tool_call_id, raw_sha)
+        if marker_key in self._blocked_marker_keys:
+            return None
+        existing = self.ledger.lookup(
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+            raw_sha256=raw_sha,
+        )
+        if existing is not None:
+            marker = self._verified_existing_marker(
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                raw_sha256=raw_sha,
+                artifact_id=existing.artifact_id,
+                marker=existing.marker,
+            )
+            if marker is None:
+                self._blocked_marker_keys.add(marker_key)
+                return None
+            if self.config.mode == "active_lossless":
+                return marker
             return None
 
         classification = classify_tool_result(
@@ -236,6 +280,11 @@ class NativeContentSlimmerHooks:
             redaction_applied=False,
             metadata=artifact_metadata,
         )
+        record = self._verify_persisted_artifact(
+            record,
+            session_id=session_id,
+            raw_text=raw_text,
+        )
         marker = build_authenticated_marker(
             session_id=session_id,
             tool_call_id=tool_call_id,
@@ -250,6 +299,27 @@ class NativeContentSlimmerHooks:
             ledger=self.ledger,
         )
         marker_bytes = raw_byte_len(marker)
+        try:
+            self._emit_telemetry(
+                mode=self.config.mode,
+                action="would_replace" if self.config.mode == "shadow" else "replace",
+                tool_name=tool_name,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                artifact_id=str(record["artifact_id"]),
+                raw_sha256=str(record["raw_sha256"]),
+                raw_source=raw_source,
+                original_bytes=original_bytes,
+                emitted_bytes=marker_bytes,
+                classification_reason=classification.reason,
+                task_id=task_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+                tool_status=status,
+            )
+        except Exception:
+            self._blocked_marker_keys.add((session_id, tool_call_id, str(record["raw_sha256"])))
+            raise
         if self.config.mode == "shadow":
             self.shadow_records.append(
                 SlimmerShadowRecord(
@@ -267,6 +337,102 @@ class NativeContentSlimmerHooks:
                 )
             )
         return marker
+
+    def _verify_persisted_artifact(
+        self,
+        record: dict[str, Any],
+        *,
+        session_id: str,
+        raw_text: str,
+    ) -> dict[str, Any]:
+        """Read the final artifact back before any marker can be emitted."""
+
+        artifact_id = str(record.get("artifact_id") or "")
+        if not artifact_id:
+            raise RuntimeError("artifact store returned no artifact_id")
+        read_record = getattr(self.store, "read_record", None)
+        if not callable(read_record):
+            raise RuntimeError("artifact store cannot verify persisted artifacts")
+        verified_obj = read_record(artifact_id, session_id=session_id)
+        if not isinstance(verified_obj, dict):
+            raise RuntimeError(f"artifact verification returned non-object for {artifact_id}")
+        verified = cast(dict[str, Any], verified_obj)
+        if str(verified.get("raw_sha256") or "") != sha256_text(raw_text):
+            raise RuntimeError(f"artifact hash verification failed for {artifact_id}")
+        if verified.get("raw_text") != raw_text:
+            raise RuntimeError(f"artifact raw_text verification failed for {artifact_id}")
+        return dict(verified)
+
+    def _verified_existing_marker(
+        self,
+        *,
+        session_id: str,
+        tool_call_id: str,
+        raw_sha256: str,
+        artifact_id: str,
+        marker: str,
+    ) -> str | None:
+        """Return a reusable marker only when artifact + HMAC still verify."""
+
+        try:
+            read_record = getattr(self.store, "read_record", None)
+            if not callable(read_record):
+                return None
+            verified_obj = read_record(artifact_id, session_id=session_id)
+            if not isinstance(verified_obj, dict):
+                return None
+            verified_record = cast(dict[str, Any], verified_obj)
+            if str(verified_record.get("raw_sha256") or "") != raw_sha256:
+                return None
+            verification = verify_marker_auth(marker, secret=self.secret, ledger=self.ledger)
+            if not verification.ok:
+                return None
+            if verification.entry is None:
+                return None
+            if verification.entry.session_id != session_id or verification.entry.tool_call_id != tool_call_id:
+                return None
+            return marker
+        except Exception as exc:
+            self._record_failure(exc)
+            return None
+
+    def _emit_telemetry(
+        self,
+        *,
+        mode: str,
+        action: str,
+        tool_name: str,
+        session_id: str,
+        tool_call_id: str,
+        artifact_id: str,
+        raw_sha256: str,
+        raw_source: str,
+        original_bytes: int,
+        emitted_bytes: int,
+        classification_reason: str,
+        task_id: str,
+        turn_id: str,
+        api_request_id: str,
+        tool_status: str,
+    ) -> None:
+        event = build_replacement_event(
+            mode=mode,
+            action=action,
+            tool_name=tool_name,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+            artifact_id=artifact_id,
+            raw_sha256=raw_sha256,
+            raw_source=raw_source,
+            original_bytes=original_bytes,
+            emitted_bytes=emitted_bytes,
+            classification_reason=classification_reason,
+            task_id=task_id,
+            turn_id=turn_id,
+            api_request_id=api_request_id,
+            tool_status=tool_status,
+        )
+        emit_event(self.telemetry, event)
 
     def _record_failure(self, exc: Exception) -> None:
         message = str(exc) or exc.__class__.__name__
@@ -295,6 +461,30 @@ def _first_nonempty(*values: Any) -> str:
         if text:
             return text
     return "none"
+
+
+def _raw_source_from_kwargs(kwargs: dict[str, Any], *, default: str) -> str:
+    """Resolve raw_source from trusted hook metadata without guessing from text."""
+
+    explicit = kwargs.get("raw_source")
+    if explicit in VALID_RAW_SOURCES:
+        return str(explicit)
+    metadata = kwargs.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("raw_source") in VALID_RAW_SOURCES:
+        return str(metadata["raw_source"])
+
+    rtk_status = str(
+        kwargs.get("rtk_status")
+        or (metadata.get("rtk_status") if isinstance(metadata, dict) else "")
+        or ""
+    ).strip().lower()
+    rtk_applied = bool(
+        kwargs.get("rtk_applied")
+        or (metadata.get("rtk_applied") if isinstance(metadata, dict) else False)
+    )
+    if rtk_applied or rtk_status in {"applied", "compressed", "post-rtk", "rewritten"}:
+        return RAW_SOURCE_POST_RTK
+    return default
 
 
 def _stable_tool_call_id(tool_name: str, raw_text: str, hint: str | None = None) -> str:
