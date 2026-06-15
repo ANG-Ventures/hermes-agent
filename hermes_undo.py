@@ -194,5 +194,4 @@ def redo(session_id: str, m: int) -> Dict[str, Any]:
 
 def on_user_message_appended(session_id: str) -> None:
     state = get_state(session_id)
-    state.undo_stack.clear()
     state.redo_stack.clear()
