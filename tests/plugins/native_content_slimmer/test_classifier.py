@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+import plugins.native_content_slimmer as native_content_slimmer
 from plugins.native_content_slimmer.classifier import (
     DEFAULT_ALLOW_TOOLS,
     Classification,
@@ -66,6 +67,30 @@ def test_secret_shapes_are_no_store(label: str, text: str) -> None:
         preview=None,
         secret_match=label,
     )
+
+
+def test_plugin_docstring_documents_secret_detection_is_heuristic() -> None:
+    doc = native_content_slimmer.__doc__ or ""
+
+    assert "heuristic" in doc
+    assert "non-matching secret" in doc
+    assert "active_lossless" in doc
+
+
+def test_documented_secret_patterns_are_detected() -> None:
+    documented_examples = {
+        "onepassword": "op://Engineering/app/password",
+        "bearer": "Authorization: Bearer token-value-123456",
+        "aws": "AWS_ACCESS_KEY_ID=" + _aws_key(),
+        "pem": _pem_private_key(),
+        "jwt": "token=" + _jwt(),
+        "cookie": "Set-Cookie: sessionid=abc123",
+        "dsn": _dsn_with_password(),
+    }
+
+    assert {label: contains_secret(text) for label, text in documented_examples.items()} == {
+        label: label for label in documented_examples
+    }
 
 
 def test_contains_secret_returns_first_matching_label() -> None:
