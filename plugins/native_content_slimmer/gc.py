@@ -17,6 +17,8 @@ from plugins.native_content_slimmer.store import (
     utc_now_iso,
 )
 
+SIZE_CAP_RECENT_EXPANSION_GRACE_SECONDS = 60 * 60
+
 
 @dataclass(frozen=True)
 class ArtifactCandidate:
@@ -64,10 +66,13 @@ def collect_garbage(
 ) -> dict[str, Any]:
     """Run TTL and size-cap artifact GC.
 
-    Expired artifacts are removed first. Size-cap eviction then removes the
-    least-recently-expanded inactive artifacts and never evicts artifacts from
-    ``active_session_id`` on the cap path. If the active session alone exceeds
-    the cap, ``over_cap`` is reported and active artifacts remain intact.
+    TTL expiry is based on ``last_expanded_at`` so old-but-live artifacts are
+    retained while markers are still being used. Expired artifacts are removed
+    first. Size-cap eviction then removes the least-recently-expanded inactive
+    artifacts, but protects anything expanded within
+    ``SIZE_CAP_RECENT_EXPANSION_GRACE_SECONDS``. If the cap cannot be reached
+    without deleting active/recently-expanded artifacts, ``over_cap`` is
+    reported and those artifacts remain intact.
     """
 
     started = utc_now_iso()
@@ -91,7 +96,7 @@ def collect_garbage(
         if ttl_delta is not None:
             expiry_cutoff = now_dt - ttl_delta
             for candidate in list(candidates):
-                if candidate.created_at <= expiry_cutoff:
+                if candidate.last_expanded_at <= expiry_cutoff:
                     deleted.append(_delete_candidate(store, candidate, reason="ttl_expired", now=now_dt))
             if deleted:
                 deleted_ids = {item["artifact_id"] for item in deleted}
@@ -100,10 +105,12 @@ def collect_garbage(
         total_after_ttl = sum(candidate.size for candidate in candidates)
         total = total_after_ttl
         if max_bytes is not None and total > int(max_bytes):
+            recent_cutoff = now_dt - timedelta(seconds=SIZE_CAP_RECENT_EXPANSION_GRACE_SECONDS)
             inactive = [
                 candidate
                 for candidate in candidates
-                if not active_session_id or candidate.session_id != active_session_id
+                if (not active_session_id or candidate.session_id != active_session_id)
+                and candidate.last_expanded_at <= recent_cutoff
             ]
             inactive.sort(key=lambda c: (c.last_expanded_at, c.created_at, c.artifact_id))
             for candidate in inactive:
@@ -218,15 +225,6 @@ def _delete_candidate(
     except Exception:
         pass
 
-    candidate.path.unlink()
-    try:
-        # Best effort directory durability for the unlink; tombstone write also
-        # fsyncs its own rename below.
-        from plugins.native_content_slimmer.store import _fsync_dir  # local private durability helper
-
-        _fsync_dir(candidate.path.parent)
-    except Exception:
-        pass
     store.write_tombstone(
         artifact_id=candidate.artifact_id,
         session_id=candidate.session_id,
@@ -234,6 +232,15 @@ def _delete_candidate(
         deleted_at=deleted_at,
         metadata=metadata,
     )
+    candidate.path.unlink()
+    try:
+        # Best effort directory durability for the unlink; tombstone write also
+        # fsyncs its own rename above.
+        from plugins.native_content_slimmer.store import _fsync_dir  # local private durability helper
+
+        _fsync_dir(candidate.path.parent)
+    except Exception:
+        pass
     return {
         "artifact_id": candidate.artifact_id,
         "session_id": candidate.session_id,

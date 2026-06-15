@@ -11,6 +11,7 @@ from plugins.native_content_slimmer.store import (
     ArtifactNotFoundError,
     ArtifactStore,
     default_artifact_root,
+    parse_utc_iso,
     sha256_text,
 )
 
@@ -147,6 +148,29 @@ def test_expand_artifact_caps_returned_content_by_utf8_bytes(tmp_path):
     assert expanded["truncated"] is True
     assert expanded["bytes_returned"] <= 5
     assert expanded["content"].encode("utf-8") == "αβ".encode("utf-8")
+
+
+def test_expand_artifact_updates_last_expanded_at_for_gc_liveness(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    old = datetime(2026, 6, 13, tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+    record = store.write_artifact(
+        session_id="s",
+        tool_call_id="c",
+        raw_text="payload",
+        created_at=old,
+        last_expanded_at=old,
+    )
+
+    expanded = store.expand_artifact(record["artifact_id"], session_id="s")
+
+    assert expanded["ok"] is True
+    updated = store.read_record(record["artifact_id"], session_id="s")
+    assert updated["last_expanded_at"] != old
+    updated_at = parse_utc_iso(updated["last_expanded_at"])
+    old_at = parse_utc_iso(old)
+    assert updated_at is not None
+    assert old_at is not None
+    assert updated_at > old_at
 
 
 def test_created_at_can_be_supplied_for_lifecycle_records(tmp_path):

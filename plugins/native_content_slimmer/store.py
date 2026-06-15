@@ -284,6 +284,8 @@ class ArtifactStore:
                 continue
             break
 
+        created_timestamp = created_at or utc_now_iso()
+        last_expanded_timestamp = extra.pop("last_expanded_at", None) or created_timestamp
         record: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "artifact_id": candidate_id,
@@ -294,7 +296,8 @@ class ArtifactStore:
             "tool_call_id": tool_call_id,
             "tool_name": tool_name or "",
             "tool_status": tool_status or _DEFAULT_TOOL_STATUS,
-            "created_at": created_at or utc_now_iso(),
+            "created_at": created_timestamp,
+            "last_expanded_at": last_expanded_timestamp,
             "raw_sha256": digest,
             "raw_bytes": raw_byte_len(raw_text),
             "raw_text": raw_text,
@@ -358,6 +361,12 @@ class ArtifactStore:
                 range_start=range_start,
                 range_end=range_end,
                 max_bytes=max_bytes,
+            )
+            updated = dict(record)
+            updated["last_expanded_at"] = utc_now_iso()
+            self._write_record_and_verify(
+                self.path_for(str(record["artifact_id"]), session_id=str(record["session_id"])),
+                updated,
             )
             return {
                 "id": artifact_id,

@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
-from plugins.native_content_slimmer.gc import collect_garbage, gc_status_path
+import pytest
+
+from plugins.native_content_slimmer.gc import ArtifactCandidate, _delete_candidate, collect_garbage, gc_status_path
 from plugins.native_content_slimmer.health import check_artifact_store_health
 from plugins.native_content_slimmer.store import ArtifactStore
 
@@ -48,6 +50,87 @@ def test_gc_removes_expired_artifacts_and_leaves_gone_tombstone(tmp_path):
     assert gone["reason"] == "ttl_expired"
 
 
+def test_gc_ttl_respects_recent_last_expanded_at_not_created_at(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    now = datetime(2026, 6, 14, tzinfo=timezone.utc)
+    recent_use = store.write_artifact(
+        session_id="ended",
+        tool_call_id="recent-use",
+        raw_text="recently used payload",
+        created_at=_iso(now - timedelta(days=30)),
+        last_expanded_at=_iso(now - timedelta(milliseconds=1)),
+    )
+
+    result = collect_garbage(store.root, ttl_seconds=0.01, now=now)
+
+    assert result["deleted_count"] == 0
+    assert store.path_for(recent_use["artifact_id"], session_id="ended").exists()
+
+
+def test_gc_size_cap_preserves_recently_expanded_inactive_artifacts(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    now = datetime(2026, 6, 14, tzinfo=timezone.utc)
+    stale = store.write_artifact(
+        session_id="ended-a",
+        tool_call_id="stale",
+        raw_text="a" * 600,
+        created_at=_iso(now - timedelta(days=2)),
+        last_expanded_at=_iso(now - timedelta(days=2)),
+    )
+    recent = store.write_artifact(
+        session_id="ended-b",
+        tool_call_id="recent",
+        raw_text="b" * 600,
+        created_at=_iso(now - timedelta(days=2)),
+        last_expanded_at=_iso(now - timedelta(seconds=1)),
+    )
+
+    result = collect_garbage(store.root, max_bytes=1, now=now)
+
+    assert not store.path_for(stale["artifact_id"], session_id="ended-a").exists()
+    assert store.path_for(recent["artifact_id"], session_id="ended-b").exists()
+    assert stale["artifact_id"] in {item["artifact_id"] for item in result["deleted"]}
+    assert recent["artifact_id"] not in {item["artifact_id"] for item in result["deleted"]}
+    assert result["over_cap"] is True
+
+
+def test_delete_candidate_writes_tombstone_before_unlink_so_crash_reports_gone(tmp_path, monkeypatch):
+    store = ArtifactStore(tmp_path / "artifacts")
+    now = datetime(2026, 6, 14, tzinfo=timezone.utc)
+    record = store.write_artifact(
+        session_id="ended",
+        tool_call_id="crash",
+        raw_text="payload that is about to be evicted",
+        created_at=_iso(now - timedelta(days=2)),
+    )
+    path = store.path_for(record["artifact_id"], session_id="ended")
+    candidate = ArtifactCandidate(
+        artifact_id=record["artifact_id"],
+        session_id="ended",
+        path=path,
+        size=path.stat().st_size,
+        created_at=now - timedelta(days=2),
+        last_expanded_at=now - timedelta(days=2),
+    )
+    original_unlink = type(path).unlink
+
+    def crash_after_artifact_unlink(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if self == path:
+            original_unlink(self, *args, **kwargs)
+            raise RuntimeError("simulated crash after unlink")
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(path), "unlink", crash_after_artifact_unlink)
+
+    with pytest.raises(RuntimeError, match="simulated crash after unlink"):
+        _delete_candidate(store, candidate, reason="ttl_expired", now=now)
+
+    gone = store.expand_artifact(record["artifact_id"], session_id="ended")
+    assert gone["ok"] is False
+    assert gone["error"] == "gone"
+    assert gone["reason"] == "ttl_expired"
+
+
 def test_gc_size_cap_eviction_never_removes_active_session_artifacts(tmp_path):
     store = ArtifactStore(tmp_path / "artifacts")
     now = datetime(2026, 6, 14, tzinfo=timezone.utc)
@@ -55,13 +138,13 @@ def test_gc_size_cap_eviction_never_removes_active_session_artifacts(tmp_path):
         session_id="ended-a",
         tool_call_id="old",
         raw_text="a" * 600,
-        created_at=_iso(now - timedelta(minutes=10)),
+        created_at=_iso(now - timedelta(hours=3)),
     )
     inactive_new = store.write_artifact(
         session_id="ended-b",
         tool_call_id="new",
         raw_text="b" * 600,
-        created_at=_iso(now - timedelta(minutes=5)),
+        created_at=_iso(now - timedelta(hours=2)),
     )
     active = store.write_artifact(
         session_id="active",
