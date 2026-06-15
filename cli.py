@@ -9200,15 +9200,30 @@ class HermesCLI:
                 if len(matches) > 1:
                     # Prefer an exact match (typed the full command name)
                     exact = [c for c in matches if c == typed_base]
+                    builtin_matches = [c for c in matches if c in COMMANDS]
+                    skill_matches = [c for c in matches if c not in COMMANDS]
                     if len(exact) == 1:
                         matches = exact
-                    else:
-                        # Prefer the unique shortest match:
-                        # /qui → /quit (5) wins over /quint-pipeline (15)
-                        min_len = min(len(c) for c in matches)
-                        shortest = [c for c in matches if len(c) == min_len]
-                        if len(shortest) == 1:
-                            matches = shortest
+                    elif len(builtin_matches) == 1:
+                        # A single built-in command is uniquely identified — prefer it
+                        # over any longer skill/bundle names that share the prefix:
+                        # /qui → /quit wins over the /quint-pipeline skill;
+                        # /con → /config.
+                        matches = builtin_matches
+                    elif len(builtin_matches) > 1:
+                        # Multiple built-ins share the prefix. Resolve to the shortest
+                        # ONLY when it is itself a prefix of every other match — i.e.
+                        # the others are extensions of one base command
+                        # (/sta → /status, with /statusbar an extension). When the
+                        # matches are unrelated siblings (/re → /redo, /reset, /retry)
+                        # there is no such base, so we stay ambiguous instead of
+                        # silently picking the shortest by length alone.
+                        shortest = min(builtin_matches, key=len)
+                        if all(c.startswith(shortest) for c in builtin_matches):
+                            matches = [shortest]
+                    elif not builtin_matches and len(skill_matches) == 1:
+                        # No built-in matched but exactly one skill/bundle did.
+                        matches = skill_matches
                 if len(matches) == 1:
                     # Expand the prefix to the full command name, preserving arguments.
                     # Guard against redispatching the same token to avoid infinite
