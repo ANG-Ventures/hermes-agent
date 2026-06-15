@@ -40,6 +40,7 @@ def build_replacement_event(
     turn_id: str = "",
     api_request_id: str = "",
     tool_status: str = "success",
+    status_quo_baseline_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Build the Blackbox-native telemetry row for one replacement decision."""
 
@@ -60,6 +61,7 @@ def build_replacement_event(
         turn_id=turn_id,
         api_request_id=api_request_id,
         tool_status=tool_status,
+        status_quo_baseline_bytes=status_quo_baseline_bytes,
     )
 
 

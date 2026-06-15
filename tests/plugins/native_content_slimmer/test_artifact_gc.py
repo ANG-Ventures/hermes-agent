@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import plugins.native_content_slimmer.gc as gc_module
 from plugins.native_content_slimmer.gc import ArtifactCandidate, _delete_candidate, collect_garbage, gc_status_path
 from plugins.native_content_slimmer.health import check_artifact_store_health
 from plugins.native_content_slimmer.store import ArtifactStore
@@ -168,6 +169,59 @@ def test_gc_size_cap_eviction_never_removes_active_session_artifacts(tmp_path):
     assert result["active_session_bytes"] == active_size
     assert result["bytes_after"] == active_size
     assert result["over_cap"] is False
+
+
+def test_gc_ttl_eviction_never_removes_active_session_artifacts(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    now = datetime(2026, 6, 14, tzinfo=timezone.utc)
+    inactive = store.write_artifact(
+        session_id="ended",
+        tool_call_id="old",
+        raw_text="inactive old payload",
+        created_at=_iso(now - timedelta(days=30)),
+        last_expanded_at=_iso(now - timedelta(days=30)),
+    )
+    active = store.write_artifact(
+        session_id="active",
+        tool_call_id="keep",
+        raw_text="active old payload",
+        created_at=_iso(now - timedelta(days=30)),
+        last_expanded_at=_iso(now - timedelta(days=30)),
+    )
+    active_size = store.artifact_file_size(active["artifact_id"], session_id="active")
+
+    result = collect_garbage(
+        store.root,
+        ttl_seconds=24 * 60 * 60,
+        active_session_id="active",
+        now=now,
+    )
+
+    assert store.path_for(active["artifact_id"], session_id="active").exists()
+    assert not store.path_for(inactive["artifact_id"], session_id="ended").exists()
+    assert store.expand_artifact(active["artifact_id"], session_id="active")["ok"] is True
+    assert active["artifact_id"] not in {item["artifact_id"] for item in result["deleted"]}
+    assert inactive["artifact_id"] in {item["artifact_id"] for item in result["deleted"]}
+    assert result["active_session_bytes"] == active_size
+
+
+def test_gc_candidate_scan_does_not_re_read_unchanged_artifacts(tmp_path, monkeypatch):
+    store = ArtifactStore(tmp_path / "artifacts")
+    first = store.write_artifact(session_id="ended-a", tool_call_id="a", raw_text="a" * 600)
+    second = store.write_artifact(session_id="ended-b", tool_call_id="b", raw_text="b" * 600)
+    read_counts: dict[str, int] = {}
+
+    class CountingStore(ArtifactStore):
+        def read_record(self, artifact_id: str, *, session_id: str | None = None):  # type: ignore[no-untyped-def]
+            read_counts[artifact_id] = read_counts.get(artifact_id, 0) + 1
+            return super().read_record(artifact_id, session_id=session_id)
+
+    monkeypatch.setattr(gc_module, "ArtifactStore", CountingStore)
+
+    result = gc_module.collect_garbage(store.root, max_bytes=10_000_000)
+
+    assert result["deleted_count"] == 0
+    assert read_counts == {first["artifact_id"]: 1, second["artifact_id"]: 1}
 
 
 def test_gc_size_cap_protects_active_session_after_path_normalization_collision(tmp_path):

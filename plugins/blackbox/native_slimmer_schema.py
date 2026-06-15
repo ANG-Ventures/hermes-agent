@@ -49,9 +49,15 @@ class NativeSlimmerTelemetryEvent:
     original_bytes: int
     emitted_bytes: int
     saved_bytes: int
+    status_quo_bytes: int
+    saved_vs_raw_bytes: int
+    saved_vs_status_quo_bytes: int
     original_tokens_est: int
+    status_quo_tokens_est: int
     emitted_tokens_est: int
     saved_tokens_est: int
+    saved_vs_raw_tokens_est: int
+    saved_vs_status_quo_tokens_est: int
     tokenizer_label: str
     token_estimate_kind: str
     lossy: bool
@@ -97,13 +103,16 @@ def build_native_slimmer_event(
     api_request_id: str = "",
     tool_status: str = "success",
     tokenizer_label: str = TOKENIZER_LABEL_UTF8_BYTES_DIV_4,
+    status_quo_baseline_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Build a validated native-slimmer telemetry event dict.
 
-    Savings are computed as the single native boundary delta
-    ``original_bytes - emitted_bytes`` for this exact artifact identity. They
-    are never an additive upstream+native claim, and repeated rows carry the
-    same ``savings_key`` so rollups can mechanically dedupe them.
+    Savings are computed as the single native boundary delta for this exact
+    artifact identity. ``saved_bytes`` is the status-quo delta when a caller
+    supplies a pre-existing truncation baseline (for example terminal output),
+    while ``saved_vs_raw_bytes`` preserves the full raw delta for diagnostics.
+    Repeated rows carry the same ``savings_key`` so rollups can mechanically
+    dedupe them.
     """
 
     mode = str(mode or "")
@@ -118,10 +127,19 @@ def build_native_slimmer_event(
 
     original = max(0, int(original_bytes or 0))
     emitted = max(0, int(emitted_bytes or 0))
-    saved = max(0, original - emitted)
+    if status_quo_baseline_bytes is None:
+        status_quo = original
+    else:
+        status_quo = min(original, max(0, int(status_quo_baseline_bytes or 0)))
+    saved_vs_raw = max(0, original - emitted)
+    saved_vs_status_quo = max(0, status_quo - emitted)
+    saved = saved_vs_status_quo
     original_tokens = estimate_tokens_from_bytes(original)
+    status_quo_tokens = estimate_tokens_from_bytes(status_quo)
     emitted_tokens = estimate_tokens_from_bytes(emitted)
-    saved_tokens = max(0, original_tokens - emitted_tokens)
+    saved_vs_raw_tokens = max(0, original_tokens - emitted_tokens)
+    saved_vs_status_quo_tokens = max(0, status_quo_tokens - emitted_tokens)
+    saved_tokens = saved_vs_status_quo_tokens
     artifact = str(artifact_id or "")
     session = str(session_id or "")
     call = str(tool_call_id or "")
@@ -141,9 +159,15 @@ def build_native_slimmer_event(
         original_bytes=original,
         emitted_bytes=emitted,
         saved_bytes=saved,
+        status_quo_bytes=status_quo,
+        saved_vs_raw_bytes=saved_vs_raw,
+        saved_vs_status_quo_bytes=saved_vs_status_quo,
         original_tokens_est=original_tokens,
+        status_quo_tokens_est=status_quo_tokens,
         emitted_tokens_est=emitted_tokens,
         saved_tokens_est=saved_tokens,
+        saved_vs_raw_tokens_est=saved_vs_raw_tokens,
+        saved_vs_status_quo_tokens_est=saved_vs_status_quo_tokens,
         tokenizer_label=str(tokenizer_label or TOKENIZER_LABEL_UTF8_BYTES_DIV_4),
         token_estimate_kind=TOKEN_ESTIMATE_KIND,
         lossy=bool(lossy),

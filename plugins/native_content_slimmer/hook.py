@@ -21,6 +21,7 @@ from plugins.blackbox.native_slimmer_schema import (
 from .classifier import Classification, classify_tool_result, deterministic_preview
 from .config import NativeContentSlimmerConfig
 from .gc import collect_garbage
+from .health import check_artifact_store_health
 from .marker import MarkerLedger, build_authenticated_marker, verify_marker_auth
 from .store import ArtifactStore, raw_byte_len, safe_component, sha256_text
 from .telemetry import NativeSlimmerTelemetryBuffer, build_replacement_event, emit_event
@@ -312,6 +313,8 @@ class NativeContentSlimmerHooks:
             metadata=metadata,
             classification=classification,
         )
+        if marker is None:
+            return None
 
         if self.config.mode == "shadow":
             return None
@@ -334,7 +337,12 @@ class NativeContentSlimmerHooks:
         duration_ms: float | int | None,
         metadata: dict[str, Any],
         classification: Classification,
-    ) -> str:
+    ) -> str | None:
+        skip_reason = self._active_artifact_store_skip_reason(session_id=session_id)
+        if skip_reason is not None:
+            self._record_skip(skip_reason)
+            return None
+
         preview = classification.preview or ""
         preview_bytes = raw_byte_len(preview)
         original_bytes = raw_byte_len(raw_text)
@@ -411,6 +419,10 @@ class NativeContentSlimmerHooks:
                 turn_id=turn_id,
                 api_request_id=api_request_id,
                 tool_status=status,
+                status_quo_baseline_bytes=_status_quo_baseline_bytes(
+                    raw_source=raw_source,
+                    original_bytes=original_bytes,
+                ),
             )
         except Exception:
             raw_sha256 = str(record["raw_sha256"])
@@ -439,6 +451,39 @@ class NativeContentSlimmerHooks:
             )
         self._maybe_gc_after_write(active_session_id=session_id)
         return marker
+
+    def _active_artifact_store_skip_reason(self, *, session_id: str) -> str | None:
+        if self.config.mode != "active_lossless":
+            return None
+        root = getattr(self.store, "root", None)
+        if root is None:
+            return None
+        max_bytes = self.config.artifact_max_bytes_per_profile
+        try:
+            health = check_artifact_store_health(
+                root,
+                max_bytes=max_bytes,
+                active_session_id=session_id,
+            )
+            if not bool(health.get("writable")):
+                return "artifact_store_unwritable"
+            if not bool(health.get("over_cap")):
+                return None
+            if int(health.get("ended_session_bytes") or 0) > 0:
+                self._run_gc(active_session_id=session_id)
+                health = check_artifact_store_health(
+                    root,
+                    max_bytes=max_bytes,
+                    active_session_id=session_id,
+                )
+                if not bool(health.get("writable")):
+                    return "artifact_store_unwritable"
+            if bool(health.get("over_cap")):
+                return "artifact_store_over_cap"
+            return None
+        except Exception as exc:
+            self._record_failure(exc)
+            return "artifact_store_unwritable"
 
     def _verify_persisted_artifact(
         self,
@@ -516,6 +561,7 @@ class NativeContentSlimmerHooks:
         turn_id: str,
         api_request_id: str,
         tool_status: str,
+        status_quo_baseline_bytes: int | None = None,
     ) -> None:
         event = build_replacement_event(
             mode=mode,
@@ -533,6 +579,7 @@ class NativeContentSlimmerHooks:
             turn_id=turn_id,
             api_request_id=api_request_id,
             tool_status=tool_status,
+            status_quo_baseline_bytes=status_quo_baseline_bytes,
         )
         emit_event(self.telemetry, event)
 
@@ -653,6 +700,20 @@ def _call_identity_artifact_id(*, session_id: str, tool_call_id: str) -> str:
         f"art_{safe_component(session_id, fallback='session')}_"
         f"{safe_component(tool_call_id, fallback='tool_call')}"
     )
+
+
+def _status_quo_baseline_bytes(*, raw_source: str, original_bytes: int) -> int | None:
+    if raw_source != RAW_SOURCE_TERMINAL_PRE_TRUNCATION:
+        return None
+    try:
+        from tools.tool_output_limits import get_max_bytes
+
+        cap = int(get_max_bytes())
+    except Exception:
+        return None
+    if cap <= 0:
+        return None
+    return min(max(0, int(original_bytes or 0)), cap)
 
 
 def _raw_source_from_kwargs(kwargs: dict[str, Any], *, default: str) -> str:

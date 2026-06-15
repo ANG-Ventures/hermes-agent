@@ -105,7 +105,7 @@ def test_gc_after_write_every_runs_with_active_session_id(monkeypatch, tmp_path)
                         "enabled": True,
                         "mode": "active_lossless",
                         "artifact_ttl_days": 14,
-                        "artifact_max_bytes_per_profile": 1,
+                        "artifact_max_bytes_per_profile": 1000000,
                         "artifact_gc_on_start": False,
                         "artifact_gc_after_write_every": 2,
                     }
@@ -138,7 +138,7 @@ def test_gc_after_write_every_runs_with_active_session_id(monkeypatch, tmp_path)
             thread.join(timeout=1.0)
         assert len(calls) == 1
         assert calls[0]["active_session_id"] == "sess-active-gc"
-        assert calls[0]["max_bytes"] == 1
+        assert calls[0]["max_bytes"] == 1000000
         assert calls[0]["ttl_days"] == 14
     finally:
         reset_hermes_home_override(token)

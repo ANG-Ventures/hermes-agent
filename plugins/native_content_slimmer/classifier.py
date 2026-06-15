@@ -47,6 +47,7 @@ _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
 )
 
+_LONG_HEX_TOKEN_RE = re.compile(r"(?<![A-Fa-f0-9])([A-Fa-f0-9]{40,})(?![A-Fa-f0-9])")
 _HIGH_ENTROPY_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9+/=_-])([A-Za-z0-9+/=_-]{48,})(?![A-Za-z0-9+/=_-])")
 _HIGH_ENTROPY_MIN_UNIQUE_CHARS = 16
 _HIGH_ENTROPY_MIN_BITS_PER_CHAR = 4.5
@@ -58,6 +59,8 @@ def contains_secret(text: str) -> str | None:
     for label, pattern in _SECRET_PATTERNS:
         if pattern.search(text):
             return label
+    if _LONG_HEX_TOKEN_RE.search(text):
+        return "long_hex"
     if _contains_high_entropy_token(text):
         return "high_entropy"
     return None

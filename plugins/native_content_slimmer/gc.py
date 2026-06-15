@@ -100,15 +100,18 @@ def collect_garbage(
     try:
         candidates = _load_candidates(root_path)
         bytes_before = sum(candidate.size for candidate in candidates)
+        deleted_keys: set[tuple[str, str]] = set()
 
         if ttl_delta is not None:
             expiry_cutoff = now_dt - ttl_delta
             for candidate in list(candidates):
+                if _same_gc_owner(candidate.session_id, active_session_id):
+                    continue
                 if candidate.last_expanded_at <= expiry_cutoff:
                     deleted.append(_delete_candidate(store, candidate, reason="ttl_expired", now=now_dt))
-            if deleted:
-                deleted_ids = {item["artifact_id"] for item in deleted}
-                candidates = [c for c in _load_candidates(root_path) if c.artifact_id not in deleted_ids]
+                    deleted_keys.add((candidate.session_id, candidate.artifact_id))
+            if deleted_keys:
+                candidates = [c for c in candidates if (c.session_id, c.artifact_id) not in deleted_keys]
 
         total_after_ttl = sum(candidate.size for candidate in candidates)
         total = total_after_ttl
@@ -126,9 +129,10 @@ def collect_garbage(
                     break
                 deleted_item = _delete_candidate(store, candidate, reason="size_cap", now=now_dt)
                 deleted.append(deleted_item)
+                deleted_keys.add((candidate.session_id, candidate.artifact_id))
                 total -= candidate.size
 
-        remaining = _load_candidates(root_path)
+        remaining = [c for c in candidates if (c.session_id, c.artifact_id) not in deleted_keys]
         active_bytes = sum(
             candidate.size
             for candidate in remaining

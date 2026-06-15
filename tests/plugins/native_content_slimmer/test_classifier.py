@@ -116,6 +116,7 @@ def test_documented_secret_patterns_are_detected() -> None:
     [
         ("pem", _pem_private_key_crlf()),
         ("high_entropy", "blob=" + _high_entropy_base64_blob()),
+        ("long_hex", "hex_token=" + ("0123456789abcdef" * 4)),
         ("authorization", "authorization=" + "tokenvalue123456789"),
     ],
 )

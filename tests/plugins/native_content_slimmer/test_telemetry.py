@@ -71,6 +71,37 @@ def test_active_replacement_emits_blackbox_telemetry_with_labeled_token_estimate
     assert event["artifact_id"] == parsed.fields["id"]
 
 
+def test_terminal_saved_bytes_status_quo_uses_truncation_cap(tmp_path, monkeypatch) -> None:
+    import tools.tool_output_limits as output_limits
+
+    monkeypatch.setattr(output_limits, "get_max_bytes", lambda: 50_000)
+    store = ArtifactStore(tmp_path / "artifacts")
+    hooks = NativeContentSlimmerHooks(
+        NativeContentSlimmerConfig(enabled=True, mode="active_lossless"),
+        store=store,
+        secret=b"terminal-status-quo-test-secret",
+    )
+    raw = "terminal-status-quo-HEAD\n" + ("x" * 55_000) + "\nterminal-status-quo-TAIL\n"
+
+    replacement = hooks.transform_terminal_output(
+        command="python emit_large_terminal.py",
+        output=raw,
+        returncode=0,
+        task_id="task-terminal-status-quo",
+        session_id="sess-terminal-status-quo",
+        tool_call_id="call-terminal-status-quo",
+    )
+
+    assert replacement is not None
+    event = hooks.telemetry_records[0]
+    marker_bytes = raw_byte_len(replacement)
+    assert event["original_bytes"] == raw_byte_len(raw)
+    assert event["status_quo_bytes"] == 50_000
+    assert event["saved_vs_raw_bytes"] == max(0, raw_byte_len(raw) - marker_bytes)
+    assert event["saved_vs_status_quo_bytes"] == max(0, 50_000 - marker_bytes)
+    assert event["saved_bytes"] == event["saved_vs_status_quo_bytes"]
+
+
 def test_raw_source_enum_accepts_only_p0_values() -> None:
     for raw_source in VALID_RAW_SOURCES:
         event = build_native_slimmer_event(

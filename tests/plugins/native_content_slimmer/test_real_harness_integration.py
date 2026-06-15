@@ -162,7 +162,9 @@ def test_terminal_live_dispatch_consumes_marker_and_records_real_transcript_delt
         event = runtime.telemetry_records[-1]
         assert event["tool_name"] == "terminal"
         assert event["raw_source"] == "pre-truncation-terminal"
-        assert event["saved_bytes"] == raw_byte_len(raw) - raw_byte_len(transcript)
+        assert event["saved_vs_raw_bytes"] == raw_byte_len(raw) - raw_byte_len(transcript)
+        assert event["status_quo_bytes"] == 50_000
+        assert event["saved_bytes"] == max(0, 50_000 - raw_byte_len(transcript))
     finally:
         reset_hermes_home_override(token)
         _clear_plugin_manager()

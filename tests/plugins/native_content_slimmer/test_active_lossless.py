@@ -87,6 +87,41 @@ def test_active_lossless_requires_enabled_config(tmp_path) -> None:
     assert list((tmp_path / "artifacts").glob("**/*.json")) == []
 
 
+def test_active_lossless_skips_over_cap_active_store_without_marker(tmp_path) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    existing = store.write_artifact(
+        session_id="sess-over-cap",
+        tool_call_id="call-existing",
+        raw_text="existing-active-artifact\n" * 200,
+    )
+    existing_size = store.artifact_file_size(existing["artifact_id"], session_id="sess-over-cap")
+    hooks = NativeContentSlimmerHooks(
+        NativeContentSlimmerConfig(
+            enabled=True,
+            mode="active_lossless",
+            artifact_max_bytes_per_profile=max(1, existing_size - 1),
+            artifact_gc_after_write_every=0,
+        ),
+        store=store,
+        secret=b"over-cap-active-test-secret",
+    )
+
+    replacement = hooks.transform_tool_result(
+        tool_name="web_extract",
+        result=_large_payload("over-cap-new"),
+        status="success",
+        session_id="sess-over-cap",
+        tool_call_id="call-new",
+    )
+
+    assert replacement is None
+    assert hooks.skip_reasons[-1] == "artifact_store_over_cap"
+    assert hooks.telemetry_records == []
+    assert list((tmp_path / "artifacts" / "sess-over-cap").glob("*.json")) == [
+        store.path_for(existing["artifact_id"], session_id="sess-over-cap")
+    ]
+
+
 class CorruptAfterWriteStore(ArtifactStore):
     def write_artifact(self, **kwargs):  # type: ignore[no-untyped-def]
         record = super().write_artifact(**kwargs)
