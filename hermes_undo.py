@@ -1,4 +1,15 @@
-"""Shared half-turn undo/redo core for Hermes sessions."""
+"""Shared half-turn undo/redo core for Hermes sessions.
+
+Concurrency precondition: callers must serialize undo()/redo()/
+on_user_message_appended() per session_id. The in-memory ``_states`` dict is
+unlocked and undo() does a non-atomic read (get_messages) then write
+(rewind_to_message), so two concurrent same-session undos could push spurious
+stack entries. This is safe today because every surface serializes per session:
+the CLI is a single-thread REPL, the gateway rejects undo/redo while an agent is
+running and runs the core synchronously on one event loop, and the TUI rejects
+undo while a turn is in flight. Any future surface that drives the core off the
+event-loop thread (or adds an ``await`` inside it) must add a per-session lock.
+"""
 
 from __future__ import annotations
 
@@ -127,6 +138,15 @@ def undo(session_id: str, n: int) -> Dict[str, Any]:
         session_id, target_id, require_user_role=False
     )
     rewound_ids = list(result.get("rewound_ids", []))
+    if not rewound_ids:
+        # Nothing was actually deactivated (degenerate/raced rewind). Don't push
+        # an empty op or clobber a pending redo — match the None-path contract of
+        # touching neither stack.
+        return {
+            "rewound_ids": [],
+            "prefill_text": None,
+            "message": "nothing to undo",
+        }
     state.undo_stack.append(UndoOp(n=n, rewound_ids=rewound_ids))
     state.redo_stack.clear()
 

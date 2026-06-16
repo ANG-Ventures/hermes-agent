@@ -188,6 +188,32 @@ def test_redo_after_transcript_rewrite_does_not_raise(db):
     assert state.redo_stack == []
 
 
+def test_undo_with_no_rewound_rows_touches_neither_stack(monkeypatch, db):
+    """A rewind that deactivates nothing must not push an empty op or wipe redo.
+
+    Matches the None-path contract: a no-op undo leaves both stacks untouched.
+    Guards the degenerate/raced rewind_to_message return.
+    """
+    sid = _make_session(db)
+    _seed_three_half_turns(db, sid)
+    hermes_undo.undo(sid, 1)
+    hermes_undo.redo(sid, 1)
+    state = hermes_undo.get_state(sid)
+    assert state.redo_stack  # a redo op is pending
+    redo_before = list(state.redo_stack)
+    undo_before = list(state.undo_stack)
+
+    # Force rewind_to_message to report it deactivated nothing.
+    monkeypatch.setattr(
+        db, "rewind_to_message", lambda *a, **k: {"rewound_ids": []}
+    )
+    r = hermes_undo.undo(sid, 1)
+    assert r["rewound_ids"] == []
+    assert r["message"] == "nothing to undo"
+    assert state.undo_stack == undo_before
+    assert state.redo_stack == redo_before
+
+
 def test_new_undo_clears_redo_and_discarded_ops_are_unreachable(db):
     sid = _make_session(db)
     _seed_three_half_turns(db, sid)
