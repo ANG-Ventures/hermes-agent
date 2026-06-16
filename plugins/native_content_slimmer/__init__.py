@@ -26,6 +26,25 @@ from .tools import register_tools
 logger = logging.getLogger(__name__)
 
 
+def _build_telemetry_sink(cfg: NativeContentSlimmerConfig) -> Any:
+    """Persistent Blackbox savings sink when enabled; fails open to the buffer.
+
+    PRD #1.5: shadow OR active both persist savings. Sink construction is
+    fail-open (never breaks registration); once built, write failures propagate
+    per the hook's rollback-on-emit-failure contract.
+    """
+
+    try:
+        from plugins.blackbox.native_slimmer_sink import build_sink
+
+        return build_sink()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("native_content_slimmer: Blackbox sink unavailable, using buffer: %s", exc)
+        from .telemetry import NativeSlimmerTelemetryBuffer
+
+        return NativeSlimmerTelemetryBuffer()
+
+
 def register(ctx: Any, config: Mapping[str, Any] | None = None) -> NativeContentSlimmerConfig:
     """Register plugin hooks and the expansion tool when explicitly enabled."""
 
@@ -51,7 +70,7 @@ def register(ctx: Any, config: Mapping[str, Any] | None = None) -> NativeContent
         else:
             logger.warning("native_content_slimmer could not register expand_artifact: %s", exc)
 
-    runtime = NativeContentSlimmerHooks(runtime_cfg)
+    runtime = NativeContentSlimmerHooks(runtime_cfg, telemetry=_build_telemetry_sink(runtime_cfg))
     ctx.register_hook("transform_terminal_output", runtime.transform_terminal_output)
     ctx.register_hook("transform_tool_result", runtime.transform_tool_result)
     if runtime_cfg.artifact_gc_on_session_end:

@@ -23,6 +23,7 @@ DEFAULT_ARTIFACT_GC_ON_START = False
 DEFAULT_ARTIFACT_GC_ON_SESSION_END = False
 DEFAULT_ARTIFACT_GC_ON_SESSION_RESET = False
 DEFAULT_ARTIFACT_GC_AFTER_WRITE_EVERY = 25
+DEFAULT_SAVINGS_RETENTION_DAYS = 30
 DEFAULT_ARTIFACT_GC_MODE = "async_best_effort"
 VALID_ARTIFACT_GC_MODES = frozenset({DEFAULT_ARTIFACT_GC_MODE})
 DEFAULT_SECRET_POLICY = "no_store_pass_through"
@@ -47,6 +48,7 @@ class NativeContentSlimmerConfig:
     artifact_gc_on_session_end: bool = DEFAULT_ARTIFACT_GC_ON_SESSION_END
     artifact_gc_on_session_reset: bool = DEFAULT_ARTIFACT_GC_ON_SESSION_RESET
     artifact_gc_after_write_every: int = DEFAULT_ARTIFACT_GC_AFTER_WRITE_EVERY
+    savings_retention_days: int = DEFAULT_SAVINGS_RETENTION_DAYS
     artifact_gc_mode: str = DEFAULT_ARTIFACT_GC_MODE
     min_bytes: int = DEFAULT_MIN_BYTES
     preview_bytes: int = DEFAULT_PREVIEW_BYTES
@@ -162,6 +164,12 @@ def load_slimmer_config(config: Mapping[str, Any] | None = None) -> NativeConten
         DEFAULT_ARTIFACT_GC_AFTER_WRITE_EVERY,
         errors,
     )
+    savings_retention_days = _parse_nonnegative_int(
+        block,
+        "savings_retention_days",
+        DEFAULT_SAVINGS_RETENTION_DAYS,
+        errors,
+    )
     artifact_gc_mode = block.get("artifact_gc_mode", DEFAULT_ARTIFACT_GC_MODE)
     if not isinstance(artifact_gc_mode, str) or artifact_gc_mode not in VALID_ARTIFACT_GC_MODES:
         errors.append("artifact_gc_mode must be async_best_effort")
@@ -196,6 +204,7 @@ def load_slimmer_config(config: Mapping[str, Any] | None = None) -> NativeConten
         artifact_gc_on_session_end=artifact_gc_on_session_end,
         artifact_gc_on_session_reset=artifact_gc_on_session_reset,
         artifact_gc_after_write_every=artifact_gc_after_write_every,
+        savings_retention_days=savings_retention_days,
         artifact_gc_mode=artifact_gc_mode,
         min_bytes=min_bytes,
         preview_bytes=preview_bytes,

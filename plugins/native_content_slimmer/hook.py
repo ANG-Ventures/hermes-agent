@@ -632,6 +632,27 @@ class NativeContentSlimmerHooks:
         self._write_count += 1
         if self._write_count % every == 0:
             self._run_gc_async(active_session_id=active_session_id)
+            self._maybe_prune_savings()
+
+    def _maybe_prune_savings(self) -> None:
+        """Best-effort TTL prune of the native_slimmer_savings table (PRD #1.5 D-8).
+
+        Rides the same write cadence as the artifact GC. Fully fail-open — a prune
+        error must never break a write. No-op unless the savings retention is set.
+        """
+
+        days = int(getattr(self.config, "savings_retention_days", 0) or 0)
+        if days <= 0:
+            return
+        try:
+            import time as _time
+
+            from plugins.blackbox import native_slimmer_store as nss
+
+            cutoff = _time.time() - days * 86400
+            nss.prune_older_than(cutoff)
+        except Exception as exc:  # pragma: no cover - defensive, fail-open
+            logger.debug("native_content_slimmer savings prune failed open: %s", exc)
 
     def _run_gc_async(self, *, active_session_id: str | None) -> None:
         # Single-flight: prune finished threads, then skip spawning if a GC pass
