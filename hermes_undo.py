@@ -193,5 +193,14 @@ def redo(session_id: str, m: int) -> Dict[str, Any]:
 
 
 def on_user_message_appended(session_id: str) -> None:
+    """Invalidate the redo branch when a new user message is appended.
+
+    Mirrors a text editor: once you type after undoing, the previously-undone
+    content can no longer be redone. ``redo()`` consumes ``undo_stack`` (the
+    pending-redoable ops), so that is the stack that must be cleared here;
+    ``redo_stack`` (the already-redone history) is cleared too so a fresh
+    message starts from a clean slate.
+    """
     state = get_state(session_id)
+    state.undo_stack.clear()
     state.redo_stack.clear()
