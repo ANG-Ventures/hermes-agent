@@ -165,7 +165,25 @@ def redo(session_id: str, m: int) -> Dict[str, Any]:
     for _ in range(k):
         op = state.undo_stack.pop()
         reactivated = db.restore_ids(session_id, op.rewound_ids)
+        if reactivated == 0 and op.rewound_ids:
+            # NONE of this op's rows could be restored — the transcript was
+            # rewritten out from under the stack (/compress, /retry, and any
+            # other replace_messages flow hard-delete + renumber rows). The redo
+            # branch is meaningless now, so discard the whole stack rather than
+            # raising: redo across a transcript rewrite is impossible, same as
+            # redo after a restart.
+            state.undo_stack.clear()
+            state.redo_stack.clear()
+            return {
+                "reactivated_count": 0,
+                "new_tail_id": None,
+                "prefill_text": None,
+                "message": "nothing to redo (transcript changed since undo)",
+            }
         if reactivated != len(op.rewound_ids):
+            # PARTIAL restore — some rows came back, some didn't. This is a
+            # genuine desync (not a clean transcript rewrite), so fail loud to
+            # surface latent corruption rather than silently half-redoing.
             raise RuntimeError(
                 "redo invariant violated: restored "
                 f"{reactivated} of {len(op.rewound_ids)} rewound rows"

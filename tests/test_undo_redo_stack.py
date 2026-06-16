@@ -94,14 +94,26 @@ def test_redo_m_non_positive_and_empty_stack_do_not_bump(db):
     assert db.get_session(sid)["redo_count"] is None
 
 
-def test_redo_raises_if_restore_reactivates_fewer_than_popped_op(monkeypatch, db):
+def test_redo_degrades_gracefully_when_no_rows_restorable(monkeypatch, db):
+    """Zero rows restorable == transcript was rewritten → graceful no-op, no raise.
+
+    A redo op whose rows ALL fail to restore means the transcript was rewritten
+    out from under the stack (/compress, /retry); redo across that is impossible,
+    same as after a restart. This must NOT raise (it's reachable by normal user
+    actions: /undo then /compress then /redo). A PARTIAL restore is different —
+    that still fails loud (see test_redo_fail_loud_requires_each_op_restore_all_rewound_ids).
+    """
     sid = _make_session(db)
     _seed_three_half_turns(db, sid)
     hermes_undo.undo(sid, 1)
     monkeypatch.setattr(db, "restore_ids", lambda _sid, _ids: 0)
 
-    with pytest.raises(RuntimeError, match="invariant"):
-        hermes_undo.redo(sid, 1)
+    r = hermes_undo.redo(sid, 1)
+    assert r["reactivated_count"] == 0
+    assert "transcript changed" in r["message"]
+    state = hermes_undo.get_state(sid)
+    assert state.undo_stack == []
+    assert state.redo_stack == []
 
 
 def test_user_message_append_invalidates_redo_branch(db):
@@ -146,6 +158,34 @@ def test_undo_then_type_then_redo_does_not_resurrect(db):
     assert r["reactivated_count"] == 0
     # a2 must NOT be wedged back between u2 and the new message
     assert _active_ids(db, sid) == [u1, a1, u2, new]
+
+
+def test_redo_after_transcript_rewrite_does_not_raise(db):
+    """A /compress (replace_messages) after /undo must not crash a later /redo.
+
+    replace_messages hard-deletes and renumbers rows, so the in-memory
+    undo_stack references dead ids. redo() must degrade gracefully (clear the
+    branch, report "transcript changed") instead of raising the restore-count
+    invariant. Regression: previously this raised an unhandled RuntimeError.
+    """
+    sid = _make_session(db)
+    _seed_three_half_turns(db, sid)
+    hermes_undo.undo(sid, 1)
+    state = hermes_undo.get_state(sid)
+    assert state.undo_stack  # a redo op is pending
+
+    # Simulate /compress: replace the transcript with the active-only rows.
+    active = db.get_messages(sid, include_inactive=False)
+    db.replace_messages(
+        sid, [{"role": m["role"], "content": m.get("content", "")} for m in active]
+    )
+
+    r = hermes_undo.redo(sid, 1)
+    assert r["reactivated_count"] == 0
+    assert "transcript changed" in r["message"]
+    # Stacks invalidated so a subsequent redo is also a clean no-op.
+    assert state.undo_stack == []
+    assert state.redo_stack == []
 
 
 def test_new_undo_clears_redo_and_discarded_ops_are_unreachable(db):
