@@ -1300,6 +1300,16 @@ class SessionStore:
                 self._db.replace_messages(session_id, messages)
             except Exception as e:
                 logger.debug("Failed to rewrite transcript in DB: %s", e)
+                return
+            # A transcript rewrite hard-deletes and renumbers rows, so any
+            # in-memory undo/redo stack now references dead ids. Invalidate it
+            # so a later /redo can't try to restore vanished rows.
+            try:
+                import hermes_undo
+
+                hermes_undo.clear_state(session_id)
+            except Exception as e:
+                logger.debug("rewrite_transcript: undo-state clear skipped: %s", e)
 
     def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages from a session's transcript.
