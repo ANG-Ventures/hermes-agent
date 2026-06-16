@@ -104,7 +104,16 @@ def test_redo_raises_if_restore_reactivates_fewer_than_popped_op(monkeypatch, db
         hermes_undo.redo(sid, 1)
 
 
-def test_user_message_append_clears_redo_only(db):
+def test_user_message_append_invalidates_redo_branch(db):
+    """Typing a new message after an undo must discard the redo branch.
+
+    ``undo_stack`` semantically holds the redo branch (ops that were undone and
+    can be redone — ``redo()`` pops it). A text editor discards that branch the
+    moment you type after undoing, so a later /redo must NOT resurrect the
+    undone content out of order. Regression: previously on_user_message_appended
+    cleared only the vestigial ``redo_stack``, leaving ``undo_stack`` live so a
+    /redo wedged stale rows back in.
+    """
     sid = _make_session(db)
     _seed_three_half_turns(db, sid)
     hermes_undo.undo(sid, 1)
@@ -117,7 +126,26 @@ def test_user_message_append_clears_redo_only(db):
     hermes_undo.on_user_message_appended(sid)
 
     assert state.redo_stack == []
-    assert state.undo_stack == [hermes_undo.UndoOp(n=99, rewound_ids=[12345])]
+    assert state.undo_stack == []
+
+
+def test_undo_then_type_then_redo_does_not_resurrect(db):
+    """End-to-end repro: undo, type a new message, redo → nothing resurrected."""
+    sid = _make_session(db)
+    u1, a1, u2, a2 = _seed_three_half_turns(db, sid)
+
+    r = hermes_undo.undo(sid, 1)
+    assert r["rewound_ids"] == [a2]
+    assert _active_ids(db, sid) == [u1, a1, u2]
+
+    new = db.append_message(sid, "user", "different question")
+    hermes_undo.on_user_message_appended(sid)
+    assert _active_ids(db, sid) == [u1, a1, u2, new]
+
+    r = hermes_undo.redo(sid, 1)
+    assert r["reactivated_count"] == 0
+    # a2 must NOT be wedged back between u2 and the new message
+    assert _active_ids(db, sid) == [u1, a1, u2, new]
 
 
 def test_new_undo_clears_redo_and_discarded_ops_are_unreachable(db):
