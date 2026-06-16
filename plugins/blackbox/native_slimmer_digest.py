@@ -10,6 +10,7 @@ an honest line:
     "$0 subscription" when included, or "—" when unpriced
   - coarse dollar rounding (no cents-precision on a bytes/4-derived figure)
   - zero-savings day → "no native-slimmer savings recorded" (not a crash, not fake 0)
+  - PRD-5 compressed-view savings NET of realized expansions, with breaker status
 
 Run read-only:  python -m plugins.blackbox.native_slimmer_digest [--days 1] [--dry-run]
 """
@@ -25,13 +26,18 @@ from plugins.blackbox.native_slimmer_dollarize import dollarize_rollup
 
 BANNER = (
     "savings = bytes/4 token estimate, priced once at uncached input rate "
-    "(per-submission lower bound; estimate, not billed)"
+    "(per-submission lower bound; estimate, not billed; net of realized expansions)"
 )
 
 
 def _fmt_usd(amount: float | None, status: str) -> str:
     if amount is None:
         return "—"
+    if amount < 0:
+        rendered = _fmt_usd(abs(amount), status)
+        if rendered.startswith("~$"):
+            return "~-$" + rendered[2:]
+        return "-" + rendered
     if status == "included" and amount == 0.0:
         return "$0 (subscription)"
     # coarse band — no cents precision on a bytes/4-derived figure
@@ -45,11 +51,14 @@ def _fmt_usd(amount: float | None, status: str) -> str:
 
 
 def _fmt_tokens(tok: int) -> str:
-    if tok >= 1_000_000:
-        return f"{tok/1_000_000:.1f}M"
-    if tok >= 1_000:
-        return f"{tok/1_000:.0f}k"
-    return str(tok)
+    value = int(tok or 0)
+    sign = "-" if value < 0 else ""
+    magnitude = abs(value)
+    if magnitude >= 1_000_000:
+        return f"{sign}{magnitude/1_000_000:.1f}M"
+    if magnitude >= 1_000:
+        return f"{sign}{magnitude/1_000:.0f}k"
+    return f"{sign}{magnitude}"
 
 
 def render_digest(rollup: dict[str, Any]) -> str:
@@ -64,19 +73,23 @@ def render_digest(rollup: dict[str, Any]) -> str:
     if saved["event_count"]:
         lines.append(
             "  • ACTIVE saved "
-            f"{_fmt_tokens(saved['saved_vs_status_quo_tokens_est'])} tok "
+            f"{_fmt_tokens(saved['saved_vs_status_quo_tokens_est'])} tok NET "
             f"({_fmt_usd(saved['saved_usd_vs_status_quo'], saved['price_status'])})"
             f" across {saved['event_count']} result(s)"
+            + _expansion_suffix(saved)
             + (f" [+{saved['unpriced_count']} unpriced]" if saved.get("unpriced_count") else "")
         )
+        lines.extend(_lane_lines(saved))
     if would["event_count"]:
         lines.append(
             "  • SHADOW would have saved "
-            f"{_fmt_tokens(would['saved_vs_status_quo_tokens_est'])} tok "
+            f"{_fmt_tokens(would['saved_vs_status_quo_tokens_est'])} tok NET "
             f"({_fmt_usd(would['saved_usd_vs_status_quo'], would['price_status'])})"
             f" across {would['event_count']} result(s)"
+            + _expansion_suffix(would)
             + (f" [+{would['unpriced_count']} unpriced]" if would.get("unpriced_count") else "")
         )
+        lines.extend(_lane_lines(would))
     lines.append(f"  ({BANNER})")
     return "\n".join(lines)
 
@@ -89,6 +102,45 @@ def build_digest(days: int = 1, *, now: float | None = None) -> str:
     rows = nss.fetch_between(start, end)
     rollup = dollarize_rollup(rows)
     return render_digest(rollup)
+
+
+def _expansion_suffix(bucket: dict[str, Any]) -> str:
+    expansions = int(bucket.get("expansion_count") or 0)
+    events = int(bucket.get("event_count") or 0)
+    if not expansions or not events:
+        return ""
+    return f"; expansions {expansions}/{events} ({expansions / events:.0%})"
+
+
+def _lane_lines(bucket: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    for lane in bucket.get("lanes") or []:
+        if not _should_render_lane(lane):
+            continue
+        expansions = int(lane.get("expansion_count") or 0)
+        samples = int(lane.get("sample_count") or 0)
+        rate = float(lane.get("expansion_rate") or 0.0)
+        lane_id = ":".join(
+            str(lane.get(part) or "unknown")
+            for part in ("tool_name", "content_class", "strategy")
+        )
+        lines.append(
+            "    - "
+            f"{lane_id}: net {_fmt_tokens(lane['saved_vs_status_quo_tokens_est'])} tok; "
+            f"expansions {expansions}/{samples} ({rate:.0%}); "
+            f"breaker={lane['breaker_action']}"
+        )
+    return lines
+
+
+def _should_render_lane(lane: dict[str, Any]) -> bool:
+    if str(lane.get("strategy") or "") == "lossless":
+        return False
+    return (
+        int(lane.get("expansion_count") or 0) > 0
+        or bool(lane.get("breaker_tripped"))
+        or int(lane.get("saved_vs_status_quo_tokens_est") or 0) < 0
+    )
 
 
 def main() -> int:

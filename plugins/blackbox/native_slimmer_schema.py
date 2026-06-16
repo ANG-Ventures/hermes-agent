@@ -8,6 +8,7 @@ Blackbox SQLite store, so telemetry failures stay isolated from the hook path.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import sqlite3
 from typing import Any, Iterable, Mapping
 
 COMPRESSOR_NATIVE_SLIMMER = "native-slimmer"
@@ -30,6 +31,12 @@ VALID_RAW_SOURCES = frozenset(
 
 VALID_NATIVE_SLIMMER_MODES = frozenset({"shadow", "active_lossless"})
 VALID_NATIVE_SLIMMER_ACTIONS = frozenset({"would_replace", "replace"})
+STRATEGY_MIGRATION_COLUMNS: Mapping[str, str] = {
+    "strategy": "TEXT",
+    "view_bytes": "INT",
+    "lossy_view": "INT",
+    "expansions_triggered": "INT",
+}
 
 
 @dataclass(frozen=True)
@@ -67,9 +74,31 @@ class NativeSlimmerTelemetryEvent:
     turn_id: str = ""
     api_request_id: str = ""
     tool_status: str = "success"
+    strategy: str | None = None
+    view_bytes: int | None = None
+    lossy_view: bool | None = None
+    expansions_triggered: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def ensure_strategy_columns(
+    conn: sqlite3.Connection,
+    *,
+    table: str = "native_slimmer_savings",
+) -> None:
+    """Apply PRD-5's additive strategy-column migration to a savings table."""
+
+    existing = {
+        str(row[1])
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    for column, column_type in STRATEGY_MIGRATION_COLUMNS.items():
+        if column in existing:
+            continue
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+    conn.commit()
 
 
 def estimate_tokens_from_bytes(byte_count: int) -> int:
@@ -104,6 +133,10 @@ def build_native_slimmer_event(
     tool_status: str = "success",
     tokenizer_label: str = TOKENIZER_LABEL_UTF8_BYTES_DIV_4,
     status_quo_baseline_bytes: int | None = None,
+    strategy: str | None = None,
+    view_bytes: int | None = None,
+    lossy_view: bool | None = None,
+    expansions_triggered: int | None = None,
 ) -> dict[str, Any]:
     """Build a validated native-slimmer telemetry event dict.
 
@@ -177,6 +210,10 @@ def build_native_slimmer_event(
         turn_id=str(turn_id or ""),
         api_request_id=str(api_request_id or ""),
         tool_status=str(tool_status or "success"),
+        strategy=strategy if strategy is None else str(strategy),
+        view_bytes=None if view_bytes is None else max(0, int(view_bytes or 0)),
+        lossy_view=None if lossy_view is None else bool(lossy_view),
+        expansions_triggered=None if expansions_triggered is None else max(0, int(expansions_triggered or 0)),
     )
     return event.to_dict()
 

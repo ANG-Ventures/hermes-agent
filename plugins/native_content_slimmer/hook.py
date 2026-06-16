@@ -18,12 +18,28 @@ from plugins.blackbox.native_slimmer_schema import (
     VALID_RAW_SOURCES,
 )
 
-from .classifier import Classification, classify_tool_result, deterministic_preview
-from .config import NativeContentSlimmerConfig
+from .classifier import COMPRESS_OFFLOAD, Classification, classify_tool_result, deterministic_preview
+from .config import (
+    ACTIVE_COMPRESSION_MODES,
+    COMPRESSION_MODE_ACTIVE,
+    COMPRESSION_MODE_CANARY,
+    COMPRESSION_MODE_OFF,
+    COMPRESSION_MODE_SHADOW,
+    NativeContentSlimmerConfig,
+)
+from .breaker import ExpansionRateCircuitBreaker
 from .gc import collect_garbage
 from .health import check_artifact_store_health
-from .marker import MarkerLedger, build_authenticated_marker, verify_marker_auth
+from .marker import (
+    MarkerLedger,
+    build_authenticated_marker,
+    make_marker_signature,
+    parse_marker,
+    verify_marker_auth,
+)
 from .store import ArtifactStore, raw_byte_len, safe_component, sha256_text
+from .strategies import registry as strategy_registry
+from .strategies.base import CompressedView, run_with_timeout_guard
 from .telemetry import NativeSlimmerTelemetryBuffer, build_replacement_event, emit_event
 
 logger = logging.getLogger(__name__)
@@ -65,6 +81,7 @@ class NativeContentSlimmerHooks:
         ledger: MarkerLedger | None = None,
         secret: bytes | str | None = None,
         telemetry: Any | None = None,
+        breaker: ExpansionRateCircuitBreaker | None = None,
     ) -> None:
         self.config = config or NativeContentSlimmerConfig()
         self.store = store or ArtifactStore()
@@ -79,6 +96,9 @@ class NativeContentSlimmerHooks:
             # storage at import/construction time.
             self.secret = secrets.token_bytes(32)
         self.telemetry = telemetry if telemetry is not None else NativeSlimmerTelemetryBuffer()
+        self.breaker = breaker or ExpansionRateCircuitBreaker(
+            trip_threshold=float(self.config.compression_breaker_ceiling or 0.0)
+        )
         self.telemetry_records = getattr(self.telemetry, "records", [])
         self.shadow_records: list[SlimmerShadowRecord] = []
         self.failures: list[str] = []
@@ -116,7 +136,7 @@ class NativeContentSlimmerHooks:
                 preview = str(record.get("marker_preview") or "")
                 if not preview and shown_bytes > 0:
                     preview = deterministic_preview(raw_text, preview_bytes=shown_bytes)
-                build_authenticated_marker(
+                marker = build_authenticated_marker(
                     session_id=session_id,
                     tool_call_id=tool_call_id,
                     artifact_id=artifact_id,
@@ -129,6 +149,23 @@ class NativeContentSlimmerHooks:
                     secret=self.secret,
                     ledger=self.ledger,
                 )
+                strategy_name = str(record.get("strategy") or "")
+                if strategy_name:
+                    marker = _annotate_compressed_marker(
+                        marker,
+                        strategy_name=strategy_name,
+                        view_bytes=int(record.get("view_bytes") or shown_bytes),
+                        lossy_view=bool(record.get("lossy_view", True)),
+                        recoverable=bool(record.get("recoverable", True)),
+                    )
+                    self._record_marker_variant(
+                        session_id=session_id,
+                        tool_call_id=tool_call_id,
+                        raw_sha256=raw_sha256,
+                        artifact_id=artifact_id,
+                        original_bytes=original_bytes,
+                        marker=marker,
+                    )
             except Exception as exc:
                 self._record_failure(exc)
 
@@ -269,6 +306,7 @@ class NativeContentSlimmerHooks:
             raw_sha256=raw_sha,
         )
         if existing is not None:
+            recompute_after_compressed_reuse = False
             marker = self._verified_existing_marker(
                 session_id=session_id,
                 tool_call_id=tool_call_id,
@@ -277,14 +315,25 @@ class NativeContentSlimmerHooks:
                 marker=existing.marker,
             )
             if marker is not None:
-                if self.config.mode == "active_lossless":
+                parsed_existing = parse_marker(marker)
+                existing_is_compressed = bool(parsed_existing and parsed_existing.fields.get("strategy"))
+                if existing_is_compressed:
+                    # A compressed marker must not bypass current config/breaker/canary
+                    # gates. Recompute the path for this turn instead of blindly
+                    # reusing a ledger entry created under older controls.
+                    self.ledger.discard(session_id=session_id, tool_call_id=tool_call_id, raw_sha256=raw_sha)
+                    recompute_after_compressed_reuse = True
+                elif self.config.mode == "active_lossless":
                     return marker
+                else:
+                    return None
+            if not recompute_after_compressed_reuse:
+                self.ledger.discard(session_id=session_id, tool_call_id=tool_call_id, raw_sha256=raw_sha)
+                self._blocked_marker_keys[marker_key] = 1
+                self._record_skip("marker_reuse_verification_failed")
                 return None
-            self.ledger.discard(session_id=session_id, tool_call_id=tool_call_id, raw_sha256=raw_sha)
-            self._blocked_marker_keys[marker_key] = 1
-            self._record_skip("marker_reuse_verification_failed")
-            return None
 
+        compression_requested = self._compression_requested_for_turn(metadata=metadata)
         classification = classify_tool_result(
             tool_name=tool_name,
             result=raw_text,
@@ -294,6 +343,15 @@ class NativeContentSlimmerHooks:
             allow_tools=self.config.allow_tools,
             deny_tools=self.config.deny_tools,
             deny_on_status=self.config.deny_on_status,
+            command=str(metadata.get("command") or ""),
+            compression_enabled=compression_requested,
+            compression_strategies=dict(self.config.compression_strategies or {}),
+        )
+        classification = self._apply_runtime_compression_gates(
+            classification=classification,
+            tool_name=tool_name,
+            raw_text=raw_text,
+            marker_key=marker_key,
         )
         if not classification.eligible:
             self._record_skip(classification.reason)
@@ -316,11 +374,105 @@ class NativeContentSlimmerHooks:
         if marker is None:
             return None
 
+        parsed_marker = parse_marker(marker)
+        marker_is_compressed = bool(parsed_marker and parsed_marker.fields.get("strategy"))
+        if marker_is_compressed:
+            if self.config.compression_mode in ACTIVE_COMPRESSION_MODES:
+                return marker
+            return None
         if self.config.mode == "shadow":
             return None
         if self.config.mode == "active_lossless":
             return marker
         return None
+
+    def _compression_requested_for_turn(self, *, metadata: dict[str, Any]) -> bool:
+        mode = self.config.compression_mode
+        if mode == COMPRESSION_MODE_OFF:
+            return False
+        # Shadow compression is a no-live-risk screening path. Generate compressed
+        # shadow rows only when the legacy slimmer path is also shadow; if lossless
+        # offload is active, keep returning the shipped lossless marker.
+        if mode == COMPRESSION_MODE_SHADOW:
+            return self.config.mode == "shadow"
+        return mode in ACTIVE_COMPRESSION_MODES
+
+    def _apply_runtime_compression_gates(
+        self,
+        *,
+        classification: Classification,
+        tool_name: str,
+        raw_text: str,
+        marker_key: tuple[str, str, str],
+    ) -> Classification:
+        if classification.outcome != COMPRESS_OFFLOAD:
+            return classification
+        lane = self._compression_lane_id(tool_name=tool_name, classification=classification)
+        mode = self.config.compression_mode
+        if mode == COMPRESSION_MODE_SHADOW:
+            return classification
+        if mode == COMPRESSION_MODE_CANARY and not self._canary_allows(marker_key):
+            self._record_skip("compression_canary_not_selected")
+            return self._lossless_classification_from(classification, raw_text, "compression_canary_not_selected")
+        if mode in ACTIVE_COMPRESSION_MODES:
+            state = self.breaker.evaluate(lane)
+            if not state.allow_compression:
+                self._record_skip(f"compression_breaker_{state.reason}")
+                return self._lossless_classification_from(
+                    classification,
+                    raw_text,
+                    f"compression_breaker_{state.reason}",
+                )
+        return classification
+
+    def _lossless_classification_from(
+        self,
+        classification: Classification,
+        raw_text: str,
+        reason: str,
+    ) -> Classification:
+        return Classification(
+            eligible=True,
+            reason=reason,
+            raw_bytes=classification.raw_bytes,
+            content_class=classification.content_class,
+            preview=deterministic_preview(raw_text, preview_bytes=self.config.preview_bytes),
+            secret_match=classification.secret_match,
+            outcome="lossless_offload",
+            recommended_strategy=None,
+        )
+
+    def _compression_lane_id(self, *, tool_name: str, classification: Classification) -> tuple[str, str, str]:
+        return (
+            str(tool_name or ""),
+            str(classification.content_class or "unknown"),
+            str(classification.recommended_strategy or "unknown"),
+        )
+
+    def _lane_params(self, *, tool_name: str, classification: Classification) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        configured = self.config.compression_lane_params or {}
+        keys = (
+            f"{tool_name}:{classification.content_class}",
+            f"{tool_name}:{classification.content_class}:{classification.recommended_strategy}",
+            str(classification.recommended_strategy or ""),
+        )
+        for key in keys:
+            value = configured.get(key)
+            if isinstance(value, dict):
+                params.update(value)
+        return params
+
+    def _canary_allows(self, marker_key: tuple[str, str, str]) -> bool:
+        percent = max(0.0, min(100.0, float(self.config.compression_canary_percent or 0.0)))
+        if percent <= 0.0:
+            return False
+        if percent >= 100.0:
+            return True
+        # Stable per-result bucketing; no randomness in tests or replay.
+        digest = sha256_text("|".join(marker_key))
+        bucket = int(digest[:8], 16) % 10_000
+        return bucket < int(percent * 100)
 
     def _persist_and_build_marker(
         self,
@@ -343,14 +495,52 @@ class NativeContentSlimmerHooks:
             self._record_skip(skip_reason)
             return None
 
-        preview = classification.preview or ""
+        compressed_view = self._compressed_view_for(
+            tool_name=tool_name,
+            raw_text=raw_text,
+            classification=classification,
+        )
+        if compressed_view is None:
+            preview = classification.preview or deterministic_preview(raw_text, preview_bytes=self.config.preview_bytes)
+            preview_strategy = _PREVIEW_STRATEGY
+            lossy = False
+            strategy_name = ""
+            recoverable = True
+        else:
+            preview = str(compressed_view.view_text or "")
+            preview_strategy = compressed_view.strategy_name or str(classification.recommended_strategy or "")
+            lossy = bool(compressed_view.lossy_view)
+            strategy_name = preview_strategy
+            recoverable = bool(compressed_view.recoverable)
         preview_bytes = raw_byte_len(preview)
         original_bytes = raw_byte_len(raw_text)
         omitted_bytes = max(0, original_bytes - preview_bytes)
+        telemetry_action = "replace" if (
+            strategy_name and self.config.compression_mode in ACTIVE_COMPRESSION_MODES
+        ) else ("would_replace" if self.config.mode == "shadow" else "replace")
+        telemetry_mode = "active_lossless" if telemetry_action == "replace" else "shadow"
         artifact_metadata: dict[str, Any] = {
-            "mode": self.config.mode,
-            "would_replace": self.config.mode == "shadow",
+            "mode": telemetry_mode,
+            "would_replace": telemetry_action == "would_replace",
         }
+        artifact_extra: dict[str, Any] = {}
+        if strategy_name:
+            artifact_metadata.update(
+                {
+                    "strategy": strategy_name,
+                    "view_bytes": preview_bytes,
+                    "lossy_view": lossy,
+                    "recoverable": recoverable,
+                }
+            )
+            artifact_extra.update(
+                {
+                    "strategy": strategy_name,
+                    "view_bytes": preview_bytes,
+                    "lossy_view": lossy,
+                    "recoverable": recoverable,
+                }
+            )
         if duration_ms is not None:
             artifact_metadata["duration_ms"] = duration_ms
         artifact_metadata.update({key: value for key, value in metadata.items() if value not in (None, "")})
@@ -367,14 +557,15 @@ class NativeContentSlimmerHooks:
             tool_name=tool_name,
             tool_status=status,
             raw_source=raw_source,
-            preview_strategy=_PREVIEW_STRATEGY,
+            preview_strategy=preview_strategy,
             preview_bytes=preview_bytes,
             omitted_bytes=omitted_bytes,
-            lossy=False,
+            lossy=lossy,
             classification_reason=classification.reason,
             redaction_applied=False,
             metadata=artifact_metadata,
             marker_preview=preview,
+            **artifact_extra,
         )
         record = self._verify_persisted_artifact(
             record,
@@ -401,11 +592,27 @@ class NativeContentSlimmerHooks:
             secret=self.secret,
             ledger=self.ledger,
         )
+        if strategy_name:
+            marker = _annotate_compressed_marker(
+                marker,
+                strategy_name=strategy_name,
+                view_bytes=preview_bytes,
+                lossy_view=lossy,
+                recoverable=recoverable,
+            )
+            self._record_marker_variant(
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                raw_sha256=str(record["raw_sha256"]),
+                artifact_id=str(record["artifact_id"]),
+                original_bytes=original_bytes,
+                marker=marker,
+            )
         marker_bytes = raw_byte_len(marker)
         try:
             self._emit_telemetry(
-                mode=self.config.mode,
-                action="would_replace" if self.config.mode == "shadow" else "replace",
+                mode=telemetry_mode,
+                action=telemetry_action,
                 tool_name=tool_name,
                 session_id=session_id,
                 tool_call_id=tool_call_id,
@@ -419,6 +626,10 @@ class NativeContentSlimmerHooks:
                 turn_id=turn_id,
                 api_request_id=api_request_id,
                 tool_status=status,
+                strategy=strategy_name or None,
+                view_bytes=preview_bytes if strategy_name else None,
+                lossy_view=lossy if strategy_name else None,
+                expansions_triggered=0 if strategy_name else None,
                 status_quo_baseline_bytes=_status_quo_baseline_bytes(
                     raw_source=raw_source,
                     original_bytes=original_bytes,
@@ -433,7 +644,7 @@ class NativeContentSlimmerHooks:
             )
             self._record_skip("telemetry_emit_failed")
             raise
-        if self.config.mode == "shadow":
+        if telemetry_action == "would_replace":
             self.shadow_records.append(
                 SlimmerShadowRecord(
                     mode="shadow",
@@ -453,7 +664,8 @@ class NativeContentSlimmerHooks:
         return marker
 
     def _active_artifact_store_skip_reason(self, *, session_id: str) -> str | None:
-        if self.config.mode != "active_lossless":
+        active_marker_path = self.config.mode == "active_lossless" or self.config.compression_mode in ACTIVE_COMPRESSION_MODES
+        if not active_marker_path:
             return None
         root = getattr(self.store, "root", None)
         if root is None:
@@ -543,6 +755,64 @@ class NativeContentSlimmerHooks:
             self._record_failure(exc)
             return None
 
+    def _compressed_view_for(
+        self,
+        *,
+        tool_name: str,
+        raw_text: str,
+        classification: Classification,
+    ) -> CompressedView | None:
+        if classification.outcome != COMPRESS_OFFLOAD:
+            return None
+        selection = strategy_registry.select_compressor(
+            tool_name=tool_name,
+            content_class=classification.content_class,
+        )
+        if selection is None:
+            return None
+        params = dict(selection.params or {})
+        params.update(self._lane_params(tool_name=tool_name, classification=classification))
+        view = run_with_timeout_guard(selection.compressor, raw_text, params=params)
+        if view is None:
+            return None
+        view_text = str(view.view_text or "")
+        strategy_name = str(view.strategy_name or selection.strategy_name or classification.recommended_strategy or "")
+        return CompressedView(
+            view_text=view_text,
+            view_bytes=raw_byte_len(view_text),
+            lossy_view=bool(view.lossy_view),
+            recoverable=bool(view.recoverable),
+            strategy_name=strategy_name,
+        )
+
+    def _record_marker_variant(
+        self,
+        *,
+        session_id: str,
+        tool_call_id: str,
+        raw_sha256: str,
+        artifact_id: str,
+        original_bytes: int,
+        marker: str,
+    ) -> None:
+        signature = make_marker_signature(
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+            raw_sha256=raw_sha256,
+            artifact_id=artifact_id,
+            original_bytes=original_bytes,
+            secret=self.secret,
+        )
+        self.ledger.record(
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+            raw_sha256=raw_sha256,
+            artifact_id=artifact_id,
+            original_bytes=original_bytes,
+            signature=signature,
+            marker=marker,
+        )
+
     def _emit_telemetry(
         self,
         *,
@@ -561,6 +831,10 @@ class NativeContentSlimmerHooks:
         turn_id: str,
         api_request_id: str,
         tool_status: str,
+        strategy: str | None = None,
+        view_bytes: int | None = None,
+        lossy_view: bool | None = None,
+        expansions_triggered: int | None = None,
         status_quo_baseline_bytes: int | None = None,
     ) -> None:
         event = build_replacement_event(
@@ -581,6 +855,16 @@ class NativeContentSlimmerHooks:
             tool_status=tool_status,
             status_quo_baseline_bytes=status_quo_baseline_bytes,
         )
+        if strategy is not None:
+            event.update(
+                {
+                    "strategy": strategy,
+                    "view_bytes": int(view_bytes or 0),
+                    "lossy_view": bool(lossy_view),
+                    "lossy": bool(lossy_view),
+                    "expansions_triggered": int(expansions_triggered or 0),
+                }
+            )
         emit_event(self.telemetry, event)
 
     def _record_skip(self, reason: str) -> None:
@@ -740,6 +1024,45 @@ def _status_quo_baseline_bytes(*, raw_source: str, original_bytes: int) -> int |
     if cap <= 0:
         return None
     return min(max(0, int(original_bytes or 0)), cap)
+
+
+def _annotate_compressed_marker(
+    marker: str,
+    *,
+    strategy_name: str,
+    view_bytes: int,
+    lossy_view: bool,
+    recoverable: bool,
+) -> str:
+    """Add compression metadata to an already-authenticated marker header."""
+
+    if not strategy_name:
+        return marker
+    lines = marker.splitlines()
+    if not lines or not lines[0].endswith("]"):
+        return marker
+    fields = [
+        _quoted_marker_field("strategy", strategy_name),
+        f"view_bytes={max(0, int(view_bytes or 0))}",
+        f"lossy_view={_bool_marker_value(lossy_view)}",
+        f"recoverable={_bool_marker_value(recoverable)}",
+    ]
+    lines[0] = f"{lines[0][:-1]} {' '.join(fields)}]"
+    if len(lines) > 1:
+        lines[1] = (
+            "This is a semantically compressed preview, not a literal excerpt or the full tool result. "
+            "Call expand_artifact(id) for exact original bytes."
+        )
+    return "\n".join(lines)
+
+
+def _quoted_marker_field(key: str, value: str) -> str:
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'{key}="{escaped}"'
+
+
+def _bool_marker_value(value: bool) -> str:
+    return "true" if bool(value) else "false"
 
 
 def _raw_source_from_kwargs(kwargs: dict[str, Any], *, default: str) -> str:

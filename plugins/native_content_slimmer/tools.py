@@ -138,12 +138,35 @@ def expand_artifact_tool(args: Mapping[str, Any], **kwargs: Any) -> dict[str, An
         # Keep the tool contract small and loud. Store-level unexpected errors
         # remain errors; they never get converted into partial content.
         return expanded
+    if expanded.get("ok") is not False:
+        _record_realized_expansion(record=record, artifact_id=artifact_id, session_id=session_id)
     return expanded
 
 
 def _trusted_session_id(kwargs: Mapping[str, Any]) -> str:
     value = kwargs.get("session_id") or kwargs.get("current_session_id")
     return str(value or "").strip()
+
+
+def _record_realized_expansion(
+    *,
+    record: Mapping[str, Any],
+    artifact_id: str,
+    session_id: str,
+) -> None:
+    """Best-effort Blackbox expansion accounting; never breaks expansion."""
+
+    try:
+        from plugins.blackbox import native_slimmer_store as nss
+
+        nss.record_expansion(
+            session_id=session_id,
+            tool_call_id=str(record.get("tool_call_id") or ""),
+            raw_sha256=str(record.get("raw_sha256") or ""),
+            artifact_id=artifact_id,
+        )
+    except Exception:
+        return
 
 
 def _authorize_same_session(

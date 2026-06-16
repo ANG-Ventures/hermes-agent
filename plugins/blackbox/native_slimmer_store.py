@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from hermes_constants import get_hermes_home
+from plugins.blackbox.native_slimmer_schema import ensure_strategy_columns
 
 TABLE = "native_slimmer_savings"
 
@@ -51,6 +52,10 @@ _SUPERSEDE_COLS = (
     "token_estimate_kind",
     "lossy",
     "classification_reason",
+    "strategy",
+    "view_bytes",
+    "lossy_view",
+    "expansions_triggered",
 )
 
 # Full insert column order (savings_key + supersedable + created_at).
@@ -105,6 +110,10 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             token_estimate_kind TEXT,
             lossy INT,
             classification_reason TEXT,
+            strategy TEXT,
+            view_bytes INT,
+            lossy_view INT,
+            expansions_triggered INT,
             created_at REAL
         );
 
@@ -114,6 +123,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             ON {TABLE}(action, created_at);
         """
     )
+    ensure_strategy_columns(conn, table=TABLE)
     conn.commit()
 
 
@@ -186,6 +196,10 @@ def insert_event(
             "token_estimate_kind": str(event.get("token_estimate_kind") or ""),
             "lossy": 1 if event.get("lossy") else 0,
             "classification_reason": str(event.get("classification_reason") or ""),
+            "strategy": str(event.get("strategy") or "") or None,
+            "view_bytes": _to_int(event.get("view_bytes")) if event.get("view_bytes") is not None else None,
+            "lossy_view": None if event.get("lossy_view") is None else (1 if event.get("lossy_view") else 0),
+            "expansions_triggered": None if event.get("expansions_triggered") is None else _to_int(event.get("expansions_triggered")),
             "created_at": float(created_at),
         }
         # The non-supersede identity columns (session/tool_call/sha/artifact) also
@@ -248,6 +262,34 @@ def fetch_between(
             (float(start_epoch), float(end_epoch)),
         ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        if own:
+            conn.close()
+
+
+def record_expansion(
+    *,
+    session_id: str,
+    tool_call_id: str,
+    raw_sha256: str,
+    artifact_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    """Best-effort realized-expansion accounting for expand_artifact calls."""
+
+    own = conn is None
+    if own:
+        conn = _connect()
+    try:
+        savings_key = "|".join(
+            str(part or "") for part in (session_id, tool_call_id, raw_sha256, artifact_id)
+        )
+        conn.execute(
+            f"UPDATE {TABLE} SET expansions_triggered = COALESCE(expansions_triggered, 0) + 1 "
+            "WHERE savings_key = ?",
+            (savings_key,),
+        )
+        conn.commit()
     finally:
         if own:
             conn.close()

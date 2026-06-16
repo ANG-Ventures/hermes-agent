@@ -5,6 +5,8 @@ import re
 from dataclasses import dataclass
 from typing import Iterable
 
+from .strategies import registry as strategy_registry
+
 
 DEFAULT_ALLOW_TOOLS = frozenset({"terminal", "web_extract", "browser_console"})
 DEFAULT_DENY_TOOLS = frozenset({
@@ -18,6 +20,9 @@ DEFAULT_DENY_ON_STATUS = frozenset({"error"})
 DEFAULT_MIN_BYTES = 12_000
 DEFAULT_PREVIEW_BYTES = 2_500
 UNKNOWN_SECRET_FIXTURES_HARD_GATE = True
+PASS_THROUGH = "pass_through"
+LOSSLESS_OFFLOAD = "lossless_offload"
+COMPRESS_OFFLOAD = "compress_offload"
 
 
 @dataclass(frozen=True)
@@ -28,6 +33,8 @@ class Classification:
     content_class: str
     preview: str | None = None
     secret_match: str | None = None
+    outcome: str = PASS_THROUGH
+    recommended_strategy: str | None = None
 
 
 _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -76,6 +83,9 @@ def classify_tool_result(
     allow_tools: Iterable[str] | None = DEFAULT_ALLOW_TOOLS,
     deny_tools: Iterable[str] | None = DEFAULT_DENY_TOOLS,
     deny_on_status: Iterable[str] | None = DEFAULT_DENY_ON_STATUS,
+    command: str | None = None,
+    compression_enabled: bool = False,
+    compression_strategies: dict[str, bool] | None = None,
 ) -> Classification:
     """Classify whether a tool result may be losslessly offloaded.
 
@@ -97,25 +107,43 @@ def classify_tool_result(
 
     denied_tools = set(deny_tools or ())
     if tool_name in denied_tools:
-        return Classification(False, "tool_denied", raw_bytes, _content_class(result))
+        return Classification(False, "tool_denied", raw_bytes, _content_class(result, tool_name=tool_name, command=command))
 
     denied_statuses = {value.lower() for value in (deny_on_status or ())}
     if status is not None and status.lower() in denied_statuses:
-        return Classification(False, "status_denied", raw_bytes, _content_class(result))
+        return Classification(False, "status_denied", raw_bytes, _content_class(result, tool_name=tool_name, command=command))
 
     allowed_tools = None if allow_tools is None else set(allow_tools)
     if allowed_tools is not None and tool_name not in allowed_tools:
-        return Classification(False, "tool_not_allowed", raw_bytes, _content_class(result))
+        return Classification(False, "tool_not_allowed", raw_bytes, _content_class(result, tool_name=tool_name, command=command))
 
     if raw_bytes < min_bytes:
-        return Classification(False, "below_min_bytes", raw_bytes, _content_class(result))
+        return Classification(False, "below_min_bytes", raw_bytes, _content_class(result, tool_name=tool_name, command=command))
+
+    content_class = _content_class(result, tool_name=tool_name, command=command)
+    selection = strategy_registry.select_compressor(tool_name=tool_name, content_class=content_class)
+    if (
+        compression_enabled
+        and selection is not None
+        and _strategy_enabled(selection.strategy_name, compression_strategies)
+    ):
+        return Classification(
+            eligible=True,
+            reason="eligible_compress_offload",
+            raw_bytes=raw_bytes,
+            content_class=content_class,
+            preview=None,
+            outcome=COMPRESS_OFFLOAD,
+            recommended_strategy=selection.strategy_name,
+        )
 
     return Classification(
         eligible=True,
         reason="eligible_lossless_offload",
         raw_bytes=raw_bytes,
-        content_class=_content_class(result),
+        content_class=content_class,
         preview=deterministic_preview(result, preview_bytes=preview_bytes),
+        outcome=LOSSLESS_OFFLOAD,
     )
 
 
@@ -163,8 +191,55 @@ def _shannon_entropy_per_char(value: str) -> float:
     return -sum((count / total) * math.log2(count / total) for count in counts.values())
 
 
-def _content_class(text: str) -> str:
+def _content_class(text: str, *, tool_name: str = "", command: str | None = None) -> str:
     stripped = text.lstrip()
     if stripped.startswith(("{", "[")):
         return "json"
+    lowered_command = str(command or "").lower()
+    if _looks_like_diff(stripped, lowered_command):
+        return "diff"
+    if _looks_like_grep_output(text, lowered_command):
+        return "grep"
+    if _looks_like_log(text):
+        return "log"
     return "text"
+
+
+def _strategy_enabled(strategy_name: str, compression_strategies: dict[str, bool] | None) -> bool:
+    if not compression_strategies:
+        return True
+    return bool(compression_strategies.get(str(strategy_name or ""), True))
+
+
+def _looks_like_diff(text: str, command: str) -> bool:
+    if "git diff" in command or command.strip().startswith("diff "):
+        return True
+    if text.startswith("diff --git "):
+        return True
+    lines = text.splitlines()[:200]
+    return any(line.startswith("@@ ") for line in lines) and any(
+        line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
+        for line in lines
+    )
+
+
+_GREP_OUTPUT_RE = re.compile(r"^[^\s:]+(?:/[^\s:]+)*\.[A-Za-z0-9_]+:\d+(?::\d+)?:", re.MULTILINE)
+_LOG_SEVERITY_RE = re.compile(r"\b(?:FATAL|ERROR|CRITICAL|Traceback|panic|PANIC|WARN(?:ING)?)\b")
+_LOG_TS_RE = re.compile(r"\b(?:\d{4}-\d{2}-\d{2}[T ][0-9:.+-]+Z?|\d{1,2}:\d{2}:\d{2}(?:\.\d+)?)\b")
+
+
+def _looks_like_grep_output(text: str, command: str) -> bool:
+    if "grep" in command or "rg " in command or command.strip().startswith("rg"):
+        return True
+    return len(_GREP_OUTPUT_RE.findall(text[:20_000])) >= 3
+
+
+def _looks_like_log(text: str) -> bool:
+    sample = text[:20_000]
+    if _LOG_SEVERITY_RE.search(sample):
+        return True
+    lines = [line for line in sample.splitlines()[:200] if line.strip()]
+    if len(lines) < 4:
+        return False
+    timestamped = sum(1 for line in lines if _LOG_TS_RE.search(line))
+    return timestamped >= 4

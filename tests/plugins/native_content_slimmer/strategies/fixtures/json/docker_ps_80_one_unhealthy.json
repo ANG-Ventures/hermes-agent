@@ -1,0 +1,2162 @@
+[
+  {
+    "ID": "cid-000",
+    "Image": "registry.local/example/service:0",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 0",
+    "CreatedAt": "2026-06-15T12:00:00Z",
+    "RunningFor": "1 hours",
+    "Ports": [
+      "127.0.0.1:8000->80/tcp",
+      "127.0.0.1:9000->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-000",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "0",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/0/data",
+      "/srv/service/0/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-001",
+    "Image": "registry.local/example/service:1",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 1",
+    "CreatedAt": "2026-06-15T12:01:00Z",
+    "RunningFor": "2 hours",
+    "Ports": [
+      "127.0.0.1:8001->80/tcp",
+      "127.0.0.1:9001->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-001",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "1",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/1/data",
+      "/srv/service/1/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-002",
+    "Image": "registry.local/example/service:2",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 2",
+    "CreatedAt": "2026-06-15T12:02:00Z",
+    "RunningFor": "3 hours",
+    "Ports": [
+      "127.0.0.1:8002->80/tcp",
+      "127.0.0.1:9002->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-002",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "2",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/2/data",
+      "/srv/service/2/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-003",
+    "Image": "registry.local/example/service:3",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 3",
+    "CreatedAt": "2026-06-15T12:03:00Z",
+    "RunningFor": "4 hours",
+    "Ports": [
+      "127.0.0.1:8003->80/tcp",
+      "127.0.0.1:9003->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-003",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "3",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/3/data",
+      "/srv/service/3/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-004",
+    "Image": "registry.local/example/service:4",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 4",
+    "CreatedAt": "2026-06-15T12:04:00Z",
+    "RunningFor": "5 hours",
+    "Ports": [
+      "127.0.0.1:8004->80/tcp",
+      "127.0.0.1:9004->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-004",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "4",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/4/data",
+      "/srv/service/4/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-005",
+    "Image": "registry.local/example/service:5",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 5",
+    "CreatedAt": "2026-06-15T12:05:00Z",
+    "RunningFor": "6 hours",
+    "Ports": [
+      "127.0.0.1:8005->80/tcp",
+      "127.0.0.1:9005->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-005",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "5",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/5/data",
+      "/srv/service/5/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-006",
+    "Image": "registry.local/example/service:6",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 6",
+    "CreatedAt": "2026-06-15T12:06:00Z",
+    "RunningFor": "7 hours",
+    "Ports": [
+      "127.0.0.1:8006->80/tcp",
+      "127.0.0.1:9006->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-006",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "6",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/6/data",
+      "/srv/service/6/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-007",
+    "Image": "registry.local/example/service:0",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 7",
+    "CreatedAt": "2026-06-15T12:07:00Z",
+    "RunningFor": "8 hours",
+    "Ports": [
+      "127.0.0.1:8007->80/tcp",
+      "127.0.0.1:9007->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-007",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "7",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/7/data",
+      "/srv/service/7/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-008",
+    "Image": "registry.local/example/service:1",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 8",
+    "CreatedAt": "2026-06-15T12:08:00Z",
+    "RunningFor": "9 hours",
+    "Ports": [
+      "127.0.0.1:8008->80/tcp",
+      "127.0.0.1:9008->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-008",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "8",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/8/data",
+      "/srv/service/8/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-009",
+    "Image": "registry.local/example/service:2",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 9",
+    "CreatedAt": "2026-06-15T12:09:00Z",
+    "RunningFor": "10 hours",
+    "Ports": [
+      "127.0.0.1:8009->80/tcp",
+      "127.0.0.1:9009->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-009",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "9",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/9/data",
+      "/srv/service/9/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-010",
+    "Image": "registry.local/example/service:3",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 10",
+    "CreatedAt": "2026-06-15T12:10:00Z",
+    "RunningFor": "11 hours",
+    "Ports": [
+      "127.0.0.1:8010->80/tcp",
+      "127.0.0.1:9010->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-010",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "10",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/10/data",
+      "/srv/service/10/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-011",
+    "Image": "registry.local/example/service:4",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 11",
+    "CreatedAt": "2026-06-15T12:11:00Z",
+    "RunningFor": "12 hours",
+    "Ports": [
+      "127.0.0.1:8011->80/tcp",
+      "127.0.0.1:9011->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-011",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "11",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/11/data",
+      "/srv/service/11/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-012",
+    "Image": "registry.local/example/service:5",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 12",
+    "CreatedAt": "2026-06-15T12:12:00Z",
+    "RunningFor": "13 hours",
+    "Ports": [
+      "127.0.0.1:8012->80/tcp",
+      "127.0.0.1:9012->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-012",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "12",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/12/data",
+      "/srv/service/12/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-013",
+    "Image": "registry.local/example/service:6",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 13",
+    "CreatedAt": "2026-06-15T12:13:00Z",
+    "RunningFor": "14 hours",
+    "Ports": [
+      "127.0.0.1:8013->80/tcp",
+      "127.0.0.1:9013->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-013",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "13",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/13/data",
+      "/srv/service/13/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-014",
+    "Image": "registry.local/example/service:0",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 14",
+    "CreatedAt": "2026-06-15T12:14:00Z",
+    "RunningFor": "15 hours",
+    "Ports": [
+      "127.0.0.1:8014->80/tcp",
+      "127.0.0.1:9014->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-014",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "14",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/14/data",
+      "/srv/service/14/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-015",
+    "Image": "registry.local/example/service:1",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 15",
+    "CreatedAt": "2026-06-15T12:15:00Z",
+    "RunningFor": "16 hours",
+    "Ports": [
+      "127.0.0.1:8015->80/tcp",
+      "127.0.0.1:9015->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-015",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "15",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/15/data",
+      "/srv/service/15/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-016",
+    "Image": "registry.local/example/service:2",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 16",
+    "CreatedAt": "2026-06-15T12:16:00Z",
+    "RunningFor": "17 hours",
+    "Ports": [
+      "127.0.0.1:8016->80/tcp",
+      "127.0.0.1:9016->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-016",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "16",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/16/data",
+      "/srv/service/16/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-017",
+    "Image": "registry.local/example/service:3",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 17",
+    "CreatedAt": "2026-06-15T12:17:00Z",
+    "RunningFor": "18 hours",
+    "Ports": [
+      "127.0.0.1:8017->80/tcp",
+      "127.0.0.1:9017->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-017",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "17",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/17/data",
+      "/srv/service/17/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-018",
+    "Image": "registry.local/example/service:4",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 18",
+    "CreatedAt": "2026-06-15T12:18:00Z",
+    "RunningFor": "19 hours",
+    "Ports": [
+      "127.0.0.1:8018->80/tcp",
+      "127.0.0.1:9018->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-018",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "18",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/18/data",
+      "/srv/service/18/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-019",
+    "Image": "registry.local/example/service:5",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 19",
+    "CreatedAt": "2026-06-15T12:19:00Z",
+    "RunningFor": "20 hours",
+    "Ports": [
+      "127.0.0.1:8019->80/tcp",
+      "127.0.0.1:9019->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-019",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "19",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/19/data",
+      "/srv/service/19/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-020",
+    "Image": "registry.local/example/service:6",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 20",
+    "CreatedAt": "2026-06-15T12:20:00Z",
+    "RunningFor": "21 hours",
+    "Ports": [
+      "127.0.0.1:8020->80/tcp",
+      "127.0.0.1:9020->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-020",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "20",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/20/data",
+      "/srv/service/20/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-021",
+    "Image": "registry.local/example/service:0",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 21",
+    "CreatedAt": "2026-06-15T12:21:00Z",
+    "RunningFor": "22 hours",
+    "Ports": [
+      "127.0.0.1:8021->80/tcp",
+      "127.0.0.1:9021->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-021",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "21",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/21/data",
+      "/srv/service/21/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-022",
+    "Image": "registry.local/example/service:1",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 22",
+    "CreatedAt": "2026-06-15T12:22:00Z",
+    "RunningFor": "23 hours",
+    "Ports": [
+      "127.0.0.1:8022->80/tcp",
+      "127.0.0.1:9022->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-022",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "22",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/22/data",
+      "/srv/service/22/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-023",
+    "Image": "registry.local/example/service:2",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 23",
+    "CreatedAt": "2026-06-15T12:23:00Z",
+    "RunningFor": "24 hours",
+    "Ports": [
+      "127.0.0.1:8023->80/tcp",
+      "127.0.0.1:9023->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-023",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "23",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/23/data",
+      "/srv/service/23/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-024",
+    "Image": "registry.local/example/service:3",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 24",
+    "CreatedAt": "2026-06-15T12:24:00Z",
+    "RunningFor": "25 hours",
+    "Ports": [
+      "127.0.0.1:8024->80/tcp",
+      "127.0.0.1:9024->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-024",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "24",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/24/data",
+      "/srv/service/24/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-025",
+    "Image": "registry.local/example/service:4",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 25",
+    "CreatedAt": "2026-06-15T12:25:00Z",
+    "RunningFor": "26 hours",
+    "Ports": [
+      "127.0.0.1:8025->80/tcp",
+      "127.0.0.1:9025->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-025",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "25",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/25/data",
+      "/srv/service/25/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-026",
+    "Image": "registry.local/example/service:5",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 26",
+    "CreatedAt": "2026-06-15T12:26:00Z",
+    "RunningFor": "27 hours",
+    "Ports": [
+      "127.0.0.1:8026->80/tcp",
+      "127.0.0.1:9026->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-026",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "26",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/26/data",
+      "/srv/service/26/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-027",
+    "Image": "registry.local/example/service:6",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 27",
+    "CreatedAt": "2026-06-15T12:27:00Z",
+    "RunningFor": "28 hours",
+    "Ports": [
+      "127.0.0.1:8027->80/tcp",
+      "127.0.0.1:9027->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-027",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "27",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/27/data",
+      "/srv/service/27/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-028",
+    "Image": "registry.local/example/service:0",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 28",
+    "CreatedAt": "2026-06-15T12:28:00Z",
+    "RunningFor": "29 hours",
+    "Ports": [
+      "127.0.0.1:8028->80/tcp",
+      "127.0.0.1:9028->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-028",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "28",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/28/data",
+      "/srv/service/28/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-029",
+    "Image": "registry.local/example/service:1",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 29",
+    "CreatedAt": "2026-06-15T12:29:00Z",
+    "RunningFor": "30 hours",
+    "Ports": [
+      "127.0.0.1:8029->80/tcp",
+      "127.0.0.1:9029->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-029",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "29",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/29/data",
+      "/srv/service/29/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-030",
+    "Image": "registry.local/example/service:2",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 30",
+    "CreatedAt": "2026-06-15T12:30:00Z",
+    "RunningFor": "31 hours",
+    "Ports": [
+      "127.0.0.1:8030->80/tcp",
+      "127.0.0.1:9030->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-030",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "30",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/30/data",
+      "/srv/service/30/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-031",
+    "Image": "registry.local/example/service:3",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 31",
+    "CreatedAt": "2026-06-15T12:31:00Z",
+    "RunningFor": "32 hours",
+    "Ports": [
+      "127.0.0.1:8031->80/tcp",
+      "127.0.0.1:9031->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-031",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "31",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/31/data",
+      "/srv/service/31/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-032",
+    "Image": "registry.local/example/service:4",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 32",
+    "CreatedAt": "2026-06-15T12:32:00Z",
+    "RunningFor": "33 hours",
+    "Ports": [
+      "127.0.0.1:8032->80/tcp",
+      "127.0.0.1:9032->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-032",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "32",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/32/data",
+      "/srv/service/32/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-033",
+    "Image": "registry.local/example/service:5",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 33",
+    "CreatedAt": "2026-06-15T12:33:00Z",
+    "RunningFor": "34 hours",
+    "Ports": [
+      "127.0.0.1:8033->80/tcp",
+      "127.0.0.1:9033->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-033",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "33",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/33/data",
+      "/srv/service/33/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-034",
+    "Image": "registry.local/example/service:6",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 34",
+    "CreatedAt": "2026-06-15T12:34:00Z",
+    "RunningFor": "35 hours",
+    "Ports": [
+      "127.0.0.1:8034->80/tcp",
+      "127.0.0.1:9034->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-034",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "34",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/34/data",
+      "/srv/service/34/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-035",
+    "Image": "registry.local/example/service:0",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 35",
+    "CreatedAt": "2026-06-15T12:35:00Z",
+    "RunningFor": "36 hours",
+    "Ports": [
+      "127.0.0.1:8035->80/tcp",
+      "127.0.0.1:9035->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-035",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "35",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/35/data",
+      "/srv/service/35/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-036",
+    "Image": "registry.local/example/service:1",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 36",
+    "CreatedAt": "2026-06-15T12:36:00Z",
+    "RunningFor": "37 hours",
+    "Ports": [
+      "127.0.0.1:8036->80/tcp",
+      "127.0.0.1:9036->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-036",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "36",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/36/data",
+      "/srv/service/36/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-037",
+    "Image": "registry.local/example/service:2",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 37",
+    "CreatedAt": "2026-06-15T12:37:00Z",
+    "RunningFor": "38 hours",
+    "Ports": [
+      "127.0.0.1:8037->80/tcp",
+      "127.0.0.1:9037->443/tcp"
+    ],
+    "State": "unhealthy",
+    "Status": "Up 3 hours (health: unhealthy)",
+    "Names": "container-037",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "37",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/37/data",
+      "/srv/service/37/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-038",
+    "Image": "registry.local/example/service:3",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 38",
+    "CreatedAt": "2026-06-15T12:38:00Z",
+    "RunningFor": "39 hours",
+    "Ports": [
+      "127.0.0.1:8038->80/tcp",
+      "127.0.0.1:9038->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-038",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "38",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/38/data",
+      "/srv/service/38/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-039",
+    "Image": "registry.local/example/service:4",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 39",
+    "CreatedAt": "2026-06-15T12:39:00Z",
+    "RunningFor": "40 hours",
+    "Ports": [
+      "127.0.0.1:8039->80/tcp",
+      "127.0.0.1:9039->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-039",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "39",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/39/data",
+      "/srv/service/39/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-040",
+    "Image": "registry.local/example/service:5",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 40",
+    "CreatedAt": "2026-06-15T12:40:00Z",
+    "RunningFor": "41 hours",
+    "Ports": [
+      "127.0.0.1:8040->80/tcp",
+      "127.0.0.1:9040->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-040",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "40",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/40/data",
+      "/srv/service/40/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-041",
+    "Image": "registry.local/example/service:6",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 41",
+    "CreatedAt": "2026-06-15T12:41:00Z",
+    "RunningFor": "42 hours",
+    "Ports": [
+      "127.0.0.1:8041->80/tcp",
+      "127.0.0.1:9041->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-041",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "41",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/41/data",
+      "/srv/service/41/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-042",
+    "Image": "registry.local/example/service:0",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 42",
+    "CreatedAt": "2026-06-15T12:42:00Z",
+    "RunningFor": "43 hours",
+    "Ports": [
+      "127.0.0.1:8042->80/tcp",
+      "127.0.0.1:9042->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-042",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "42",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/42/data",
+      "/srv/service/42/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-043",
+    "Image": "registry.local/example/service:1",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 43",
+    "CreatedAt": "2026-06-15T12:43:00Z",
+    "RunningFor": "44 hours",
+    "Ports": [
+      "127.0.0.1:8043->80/tcp",
+      "127.0.0.1:9043->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-043",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "43",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/43/data",
+      "/srv/service/43/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-044",
+    "Image": "registry.local/example/service:2",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 44",
+    "CreatedAt": "2026-06-15T12:44:00Z",
+    "RunningFor": "45 hours",
+    "Ports": [
+      "127.0.0.1:8044->80/tcp",
+      "127.0.0.1:9044->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-044",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "44",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/44/data",
+      "/srv/service/44/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-045",
+    "Image": "registry.local/example/service:3",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 45",
+    "CreatedAt": "2026-06-15T12:45:00Z",
+    "RunningFor": "46 hours",
+    "Ports": [
+      "127.0.0.1:8045->80/tcp",
+      "127.0.0.1:9045->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-045",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "45",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/45/data",
+      "/srv/service/45/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-046",
+    "Image": "registry.local/example/service:4",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 46",
+    "CreatedAt": "2026-06-15T12:46:00Z",
+    "RunningFor": "47 hours",
+    "Ports": [
+      "127.0.0.1:8046->80/tcp",
+      "127.0.0.1:9046->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-046",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "46",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/46/data",
+      "/srv/service/46/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-047",
+    "Image": "registry.local/example/service:5",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 47",
+    "CreatedAt": "2026-06-15T12:47:00Z",
+    "RunningFor": "48 hours",
+    "Ports": [
+      "127.0.0.1:8047->80/tcp",
+      "127.0.0.1:9047->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-047",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "47",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/47/data",
+      "/srv/service/47/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-048",
+    "Image": "registry.local/example/service:6",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 48",
+    "CreatedAt": "2026-06-15T12:48:00Z",
+    "RunningFor": "49 hours",
+    "Ports": [
+      "127.0.0.1:8048->80/tcp",
+      "127.0.0.1:9048->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-048",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "48",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/48/data",
+      "/srv/service/48/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-049",
+    "Image": "registry.local/example/service:0",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 49",
+    "CreatedAt": "2026-06-15T12:49:00Z",
+    "RunningFor": "50 hours",
+    "Ports": [
+      "127.0.0.1:8049->80/tcp",
+      "127.0.0.1:9049->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-049",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "49",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/49/data",
+      "/srv/service/49/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-050",
+    "Image": "registry.local/example/service:1",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 50",
+    "CreatedAt": "2026-06-15T12:50:00Z",
+    "RunningFor": "51 hours",
+    "Ports": [
+      "127.0.0.1:8050->80/tcp",
+      "127.0.0.1:9050->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-050",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "50",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/50/data",
+      "/srv/service/50/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-051",
+    "Image": "registry.local/example/service:2",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 51",
+    "CreatedAt": "2026-06-15T12:51:00Z",
+    "RunningFor": "52 hours",
+    "Ports": [
+      "127.0.0.1:8051->80/tcp",
+      "127.0.0.1:9051->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-051",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "51",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/51/data",
+      "/srv/service/51/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-052",
+    "Image": "registry.local/example/service:3",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 52",
+    "CreatedAt": "2026-06-15T12:52:00Z",
+    "RunningFor": "53 hours",
+    "Ports": [
+      "127.0.0.1:8052->80/tcp",
+      "127.0.0.1:9052->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-052",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "52",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/52/data",
+      "/srv/service/52/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-053",
+    "Image": "registry.local/example/service:4",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 53",
+    "CreatedAt": "2026-06-15T12:53:00Z",
+    "RunningFor": "54 hours",
+    "Ports": [
+      "127.0.0.1:8053->80/tcp",
+      "127.0.0.1:9053->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-053",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "53",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/53/data",
+      "/srv/service/53/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-054",
+    "Image": "registry.local/example/service:5",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 54",
+    "CreatedAt": "2026-06-15T12:54:00Z",
+    "RunningFor": "55 hours",
+    "Ports": [
+      "127.0.0.1:8054->80/tcp",
+      "127.0.0.1:9054->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-054",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "54",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/54/data",
+      "/srv/service/54/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-055",
+    "Image": "registry.local/example/service:6",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 55",
+    "CreatedAt": "2026-06-15T12:55:00Z",
+    "RunningFor": "56 hours",
+    "Ports": [
+      "127.0.0.1:8055->80/tcp",
+      "127.0.0.1:9055->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-055",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "55",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/55/data",
+      "/srv/service/55/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-056",
+    "Image": "registry.local/example/service:0",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 56",
+    "CreatedAt": "2026-06-15T12:56:00Z",
+    "RunningFor": "57 hours",
+    "Ports": [
+      "127.0.0.1:8056->80/tcp",
+      "127.0.0.1:9056->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-056",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "56",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/56/data",
+      "/srv/service/56/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-057",
+    "Image": "registry.local/example/service:1",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 57",
+    "CreatedAt": "2026-06-15T12:57:00Z",
+    "RunningFor": "58 hours",
+    "Ports": [
+      "127.0.0.1:8057->80/tcp",
+      "127.0.0.1:9057->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-057",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "57",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/57/data",
+      "/srv/service/57/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-058",
+    "Image": "registry.local/example/service:2",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 58",
+    "CreatedAt": "2026-06-15T12:58:00Z",
+    "RunningFor": "59 hours",
+    "Ports": [
+      "127.0.0.1:8058->80/tcp",
+      "127.0.0.1:9058->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-058",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "58",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/58/data",
+      "/srv/service/58/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-059",
+    "Image": "registry.local/example/service:3",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 59",
+    "CreatedAt": "2026-06-15T12:59:00Z",
+    "RunningFor": "60 hours",
+    "Ports": [
+      "127.0.0.1:8059->80/tcp",
+      "127.0.0.1:9059->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-059",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "59",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/59/data",
+      "/srv/service/59/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-060",
+    "Image": "registry.local/example/service:4",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 60",
+    "CreatedAt": "2026-06-15T12:00:00Z",
+    "RunningFor": "61 hours",
+    "Ports": [
+      "127.0.0.1:8060->80/tcp",
+      "127.0.0.1:9060->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-060",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "60",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/60/data",
+      "/srv/service/60/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-061",
+    "Image": "registry.local/example/service:5",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 61",
+    "CreatedAt": "2026-06-15T12:01:00Z",
+    "RunningFor": "62 hours",
+    "Ports": [
+      "127.0.0.1:8061->80/tcp",
+      "127.0.0.1:9061->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-061",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "61",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/61/data",
+      "/srv/service/61/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-062",
+    "Image": "registry.local/example/service:6",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 62",
+    "CreatedAt": "2026-06-15T12:02:00Z",
+    "RunningFor": "63 hours",
+    "Ports": [
+      "127.0.0.1:8062->80/tcp",
+      "127.0.0.1:9062->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-062",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "62",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/62/data",
+      "/srv/service/62/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-063",
+    "Image": "registry.local/example/service:0",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 63",
+    "CreatedAt": "2026-06-15T12:03:00Z",
+    "RunningFor": "64 hours",
+    "Ports": [
+      "127.0.0.1:8063->80/tcp",
+      "127.0.0.1:9063->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-063",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "63",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/63/data",
+      "/srv/service/63/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-064",
+    "Image": "registry.local/example/service:1",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 64",
+    "CreatedAt": "2026-06-15T12:04:00Z",
+    "RunningFor": "65 hours",
+    "Ports": [
+      "127.0.0.1:8064->80/tcp",
+      "127.0.0.1:9064->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-064",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "64",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/64/data",
+      "/srv/service/64/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-065",
+    "Image": "registry.local/example/service:2",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 65",
+    "CreatedAt": "2026-06-15T12:05:00Z",
+    "RunningFor": "66 hours",
+    "Ports": [
+      "127.0.0.1:8065->80/tcp",
+      "127.0.0.1:9065->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-065",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "65",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/65/data",
+      "/srv/service/65/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-066",
+    "Image": "registry.local/example/service:3",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 66",
+    "CreatedAt": "2026-06-15T12:06:00Z",
+    "RunningFor": "67 hours",
+    "Ports": [
+      "127.0.0.1:8066->80/tcp",
+      "127.0.0.1:9066->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-066",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "66",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/66/data",
+      "/srv/service/66/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-067",
+    "Image": "registry.local/example/service:4",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 67",
+    "CreatedAt": "2026-06-15T12:07:00Z",
+    "RunningFor": "68 hours",
+    "Ports": [
+      "127.0.0.1:8067->80/tcp",
+      "127.0.0.1:9067->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-067",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "67",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/67/data",
+      "/srv/service/67/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-068",
+    "Image": "registry.local/example/service:5",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 68",
+    "CreatedAt": "2026-06-15T12:08:00Z",
+    "RunningFor": "69 hours",
+    "Ports": [
+      "127.0.0.1:8068->80/tcp",
+      "127.0.0.1:9068->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-068",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "68",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/68/data",
+      "/srv/service/68/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-069",
+    "Image": "registry.local/example/service:6",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 69",
+    "CreatedAt": "2026-06-15T12:09:00Z",
+    "RunningFor": "70 hours",
+    "Ports": [
+      "127.0.0.1:8069->80/tcp",
+      "127.0.0.1:9069->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-069",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "69",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/69/data",
+      "/srv/service/69/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-070",
+    "Image": "registry.local/example/service:0",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 70",
+    "CreatedAt": "2026-06-15T12:10:00Z",
+    "RunningFor": "71 hours",
+    "Ports": [
+      "127.0.0.1:8070->80/tcp",
+      "127.0.0.1:9070->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-070",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "70",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/70/data",
+      "/srv/service/70/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-071",
+    "Image": "registry.local/example/service:1",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 71",
+    "CreatedAt": "2026-06-15T12:11:00Z",
+    "RunningFor": "72 hours",
+    "Ports": [
+      "127.0.0.1:8071->80/tcp",
+      "127.0.0.1:9071->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-071",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "71",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/71/data",
+      "/srv/service/71/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-072",
+    "Image": "registry.local/example/service:2",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 72",
+    "CreatedAt": "2026-06-15T12:12:00Z",
+    "RunningFor": "73 hours",
+    "Ports": [
+      "127.0.0.1:8072->80/tcp",
+      "127.0.0.1:9072->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-072",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "72",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/72/data",
+      "/srv/service/72/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-073",
+    "Image": "registry.local/example/service:3",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 73",
+    "CreatedAt": "2026-06-15T12:13:00Z",
+    "RunningFor": "74 hours",
+    "Ports": [
+      "127.0.0.1:8073->80/tcp",
+      "127.0.0.1:9073->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-073",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "73",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/73/data",
+      "/srv/service/73/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-074",
+    "Image": "registry.local/example/service:4",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 74",
+    "CreatedAt": "2026-06-15T12:14:00Z",
+    "RunningFor": "75 hours",
+    "Ports": [
+      "127.0.0.1:8074->80/tcp",
+      "127.0.0.1:9074->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-074",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "74",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/74/data",
+      "/srv/service/74/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-075",
+    "Image": "registry.local/example/service:5",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 75",
+    "CreatedAt": "2026-06-15T12:15:00Z",
+    "RunningFor": "76 hours",
+    "Ports": [
+      "127.0.0.1:8075->80/tcp",
+      "127.0.0.1:9075->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-075",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "75",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/75/data",
+      "/srv/service/75/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-076",
+    "Image": "registry.local/example/service:6",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 76",
+    "CreatedAt": "2026-06-15T12:16:00Z",
+    "RunningFor": "77 hours",
+    "Ports": [
+      "127.0.0.1:8076->80/tcp",
+      "127.0.0.1:9076->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-076",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "76",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/76/data",
+      "/srv/service/76/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-077",
+    "Image": "registry.local/example/service:0",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 77",
+    "CreatedAt": "2026-06-15T12:17:00Z",
+    "RunningFor": "78 hours",
+    "Ports": [
+      "127.0.0.1:8077->80/tcp",
+      "127.0.0.1:9077->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-077",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "77",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/77/data",
+      "/srv/service/77/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-078",
+    "Image": "registry.local/example/service:1",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 78",
+    "CreatedAt": "2026-06-15T12:18:00Z",
+    "RunningFor": "79 hours",
+    "Ports": [
+      "127.0.0.1:8078->80/tcp",
+      "127.0.0.1:9078->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-078",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "78",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/78/data",
+      "/srv/service/78/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  },
+  {
+    "ID": "cid-079",
+    "Image": "registry.local/example/service:2",
+    "Command": "python -m service.worker --queue main --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --very-long-flag value --index 79",
+    "CreatedAt": "2026-06-15T12:19:00Z",
+    "RunningFor": "80 hours",
+    "Ports": [
+      "127.0.0.1:8079->80/tcp",
+      "127.0.0.1:9079->443/tcp"
+    ],
+    "State": "running",
+    "Status": "Up 3 hours (healthy)",
+    "Names": "container-079",
+    "Labels": {
+      "com.example.service": "api",
+      "com.example.ordinal": "79",
+      "com.example.long": "label-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "Mounts": [
+      "/srv/service/79/data",
+      "/srv/service/79/logs"
+    ],
+    "Networks": [
+      "frontend",
+      "backend"
+    ]
+  }
+]
