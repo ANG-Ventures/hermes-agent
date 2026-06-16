@@ -27,7 +27,7 @@ from .config import (
     COMPRESSION_MODE_SHADOW,
     NativeContentSlimmerConfig,
 )
-from .breaker import ExpansionRateCircuitBreaker
+from .breaker import BREAKER_STATE_CLOSED, ExpansionRateCircuitBreaker
 from .gc import collect_garbage
 from .health import check_artifact_store_health
 from .marker import (
@@ -197,7 +197,7 @@ class NativeContentSlimmerHooks:
                 kwargs,
                 default=RAW_SOURCE_TERMINAL_PRE_TRUNCATION,
             )
-            return self._process_result(
+            return self.select_replacement(
                 tool_name=_TERMINAL_TOOL,
                 raw_text=output,
                 raw_source=raw_source,
@@ -250,7 +250,7 @@ class NativeContentSlimmerHooks:
                 self._record_skip("no_tool_call_id")
                 return None
             raw_source = _raw_source_from_kwargs(_, default=RAW_SOURCE_TOOL_RESULT_RETURNED)
-            return self._process_result(
+            return self.select_replacement(
                 tool_name=name,
                 raw_text=result,
                 raw_source=raw_source,
@@ -267,7 +267,7 @@ class NativeContentSlimmerHooks:
             self._record_failure(exc)
             return None
 
-    def _process_result(
+    def select_replacement(
         self,
         *,
         tool_name: str,
@@ -282,6 +282,7 @@ class NativeContentSlimmerHooks:
         duration_ms: float | int | None,
         metadata: dict[str, Any],
     ) -> str | None:
+        """Live replacement selection entrypoint used by tool-result hooks."""
         if not self.config.enabled:
             return None
         if not isinstance(raw_text, str) or raw_text == "":
@@ -386,6 +387,8 @@ class NativeContentSlimmerHooks:
             return marker
         return None
 
+    _process_result = select_replacement
+
     def _compression_requested_for_turn(self, *, metadata: dict[str, Any]) -> bool:
         mode = self.config.compression_mode
         if mode == COMPRESSION_MODE_OFF:
@@ -416,7 +419,13 @@ class NativeContentSlimmerHooks:
             return self._lossless_classification_from(classification, raw_text, "compression_canary_not_selected")
         if mode in ACTIVE_COMPRESSION_MODES:
             state = self.breaker.evaluate(lane)
-            if not state.allow_compression:
+            state_name = str(getattr(state, "state", "") or "")
+            allow_compression = (
+                state_name == BREAKER_STATE_CLOSED
+                if state_name
+                else bool(getattr(state, "allow_compression", False))
+            )
+            if not allow_compression:
                 self._record_skip(f"compression_breaker_{state.reason}")
                 return self._lossless_classification_from(
                     classification,
@@ -522,8 +531,11 @@ class NativeContentSlimmerHooks:
         artifact_metadata: dict[str, Any] = {
             "mode": telemetry_mode,
             "would_replace": telemetry_action == "would_replace",
+            "content_class": str(classification.content_class or "unknown"),
         }
-        artifact_extra: dict[str, Any] = {}
+        artifact_extra: dict[str, Any] = {
+            "content_class": str(classification.content_class or "unknown"),
+        }
         if strategy_name:
             artifact_metadata.update(
                 {

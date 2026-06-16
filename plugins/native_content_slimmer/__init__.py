@@ -20,6 +20,7 @@ from dataclasses import replace
 from typing import Any, Mapping
 
 from .config import NativeContentSlimmerConfig, load_slimmer_config
+from .breaker import ExpansionRateCircuitBreaker
 from .hook import NativeContentSlimmerHooks, transform_terminal_output, transform_tool_result
 from .tools import register_tools
 
@@ -53,8 +54,11 @@ def register(ctx: Any, config: Mapping[str, Any] | None = None) -> NativeContent
         return cfg
 
     runtime_cfg = cfg
+    breaker = ExpansionRateCircuitBreaker(
+        trip_threshold=float(cfg.compression_breaker_ceiling or 0.0)
+    )
     try:
-        register_tools(ctx)
+        register_tools(ctx, breaker=breaker)
     except Exception as exc:
         if cfg.mode == "active_lossless":
             logger.error(
@@ -70,7 +74,11 @@ def register(ctx: Any, config: Mapping[str, Any] | None = None) -> NativeContent
         else:
             logger.warning("native_content_slimmer could not register expand_artifact: %s", exc)
 
-    runtime = NativeContentSlimmerHooks(runtime_cfg, telemetry=_build_telemetry_sink(runtime_cfg))
+    runtime = NativeContentSlimmerHooks(
+        runtime_cfg,
+        telemetry=_build_telemetry_sink(runtime_cfg),
+        breaker=breaker,
+    )
     ctx.register_hook("transform_terminal_output", runtime.transform_terminal_output)
     ctx.register_hook("transform_tool_result", runtime.transform_tool_result)
     if runtime_cfg.artifact_gc_on_session_end:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Hashable, Mapping
 from typing import Any
 
 from plugins.native_content_slimmer.classifier import contains_secret
@@ -55,14 +55,27 @@ EXPAND_ARTIFACT_SCHEMA: dict[str, Any] = {
 }
 
 
-def register_tools(ctx: Any) -> None:
+def register_tools(
+    ctx: Any,
+    *,
+    breaker: Any | None = None,
+    store: ArtifactStore | None = None,
+) -> None:
     """Register native content slimmer tools with a Hermes plugin context."""
 
+    def _live_expand_artifact_handler(args: Mapping[str, Any] | None, **kwargs: Any) -> str:
+        if breaker is not None and "breaker" not in kwargs:
+            kwargs["breaker"] = breaker
+        if store is not None and "store" not in kwargs:
+            kwargs["store"] = store
+        return handle_expand_artifact(args, **kwargs)
+
+    _live_expand_artifact_handler.__name__ = handle_expand_artifact.__name__
     ctx.register_tool(
         name=EXPAND_ARTIFACT_NAME,
         toolset=TOOLSET_NAME,
         schema=EXPAND_ARTIFACT_SCHEMA,
-        handler=handle_expand_artifact,
+        handler=_live_expand_artifact_handler,
         emoji="📦",
     )
 
@@ -139,6 +152,19 @@ def expand_artifact_tool(args: Mapping[str, Any], **kwargs: Any) -> dict[str, An
         # remain errors; they never get converted into partial content.
         return expanded
     if expanded.get("ok") is not False:
+        breaker = kwargs.get("breaker")
+        lane = _compression_lane_from_record(record)
+        if breaker is not None and lane is not None:
+            try:
+                observe = getattr(breaker, "observe", None)
+                if callable(observe):
+                    observe(lane, expanded=True)
+                else:
+                    record_result = getattr(breaker, "record_result", None)
+                    if callable(record_result):
+                        record_result(lane, expanded=True)
+            except Exception:
+                pass
         _record_realized_expansion(record=record, artifact_id=artifact_id, session_id=session_id)
     return expanded
 
@@ -146,6 +172,20 @@ def expand_artifact_tool(args: Mapping[str, Any], **kwargs: Any) -> dict[str, An
 def _trusted_session_id(kwargs: Mapping[str, Any]) -> str:
     value = kwargs.get("session_id") or kwargs.get("current_session_id")
     return str(value or "").strip()
+
+
+def _compression_lane_from_record(record: Mapping[str, Any]) -> tuple[Hashable, Hashable, Hashable] | None:
+    strategy = str(record.get("strategy") or "")
+    metadata = record.get("metadata")
+    if not strategy and isinstance(metadata, Mapping):
+        strategy = str(metadata.get("strategy") or "")
+    if not strategy:
+        return None
+    tool_name = str(record.get("tool_name") or "")
+    content_class = str(record.get("content_class") or "")
+    if not content_class and isinstance(metadata, Mapping):
+        content_class = str(metadata.get("content_class") or "")
+    return (tool_name, content_class or "unknown", strategy)
 
 
 def _record_realized_expansion(

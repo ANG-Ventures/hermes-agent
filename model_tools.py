@@ -1090,6 +1090,15 @@ def handle_function_call(
                                 "api_request_id": api_request_id,
                             }
                         )
+                    elif function_name == "expand_artifact":
+                        dispatch_kwargs.update(
+                            {
+                                "session_id": session_id,
+                                "tool_call_id": tool_call_id,
+                                "turn_id": turn_id,
+                                "api_request_id": api_request_id,
+                            }
+                        )
                     return registry.dispatch(function_name, next_args, **dispatch_kwargs)
             result = _dispatch(function_args)
         finally:

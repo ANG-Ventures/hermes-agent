@@ -18,6 +18,9 @@ TRIP_THRESHOLD = 0.25
 
 ACTION_COMPRESS = "compress"
 ACTION_OFFLOAD = "offload"
+BREAKER_STATE_NOT_READY = "NOT_READY"
+BREAKER_STATE_OPEN = "OPEN"
+BREAKER_STATE_CLOSED = "CLOSED"
 
 
 @dataclass(frozen=True)
@@ -31,8 +34,16 @@ class BreakerState:
     reason: str
 
     @property
+    def state(self) -> str:
+        if self.action == ACTION_COMPRESS and not self.tripped:
+            return BREAKER_STATE_CLOSED
+        if self.reason == "cold_start":
+            return BREAKER_STATE_NOT_READY
+        return BREAKER_STATE_OPEN
+
+    @property
     def allow_compression(self) -> bool:
-        return self.action == ACTION_COMPRESS
+        return self.state == BREAKER_STATE_CLOSED
 
 
 class ExpansionRateCircuitBreaker:
@@ -76,7 +87,12 @@ class ExpansionRateCircuitBreaker:
             self._latched.add(lane)
         return state
 
-    # Short alias for callers/tests that name the event as a sample.
+    def observe(self, lane: Hashable, *, expanded: bool = True) -> BreakerState:
+        """Observe one live expansion outcome for a lane."""
+
+        return self.record_result(lane, expanded=expanded)
+
+    # Short aliases for callers/tests that name the event as a sample.
     record = record_result
 
     def evaluate(self, lane: Hashable) -> BreakerState:
