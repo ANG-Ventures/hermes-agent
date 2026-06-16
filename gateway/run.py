@@ -8246,9 +8246,10 @@ class GatewayRunner:
                 except (ValueError, IndexError):
                     _undo_n = 1
             _undo_detail = (
-                "This removes the last user/assistant exchange from history."
+                "This backs up the last half-turn (one party's run of "
+                "messages) from history."
                 if _undo_n == 1
-                else f"This removes the last {_undo_n} user turns from history."
+                else f"This backs up the last {_undo_n} half-turns from history."
             )
             return await self._maybe_confirm_destructive_slash(
                 event=event,
