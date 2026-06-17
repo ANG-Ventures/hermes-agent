@@ -27,19 +27,45 @@ CostSource = Literal[
 ]
 
 
-# Local subscription proxies / bridges that front the Anthropic API. Their
-# marginal cash cost is $0 (flat Claude subscription / tailnet failover), but we
-# price them at official Anthropic API rates for fleet cost *visibility* and
-# label the result "estimated". Provider names match the `provider:` keys used
-# in ~/.hermes/config.yaml across the fleet. Add new bridge/proxy aliases here.
+# Local subscription proxies / bridges / pools that front the Anthropic API.
+# Their marginal cash cost is $0 (flat Claude subscription / tailnet failover /
+# local relay), but we price them at official Anthropic API rates for fleet cost
+# *visibility* and label the result "estimated". Provider names match the
+# `provider:` keys used in ~/.hermes/config.yaml + plugins/model-providers/*
+# across the fleet.
+#
+# This is the set of EXACT BASE names. The numbered failover family
+# (claude-api-proxy-fN / claude-bridge-fN, any integer N) is matched by PATTERN
+# in is_notional_anthropic_provider() below — so a NEW failover lane (-f6, -f7,
+# …) can never again silently price as $0 the way -f2/-f3/-f4/-f5 did. Use the
+# predicate, not bare `in` membership, at every call site.
 NOTIONAL_ANTHROPIC_PROVIDERS = frozenset({
     "claude-api-proxy",
-    "claude-api-proxy-f1",
-    "claude-api-proxy-f2",
     "claude-bridge",
-    "claude-bridge-f1",
-    "claude-bridge-f2",
+    "claude-pool",
 })
+
+# claude-api-proxy-f1, claude-bridge-f2, … -f<any integer>. Anchored +
+# integer-only so it matches ONLY the disciplined failover naming and never an
+# unrelated "claude-bridge-frobnicate". claude-pool has no -fN family (failover
+# happens inside the relay), so it stays an exact base member above.
+_NOTIONAL_ANTHROPIC_FN_RE = re.compile(r"^claude-(?:api-proxy|bridge)-f\d+$")
+
+
+def is_notional_anthropic_provider(provider_name: Optional[str]) -> bool:
+    """True if a provider key should be priced at notional Anthropic rates.
+
+    Covers the exact base relays/proxies/pool AND the numbered -fN failover
+    family by pattern, so adding a new -fN lane (or a config that references
+    one) never needs a code change. Normalizes (strip/lower) defensively for
+    direct callers; resolve_billing_route already normalizes before calling.
+    """
+    p = (provider_name or "").strip().lower()
+    if not p:
+        return False
+    return p in NOTIONAL_ANTHROPIC_PROVIDERS or bool(
+        _NOTIONAL_ANTHROPIC_FN_RE.match(p)
+    )
 
 # Notional pricing for ChatGPT-subscription Codex providers (openai-codex).
 # Marginal cash cost is $0 (covered by a flat ChatGPT subscription), but for
@@ -600,7 +626,7 @@ def resolve_billing_route(
     # cost *visibility* we price these at official Anthropic API rates and label
     # the result "estimated" so /cost cards, top, and session rollups carry
     # meaningful numbers. See NOTIONAL_ANTHROPIC_PROVIDERS.
-    if provider_name in NOTIONAL_ANTHROPIC_PROVIDERS:
+    if is_notional_anthropic_provider(provider_name):
         return BillingRoute(
             provider="anthropic",
             model=model.split("/")[-1],
@@ -656,6 +682,29 @@ def _normalize_anthropic_model_name(model: str) -> str:
     return name
 
 
+# Trailing 8-digit release-date suffix on a NEW-scheme Anthropic model id, e.g.
+# claude-haiku-4-5-20251001 → the dated alias of claude-haiku-4-5. Anchored to
+# the end and require a preceding "-N" version segment so we only strip a date
+# that was APPENDED to an already-versioned name — never the canonical OLD-scheme
+# ids whose date IS part of the name (claude-3-5-haiku-20241022, where stripping
+# would land on the non-existent claude-3-5-haiku). Used ONLY as a last-resort
+# snapshot fallback, after direct + dot-normalized lookups, so a real dated entry
+# always wins.
+_ANTHROPIC_DATED_SUFFIX_RE = re.compile(r"^(claude-.*-\d+-\d+)-\d{8}$")
+
+
+def _strip_anthropic_release_date(name: str) -> Optional[str]:
+    """Strip a trailing -YYYYMMDD appended to a versioned new-scheme name.
+
+    claude-haiku-4-5-20251001 → claude-haiku-4-5 ; claude-opus-4-8-20260115 →
+    claude-opus-4-8. Returns None when there is no such suffix to strip (incl.
+    the old-scheme claude-3-5-haiku-20241022, which lacks the -N-N version tail
+    before the date and so is left intact for its own direct entry).
+    """
+    m = _ANTHROPIC_DATED_SUFFIX_RE.match(name)
+    return m.group(1) if m else None
+
+
 def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]:
     model = route.model.lower()
     # Direct lookup first
@@ -667,6 +716,16 @@ def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]
         normalized = _normalize_anthropic_model_name(model)
         if normalized != model:
             entry = _OFFICIAL_DOCS_PRICING.get((route.provider, normalized))
+            if entry:
+                return entry
+        # Last-resort: strip a trailing -YYYYMMDD release date appended to a
+        # versioned new-scheme id and retry on the base (claude-haiku-4-5-
+        # 20251001 → claude-haiku-4-5). Runs AFTER direct + dot-normalized so a
+        # real dated entry (e.g. claude-3-5-haiku-20241022) always wins on its
+        # own key. Fixes the dated-Haiku unpriced gap (audit 2026-06-17).
+        base = _strip_anthropic_release_date(normalized)
+        if base and base != normalized:
+            entry = _OFFICIAL_DOCS_PRICING.get((route.provider, base))
             if entry:
                 return entry
     return None

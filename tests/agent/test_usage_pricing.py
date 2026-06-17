@@ -6,9 +6,27 @@ from agent.usage_pricing import (
     estimate_usage_cost,
     get_pricing_entry,
     has_known_pricing,
+    is_notional_anthropic_provider,
     normalize_usage,
     resolve_billing_route,
 )
+
+
+# Representative notional-Anthropic provider keys: the exact base members PLUS a
+# spread of the -fN failover family (matched by pattern, not membership). Tests
+# that assert "every notional provider prices correctly" iterate THIS, not the
+# frozenset — because the frozenset deliberately holds only the base names now.
+_REPRESENTATIVE_NOTIONAL = [
+    "claude-api-proxy",
+    "claude-bridge",
+    "claude-pool",
+    "claude-api-proxy-f1",
+    "claude-api-proxy-f2",
+    "claude-api-proxy-f5",
+    "claude-bridge-f1",
+    "claude-bridge-f3",
+    "claude-bridge-f5",
+]
 
 
 def test_normalize_usage_anthropic_keeps_cache_buckets_separate():
@@ -156,13 +174,20 @@ def test_estimate_usage_cost_marks_true_subscription_routes_included(monkeypatch
     assert result.amount_usd is not None and float(result.amount_usd) == 0.0  # type: ignore[arg-type]
 
 
-def test_notional_anthropic_includes_f2_failover_aliases():
-    """Regression: the -f2 failover lane (Sub#3 / claude-usw-f2 VPS) must be a
-    notional-Anthropic provider, same as bare and -f1. Missing aliases caused
-    every f2-routed turn to price as 'unknown'/$0, blinding /cost to ~25% of
-    real Opus spend (audit 2026-06-13)."""
-    for provider in ("claude-api-proxy-f2", "claude-bridge-f2"):
-        assert provider in NOTIONAL_ANTHROPIC_PROVIDERS, provider
+def test_notional_anthropic_includes_fn_failover_family_by_pattern():
+    """Regression (the recurring f-lane alias gap): every -fN failover lane —
+    claude-api-proxy-fN / claude-bridge-fN for ANY integer N — must price as
+    notional-Anthropic, matched by PATTERN (not frozenset membership) so a new
+    lane never needs a code edit. Missing aliases caused -f2 (audit 2026-06-13,
+    ~25% of Opus spend) and then claude-pool/-f3/-f4/-f5 (audit 2026-06-17,
+    ~$872 over 2 days) to price 'unknown'/$0, blinding /cost."""
+    for provider in (
+        "claude-api-proxy-f1", "claude-api-proxy-f2", "claude-api-proxy-f3",
+        "claude-api-proxy-f4", "claude-api-proxy-f5",
+        "claude-bridge-f1", "claude-bridge-f2", "claude-bridge-f3",
+        "claude-bridge-f4", "claude-bridge-f5", "claude-pool",
+    ):
+        assert is_notional_anthropic_provider(provider), provider
         result = estimate_usage_cost(
             "claude-opus-4-8",
             CanonicalUsage(input_tokens=1000, output_tokens=100,
@@ -173,18 +198,46 @@ def test_notional_anthropic_includes_f2_failover_aliases():
         assert result.amount_usd is not None and float(result.amount_usd) > 0
 
 
+def test_notional_anthropic_pattern_is_open_ended_on_n():
+    """The -fN pattern must accept ANY integer N (today -f1..-f5, tomorrow -f6+),
+    proving a future failover lane is covered with zero code change."""
+    for provider in (
+        "claude-bridge-f6", "claude-bridge-f9", "claude-bridge-f12",
+        "claude-api-proxy-f7", "claude-api-proxy-f10", "claude-api-proxy-f99",
+    ):
+        assert is_notional_anthropic_provider(provider), provider
+        route = resolve_billing_route("claude-opus-4-8", provider=provider)
+        assert route.billing_mode == "official_docs_snapshot", provider
+
+
+def test_notional_anthropic_pattern_rejects_non_failover():
+    """The pattern must be ANCHORED + integer-only — it must NOT match a lookalike
+    that isn't a real failover lane (else we'd misprice an unrelated provider as
+    Anthropic). Guards against a greedy/unanchored regex."""
+    for provider in (
+        "claude-bridge-frobnicate", "claude-api-proxy-foo", "claude-bridge-f",
+        "claude-bridgef3", "xclaude-bridge-f3", "claude-bridge-f3x",
+        "claude-bridge-f3-extra", "claude-pool-f3", "claude-poolx",
+        "openai-codex", "anthropic", "openrouter", "", "   ",
+    ):
+        assert not is_notional_anthropic_provider(provider), repr(provider)
+    # None must be safe too (Optional param)
+    assert not is_notional_anthropic_provider(None)
+
+
 def test_notional_anthropic_providers_price_at_official_rates():
-    """The 4 Claude subscription proxies/bridges must price claude-opus-4-8 at
-    official Anthropic rates ($5/$25 per M, $0.50 cache-read, $6.25 cache-write)
-    and label the result 'estimated' — NOT 'unknown' (which suppresses /cost
-    cards) and NOT 'included'/$0 (which hides spend in rollups)."""
+    """The notional Claude subscription proxies/bridges/pool must price
+    claude-opus-4-8 at official Anthropic rates ($5/$25 per M, $0.50 cache-read,
+    $6.25 cache-write) and label the result 'estimated' — NOT 'unknown' (which
+    suppresses /cost cards) and NOT 'included'/$0 (which hides spend in
+    rollups). Iterates the representative set incl. -fN pattern members."""
     usage = CanonicalUsage(
         input_tokens=500_000, output_tokens=559,
         cache_read_tokens=499_000, cache_write_tokens=1000,
     )
     # 500000*5/1e6 + 559*25/1e6 + 499000*0.5/1e6 + 1000*6.25/1e6 = 2.769725
     expected = 2.769725
-    for provider in sorted(NOTIONAL_ANTHROPIC_PROVIDERS):
+    for provider in _REPRESENTATIVE_NOTIONAL:
         result = estimate_usage_cost("claude-opus-4-8", usage, provider=provider)
         assert result.status == "estimated", f"{provider}: {result.status}"
         assert result.amount_usd is not None, f"{provider} priced None"
@@ -196,7 +249,7 @@ def test_notional_anthropic_providers_price_at_official_rates():
 def test_notional_anthropic_route_resolves_to_anthropic_billing():
     """resolve_billing_route must rewrite the proxy provider to 'anthropic' with
     the docs-snapshot billing mode so all downstream pricing lookups work."""
-    for provider in NOTIONAL_ANTHROPIC_PROVIDERS:
+    for provider in _REPRESENTATIVE_NOTIONAL:
         route = resolve_billing_route("claude-opus-4-8", provider=provider)
         assert route.provider == "anthropic", provider
         assert route.billing_mode == "official_docs_snapshot", provider
@@ -214,9 +267,10 @@ def test_notional_anthropic_accepts_dot_notation_and_prefixed_model():
 
 
 def test_notional_anthropic_has_known_pricing():
-    """has_known_pricing must return True for the proxy providers (used by
-    callers to decide whether to attempt cost display)."""
-    for provider in NOTIONAL_ANTHROPIC_PROVIDERS:
+    """has_known_pricing must return True for the notional providers (used by
+    callers to decide whether to attempt cost display) — incl. -fN pattern
+    members and claude-pool, since it routes through resolve_billing_route."""
+    for provider in _REPRESENTATIVE_NOTIONAL:
         assert has_known_pricing("claude-opus-4-8", provider=provider), provider
 
 
@@ -225,6 +279,47 @@ _CODEX_STUB_METADATA = {
     "gpt-5.4": {"pricing": {"prompt": "0.0000025", "completion": "0.000015"}},
     "gpt-5.3-codex": {"pricing": {"prompt": "0.00000175", "completion": "0.000014"}},
 }
+
+
+def test_anthropic_dated_release_suffix_falls_back_to_base_snapshot():
+    """A new-scheme Anthropic id with a trailing -YYYYMMDD release date that has
+    no explicit snapshot entry must fall back to its base model's pricing —
+    NOT price 'unknown'. Fixes the dated-Haiku gap (claude-haiku-4-5-20251001
+    priced $0 while bare claude-haiku-4-5 priced fine; audit 2026-06-17)."""
+    usage = CanonicalUsage(input_tokens=1000, output_tokens=100,
+                           cache_read_tokens=5000, cache_write_tokens=200)
+    base = estimate_usage_cost("claude-haiku-4-5", usage, provider="claude-pool")
+    dated = estimate_usage_cost("claude-haiku-4-5-20251001", usage, provider="claude-pool")
+    assert base.status == "estimated"
+    assert dated.status == "estimated", f"dated priced {dated.status}"
+    assert dated.amount_usd is not None and dated.amount_usd == base.amount_usd, (
+        f"dated {dated.amount_usd} != base {base.amount_usd}"
+    )
+    # Also covers a hypothetical future dated Opus id.
+    opus = estimate_usage_cost("claude-opus-4-8-20260115", usage, provider="claude-bridge")
+    assert opus.status == "estimated" and opus.amount_usd is not None
+
+
+def test_anthropic_old_scheme_dated_model_is_not_date_stripped():
+    """No-regression guard: an OLD-scheme id whose date is PART of the canonical
+    name (claude-3-5-haiku-20241022) must hit its OWN snapshot entry directly,
+    never get date-stripped to a non-existent base (claude-3-5-haiku). It has
+    its own distinct rate, so stripping would mis-price it."""
+    from agent.usage_pricing import _strip_anthropic_release_date
+    # The strip helper must DECLINE the old-scheme name (no -N-N version tail).
+    assert _strip_anthropic_release_date("claude-3-5-haiku-20241022") is None
+    assert _strip_anthropic_release_date("claude-haiku-4-5-20251001") == "claude-haiku-4-5"
+    assert _strip_anthropic_release_date("claude-opus-4-8-20260115") == "claude-opus-4-8"
+    # Non-dated / partial-date names are left alone.
+    for n in ("claude-haiku-4-5", "claude-opus-4-8", "claude-haiku-4-5-2025", "gpt-5.5"):
+        assert _strip_anthropic_release_date(n) is None, n
+    # End-to-end: the old-scheme dated Haiku still prices via its own entry,
+    # and its rate is DISTINCT from the new 4-5 Haiku (proves no cross-contamination).
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=0)
+    old = estimate_usage_cost("claude-3-5-haiku-20241022", usage, provider="anthropic")
+    new = estimate_usage_cost("claude-haiku-4-5", usage, provider="anthropic")
+    assert old.status == "estimated" and new.status == "estimated"
+    assert old.amount_usd != new.amount_usd, "old-scheme must keep its own rate"
 
 
 def test_openai_codex_route_resolves_to_notional_openrouter():
