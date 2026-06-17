@@ -53,16 +53,17 @@ def test_fresh_runtime_registry_populates_eval_gated_lanes() -> None:
     assert ("web_extract", "json", "json_compact") in lanes
     assert ("terminal", "log", "log_dedup") in lanes
     assert ("terminal", "diff", "diff_collapse") in lanes
-    assert ("terminal", "grep", "grep_cluster") in lanes
+    # RD-AMEND1, 2026-06-16: grep_cluster fenced off the semantic path (PRD-5 Amendment 1).
+    # The grep lane must be ABSENT; it used to assert presence here.
+    assert ("terminal", "grep", "grep_cluster") not in lanes
     assert all(lane.eval_run_id and lane.threshold for lane in registry.registered_lanes())
 
 
-def test_classifier_reaches_json_log_diff_and_grep_compressor_lanes() -> None:
+def test_classifier_reaches_json_log_diff_compressor_lanes_and_fences_grep() -> None:
     cases = [
         ("web_extract", _json_raw(), "", "json", "json_compact"),
         ("terminal", _log_raw(), "", "log", "log_dedup"),
         ("terminal", _diff_raw(), "git diff", "diff", "diff_collapse"),
-        ("terminal", _grep_raw(), "", "grep", "grep_cluster"),
     ]
 
     for tool_name, raw, command, content_class, strategy in cases:
@@ -76,6 +77,19 @@ def test_classifier_reaches_json_log_diff_and_grep_compressor_lanes() -> None:
         assert classified.content_class == content_class
         assert classified.outcome == COMPRESS_OFFLOAD
         assert classified.recommended_strategy == strategy
+
+    grep_classified = classify_tool_result(
+        tool_name="terminal",
+        result=_grep_raw(),
+        min_bytes=100,
+        command="",
+        compression_enabled=True,
+    )
+    assert grep_classified.content_class == "grep"
+    # RD-AMEND1, 2026-06-16: classification still recognizes grep, but the
+    # semantic grep_cluster lane is fenced off so grep routes lossless.
+    assert grep_classified.outcome == LOSSLESS_OFFLOAD
+    assert grep_classified.recommended_strategy is None
 
 
 def test_compression_mode_off_disabled_strategy_and_cold_breaker_do_not_compress(tmp_path: Path) -> None:

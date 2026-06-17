@@ -37,12 +37,17 @@ def ensure_registered() -> None:
         return
     _SELF_REGISTRATION_DONE = True
 
-    from . import diff_collapse, grep_cluster, json_compact, log_dedup
+    from . import diff_collapse, json_compact, log_dedup
 
     json_compact.register()
     log_dedup.register_default_lanes()
     diff_collapse.register()
-    grep_cluster.register()
+    # RD-AMEND1 (PRD-5 Amendment 1, 2026-06-16): grep_cluster is FENCED OFF the semantic path.
+    # The lossy grep_cluster view destroys path:line citation provenance (RC-1) AND yields
+    # negative compression on real grep dumps (RC-3). Grep routes to the lossless lane instead.
+    # DO NOT re-add grep_cluster.register() without re-passing the citation gate (see
+    # docs/PRD-5-AMEND-1-grep-cluster-citation-fix.md §9 G-4 and test_grep_lane_fenced.py).
+    # The strategy module + its unit tests stay in-tree (D-3) for a future trigger-gated fix.
 
 
 def register_compressor(

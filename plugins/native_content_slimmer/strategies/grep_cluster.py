@@ -179,4 +179,5 @@ def _positive_int(value: object, *, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
-register()
+# RD-AMEND1 (PRD-5 Amendment 1, 2026-06-16): keep register() available for
+# explicit mutation/roadmap tests, but do NOT self-register this fenced lane on import.

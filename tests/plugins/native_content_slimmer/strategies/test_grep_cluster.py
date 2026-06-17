@@ -69,18 +69,19 @@ def test_keeps_every_distinct_match_value_in_one_file_prefix_group() -> None:
         assert f"- token = VALUE_{line_no:02d} ×1" in section
 
 
-def test_import_self_registers_terminal_grep_lane() -> None:
+def test_grep_lane_fenced_but_compressor_retained() -> None:
+    # RD-AMEND1, 2026-06-16: grep_cluster is fenced off the registry (PRD-5 Amendment 1).
+    # The lane must NOT be selectable, but the strategy class stays importable + functional
+    # in-tree (D-3) so a future trigger-gated fix can re-enable it.
     registry.clear_registry_for_tests()
 
     importlib.reload(grep_cluster)
-    selection = registry.select_compressor(tool_name="terminal", content_class="grep")
+    assert registry.select_compressor(tool_name="terminal", content_class="grep") is None
 
-    assert selection is not None
-    assert selection.tool_name == "terminal"
-    assert selection.content_class == "grep"
-    assert selection.strategy_name == "grep_cluster"
-    assert selection.eval_run_id
-    assert "recoverability=1.00" in selection.threshold
+    # Strategy code retained and still works when invoked directly.
+    view = grep_cluster.GrepClusterCompressor().compress("src/app.py:1:x = 1", params={})
+    assert view is not None
+    assert view.strategy_name == "grep_cluster"
     assert registry.select_compressor(tool_name="terminal", content_class="text") is None
 
 
