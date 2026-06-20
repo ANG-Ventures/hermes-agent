@@ -16,6 +16,12 @@ from plugins.blackbox.record import TurnRecord, tools_summary
 
 logger = logging.getLogger(__name__)
 
+_RAW_BYTES_SOURCES = {"rtk-selfreport", "rtk-shadow", "native-exact"}
+_RAW_BYTES_SOURCE_CHECK = (
+    "raw_bytes_source IS NULL OR raw_bytes_source IN "
+    "('rtk-selfreport','rtk-shadow','native-exact')"
+)
+
 
 def _db_path() -> Path:
     return get_hermes_home() / "blackbox" / "turns.db"
@@ -78,6 +84,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             comp_skills_count INT,
             comp_framing_tokens INT,
             comp_calls_json TEXT,
+            turn_saved_tokens_est INT,
             cost_usd REAL,
             cost_status TEXT,
             interrupted INT,
@@ -92,6 +99,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             name TEXT,
             args_preview TEXT,
             result_preview TEXT,
+            saved_bytes INT,
+            saved_tokens_est INT,
+            compressor TEXT,
+            raw_bytes_source TEXT CHECK(raw_bytes_source IS NULL OR raw_bytes_source IN ('rtk-selfreport','rtk-shadow','native-exact')),
             PRIMARY KEY(turn_id, seq)
         );
 
@@ -145,6 +156,34 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE turns ADD COLUMN comp_calls_json TEXT")
         except sqlite3.OperationalError:
             pass
+    if "turn_saved_tokens_est" not in _existing:
+        try:
+            conn.execute("ALTER TABLE turns ADD COLUMN turn_saved_tokens_est INT")
+        except sqlite3.OperationalError:
+            pass
+
+    _tool_existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(turn_tool_calls)").fetchall()
+    }
+    for _col in ("saved_bytes", "saved_tokens_est"):
+        if _col not in _tool_existing:
+            try:
+                conn.execute(f"ALTER TABLE turn_tool_calls ADD COLUMN {_col} INT")
+            except sqlite3.OperationalError:
+                pass
+    if "compressor" not in _tool_existing:
+        try:
+            conn.execute("ALTER TABLE turn_tool_calls ADD COLUMN compressor TEXT")
+        except sqlite3.OperationalError:
+            pass
+    if "raw_bytes_source" not in _tool_existing:
+        try:
+            conn.execute(
+                "ALTER TABLE turn_tool_calls ADD COLUMN raw_bytes_source TEXT "
+                f"CHECK({_RAW_BYTES_SOURCE_CHECK})"
+            )
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
 
 
@@ -165,6 +204,20 @@ def _int_or_none(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _text_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _raw_bytes_source(value: Any) -> str | None:
+    text = _text_or_none(value)
+    if text in _RAW_BYTES_SOURCES:
+        return text
+    return None
 
 
 def _bool_int(value: Any) -> int:
@@ -221,9 +274,10 @@ def insert_turn(record: TurnRecord) -> None:
                     comp_skills_tokens, comp_framing_tokens,
                     comp_skills_count,
                     comp_calls_json,
+                    turn_saved_tokens_est,
                     cost_usd, cost_status, interrupted, alerted, user_text,
                     final_text
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.turn_id,
@@ -260,6 +314,7 @@ def insert_turn(record: TurnRecord) -> None:
                     _int_or_none(record.comp_framing_tokens),
                     _int_or_none(record.comp_skills_count),
                     record.comp_calls_json,
+                    _int_or_none(record.turn_saved_tokens_est),
                     _cost_float(record.cost_usd),
                     record.cost_status or "unknown",
                     _bool_int(record.interrupted),
@@ -273,8 +328,9 @@ def insert_turn(record: TurnRecord) -> None:
                 conn.execute(
                     """
                     INSERT INTO turn_tool_calls (
-                        turn_id, seq, name, args_preview, result_preview
-                    ) VALUES (?, ?, ?, ?, ?)
+                        turn_id, seq, name, args_preview, result_preview,
+                        saved_bytes, saved_tokens_est, compressor, raw_bytes_source
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record.turn_id,
@@ -282,6 +338,10 @@ def insert_turn(record: TurnRecord) -> None:
                         str(call.get("name", "")),
                         scrub_and_truncate(call.get("args_preview", "")),
                         scrub_and_truncate(call.get("result_preview", "")),
+                        _int_or_none(call.get("saved_bytes")),
+                        _int_or_none(call.get("saved_tokens_est", call.get("saved_tokens"))),
+                        _text_or_none(call.get("compressor")),
+                        _raw_bytes_source(call.get("raw_bytes_source")),
                     ),
                 )
             conn.execute(

@@ -60,6 +60,10 @@ class TurnRecord:
     comp_framing_tokens: Optional[int] = None
     # Per-call composition history JSON (list of breakdown dicts) for forensics.
     comp_calls_json: Optional[str] = None
+    # Compression-savings rollup. Nullable: old rows / no compressor signal → None.
+    # This is the end-to-end headline estimate for the turn, not a naive sum over
+    # independent compressor layers (prevents double-counting overlapping savings).
+    turn_saved_tokens_est: Optional[int] = None
     cost_usd: Optional[float] = None
     cost_status: str = "unknown"                   # estimated|included|unknown|partial
     interrupted: bool = False

@@ -1,0 +1,13 @@
+{
+  "name": "compression-health",
+  "schedule": "0 9 * * *",
+  "timezone": "America/Los_Angeles",
+  "no_agent": true,
+  "script": "compression-health.sh",
+  "cron_invocation": "compression-health.sh --cron",
+  "deliver_healthy": "silent",
+  "deliver_unhealthy": "#alerts",
+  "deliver_logs": "#logs",
+  "install_notes": "Deploy staging/scripts/compression-health.sh into ~/.hermes/scripts/, install as a no_agent cron health tick, and run it in cron mode (--cron) so HEALTHY emits wakeAgent:false/silent while UNHEALTHY exits non-zero and routes loudly to #alerts. Use #logs only for manual/verbose health evidence, not for OK spam. If the current cron runner cannot pass script args directly, install a tiny live wrapper that execs compression-health.sh --cron and register that wrapper as the no_agent script.",
+  "write_scope": "staging-only registration; main deploy copies staging to live after review"
+}
