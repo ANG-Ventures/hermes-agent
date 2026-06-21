@@ -285,6 +285,56 @@ async def test_e2e_single_deliberate_restart_resumes_once_no_loop(tmp_path, monk
 
 
 @pytest.mark.asyncio
+async def test_rapid_legit_deploys_with_progress_do_not_suspend(tmp_path, monkeypatch):
+    """F2 false-trip guard (Pass-3 required change): three+ rapid LEGITIMATE
+    deploys of the SAME session inside the window must NOT suspend it — because
+    each resumed turn makes FORWARD PROGRESS (completes a real turn) before the
+    next deploy interrupts. The forward-progress gate (_resumed_this_boot.discard
+    on a clean turn) is the discriminator vs. a true no-progress loop.
+
+    Structural twin of test_e2e_restart_interrupted_replay_loop_is_broken (which
+    suspends): the ONLY difference is that here the resumed turn finishes. That is
+    exactly the false-trip boundary the reviewer asked to be made explicit.
+    """
+    monkeypatch.setenv("HERMES_RESTART_LOOP_THRESHOLD", "3")
+    monkeypatch.setenv("HERMES_RESTART_LOOP_WINDOW_SECS", "300")
+
+    # Two structurally identical sessions, differing ONLY in whether each resumed
+    # turn made forward progress (a clean turn). The PROGRESS session must NOT be
+    # suspended; the NO-PROGRESS session MUST be — that contrast is the gate.
+    runner, _adapter = _runner(tmp_path, monkeypatch)
+    progress = _entry(runner, "progress").session_key
+    stuck = _entry(runner, "stuck").session_key
+    for sk in (progress, stuck):
+        runner._resumed_this_boot.add(sk)  # both were auto-resumed this boot
+
+    # 3 deploy-interrupt cycles for each, in the same window.
+    for _ in range(3):
+        # PROGRESS: the resumed turn COMPLETED. The real clean-turn path (run.py
+        # ~9327) both CLEARS replay marks and DISCARDS _resumed_this_boot — together
+        # these are the forward-progress gate. Model exactly that path.
+        runner._clear_restart_replay_marks(progress)
+        runner._resumed_this_boot.discard(progress)
+        runner._replay_marked_during_stop = set()
+        runner._mark_resume_pending_for_shutdown(progress)
+        # The next boot re-resumes it (progress session keeps being legitimately used).
+        runner._resumed_this_boot.add(progress)
+
+        # NO-PROGRESS: the resumed turn never completed — no clean-turn clear, stays
+        # in _resumed_this_boot, marks accrue. This is the true loop.
+        runner._replay_marked_during_stop = set()
+        runner._mark_resume_pending_for_shutdown(stuck)
+
+    # The discriminator: progress session healthy, stuck session suspended.
+    assert runner.session_store._entries[progress].suspended is False, (
+        "healthy rapid deploys (each resume completed) wrongly suspended — false-trip"
+    )
+    assert runner.session_store._entries[stuck].suspended is True, (
+        "a true no-progress replay loop was NOT suspended — breaker failed"
+    )
+
+
+@pytest.mark.asyncio
 async def test_stale_marker_after_crash_bounded_by_freshness(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_AUTO_CONTINUE_FRESHNESS", "300")
     runner, _adapter = _runner(tmp_path, monkeypatch)

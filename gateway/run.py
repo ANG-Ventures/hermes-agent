@@ -9326,6 +9326,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the restart-interruption system note.
             if session_key and _should_clear_resume_pending_after_turn(agent_result):
                 self._clear_restart_replay_marks(session_key)
+                # Forward-progress gate for the replay-loop breaker (F2): a turn
+                # that completed cleanly is REAL progress, not a relapse. Drop the
+                # session from _resumed_this_boot so a LATER restart-interrupt is
+                # not miscounted as resume→re-interrupt. This is what distinguishes
+                # rapid *legitimate* deploys (each resume finishes work → no mark)
+                # from a true loop (resume never makes progress → keeps marking).
+                try:
+                    self._resumed_this_boot.discard(session_key)
+                except Exception:
+                    pass
                 try:
                     self.session_store.clear_resume_pending(session_key)
                 except Exception as _e:
