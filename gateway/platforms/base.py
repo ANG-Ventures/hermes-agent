@@ -3278,8 +3278,9 @@ class BasePlatformAdapter(ABC):
                     await asyncio.sleep(0)
             # Relinquish ownership only if a NEWER turn hasn't superseded us.
             # stop_typing did NOT touch _typing_owner, so this compare is
-            # stable (single-writer rule, Pass-2 R1).
-            if token is not None and self._typing_owner.get(chat_id) == token:
+            # stable (single-writer rule, Pass-2 R1). getattr-guarded so a
+            # partially-initialized test adapter can't AttributeError here.
+            if token is not None and getattr(self, "_typing_owner", {}).get(chat_id) == token:
                 self._typing_owner.pop(chat_id, None)
         finally:
             self._typing_paused.discard(chat_id)
@@ -3315,13 +3316,20 @@ class BasePlatformAdapter(ABC):
 
         THE ONLY writer that increments ``_typing_owner``.
         """
-        tok = self._typing_owner.get(chat_id, 0) + 1
-        self._typing_owner[chat_id] = tok
+        # Defensive: some test adapters build via object.__new__ and skip
+        # __init__, so the dict may be absent — create it lazily rather than
+        # AttributeError.
+        owner = getattr(self, "_typing_owner", None)
+        if owner is None:
+            owner = {}
+            self._typing_owner = owner
+        tok = owner.get(chat_id, 0) + 1
+        owner[chat_id] = tok
         return tok
 
     def _current_typing_token(self, chat_id: str):
         """Return the token of the turn currently owning typing (or None)."""
-        return self._typing_owner.get(chat_id)
+        return getattr(self, "_typing_owner", {}).get(chat_id)
 
     def _typing_token_is_current(self, chat_id: str, token) -> bool:
         """True if ``token`` still owns typing for this chat.
@@ -3330,7 +3338,7 @@ class BasePlatformAdapter(ABC):
         unconditional error/interrupt stop paths) => always allowed, so
         behavior is unchanged for callers that don't opt in.
         """
-        return token is None or self._typing_owner.get(chat_id) == token
+        return token is None or getattr(self, "_typing_owner", {}).get(chat_id) == token
 
     async def interrupt_session_activity(self, session_key: str, chat_id: str) -> None:
         """Signal the active session loop to stop and clear typing immediately."""
