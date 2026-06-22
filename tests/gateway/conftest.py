@@ -32,11 +32,64 @@ incident.
 """
 
 import ast
+import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _restore_os_environ_after_test(_hermetic_environment):
+    """Snapshot ``os.environ`` at setup and diff-restore it at teardown.
+
+    **Why:** ``load_gateway_config()`` (``gateway/config.py``) bridges
+    ``config.yaml`` platform settings into the process environment via *raw
+    assignment* — ``os.environ["TELEGRAM_ALLOWED_TOPICS"] = ...``,
+    ``os.environ["SLACK_ALLOWED_CHANNELS"] = ...`` and ~40 sibling keys across 7
+    platforms. A raw ``os.environ[...] =`` write is **NOT** reverted by
+    ``monkeypatch`` (monkeypatch only undoes what *it* set), so any test body that
+    calls the loader leaks those values into every later test in the same
+    process. A later test that builds a real ``SlackAdapter``/``TelegramAdapter``
+    then reads the leaked gating var and silently changes behavior (e.g. a leaked
+    ``TELEGRAM_ALLOWED_TOPICS=8`` makes a general-topic guest message fail the
+    allowed-topics gate; a leaked ``SLACK_ALLOWED_CHANNELS`` drops a mention
+    before ``handle_message``). These only bite single-process / random-order
+    runs (the per-file CI runner gets a fresh interpreter), so CI is green while
+    a local ``-p randomly`` run fails.
+
+    **The fix is by construction and immune to *how* the bridge codes the write
+    (literal, loop, ``update``, ``setdefault``, computed key):** snapshot the
+    whole environment at setup and re-establish it exactly at teardown. There is
+    no enumerated var list anywhere — the source of truth is the live
+    ``os.environ`` — so the fix can never drift as the bridge adds vars, and it
+    fails *closed* (anything a test mutates is reverted).
+
+    **Scope & ordering:** gateway-scoped (this conftest), so the blast radius
+    equals the suite whose evidence we run. It explicitly depends on the root
+    ``_hermetic_environment`` fixture (requested as a parameter) so it is
+    guaranteed to snapshot the *already-clean* env (after the root fixture's
+    HERMES_HOME redirect + credential/behavioral strip) and to finalize *before*
+    the root fixture's monkeypatch undo — the dependency is explicit so a future
+    autouse-ordering change can't silently invert it.
+
+    **What this does NOT do (honest scope):** it reverts only *test-induced*
+    mutations. A bridge-gating var inherited from the CI/dev shell at session
+    start is faithfully *preserved* (not stripped) — ambient-env hygiene is the
+    root ``_hermetic_environment`` strip list's job, not this fixture's.
+    """
+    snapshot = dict(os.environ)
+    try:
+        yield
+    finally:
+        # Re-establish the exact snapshot: revert test-added, test-removed, and
+        # test-changed keys in one shot. (clear()+update() over the live mapping
+        # so the same os.environ object identity is preserved for any code
+        # holding a reference.)
+        if os.environ != snapshot:
+            os.environ.clear()
+            os.environ.update(snapshot)
 
 
 def _ensure_telegram_mock() -> None:
