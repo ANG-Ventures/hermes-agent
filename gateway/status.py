@@ -123,6 +123,11 @@ def get_process_start_time(pid: int) -> Optional[int]:
     return _get_process_start_time(pid)
 
 
+def get_current_boot_id() -> str:
+    """The current process's per-boot identity (see :func:`_compute_boot_id`)."""
+    return _compute_boot_id(os.getpid())
+
+
 def _read_process_cmdline(pid: int) -> Optional[str]:
     """Return the process command line as a space-separated string.
 
@@ -200,12 +205,37 @@ def _record_looks_like_gateway(record: dict[str, Any]) -> bool:
     return any(pattern in cmdline for pattern in patterns)
 
 
+def _compute_boot_id(pid: int) -> str:
+    """Stable per-boot identity string for a gateway process.
+
+    ``f"{pid}:{create_time}"`` where ``create_time`` is the kernel process
+    start time via psutil (cross-platform: macOS/Linux/Windows). pid alone is
+    insufficient — pids are reused across reboots — so we pair it with the
+    process create time. psutil is a hard dependency (see pyproject) and is
+    already used elsewhere in this module.
+
+    Falls back to ``f"{pid}:"`` only if psutil cannot read the create time
+    (the caller treats an empty create-time component as a degraded id).
+    """
+    try:
+        import psutil
+
+        return f"{pid}:{psutil.Process(pid).create_time()}"
+    except Exception:
+        return f"{pid}:"
+
+
 def _build_pid_record() -> dict:
+    pid = os.getpid()
     return {
-        "pid": os.getpid(),
+        "pid": pid,
         "kind": _GATEWAY_KIND,
         "argv": list(sys.argv),
-        "start_time": _get_process_start_time(os.getpid()),
+        "start_time": _get_process_start_time(pid),
+        # Cross-platform per-boot identity (status.py:_get_process_start_time is
+        # /proc-only → None on macOS; boot_id is the portable replacement used by
+        # the F2 restart-initiator breadcrumb to reject cross-boot crumbs).
+        "boot_id": _compute_boot_id(pid),
     }
 
 
