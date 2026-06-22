@@ -92,6 +92,95 @@ def _restore_os_environ_after_test(_hermetic_environment):
             os.environ.update(snapshot)
 
 
+# Module slots whose identity several gateway test files mutate at import (by
+# installing a mock ``telegram``/``discord`` into ``sys.modules`` — often via
+# ``setdefault`` so the FIRST file to run wins the slot — and by popping +
+# reimporting the consumer). A file that does this without restoring leaks two
+# things into every later single-process test:
+#   1. the ``sys.modules`` slot itself (a foreign mock with different type
+#      objects — e.g. ``discord.DMChannel`` is a different class than the one a
+#      later test patches, so its ``isinstance`` checks silently mismatch);
+#   2. the CONSUMER module's early-bound globals — ``gateway.platforms.telegram``
+#      caches ``ParseMode``/``ChatType`` from whatever ``telegram.constants`` was
+#      live at its import; ``plugins.platforms.discord.adapter`` caches the
+#      ``discord`` module object — so a rebind during one test poisons the
+#      identity every later test reads (the PR #89 ParseMode-plain-string leak,
+#      reappearing under random order via a different leaker than the one #89
+#      fixed; and the discord-mock-identity leak).
+_GUARDED_SYS_MODULE_SLOTS = (
+    "telegram",
+    "telegram.ext",
+    "telegram.constants",
+    "telegram.request",
+    "telegram.error",
+    "discord",
+    "discord.ext",
+    "discord.ext.commands",
+)
+
+# Consumer modules + the attribute names they early-bind from the slots above.
+# We snapshot/restore these attributes IN PLACE on the live module object (NOT by
+# re-import — a fresh import makes a NEW module object, but consumers that did
+# ``from gateway.platforms.telegram import X`` at their module top read X from the
+# ORIGINAL module __dict__, so the live dict is what must be reverted).
+_GUARDED_CONSUMER_BINDINGS = {
+    "gateway.platforms.telegram": ("ParseMode", "ChatType"),
+    "plugins.platforms.discord.adapter": ("discord",),
+}
+
+
+@pytest.fixture(autouse=True)
+def _restore_mock_module_slots_after_test(_hermetic_environment):
+    """Snapshot + restore the ``sys.modules`` mock slots and consumer bindings.
+
+    By construction (no per-file fixture to forget): any test that mutates a
+    guarded ``telegram``/``discord`` ``sys.modules`` slot, or rebinds a consumer
+    module's early-bound ``ParseMode``/``ChatType``/``discord`` global, has that
+    mutation reverted at teardown — so it cannot poison a later test in a
+    single-process / random-order run. Mirrors the ``os.environ`` snapshot/restore
+    fixture above, applied to ``sys.modules`` + the consumer bindings.
+
+    Only reverts state that actually CHANGED during the test (identity compare),
+    so the steady-state shared mocks the suite relies on are untouched on the
+    overwhelming majority of tests that don't mutate these slots.
+    """
+    sentinel = object()
+    slot_snapshot = {name: sys.modules.get(name, sentinel) for name in _GUARDED_SYS_MODULE_SLOTS}
+    binding_snapshot = {}
+    for mod_name, attrs in _GUARDED_CONSUMER_BINDINGS.items():
+        mod = sys.modules.get(mod_name)
+        if mod is not None:
+            binding_snapshot[mod_name] = {a: getattr(mod, a, sentinel) for a in attrs}
+    try:
+        yield
+    finally:
+        # 1. Restore the sys.modules slots to their pre-test identity.
+        for name, prior in slot_snapshot.items():
+            current = sys.modules.get(name, sentinel)
+            if current is prior:
+                continue
+            if prior is sentinel:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = prior
+        # 2. Restore consumer early-bound globals IN PLACE on the live module.
+        for mod_name, attrs in binding_snapshot.items():
+            mod = sys.modules.get(mod_name)
+            if mod is None:
+                continue
+            for attr, prior in attrs.items():
+                if getattr(mod, attr, sentinel) is prior:
+                    continue
+                if prior is sentinel:
+                    if hasattr(mod, attr):
+                        try:
+                            delattr(mod, attr)
+                        except AttributeError:
+                            pass
+                else:
+                    setattr(mod, attr, prior)
+
+
 def _ensure_telegram_mock() -> None:
     """Install a comprehensive telegram mock in sys.modules.
 
