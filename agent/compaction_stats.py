@@ -245,6 +245,14 @@ def build_hygiene_stats(
     post_messages = kept_messages + summary_messages + anchor_messages
 
     cleared_rows = _disjoint_remainder(pre_msgs, elig)
+    cleared_tokens = int(estimator(cleared_rows)) if cleared_rows else 0
+    # Optional tool/other sub-split of the cleared population (derive-by-subtraction,
+    # parent `cleared_tokens` untouched). Degrade to None on any failure (D-6).
+    _ctc = _ctt = _coc = _cot = None
+    try:
+        _ctc, _ctt, _coc, _cot = _tool_other_split(cleared_rows, cleared_tokens, estimator)
+    except Exception:
+        _ctc = _ctt = _coc = _cot = None
 
     return CompactionStats(
         pre_messages=pre_messages,
@@ -260,8 +268,12 @@ def build_hygiene_stats(
         kept_tokens=int(estimator(kept_rows)),
         summary_tokens=int(estimator(summary_rows)) if summary_rows else 0,
         anchor_tokens=int(estimator(anchor_rows)) if anchor_rows else 0,
-        cleared_tokens=int(estimator(cleared_rows)) if cleared_rows else 0,
+        cleared_tokens=cleared_tokens,
         folded_tokens=int(estimator(_fold_rows(elig, kept_rows))),
+        cleared_tool_count=_ctc,
+        cleared_tool_tokens=_ctt,
+        cleared_other_count=_coc,
+        cleared_other_tokens=_cot,
     )
 
 

@@ -486,3 +486,48 @@ def test_build_inturn_stats_subsplit_survives_fold_signature_fallback():
     ok, reason = stats.validate()
     assert ok, reason
     assert stats.folded_tool_count + stats.folded_other_count == stats.folded_count
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — build_hygiene_stats populates the (previously dead) cleared sub-split
+# ---------------------------------------------------------------------------
+
+def test_build_hygiene_stats_populates_cleared_subsplit_exact():
+    from agent.compaction_stats import build_hygiene_stats
+    # raw has tool rows (go to cleared) + contentless tool-call assistant (cleared) + chat (eligible)
+    raw = []
+    for i in range(5):
+        raw.append({"role": "user", "content": f"u{i} " * 20})
+        raw.append({"role": "assistant", "content": f"a{i} " * 40})
+        raw.append({"role": "assistant", "content": "", "tool_calls": "[{}]"})   # contentless → cleared
+        raw.append({"role": "tool", "content": f"TOOL {i} " * 200, "tool_call_id": f"t{i}"})  # cleared
+    eligible = [{"role": m["role"], "content": m["content"]}
+                for m in raw if m["role"] in ("user", "assistant") and m.get("content")]
+    keep = 3
+    kept = eligible[-keep:]
+    summary = {"role": "assistant", "content": "[Recent Summary (d0, node 1)]\nx\n[Expand for details: y]"}
+    anchor = {"role": "system", "content": "SYS " * 30}
+    compressed = [anchor, summary] + kept
+    stats = build_hygiene_stats(raw_history=raw, eligible_msgs=eligible, compressed=compressed, estimator=_est)
+    ok, reason = stats.validate()
+    assert ok, reason
+    # cleared = tool rows + contentless assistant rows; tool count = 5
+    assert stats.cleared_tool_count == 5
+    assert stats.cleared_other_count == stats.cleared_count - 5
+    assert stats.cleared_tool_tokens + stats.cleared_other_tokens == stats.cleared_tokens
+
+
+def test_build_hygiene_stats_cleared_parent_unchanged_by_subsplit():
+    from agent.compaction_stats import build_hygiene_stats, _disjoint_remainder
+    raw = []
+    for i in range(5):
+        raw.append({"role": "user", "content": f"u{i} " * 20})
+        raw.append({"role": "assistant", "content": f"a{i} " * 40})
+        raw.append({"role": "tool", "content": f"TOOL {i} " * 200, "tool_call_id": f"t{i}"})
+    eligible = [{"role": m["role"], "content": m["content"]}
+                for m in raw if m["role"] in ("user", "assistant") and m.get("content")]
+    kept = eligible[-2:]
+    compressed = list(kept)
+    stats = build_hygiene_stats(raw_history=raw, eligible_msgs=eligible, compressed=compressed, estimator=_est)
+    cleared_rows = _disjoint_remainder(raw, eligible)
+    assert stats.cleared_tokens == _est(cleared_rows)  # parent untouched
