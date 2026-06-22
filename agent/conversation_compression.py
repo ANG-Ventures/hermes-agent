@@ -1099,6 +1099,29 @@ def compress_context(
             now_monotonic=_now_mono,
             current_turn_id=getattr(agent, "_current_turn_id", None),
         )
+        # Granular stats (in-turn population = the whole messages list; cleared=0).
+        # Built inside try/except; validate()+degrade so a reconcile bug never
+        # ships wrong math or breaks the turn. Guarded by hasattr so built-in /
+        # overflow / manual paths (no LCM marker shape) simply degrade.
+        _inturn_stats = None
+        try:
+            from agent.compaction_stats import build_inturn_stats
+            from agent.model_metadata import estimate_messages_tokens_rough as _est
+            _cand = build_inturn_stats(messages=messages, compressed=compressed, estimator=_est)
+            _ok2, _why2 = _cand.validate()
+            if _ok2:
+                _inturn_stats = _cand
+            else:
+                logger.debug("COMPACTION_STATS_RECONCILE_FAILED in-turn %s", _why2)
+        except Exception:
+            logger.debug("in-turn stats build failed; degrading to two-line", exc_info=True)
+        _reasoning_inturn = None
+        try:
+            from gateway.run import _load_gateway_config as _lgc
+            _ac = (_lgc().get("agent") or {})
+            _reasoning_inturn = str(_ac.get("reasoning_effort", "") or "").strip() or None
+        except Exception:
+            _reasoning_inturn = None
         _emit_compaction_announce(
             agent,
             dedupe_key=_dedupe_key,
@@ -1122,6 +1145,8 @@ def compress_context(
                 getattr(_cc, "threshold_tokens", None)
                 if trigger_reason == "threshold" else None
             ),
+            reasoning=_reasoning_inturn,
+            stats=_inturn_stats,
         )
     except Exception:
         logger.debug("compaction announce skipped (non-fatal)", exc_info=True)

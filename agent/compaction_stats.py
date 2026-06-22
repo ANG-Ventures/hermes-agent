@@ -269,3 +269,57 @@ def _fold_rows(eligible: List[dict], kept: List[dict]) -> List[dict]:
         else:
             out.append(m)
     return out
+
+
+def build_inturn_stats(
+    *,
+    messages: List[dict],
+    compressed: List[dict],
+    estimator,
+) -> "CompactionStats":
+    """Build a reconciling ``CompactionStats`` for the in-turn (LCM) done-site.
+
+    The in-turn path does NOT role-filter — the whole input ``messages`` list is
+    the population, so ``cleared == 0`` and ``eligible == pre``. The compressed
+    output splits into summary message(s) (LCM markers), the leading anchor
+    (role == "system" / preserved-objective), and the kept tail (remainder);
+    ``folded = eligible - kept``. All token sums use the SAME ``estimator`` over
+    each subset (message-level — consistent, never the request-level estimate).
+
+    Caller validates + degrades on failure (e.g. an exotic compressed shape).
+    """
+    pre_msgs = list(messages or [])
+    comp = list(compressed or [])
+
+    summary_rows = [m for m in comp if _is_summary_message(m.get("content") or "")]
+    anchor_rows = [m for m in comp if m.get("role") == "system"]
+    kept_rows = [
+        m for m in comp
+        if m.get("role") != "system" and not _is_summary_message(m.get("content") or "")
+    ]
+
+    pre_messages = len(pre_msgs)
+    eligible_count = pre_messages  # no role filter on the in-turn path
+    kept_messages = len(kept_rows)
+    folded_count = eligible_count - kept_messages
+    summary_messages = len(summary_rows)
+    anchor_messages = len(anchor_rows)
+    post_messages = kept_messages + summary_messages + anchor_messages
+
+    return CompactionStats(
+        pre_messages=pre_messages,
+        post_messages=post_messages,
+        eligible_count=eligible_count,
+        kept_messages=kept_messages,
+        summary_messages=summary_messages,
+        anchor_messages=anchor_messages,
+        cleared_count=0,
+        folded_count=folded_count,
+        pre_tokens=int(estimator(pre_msgs)),
+        post_tokens=int(estimator(comp)),
+        kept_tokens=int(estimator(kept_rows)),
+        summary_tokens=int(estimator(summary_rows)) if summary_rows else 0,
+        anchor_tokens=int(estimator(anchor_rows)) if anchor_rows else 0,
+        cleared_tokens=0,
+        folded_tokens=int(estimator(_fold_rows(pre_msgs, kept_rows))),
+    )
