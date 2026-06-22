@@ -1,6 +1,6 @@
 # PRD — Gateway session-state process-global `os.environ` leak (the v3-latch bug class, generalized)
 
-**Status:** DRAFT v0.1 — pre-review
+**Status:** v0.2 — Opus Pass-1 review complete; 3 BLOCKERS folded. The fix REFRAMED by the review: the root cause is **`_set_session_env` never binds the `HERMES_SESSION_ID` contextvar at all** (it passes `session_key` but omits `session_id`), so on a normal cached-agent gateway turn the SESSION_ID contextvar is `""` and only `os.environ` carries a (clobbered) value. The correct fix is to **bind `session_id` into the per-turn contextvar** (then the os.environ writes become droppable), not just to gate the writes. See Ground-Truth §0 + Resolved Decisions.
 **Author:** Apollo
 **Date:** 2026-06-22
 **Related:** `PRD-send-message-origin-leak-v3-cron-session-latch.md` (v3 fixed ONE instance of this class — `HERMES_CRON_SESSION`). This PRD addresses the **remaining instances** + the **root-cause class** discovered during v3 closeout.
@@ -10,6 +10,17 @@
 ## 0. Ground-Truth (measured against the live tree, 2026-06-22 — read BEFORE the design)
 
 The discovery that motivated this PRD: from a live interactive `#fix-issues` turn, `env | grep` in a `terminal` subprocess showed `HERMES_CRON_SESSION=1` **and** `HERMES_SESSION_ID/CHAT_ID/KEY` belonging to a *different concurrently-active session* (`ee660b`, running an every-2-min `no_agent` cron sweeper) — not my turn's session. The gateway is a **single process** that runs concurrent sessions (asyncio tasks) + an in-process cron tick; any code that writes session state to **process-global `os.environ`** clobbers it for every other concurrent session.
+
+### 🔴 PHASE-0 / OPUS-PASS-1 GROUND-TRUTH CORRECTION (the reframe — 3 blockers)
+
+The original v0.1 design assumed the `HERMES_SESSION_ID` *contextvar* carried the live id during a gateway turn (it doesn't), and would have **regressed** kanban stamping to empty. Corrected, code-verified facts:
+
+1. **`_set_session_env` (`gateway/run.py:12825`) binds `session_key` but OMITS `session_id`.** So `set_session_vars` sets `_SESSION_ID` to `""` (the default), and `get_session_env("HERMES_SESSION_ID")` returns `""` (no os.environ fallback, because `""` ≠ `_UNSET`). The **only** writers of the real id are `set_current_session_id`, called ONLY at fresh-agent construction (`agent/agent_init.py:1087`) and on compression split (`agent/conversation_compression.py:984`) — **never on a cached-agent reuse turn** (the common path). ⇒ On a normal gateway turn the SESSION_ID contextvar is empty; only `os.environ["HERMES_SESSION_ID"]` (the clobbered global) carries a value. **This is the actual root cause** — and it means the fix is *bind the contextvar per turn* (then drop the os.environ writes), not just *gate the writes*.
+   - Contrast: `session_key` IS passed by `_set_session_env`, so `_SESSION_KEY` is correctly bound every turn → D-2 (drop the SESSION_KEY os.environ write) was sound as written.
+2. **The gateway-detection predicate `_HERMES_GATEWAY=1` LEAKS into kanban worker subprocesses.** Gateway sets it (`gateway/run.py:1217`); the restart watcher pops it (`:5107/:5137`) but the **kanban worker spawn does NOT** (`hermes_cli/kanban_db.py:6779` `env = dict(os.environ)`, no pop). So a worker is misclassified "gateway" → a predicate that suppresses the worker's os.environ write would break I3 (the worker's own-session stamping relies on that write). ⇒ Either pop `_HERMES_GATEWAY` in the worker spawn, OR don't rely on a write-suppression predicate for the worker path at all (the contextvar-binding reframe makes this moot — see D-1').
+3. **A `get_session_env`-only isolation test is a FAKE-GREEN** — it passes on the *current buggy* code because `get_session_env` is contextvar-first and each task reads its own (empty/own) value; the bug lives in `os.environ`, which such a test never inspects. The real test must assert the **`os.environ` snapshot is not cross-contaminated** under two concurrent contexts, AND (post-fix) that `get_session_env("HERMES_SESSION_ID")` returns the live id (not `""`). Must be RED on current `main`.
+
+
 
 **The session-context module was ALREADY migrated to contextvars for exactly this reason** (`gateway/session_context.py` docstring literally describes the bug). `set_session_vars` (the main per-turn binder) is **contextvar-only**. But residual `os.environ` writes remain.
 
@@ -82,12 +93,15 @@ This PRD is structured as **north-star (full class migration)** + **v0.1 cut (th
 
 ## 4. Resolved Decisions
 
-- **D-1 — `set_current_session_id` becomes gateway-aware (chosen for #2).** It currently writes `os.environ["HERMES_SESSION_ID"]` unconditionally + the contextvar. Change: write the **contextvar always**, and write **os.environ only when NOT in a concurrent-gateway process**. The gateway-detection signal: reuse the existing one the codebase already trusts for this exact distinction (the gateway sets `_HERMES_GATEWAY=1` / `HERMES_GATEWAY_SESSION`; the session-context module + v3 already branch on "is this a live gateway turn"). Pick the signal Phase-0 confirms is reliably set in the gateway and unset in CLI/cron-standalone.
-  - *Rejected — remove the os.environ write entirely:* would regress CLI session rotation (I2). The CLI genuinely needs the global because it has no per-task contextvar isolation across `/new`.
-  - *Rejected — leave it, only fix readers:* doesn't make the raw os.environ honest, leaves the diagnostic lying, and leaves `kanban:744` exposed on the gateway path. Half-fix.
-- **D-2 — `gateway/run.py:15287` (`HERMES_SESSION_KEY` per-turn write) gets the same gateway-aware treatment OR is dropped.** Phase-0 determines: is anything that reads `HERMES_SESSION_KEY` *via raw os.environ* reachable only outside the gateway? If the only gateway-reachable readers are contextvar-first (confirmed: `get_current_session_key`, `terminal_tool:208` both are), the gateway write is **pure pollution** and can be dropped in-gateway (contextvar `set_session_vars` already set it). Decide by grep, not assumption.
-- **D-3 — kanban `:744` (#3): read the contextvar, not raw os.environ.** Change `args.get("session_id") or os.environ.get("HERMES_SESSION_ID")` → `args.get("session_id") or get_session_env("HERMES_SESSION_ID")`. `get_session_env` is contextvar-first with os.environ fallback, so the worker-subprocess path (I3) is preserved (no contextvar there → falls to its correct per-process os.environ) AND the gateway path reads the right session's contextvar. `:124` (`_stamp_worker_session_metadata`) is gated on `HERMES_KANBAN_TASK` so it's worker-subprocess-only; migrate it too for consistency (same `get_session_env` swap) but it's lower-risk.
-- **D-4 — north-star (#4) is its own roadmap, not v0.1.** The full "audit every process-global `HERMES_*` writer and migrate the whole class" is captured below as the north-star with a phase table, but v0.1 ships only the gateway session-id/key + kanban fixes (the measured-real-impact slice). Broader migration ships per-trigger.
+- **D-1' (REFRAMED by Opus Pass-1 — supersedes the original D-1) — bind `session_id` into the per-turn contextvar, THEN drop the gateway os.environ writes.** The root cause is that `_set_session_env` (`gateway/run.py:12825`) never binds `session_id`. Fix:
+  1. **`gateway/run.py:12825` — pass `session_id=context.session_id` (or the session-entry id) into `set_session_vars`.** This binds `_SESSION_ID` per-turn for EVERY turn (cached or fresh), exactly as `session_key` already is. Now `get_session_env("HERMES_SESSION_ID")` returns the live id on the normal path — which is the precondition that makes D-3 (kanban) work at all.
+  2. **`set_current_session_id` (`gateway/session_context.py:109`) — keep the contextvar write; make the `os.environ` write gateway-aware** (write os.environ only when NOT `_HERMES_GATEWAY`). With the contextvar now bound per-turn, the os.environ write is only needed by single-process entrypoints (CLI rotation, cron-standalone).
+  - This is strictly better than "just gate the writes": it fixes the *missing contextvar bind* (the real bug) so every contextvar-first reader gets the right id, and reduces os.environ to a CLI/cron-only fallback.
+  - *Rejected — only gate the writes (original D-1):* leaves the SESSION_ID contextvar empty on cached turns, so D-3 would stamp `""`. Falsified by the review.
+- **D-2 — `gateway/run.py:15287` (`HERMES_SESSION_KEY` per-turn write) is DROPPED in-gateway (confirmed sound).** `_set_session_env` already binds `session_key` into the contextvar every turn, and the only gateway-reachable readers (`get_current_session_key` `approval.py:148`, `terminal_tool.py:206`) are contextvar-first. So the per-turn os.environ write is pure pollution → drop it. (The CLI/cron paths set their own `HERMES_SESSION_KEY` via their own entrypoints; not affected.)
+- **D-3 — kanban `:744` + `:124` (#3): read the contextvar via `get_session_env`, not raw os.environ.** `args.get("session_id") or os.environ.get("HERMES_SESSION_ID")` → `args.get("session_id") or get_session_env("HERMES_SESSION_ID")`. **Now valid because D-1' binds the contextvar per turn.** The worker-subprocess path (I3) still resolves: workers run in a separate process with no bound contextvar → `get_session_env` falls through to that process's correct os.environ `HERMES_SESSION_ID`.
+  - 🔴 **B2 mitigation (required):** the kanban worker spawn (`hermes_cli/kanban_db.py:6779`) inherits `_HERMES_GATEWAY=1` un-popped. To keep the worker correctly classified single-session (so D-1''s gated os.environ write fires *in the worker*, populating the fallback I3 depends on), **pop `_HERMES_GATEWAY` from the worker spawn env** (mirroring `gateway/run.py:5107/5137`). Without this, a worker would skip its os.environ write AND have no contextvar → stamp nothing.
+- **D-4 — north-star (#4) is its own roadmap, not v0.1.** Unchanged. v0.1 = D-1' + D-2 + D-3 + B2 pop. Broader audit ships per-trigger.
 
 ---
 
@@ -101,8 +115,9 @@ v3's fix: a process-global flag → task-isolated contextvar, set/cleared per sc
 ### Edits (v0.1 cut)
 1. **`gateway/session_context.py`** — `set_current_session_id`: gate the `os.environ["HERMES_SESSION_ID"]` write behind a "not in concurrent gateway" check; always set the contextvar. Add a small helper `_is_concurrent_gateway()` (or reuse the existing signal) — Phase-0 picks the exact predicate.
 2. **`gateway/run.py:15287`** — drop or gate the per-turn `os.environ["HERMES_SESSION_KEY"]` write (D-2; the contextvar is already set by `_set_session_env`).
-3. **`tools/kanban_tools.py:744` + `:124`** — `os.environ.get("HERMES_SESSION_ID")` → `get_session_env("HERMES_SESSION_ID")` (contextvar-first, os.environ fallback preserves the worker-subprocess path).
-4. **Tests** — concurrent-session isolation test; kanban gateway-vs-worker test; CLI back-compat assertion.
+3. **`tools/kanban_tools.py:744` + `:124`** — `os.environ.get("HERMES_SESSION_ID")` → `get_session_env("HERMES_SESSION_ID")` (contextvar-first, os.environ fallback preserves the worker-subprocess path). *Valid only because edit #0 binds the contextvar per turn.*
+0. **`gateway/run.py:12825` (`_set_session_env`) — pass `session_id=` into `set_session_vars`** (the root-cause edit; do this FIRST). Plus **`hermes_cli/kanban_db.py:6779` — pop `_HERMES_GATEWAY` from the worker spawn env** (B2).
+4. **Tests** — concurrent-session **os.environ** isolation test (must be RED on current main); kanban gateway-vs-worker test; CLI/cron back-compat assertion.
 
 ### North-star (#4) — full class migration roadmap
 | Version | What ships | Trigger | Maps to |
@@ -115,28 +130,31 @@ v3's fix: a process-global flag → task-isolated contextvar, set/cleared per sc
 
 ## 6. Implementation Phases
 
-- **Phase 0 — ground-truth the gateway-detection predicate + reader reachability (REQUIRED, ~5 probes, no code).** Confirm: (a) which signal (`_HERMES_GATEWAY`, `HERMES_GATEWAY_SESSION`, or the session-context "in a gateway turn" check) is reliably set in the running gateway and unset in CLI + cron-standalone; (b) every raw-os.environ reader of `HERMES_SESSION_KEY`/`ID` reachable from the gateway is contextvar-first (already 90% confirmed) so the write can be safely dropped/gated; (c) `set_current_session_id`'s callers in-gateway.
-  - *Verify with:* live `execute_code` in the gateway prints the candidate signals; `grep` of every reader; record results in a "Phase-0 ground-truth" block. If a predicate is unreliable or a raw reader is found, the design adjusts before code.
+- **Phase 0 — ground-truth (DONE in Opus Pass-1; see §0 correction).** Confirmed: `_set_session_env` omits `session_id`; `_HERMES_GATEWAY=1` is the gateway signal but leaks into kanban workers (un-popped); a `get_session_env`-only isolation test is a fake-green. Design reframed (D-1').
 
-- **Phase 1 — `set_current_session_id` gateway-aware (#2 core).** Contextvar always; os.environ gated.
-  - *Unit/script check:* in a simulated gateway context, `set_current_session_id("S1")` then assert `get_session_env("HERMES_SESSION_ID")=="S1"` AND `os.environ.get("HERMES_SESSION_ID")` is **unchanged** (not clobbered). In a non-gateway (CLI) context, assert os.environ IS updated (back-compat).
-  - *E2E/integration (REQUIRED — concurrency):* two concurrent asyncio tasks each bind their own session via the real `_set_session_env` + `set_current_session_id`; assert each task's `get_session_env("HERMES_SESSION_ID")` returns ITS OWN id (not the other's), and a `terminal`-style `os.environ` snapshot is not cross-contaminated.
-  - *Negative/adversarial:* a cron tick (in-gateway) running concurrently with an interactive turn — the interactive turn's `get_session_env("HERMES_SESSION_ID")` must not return the cron session's id.
-  - *Verify with:* `pytest tests/gateway/test_session_id_isolation.py -o 'addopts=' -q` → pass.
+- **Phase 1 — bind `session_id` per turn + drop/gate the writes (the root-cause cut, D-1' + D-2).**
+  - **Edit 1a:** `_set_session_env` (`gateway/run.py:12825`) passes `session_id=<session-entry id>` into `set_session_vars`. Also audit the other in-gateway `set_session_vars` callers (`gateway/platforms/api_server.py:3521,3791`, and cron `run_job` `cron/scheduler.py:1622`) and pass `session_id` where the session id is available (RC-5).
+  - **Edit 1b:** `set_current_session_id` keeps the contextvar write; gates the os.environ write behind `not _HERMES_GATEWAY`.
+  - **Edit 1c:** drop the `gateway/run.py:15287` `HERMES_SESSION_KEY` os.environ write.
+  - *Unit/script check:* in a bound gateway turn context, `get_session_env("HERMES_SESSION_ID")` returns the live id (NOT `""`); `os.environ["HERMES_SESSION_ID"]` is NOT written by the gateway path. In a non-gateway (CLI, `_HERMES_GATEWAY` unset) context, `set_current_session_id` DOES write os.environ.
+  - *E2E/integration (REQUIRED — concurrency, the RED-on-main test):* two concurrent contexts each bind their own session via the real `set_session_vars`(`session_id=`)/`set_current_session_id`; **assert the raw `os.environ["HERMES_SESSION_ID"]` is NOT cross-contaminated** (the real bug surface — a `get_session_env`-only assert is a fake-green per §0.3) AND each context's `get_session_env` returns its own id. Must FAIL on current `main` (where the unconditional os.environ write clobbers).
+  - *Negative/adversarial:* in-gateway cron tick concurrent with an interactive turn — neither sees the other's `HERMES_SESSION_ID` (contextvar or os.environ).
+  - *Verify with:* `pytest tests/gateway/test_session_id_isolation.py -o 'addopts=' -q` → pass; confirm RED on stash of the fix.
 
-- **Phase 2 — drop/gate `gateway/run.py:15287` SESSION_KEY write (#2).**
-  - *Unit/script check:* a gateway turn binds session_key via contextvar; assert `get_current_session_key()` resolves correctly WITHOUT the os.environ write; assert os.environ is not polluted with a per-turn key.
-  - *Negative/adversarial:* CLI/cron path (no contextvar) still resolves session_key via its own os.environ.
-  - *Verify with:* `pytest tests/tools/test_approval*.py -o 'addopts=' -q` (the approval session-key readers) stay green + new isolation assertion.
-
-- **Phase 3 — kanban direct-reader migration (#3).**
-  - *Unit/script check:* `_create_task` with no `args["session_id"]` + a bound contextvar `HERMES_SESSION_ID` stamps the contextvar value; with neither, stamps None.
-  - *E2E/integration (REQUIRED — the wrong-data path):* simulate gateway concurrency — task created in session A while session B's id is in os.environ (clobbered); assert the created task stamps A's id (from contextvar), not B's.
-  - *Negative/adversarial (I3):* a worker subprocess (`HERMES_KANBAN_TASK` set, NO contextvar, session id only in os.environ) still stamps its own id via the os.environ fallback.
+- **Phase 2 — kanban worker `_HERMES_GATEWAY` pop (B2) + verify back-compat.**
+  - **Edit 2a:** `hermes_cli/kanban_db.py:6779` worker spawn pops `_HERMES_GATEWAY` from the child env (so the worker is single-session-classified and its gated os.environ write fires).
+  - *Unit/script check:* the worker spawn env dict does not contain `_HERMES_GATEWAY`.
+  - *Negative/adversarial:* a worker process (`_HERMES_GATEWAY` absent, `HERMES_KANBAN_TASK` set, session id in os.environ, no contextvar) → `set_current_session_id` writes os.environ → `get_session_env("HERMES_SESSION_ID")` resolves the worker's own id.
   - *Verify with:* `pytest tests/tools/test_kanban*.py -o 'addopts=' -q` → pass.
 
-- **Phase 4 — north-star audit (v0.2, deferred unless Phase-0 finds more).** An enforcement test/grep that asserts no gateway-reachable module writes `os.environ["HERMES_SESSION_*"]` outside the sanctioned single-process entrypoints.
-  - *Verify with:* a `test_no_gateway_session_env_writes` grep-test (allowlist the CLI/TUI/ACP/oneshot files); fails if a new violator appears.
+- **Phase 3 — kanban direct-reader migration (#3, D-3).** `:744` + `:124` → `get_session_env`.
+  - *Unit/script check:* `_create_task` with no `args["session_id"]` + a bound contextvar `HERMES_SESSION_ID` stamps the contextvar value (now non-empty thanks to Phase-1); with neither, stamps None.
+  - *E2E/integration (REQUIRED — the wrong-data path):* task created in bound session A while session B's id sits in os.environ (clobbered); assert the created task stamps A's id (contextvar), not B's. Must FAIL on current main (where it reads raw os.environ = B).
+  - *Negative/adversarial (I3):* worker subprocess (no contextvar, id in os.environ via Phase-2's write) still stamps its own id via the os.environ fallback.
+  - *Verify with:* `pytest tests/tools/test_kanban_session_attribution.py -o 'addopts=' -q` → pass.
+
+- **Phase 4 — north-star audit (v0.2, deferred unless the enforcement test finds more).** A `test_no_gateway_session_env_writes` grep-test that asserts no gateway-reachable module writes `os.environ["HERMES_SESSION_*"]` outside the sanctioned single-process entrypoints (allowlist CLI/TUI/ACP/oneshot + the `except`-fallback lines in `agent_init.py:1089`/`conversation_compression.py:986`).
+  - *Verify with:* the grep-test passes (current violators fixed) and fails if a new one appears.
 
 ---
 
@@ -160,17 +178,19 @@ v3's fix: a process-global flag → task-isolated contextvar, set/cleared per sc
 
 ## 9. Open Questions
 
-- **OQ1 (Phase-0 resolves):** exact gateway-detection predicate — `_HERMES_GATEWAY`, `HERMES_GATEWAY_SESSION`, or a `session_context` helper? Need one reliably TRUE in-gateway and FALSE in CLI + cron-standalone.
-- **OQ2 (Phase-0 resolves):** can `gateway/run.py:15287` SESSION_KEY write be **dropped** entirely in-gateway (D-2), or must it be gated like SESSION_ID? Depends on whether any non-contextvar reader needs it. Grep answers it.
+- **OQ1 — RESOLVED (Opus Pass-1):** predicate is `_HERMES_GATEWAY` (set `gateway/run.py:1217`, unset in CLI/cron-standalone) — BUT it leaks into kanban worker subprocesses un-popped, so Phase-2 must pop it. The contextvar-binding reframe (D-1') makes the gateway *reads* correct regardless; the predicate only governs the CLI/cron os.environ-fallback write.
+- **OQ2 — RESOLVED (Opus Pass-1):** `gateway/run.py:15287` SESSION_KEY write can be **dropped** in-gateway — `_set_session_env` already binds the `session_key` contextvar and the only gateway-reachable readers are contextvar-first.
 
 ---
 
 ## 10. Acceptance Criteria
 
-- [ ] **AC1 (I1):** Two concurrent in-process sessions don't see each other's `HERMES_SESSION_ID` via `get_session_env`. Evidence: `pytest tests/gateway/test_session_id_isolation.py::test_concurrent_sessions_isolated` (RED if the unconditional os.environ write remains).
-- [ ] **AC2 (I1):** `grep` shows no gateway-reachable per-turn/per-session `os.environ["HERMES_SESSION_ID"|"HERMES_SESSION_KEY"] =` write (the 4 mapped sites are gated/dropped). Evidence: grep output + the Phase-4 enforcement test.
-- [ ] **AC3 (I2):** CLI session rotation still resolves the active session id. Evidence: existing CLI/session tests green + a non-gateway `set_current_session_id` test asserting os.environ IS updated.
-- [ ] **AC4 (I3 — #3):** A task created from the gateway under concurrency stamps the correct (contextvar) `worker_session_id`, not a clobbered global; a worker subprocess still stamps its own. Evidence: `tests/tools/test_kanban_session_attribution.py` (both arms).
+- [ ] **AC0 (root cause, RC by Pass-1):** On a normal cached-agent gateway turn, `get_session_env("HERMES_SESSION_ID")` returns the live session id (NOT `""`), because `_set_session_env` now binds `session_id`. Evidence: `tests/gateway/test_session_id_isolation.py::test_session_id_bound_on_turn` (RED on current main where it returns `""`).
+- [ ] **AC1 (I1 — the REAL isolation test, not the fake-green):** Two concurrent in-process contexts each binding their own session leave `os.environ["HERMES_SESSION_ID"]` **NOT cross-contaminated** AND each context's `get_session_env` returns its own id. Evidence: `::test_concurrent_sessions_os_environ_not_contaminated` — must be RED on current main (the unconditional os.environ write clobbers); a `get_session_env`-only assertion is explicitly insufficient (§0.3).
+- [ ] **AC2 (I1):** `grep` shows no gateway-reachable per-turn `os.environ["HERMES_SESSION_ID"|"HERMES_SESSION_KEY"] =` write (the SESSION_KEY write dropped; the SESSION_ID write gated behind `not _HERMES_GATEWAY`). Evidence: grep + Phase-4 enforcement test.
+- [ ] **AC3 (I2):** CLI + cron-standalone (and the popped kanban worker) session rotation still resolves the active session id via the gated os.environ write. Evidence: existing CLI/session tests green + a non-gateway (`_HERMES_GATEWAY` unset) `set_current_session_id` test asserting os.environ IS updated.
+- [ ] **AC4 (I3 — #3):** A task created from the gateway under concurrency stamps the correct (contextvar) `worker_session_id`, not a clobbered global (RED on main); a kanban worker subprocess (B2-popped, no contextvar) still stamps its own via os.environ. Evidence: `tests/tools/test_kanban_session_attribution.py` (both arms).
+- [ ] **AC4b (B2):** the kanban worker spawn env does not contain `_HERMES_GATEWAY`. Evidence: `::test_worker_spawn_drops_gateway_flag`.
 - [ ] **AC5 (I4):** v3 + send_message_origin + cron_approval suites stay green; a live bare `send_message` routes to the current channel post-deploy. Evidence: pytest + staged live send.
 - [ ] **AC6 (honest scope):** §7 and Ground-Truth state the severity accurately (hygiene/correctness + one data-attribution bug, not an active security misroute). Evidence: inspection.
 
