@@ -8921,6 +8921,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_hard_msg_limit = _parsed
                             except (TypeError, ValueError):
                                 pass
+                        # hygiene token threshold (fraction of window) — config key
+                        # so it's visible/tunable; default 0.85 (intentionally higher
+                        # than the in-turn compressor's compression.threshold).
+                        _raw_hyg_thr = _comp_cfg.get("hygiene_threshold")
+                        if _raw_hyg_thr is not None:
+                            try:
+                                _parsed_thr = float(_raw_hyg_thr)
+                                if 0.0 < _parsed_thr <= 1.0:
+                                    _hyg_threshold_pct = _parsed_thr
+                            except (TypeError, ValueError):
+                                pass
 
                 try:
                     _hyg_model, _hyg_runtime = self._resolve_session_agent_runtime(
