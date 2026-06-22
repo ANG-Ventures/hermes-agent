@@ -36,7 +36,11 @@ def _reset_signal_scheduler():
         try:
             from plugins.platforms.discord import adapter as _discord_adapter
             _discord_adapter._DISCORD_CHANNEL_TYPE_PROBE_CACHE.clear()
-        except Exception:
+        except ImportError:
+            # Discord plugin not installed in this test env — nothing to reset.
+            # Deliberately narrow: an AttributeError (e.g. the cache attr is
+            # renamed) must surface, not silently stop resetting and let the
+            # flaky ordering bug back in.
             pass
 
     _reset_scheduler()
