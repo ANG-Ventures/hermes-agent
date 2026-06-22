@@ -9275,7 +9275,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 # #2153 death-spiral backstop → it wins.
                                 if _msg_count >= _HARD_MSG_LIMIT:
                                     _hyg_reason = "hygiene_messages"
-                                    _hyg_reason_value = _msg_count
+                                    # The clause reads "message-count safety limit:
+                                    # {value} messages" — it must show the CONFIGURED
+                                    # LIMIT, not the current count (which is already in
+                                    # the X→Y body). Passing _msg_count made it read
+                                    # "limit: 1075" with 1075 repeated (the live bug).
+                                    _hyg_reason_value = _HARD_MSG_LIMIT
                                 else:
                                     _hyg_reason = "hygiene_tokens"
                                     _hyg_reason_value = _compress_token_threshold
