@@ -4768,7 +4768,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         completed; the breaker, not the resume flag, is what trips a loop).
         """
         initiated_restart = bool(
-            self._session_initiated_restart.pop(session_key, False)
+            getattr(self, "_session_initiated_restart", {}).pop(session_key, False)
         )
         if initiated_restart:
             try:
