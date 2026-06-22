@@ -1029,12 +1029,19 @@ def test_sweep_degraded_boot_reaps_all(tmp_path, monkeypatch):
 from gateway.run import (
     _AGENT_CONFIG_ENV_BRIDGE,
     _bridge_agent_config_to_env,
-    _restart_loop_threshold,
-    _restart_loop_window_secs,
 )
 
 
 # ---- Phase 1: Item 3 — restart_* config family consistency ----
+
+def test_restart_initiated_ttl_in_bridge_map():
+    """The new knob is wired into the single-sourced bridge map (so the startup
+    block bridges it without a bespoke if-branch)."""
+    assert _AGENT_CONFIG_ENV_BRIDGE["restart_initiated_ttl_secs"] == "HERMES_RESTART_INITIATED_TTL_SECS"
+    # the already-shipped siblings stay mapped (no accidental drop in the refactor)
+    assert _AGENT_CONFIG_ENV_BRIDGE["restart_loop_threshold"] == "HERMES_RESTART_LOOP_THRESHOLD"
+    assert _AGENT_CONFIG_ENV_BRIDGE["restart_loop_window_secs"] == "HERMES_RESTART_LOOP_WINDOW_SECS"
+
 
 def test_restart_initiated_ttl_bridged_from_config(monkeypatch):
     """The new agent.restart_initiated_ttl_secs config key is bridged to its env
