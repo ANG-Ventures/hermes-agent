@@ -15,7 +15,71 @@
 | Phase 0 — baseline + harness + send-guard | **PASS** | findings F0-1..3 below |
 | Phase 1 — context engine / compaction | **PASS** | byte-exact recovery proven on real-data copy |
 | Phase 2 — gateway core | **PASS** (F0-1 FIXED) | 6963 green single-process after the FD fix |
-| Phase 3 — cron operational surfaces | pending | |
+| Phase 3 — cron operational surfaces | **PASS** | 6/6 firing OK (telemetry) + destinations resolve + logic checks substantive |
+
+---
+
+## Phase 3 — cron operational surfaces — **PASS**
+
+Tier-1c set (Ace's proposed daily crons): `morning-digest`, `x-feed-brief`, `gmail-triage`,
+`twitter-daily-inspo`, `claude-usage-90pct-alert`, `fleet-config-lint`.
+
+### Evidence (B1 two-/three-signal live-path proof, NOT a mocked dry-run)
+- **Signal 1 — scheduler-fires-it (real telemetry, not cached `cron list`):** read each job's live
+  `state`/`last_status`/`last_run_at`/`next_run_at`/`last_error` from `cron/jobs.json`. **All 6:
+  `state=scheduled`, `last_status=ok`, recent real `last_run_at`, scheduled `next_run_at`, zero
+  `last_error`/`last_delivery_error`.** The scheduler is firing them on time and they succeed.
+- **Signal 3 — destination resolves (non-spamming):** `morning-digest`/`x-feed-brief` deliver to
+  discord `1480525090331561984` — resolved via `discord_admin channel_info` to a real, accessible
+  `#logs` channel (recent `last_message_id` ⇒ bot can post). The other 4 deliver `local` (no live
+  send). No wrong/deleted/unpermissioned destination.
+- **Logic checks (substantive output, not empty-but-no-error):** ran the two `no_agent` scripts live
+  read-only — `fleet-config-lint.py` → "✅ all profiles route correctly"; `claude-usage-alert.py` →
+  "OK: nothing over 75%". Both produce real, substantive results. Script-field paths resolve to real
+  files on disk (`~/.hermes/scripts/…`).
+
+### Findings
+| ID | Finding | Severity × Priority | Disposition |
+|---|---|---|---|
+| **F3-1** | Signal 2 (a forced real cron re-fire to a scratch safe-sink + transport read-back) was NOT executed — it's a deliberate "leaves-the-machine" live send. Signals 1 (telemetry: all 6 fired OK in the last day) + 3 (destinations resolve) already prove the live path end-to-end. | Info × Low | **BACKLOG** — fire one safe-sink delivery on Ace's go-ahead if he wants the belt-and-suspenders proof; not a defect. |
+
+### Self-audit
+Signal 1 is the LIVE scheduler state (the `last_run_at`/`last_status` the scheduler writes after each
+real fire), not the cached `cron list` line the spec warned about; destinations were resolved against
+the real Discord API; logic checks ran the deployed scripts live, not a mock.
+
+---
+
+## Tier-1 campaign summary
+
+| Phase | Verdict |
+|---|---|
+| 0 — baseline / harness / send-guard | PASS |
+| 1 — context engine / compaction | PASS (byte-exact recovery proven) |
+| 2 — gateway core | PASS — **F0-1 FD-leak FIXED & shipped** |
+| 3 — cron operational surfaces | PASS (all 6 firing OK + destinations resolve) |
+
+**Real fix shipped:** F0-1 — single-process FD exhaustion (PR #82). **No product defects found** in
+the Tier-1 surfaces; everything else triaged to pollution (per-file CI never hits) or macOS-local env
+artifacts, each with a disposition.
+
+### Loose-end triage (final)
+| Loose end | Disposition | Trigger / reason |
+|---|---|---|
+| F0-1 gateway FD leak | **SHIP-NOW — DONE** | fixed + RED-proven, PR #82 |
+| F0-2 / F2-2 macOS `/tmp` + systemd/POSIX env tests | BACKLOG | `skipif`-Darwin / realpath; trigger = next gateway sweep |
+| F2-1 gateway single-process cross-file pollution (~12 tests) | BACKLOG | own campaign; trigger = wanting a single-process gateway gate |
+| F3-1 cron safe-sink live re-fire (signal 2) | BACKLOG | fire on Ace's go-ahead |
+
+### DISCOVERIES
+- **Instrument-first turned 2,862 scary "failures" into 1 real fix + 0 product bugs.** The gateway
+  suite's mass errors were a single FD-limit ceiling, not a code rot — captured the literal `Errno 24`,
+  re-ran with a raised limit, fixed the limit at the harness, RED-proved it.
+- The macOS dev box produces a consistent class of false-fails (`/tmp`↔`/private/tmp`, systemd
+  `INVOCATION_ID`, POSIX subprocess sandbox) that all pass on Linux CI — worth a Darwin `skipif` sweep
+  someday, but never product bugs.
+- Cron health is best read from the scheduler's own `last_run_at`/`last_status` telemetry, not
+  `cron list` (cached) — all 6 daily crons are firing and succeeding.
 
 ---
 
