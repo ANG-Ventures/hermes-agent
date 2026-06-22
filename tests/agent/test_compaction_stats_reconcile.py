@@ -249,3 +249,73 @@ def test_build_hygiene_stats_zero_fold_reconciles():
     assert ok, reason
     assert stats.folded_count == 0 and stats.summary_messages == 0
     assert stats.kept_messages == stats.eligible_count
+
+
+# ---------------------------------------------------------------------------
+# Greptile PR#76 P2 fixes — regression guards
+# ---------------------------------------------------------------------------
+
+def test_freed_check_tolerates_compounded_axis_error():
+    """The freed identity is the difference of the two ±_TOKEN_TOL axis checks, so
+    its bound is 2×_TOKEN_TOL. A compounded error of +_TOKEN_TOL on pre and
+    -_TOKEN_TOL on post (net 2×) must still reconcile — not spuriously degrade.
+    """
+    from agent.compaction_stats import _TOKEN_TOL
+    # Start from the baseline, then perturb pre/post axes in OPPOSITE directions
+    # each by exactly _TOKEN_TOL so both axis checks pass at their edge but the
+    # freed identity sees a 2×_TOKEN_TOL gap.
+    s = _stats(
+        # pre axis: cleared+folded+kept = pre + _TOKEN_TOL (edge-pass)
+        cleared_tokens=247262 + _TOKEN_TOL,
+        # post axis: kept+summary+anchor = post - _TOKEN_TOL (edge-pass)
+        summary_tokens=4800 - _TOKEN_TOL,
+    )
+    ok, reason = s.validate()
+    assert ok, f"compounded 2x-tol error must still reconcile: {reason}"
+
+
+def test_freed_check_never_fails_alone_when_both_axes_pass():
+    """With _FREED_TOL = 2×_TOKEN_TOL, the freed identity is mathematically
+    redundant: it is the difference of the two axis checks, so whenever both axes
+    pass (±_TOKEN_TOL each) the freed gap is ≤2×_TOKEN_TOL by construction and can
+    never be the *sole* failure. Any value that breaks freed beyond 2× must break
+    an axis first — proving the old single-_TOKEN_TOL bound was the spurious one.
+    """
+    from agent.compaction_stats import _TOKEN_TOL
+    # Break freed by 2×+1 by perturbing only cleared_tokens: this necessarily
+    # breaks the pre axis too (cleared feeds it), so freed is never the lone cause.
+    s = _stats(cleared_tokens=247262 + 2 * _TOKEN_TOL + 1)
+    ok, reason = s.validate()
+    assert not ok
+    assert "token pre" in reason  # the axis fails first, not "freed"
+
+
+def test_signature_fallback_handles_identical_long_prefixes():
+    """Fallback subtraction (copies path) must NOT collide on messages that share
+    a long identical prefix — the [:200]-truncation bug. With copied dicts (no
+    id() match), the producer falls back to the row signature; a full-content
+    hash keeps distinct-suffix rows distinct so cleared/folded attribution and
+    validate() stay correct.
+    """
+    from agent.compaction_stats import build_hygiene_stats
+    prefix = "TOOLRESULT " * 40  # >200 chars, shared by every tool row
+    raw = []
+    for i in range(5):
+        raw.append({"role": "user", "content": f"u{i} " * 20})
+        raw.append({"role": "assistant", "content": f"{prefix} UNIQUE_SUFFIX_{i}"})
+    # eligible = COPIES (fresh dicts) so id()-identity fails → signature path runs
+    eligible = [
+        {"role": m["role"], "content": m["content"]}
+        for m in raw
+        if m["role"] in ("user", "assistant") and m.get("content")
+    ]
+    # keep the last two eligible (also copies, distinct suffixes)
+    kept = [{"role": m["role"], "content": m["content"]} for m in eligible[-2:]]
+    summary = {"role": "assistant", "content": "[Recent Summary (d0, node 1)]\nx\n[Expand for details: y]"}
+    compressed = [summary] + kept
+    stats = build_hygiene_stats(raw_history=raw, eligible_msgs=eligible, compressed=compressed, estimator=_est)
+    ok, reason = stats.validate()
+    assert ok, f"long-prefix rows must reconcile via full-content signature: {reason}"
+    assert stats.eligible_count == len(eligible)
+    assert stats.kept_messages == 2
+    assert stats.folded_count == len(eligible) - 2

@@ -9061,7 +9061,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_reason = "hygiene_tokens"
                                     _hyg_reason_value = _compress_token_threshold
                                 _hyg_eligible_count = len(_hyg_msgs)
-                                _hyg_pre_history = list(history)  # snapshot raw transcript before rewrite
+                                # Snapshot the raw transcript BEFORE the rewrite.
+                                # Per-entry shallow-dict copy (not list(history)):
+                                # list() shares the dict objects, so any in-place
+                                # mutation downstream (key add / content rewrite)
+                                # before the announce would corrupt the "before"
+                                # token measurement. {**m} decouples the dicts;
+                                # content is an immutable str so a shallow copy is
+                                # enough (no deepcopy cost).
+                                _hyg_pre_history = [{**m} for m in history]
                                 _hyg_old_sid = session_entry.session_id
                                 _hyg_agent = AIAgent(
                                     **_hyg_runtime,

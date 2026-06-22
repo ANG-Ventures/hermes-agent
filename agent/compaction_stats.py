@@ -122,15 +122,25 @@ class CompactionStats:
             )
         # freed identity with the anchor term (Pass-2 blocker fix):
         # cleared + folded - summary - anchor == freed
+        # NOTE: this identity is the algebraic difference of the two axis checks
+        # above (pre = cleared+folded+kept ; post = kept+summary+anchor →
+        # pre-post = cleared+folded-summary-anchor). Each axis tolerates ±_TOKEN_TOL
+        # independently, so the compounded error here is bounded by 2×_TOKEN_TOL
+        # (worst case ε_pre=+tol, ε_post=-tol). Using a single _TOKEN_TOL here would
+        # spuriously fail — and silently degrade to the two-line form — on data that
+        # passed both axis checks. The estimator is exactly additive over disjoint
+        # subsets today (ε≈0), but widen the bound so a future rounding estimator
+        # can't trip this latent trap.
+        _FREED_TOL = 2 * _TOKEN_TOL
         freed_check = (
             self.cleared_tokens + self.folded_tokens
             - self.summary_tokens - self.anchor_tokens
         )
-        if abs(freed_check - self.freed_tokens) > _TOKEN_TOL:
+        if abs(freed_check - self.freed_tokens) > _FREED_TOL:
             return False, (
                 f"freed: cleared {self.cleared_tokens} + folded {self.folded_tokens} "
                 f"- summary {self.summary_tokens} - anchor {self.anchor_tokens} "
-                f"= {freed_check} != freed {self.freed_tokens} (tol {_TOKEN_TOL})"
+                f"= {freed_check} != freed {self.freed_tokens} (tol {_FREED_TOL})"
             )
         # ── optional sub-split must sum to cleared ──
         if self.cleared_tool_count is not None or self.cleared_other_count is not None:
@@ -228,6 +238,28 @@ def build_hygiene_stats(
     )
 
 
+def _row_signature(m: dict) -> Tuple[Optional[str], str]:
+    """Collision-resistant ``(role, content-hash)`` key for fallback subtraction.
+
+    Used only when ``id()``-identity matching fails (the population was copied).
+    Hashes the FULL content rather than a truncated prefix: templated tool
+    results or assistant turns frequently share a long identical prefix, so a
+    ``content[:200]`` key collided and the Counter subtraction deducted the wrong
+    row — making the granular announce silently degrade to the two-line form on
+    exactly those structural sessions. A full-content hash avoids that. (Hash
+    bounds key size vs. carrying multi-KB strings as dict keys; SHA-1 is for
+    de-dup, not security, so it's fine here.)
+    """
+    import hashlib
+
+    content = m.get("content")
+    if not isinstance(content, str):
+        # tool-call-only / structured content → stringify deterministically
+        content = repr(content)
+    digest = hashlib.sha1(content.encode("utf-8", "surrogatepass")).hexdigest()
+    return (m.get("role"), digest)
+
+
 def _disjoint_remainder(whole: List[dict], subset: List[dict]) -> List[dict]:
     """Rows in ``whole`` not present (by identity) in ``subset`` — for cleared_tok.
 
@@ -240,11 +272,10 @@ def _disjoint_remainder(whole: List[dict], subset: List[dict]) -> List[dict]:
         return rem
     # identity didn't line up (copies); fall back to signature subtraction
     from collections import Counter
-    sig = lambda m: (m.get("role"), (m.get("content") or "")[:200])  # noqa: E731
-    want = Counter(sig(m) for m in subset)
+    want = Counter(_row_signature(m) for m in subset)
     out = []
     for m in whole:
-        s = sig(m)
+        s = _row_signature(m)
         if want.get(s, 0) > 0:
             want[s] -= 1
         else:
@@ -259,11 +290,10 @@ def _fold_rows(eligible: List[dict], kept: List[dict]) -> List[dict]:
     if len(rem) == len(eligible) - len(kept):
         return rem
     from collections import Counter
-    sig = lambda m: (m.get("role"), (m.get("content") or "")[:200])  # noqa: E731
-    want = Counter(sig(m) for m in kept)
+    want = Counter(_row_signature(m) for m in kept)
     out = []
     for m in eligible:
-        s = sig(m)
+        s = _row_signature(m)
         if want.get(s, 0) > 0:
             want[s] -= 1
         else:
