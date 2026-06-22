@@ -28,6 +28,10 @@ def _ensure_telegram_mock():
     # "MarkdownV2"; without restore, every later gateway test sees that string and
     # `"MARKDOWN_V2" in repr(parse_mode)` assertions fail single-process).
     global _PRIOR_SYS_MODULES
+    # Only the telegram.* slots need restoring; the consumer module
+    # (gateway.platforms.telegram) is restored by IN-PLACE attribute mutation in
+    # the teardown fixture (step 2), not slot replacement, so it is intentionally
+    # NOT captured here.
     _PRIOR_SYS_MODULES = {
         name: sys.modules.get(name)
         for name in (
@@ -35,7 +39,6 @@ def _ensure_telegram_mock():
             "telegram.ext",
             "telegram.constants",
             "telegram.request",
-            "gateway.platforms.telegram",
         )
     }
 

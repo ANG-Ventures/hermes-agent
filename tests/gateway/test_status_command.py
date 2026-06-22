@@ -26,7 +26,7 @@ def _isolate_gateway_config_from_live(monkeypatch):
     Pinning the config to ``{}`` makes these tests independent of the host's live
     config and the shared cache state. (Isolation hardening, RED-proven below.)
     """
-    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {}, raising=False)
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
 
 
 def _make_source(platform: Platform = Platform.TELEGRAM) -> SessionSource:

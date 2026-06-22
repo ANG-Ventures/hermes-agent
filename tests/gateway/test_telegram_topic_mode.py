@@ -25,7 +25,7 @@ def _isolate_gateway_config_from_live(monkeypatch):
     a full single-process run makes ``result`` become ``"<reply>\\n\\n<footer>"`` and
     breaks ``assert result == "<reply>"``. Isolation hardening.
     """
-    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {}, raising=False)
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
 
 
 def _make_source(*, thread_id: str | None = None) -> SessionSource:
