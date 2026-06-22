@@ -194,3 +194,58 @@ def test_all_frozen_fixture_shapes_reconcile():
         cs = CompactionStats(**kw)
         ok, reason = cs.validate()
         assert ok, f"fixture shape {name!r}: {reason}"
+
+
+# ---------------------------------------------------------------------------
+# producer test — build_hygiene_stats over realistic role-mixed data reconciles
+# (this is where the 222->222 bug lived: the bucket-COMPUTATION code)
+# ---------------------------------------------------------------------------
+
+def _est(msgs):
+    """Tiny deterministic additive estimator (chars/4) over a row subset."""
+    return sum(len((m.get("content") or "")) for m in msgs) // 4
+
+
+def _raw_history():
+    raw = []
+    for i in range(6):
+        raw.append({"role": "user", "content": f"q{i} " * 20})
+        raw.append({"role": "assistant", "content": f"a{i} " * 40})
+        raw.append({"role": "assistant", "content": "", "tool_calls": "[{}]"})  # contentless
+        raw.append({"role": "tool", "content": f"TOOL {i} " * 200, "tool_call_id": f"t{i}"})
+    return raw
+
+
+def test_build_hygiene_stats_reconciles_with_fold():
+    from agent.compaction_stats import build_hygiene_stats
+    raw = _raw_history()
+    eligible = [m for m in raw if m["role"] in ("user", "assistant") and m.get("content")]
+    keep = 3
+    kept = eligible[-keep:]
+    summary = {"role": "assistant", "content": "[Recent Summary (d0, node 1)]\nfolded\n[Expand for details: x]"}
+    anchor = {"role": "system", "content": "SYS " * 30}
+    compressed = [anchor, summary] + kept
+    stats = build_hygiene_stats(raw_history=raw, eligible_msgs=eligible, compressed=compressed, estimator=_est)
+    ok, reason = stats.validate()
+    assert ok, reason
+    # buckets reflect reality
+    assert stats.pre_messages == len(raw)
+    assert stats.eligible_count == len(eligible)
+    assert stats.cleared_count == len(raw) - len(eligible)
+    assert stats.kept_messages == keep
+    assert stats.folded_count == len(eligible) - keep
+    assert stats.summary_messages == 1
+    assert stats.anchor_messages == 1
+
+
+def test_build_hygiene_stats_zero_fold_reconciles():
+    # LCM folded nothing: compressed == eligible (no summary, no anchor) — the 222->222 shape
+    from agent.compaction_stats import build_hygiene_stats
+    raw = _raw_history()
+    eligible = [m for m in raw if m["role"] in ("user", "assistant") and m.get("content")]
+    compressed = list(eligible)  # everything kept verbatim, nothing folded
+    stats = build_hygiene_stats(raw_history=raw, eligible_msgs=eligible, compressed=compressed, estimator=_est)
+    ok, reason = stats.validate()
+    assert ok, reason
+    assert stats.folded_count == 0 and stats.summary_messages == 0
+    assert stats.kept_messages == stats.eligible_count

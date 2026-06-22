@@ -9050,6 +9050,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_reason = "hygiene_tokens"
                                     _hyg_reason_value = _compress_token_threshold
                                 _hyg_eligible_count = len(_hyg_msgs)
+                                _hyg_pre_history = list(history)  # snapshot raw transcript before rewrite
                                 _hyg_old_sid = session_entry.session_id
                                 _hyg_agent = AIAgent(
                                     **_hyg_runtime,
@@ -9145,6 +9146,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             runtime=_hyg_runtime,
                                             trigger_reason=_hyg_reason,
                                             trigger_value=_hyg_reason_value,
+                                            raw_pre_count=_msg_count,
+                                            raw_history=_hyg_pre_history,
+                                            eligible_msgs=_hyg_msgs,
+                                            compressed=_compressed,
                                         )
 
                                     # If summary generation failed, the
@@ -11804,6 +11809,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         runtime: dict,
         trigger_reason: str,
         trigger_value: int,
+        raw_pre_count: "Optional[int]" = None,
+        raw_history: "Optional[list]" = None,
+        eligible_msgs: "Optional[list]" = None,
+        compressed: "Optional[list]" = None,
     ) -> None:
         """Format + deliver the session-hygiene compaction announce from REAL
         gateway facts (not the throwaway agent's filtered done-site view), on the
@@ -11814,10 +11823,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         recovery pointer's session ids are stripped from the channel variant
         (D-11) — only the LCM lossless-store guidance ships to chat.
 
+        When ``raw_history``/``eligible_msgs``/``compressed`` are supplied, builds
+        a reconciling ``CompactionStats`` for the granular breakdown — inside a
+        try/except that degrades to the two-line form on ANY failure (a reconcile
+        bug can never break hygiene or ship wrong math).
+
         Kill switch: compression.announce_on_hygiene (default true).
         """
         try:
             # Kill switch (per-event mtime-cached config read; non-privileged).
+            _cfg = None
             try:
                 _cfg = _load_gateway_config()
                 _comp_cfg = _cfg.get("compression", {}) if isinstance(_cfg, dict) else {}
@@ -11834,6 +11849,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _status = getattr(_comp, "_last_compression_status", None)
             _provider = runtime.get("provider") if isinstance(runtime, dict) else None
 
+            # Reasoning level for the model line (same source as the runtime footer).
+            _reasoning = None
+            try:
+                _agent_cfg = (_cfg.get("agent") or {}) if isinstance(_cfg, dict) else {}
+                _reasoning = str(_agent_cfg.get("reasoning_effort", "") or "").strip() or None
+            except Exception:
+                _reasoning = None
+
+            # Build the granular reconciling stats (degrade on ANY failure).
+            _stats = None
+            _recovery_hint = None
+            if raw_history is not None and eligible_msgs is not None and compressed is not None:
+                try:
+                    from agent.compaction_stats import build_hygiene_stats
+                    from agent.model_metadata import estimate_messages_tokens_rough
+                    _stats = build_hygiene_stats(
+                        raw_history=raw_history,
+                        eligible_msgs=eligible_msgs,
+                        compressed=compressed,
+                        estimator=estimate_messages_tokens_rough,
+                    )
+                    _ok, _why = _stats.validate()
+                    if not _ok:
+                        logger.warning("COMPACTION_STATS_RECONCILE_FAILED hygiene %s", _why)
+                        _stats = None
+                    else:
+                        # Per-path store-correct recovery line: hygiene clears
+                        # tool/system rows into the rotated transcript (state.db /
+                        # session_search) AND folds chat into lcm.db.
+                        if _engine_name == "lcm":
+                            _recovery_hint = (
+                                "↩ Nothing lost — recover cleared tool/system output via "
+                                "session_search (old transcript in state.db) and folded chat "
+                                "via lcm_grep / lcm_expand (lcm.db)."
+                            )
+                except Exception:
+                    logger.debug("hygiene stats build failed; degrading to two-line", exc_info=True)
+                    _stats = None
+
             # Built-in variant: do NOT ship session ids to a chat channel (D-11).
             # _format_compaction_announce renders the built-in recovery pointer
             # only when old/new sids differ; pass equal sentinels so the built-in
@@ -11849,7 +11903,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 status=_status,
                 old_session_id=_old_sid_arg,
                 new_session_id=_new_sid_arg,
-                old_messages=eligible_count,
+                old_messages=raw_pre_count if raw_pre_count is not None else eligible_count,
                 new_messages=new_count,
                 pre_tokens=pre_tokens,
                 post_tokens=post_tokens,
@@ -11858,6 +11912,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 summary_snippet=None,  # contentless on the channel rail (D-7)
                 trigger_reason=trigger_reason,
                 trigger_value=trigger_value,
+                reasoning=_reasoning,
+                stats=_stats,
+                recovery_hint=_recovery_hint,
             )
             if not line:
                 return  # gating said skip (noop/idle/etc.) — nothing to deliver

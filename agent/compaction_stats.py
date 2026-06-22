@@ -147,3 +147,125 @@ class CompactionStats:
         ok, reason = self.validate()
         if not ok:
             raise ValueError(f"CompactionStats does not reconcile: {reason}")
+
+
+# Identifies an LCM summary message in a compressed/active context.
+_LCM_SUMMARY_RE = None  # lazy-compiled below
+
+
+def _is_summary_message(content: str) -> bool:
+    global _LCM_SUMMARY_RE
+    if _LCM_SUMMARY_RE is None:
+        import re
+        _LCM_SUMMARY_RE = re.compile(
+            r"\[(?:Recent|Session Arc|Durable|Depth-\d+) Summary \(d\d+, node \d+\)\]"
+        )
+    return bool(content) and bool(_LCM_SUMMARY_RE.search(content))
+
+
+def build_hygiene_stats(
+    *,
+    raw_history: List[dict],
+    eligible_msgs: List[dict],
+    compressed: List[dict],
+    estimator,
+) -> "CompactionStats":
+    """Build a reconciling ``CompactionStats`` from the session-hygiene path's real data.
+
+    All counts/tokens are MEASURED independently over disjoint row subsets of the
+    SAME population (no back-derivation), so ``validate()`` is a real cross-check:
+
+    - ``pre`` = the full raw transcript (`raw_history`).
+    - ``eligible`` = the role-filtered subset fed to the throwaway compressor
+      (`eligible_msgs` = user/assistant-with-content). ``cleared = pre - eligible``
+      (tool + system + contentless-assistant rows the filter removed).
+    - ``compressed`` = the LCM output written back. Within it: summary message(s)
+      (LCM markers), the system anchor (role == "system"), and the kept tail
+      (everything else). ``kept`` rows are a subset of ``eligible``; ``folded =
+      eligible - kept``.
+
+    Token sums all use the SAME ``estimator`` over each subset (same-estimator
+    contract). Returns a stats object; the caller validates + degrades on failure.
+    """
+    pre_msgs = list(raw_history or [])
+    elig = list(eligible_msgs or [])
+    comp = list(compressed or [])
+
+    summary_rows = [m for m in comp if _is_summary_message(m.get("content") or "")]
+    anchor_rows = [m for m in comp if m.get("role") == "system"]
+    kept_rows = [
+        m for m in comp
+        if m.get("role") != "system" and not _is_summary_message(m.get("content") or "")
+    ]
+
+    pre_messages = len(pre_msgs)
+    eligible_count = len(elig)
+    cleared_count = pre_messages - eligible_count
+    kept_messages = len(kept_rows)
+    folded_count = eligible_count - kept_messages
+    summary_messages = len(summary_rows)
+    anchor_messages = len(anchor_rows)
+    post_messages = kept_messages + summary_messages + anchor_messages
+
+    cleared_rows = _disjoint_remainder(pre_msgs, elig)
+
+    return CompactionStats(
+        pre_messages=pre_messages,
+        post_messages=post_messages,
+        eligible_count=eligible_count,
+        kept_messages=kept_messages,
+        summary_messages=summary_messages,
+        anchor_messages=anchor_messages,
+        cleared_count=cleared_count,
+        folded_count=folded_count,
+        pre_tokens=int(estimator(pre_msgs)),
+        post_tokens=int(estimator(comp)),
+        kept_tokens=int(estimator(kept_rows)),
+        summary_tokens=int(estimator(summary_rows)) if summary_rows else 0,
+        anchor_tokens=int(estimator(anchor_rows)) if anchor_rows else 0,
+        cleared_tokens=int(estimator(cleared_rows)) if cleared_rows else 0,
+        folded_tokens=int(estimator(_fold_rows(elig, kept_rows))),
+    )
+
+
+def _disjoint_remainder(whole: List[dict], subset: List[dict]) -> List[dict]:
+    """Rows in ``whole`` not present (by identity) in ``subset`` — for cleared_tok.
+
+    Uses id()-identity when the same objects flow through, else falls back to a
+    role+content signature so token attribution is over the right rows.
+    """
+    sub_ids = {id(m) for m in subset}
+    rem = [m for m in whole if id(m) not in sub_ids]
+    if len(rem) == len(whole) - len(subset):
+        return rem
+    # identity didn't line up (copies); fall back to signature subtraction
+    from collections import Counter
+    sig = lambda m: (m.get("role"), (m.get("content") or "")[:200])  # noqa: E731
+    want = Counter(sig(m) for m in subset)
+    out = []
+    for m in whole:
+        s = sig(m)
+        if want.get(s, 0) > 0:
+            want[s] -= 1
+        else:
+            out.append(m)
+    return out
+
+
+def _fold_rows(eligible: List[dict], kept: List[dict]) -> List[dict]:
+    """Eligible rows NOT in the kept tail — the folded population (token source)."""
+    kept_ids = {id(m) for m in kept}
+    rem = [m for m in eligible if id(m) not in kept_ids]
+    if len(rem) == len(eligible) - len(kept):
+        return rem
+    from collections import Counter
+    sig = lambda m: (m.get("role"), (m.get("content") or "")[:200])  # noqa: E731
+    want = Counter(sig(m) for m in kept)
+    out = []
+    for m in eligible:
+        s = sig(m)
+        if want.get(s, 0) > 0:
+            want[s] -= 1
+        else:
+            out.append(m)
+    return out
