@@ -198,3 +198,15 @@ gateway process
 - `cron/scheduler.py:~1588-1620` — the delivery-var ContextVar migration with the "os.environ is process-global" comment (the precedent this fix extends).
 - Readers: `tools/approval.py:147,1187,1424,1713` (approval gating), `tools/send_message_tool.py:176,277` (origin resolve + tripwire).
 - Live proof: `terminal` → `HERMES_CRON_SESSION=1` in gateway PID 95240; Apollo main-turn bare `send_message` → `"Sent to discord home channel (chat_id: 1502228850338435153)"` while user in `#fix-issues` (`1517844402897424504`); `execute_code` (sanitized subprocess) saw it absent — the discrepancy is the env-inheritance vs sanitized-subprocess difference, with the raw-`os.environ` terminal read authoritative.
+
+---
+
+## Closeout addendum (2026-06-22)
+
+**Loose ends resolved (all SHIP-NOW, not deferred):**
+- The two "pre-existing red" test classes (`test_hardline_blocklist`, `TestDelegateHeartbeat`) were **investigated and fixed**, not WONTFIX'd (PR #92, merged `eb7b4651c`):
+  - `test_hardline_blocklist` (24 reboot/shutdown cases + yolo-bypass): the live fleet sets `HERMES_ALLOW_REBOOT=1` (legit ops opt-out, `74ed8a85c`), which leaks into pytest's inherited env and downgrades the reboot family out of the hardline floor → the default-block tests fail. Fixed with an autouse `monkeypatch.delenv("HERMES_ALLOW_REBOOT")`. Deterministic in both ambient states.
+  - `TestDelegateHeartbeat` (3 timing-brittle tests): asserted wall-clock-derived touch counts; the heartbeat thread's wake cadence is GIL/scheduler-bound, so on a loaded host they produced too few touches. Rewrote to assert the **behavior contract** (heartbeat still alive late in the run / ≥1 touch with pinned thresholds) instead of a count. Verified 6/6 green under a 6-thread CPU burn.
+- The v2-spec OQ2 docs correction shipped (PR #91).
+
+**DISCOVERY (latent, BACKLOG — NOT a v3 regression, NO routing leak):** the `terminal` tool's subprocess can inherit a *different concurrently-active session's* contextvars (a `no_agent` cron job's `set_cron_session()` bleeds the whole `HERMES_SESSION_*` block — incl. `HERMES_CRON_SESSION=1` and that cron session's `SESSION_ID`/`CHAT_ID`/`KEY` — into an interactive turn's terminal env). It bleeds **every** session var, not just the cron flag, so it's a general context-inheritance issue, pre-existing, exposed (not caused) by adding `HERMES_CRON_SESSION` to `_VAR_MAP`. It does **not** misroute `send_message` (which reads the model's turn context — live-verified routing to the current channel). Practical impact: the Mechanism-4 `terminal env|grep HERMES_CRON_SESSION` diagnostic now gives false positives — **cross-check with the in-process `execute_code` read** (`gateway.session_context.is_cron_session()`), which is authoritative. The `agent-message-misrouting-diagnosis` skill was updated with this caveat. Promotion trigger: if it ever causes a real cross-context terminal action (a cron-spawned terminal command running with interactive creds or vice versa).
