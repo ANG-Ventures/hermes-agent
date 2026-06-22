@@ -426,7 +426,7 @@ class TestCompactionCallSiteCoverage:
         #   in-turn live agent (has status_callback) → _emit_compaction_announce
         #     covered by TestLoudFailMarkers + test_compaction_announce_lcm
         #   gateway hygiene throwaway → _announce_hygiene_compaction
-        #     covered by test_session_hygiene::test_hygiene_msgcount_announces_real_count
+        #     covered by test_session_hygiene::test_hygiene_msgcount_announces_limit_not_count
         #   /compress slash throwaway → user already gets the before/after report
         #     (D-8: intentionally no second announce)
         expected = {
