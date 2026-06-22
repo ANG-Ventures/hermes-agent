@@ -221,7 +221,7 @@ def _build_record(
     ts_end = now
     tool_calls = list(state.get("tool_calls") or [])
 
-    cost_usd, cost_status = compute_turn_cost(
+    cost_usd, cost_status, cost_perclass = compute_turn_cost(
         model,
         provider,
         kwargs.get("base_url") or usage.get("base_url"),
