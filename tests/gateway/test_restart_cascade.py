@@ -955,6 +955,45 @@ def test_no_spawn_without_write_flag_plants_no_breadcrumb(tmp_path, monkeypatch)
     assert not (tmp_path / ".restart_initiated" / _restart_initiated_filename(sk)).exists()
 
 
+def test_cross_process_breadcrumb_contract_ci_safe(tmp_path, monkeypatch):
+    """CI-GUARANTEED cross-process contract (Required Change #1): the round-trip
+    subprocess tests skip when the live skill script isn't on-path (CI), which
+    would make the anti-masking proof illusory off-host. This test reproduces the
+    SCRIPT's breadcrumb-write contract INLINE (the exact JSON shape + filename
+    hash + boot_id read from gateway_state.json) and proves the real gateway gate
+    consumes it — so the cross-process file contract is verified on EVERY host,
+    with no dependency on the skill script's filesystem location.
+
+    If the real script's write shape ever drifts from this inline replica, the
+    subprocess round-trip tests (when present) catch it; this guarantees the gate
+    side of the contract is always exercised."""
+    import gateway.status as status
+
+    monkeypatch.setenv("HERMES_RESTART_LOOP_THRESHOLD", "3")
+    runner, _adapter = _runner(tmp_path, monkeypatch)
+    sk = _entry(runner, "ci").session_key
+    # real producer persists boot_id (stale_first → exercises the refresh path)
+    _seed_gateway_state_via_real_producer(tmp_path, monkeypatch, stale_first=True)
+
+    # Replicate the SCRIPT's write: read boot_id from gateway_state.json (the
+    # field the real producer just wrote), write the per-session file with the
+    # same {session_key, ts, boot_id} shape and sha8 filename the gate expects.
+    gw_state = json.loads((tmp_path / "gateway_state.json").read_text())
+    boot_id = gw_state["boot_id"]
+    assert boot_id == status.get_current_boot_id()  # producer/consumer agree
+    d = runner._restart_initiated_dir()
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (d / _restart_initiated_filename(sk)).write_text(
+        json.dumps({"session_key": sk, "ts": _time.time(), "boot_id": boot_id}),
+        encoding="utf-8",
+    )
+
+    runner._resumed_this_boot.add(sk)
+    runner._apply_post_turn_resume_gate(sk)
+    counts = runner._load_restart_failure_counts().get(sk, {})
+    assert len(counts.get("replay_marks", [])) == 1
+
+
 def test_degraded_current_boot_id_rejects_breadcrumb(tmp_path, monkeypatch):
     """MAJOR-1: if the gateway's _current_boot_id() is degraded (pid-only, no
     create_time — psutil failure), the consume side must REJECT every breadcrumb
@@ -967,3 +1006,16 @@ def test_degraded_current_boot_id_rejects_breadcrumb(tmp_path, monkeypatch):
     # write a crumb whose stored boot_id is ALSO pid-only for the same pid
     _write_breadcrumb(runner, sk, boot_id=f"{_os.getpid()}:")
     assert runner._consume_restart_initiated_breadcrumb(sk) is False
+
+
+def test_sweep_degraded_boot_reaps_all(tmp_path, monkeypatch):
+    """Sweep symmetry with consume (Pass-review RC-2): under a degraded current
+    boot_id, the sweep treats every crumb as stale (it can't trust a same-pid
+    match), keeping the dir from accumulating."""
+    runner, _adapter = _runner(tmp_path, monkeypatch)
+    sk = _entry(runner, "sweepdeg").session_key
+    monkeypatch.setattr(runner, "_current_boot_id", lambda: f"{_os.getpid()}:")
+    # a crumb stamped with the SAME pid-only id (would survive a naive == check)
+    _write_breadcrumb(runner, sk, boot_id=f"{_os.getpid()}:")
+    removed = runner._sweep_restart_initiated_breadcrumbs()
+    assert removed == 1

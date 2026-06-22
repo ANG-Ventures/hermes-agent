@@ -4958,6 +4958,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return 0
         current = self._current_boot_id()
+        # Symmetry with the consume side (MAJOR-1): if our own boot_id is degraded
+        # (pid-only, psutil failed), we cannot reliably distinguish a same-pid
+        # prior-boot crumb from a current one — so treat ALL crumbs as stale and
+        # reap them (the consume side would reject them anyway; this keeps the dir
+        # from accumulating under a degraded boot).
+        current_degraded = current.endswith(":")
         ttl = _restart_initiated_ttl_secs()
         now = time.time()
         removed = 0
@@ -4974,8 +4980,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         ts = float(data.get("ts", 0) or 0)
                         # Keep ONLY current-boot, in-TTL crumbs (an in-flight
                         # current-boot breadcrumb written during the sweep window
-                        # must survive — RC-4).
-                        stale = data.get("boot_id") != current or (now - ts) > ttl
+                        # must survive — RC-4). A degraded current boot keeps
+                        # nothing (symmetry with consume).
+                        stale = (
+                            current_degraded
+                            or data.get("boot_id") != current
+                            or (now - ts) > ttl
+                        )
                 except Exception:
                     stale = True
                 if stale:

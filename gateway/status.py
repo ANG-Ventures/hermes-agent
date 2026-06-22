@@ -13,6 +13,7 @@ concurrently under distinct configurations).
 
 import hashlib
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -22,6 +23,8 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Any, Optional
 from utils import atomic_json_write
+
+logger = logging.getLogger(__name__)
 
 if sys.platform == "win32":
     import msvcrt
@@ -214,14 +217,22 @@ def _compute_boot_id(pid: int) -> str:
     process create time. psutil is a hard dependency (see pyproject) and is
     already used elsewhere in this module.
 
-    Falls back to ``f"{pid}:"`` only if psutil cannot read the create time
-    (the caller treats an empty create-time component as a degraded id).
+    Falls back to ``f"{pid}:"`` only if psutil cannot read the create time. A
+    degraded (pid-only) id makes the F2 restart-initiator breadcrumb fail CLOSED
+    (every crumb rejected as degraded → silent fall back to C1/F1), so we log a
+    WARNING to make that otherwise-silent inert state observable.
     """
     try:
         import psutil
 
         return f"{pid}:{psutil.Process(pid).create_time()}"
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "boot_id degraded to pid-only for pid %s (psutil failed: %s) — the F2 "
+            "restart-initiator breadcrumb will fail closed (fall back to C1/F1)",
+            pid,
+            exc,
+        )
         return f"{pid}:"
 
 
