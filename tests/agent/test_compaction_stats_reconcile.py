@@ -374,3 +374,115 @@ def test_cleared_subsplit_tokens_ok_exact():
         cleared_tool_tokens=200000, cleared_other_tokens=47262,  # == cleared_tokens
     ).validate()
     assert ok, reason
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — _tool_other_split helper + build_inturn_stats folded sub-split
+# ---------------------------------------------------------------------------
+
+def _toolmsg(i, n=200):
+    return {"role": "tool", "content": f"TOOLRESULT {i} " * n, "tool_call_id": f"t{i}"}
+
+def _chatmsg(i, role="assistant", n=40):
+    return {"role": role, "content": f"{role} turn {i} " * n}
+
+
+def test_tool_other_split_derives_other_by_subtraction():
+    from agent.compaction_stats import _tool_other_split
+    rows = [_toolmsg(0), _toolmsg(1), _chatmsg(0), _chatmsg(1, role="user")]
+    parent = _est(rows)
+    tc, tt, oc, ot = _tool_other_split(rows, parent, _est)
+    assert tc == 2 and oc == 2
+    # tool estimated, other DERIVED → exact tie-out, parent untouched
+    assert tt == _est([rows[0], rows[1]])
+    assert tt + ot == parent
+    assert ot == parent - tt
+
+
+def test_estimator_returns_int_contract():
+    # CHANGE-1: estimator returns int, so no int() wrap is needed in the helper
+    from agent.model_metadata import estimate_messages_tokens_rough as real_est
+    r = real_est([{"role": "tool", "content": "x" * 100}])
+    assert isinstance(r, int)
+    assert isinstance(real_est([]), int)
+
+
+def test_build_inturn_stats_populates_folded_subsplit_exact():
+    from agent.compaction_stats import build_inturn_stats
+    # 6 tool + 4 chat in the population; keep the last 2 chat as the tail
+    msgs = [_toolmsg(i) for i in range(6)] + [_chatmsg(i) for i in range(4)]
+    kept = msgs[-2:]  # last 2 chat rows (members of msgs, so fold = 8)
+    summary = {"role": "assistant", "content": "[Recent Summary (d0, node 1)]\nx\n[Expand for details: y]"}
+    compressed = [summary] + kept
+    stats = build_inturn_stats(messages=msgs, compressed=compressed, estimator=_est)
+    ok, reason = stats.validate()
+    assert ok, reason
+    # folded population = 8 (6 tool + 2 chat); kept tail = 2 chat
+    assert stats.folded_tool_count == 6
+    assert stats.folded_other_count == 2
+    assert stats.folded_tool_tokens + stats.folded_other_tokens == stats.folded_tokens
+    assert stats.folded_tool_count > 0
+
+
+def test_build_inturn_stats_parent_unchanged_by_subsplit():
+    """BLOCKER-2: folded_tokens must be byte-equal whether or not the sub-split runs."""
+    from agent.compaction_stats import build_inturn_stats, _fold_rows
+    msgs = [_toolmsg(i) for i in range(6)] + [_chatmsg(i) for i in range(4)]
+    kept = msgs[-2:]
+    summary = {"role": "assistant", "content": "[Recent Summary (d0, node 1)]\nx\n[Expand for details: y]"}
+    compressed = [summary] + kept
+    stats = build_inturn_stats(messages=msgs, compressed=compressed, estimator=_est)
+    # parent folded_tokens == direct estimate of the fold population (unperturbed)
+    kept_rows = [m for m in compressed
+                 if m.get("role") != "system"
+                 and "[Recent Summary" not in (m.get("content") or "")]
+    fold_pop = _fold_rows(msgs, kept_rows)
+    assert stats.folded_tokens == _est(fold_pop)
+
+
+def test_build_inturn_stats_roleless_row_lands_in_other_succeeds():
+    # CHANGE-D (a-i): a roleless row goes to `other`, never estimated → split SUCCEEDS
+    from agent.compaction_stats import build_inturn_stats
+    msgs = [_toolmsg(0), {"content": "no role here"}, _chatmsg(0)]
+    kept = msgs[-1:]  # the chat row (member of msgs)
+    compressed = list(kept)
+    stats = build_inturn_stats(messages=msgs, compressed=compressed, estimator=_est)
+    ok, reason = stats.validate()
+    assert ok, reason
+    assert stats.folded_tool_count is not None  # populated, not degraded
+
+
+def test_build_inturn_stats_degrades_when_tool_estimate_raises():
+    # CHANGE-D (a-ii): estimator raises on the pure-tool sublist (inside _tool_other_split)
+    # → sub-split degrades to None, but the parent folded_tokens (mixed list) still computes.
+    from agent.compaction_stats import build_inturn_stats
+    t0 = {"role": "tool", "content": "tool a " * 50, "tool_call_id": "a"}
+    t1 = {"role": "tool", "content": "tool b " * 50, "tool_call_id": "b"}
+    c0, c1 = _chatmsg(0), _chatmsg(1)
+    msgs = [t0, t1, c0, c1]
+    def boom_est(rows):
+        # raise ONLY on a non-empty all-tool list (the sublist _tool_other_split builds)
+        if rows and all(m.get("role") == "tool" for m in rows):
+            raise ValueError("boom on pure-tool sublist")
+        return _est(rows)
+    kept = [c1]
+    compressed = list(kept)
+    stats = build_inturn_stats(messages=msgs, compressed=compressed, estimator=boom_est)
+    ok, reason = stats.validate()
+    assert ok, reason  # parent still reconciles
+    assert stats.folded_tool_count is None  # sub-split degraded
+
+
+def test_build_inturn_stats_subsplit_survives_fold_signature_fallback():
+    # CHANGE-E/C5: duplicate-signature rows force _fold_rows' Counter fallback;
+    # the helper must split the SAME post-fold list → still sums exactly.
+    from agent.compaction_stats import build_inturn_stats
+    dup = "TOOLRESULT " * 40
+    msgs = [{"role": "tool", "content": dup, "tool_call_id": f"t{i}"} for i in range(4)] + [_chatmsg(0)]
+    # kept = COPIES so id() match fails → signature fallback
+    kept = [{"role": "tool", "content": dup, "tool_call_id": "t0"}]
+    compressed = list(kept)
+    stats = build_inturn_stats(messages=msgs, compressed=compressed, estimator=_est)
+    ok, reason = stats.validate()
+    assert ok, reason
+    assert stats.folded_tool_count + stats.folded_other_count == stats.folded_count
