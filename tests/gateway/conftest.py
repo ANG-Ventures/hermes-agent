@@ -124,7 +124,7 @@ _GUARDED_SYS_MODULE_SLOTS = (
 # ``from gateway.platforms.telegram import X`` at their module top read X from the
 # ORIGINAL module __dict__, so the live dict is what must be reverted).
 _GUARDED_CONSUMER_BINDINGS = {
-    "gateway.platforms.telegram": ("ParseMode", "ChatType"),
+    "gateway.platforms.telegram": ("ParseMode",),
     "plugins.platforms.discord.adapter": ("discord",),
 }
 
@@ -232,19 +232,21 @@ def _normalize_poisoned_telegram_consumer_binding() -> None:
     parse_mode = getattr(consumer, "ParseMode", None)
     if parse_mode is None or not _parse_mode_is_poisoned(parse_mode):
         return
-    # Build a healthy ParseMode/ChatType whose members keep their name in repr.
+    # Build a healthy ParseMode whose members keep their name in repr. ONLY
+    # ParseMode is normalized — ChatType is NOT touched: ChatType carries
+    # meaningful string values (PRIVATE="private", GROUP="group", …) that tests
+    # compare against (chat_type == "group"), so replacing it with a generic
+    # MagicMock whose members return arbitrary mocks would BREAK those tests. The
+    # poison only ever affects ParseMode (the plain-string MARKDOWN_V2), so the
+    # repair is scoped to it.
     healthy_parse_mode = MagicMock(name="ParseMode")
-    healthy_chat_type = MagicMock(name="ChatType")
     consumer.ParseMode = healthy_parse_mode
-    if hasattr(consumer, "ChatType"):
-        consumer.ChatType = healthy_chat_type
-    # Keep the sys.modules telegram.constants slot consistent so a later
-    # consumer re-import also sees a healthy binding.
+    # Keep the sys.modules telegram.constants slot's ParseMode consistent so a
+    # later consumer re-import also sees a healthy binding.
     constants = sys.modules.get("telegram.constants")
     if constants is not None:
         try:
             constants.ParseMode = healthy_parse_mode
-            constants.ChatType = healthy_chat_type
         except Exception:
             pass
 
