@@ -1,0 +1,3 @@
+# A4 DRILL — DO NOT MERGE. Fake credential to trip secret_scan.
+aws_access_key_id = AKIAZ7QODRILLA4B3WD
+aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYzZ8aQwA4drl
