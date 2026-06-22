@@ -141,7 +141,7 @@ def backfill_db(path: str, *, apply: bool, rate_drift_bound: float = DEFAULT_RAT
         routes = audit_routes([path])
     stats = {
         "total_rows": 0, "repriced": 0, "skipped_status": 0,
-        "skipped_route": 0, "skipped_guardrail": 0, "skipped_no_tokens": 0,
+        "skipped_route": 0, "skipped_guardrail": 0,
     }
     if apply:
         backup = f"{path}.bak-perclass-{int(time.time())}"

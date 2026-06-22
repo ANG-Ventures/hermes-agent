@@ -85,7 +85,9 @@ def compute_turn_cost(
         known_total += Decimal(str(amount))
         known_count += 1
         known_statuses.append("estimated" if status == "actual" else status)
-        # accumulate the per-class parts (None on an included/zero result)
+        # accumulate the per-class parts (Decimal("0") for an included/zero-cost
+        # result; the `or Decimal("0")` guards the genuine None an unknown-route
+        # early-return would produce — those calls don't reach here anyway).
         acc_input += result.cost_input_usd or Decimal("0")
         acc_output += result.cost_output_usd or Decimal("0")
         acc_cache_read += result.cost_cache_read_usd or Decimal("0")
