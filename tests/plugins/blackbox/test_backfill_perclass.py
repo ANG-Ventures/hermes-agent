@@ -124,3 +124,28 @@ def test_backfill_db_dry_run_writes_nothing_then_apply(tmp_path):
     assert part["cost_uncached_usd"] is None
     assert stats["repriced"] == 1
     assert stats["skipped_status"] == 1
+
+
+def test_backfill_preserves_existing_cost_usd_and_scales_split(tmp_path):
+    """greptile #79: an already-priced row must NOT have its historical cost_usd
+    overwritten. The split is SCALED to the stored total (proportions preserved,
+    parts sum to the real billed amount), and cost_usd is left byte-identical."""
+    db = tmp_path / "t.db"
+    _seed_db(db, [
+        dict(turn_id="hist", model="claude-opus-4-8", provider="claude-api-proxy",
+             cost_status="estimated", cost_usd=50.00,  # historical billed total
+             input_tokens=0, output_tokens=130000, cache_read=109_700_000,
+             cache_write=646000, reasoning=0),
+    ])
+    # the fresh reprice of these tokens is ~$62; within a generous bound it must
+    # NOT overwrite the stored $50 — it scales the split to $50 instead.
+    bf.backfill_db(str(db), apply=True, rate_drift_bound=100.0)
+    conn = sqlite3.connect(str(db)); conn.row_factory = sqlite3.Row
+    r = conn.execute("SELECT * FROM turns WHERE turn_id='hist'").fetchone()
+    conn.close()
+    assert r["cost_usd"] == 50.00, "historical cost_usd must be preserved, not overwritten"
+    parts = (r["cost_uncached_usd"] + r["cost_cache_read_usd"]
+             + r["cost_cache_write_usd"] + r["cost_output_usd"])
+    assert abs(parts - 50.00) < 0.01, "scaled split must sum to the stored total"
+    # proportions preserved: cache-read dominates an Opus turn
+    assert r["cost_cache_read_usd"] > r["cost_output_usd"]

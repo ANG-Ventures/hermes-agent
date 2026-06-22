@@ -180,12 +180,28 @@ def backfill_db(path: str, *, apply: bool, rate_drift_bound: float = DEFAULT_RAT
             total, split = out
             stats["repriced"] += 1
             if apply:
+                # NEVER overwrite an existing historical cost_usd (greptile #79):
+                # the stored total was billed at record-time rates; the split was
+                # priced at current rates. For an already-priced row, keep the
+                # billed total and SCALE the split to it (single factor preserves
+                # each class's proportion exactly AND keeps parts summing to the
+                # real billed amount — INV-2). Only WRITE cost_usd when the row
+                # was never priced (original is None → first-time pricing).
+                orig = row["cost_usd"]
+                if orig is None:
+                    new_cost = total
+                    s = split
+                else:
+                    new_cost = orig
+                    factor = (float(orig) / total) if total else 0.0
+                    s = {k: (v * factor if v is not None else None)
+                         for k, v in split.items()}
                 conn.execute(
                     """UPDATE turns SET cost_usd=?, cost_uncached_usd=?,
                        cost_cache_read_usd=?, cost_cache_write_usd=?,
                        cost_output_usd=? WHERE turn_id=?""",
-                    (total, split["uncached"], split["cache_read"],
-                     split["cache_write"], split["output"], row["turn_id"]))
+                    (new_cost, s["uncached"], s["cache_read"],
+                     s["cache_write"], s["output"], row["turn_id"]))
         if apply:
             conn.commit()
     finally:
