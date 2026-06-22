@@ -143,7 +143,21 @@ def _restore_mock_module_slots_after_test(_hermetic_environment):
     Only reverts state that actually CHANGED during the test (identity compare),
     so the steady-state shared mocks the suite relies on are untouched on the
     overwhelming majority of tests that don't mutate these slots.
+
+    **Setup-time normalization (the collection-time-poison case):** some leaker
+    files install a plain-STRING ParseMode mock (``ParseMode.MARKDOWN_V2 =
+    "MarkdownV2"``) at *module import / collection* time — BEFORE any test setup
+    runs — via ``setdefault`` (so they win the slot only when it's empty). A
+    snapshot-then-restore can't fix that: by this test's setup the consumer is
+    ALREADY poisoned, so the snapshot captures the poison. So at setup we also
+    *detect the poison signature* (consumer ``ParseMode.MARKDOWN_V2`` is a plain
+    ``str`` whose repr lost the ``MARKDOWN_V2`` member name) and re-bind the
+    consumer's ``ParseMode``/``ChatType`` to the canonical conftest telegram mock,
+    so every test starts from a good binding regardless of collection order. (The
+    canonical mock's members are MagicMock attributes whose repr DOES carry the
+    member name — what the real ``StringEnum`` and the telegram tests rely on.)
     """
+    _normalize_poisoned_telegram_consumer_binding()
     sentinel = object()
     slot_snapshot = {name: sys.modules.get(name, sentinel) for name in _GUARDED_SYS_MODULE_SLOTS}
     binding_snapshot = {}
@@ -179,6 +193,60 @@ def _restore_mock_module_slots_after_test(_hermetic_environment):
                             pass
                 else:
                     setattr(mod, attr, prior)
+
+
+def _parse_mode_is_poisoned(parse_mode) -> bool:
+    """True when a ParseMode object is the leaked plain-string poison.
+
+    The poison signature: ``MARKDOWN_V2`` is a plain ``str`` (``"MarkdownV2"``)
+    whose repr LOST the member name. A real ``StringEnum`` member and the gateway
+    test env's ``MagicMock`` member both keep ``MARKDOWN_V2`` in their repr — only
+    the leaked plain string does not. (Asserting on repr, not ``==``: ParseMode is
+    a ``str`` subclass so ``MARKDOWN_V2 == "MarkdownV2"`` is True for BOTH the real
+    enum and the poison — a ``==`` check can't tell them apart.)
+    """
+    member = getattr(parse_mode, "MARKDOWN_V2", None)
+    return isinstance(member, str) and "MARKDOWN_V2" not in repr(member)
+
+
+def _normalize_poisoned_telegram_consumer_binding() -> None:
+    """If the telegram consumer's ParseMode is the leaked plain string, re-bind it.
+
+    Corrects a collection-time poison (a leaker file that installed a plain-string
+    ParseMode mock via ``setdefault`` before any test setup ran) so each test
+    starts from a good binding. No-op when the binding is already healthy or the
+    real telegram library is installed.
+
+    The healthy replacement is a ``MagicMock`` ParseMode whose members keep their
+    name in ``repr`` (``<MagicMock name='...ParseMode.MARKDOWN_V2'>``) — matching
+    what the real ``StringEnum`` member and the normal gateway-test mock provide,
+    and what the telegram tests assert via ``"MARKDOWN_V2" in repr(parse_mode)``.
+    """
+    consumer = sys.modules.get("gateway.platforms.telegram")
+    if consumer is None:
+        return
+    # If the real telegram library is installed, never touch the binding.
+    tg = sys.modules.get("telegram")
+    if tg is not None and hasattr(tg, "__file__"):
+        return
+    parse_mode = getattr(consumer, "ParseMode", None)
+    if parse_mode is None or not _parse_mode_is_poisoned(parse_mode):
+        return
+    # Build a healthy ParseMode/ChatType whose members keep their name in repr.
+    healthy_parse_mode = MagicMock(name="ParseMode")
+    healthy_chat_type = MagicMock(name="ChatType")
+    consumer.ParseMode = healthy_parse_mode
+    if hasattr(consumer, "ChatType"):
+        consumer.ChatType = healthy_chat_type
+    # Keep the sys.modules telegram.constants slot consistent so a later
+    # consumer re-import also sees a healthy binding.
+    constants = sys.modules.get("telegram.constants")
+    if constants is not None:
+        try:
+            constants.ParseMode = healthy_parse_mode
+            constants.ChatType = healthy_chat_type
+        except Exception:
+            pass
 
 
 def _ensure_telegram_mock() -> None:
