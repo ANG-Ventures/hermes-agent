@@ -53,11 +53,16 @@ class CompactionStats:
     anchor_tokens: int
     cleared_tokens: int
     folded_tokens: int
-    # ── optional sub-split of `cleared` (only when Phase-0 attribution is clean) ──
+    # ── optional sub-split of `cleared` (only when attribution is clean) ──
     cleared_tool_count: Optional[int] = None
     cleared_tool_tokens: Optional[int] = None
     cleared_other_count: Optional[int] = None
     cleared_other_tokens: Optional[int] = None
+    # ── optional sub-split of `folded` (in-turn path; only when attribution is clean) ──
+    folded_tool_count: Optional[int] = None
+    folded_tool_tokens: Optional[int] = None
+    folded_other_count: Optional[int] = None
+    folded_other_tokens: Optional[int] = None
 
     # NOTE: deliberately NO validation in __post_init__ (keeps any raise off the
     # hot path; callers invoke validate()/assert_reconciles() explicitly).
@@ -142,13 +147,35 @@ class CompactionStats:
                 f"- summary {self.summary_tokens} - anchor {self.anchor_tokens} "
                 f"= {freed_check} != freed {self.freed_tokens} (tol {_FREED_TOL})"
             )
-        # ── optional sub-split must sum to cleared ──
+        # ── optional sub-split of `cleared` must sum to cleared (count + tokens) ──
+        # tokens are EXACT: other_tokens is derived as (cleared_tokens - tool_tokens)
+        # by the producer (D-7), so any drift here is a real producer bug, not rounding.
         if self.cleared_tool_count is not None or self.cleared_other_count is not None:
             t = self.cleared_tool_count or 0
             o = self.cleared_other_count or 0
             if t + o != self.cleared_count:
                 return False, (
-                    f"sub-split: tool {t} + other {o} != cleared {self.cleared_count}"
+                    f"cleared sub-split: tool {t} + other {o} != cleared {self.cleared_count}"
+                )
+            tt = self.cleared_tool_tokens or 0
+            ot = self.cleared_other_tokens or 0
+            if tt + ot != self.cleared_tokens:
+                return False, (
+                    f"cleared sub-split tokens: {tt}+{ot} != cleared {self.cleared_tokens}"
+                )
+        # ── optional sub-split of `folded` must sum to folded (count + tokens, EXACT) ──
+        if self.folded_tool_count is not None or self.folded_other_count is not None:
+            t = self.folded_tool_count or 0
+            o = self.folded_other_count or 0
+            if t + o != self.folded_count:
+                return False, (
+                    f"folded sub-split: tool {t} + other {o} != folded {self.folded_count}"
+                )
+            tt = self.folded_tool_tokens or 0
+            ot = self.folded_other_tokens or 0
+            if tt + ot != self.folded_tokens:
+                return False, (
+                    f"folded sub-split tokens: {tt}+{ot} != folded {self.folded_tokens}"
                 )
         return True, ""
 

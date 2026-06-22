@@ -319,3 +319,58 @@ def test_signature_fallback_handles_identical_long_prefixes():
     assert stats.eligible_count == len(eligible)
     assert stats.kept_messages == 2
     assert stats.folded_count == len(eligible) - 2
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — folded sub-split fields + validation (tool-result sub-split spec)
+# ---------------------------------------------------------------------------
+
+def test_folded_subsplit_ok():
+    """A folded sub-split whose counts AND tokens partition the folded bucket reconciles."""
+    ok, reason = _stats(
+        folded_tool_count=250, folded_other_count=50,            # 300 == folded_count
+        folded_tool_tokens=120000, folded_other_tokens=19294,    # == folded_tokens 139294
+    ).validate()
+    assert ok, reason
+
+
+def test_folded_subsplit_count_must_sum():
+    ok, reason = _stats(
+        folded_tool_count=250, folded_other_count=40,            # 290 != 300
+        folded_tool_tokens=120000, folded_other_tokens=19294,
+    ).validate()
+    assert not ok and "folded sub-split" in reason
+
+
+def test_folded_subsplit_tokens_must_sum_exactly():
+    # exact tie-out (derive-by-subtraction) — even +1 off must fail
+    ok, reason = _stats(
+        folded_tool_count=250, folded_other_count=50,
+        folded_tool_tokens=120000, folded_other_tokens=19295,    # 139295 != 139294
+    ).validate()
+    assert not ok and "folded sub-split tokens" in reason
+
+
+def test_folded_subsplit_never_raises_on_bad_data():
+    # validate() is non-raising at runtime — a broken sub-split returns (False, …)
+    s = _stats(folded_tool_count=999, folded_other_count=0,
+               folded_tool_tokens=1, folded_other_tokens=1)
+    ok, reason = s.validate()
+    assert ok is False and isinstance(reason, str)
+
+
+def test_cleared_subsplit_tokens_must_sum_exactly():
+    # the cleared sub-split gains the token-axis check it was missing (CHANGE-2)
+    ok, reason = _stats(
+        cleared_tool_count=356, cleared_other_count=60,          # 416 == cleared_count
+        cleared_tool_tokens=200000, cleared_other_tokens=47263,  # 247263 != 247262
+    ).validate()
+    assert not ok and "cleared sub-split tokens" in reason
+
+
+def test_cleared_subsplit_tokens_ok_exact():
+    ok, reason = _stats(
+        cleared_tool_count=356, cleared_other_count=60,
+        cleared_tool_tokens=200000, cleared_other_tokens=47262,  # == cleared_tokens
+    ).validate()
+    assert ok, reason
