@@ -180,9 +180,14 @@ def _has_messaging_origin() -> bool:
             return True
         # Subagent send-origin (routing-only contextvars). Wrapped so an
         # import/lookup failure fails toward home, never an in-turn error.
+        # Require BOTH platform AND chat_id so this stays consistent with
+        # _interactive_origin (which needs both) — otherwise a platform-only
+        # send-origin would flip this True while _interactive_origin returns
+        # None, surfacing a hard error instead of falling closed to home.
         try:
             from gateway.session_context import get_send_origin
-            if get_send_origin()[0]:
+            so_platform, so_chat, _so_thread = get_send_origin()
+            if so_platform and so_chat:
                 return True
         except Exception:
             pass

@@ -330,3 +330,20 @@ def test_bind_helper_none_when_no_parent_origin(_clean_env):
     from tools.delegate_tool import _bind_child_send_origin
     child = SimpleNamespace(_blackbox_parent_platform="", _blackbox_parent_chat_id="")
     assert _bind_child_send_origin(child) is None
+
+
+def test_platform_only_send_origin_falls_to_home_not_error(_clean_env):
+    """Greptile P2: a send-origin with platform but EMPTY chat_id must fall
+    closed to home (NOT_IN_TURN), not surface a hard IN_TURN_UNRESOLVABLE error.
+    _has_messaging_origin must require BOTH platform and chat to match
+    _interactive_origin's contract."""
+    from tools.send_message_tool import _SEND_TARGET_NOT_IN_TURN
+    tokens = set_send_origin("discord", "")  # platform set, chat empty
+    try:
+        assert _has_messaging_origin() is False, \
+            "platform-only send-origin must not flag a messaging origin"
+        state, _c, _t = _resolve_send_target("discord")
+        assert state == _SEND_TARGET_NOT_IN_TURN, \
+            "must fall closed to home, not IN_TURN_UNRESOLVABLE error"
+    finally:
+        clear_send_origin(tokens)
