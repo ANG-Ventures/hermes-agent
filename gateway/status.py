@@ -555,6 +555,13 @@ def write_runtime_status(
     payload["pid"] = current_record["pid"]
     payload["argv"] = current_record["argv"]
     payload["start_time"] = current_record["start_time"]
+    # boot_id MUST be refreshed on every write, not seeded once: gateway_state.json
+    # survives across reboots (never unlinked at startup), so without this the
+    # prior boot's boot_id would persist while pid updates to the new process —
+    # making the F2 restart-initiator breadcrumb's boot check always mismatch
+    # (feature silently inert after restart #1). The gateway is the SINGLE
+    # producer of boot_id; safe-restart.py copies this string verbatim.
+    payload["boot_id"] = current_record["boot_id"]
     payload["updated_at"] = _utc_now_iso()
 
     if gateway_state is not _UNSET:

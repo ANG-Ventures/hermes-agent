@@ -4902,7 +4902,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return False
         stored_key = data.get("session_key")
-        # I-8: the stored key must hash to this filename (anti-forgery).
+        # I-8 (integrity, not authZ — the security boundary is the 0700 dir owner):
+        # the breadcrumb's stored key must equal the session we're consuming for.
+        # On this direct-lookup path `path.name == filename(session_key)` by
+        # construction, so `stored_key == session_key` is the load-bearing check;
+        # the filename-hash equality is the same invariant the sweep relies on
+        # when it trusts a filename from iterdir(), kept here as a cheap assert.
         if stored_key != session_key or _restart_initiated_filename(
             stored_key or ""
         ) != path.name:
@@ -4911,7 +4916,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return False
         boot_id = data.get("boot_id")
-        if boot_id != self._current_boot_id():
+        current_boot = self._current_boot_id()
+        # MAJOR-1 fail-safe: a degraded boot_id (no create_time component, e.g.
+        # "1234:") cannot prove same-boot — pids are reused across reboots, so a
+        # bare-pid match would honor a cross-boot crumb. If EITHER side is
+        # degraded, refuse the authoritative signal (fall back to C1/F1).
+        if current_boot.endswith(":") or not isinstance(boot_id, str) or boot_id.endswith(":"):
+            logger.info(
+                "F2 breadcrumb for %s discarded (degraded/unknown boot_id: %r vs %r)",
+                session_key, boot_id, current_boot,
+            )
+            return False
+        if boot_id != current_boot:
             logger.info(
                 "F2 breadcrumb for %s discarded (wrong boot: %r != current)",
                 session_key,

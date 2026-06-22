@@ -767,12 +767,57 @@ def test_finally_consume_present_in_handler():
     )
 
 
+def _seed_gateway_state_via_real_producer(tmp_path, monkeypatch, *, stale_first=False):
+    """Write gateway_state.json via the REAL producer (write_runtime_status),
+    NOT by hand — so the test exercises the actual code path the script depends
+    on (BLOCKER-2: hand-seeding masks the stale-boot_id bug). HERMES_HOME is
+    pointed at tmp_path so the status file lands where the script reads it.
+
+    When stale_first=True, first drop a prior-boot status file on disk (with a
+    DIFFERENT boot_id) to simulate the file surviving a reboot, then call the
+    real producer — proving the producer REFRESHES boot_id rather than leaving
+    the stale value.
+    """
+    import gateway.status as status
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # status.py resolves the status path from get_hermes_home(); make sure it
+    # points at tmp_path for this call.
+    monkeypatch.setattr(status, "get_hermes_home", lambda: tmp_path, raising=False)
+    state_path = tmp_path / "gateway_state.json"
+    if stale_first:
+        state_path.write_text(json.dumps({
+            "pid": 999999, "boot_id": "999999:1.0", "gateway_state": "running",
+        }), encoding="utf-8")
+    status.write_runtime_status(gateway_state="running")
+    return state_path
+
+
+def test_real_producer_refreshes_boot_id_across_restart(tmp_path, monkeypatch):
+    """BLOCKER-1/2 regression: write_runtime_status MUST refresh boot_id on every
+    write. gateway_state.json survives reboots, so a stale prior-boot file must
+    not leave its old boot_id behind (which would make every breadcrumb mismatch
+    → feature inert after restart #1). RED against the pre-fix producer."""
+    import gateway.status as status
+
+    state_path = _seed_gateway_state_via_real_producer(
+        tmp_path, monkeypatch, stale_first=True
+    )
+    persisted = json.loads(state_path.read_text())["boot_id"]
+    # The producer must have overwritten the stale "999999:1.0" with THIS boot.
+    assert persisted == status.get_current_boot_id()
+    assert persisted != "999999:1.0"
+    # and it carries a real create_time component (not pid-only)
+    assert not persisted.endswith(":")
+
+
 def test_roundtrip_real_script_writes_breadcrumb_gate_marks(tmp_path, monkeypatch):
     """E2E no-mock seam (the load-bearing alias/wrapper-robustness proof): run the
-    REAL safe-restart.py as a subprocess (--no-spawn) — the gateway never sees its
-    command line — so the ONLY signal is the breadcrumb file it drops. Then the
-    real gateway gate consumes it and records a mark. Detection works without the
-    command string → robust to alias/wrapper/rename (the whole point)."""
+    REAL safe-restart.py as a subprocess — the gateway never sees its command
+    line — so the ONLY signal is the breadcrumb file it drops. gateway_state.json
+    is produced by the REAL write_runtime_status (not hand-seeded), so the
+    script reads the boot_id the real producer persists. Then the real gateway
+    gate consumes it and records a mark."""
     import subprocess
     import sys
 
@@ -786,34 +831,36 @@ def test_roundtrip_real_script_writes_breadcrumb_gate_marks(tmp_path, monkeypatc
     monkeypatch.setenv("HERMES_RESTART_LOOP_THRESHOLD", "3")
     runner, _adapter = _runner(tmp_path, monkeypatch)
     sk = _entry(runner, "rt").session_key
-
-    # The gateway's boot_id must be persisted where the script reads it.
-    state = {"pid": _os.getpid(), "boot_id": runner._current_boot_id(),
-             "gateway_state": "running"}
-    (tmp_path / "gateway_state.json").write_text(json.dumps(state), encoding="utf-8")
+    # REAL producer writes gateway_state.json (incl. boot_id) at tmp_path —
+    # stale_first=True simulates the file surviving a reboot (the NORMAL steady
+    # state), so this test exercises the exact stale-boot_id path BLOCKER-1 fixed.
+    _seed_gateway_state_via_real_producer(tmp_path, monkeypatch, stale_first=True)
 
     env = dict(_os.environ)
     env["HERMES_HOME"] = str(tmp_path)
     r = subprocess.run(
-        [sys.executable, script, "--no-spawn", "--session-key", sk,
-         "--session-id", "sidrt", "--chat", "123", "--platform", "telegram",
-         "--handoff", "roundtrip"],
+        [sys.executable, script, "--no-spawn", "--write-breadcrumb",
+         "--session-key", sk, "--session-id", "sidrt", "--chat", "123",
+         "--platform", "telegram", "--handoff", "roundtrip"],
         capture_output=True, text=True, env=env,
     )
     assert r.returncode == 0, r.stderr
     assert json.loads(r.stdout)["breadcrumb_written"] is True
 
-    # The gateway gate (different "process" conceptually) now consumes it.
+    # The gateway gate now consumes it — boot_id read from the REAL producer's
+    # file must match the gate's _current_boot_id() (this is the seam that was
+    # broken before BLOCKER-1's fix).
     runner._resumed_this_boot.add(sk)
     runner._apply_post_turn_resume_gate(sk)
     counts = runner._load_restart_failure_counts().get(sk, {})
     assert len(counts.get("replay_marks", [])) == 1
 
 
-def test_roundtrip_script_boot_id_matches_gateway(tmp_path, monkeypatch):
-    """Pass-2 B-1/I-9: the script copies the gateway's boot_id STRING verbatim
-    (single producer). The breadcrumb the real script writes carries exactly the
-    gateway's _current_boot_id() — no second parser, no drift."""
+def test_roundtrip_script_boot_id_matches_real_producer(tmp_path, monkeypatch):
+    """Pass-2 B-1/I-9 via the REAL producer: the breadcrumb the script writes
+    carries exactly the boot_id write_runtime_status persisted — single producer,
+    verbatim copy, no second parser. (Replaces the prior hand-seeded version that
+    masked BLOCKER-1.)"""
     import subprocess
     import sys
 
@@ -824,24 +871,25 @@ def test_roundtrip_script_boot_id_matches_gateway(tmp_path, monkeypatch):
     if not _os.path.exists(script):
         pytest.skip("safe-restart.py skill script not present")
 
+    import gateway.status as status
     runner, _adapter = _runner(tmp_path, monkeypatch)
     sk = _entry(runner, "rtboot").session_key
-    gw_boot = runner._current_boot_id()
-    state = {"pid": _os.getpid(), "boot_id": gw_boot, "gateway_state": "running"}
-    (tmp_path / "gateway_state.json").write_text(json.dumps(state), encoding="utf-8")
+    _seed_gateway_state_via_real_producer(tmp_path, monkeypatch, stale_first=True)
+    expected_boot = status.get_current_boot_id()
 
     env = dict(_os.environ)
     env["HERMES_HOME"] = str(tmp_path)
     subprocess.run(
-        [sys.executable, script, "--no-spawn", "--session-key", sk,
-         "--session-id", "s", "--chat", "1", "--platform", "telegram",
-         "--handoff", "x"],
+        [sys.executable, script, "--no-spawn", "--write-breadcrumb",
+         "--session-key", sk, "--session-id", "s", "--chat", "1",
+         "--platform", "telegram", "--handoff", "x"],
         capture_output=True, text=True, env=env, check=True,
     )
     crumb = json.loads(
         (tmp_path / ".restart_initiated" / _restart_initiated_filename(sk)).read_text()
     )
-    assert crumb["boot_id"] == gw_boot  # verbatim copy, byte-equal
+    assert crumb["boot_id"] == expected_boot  # verbatim copy of the producer's id
+    assert crumb["boot_id"] != "999999:1.0"   # not the stale prior-boot value
 
 
 def test_roundtrip_script_dead_pid_writes_no_breadcrumb(tmp_path, monkeypatch):
@@ -866,11 +914,56 @@ def test_roundtrip_script_dead_pid_writes_no_breadcrumb(tmp_path, monkeypatch):
     env = dict(_os.environ)
     env["HERMES_HOME"] = str(tmp_path)
     r = subprocess.run(
-        [sys.executable, script, "--no-spawn", "--session-key", sk,
-         "--session-id", "s", "--chat", "1", "--platform", "telegram",
-         "--handoff", "x"],
+        [sys.executable, script, "--no-spawn", "--write-breadcrumb",
+         "--session-key", sk, "--session-id", "s", "--chat", "1",
+         "--platform", "telegram", "--handoff", "x"],
         capture_output=True, text=True, env=env,
     )
     assert r.returncode == 0
     assert json.loads(r.stdout)["breadcrumb_written"] is False
     assert not (tmp_path / ".restart_initiated" / _restart_initiated_filename(sk)).exists()
+
+
+def test_no_spawn_without_write_flag_plants_no_breadcrumb(tmp_path, monkeypatch):
+    """MINOR-2: a diagnostic --no-spawn (without --write-breadcrumb) must NOT
+    drop a real breadcrumb — else a diagnostic run under a live gateway plants a
+    crumb the session's next turn consumes as a restart-initiator mark."""
+    import subprocess
+    import sys
+
+    script = (
+        "/Users/alexgierczyk/.hermes/skills-shared/general/"
+        "safe-gateway-restart/scripts/safe-restart.py"
+    )
+    if not _os.path.exists(script):
+        pytest.skip("safe-restart.py skill script not present")
+
+    runner, _adapter = _runner(tmp_path, monkeypatch)
+    sk = _entry(runner, "nodiag").session_key
+    _seed_gateway_state_via_real_producer(tmp_path, monkeypatch)
+
+    env = dict(_os.environ)
+    env["HERMES_HOME"] = str(tmp_path)
+    r = subprocess.run(
+        [sys.executable, script, "--no-spawn",  # NO --write-breadcrumb
+         "--session-key", sk, "--session-id", "s", "--chat", "1",
+         "--platform", "telegram", "--handoff", "x"],
+        capture_output=True, text=True, env=env,
+    )
+    assert r.returncode == 0
+    assert json.loads(r.stdout)["breadcrumb_written"] is False
+    assert not (tmp_path / ".restart_initiated" / _restart_initiated_filename(sk)).exists()
+
+
+def test_degraded_current_boot_id_rejects_breadcrumb(tmp_path, monkeypatch):
+    """MAJOR-1: if the gateway's _current_boot_id() is degraded (pid-only, no
+    create_time — psutil failure), the consume side must REJECT every breadcrumb
+    (can't prove same-boot → fall back to C1/F1) rather than honor a pid-only
+    match (pid reuse across reboots)."""
+    runner, _adapter = _runner(tmp_path, monkeypatch)
+    sk = _entry(runner, "degraded").session_key
+    # force a degraded current boot id
+    monkeypatch.setattr(runner, "_current_boot_id", lambda: f"{_os.getpid()}:")
+    # write a crumb whose stored boot_id is ALSO pid-only for the same pid
+    _write_breadcrumb(runner, sk, boot_id=f"{_os.getpid()}:")
+    assert runner._consume_restart_initiated_breadcrumb(sk) is False
