@@ -29,13 +29,27 @@ def _is_cron_session() -> bool:
 
     Lazy import of ``gateway.session_context.is_cron_session`` to avoid a
     circular import at module load (``gateway`` pulls in modules that import
-    ``tools.approval``). Falls back to the raw env read if the import fails so
-    cron gating is never silently lost.
+    ``tools.approval``).
+
+    The ``except`` fallback (raw ``os.environ`` read) is a best-effort backstop
+    for standalone-CLI / test callers that still set ``HERMES_CRON_SESSION`` in
+    the environment. NOTE: it is NOT a reliable backstop for in-process gateway
+    cron — ``run_job`` no longer writes ``os.environ`` (the marker is a
+    ContextVar now), so if the import itself failed inside a cron job the env
+    read would return False and the caller would auto-approve. That import
+    failure is effectively impossible (``gateway.session_context`` only imports
+    ``contextvars``/``typing`` at module load and is already imported live), so
+    this path is defensive only; we log it loudly rather than fail silently.
     """
     try:
         from gateway.session_context import is_cron_session
         return is_cron_session()
     except Exception:
+        logger.error(
+            "is_cron_session import failed in approval gate; falling back to "
+            "raw env read (NOT a reliable cron backstop post-ContextVar migration)",
+            exc_info=True,
+        )
         return env_var_enabled("HERMES_CRON_SESSION")
 
 # Freeze YOLO mode at module import time. Reading os.environ on every call

@@ -52,6 +52,22 @@ class TestCronSessionContextVar:
         sc.clear_cron_session(None)
         assert sc.is_cron_session() is False
 
+    def test_clear_with_bad_token_restores_env_fallback(self):
+        # Greptile P2: if reset(token) raises (cross-context token), the
+        # fallback must restore _UNSET (not "") so get_session_env still falls
+        # through to os.environ — otherwise I5 back-compat is silently defeated.
+        sc.set_cron_session()  # bind it (we will clear with a bogus token)
+        os.environ["HERMES_CRON_SESSION"] = "1"
+        # A token from a different ContextVar instance forces reset() to raise.
+        import contextvars
+        bogus = contextvars.ContextVar("bogus", default="").set("x")
+        sc.clear_cron_session(bogus)
+        # After the except path, the ContextVar is _UNSET, so the os.environ
+        # value is honored again (fallback works).
+        assert sc.is_cron_session() is True
+        os.environ.pop("HERMES_CRON_SESSION")
+        assert sc.is_cron_session() is False
+
     def test_nestable_reset_restores_prior(self):
         outer = sc.set_cron_session()
         try:

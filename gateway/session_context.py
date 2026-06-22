@@ -300,9 +300,11 @@ def clear_cron_session(token) -> None:
         _CRON_SESSION.reset(token)
     except Exception:
         # Token from a different context (shouldn't happen — same-thread
-        # set+clear). Fall back to clearing to empty so we never leave a stale
-        # cron marker bound.
-        _CRON_SESSION.set("")
+        # set+clear). Restore the _UNSET sentinel (NOT "") so get_session_env
+        # still falls through to os.environ — setting "" would pin the
+        # ContextVar to a non-_UNSET value and silently defeat the I5
+        # os.environ back-compat fallback for CLI/standalone/test callers.
+        _CRON_SESSION.set(_UNSET)
 
 
 def is_cron_session() -> bool:
