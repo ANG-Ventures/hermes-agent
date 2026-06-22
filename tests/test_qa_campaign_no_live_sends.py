@@ -12,8 +12,6 @@ that the harness neutralizes.
 """
 import os
 
-import pytest
-
 
 # the credential env vars a real Discord/Telegram/webhook send needs
 _SEND_CREDENTIAL_VARS = [
@@ -47,12 +45,8 @@ def test_hermes_home_is_redirected_off_the_real_one():
 
 def test_deliberate_discord_send_fails_closed_without_token():
     """A deliberate 'would-spam' Discord send must fail closed (no token) rather
-    than reach the live channel. We assert the credential is absent, which is the
-    mechanism that makes the real adapter's send raise/return-error instead of
-    delivering."""
+    than reach the live channel. The credential being absent is the mechanism that
+    makes the real adapter's send raise/return-error instead of delivering."""
     assert not os.environ.get("DISCORD_BOT_TOKEN"), (
         "DISCORD_BOT_TOKEN present under test — a send would actually deliver"
     )
-    # And a constructed adapter with no token cannot authenticate a send.
-    token = os.environ.get("DISCORD_BOT_TOKEN", "")
-    assert token == "", "no usable Discord credential → send is impossible"

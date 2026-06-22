@@ -6,7 +6,9 @@ many open files`` masquerading as thousands of unrelated errors. ``conftest.py``
 ``pytest_configure`` raises the soft limit at session start. This guard proves the
 limit was actually raised, so the fix can't silently regress.
 """
-import resource
+import pytest
+
+resource = pytest.importorskip("resource")  # POSIX-only; skip the module on Windows
 
 
 def test_soft_fd_limit_raised_for_single_process_runs():
