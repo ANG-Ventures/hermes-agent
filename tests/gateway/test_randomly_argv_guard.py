@@ -82,5 +82,7 @@ def test_hermes_cli_main_no_systemexit_after_sanitize(monkeypatch):
 
     from hermes_cli.main import _apply_profile_override
 
-    _apply_profile_override()  # must not raise SystemExit
-    _restore_sanitized_argv()
+    try:
+        _apply_profile_override()  # must not raise SystemExit
+    finally:
+        _restore_sanitized_argv()  # always restore, even if the call raised

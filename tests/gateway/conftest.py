@@ -438,8 +438,10 @@ def pytest_configure(config):
     # parses ``randomly`` as a Hermes profile, fails to resolve it, and calls
     # ``sys.exit(1)`` — killing whichever test triggers the first ``hermes_cli.main``
     # import during a ``-p randomly`` run (a seed-dependent victim, a constant cause).
-    # We strip ONLY pytest-randomly's own tokens so any deferred CLI-module import
-    # sees a clean argv. Restored at session end (see _restore_sanitized_argv).
+    # Because the collision is GENERAL to pytest's ``-p <plugin>`` flag (not specific to
+    # randomly), we BLANKET-reduce argv to ``[argv0]`` rather than maintain an incomplete
+    # token allowlist; gateway tests never read the process argv. Restored at session end
+    # (see _restore_sanitized_argv / pytest_unconfigure).
     _sanitize_pytest_randomly_argv(config)
 
     # Only run on the xdist controller (or in non-xdist runs). Skip on
