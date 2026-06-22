@@ -190,6 +190,22 @@ class CompactionStats:
 _LCM_SUMMARY_RE = None  # lazy-compiled below
 
 
+def hygiene_eligible_msgs(history: List[dict]) -> List[dict]:
+    """The session-hygiene eligible filter: user/assistant rows WITH content.
+
+    This is the SINGLE source of truth for which transcript rows the hygiene
+    compressor operates on (tool / system / contentless-assistant rows are
+    removed). The gateway hygiene block and the reconciliation replay probe both
+    call this so the filter can never drift between production and verification.
+    Returns shallow `{role, content}` dicts, matching the gateway's snapshot.
+    """
+    return [
+        {"role": m.get("role"), "content": m.get("content")}
+        for m in (history or [])
+        if m.get("role") in {"user", "assistant"} and m.get("content")
+    ]
+
+
 def _is_summary_message(content: str) -> bool:
     global _LCM_SUMMARY_RE
     if _LCM_SUMMARY_RE is None:

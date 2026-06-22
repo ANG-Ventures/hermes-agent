@@ -9262,12 +9262,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
                         )
                         if _hyg_runtime.get("api_key"):
-                            _hyg_msgs = [
-                                {"role": m.get("role"), "content": m.get("content")}
-                                for m in history
-                                if m.get("role") in {"user", "assistant"}
-                                and m.get("content")
-                            ]
+                            from agent.compaction_stats import hygiene_eligible_msgs
+                            _hyg_msgs = hygiene_eligible_msgs(history)
 
                             if len(_hyg_msgs) >= 4:
                                 # Which valve tripped (for the announce reason).
