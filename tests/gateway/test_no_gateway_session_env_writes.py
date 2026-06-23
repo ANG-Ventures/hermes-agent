@@ -31,15 +31,18 @@ _ALLOWED_PREFIXES = (
     "tests/",
 )
 
-# Specific allowlisted lines: the except-fallback in agent init/compression
-# (only fires if the import of set_current_session_id fails; set_current_session_id
-# is itself gateway-aware) — documented in the PRD. Plus session_context.py
-# itself, which owns the ONE sanctioned gateway-AWARE setter (its os.environ
-# write is guarded by `if _HERMES_GATEWAY != "1"` — the CLI/cron/worker fallback).
-_ALLOWED_FILES_FOR_FALLBACK = (
+# The ONLY sanctioned per-session os.environ writes are:
+#   (a) the gated write in set_current_session_id — guarded by a
+#       `if ... _HERMES_GATEWAY ... != "1"` check on a nearby preceding line, and
+#   (b) the import-`except` fallbacks in agent init/compression — which only
+#       fire if importing the (gateway-aware) set_current_session_id fails.
+# We allowlist these PER-LINE (not per-file) so a future *ungated* write in any
+# of these files — e.g. someone removing the `not _HERMES_GATEWAY` guard — is
+# still caught (Greptile P2).
+_GATEWAY_GUARD_RE = re.compile(r"_HERMES_GATEWAY")
+_IMPORT_FALLBACK_FILES = (
     "agent/agent_init.py",
     "agent/conversation_compression.py",
-    "gateway/session_context.py",
 )
 
 _WRITE_RE = re.compile(
@@ -49,6 +52,24 @@ _WRITE_RE = re.compile(
 
 def _is_allowed(rel: str) -> bool:
     return any(rel == p or rel.startswith(p) for p in _ALLOWED_PREFIXES)
+
+
+def _write_is_sanctioned(lines: list, idx: int, rel: str) -> bool:
+    """A per-session os.environ write at 0-based line ``idx`` is sanctioned iff:
+      (a) it is guarded by an ``_HERMES_GATEWAY`` check within the preceding 3
+          lines (the gateway-aware setter), OR
+      (b) it sits inside an ``except`` block in the import-fallback files.
+    """
+    window = "\n".join(lines[max(0, idx - 3): idx + 1])
+    if _GATEWAY_GUARD_RE.search(window):
+        return True
+    if rel in _IMPORT_FALLBACK_FILES:
+        # Allow only when an `except` appears in the preceding few lines (the
+        # import-failure fallback), not an arbitrary unguarded write.
+        preceding = "\n".join(lines[max(0, idx - 4): idx])
+        if re.search(r"^\s*except\b", preceding, re.MULTILINE):
+            return True
+    return False
 
 
 def test_no_gateway_session_env_writes():
@@ -61,14 +82,15 @@ def test_no_gateway_session_env_writes():
             text = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
+        lines = text.split("\n")
         for m in _WRITE_RE.finditer(text):
             line_no = text[: m.start()].count("\n") + 1
-            # Allow the documented except-fallback lines in agent init/compression.
-            if rel in _ALLOWED_FILES_FOR_FALLBACK:
+            if _write_is_sanctioned(lines, line_no - 1, rel):
                 continue
             violations.append(f"{rel}:{line_no}: {m.group(0)}")
     assert not violations, (
         "Gateway-reachable per-session os.environ write(s) found (v3-latch bug "
         "class). Use the per-turn contextvar (set_session_vars/set_cron_session), "
-        "not process-global os.environ:\n  " + "\n  ".join(violations)
+        "or guard the write with `if ... _HERMES_GATEWAY ... != '1'` if it is a "
+        "genuine CLI/cron/worker fallback:\n  " + "\n  ".join(violations)
     )
