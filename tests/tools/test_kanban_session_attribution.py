@@ -22,10 +22,12 @@ import tools.kanban_tools as kt
 def _clean(monkeypatch):
     for k in ("HERMES_SESSION_ID", "HERMES_KANBAN_TASK", "_HERMES_GATEWAY"):
         monkeypatch.delenv(k, raising=False)
-    # Reset the session-id contextvar to its UNSET default so an earlier test's
-    # set/clear can't leave a "" that defeats the os.environ fallback.
+    # Reset the session-id contextvar to its UNSET default before AND after each
+    # test, so neither an earlier test's "" nor this test's bindings leak across
+    # the file boundary into other suites (e.g. test_kanban_tools).
     sc._SESSION_ID.set(sc._UNSET)
     yield
+    sc._SESSION_ID.set(sc._UNSET)
 
 
 class TestCurrentSessionIdResolution:
@@ -50,6 +52,20 @@ class TestCurrentSessionIdResolution:
 
     def test_none_when_neither_set(self):
         assert kt._current_session_id() is None
+
+    def test_empty_contextvar_falls_through_to_os_environ(self, monkeypatch):
+        """ACP regression: a caller binds the session_id contextvar to "" (e.g.
+        set_session_vars(session_key=session_id) leaves session_id="") while
+        writing the real id to os.environ. A "" contextvar is NOT _UNSET, so it
+        must NOT shadow the os.environ value — _current_session_id falls through.
+        """
+        monkeypatch.setenv("HERMES_SESSION_ID", "acp-sess-abc")
+        tokens = sc.set_session_vars(session_key="acp-sess-abc")  # session_id -> ""
+        try:
+            assert sc.get_session_env("HERMES_SESSION_ID") == ""  # the trap
+            assert kt._current_session_id() == "acp-sess-abc"  # fell through
+        finally:
+            sc.clear_session_vars(tokens)
 
 
 class TestStampWorkerSessionMetadata:
