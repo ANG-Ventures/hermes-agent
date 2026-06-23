@@ -1267,15 +1267,56 @@ def test_both_kept_populations_measured_independently():
 
 
 def test_kept_messages_display_unchanged():
-    """§0.11 audit: the announce renders kept_messages (a COUNT), unaffected by the
-    kept_tokens pre→comp flip."""
+    """The announce renders kept_messages (a COUNT). Post-message-axis-fix it is the
+    COMP-side count (what's actually in live context), so the granular announce shows
+    the real kept-tail size — never the pre-side 0 that the sanitized-tail bug produced."""
     from agent.compaction_stats import build_hygiene_stats
     pre, comp = _hyg_sanitized_tail()
     stats = build_hygiene_stats(raw_history=pre, eligible_msgs=pre, compressed=comp,
                                 estimator=_est, engine_is_lcm=True)
-    # kept_messages = pre-side kept rows that survived (count), still 0 here since
-    # the comp tail didn't sig-match — the announce shows that count, unchanged.
-    assert isinstance(stats.kept_messages, int)
+    # comp kept tail = 2 sanitized rows → kept_messages == 2 (truth in context),
+    # while the pre-side kept count is 0 (sanitized rows don't signature-match raw).
+    assert stats.kept_messages == 2, "display count must be the comp-side kept tail"
+    assert stats._kept_pre_messages == 0, "pre-side kept is 0 here (sanitized tail)"
+    assert stats.kept_messages != stats._kept_pre_messages, "this fixture must diverge"
+
+
+def test_message_axis_two_populations_measured_independently():
+    """CI-caught regression (PR #101): the message axis has the SAME two-population
+    split as the token axis. kept_messages must be the COMP-side count (display +
+    POST identity); kept_pre_messages the PRE-side count (PRE/eligible identities).
+    Corrupt each independently → the matching identity fails. Guards against a future
+    collapse back to one field (which rendered 'kept 0 recent chat' on live sessions)."""
+    from agent.compaction_stats import build_hygiene_stats
+    import dataclasses
+    pre, comp = _hyg_sanitized_tail()
+    stats = build_hygiene_stats(raw_history=pre, eligible_msgs=pre, compressed=comp,
+                                estimator=_est, engine_is_lcm=True)
+    ok, why = stats.validate()
+    assert ok, f"sanitized-tail message axis must reconcile after the fix: {why}"
+    # post_messages is MEASURED (len(comp)), not the tautological kept+summary+anchor
+    assert stats.post_messages == len(comp)
+    # corrupt comp-side kept count → POST message identity fails
+    bad_post = dataclasses.replace(stats, kept_messages=stats.kept_messages + 3)
+    assert not bad_post.validate()[0], "corrupting comp-side kept_messages must fail POST"
+    # corrupt pre-side kept count → PRE/eligible message identity fails
+    bad_pre = dataclasses.replace(stats, kept_pre_messages=(stats._kept_pre_messages) + 3)
+    assert not bad_pre.validate()[0], "corrupting pre-side kept_pre_messages must fail PRE"
+
+
+def test_inturn_kept_pre_messages_defaults_to_comp_side():
+    """In-turn path doesn't set kept_pre_messages → it defaults to comp-side
+    kept_messages, so the in-turn (already-correct) reconcile is unchanged."""
+    from agent.compaction_stats import build_inturn_stats
+    anchor = {"role": "system", "content": "SYS " * 50}
+    summary = {"role": "assistant", "content": "[Recent Summary (d0, node 1)] x", "_lcm_summary": True}
+    body = [_blockmsg("assistant", f"chat {i}") for i in range(10)]
+    msgs = [anchor] + body
+    compressed = [anchor, summary] + msgs[-3:]
+    stats = build_inturn_stats(messages=msgs, compressed=compressed, estimator=_est)
+    assert stats.validate()[0]
+    assert stats.kept_pre_messages is None  # not set → property falls back to kept_messages
+    assert stats._kept_pre_messages == stats.kept_messages
 
 
 def test_inturn_kept_pre_defaults_to_comp_side():

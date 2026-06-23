@@ -77,9 +77,29 @@ class CompactionStats:
     # `kept_tokens` for the in-turn path + legacy callers, where the kept rows ARE
     # comp-side so the two are equal by construction.
     kept_pre_tokens: Optional[int] = None
+    # ── PRE-side kept MESSAGE COUNT (hygiene path) — distinct from comp-side `kept_messages` ──
+    # The SAME two-population split as `kept_pre_tokens`, on the message axis:
+    #   * `kept_messages`     = COUNT of the comp-side kept tail (what's actually in
+    #     live context now) → the POST identity + the user-facing "kept N recent chat".
+    #   * `kept_pre_messages` = COUNT of pre-side kept rows (raw rows that survived) →
+    #     the PRE / eligible identities (cleared + folded + kept_pre == pre).
+    # When LCM sanitizes the kept tail, a comp kept row no longer signature-matches its
+    # raw original, so the pre-side partition finds ZERO matches while the comp tail is
+    # full — the message-axis form of the 2026-06-22 divergence. Measuring `kept_messages`
+    # pre-side made the granular announce render "kept 0 recent chat" (post_messages was
+    # also computed tautologically as kept_pre + summary + anchor, so it under-counted in
+    # lockstep and never tripped validate()). DEFAULT None → falls back to `kept_messages`
+    # for the in-turn path + legacy/direct-construction callers (kept is comp-side there).
+    kept_pre_messages: Optional[int] = None
 
     # NOTE: deliberately NO validation in __post_init__ (keeps any raise off the
     # hot path; callers invoke validate()/assert_reconciles() explicitly).
+
+    @property
+    def _kept_pre_messages(self) -> int:
+        """PRE-identity kept message count; defaults to comp-side ``kept_messages``
+        when a caller (in-turn path / legacy) didn't supply a distinct pre-side value."""
+        return self.kept_messages if self.kept_pre_messages is None else self.kept_pre_messages
 
     @property
     def _kept_pre_tokens(self) -> int:
@@ -100,19 +120,25 @@ class CompactionStats:
     def validate(self) -> Tuple[bool, str]:
         """Return ``(ok, reason)``. Never raises. ``reason`` empty when ok."""
         # ── message axis: EXACT ──
-        if self.cleared_count + self.folded_count + self.kept_messages != self.pre_messages:
+        # PRE / eligible identities use the PRE-side kept count (raw rows that
+        # survived); the POST identity uses the comp-side kept count (the actual
+        # kept tail in `compressed`). The two diverge on the hygiene path when LCM
+        # sanitizes the kept tail (a comp row no longer signature-matches its raw
+        # original) — the message-axis twin of the kept_pre_tokens split. On the
+        # in-turn/legacy path the two are equal by construction (kept is comp-side).
+        if self.cleared_count + self.folded_count + self._kept_pre_messages != self.pre_messages:
             return False, (
                 f"msg axis: cleared {self.cleared_count} + folded {self.folded_count} "
-                f"+ kept {self.kept_messages} != pre {self.pre_messages}"
+                f"+ kept {self._kept_pre_messages} != pre {self.pre_messages}"
             )
         if self.cleared_count != self.pre_messages - self.eligible_count:
             return False, (
                 f"eligible: cleared {self.cleared_count} != pre {self.pre_messages} "
                 f"- eligible {self.eligible_count}"
             )
-        if self.kept_messages + self.folded_count != self.eligible_count:
+        if self._kept_pre_messages + self.folded_count != self.eligible_count:
             return False, (
-                f"eligible: kept {self.kept_messages} + folded {self.folded_count} "
+                f"eligible: kept {self._kept_pre_messages} + folded {self.folded_count} "
                 f"!= eligible {self.eligible_count}"
             )
         if self.post_messages != self.kept_messages + self.summary_messages + self.anchor_messages:
@@ -127,10 +153,10 @@ class CompactionStats:
                     f"zero-fold: folded==0 requires summary_messages==0 and "
                     f"summary_tokens==0 (got {self.summary_messages}/{self.summary_tokens})"
                 )
-            if self.kept_messages != self.eligible_count:
+            if self._kept_pre_messages != self.eligible_count:
                 return False, (
                     f"zero-fold: folded==0 requires kept==eligible "
-                    f"({self.kept_messages} != {self.eligible_count})"
+                    f"({self._kept_pre_messages} != {self.eligible_count})"
                 )
         # ── token axis: ±tolerance ──
         if self.pre_tokens <= 0:
@@ -456,12 +482,19 @@ def build_hygiene_stats(
             cleared_rows.append(m)
 
     pre_messages = len(pre_msgs)
-    kept_messages = len(kept_rows)
+    # Two kept populations on the message axis (twin of the kept_pre_tokens split):
+    #   kept_messages     = COUNT of the comp-side kept tail (truth in live context).
+    #   kept_pre_messages = COUNT of pre-side kept rows (raw rows that survived).
+    # They diverge when LCM sanitizes the kept tail (pre-side finds no signature
+    # match). post_messages is MEASURED as len(comp) — NOT kept+summary+anchor, which
+    # would be tautological with validate()'s POST identity and hide a partition bug.
+    kept_pre_messages = len(kept_rows)
+    kept_messages = len(kept_compressed_rows)
     folded_count = len(folded_rows)
     cleared_count = len(cleared_rows)
     summary_messages = len(summary_rows)
     anchor_messages = len(anchor_rows)
-    post_messages = kept_messages + summary_messages + anchor_messages
+    post_messages = len(comp)
 
     cleared_tokens = int(estimator(cleared_rows)) if cleared_rows else 0
     # Optional tool/other sub-split of the cleared population (derive-by-subtraction,
@@ -475,17 +508,18 @@ def build_hygiene_stats(
     return CompactionStats(
         pre_messages=pre_messages,
         post_messages=post_messages,
-        # eligible_count must satisfy validate()'s two coupled identities:
-        #   cleared == pre - eligible   AND   kept + folded == eligible.
-        # Under the identity partition `cleared + folded + kept == pre`, BOTH hold
-        # iff `eligible == kept + folded` (every retained row — folded into the
+        # eligible_count must satisfy validate()'s two coupled PRE-axis identities:
+        #   cleared == pre - eligible   AND   kept_pre + folded == eligible.
+        # Under the identity partition `cleared + folded + kept_pre == pre`, BOTH hold
+        # iff `eligible == kept_pre + folded` (every retained row — folded into the
         # summary OR kept verbatim — is on the "eligible/retained" side; `cleared`
-        # is exactly what was removed). This generalises the old `kept ⊆ eligible`
-        # case (where kept+folded did equal the filtered eligible set) to the LCM
-        # case where the kept tail may include a tool/system row: it's still a
-        # retained row, so it belongs on the eligible side of the axis, not cleared.
-        eligible_count=kept_messages + folded_count,
+        # is exactly what was removed). Uses the PRE-side kept count (raw rows that
+        # survived): the eligible axis is about the raw transcript partition, not the
+        # post-sanitization comp tail. (kept_messages, the comp-side count, only
+        # carries the POST identity + the user-facing display.)
+        eligible_count=kept_pre_messages + folded_count,
         kept_messages=kept_messages,
+        kept_pre_messages=kept_pre_messages,
         summary_messages=summary_messages,
         anchor_messages=anchor_messages,
         cleared_count=cleared_count,
