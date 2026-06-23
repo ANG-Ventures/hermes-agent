@@ -1,6 +1,8 @@
 # PRD — Gateway session-state process-global `os.environ` leak (the v3-latch bug class, generalized)
 
-**Status:** v0.2 — Opus Pass-1 review complete; 3 BLOCKERS folded. The fix REFRAMED by the review: the root cause is **`_set_session_env` never binds the `HERMES_SESSION_ID` contextvar at all** (it passes `session_key` but omits `session_id`), so on a normal cached-agent gateway turn the SESSION_ID contextvar is `""` and only `os.environ` carries a (clobbered) value. The correct fix is to **bind `session_id` into the per-turn contextvar** (then the os.environ writes become droppable), not just to gate the writes. See Ground-Truth §0 + Resolved Decisions.
+**Status:** ✅ SHIPPED & CLOSED (2026-06-22) — built, Opus-reviewed (3 blockers + root-cause reframe folded), merged via fork PR #97 (`bd563daa1`), deployed + restarted + **live-verified**. Live e2e caught an ACP regression (empty session_id contextvar shadowed the os.environ fallback → ACP kanban stamping returned None), fixed in follow-up PR #98 (`_current_session_id` treats an empty contextvar as not-bound). The `terminal env|grep` diagnostic is honest again (shows the turn's own session, not a bleeding concurrent one); gateway os.environ no longer carries a clobbered per-session id. Closeout below.
+
+*(v0.2 history: Opus Pass-1 reframed the fix — root cause is **`_set_session_env` never binds the `HERMES_SESSION_ID` contextvar** (it passed `session_key` but omitted `session_id`), so on a normal cached-agent turn the SESSION_ID contextvar was `""` and only `os.environ` carried a clobbered value. The fix binds `session_id` per-turn, THEN drops/gates the os.environ writes. See Ground-Truth §0.)
 **Author:** Apollo
 **Date:** 2026-06-22
 **Related:** `PRD-send-message-origin-leak-v3-cron-session-latch.md` (v3 fixed ONE instance of this class — `HERMES_CRON_SESSION`). This PRD addresses the **remaining instances** + the **root-cause class** discovered during v3 closeout.
