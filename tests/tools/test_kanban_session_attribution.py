@@ -54,16 +54,31 @@ class TestCurrentSessionIdResolution:
         assert kt._current_session_id() is None
 
     def test_empty_contextvar_falls_through_to_os_environ(self, monkeypatch):
-        """ACP regression: a caller binds the session_id contextvar to "" (e.g.
-        set_session_vars(session_key=session_id) leaves session_id="") while
-        writing the real id to os.environ. A "" contextvar is NOT _UNSET, so it
-        must NOT shadow the os.environ value — _current_session_id falls through.
-        """
+        """ACP regression (OUTSIDE gateway): a caller binds the session_id
+        contextvar to "" (e.g. set_session_vars(session_key=session_id) leaves
+        session_id="") while writing the real id to os.environ. A "" contextvar
+        is NOT _UNSET, so it must NOT shadow the os.environ value —
+        _current_session_id falls through (not in the gateway)."""
+        monkeypatch.delenv("_HERMES_GATEWAY", raising=False)  # not the gateway
         monkeypatch.setenv("HERMES_SESSION_ID", "acp-sess-abc")
         tokens = sc.set_session_vars(session_key="acp-sess-abc")  # session_id -> ""
         try:
             assert sc.get_session_env("HERMES_SESSION_ID") == ""  # the trap
             assert kt._current_session_id() == "acp-sess-abc"  # fell through
+        finally:
+            sc.clear_session_vars(tokens)
+
+    def test_in_gateway_empty_contextvar_does_not_fall_through(self, monkeypatch):
+        """IN the gateway (Greptile P2): clear_session_vars sets "" to SUPPRESS
+        the os.environ fallback. A post-clear read must return None, NEVER a
+        stale/clobbered os.environ value — the per-turn contextvar is
+        authoritative there (mirrors set_current_session_id's _HERMES_GATEWAY
+        guard)."""
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        monkeypatch.setenv("HERMES_SESSION_ID", "STALE_OR_CLOBBERED")  # pre-seeded global
+        tokens = sc.set_session_vars(session_key="K")  # session_id -> "" (cleared)
+        try:
+            assert kt._current_session_id() is None  # NOT the stale global
         finally:
             sc.clear_session_vars(tokens)
 
