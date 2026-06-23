@@ -63,9 +63,29 @@ class CompactionStats:
     folded_tool_tokens: Optional[int] = None
     folded_other_count: Optional[int] = None
     folded_other_tokens: Optional[int] = None
+    # ── PRE-side kept tokens (hygiene path) — distinct from comp-side `kept_tokens` ──
+    # The hygiene path has TWO different "kept" populations that must NOT be conflated:
+    #   * `kept_tokens`     = estimator(comp-side kept tail)  → the POST identity
+    #     (kept + summary + anchor == post_tokens == estimator(comp)).
+    #   * `kept_pre_tokens` = estimator(pre-side kept rows)   → the PRE identity
+    #     (cleared + folded + kept_pre == pre_tokens).
+    # When LCM sanitizes the kept tail (cleans assistant content / strips tool
+    # scaffolding), a comp kept row no longer signature-matches its raw original,
+    # so the two populations diverge in TOKENS (live 2026-06-22 reconcile failures).
+    # Each is an INDEPENDENT estimator() call over its own disjoint rows (no
+    # back-derivation — the dead-guard trap). DEFAULT None → falls back to
+    # `kept_tokens` for the in-turn path + legacy callers, where the kept rows ARE
+    # comp-side so the two are equal by construction.
+    kept_pre_tokens: Optional[int] = None
 
     # NOTE: deliberately NO validation in __post_init__ (keeps any raise off the
     # hot path; callers invoke validate()/assert_reconciles() explicitly).
+
+    @property
+    def _kept_pre_tokens(self) -> int:
+        """PRE-identity kept tokens; defaults to comp-side ``kept_tokens`` when a
+        caller (in-turn path / legacy) didn't supply a distinct pre-side value."""
+        return self.kept_tokens if self.kept_pre_tokens is None else self.kept_pre_tokens
 
     @property
     def freed_tokens(self) -> int:
@@ -115,10 +135,10 @@ class CompactionStats:
         # ── token axis: ±tolerance ──
         if self.pre_tokens <= 0:
             return False, f"pre_tokens must be > 0 (got {self.pre_tokens})"
-        if abs((self.cleared_tokens + self.folded_tokens + self.kept_tokens) - self.pre_tokens) > _TOKEN_TOL:
+        if abs((self.cleared_tokens + self.folded_tokens + self._kept_pre_tokens) - self.pre_tokens) > _TOKEN_TOL:
             return False, (
                 f"token pre: cleared {self.cleared_tokens} + folded {self.folded_tokens} "
-                f"+ kept {self.kept_tokens} != pre {self.pre_tokens} (tol {_TOKEN_TOL})"
+                f"+ kept {self._kept_pre_tokens} != pre {self.pre_tokens} (tol {_TOKEN_TOL})"
             )
         if abs((self.kept_tokens + self.summary_tokens + self.anchor_tokens) - self.post_tokens) > _TOKEN_TOL:
             return False, (
@@ -126,24 +146,26 @@ class CompactionStats:
                 f"+ anchor {self.anchor_tokens} != post {self.post_tokens} (tol {_TOKEN_TOL})"
             )
         # freed identity with the anchor term (Pass-2 blocker fix):
-        # cleared + folded - summary - anchor == freed
-        # NOTE: this identity is the algebraic difference of the two axis checks
-        # above (pre = cleared+folded+kept ; post = kept+summary+anchor →
-        # pre-post = cleared+folded-summary-anchor). Each axis tolerates ±_TOKEN_TOL
-        # independently, so the compounded error here is bounded by 2×_TOKEN_TOL
-        # (worst case ε_pre=+tol, ε_post=-tol). Using a single _TOKEN_TOL here would
-        # spuriously fail — and silently degrade to the two-line form — on data that
-        # passed both axis checks. The estimator is exactly additive over disjoint
-        # subsets today (ε≈0), but widen the bound so a future rounding estimator
-        # can't trip this latent trap.
-        _FREED_TOL = 2 * _TOKEN_TOL
+        # freed = pre - post. With the two distinct kept populations (hygiene path),
+        #   pre  = cleared + folded + kept_pre        (pre-side kept)
+        #   post = kept_comp + summary + anchor       (comp-side kept)
+        # so freed = pre - post
+        #          = cleared + folded + kept_pre - kept_comp - summary - anchor.
+        # The (kept_pre - kept_comp) term is ZERO on the in-turn/legacy path (kept is
+        # comp-side there) but NON-ZERO on hygiene when LCM sanitized the kept tail —
+        # which is exactly the 2026-06-22 live bug. Include it so the freed identity is
+        # the true algebraic difference of the two axis checks, both measured
+        # independently (no back-derivation). Each axis tolerates ±_TOKEN_TOL, plus the
+        # kept-difference is two more independent estimator calls, so widen the bound.
+        _FREED_TOL = 3 * _TOKEN_TOL
         freed_check = (
-            self.cleared_tokens + self.folded_tokens
-            - self.summary_tokens - self.anchor_tokens
+            self.cleared_tokens + self.folded_tokens + self._kept_pre_tokens
+            - self.kept_tokens - self.summary_tokens - self.anchor_tokens
         )
         if abs(freed_check - self.freed_tokens) > _FREED_TOL:
             return False, (
                 f"freed: cleared {self.cleared_tokens} + folded {self.folded_tokens} "
+                f"+ kept_pre {self._kept_pre_tokens} - kept {self.kept_tokens} "
                 f"- summary {self.summary_tokens} - anchor {self.anchor_tokens} "
                 f"= {freed_check} != freed {self.freed_tokens} (tol {_FREED_TOL})"
             )
@@ -470,7 +492,11 @@ def build_hygiene_stats(
         folded_count=folded_count,
         pre_tokens=int(estimator(pre_msgs)),
         post_tokens=int(estimator(comp)),
-        kept_tokens=int(estimator(kept_rows)) if kept_rows else 0,
+        # POST identity: comp-side kept tail (the actual fresh tail in `compressed`).
+        kept_tokens=int(estimator(kept_compressed_rows)) if kept_compressed_rows else 0,
+        # PRE identity: pre-side kept rows (raw_history rows that survived). Distinct
+        # population — diverges from comp-side when LCM sanitized the kept tail.
+        kept_pre_tokens=int(estimator(kept_rows)) if kept_rows else 0,
         summary_tokens=int(estimator(summary_rows)) if summary_rows else 0,
         anchor_tokens=int(estimator(anchor_rows)) if anchor_rows else 0,
         cleared_tokens=cleared_tokens,
