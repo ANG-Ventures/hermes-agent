@@ -502,13 +502,11 @@ def _resume_reason_phrase(reason: Optional[str]) -> str:
     tests, so the wording has a single source of truth (no drift-prone mirror).
     An unrecognized/None reason falls back to the generic phrasing.
     """
-    _phrases: Dict[str, str] = {
+    _phrases: Dict[Optional[str], str] = {
         "restart_timeout": "a gateway restart",
         "shutdown_timeout": "a gateway shutdown",
         "reboot_interrupted": "a machine reboot",
     }
-    if reason is None:
-        return "a gateway interruption"
     return _phrases.get(reason, "a gateway interruption")
 
 
