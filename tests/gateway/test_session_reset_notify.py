@@ -15,6 +15,7 @@ from gateway.config import (
     Platform,
     SessionResetPolicy,
 )
+from gateway.run import _reset_reason_text, SESSION_RESET_NOTICE_SEND_FAILED
 from gateway.session import SessionEntry, SessionSource, SessionStore
 
 
@@ -280,3 +281,52 @@ class TestSessionEntryAutoResetRoundtrip:
         assert reloaded.was_auto_reset is False
         assert reloaded.auto_reset_reason is None
         assert reloaded.reset_had_activity is False
+
+
+# ---------------------------------------------------------------------------
+# _reset_reason_text — mode-correct notice wording (idle/daily/both/suspended)
+# ---------------------------------------------------------------------------
+
+class TestResetReasonText:
+    def test_idle_reason_72h(self):
+        policy = SessionResetPolicy(mode="idle", idle_minutes=4320, at_hour=4)
+        assert _reset_reason_text("idle", policy) == "inactive for 72h"
+
+    def test_idle_reason_hours_and_minutes(self):
+        policy = SessionResetPolicy(mode="idle", idle_minutes=90)
+        assert _reset_reason_text("idle", policy) == "inactive for 1h 30m"
+
+    def test_idle_reason_minutes_only(self):
+        policy = SessionResetPolicy(mode="idle", idle_minutes=30)
+        assert _reset_reason_text("idle", policy) == "inactive for 30m"
+
+    def test_daily_reason_uses_at_hour(self):
+        policy = SessionResetPolicy(mode="daily", at_hour=4)
+        assert _reset_reason_text("daily", policy) == "daily schedule at 4:00"
+
+    def test_suspended_reason(self):
+        policy = SessionResetPolicy()
+        assert _reset_reason_text("suspended", policy) == (
+            "previous session was stopped or interrupted"
+        )
+
+    def test_both_mode_resolves_to_concrete_reason(self):
+        """Under mode=both, _should_reset returns the concrete reason that
+        tripped (idle or daily), never 'both' — so the helper is correct for
+        both-mode without special-casing it."""
+        policy = SessionResetPolicy(mode="both", idle_minutes=4320, at_hour=4)
+        assert _reset_reason_text("idle", policy) == "inactive for 72h"
+        assert _reset_reason_text("daily", policy) == "daily schedule at 4:00"
+
+    def test_unknown_reason_is_neutral_no_raw_token(self):
+        """A future/unknown reason yields no clause (caller emits the neutral
+        'Session automatically reset.' form) and never echoes the raw token."""
+        policy = SessionResetPolicy()
+        result = _reset_reason_text("some_future_reason", policy)
+        assert result == ""
+        assert "some_future_reason" not in result
+        assert "inactive" not in result
+        assert "daily" not in result
+
+    def test_marker_constant_is_stable(self):
+        assert SESSION_RESET_NOTICE_SEND_FAILED == "SESSION_RESET_NOTICE_SEND_FAILED"
