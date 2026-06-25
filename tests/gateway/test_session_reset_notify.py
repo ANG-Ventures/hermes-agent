@@ -337,6 +337,85 @@ class TestResetReasonText:
 
 
 # ---------------------------------------------------------------------------
+# had_any_turn — durable activity flag survives compaction zeroing
+# (PR #104 Greptile P2: last_prompt_tokens is reset to 0 by the transcript-
+# compression path; a compressed-then-idle session must still notify.)
+# ---------------------------------------------------------------------------
+
+class TestHadAnyTurnDurableFlag:
+    def test_update_session_latches_flag_on_real_turn(self, tmp_path):
+        store = _make_store(SessionResetPolicy(mode="idle", idle_minutes=1), tmp_path)
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+        assert entry.had_any_turn is False
+        store.update_session(entry.session_key, last_prompt_tokens=42000)
+        assert store._entries[entry.session_key].had_any_turn is True
+
+    def test_compaction_zeroing_does_not_clear_flag(self, tmp_path):
+        """update_session(..., last_prompt_tokens=0) is how transcript
+        compression marks the value stale — it must NOT set OR clear the
+        durable flag."""
+        store = _make_store(SessionResetPolicy(mode="idle", idle_minutes=1), tmp_path)
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+        store.update_session(entry.session_key, last_prompt_tokens=42000)  # real turn
+        store.update_session(entry.session_key, last_prompt_tokens=0)       # compaction
+        live = store._entries[entry.session_key]
+        assert live.last_prompt_tokens == 0       # compaction zeroed it
+        assert live.had_any_turn is True          # but the durable flag survives
+
+    def test_zero_only_session_never_latches_flag(self, tmp_path):
+        """A session that only ever saw a 0 token-count (no real turn) must
+        not latch the flag — no false 'history cleared'."""
+        store = _make_store(SessionResetPolicy(mode="idle", idle_minutes=1), tmp_path)
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+        store.update_session(entry.session_key, last_prompt_tokens=0)
+        assert store._entries[entry.session_key].had_any_turn is False
+
+    def test_compressed_then_idle_session_still_flags_activity(self, tmp_path):
+        """The Greptile P2 case end-to-end: a session has a real turn, gets
+        compressed (last_prompt_tokens -> 0), then idles out. The reset MUST
+        still report had_activity via the durable flag."""
+        store = _make_store(SessionResetPolicy(mode="idle", idle_minutes=1), tmp_path)
+        source = _make_source()
+        entry1 = store.get_or_create_session(source)
+        store.update_session(entry1.session_key, last_prompt_tokens=42000)  # real turn
+        store.update_session(entry1.session_key, last_prompt_tokens=0)       # compaction
+        # Age it past the idle threshold.
+        store._entries[entry1.session_key].updated_at = datetime.now() - timedelta(minutes=5)
+        store._save()
+        entry2 = store.get_or_create_session(source)
+        assert entry2.was_auto_reset is True
+        assert entry2.reset_had_activity is True  # would be False under the old gate
+
+    def test_flag_survives_roundtrip(self, tmp_path):
+        store = _make_store(SessionResetPolicy(mode="idle", idle_minutes=1), tmp_path)
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+        store.update_session(entry.session_key, last_prompt_tokens=42000)
+        store._loaded = False
+        store._entries.clear()
+        store._ensure_loaded()
+        assert store._entries[entry.session_key].had_any_turn is True
+
+    def test_legacy_entry_without_flag_falls_back_to_last_prompt_tokens(self, tmp_path):
+        """Entries persisted before had_any_turn existed default the flag to
+        False but may carry a non-zero last_prompt_tokens — the gate's OR
+        fallback must still flag activity for them."""
+        store = _make_store(SessionResetPolicy(mode="idle", idle_minutes=1), tmp_path)
+        source = _make_source()
+        entry1 = store.get_or_create_session(source)
+        # Simulate a legacy row: token count set directly, flag never latched.
+        entry1.last_prompt_tokens = 5000
+        entry1.had_any_turn = False
+        entry1.updated_at = datetime.now() - timedelta(minutes=5)
+        store._save()
+        entry2 = store.get_or_create_session(source)
+        assert entry2.reset_had_activity is True
+
+
+# ---------------------------------------------------------------------------
 # AST invariant: the auto-reset NOTICE block wiring (gateway/run.py)
 #
 # The notice send lives deep in the 17k-line async message handler, so we pin
