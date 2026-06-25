@@ -535,3 +535,399 @@ def test_is_available_cloud_requires_api_key(monkeypatch, tmp_path):
     assert Mem0MemoryProvider().is_available() is False
     monkeypatch.setenv("MEM0_API_KEY", "cloud-key")
     assert Mem0MemoryProvider().is_available() is True
+
+
+# ===========================================================================
+# W2-PLUMB — param-drop client fix + call-site split (INV-8) + sibling audit.
+# THE BUG: _DirectRestMem0Client.search() built the POST body with only query +
+# scope and DISCARDED rerank/keyword_search/top_k — so rerank was a no-op on the
+# wire for months. These are behavior contracts (does the param reach the body /
+# the right call-site), not value snapshots.
+# ===========================================================================
+
+
+def _capturing_client(**overrides):
+    """A real _DirectRestMem0Client whose _request is stubbed to capture the call."""
+    from importlib import import_module
+    mod = import_module("plugins.memory.mem0")
+    kw = {"host": "http://mem0.test", "admin_api_key": "k",
+          "agent_id": "daedalus", "user_id": "ace"}
+    kw.update(overrides)
+    client = mod._DirectRestMem0Client(**kw)
+    sent = []
+
+    def _fake_request(method, path, *, body=None, params=None):
+        sent.append({"method": method, "path": path, "body": body, "params": params})
+        return {"results": []}
+
+    client._request = _fake_request
+    return client, sent
+
+
+# --- the load-bearing regression: search() PUTS the flags in the POST body -----
+
+def test_search_puts_retrieval_flags_in_post_body():
+    """REGRESSION for the param-drop bug. A search() with explicit rerank/keyword_search/
+    top_k/reference_date must place EACH in the POST body — not silently drop them."""
+    client, sent = _capturing_client()
+    client.search(query="q", rerank=True, keyword_search=True, top_k=7,
+                  reference_date="2026-06-01")
+    body = sent[-1]["body"]
+    assert sent[-1]["method"] == "POST" and sent[-1]["path"] == "/search"
+    assert body["query"] == "q"
+    assert body["rerank"] is True
+    assert body["keyword_search"] is True
+    assert body["top_k"] == 7
+    assert body["reference_date"] == "2026-06-01"
+    # scope still floored to user_id (read scope, no agent_id)
+    assert body["user_id"] == "ace"
+    assert "agent_id" not in body
+
+
+def test_search_omits_none_flags_so_server_resolves_its_default():
+    """INV-8(i)/INV-10: a None flag is OMITTED from the body so the server resolves it
+    from its settings default (ships OFF). Only query + scope when nothing is passed."""
+    client, sent = _capturing_client()
+    client.search(query="q")  # every flag defaults to None
+    body = sent[-1]["body"]
+    for flag in ("rerank", "keyword_search", "top_k", "reference_date"):
+        assert flag not in body, f"{flag}=None must be omitted, not sent"
+    assert set(body) == {"query", "user_id"}
+
+
+def test_search_partial_flags_only_sends_what_was_set():
+    """A caller that sets only rerank must send ONLY rerank — the others stay omitted
+    (server default), proving per-flag independence."""
+    client, sent = _capturing_client()
+    client.search(query="q", rerank=False, top_k=5)
+    body = sent[-1]["body"]
+    assert body["rerank"] is False          # explicit False is sent (not omitted)
+    assert body["top_k"] == 5
+    assert "keyword_search" not in body
+    assert "reference_date" not in body
+
+
+# --- sibling param-drop audit: the whole bug CLASS, one test per method ---------
+
+def test_sibling_audit_add_forwards_documented_params():
+    """add() must forward its documented params (metadata/infer/run_id) into the body —
+    not just user_id/agent_id scope."""
+    client, sent = _capturing_client()
+    client.add([{"role": "user", "content": "x"}],
+               metadata={"write_kind": "deliberate"}, infer=False, run_id="r1")
+    body = sent[-1]["body"]
+    assert sent[-1]["path"] == "/memories"
+    assert body["messages"] == [{"role": "user", "content": "x"}]
+    assert body["metadata"] == {"write_kind": "deliberate"}
+    assert body["infer"] is False
+    assert body["run_id"] == "r1"
+    assert body["user_id"] == "ace" and body["agent_id"] == "daedalus"
+
+
+def test_sibling_audit_get_all_forwards_filters_into_request():
+    """get_all() must forward its filters (scoped) into the request params."""
+    client, sent = _capturing_client()
+    client.get_all(filters={"agent_id": "explicit"})
+    params = sent[-1]["params"]
+    assert sent[-1]["method"] == "GET" and sent[-1]["path"] == "/memories"
+    assert params["agent_id"] == "explicit"   # explicit caller filter honored
+    assert params["user_id"] == "ace"         # user scope floored in
+
+
+def test_sibling_audit_update_forwards_text_and_metadata():
+    """update() must forward its documented text + metadata into the PUT body."""
+    client, sent = _capturing_client()
+    client.update("m-1", text="new text", metadata={"forgotten": True})
+    body = sent[-1]["body"]
+    assert sent[-1]["method"] == "PUT" and sent[-1]["path"] == "/memories/m-1"
+    assert body["text"] == "new text"
+    assert body["metadata"] == {"forgotten": True}
+
+
+# --- call-site split (INV-8(ii)): the two enumerated flag-passing call-sites ----
+
+class _SearchCapturingClient:
+    def __init__(self):
+        self.searches = []
+
+    def search(self, **kwargs):
+        self.searches.append(kwargs)
+        return {"results": []}
+
+    def get_all(self, **kwargs):
+        return {"results": []}
+
+
+def _provider_with(monkeypatch, tmp_path, client, *, rerank_cfg=None):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MEM0_HOST", "http://mem0.test")
+    monkeypatch.setenv("MEM0_ADMIN_API_KEY", "admin-key")
+    monkeypatch.setenv("MEM0_USER_ID", "ace")
+    monkeypatch.setenv("MEM0_AGENT_ID", "daedalus")
+    monkeypatch.delenv("MEM0_API_KEY", raising=False)
+    monkeypatch.delenv("MEM0_CAPTURE", raising=False)
+    if rerank_cfg is not None:
+        (tmp_path / "mem0.json").write_text(json.dumps({"rerank": rerank_cfg}))
+    provider = Mem0MemoryProvider()
+    provider.initialize("test-session")
+    monkeypatch.setattr(provider, "_get_client", lambda: client)
+    return provider
+
+
+def test_queue_prefetch_reranks_nl_but_not_exact_token(monkeypatch, tmp_path):
+    """INV-8(ii) + Ace 2026-06-24: the every-turn prefetch path NOW reranks (the
+    cross-encoder's semantic/temporal win rides prefetch, bounded by the 10s join
+    ceiling) — EXCEPT for exact-token lookups (IP/port/email/long-id), where the
+    cross-encoder regresses the exact match RRF already nails. top_k stays 5 (INV-3)."""
+    # normal NL query → rerank ON
+    client = _SearchCapturingClient()
+    provider = _provider_with(monkeypatch, tmp_path, client, rerank_cfg="true")
+    provider.queue_prefetch("what is my coffee preference")
+    provider._prefetch_thread.join(timeout=2)
+    assert len(client.searches) == 1
+    call = client.searches[0]
+    assert call["rerank"] is True           # rerank rides prefetch for NL queries
+    assert call["top_k"] == 5               # INV-3 payload-size cap unchanged
+
+    # exact-token query → rerank OFF (RRF owns it)
+    client2 = _SearchCapturingClient()
+    provider2 = _provider_with(monkeypatch, tmp_path, client2, rerank_cfg="true")
+    provider2.queue_prefetch("what runs on port 8443")
+    provider2._prefetch_thread.join(timeout=2)
+    assert client2.searches[0]["rerank"] is False   # exact-token gate
+
+    # rerank profile OFF → prefetch never reranks regardless of query
+    client3 = _SearchCapturingClient()
+    provider3 = _provider_with(monkeypatch, tmp_path, client3, rerank_cfg="false")
+    provider3.queue_prefetch("what is my coffee preference")
+    provider3._prefetch_thread.join(timeout=2)
+    assert client3.searches[0]["rerank"] is False
+
+
+def test_exact_token_query_detector_gates_rerank():
+    """W2-RERANK gate: the detector flags exact-identifier lookups (where the
+    cross-encoder regresses what RRF already nails) and passes NL queries through."""
+    from importlib import import_module
+    P = import_module("plugins.memory.mem0").Mem0MemoryProvider
+    for q in ["what runs on port 8443", "what is at 192.168.1.34",
+              "alex@angsciences.com", "what is commit 9315e3036f24",
+              "firmware xvf-3510-v4.2.1"]:
+        assert P._is_exact_token_query(q) is True, q
+    for q in ["what is my coffee preference", "what did I decide about the theater",
+              "who maintains the media stack", "", None]:
+        assert P._is_exact_token_query(q) is False, q
+
+
+def test_mem0_search_uses_configured_rerank_profile_by_default(monkeypatch, tmp_path):
+    """INV-8(ii): the deliberate tool path sends the RERANK profile. With no per-call
+    rerank arg it falls back to the configured profile (self._rerank), coerced from the
+    JSON-string config value."""
+    client = _SearchCapturingClient()
+    provider = _provider_with(monkeypatch, tmp_path, client, rerank_cfg="true")
+    provider.handle_tool_call("mem0_search", {"query": "needle"})
+    assert client.searches[-1]["rerank"] is True   # picked up the configured profile
+
+
+def test_mem0_search_per_call_rerank_overrides_profile(monkeypatch, tmp_path):
+    """The model may force rerank per-call, overriding the configured profile."""
+    client = _SearchCapturingClient()
+    provider = _provider_with(monkeypatch, tmp_path, client, rerank_cfg="true")
+    provider.handle_tool_call("mem0_search", {"query": "needle", "rerank": False})
+    assert client.searches[-1]["rerank"] is False
+
+
+# --- call-site lint (INV-8 / Pass-4 RC): keep the split true past today --------
+
+def test_call_site_lint_exactly_two_search_call_sites_pass_flags():
+    """Standing lint: EXACTLY two `client.search(...)` call-sites pass retrieval flags —
+    queue_prefetch (fast) and the mem0_search handler — and they are the ONLY ones. A
+    future third flag-passing call-site (silent re-divergence) fails this test."""
+    import ast
+    import inspect
+    from importlib import import_module
+    mod = import_module("plugins.memory.mem0")
+    source = inspect.getsource(mod)
+    tree = ast.parse(source)
+
+    RETRIEVAL_FLAGS = {"rerank", "keyword_search", "top_k", "reference_date"}
+
+    # Map every node to its enclosing FunctionDef chain so we can name the call-site.
+    parent_func = {}
+
+    def _annotate(node, chain):
+        for child in ast.iter_child_nodes(node):
+            new_chain = chain
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                new_chain = chain + [child.name]
+            parent_func[child] = chain
+            _annotate(child, new_chain)
+
+    _annotate(tree, [])
+
+    flag_call_sites = []  # (enclosing-chain, kwargs)
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "search"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "client"):
+            kwargs = {kw.arg for kw in node.keywords if kw.arg}
+            if kwargs & RETRIEVAL_FLAGS:
+                flag_call_sites.append((parent_func.get(node, []), kwargs))
+
+    # Exactly two flag-passing client.search call-sites.
+    assert len(flag_call_sites) == 2, (
+        f"expected exactly 2 flag-passing client.search call-sites (INV-8(ii)), "
+        f"found {len(flag_call_sites)}: {flag_call_sites}"
+    )
+    enclosing = ["::".join(chain) for chain, _ in flag_call_sites]
+    # One lives under queue_prefetch (the fast hot path), one under handle_tool_call
+    # (the mem0_search tool path). Both names must appear.
+    assert any("queue_prefetch" in e for e in enclosing), enclosing
+    assert any("handle_tool_call" in e for e in enclosing), enclosing
+
+
+# --- INV-3: no injected-payload-size / prefix delta ---------------------------
+
+def test_inv3_prefetch_caps_injected_lines_and_prefix_unchanged(monkeypatch, tmp_path):
+    """INV-3: the change alters request PARAMS only. The injected memory block's SIZE
+    (top-5 lines) and its prefix are unchanged — the prefetch still requests top_k=5 and
+    renders the same `## Mem0 Memory` / `- `-bulleted shape."""
+    captured = {}
+
+    class _Client:
+        def search(self, **kwargs):
+            captured.update(kwargs)
+            return {"results": [{"memory": f"fact {i}"} for i in range(10)]}
+
+    client = _Client()
+    provider = _provider_with(monkeypatch, tmp_path, client)
+    provider.queue_prefetch("q")
+    provider._prefetch_thread.join(timeout=2)
+    # payload-size cap: still top_k=5 (the server returns 5; format never grows the block)
+    assert captured["top_k"] == 5
+    injected = provider.prefetch("q")
+    assert injected.startswith("## Mem0 Memory\n")          # prefix byte-stable
+    body_lines = [ln for ln in injected.splitlines() if ln.startswith("- ")]
+    # The server already trims to top_k=5; the plugin renders the returned rows as-is.
+    assert all(ln.startswith("- ") for ln in body_lines)
+    assert "## Mem0 Memory" in injected
+
+
+# ===========================================================================
+# W3-TEMPORAL — tau_m created_at window (plugin-side parse + filter+boost).
+# Behavior contracts: window applied ONLY when the feature is on AND a temporal
+# expression parses; in-window rows boosted to the top (recency = boost, not a
+# hard filter); the prefetch hot path and non-temporal queries are untouched.
+# ===========================================================================
+
+
+def _temporal_provider(monkeypatch, tmp_path, client, **cfg):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MEM0_HOST", "http://mem0.test")
+    monkeypatch.setenv("MEM0_ADMIN_API_KEY", "admin-key")
+    monkeypatch.setenv("MEM0_USER_ID", "ace")
+    monkeypatch.setenv("MEM0_AGENT_ID", "daedalus")
+    monkeypatch.delenv("MEM0_API_KEY", raising=False)
+    monkeypatch.delenv("MEM0_CAPTURE", raising=False)
+    base = {"rerank": "false"}
+    base.update(cfg)
+    (tmp_path / "mem0.json").write_text(json.dumps(base))
+    provider = Mem0MemoryProvider()
+    provider.initialize("test-session")
+    monkeypatch.setattr(provider, "_get_client", lambda: client)
+    return provider
+
+
+class _DatedSearchClient:
+    """Returns a fixed candidate set with created_at, capturing the requested top_k."""
+    def __init__(self, results):
+        self._results = results
+        self.searches = []
+
+    def search(self, **kwargs):
+        self.searches.append(kwargs)
+        return {"results": list(self._results)}
+
+    def get_all(self, **kwargs):
+        return {"results": []}
+
+
+_FACTS = [
+    {"memory": "off-window A", "score": 0.9, "created_at": "2026-05-01T12:00:00+00:00"},
+    {"memory": "in-window on the 20th", "score": 0.4, "created_at": "2026-06-20T18:00:00+00:00"},
+    {"memory": "off-window B", "score": 0.8, "created_at": "2026-06-01T12:00:00+00:00"},
+]
+
+
+def test_temporal_off_by_default_no_window(monkeypatch, tmp_path):
+    """Feature ships OFF: even a clearly-temporal query gets the plain fetch (top_k as
+    requested, no boost re-rank, no over-fetch)."""
+    client = _DatedSearchClient(_FACTS)
+    provider = _temporal_provider(monkeypatch, tmp_path, client)  # temporal_search unset
+    assert provider._temporal_search is False
+    provider.handle_tool_call("mem0_search", {"query": "what did we do on June 20th", "top_k": 3})
+    assert client.searches[-1]["top_k"] == 3        # no over-fetch when off
+
+
+def test_temporal_on_overfetches_and_boosts_in_window_row(monkeypatch, tmp_path):
+    """Flag on + a temporal expression: over-fetch the deeper pool, then boost the
+    in-window row above higher-semantic-score out-of-window rows."""
+    client = _DatedSearchClient(_FACTS)
+    provider = _temporal_provider(monkeypatch, tmp_path, client,
+                                  temporal_search=True, temporal_overfetch=50)
+    out = provider.handle_tool_call("mem0_search", {"query": "what did we do on June 20th", "top_k": 2})
+    # over-fetched the deeper candidate pool
+    assert client.searches[-1]["top_k"] == 50
+    payload = json.loads(out)
+    memories = [r["memory"] for r in payload["results"]]
+    # the in-window 06-20 row is promoted to rank 0 despite a lower semantic score
+    assert memories[0] == "in-window on the 20th"
+    assert len(memories) == 2                        # trimmed back to top_k
+
+
+def test_temporal_on_but_no_expression_is_passthrough(monkeypatch, tmp_path):
+    """Flag on but NO temporal expression in the query → behaves exactly like off
+    (no over-fetch, original order preserved)."""
+    client = _DatedSearchClient(_FACTS)
+    provider = _temporal_provider(monkeypatch, tmp_path, client, temporal_search=True)
+    out = provider.handle_tool_call("mem0_search", {"query": "what is my postgres password", "top_k": 3})
+    assert client.searches[-1]["top_k"] == 3         # no over-fetch
+    memories = [r["memory"] for r in json.loads(out)["results"]]
+    assert memories[0] == "off-window A"             # original semantic order kept
+
+
+def test_temporal_boost_keeps_out_of_window_rows(monkeypatch, tmp_path):
+    """Recency is a BOOST not a hard filter: out-of-window rows are retained (not
+    dropped), they just rank below in-window rows."""
+    client = _DatedSearchClient(_FACTS)
+    provider = _temporal_provider(monkeypatch, tmp_path, client, temporal_search=True)
+    out = provider.handle_tool_call("mem0_search", {"query": "decisions on the 20th", "top_k": 5})
+    memories = [r["memory"] for r in json.loads(out)["results"]]
+    assert memories[0] == "in-window on the 20th"
+    assert set(memories[1:]) == {"off-window A", "off-window B"}   # both retained
+
+
+def test_temporal_does_not_touch_prefetch(monkeypatch, tmp_path):
+    """INV-3 / INV-8: temporal boost is mem0_search-only. The prefetch hot path still
+    requests top_k=5 (no over-fetch) even with the feature on and a temporal query."""
+    client = _DatedSearchClient(_FACTS)
+    provider = _temporal_provider(monkeypatch, tmp_path, client, temporal_search=True)
+    provider.queue_prefetch("what did we change on the 20th")
+    provider._prefetch_thread.join(timeout=2)
+    assert client.searches[-1]["top_k"] == 5         # prefetch untouched by temporal
+
+
+def test_temporal_parse_failure_is_non_fatal(monkeypatch, tmp_path):
+    """A parser exception must NOT break recall — the search proceeds windowless."""
+    import plugins.memory.mem0 as mod
+    client = _DatedSearchClient(_FACTS)
+    provider = _temporal_provider(monkeypatch, tmp_path, client, temporal_search=True)
+    monkeypatch.setattr(mod, "parse_temporal_window",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    out = provider.handle_tool_call("mem0_search", {"query": "on the 20th", "top_k": 3})
+    payload = json.loads(out)
+    assert payload["count"] == 3                      # recall still works
+    assert client.searches[-1]["top_k"] == 3         # fell back to plain fetch (no window)
+
+
