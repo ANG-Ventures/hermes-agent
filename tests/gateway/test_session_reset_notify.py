@@ -9,12 +9,16 @@ Verifies that:
 
 from datetime import datetime, timedelta
 
+import ast
+import inspect
+
 
 from gateway.config import (
     GatewayConfig,
     Platform,
     SessionResetPolicy,
 )
+from gateway import run as gateway_run
 from gateway.run import _reset_reason_text, SESSION_RESET_NOTICE_SEND_FAILED
 from gateway.session import SessionEntry, SessionSource, SessionStore
 
@@ -330,3 +334,109 @@ class TestResetReasonText:
 
     def test_marker_constant_is_stable(self):
         assert SESSION_RESET_NOTICE_SEND_FAILED == "SESSION_RESET_NOTICE_SEND_FAILED"
+
+
+# ---------------------------------------------------------------------------
+# AST invariant: the auto-reset NOTICE block wiring (gateway/run.py)
+#
+# The notice send lives deep in the 17k-line async message handler, so we pin
+# its load-bearing structure with an AST invariant (the established pattern —
+# see test_35809_auto_reset_clean_context.py) rather than driving the whole
+# handler. The behavioral correctness of the gate + wording is covered by the
+# real-SessionStore tests above and the _reset_reason_text unit tests.
+# ---------------------------------------------------------------------------
+
+def _find_auto_reset_notice_block() -> ast.If:
+    """Return the ``if getattr(session_entry, 'was_auto_reset', False):`` block."""
+    tree = ast.parse(inspect.getsource(gateway_run))
+    candidates = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        consts = {
+            n.value
+            for n in ast.walk(node.test)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)
+        }
+        if "was_auto_reset" in consts:
+            calls = {
+                sub.func.attr
+                for sub in ast.walk(node)
+                if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+            }
+            if "_reset_reason_text" in calls or "send" in calls:
+                candidates.append(node)
+    assert candidates, (
+        "Could not locate the auto-reset notice block "
+        "(if getattr(session_entry,'was_auto_reset',...) ... _reset_reason_text) "
+        "in gateway/run.py — the structure changed or the AST walker is stale."
+    )
+    # The outermost matching block.
+    return max(candidates, key=lambda n: len(list(ast.walk(n))))
+
+
+class TestAutoResetNoticeBlockWiring:
+    def test_block_uses_reset_reason_text_helper(self):
+        block = _find_auto_reset_notice_block()
+        attrs = {
+            sub.func.attr
+            for sub in ast.walk(block)
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+        }
+        names = {
+            sub.func.id
+            for sub in ast.walk(block)
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+        }
+        assert "_reset_reason_text" in names, (
+            "the auto-reset notice block must build its reason text via the "
+            "_reset_reason_text helper (mode-correct + testable)."
+        )
+        assert "send" in attrs, (
+            "the auto-reset notice block must adapter.send the notice."
+        )
+
+    def test_block_logs_warning_marker_on_send_failure(self):
+        """The lost-send path must reference the greppable WARNING marker, and
+        the marker must be logged at WARNING (not debug)."""
+        block = _find_auto_reset_notice_block()
+        marker_refs = [
+            n
+            for n in ast.walk(block)
+            if isinstance(n, ast.Name) and n.id == "SESSION_RESET_NOTICE_SEND_FAILED"
+        ]
+        assert marker_refs, (
+            "the auto-reset notice block must reference "
+            "SESSION_RESET_NOTICE_SEND_FAILED on the send-failure path so a "
+            "silently-broken adapter is greppable."
+        )
+        warning_calls = [
+            sub
+            for sub in ast.walk(block)
+            if isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Attribute)
+            and sub.func.attr == "warning"
+        ]
+        assert warning_calls, (
+            "the lost-send path must logger.warning(...), not logger.debug(...)."
+        )
+
+    def test_notice_is_out_of_band_no_history_mutation(self):
+        """Invariant I1/I2: the notice is sent via adapter.send only; it must
+        NOT be appended into model conversation history (prompt-cache &
+        role-alternation safety)."""
+        block = _find_auto_reset_notice_block()
+        bad_appends = [
+            sub
+            for sub in ast.walk(block)
+            if isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Attribute)
+            and sub.func.attr == "append"
+            and isinstance(sub.func.value, ast.Name)
+            and sub.func.value.id in {"messages", "history"}
+        ]
+        assert not bad_appends, (
+            "the auto-reset notice must be out-of-band (adapter.send), never "
+            "appended into messages/history — that would break prompt caching "
+            "and role alternation (Invariants I1/I2)."
+        )
