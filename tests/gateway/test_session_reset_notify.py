@@ -153,8 +153,11 @@ class TestSessionEntryReason:
         source = _make_source()
 
         entry1 = store.get_or_create_session(source)
-        # Simulate some conversation happened
-        entry1.total_tokens = 5000
+        # Simulate some conversation happened (last_prompt_tokens is the
+        # API-reported prompt-token count persisted every turn via
+        # update_session; total_tokens is never populated on SessionEntry —
+        # see gateway/slash_commands.py).
+        entry1.last_prompt_tokens = 5000
         entry1.updated_at = datetime.now() - timedelta(minutes=5)
         store._save()
 
@@ -245,7 +248,7 @@ class TestSessionEntryAutoResetRoundtrip:
         source = _make_source()
 
         entry = store.get_or_create_session(source)
-        entry.total_tokens = 1000
+        entry.last_prompt_tokens = 1000
         entry.updated_at = datetime.now() - timedelta(minutes=5)
         store._save()
 

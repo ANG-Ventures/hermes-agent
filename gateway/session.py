@@ -939,8 +939,15 @@ class SessionStore:
                     # Session is being auto-reset.
                     was_auto_reset = True
                     auto_reset_reason = reset_reason
-                    # Track whether the expired session had any real conversation
-                    reset_had_activity = entry.total_tokens > 0
+                    # Track whether the expired session had any real conversation.
+                    # last_prompt_tokens is the API-reported prompt-token count
+                    # persisted every turn (update_session); it is >0 iff at least
+                    # one real model turn completed in this session. SessionEntry.
+                    # total_tokens is never populated (token totals live in the
+                    # SessionDB — see gateway/slash_commands.py), so the old
+                    # `total_tokens > 0` gate was permanently False and the
+                    # user-facing reset notice never fired.
+                    reset_had_activity = entry.last_prompt_tokens > 0
                     db_end_session_id = entry.session_id
             else:
                 was_auto_reset = False
