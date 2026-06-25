@@ -59,8 +59,22 @@ _RE_MID_MONTH = re.compile(r"\bmid[-\s]+(" + _MONTH_ALT + r")\b", re.IGNORECASE)
 # "in June" / "during June" (whole month)
 _RE_IN_MONTH = re.compile(
     r"\b(?:in|during|throughout)\s+(" + _MONTH_ALT + r")\b", re.IGNORECASE)
-# bare "the 20th" / "on the 21st" (day-of-month, month inferred from reference)
-_RE_THE_NTH = re.compile(r"\b(?:on\s+)?the\s+(\d{1,2})(?:st|nd|rd|th)\b", re.IGNORECASE)
+# bare "the 20th" / "on the 21st" (day-of-month, month inferred from reference).
+# Negative lookahead guards against ordinal-as-rank phrasing ("the 3rd result",
+# "the 1st warning", "the 2nd item") — those are NOT day-of-month references and
+# would otherwise silently promote memories from that calendar day. The excluded
+# nouns are the common "Nth <thing>" enumerators; a real date use ("on the 21st",
+# "the 21st we shipped") doesn't put one of these immediately after the ordinal.
+_RE_THE_NTH = re.compile(
+    r"\b(?:on\s+)?the\s+(\d{1,2})(?:st|nd|rd|th)\b"
+    r"(?!\s+(?:result|item|one|time|place|step|warning|entry|entries|row|line|"
+    r"example|option|answer|attempt|try|version|part|point|section|paragraph|"
+    r"page|chapter|message|reply|replies|note|record|element|column|field|"
+    r"results|items|times|places|steps|warnings|rows|lines|options|answers|"
+    r"attempts|versions|parts|points|sections|paragraphs|pages|chapters|"
+    r"messages|notes|records|elements|columns|fields)\b)",
+    re.IGNORECASE,
+)
 # relative
 _RE_YESTERDAY = re.compile(r"\byesterday\b", re.IGNORECASE)
 _RE_TODAY = re.compile(r"\btoday\b", re.IGNORECASE)

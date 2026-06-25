@@ -593,10 +593,14 @@ class Mem0MemoryProvider(MemoryProvider):
         """Runtime kill-switch for rerank, the correctness canary's auto-revert surface
         (INV-8). Read FRESH from mem0.json each call (NOT cached at init) so the canary
         can flip `retrieval_kill.rerank: true` and have the live plugin honor it on the
-        very next turn — no gateway restart. Fail-open (a read error never forces rerank
-        off and never crashes recall)."""
+        very next turn — no gateway restart. Targeted read (just the one key) rather than
+        a full _load_config() env-default reconstruction, because this is on the per-turn
+        hot path (queue_prefetch + every mem0_search). Fail-open: a missing file / read /
+        parse error never forces rerank off and never crashes recall."""
         try:
-            kill = (_load_config().get("retrieval_kill") or {})
+            from hermes_constants import get_hermes_home
+            cfg_path = get_hermes_home() / "mem0.json"
+            kill = (json.loads(cfg_path.read_text(encoding="utf-8")).get("retrieval_kill") or {})
             return self._truthy(kill.get("rerank", False))
         except Exception:
             return False
@@ -646,6 +650,13 @@ class Mem0MemoryProvider(MemoryProvider):
             self._orig_lane = None
         self._agent_id = self._config.get("agent_id", "hermes")
         self._rerank = self._config.get("rerank", True)
+        # keyword_search: hybrid BM25+semantic toggle. Resolved here at init (config/env
+        # floor) and threaded to the client search call at BOTH enumerated call-sites so
+        # setting `keyword_search: true` in mem0.json actually reaches the wire (the
+        # param-drop fix listed it but initialize never read it -> it was a silent no-op).
+        # None/unset -> omitted from the body so the server resolves its own default
+        # (INV-8(i)).
+        self._keyword_search = self._config.get("keyword_search", None)
         # W3-TEMPORAL (tau_m created_at window) — plugin-side, config-gated, reversible
         # (INV-4). Off by default so deploy is inert until the flag flips. When on,
         # mem0_search detects a temporal expression, resolves it to a created_at
@@ -826,6 +837,7 @@ class Mem0MemoryProvider(MemoryProvider):
                     query=query,
                     filters=self._read_filters(),
                     rerank=_pf_rerank,
+                    keyword_search=self._keyword_search,
                     top_k=5,
                 )))
                 if results:
@@ -914,8 +926,10 @@ class Mem0MemoryProvider(MemoryProvider):
             rerank = self._truthy(self._rerank if rerank is None else rerank)
             # W2-RERANK gate: an exact-identifier lookup (IP/port/email/long-id) skips
             # rerank — the cross-encoder demotes the exact match RRF already ranks #1.
-            # A model-explicit rerank=true still wins (override); the gate only applies
-            # to the profile default. The canary's runtime kill-flag also forces it off.
+            # A model-explicit rerank=true overrides the exact-token gate (the gate only
+            # suppresses the PROFILE default), but the canary runtime kill-flag below is a
+            # HARD override that wins even over a model-explicit rerank=true (safety > the
+            # model's per-call preference; the canary only trips on a measured regression).
             if rerank and args.get("rerank") is None and self._is_exact_token_query(query):
                 rerank = False
             if rerank and self._rerank_killed():
@@ -941,6 +955,7 @@ class Mem0MemoryProvider(MemoryProvider):
                     query=query,
                     filters=self._read_filters(),
                     rerank=rerank,
+                    keyword_search=self._keyword_search,
                     top_k=fetch_k,
                 )))
                 self._record_success()
