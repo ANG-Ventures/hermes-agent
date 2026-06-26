@@ -55,6 +55,30 @@ from .tokens import count_message_tokens
 logger = logging.getLogger(__name__)
 
 
+def _coerce_ts(value: Any) -> float:
+    """Resolve a message's timestamp for ingest.
+
+    Replayed rows (restored from the durable transcript) carry their real
+    arrival ``timestamp``; preserve it so a restart/session-bind replay does
+    not re-stamp the whole batch with one ``time.time()`` instant (the
+    timestamp-collapse bug). A genuinely-new live message has no usable
+    ``timestamp`` and falls back to now. Non-numeric / None / <=0 values are
+    treated as missing (a real message is never legitimately stamped 0) and
+    fall back to now — never crash, never write a 1970 epoch.
+    """
+    if value is None:
+        return time.time()
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return time.time()
+    # reject NaN / inf / non-positive
+    if ts > 0 and ts == ts and ts != float("inf"):
+        return ts
+    return time.time()
+
+
+
 _MESSAGE_ROLE_BIAS_SQL = "CASE m.role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1 WHEN 'tool' THEN 2 ELSE 1 END"
 _MESSAGE_SELECT_COLUMNS = (
     "store_id, session_id, source, role, content, tool_call_id, "
@@ -354,7 +378,7 @@ class MessageStore:
                     msg.get("tool_call_id"),
                     tool_calls_stored,
                     msg.get("tool_name"),
-                    time.time(),
+                    _coerce_ts(msg.get("timestamp")),
                     token_estimate,
                     0,
                 ),
@@ -379,15 +403,20 @@ class MessageStore:
         )
 
         ids = []
-        ts = time.time()
         with self._write_lock, self._conn:
-            for msg, est in zip(protected_messages, token_estimates):
+            for msg, est, original_msg in zip(protected_messages, token_estimates, messages):
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
                 content_plain = _normalize_content_value(msg.get("content"))
                 search_content = _index_safe_text(msg.get("content"), self._ingest_protection_config)
                 content_stored = _encrypted_or_plain(self._cipher, content_plain, field="content")
                 tool_calls_stored = _encrypted_or_plain(self._cipher, tc_json, field="tool_calls")
+                # Per-row timestamp: a replayed row carries its real arrival time;
+                # read it from the protected msg, falling back to the original
+                # (the protection transform may not retain the key) then to now.
+                row_ts = _coerce_ts(
+                    msg.get("timestamp", original_msg.get("timestamp"))
+                )
                 cur = self._conn.execute(
                     """INSERT INTO messages
                        (session_id, source, role, content, search_content, tool_call_id, tool_calls,
@@ -402,7 +431,7 @@ class MessageStore:
                         msg.get("tool_call_id"),
                         tool_calls_stored,
                         msg.get("tool_name"),
-                        ts,
+                        row_ts,
                         est,
                         0,
                     ),
