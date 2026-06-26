@@ -673,8 +673,39 @@ def _inturn_content_struct(content):
     return ("scalar", repr(content))
 
 
+def _inturn_tool_calls_struct(tool_calls):
+    """Structural key for an assistant row's ``tool_calls``.
+
+    The sanitizer PRESERVES assistant tool_calls (and uses them to decide which
+    stub tool-results to insert), so two assistant rows with identical sanitized
+    visible content but DIFFERENT tool calls are distinct rows — omitting
+    tool_calls from the match key would let a wrong cut compare equal and produce
+    a reconciled-but-wrong folded/kept split (Greptile P1, PR #106). Normalize by
+    the call ``id`` + function name/arguments when present (dict-order-independent),
+    falling back to ``repr`` for an unexpected shape.
+    """
+    if not tool_calls:
+        return ()
+    out = []
+    for call in tool_calls:
+        if isinstance(call, dict):
+            fn = call.get("function")
+            if isinstance(fn, dict):
+                out.append((call.get("id"), fn.get("name"), fn.get("arguments")))
+            else:
+                out.append((call.get("id"), call.get("name"), call.get("arguments"), repr(fn)))
+        else:
+            out.append(repr(call))
+    return tuple(out)
+
+
 def _inturn_norm_row(m):
-    return (m.get("role"), _inturn_content_struct(m.get("content")), m.get("tool_call_id"))
+    return (
+        m.get("role"),
+        _inturn_content_struct(m.get("content")),
+        m.get("tool_call_id"),
+        _inturn_tool_calls_struct(m.get("tool_calls")),
+    )
 
 
 def _inturn_norm(msgs):

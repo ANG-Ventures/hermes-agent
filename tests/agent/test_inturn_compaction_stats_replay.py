@@ -216,6 +216,20 @@ def test_inturn_no_sanitize_built_in_back_compat():
 
 # ───────────────────────── fixture provenance (D-6) ─────────────────────────
 
+def test_inturn_norm_distinguishes_tool_calls():
+    """Two assistant rows with identical sanitized content but DIFFERENT tool_calls
+    must NOT compare equal in the alignment norm — else a wrong cut can match and
+    produce a reconciled-but-wrong folded/kept split (Greptile P1, PR #106)."""
+    from agent.compaction_stats import _inturn_norm_row
+    a = {"role": "assistant", "content": "Done.",
+         "tool_calls": [{"id": "call_1", "function": {"name": "terminal", "arguments": "{}"}}]}
+    b = {"role": "assistant", "content": "Done.",
+         "tool_calls": [{"id": "call_2", "function": {"name": "browser", "arguments": "{}"}}]}
+    assert _inturn_norm_row(a) != _inturn_norm_row(b)
+    # identical rows still compare equal (idempotent)
+    assert _inturn_norm_row(a) == _inturn_norm_row(dict(a))
+
+
 def test_fixture_sanitizer_provenance_current():
     """The committed fixture was generated against the CURRENT live sanitizer source.
     Fails (prompting a regenerate) if the sanitizer behavior-relevant source diverges."""
