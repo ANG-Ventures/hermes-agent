@@ -811,6 +811,9 @@ class MessageStore:
             try:
                 where = ["messages_fts MATCH ?"]
                 args: list[Any] = [safe_query]
+                # Exclude replay-dedup soft-hidden rows so a re-ingested copy
+                # never resurfaces as a duplicate search hit (v5 column).
+                where.append("m.superseded_by IS NULL")
                 if session_id is not None:
                     where.append("m.session_id = ?")
                     args.append(session_id)
@@ -897,7 +900,7 @@ class MessageStore:
             return []
         fetch_limit = compute_search_fetch_limit(limit, terms, phrases)
 
-        where: list[str] = ["search_content IS NOT NULL"]
+        where: list[str] = ["search_content IS NOT NULL", "superseded_by IS NULL"]
         args: list[Any] = []
         if session_id is not None:
             where.append("session_id = ?")

@@ -110,3 +110,30 @@ class TestStoreReplayPreservesTimestamps:
         assert ts[0] == base
         assert before <= ts[1] <= time.time() + 1
 
+
+class TestDedupReaderFilter:
+    """v5 schema + search excludes replay-dedup soft-hidden rows."""
+
+    def _store(self, tmp_path):
+        from plugins.context_engine.lcm.store import MessageStore
+        return MessageStore(str(tmp_path / "lcm.db"))
+
+    def test_v5_column_present_on_fresh_db(self, tmp_path):
+        store = self._store(tmp_path)
+        cols = [c[1] for c in store._conn.execute("PRAGMA table_info(messages)")]
+        assert "superseded_by" in cols
+        assert "timestamp_original" in cols
+        assert "timestamp_reconstructed" in cols
+        assert "timestamp_verified" in cols
+
+    def test_hidden_row_excluded_from_search(self, tmp_path):
+        store = self._store(tmp_path)
+        store.append("s", {"role": "user", "content": "uniqtoken_zzz alpha"})
+        i2 = store.append("s", {"role": "user", "content": "uniqtoken_zzz alpha"})
+        assert len(store.search("uniqtoken_zzz")) == 2
+        store._conn.execute("UPDATE messages SET superseded_by='replay-dedup-test' WHERE store_id=?", (i2,))
+        store._conn.commit()
+        res = store.search("uniqtoken_zzz")
+        assert len(res) == 1
+        assert all(r.get("store_id") != i2 for r in res)
+
