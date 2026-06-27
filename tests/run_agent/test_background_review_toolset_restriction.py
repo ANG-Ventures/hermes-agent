@@ -207,3 +207,35 @@ def test_mem0_write_flag_on_includes_mem0_remember(monkeypatch):
     assert "terminal" not in whitelist
     assert "delegate_task" not in whitelist
 
+
+def test_memory_prompt_mem0_clause_gated_by_flag(monkeypatch):
+    """The mem0_remember save clause is appended to the memory-review prompt ONLY
+    when the flag is on (and only for memory passes)."""
+    import run_agent
+    from agent import background_review as br
+    import hermes_cli.config as _config
+
+    agent = _make_agent_stub(run_agent.AIAgent)
+
+    # Flag OFF -> clause absent
+    monkeypatch.setattr(_config, "load_config_readonly", lambda: {
+        "memory": {"background_review_mem0_write": False}})
+    _, prompt_off = br.spawn_background_review_thread(
+        agent, [], review_memory=True, review_skills=False)
+    assert "mem0_remember" not in prompt_off
+
+    # Flag ON -> clause present, names the tool + the durable-fact rubric
+    monkeypatch.setattr(_config, "load_config_readonly", lambda: {
+        "memory": {"background_review_mem0_write": True}})
+    _, prompt_on = br.spawn_background_review_thread(
+        agent, [], review_memory=True, review_skills=False)
+    assert "mem0_remember" in prompt_on
+    assert "durable" in prompt_on.lower()
+    assert "never the conversation" in prompt_on.lower()
+
+    # Flag ON but a SKILL-only pass -> no mem0 clause (it's a memory-pass feature)
+    _, prompt_skill = br.spawn_background_review_thread(
+        agent, [], review_memory=False, review_skills=True)
+    assert "mem0_remember" not in prompt_skill
+
+

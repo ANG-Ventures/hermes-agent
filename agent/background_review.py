@@ -42,6 +42,21 @@ _MEMORY_REVIEW_PROMPT = (
     "If nothing is worth saving, just say 'Nothing to save.' and stop."
 )
 
+# Appended to the memory-review prompt ONLY when memory.background_review_mem0_write
+# is on (default-OFF). Tells the model to ALSO persist a genuinely-durable fact into
+# long-term memory (mem0) via the manager-free mem0_remember helper. The fork cannot
+# reach mem0_conclude (no _memory_manager); mem0_remember is the only mem0 write it has.
+_MEMORY_REVIEW_MEM0_CLAUSE = (
+    "\n\nIf — and only if — you found a DURABLE fact about the user or their stable "
+    "environment worth remembering across sessions (a preference, a standing decision "
+    "or correction, an account/device/topology pointer, a long-lived plan or "
+    "constraint), ALSO save it to long-term memory by calling the mem0_remember tool "
+    "with that single fact, in addition to the memory tool. Save the FACT itself as a "
+    "standalone declarative sentence — never the conversation, your work this turn, or "
+    "this prompt. Do NOT save work-narration, status, or anything stale within a week. "
+    "One fact per call. If nothing qualifies, do not call mem0_remember."
+)
+
 _SKILL_REVIEW_PROMPT = (
     "Review the conversation above and update the skill library. Be "
     "ACTIVE — most sessions produce at least one skill update, even if "
@@ -618,6 +633,19 @@ def spawn_background_review_thread(
         prompt = getattr(agent, "_MEMORY_REVIEW_PROMPT", _MEMORY_REVIEW_PROMPT)
     else:
         prompt = getattr(agent, "_SKILL_REVIEW_PROMPT", _SKILL_REVIEW_PROMPT)
+
+    # mem0-in-background-review (default-OFF): when the flag is on AND this pass reviews
+    # memory, append the mem0_remember save clause so the model knows it can ALSO persist
+    # a durable fact to long-term memory. Without the flag the clause is absent (and the
+    # tool is denied at dispatch anyway), so the model is never told to call a dead tool.
+    if review_memory:
+        try:
+            from hermes_cli.config import load_config_readonly, cfg_get
+            if bool(cfg_get(load_config_readonly(), "memory",
+                            "background_review_mem0_write", default=False)):
+                prompt = prompt + _MEMORY_REVIEW_MEM0_CLAUSE
+        except Exception:
+            pass
 
     def _target() -> None:
         _run_review_in_thread(agent, messages_snapshot, prompt)
