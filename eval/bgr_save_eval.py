@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Phase-2 save-decision eval (the GATE).
+
+Runs the REAL memory-review prompt + the mem0_remember salience clause through a model
+over held-out multi-turn fixtures, and records whether the model decides to save
+(call mem0_remember) or not. Gate (S10 holdout precedent):
+  - save-recall Wilson 95% LB >= 0.75  (genuine facts that get saved)
+  - false-save rate            <= 0.10 (narration/ambiguous that get saved)
+
+The model is asked to emit a strict JSON verdict so the decision is mechanically graded
+(no model-grades-model). Fixtures were authored BEFORE the clause wording and label the
+SAVE DECISION, not the wording.
+"""
+import json, os, sys, urllib.request, urllib.error, math
+
+FIX = os.path.join(os.path.dirname(__file__), "fixtures", "bgr_save_fixtures.jsonl")
+
+# Import the REAL clause + rubric the fork uses.
+sys.path.insert(0, "/Users/alexgierczyk/.hermes/worktrees/bgr-mem0")
+from agent.background_review import _MEMORY_REVIEW_PROMPT, _MEMORY_REVIEW_MEM0_CLAUSE
+
+def _key():
+    for line in open("/Users/alexgierczyk/.hermes/.env"):
+        if line.startswith("OPENAI" + "_API_" + "KEY="):
+            return line.split("=", 1)[1].strip()
+    return os.environ.get("OPENAI_API_KEY", "")
+
+SYSTEM = (
+    "You are the background self-improvement review pass of an AI assistant. You read a short "
+    "conversation excerpt and decide whether it contains a DURABLE fact about the user worth "
+    "saving to long-term memory via the mem0_remember tool.\n\n"
+    + _MEMORY_REVIEW_PROMPT + _MEMORY_REVIEW_MEM0_CLAUSE +
+    "\n\nFor THIS eval, do not call a tool. Instead output STRICT JSON only: "
+    '{\"save\": true|false, \"fact\": \"<the one durable fact, or empty>\"}. '
+    "save=true ONLY if you would call mem0_remember on this excerpt."
+)
+
+def decide(transcript, k, model="gpt-5-nano"):
+    body = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": "Conversation excerpt:\n" + transcript},
+        ],
+        "response_format": {"type": "json_object"},
+    }).encode()
+    r = urllib.request.Request("https://api.openai.com/v1/chat/completions", data=body, method="POST",
+                               headers={"Authorization": f"Bearer {k}", "Content-Type": "application/json"})
+    resp = json.loads(urllib.request.urlopen(r, timeout=60).read())
+    txt = resp["choices"][0]["message"]["content"]
+    try:
+        return bool(json.loads(txt).get("save"))
+    except Exception:
+        return "save" in txt.lower() and "true" in txt.lower()
+
+
+CLAUDE_URL = os.environ.get("SAVE_EVAL_CLAUDE_URL", "http://localhost:18810/anthropic/v1/messages")
+
+def decide_claude(transcript, model="claude-opus-4-8"):
+    """Decide using the REAL fork model (Apollo runs claude-opus-4-8). This is the
+    honest measure — the review fork inherits agent.model, not gpt-5-nano."""
+    body = json.dumps({
+        "model": model,
+        "max_tokens": 200,
+        "system": SYSTEM,
+        "messages": [{"role": "user", "content": "Conversation excerpt:\n" + transcript +
+                      "\n\nOutput ONLY the strict JSON verdict."}],
+    }).encode()
+    import time as _t
+    last = None
+    for attempt in range(8):
+        try:
+            r = urllib.request.Request(CLAUDE_URL, data=body, method="POST",
+                                       headers={"content-type": "application/json", "anthropic-version": "2023-06-01"})
+            resp = json.loads(urllib.request.urlopen(r, timeout=60).read())
+            txt = resp["content"][0]["text"]
+            import re
+            m = re.search(r"\{[^}]*\"save\"[^}]*\}", txt)
+            if m:
+                try:
+                    return bool(json.loads(m.group(0)).get("save"))
+                except Exception:
+                    pass
+            return "\"save\": true" in txt.lower() or '"save":true' in txt.lower()
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code in (429, 500, 502, 503, 529):
+                _t.sleep(8 * (attempt + 1)); continue
+            raise
+        except Exception as e:
+            last = e
+            _t.sleep(4); continue
+    raise last
+
+def wilson_lb(k, n, z=1.96):
+    if n == 0:
+        return 0.0
+    p = k / n
+    d = 1 + z*z/n
+    c = p + z*z/(2*n)
+    m = z*math.sqrt(p*(1-p)/n + z*z/(4*n*n))
+    return (c - m) / d
+
+def main():
+    k = _key()
+    backend = os.environ.get("SAVE_EVAL_BACKEND", "claude")
+    decide_fn = (lambda t: decide_claude(t)) if backend == "claude" else (lambda t: decide(t, k))
+    print(f"backend: {backend} ({'claude-opus-4-8 (real fork model)' if backend=='claude' else 'gpt-5-nano'})")
+    rows = [json.loads(l) for l in open(FIX) if l.strip()]
+    genuine = [r for r in rows if r["expect"] == "save"]
+    nosave = [r for r in rows if r["expect"] == "no_save"]
+
+    saved_genuine = 0
+    false_saves = 0
+    misses, fps = [], []
+    for r in rows:
+        d = decide_fn(r["transcript"])
+        import time as _t; _t.sleep(1.0)  # gentle pacing for the shared Opus relay
+        if r["expect"] == "save":
+            if d: saved_genuine += 1
+            else: misses.append(r["id"])
+        else:
+            if d:
+                false_saves += 1
+                fps.append(r["id"])
+
+    n_g = len(genuine); n_ns = len(nosave)
+    recall = saved_genuine / n_g if n_g else 0
+    recall_lb = wilson_lb(saved_genuine, n_g)
+    fsave = false_saves / n_ns if n_ns else 0
+
+    print(f"genuine: {saved_genuine}/{n_g} saved (recall {recall:.1%}, Wilson95 LB {recall_lb:.3f})")
+    print(f"  misses: {misses}")
+    print(f"no-save: {false_saves}/{n_ns} wrongly saved (false-save {fsave:.1%})")
+    print(f"  false-saves: {fps}")
+    ok = recall_lb >= 0.75 and fsave <= 0.10
+    print(f"\nGATE: save-recall LB {recall_lb:.3f} >= 0.75 AND false-save {fsave:.1%} <= 10%")
+    print(f"SAVE-EVAL {'PASS' if ok else 'FAIL'}")
+    sys.exit(0 if ok else 1)
+
+if __name__ == "__main__":
+    main()

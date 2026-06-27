@@ -47,14 +47,19 @@ _MEMORY_REVIEW_PROMPT = (
 # long-term memory (mem0) via the manager-free mem0_remember helper. The fork cannot
 # reach mem0_conclude (no _memory_manager); mem0_remember is the only mem0 write it has.
 _MEMORY_REVIEW_MEM0_CLAUSE = (
-    "\n\nIf — and only if — you found a DURABLE fact about the user or their stable "
+    "\n\nIf — and only if — you found a DURABLE, SETTLED fact about the user or their stable "
     "environment worth remembering across sessions (a preference, a standing decision "
     "or correction, an account/device/topology pointer, a long-lived plan or "
     "constraint), ALSO save it to long-term memory by calling the mem0_remember tool "
     "with that single fact, in addition to the memory tool. Save the FACT itself as a "
     "standalone declarative sentence — never the conversation, your work this turn, or "
     "this prompt. Do NOT save work-narration, status, or anything stale within a week. "
-    "One fact per call. If nothing qualifies, do not call mem0_remember."
+    "Do NOT save SPECULATION or TENTATIVE statements ('I might', 'thinking about', 'not "
+    "sure yet', 'maybe'), one-off REQUESTS or commands ('swap this', 'remind me', "
+    "'set a timer'), passing complaints, or transient events ('the reminder didn't fire', "
+    "'the UI is slow today') — a fact is durable only if it is settled and will still be "
+    "true next week. When in doubt, DO NOT save. One fact per call. If nothing qualifies, "
+    "do not call mem0_remember."
 )
 
 _SKILL_REVIEW_PROMPT = (
