@@ -1184,10 +1184,20 @@ class LCMEngine(ContextEngine):
             stamped_tail = []
             for off, row in enumerate(tail_rows):
                 src_idx = n_msgs - (n_tail - off)
-                # Only stamp when the suffix mapping is exact (same object), so a
-                # shape that violates the suffix assumption falls back to A-floor
-                # instead of recording a wrong origin.
-                if isinstance(row, dict) and 0 <= src_idx < n_msgs and messages[src_idx] is row:
+                # The fresh tail is a suffix of `messages` (1:1 order-preserving
+                # ingest + front-only fold), so the suffix index is structurally
+                # correct. ingest SHALLOW-COPIES rows, so an `is` identity check would
+                # never match (Greptile #110): guard instead on a cheap role match
+                # (content may be quarantine-rewritten). The consumer is the real
+                # gate — harvest validates indices in-range + the reconcile check
+                # falls to the A-floor if anything is off, so a wrong stamp can never
+                # ship a confidently-wrong split.
+                if (
+                    isinstance(row, dict)
+                    and 0 <= src_idx < n_msgs
+                    and isinstance(messages[src_idx], dict)
+                    and messages[src_idx].get("role") == row.get("role")
+                ):
                     row = dict(row)
                     row["_src_idx"] = src_idx
                 stamped_tail.append(row)

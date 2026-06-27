@@ -47,7 +47,9 @@ def _stamp_and_assemble(e, messages, *, leaf_passes, working_messages=None):
         stamped = []
         for off, row in enumerate(tail_rows):
             src_idx = n_msgs - (n_tail - off)
-            if isinstance(row, dict) and 0 <= src_idx < n_msgs and messages[src_idx] is row:
+            if (isinstance(row, dict) and 0 <= src_idx < n_msgs
+                    and isinstance(messages[src_idx], dict)
+                    and messages[src_idx].get("role") == row.get("role")):
                 row = dict(row, **{"_src_idx": src_idx})
             stamped.append(row)
         tail_rows = stamped
@@ -81,8 +83,10 @@ def test_stamp_engages_after_front_fold():
     a SUFFIX of the original. Suffix-from-end indexing must still stamp + map exactly."""
     e = _engine()
     messages = _msgs(120)
-    # simulate a front-fold: anchor + (rows after a 60-row folded chunk)
-    working = messages[:1] + messages[61:]
+    # simulate a front-fold + ingest SHALLOW-COPY: anchor + COPIES of rows after a
+    # 60-row folded chunk (ingest copies rows, so working rows are NOT identity-equal
+    # to messages — the role-guard, not `is`, must let the stamp fire). Greptile #110.
+    working = [dict(messages[0])] + [dict(m) for m in messages[61:]]
     compressed = _stamp_and_assemble(e, messages, leaf_passes=1, working_messages=working)
     kept = [m for m in compressed if m.get("role") != "system" and not m.get("_lcm_summary")]
     with_key = [m for m in kept if "_src_idx" in m]
