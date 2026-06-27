@@ -196,3 +196,49 @@ class TestDupOnReplayFix:
         assert not eng._is_strong_compaction_scaffold(
             {"role": "user", "content": "an ordinary turn"}
         )
+
+    def test_reconciled_durable_tail_does_not_double_count_new_repeat(self, tmp_path):
+        """Greptile #107 P1 (3rd): when the cursor reconcile ALREADY advances
+        past the replayed durable tail, the stored-tail overlap guard (the
+        fallback for a scaffold-ONLY cursor advance) must not run again — else
+        it double-counts and strips a genuinely-new row that coincidentally
+        repeats the last stored identity.
+
+        Scenario: store ends with a 'go'. On restart the active context is
+        [LCM system note] + [full fresh tail incl. 'go' (already stored)] +
+        [a genuinely-new 'go']. The reconcile consumes the durable tail
+        (cursor past 'go'), leaving new_messages == [new 'go']. The overlap
+        guard would otherwise match run=1 against the stored tail and drop it.
+        The new 'go' must survive (count 'go' == 2: 1 stored + 1 new)."""
+        eng, db = _engine(tmp_path)
+        stored = _base(8) + [{"role": "user", "content": "go"}]
+        eng._store.append_batch("S", stored)
+        n0 = eng._store.get_session_count("S")
+        replay = (
+            [{"role": "system", "content": SCAFFOLD}]
+            + _base(8)
+            + [{"role": "user", "content": "go"}]   # already-stored fresh tail
+            + [{"role": "user", "content": "go"}]   # genuinely NEW, same identity
+        )
+        eng._ingest_cursor_needs_reconcile = True
+        eng._ingest_messages(replay)
+        assert eng._store.get_session_count("S") == n0 + 1
+        assert _count(db, "go") == 2
+
+    def test_scaffold_only_cursor_advance_still_dedups_stored_tail(self, tmp_path):
+        """Counterpart guard: when the reconcile only skips the scaffold head
+        (consumes ZERO durable rows), the overlap guard MUST still run and
+        de-dup the already-stored fresh tail — the canonical dup-on-replay
+        fix is unchanged by the Greptile #3 gate."""
+        eng, db = _engine(tmp_path)
+        stored = _base(10)
+        eng._store.append_batch("S", stored)
+        n0 = eng._store.get_session_count("S")
+        replay = (
+            [{"role": "system", "content": SCAFFOLD},
+             {"role": "assistant", "content": SUMMARY}]
+            + _base(10)  # already-stored fresh tail, no genuinely-new rows
+        )
+        eng._ingest_cursor_needs_reconcile = True
+        eng._ingest_messages(replay)
+        assert eng._store.get_session_count("S") == n0

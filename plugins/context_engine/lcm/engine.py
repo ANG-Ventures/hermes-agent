@@ -3745,6 +3745,11 @@ class LCMEngine(ContextEngine):
             prefer_existing_externalized=prefer_existing_externalized,
         )
         replay_messages = self._redact_active_replay_messages(replay_messages)
+        # When the cursor reconcile advances PAST durable (non-scaffold) rows the
+        # already-stored fresh tail is accounted for by the cursor itself, so the
+        # stored-tail overlap guard (the fallback for a *scaffold-only* advance)
+        # must be suppressed to avoid double-counting (Greptile #107 P1, 3rd).
+        reconcile_consumed_durable_tail = False
         if self._ingest_cursor_needs_reconcile:
             reconcile_messages = replay_messages
             if self._compiled_ignore_message_patterns:
@@ -3754,6 +3759,17 @@ class LCMEngine(ContextEngine):
                 ]
             self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
             self._ingest_cursor_needs_reconcile = False
+            # Did the reconcile advance the cursor PAST durable (non-scaffold)
+            # rows? If so the already-stored fresh tail is ALREADY accounted for
+            # by the cursor, and the stored-tail overlap guard below — which is
+            # only the fallback for a *scaffold-only* cursor advance — must NOT
+            # run, or it double-counts and strips a genuinely-new row that
+            # coincidentally repeats the last stored identity (Greptile #107 P1,
+            # 3rd). When the reconcile only skipped the scaffold head
+            # (no durable rows consumed), the guard is still needed.
+            reconcile_consumed_durable_tail = bool(self._ingest_cursor) and bool(
+                self._effective_replay_identities(reconcile_messages[: self._ingest_cursor])
+            )
         cursor = min(max(self._ingest_cursor, 0), n)
         logger.debug(
             "Ingest: session=%s cursor=%d incoming=%d",
@@ -3776,8 +3792,12 @@ class LCMEngine(ContextEngine):
         # tail-only delta), drop the leading run of new_messages that already
         # exists as the stored tail. Gating on scaffold evidence preserves the
         # deliberate dup-over-loss guarantee for anchorless deltas.
-        overlap = self._compacted_replay_stored_tail_overlap(
-            new_messages, original_new_messages, replay_messages
+        overlap = (
+            0
+            if reconcile_consumed_durable_tail
+            else self._compacted_replay_stored_tail_overlap(
+                new_messages, original_new_messages, replay_messages
+            )
         )
         if overlap > 0:
             self._record_ingest_reconciliation(
