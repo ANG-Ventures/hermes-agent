@@ -129,3 +129,27 @@ class TestDupOnReplayFix:
         eng._ingest_cursor_needs_reconcile = True
         eng._ingest_messages(comp)
         assert eng._store.get_session_count("S") == n0
+
+    def test_repeating_tail_pattern_preserves_genuine_new_turns(self, tmp_path):
+        """Greptile #107 P1 (dup-over-loss): when the durable store ends with a
+        REPEATING identity pattern and the post-compaction replay is the kept
+        fresh tail [A,B,A,B] followed by GENUINELY-NEW [A,B], the overlap skip
+        must NOT consume the new turns. The longest-match version lost them;
+        smallest-match never skips past the real fresh-tail boundary."""
+        eng, db = _engine(tmp_path)
+        A = {"role": "user", "content": "AAA"}
+        B = {"role": "assistant", "content": "BBB"}
+        base = _base(20)
+        stored = base + [dict(A), dict(B), dict(A), dict(B), dict(A), dict(B)]
+        eng._store.append_batch("S", stored)
+        n0 = eng._store.get_session_count("S")
+        replay = (
+            [{"role": "system", "content": SCAFFOLD},
+             {"role": "assistant", "content": SUMMARY}]
+            + [dict(A), dict(B), dict(A), dict(B)]
+            + [dict(A), dict(B)]
+        )
+        eng._ingest_cursor_needs_reconcile = True
+        eng._ingest_messages(replay)
+        # SACRED no-loss: the 2 genuinely-new turns must be ingested (dup-over-loss).
+        assert eng._store.get_session_count("S") >= n0 + 2

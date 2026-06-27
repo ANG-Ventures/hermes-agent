@@ -3476,13 +3476,23 @@ class LCMEngine(ContextEngine):
         if not stored_tail:
             return 0
 
-        # The leading candidate run must equal a suffix of the stored tail that
-        # ends at the true end of the store (the rows just written before the
-        # restart). Walk the longest leading candidate run that matches the
-        # stored tail ending exactly at stored_tail[-1].
+        # Match the leading candidate run against a suffix of the stored tail
+        # that ends at the true end of the store.
+        #
+        # 🔴 DUP-OVER-LOSS (Greptile #107 P1): pick the SMALLEST matching run,
+        # never the largest. When the stored tail contains a REPEATING identity
+        # pattern (e.g. store ends [A,B,A,B,A,B] and the replay is the kept fresh
+        # tail [A,B,A,B] followed by GENUINELY-NEW turns [A,B]), the longest
+        # match overshoots the real fresh-tail boundary and skips the new turns
+        # as "overlap" — silent data loss. Content alone cannot distinguish a
+        # replayed stored row from a new row with identical content, so we bias
+        # toward NEW: the real kept-fresh-tail length T is always in the matching
+        # set, so the smallest matching run is provably <= T and therefore never
+        # skips a genuinely-new row. Worst case under repetition we skip too few
+        # (a few residual dups the dedup pass cleans), never too many.
         best = 0
         max_run = min(len(candidate), len(stored_tail))
-        for run in range(max_run, 0, -1):
+        for run in range(1, max_run + 1):
             cand_ids = [ident for _idx, ident in candidate[:run]]
             if cand_ids == stored_tail[-run:]:
                 best = run
