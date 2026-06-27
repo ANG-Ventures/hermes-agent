@@ -83,6 +83,17 @@ def _register_runtime_for(model_slug: str) -> None:
     )
     print(f"[real-model] runtime registered: provider={provider} model={model} "
           f"base_url={base_url or '(default)'} key={'set' if api_key else 'MISSING'}")
+    # Fail LOUDLY rather than silently degrading to the off-gateway auto-chain:
+    # if we couldn't resolve a base_url+key for this provider, the summarizer would
+    # fall through to openrouter/nous (unhealthy off-gateway) and 400 — exactly the
+    # confusing failure this driver exists to avoid. Surface it (Greptile #113).
+    if not base_url or not api_key:
+        raise SystemExit(
+            f"[real-model] cannot resolve credentials for provider={provider!r} "
+            f"(base_url={'set' if base_url else 'EMPTY'}, key={'set' if api_key else 'EMPTY'}). "
+            f"Pass an in-registry provider/model (e.g. claude-app/claude-haiku-4-5) and ensure "
+            f"its key env var is loaded (this driver loads ~/.hermes/.env for --real-model)."
+        )
 
 
 def main() -> int:
