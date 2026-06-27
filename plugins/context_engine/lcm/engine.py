@@ -353,6 +353,11 @@ class LCMEngine(ContextEngine):
         self._update_model_pending_session_start = False
         self.threshold_tokens = 0
         self.threshold_percent = self._config.context_threshold
+        # P2 calibration knobs (read by the ContextEngine ABC calibration methods
+        # via getattr). Sourced ONCE here from this engine's own config so the
+        # process-global singleton is never mutated per-agent (Greptile PR #111).
+        self._skew_floor = self._config.skew_floor
+        self._hard_frac = self._config.calibration_hard_frac
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0

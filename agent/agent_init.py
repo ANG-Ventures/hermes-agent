@@ -1567,14 +1567,11 @@ def init_agent(
 
     if _selected_engine is not None:
         agent.context_compressor = _selected_engine
-        # P2 calibration knobs for plugin engines (e.g. LCM). The calibration
-        # methods live on the ContextEngine ABC and read `_skew_floor`/`_hard_frac`
-        # via getattr-with-default; plugin __init__ doesn't set them, so apply the
-        # validated config values here or they'd silently run defaults (Greptile #111).
-        if isinstance(_compression_skew_floor, (int, float)) and 0.0 < float(_compression_skew_floor) <= 1.0:
-            agent.context_compressor._skew_floor = float(_compression_skew_floor)
-        if isinstance(_compression_calibration_hard_frac, (int, float)) and 0.0 < float(_compression_calibration_hard_frac) <= 1.0:
-            agent.context_compressor._hard_frac = float(_compression_calibration_hard_frac)
+        # NOTE: P2 calibration knobs (skew_floor / calibration_hard_frac) for plugin
+        # engines (e.g. LCM) are sourced by the engine from its OWN config at
+        # construction (LCMConfig.from_env → compression.<key>), NOT mutated here.
+        # The LCM engine is a process-global singleton; per-agent mutation would let
+        # one agent's config silently overwrite another's calibration (Greptile #111).
         # Resolve context_length for plugin engines — mirrors switch_model() path
         from agent.model_metadata import get_model_context_length
         _plugin_ctx_len = get_model_context_length(
