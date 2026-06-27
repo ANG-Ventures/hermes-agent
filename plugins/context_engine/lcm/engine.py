@@ -1162,10 +1162,31 @@ class LCMEngine(ContextEngine):
         leading_anchor_count = self._leading_anchor_count(working_messages)
         anchor_leading_count = self._leading_anchor_count(anchor_source_messages)
         self._pending_context_anchor_messages = anchor_source_messages[anchor_leading_count:]
+        # ── Option B provenance stamp (single-pass only) ──────────────────────────
+        # Stamp each tail row handed to _assemble_context with `_src_idx` = its index
+        # into the ORIGINAL `messages`, so the in-turn compaction-stats consumer can
+        # read the EXACT pre-side kept partition off the returned `compressed` (the
+        # rows' shallow-copies carry the key through every sanitize/trim/rewrite
+        # stage by construction; synthetic stubs lack it). Single-pass only: the 1:1
+        # `messages`→`working_messages` position mapping (quarantine is a 1:1 list
+        # comprehension) holds only when no leaf-fold rebuilt the list. The consumer
+        # harvests then STRIPS `_src_idx` before `compressed` flows onward, so the key
+        # never reaches the wire/cache. `_src_idx` is `_`-prefixed (internal scaffold,
+        # stripped by the transport sanitizer as a backstop).
+        tail_rows = working_messages[leading_anchor_count:]
+        if leaf_passes == 1 and len(working_messages) == len(messages):
+            stamped_tail = []
+            for off, row in enumerate(tail_rows):
+                src_idx = leading_anchor_count + off
+                if isinstance(row, dict):
+                    row = dict(row)
+                    row["_src_idx"] = src_idx
+                stamped_tail.append(row)
+            tail_rows = stamped_tail
         try:
             compressed = self._assemble_context(
                 working_messages[0] if leading_anchor_count else None,
-                working_messages[leading_anchor_count:],
+                tail_rows,
                 assembly_cap_override=recovery_assembly_cap,
             )
         finally:

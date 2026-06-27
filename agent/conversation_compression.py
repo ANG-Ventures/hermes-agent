@@ -1292,6 +1292,19 @@ def compress_context(
     except Exception:
         logger.debug("compaction announce skipped (non-fatal)", exc_info=True)
 
+    # ── Option B provenance strip (load-bearing) ──────────────────────────────
+    # The engine stamps ``_src_idx`` on kept rows so build_inturn_stats (above) can
+    # read the EXACT pre-side partition. It MUST NOT reach the wire / prompt cache /
+    # transcript, so strip it from `compressed` now that the in-turn stats are built
+    # — the single point on the only path where `compressed` carries it (the early
+    # abort/noop returns return the original `messages`, never stamped). Idempotent;
+    # the transport sanitizer also drops ``_``-prefixed keys as a backstop.
+    try:
+        from agent.compaction_stats import strip_provenance as _strip_prov
+        _strip_prov(compressed)
+    except Exception:
+        logger.debug("provenance strip skipped (non-fatal)", exc_info=True)
+
     # Release the lock on the OLD session_id only AFTER rotation completed
     # and all post-rotation bookkeeping (memory manager, context engine,
     # file dedup) ran. A concurrent path that wakes up the moment we
