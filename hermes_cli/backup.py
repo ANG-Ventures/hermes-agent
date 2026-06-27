@@ -46,6 +46,10 @@ _EXCLUDED_DIRS = {
     "dropbox-media",    # youtube-ingest bulk media (tens of GB) — sourced from Dropbox,
                         # not agent state; ballooned the encrypted offsite backup to 100GB+
     "image_cache",      # cached fetched images — regenerable, not state
+    "swiftui-docs",     # Apple's AdditionalDocumentation extracted from a local Xcode (Apple IP).
+                        # The mobile-design/swiftui-skills skill reads Apple docs IN-PLACE from the
+                        # live Xcode.app and never copies them here — but if a stray copy ever lands
+                        # under a dir named swiftui-docs, keep Apple's IP out of the backup zip.
 }
 
 # Directory-NAME prefixes to skip anywhere in the tree. Browser-automation debug

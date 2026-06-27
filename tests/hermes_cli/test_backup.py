@@ -110,6 +110,17 @@ class TestShouldExclude:
         from hermes_cli.backup import _should_exclude
         assert _should_exclude(Path("backups/pre-update-2026-04-27-063400.zip"))
 
+    def test_excludes_swiftui_docs(self):
+        """Apple's AdditionalDocumentation (extracted from a local Xcode) is Apple IP and must
+        never enter the backup zip. The mobile-design/swiftui-skills skill reads them in-place
+        from the live Xcode.app and never copies them — this is the belt against a stray copy
+        landing under a swiftui-docs/ dir. Backup ignores .gitignore, so the exclude must be here."""
+        from hermes_cli.backup import _should_exclude
+        assert _should_exclude(Path("skills-shared/mobile-design/swiftui-skills/swiftui-docs/SwiftUI.md"))
+        assert _should_exclude(Path("swiftui-docs/Observation.md"))
+        # a normal skill file in the same skill is NOT excluded
+        assert not _should_exclude(Path("skills-shared/mobile-design/swiftui-skills/SKILL.md"))
+
     def test_excludes_sqlite_sidecars(self):
         """SQLite WAL/SHM/journal sidecars must not ship alongside the
         safe-copied .db — pairing a fresh snapshot with stale sidecar state
