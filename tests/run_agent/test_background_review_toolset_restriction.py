@@ -156,3 +156,54 @@ def test_background_review_agent_tools_are_limited():
     assert "delegate_task" not in expected_tools
     assert "web_search" not in expected_tools
     assert "execute_code" not in expected_tools
+
+
+def _run_with_flag(monkeypatch, flag_value):
+    """Spawn the review fork with the mem0-write flag set; capture the whitelist."""
+    import run_agent
+    from hermes_cli import plugins as _plugins
+    import hermes_cli.config as _config
+
+    captured = {}
+
+    def _capture_whitelist(whitelist, deny_msg_fmt=None):
+        captured["whitelist"] = set(whitelist)
+        raise RuntimeError("stop after capturing whitelist")
+
+    # Make the flag read deterministic regardless of the real config.yaml.
+    monkeypatch.setattr(_config, "load_config_readonly", lambda: {
+        "memory": {"background_review_mem0_write": flag_value}})
+
+    agent = _make_agent_stub(run_agent.AIAgent)
+
+    def _no_init(self, *args, **kwargs):
+        return None
+
+    with patch.object(run_agent.AIAgent, "__init__", _no_init), \
+         patch.object(_plugins, "set_thread_tool_whitelist", _capture_whitelist), \
+         patch("threading.Thread", _SyncThread):
+        agent._spawn_background_review(
+            messages_snapshot=[],
+            review_memory=True,
+            review_skills=False,
+        )
+    return captured.get("whitelist", set())
+
+
+def test_mem0_write_flag_off_excludes_mem0_remember(monkeypatch):
+    """Default-OFF: mem0_remember must NOT be in the fork whitelist (denied-not-absent)."""
+    whitelist = _run_with_flag(monkeypatch, False)
+    assert "mem0_remember" not in whitelist
+    # sanity: the normal memory/skill tools are still there
+    assert "memory" in whitelist
+    assert "skill_manage" in whitelist
+
+
+def test_mem0_write_flag_on_includes_mem0_remember(monkeypatch):
+    """Flag ON: mem0_remember is added to the fork whitelist (dispatch allowed)."""
+    whitelist = _run_with_flag(monkeypatch, True)
+    assert "mem0_remember" in whitelist
+    # dangerous tools still excluded
+    assert "terminal" not in whitelist
+    assert "delegate_task" not in whitelist
+

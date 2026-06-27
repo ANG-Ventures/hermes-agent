@@ -487,6 +487,20 @@ def _run_review_in_thread(
                     quiet_mode=True,
                 )
             }
+            # mem0-in-background-review (default-OFF): when the flag is on, allow the
+            # manager-free mem0 write helper (registry tool in the 'memory_write'
+            # toolset, so it's parent-resident/cache-stable but denied here unless
+            # explicitly whitelisted — denied-not-absent). See
+            # docs/2026-06-27_mem0-in-background-review-spec.md §5A.
+            try:
+                from hermes_cli.config import load_config_readonly, cfg_get
+                _bgr_mem0_on = bool(cfg_get(
+                    load_config_readonly(), "memory", "background_review_mem0_write",
+                    default=False))
+            except Exception:
+                _bgr_mem0_on = False
+            if _bgr_mem0_on:
+                review_whitelist.add("mem0_remember")
             set_thread_tool_whitelist(
                 review_whitelist,
                 deny_msg_fmt=(

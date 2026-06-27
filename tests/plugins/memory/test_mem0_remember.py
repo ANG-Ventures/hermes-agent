@@ -97,8 +97,41 @@ def test_remember_writes_infer_false_with_review_origin(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Task D1 — Tier 1 exact-hash skip (normalize before hash)
+# Task 1.3 — registry-tool registration (denied-not-absent)
 # ---------------------------------------------------------------------------
+
+def test_mem0_remember_is_registry_tool_in_memory_write_toolset():
+    """mem0_remember registers in its OWN toolset 'memory_write' (NOT 'memory'),
+    so it's parent-resident (cache-stable) but denied in the fork whose whitelist
+    is built from memory+skills. And it must be top-level auto-discoverable."""
+    import os
+    os.environ.setdefault("MEM0_HOST", "http://mem0.test")
+    os.environ.setdefault("MEM0_ADMIN_API_KEY", "admin-key")
+    import tools.mem0_remember_tool  # noqa: F401 (triggers registration)
+    from tools.registry import registry, _module_registers_tools
+    from pathlib import Path
+
+    # Auto-discovery must see it (top-level register call, not nested).
+    tool_file = Path(tools.mem0_remember_tool.__file__)
+    assert _module_registers_tools(tool_file), "register() must be a top-level statement"
+
+    assert registry.get_toolset_for_tool("mem0_remember") == "memory_write"
+    assert "mem0_remember" not in registry.get_tool_names_for_toolset("memory"), (
+        "must NOT be in the 'memory' toolset, or the fork would auto-whitelist it"
+    )
+
+
+def test_fork_whitelist_excludes_mem0_remember_by_default():
+    """The review fork builds its whitelist from memory+skills toolsets; the
+    memory_write tool must be ABSENT there (denied-not-absent default)."""
+    import os
+    os.environ.setdefault("MEM0_HOST", "http://mem0.test")
+    os.environ.setdefault("MEM0_ADMIN_API_KEY", "admin-key")
+    import tools.mem0_remember_tool  # noqa: F401
+    from toolsets import resolve_multiple_toolsets
+    fork_tools = set(resolve_multiple_toolsets(["memory", "skills"]))
+    assert "mem0_remember" not in fork_tools
+
 
 def test_dedup_norm_hash_normalizes():
     from plugins.memory.mem0 import _dedup_norm_hash
