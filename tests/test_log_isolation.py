@@ -71,6 +71,57 @@ def test_warning_during_test_does_not_write_real_agent_log(tmp_path):
         )
 
 
+def test_sibling_sandbox_dir_handler_is_stripped(tmp_path):
+    """Greptile #114: a handler in a SIBLING sandbox dir (path that shares a string
+    prefix but is not actually inside) must be stripped, not kept."""
+    import sys as _sys
+    from logging.handlers import RotatingFileHandler as _RFH
+
+    _conftest = _sys.modules.get("conftest") or _sys.modules.get("tests.conftest")
+    assert _conftest is not None
+
+    # sandbox = .../tX ; sibling = .../tX1 (str-prefix match, but NOT inside)
+    sandbox = tmp_path / "t0"
+    sandbox.mkdir()
+    sibling = tmp_path / "t01"
+    (sibling / "logs").mkdir(parents=True)
+    sib_log = sibling / "logs" / "agent.log"
+
+    root = logging.getLogger()
+    h = _RFH(str(sib_log), maxBytes=1024, backupCount=0, delay=True)
+    root.addHandler(h)
+    try:
+        _conftest._strip_nonsandbox_file_handlers(str(sandbox))
+        assert h not in root.handlers, "sibling-dir handler wrongly kept (str-prefix bug)"
+    finally:
+        if h in root.handlers:
+            root.removeHandler(h)
+        h.close()
+
+
+def test_in_sandbox_handler_is_kept(tmp_path):
+    """A handler genuinely INSIDE the sandbox is kept (the guard must not nuke
+    legitimate per-test log handlers)."""
+    import sys as _sys
+    from logging.handlers import RotatingFileHandler as _RFH
+
+    _conftest = _sys.modules.get("conftest") or _sys.modules.get("tests.conftest")
+    assert _conftest is not None
+
+    (tmp_path / "logs").mkdir()
+    in_log = tmp_path / "logs" / "agent.log"
+    root = logging.getLogger()
+    h = _RFH(str(in_log), maxBytes=1024, backupCount=0, delay=True)
+    root.addHandler(h)
+    try:
+        _conftest._strip_nonsandbox_file_handlers(str(tmp_path))
+        assert h in root.handlers, "in-sandbox handler wrongly stripped"
+    finally:
+        if h in root.handlers:
+            root.removeHandler(h)
+        h.close()
+
+
 def test_guard_strips_a_real_home_handler_attached_mid_session():
     """RED-proof of the guard: even if something attaches a RotatingFileHandler at
     the REAL ~/.hermes/logs (the intermittent import-order leak), the autouse

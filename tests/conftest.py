@@ -46,7 +46,7 @@ def _strip_nonsandbox_file_handlers(sandbox_prefix=None):
     """
     import logging as _logging
 
-    sandbox_prefix = sandbox_prefix or ""
+    sandbox_root = Path(sandbox_prefix).resolve() if sandbox_prefix else None
     loggers = [_logging.getLogger()] + [
         _logging.getLogger(name) for name in list(_logging.root.manager.loggerDict)
         if isinstance(_logging.getLogger(name), _logging.Logger)
@@ -56,9 +56,16 @@ def _strip_nonsandbox_file_handlers(sandbox_prefix=None):
             base = getattr(h, "baseFilename", None)
             if not base:
                 continue
-            # keep handlers that write inside the test sandbox; strip the rest
-            if sandbox_prefix and str(base).startswith(sandbox_prefix):
-                continue
+            # keep handlers that write INSIDE the test sandbox; strip the rest.
+            # Use real path-containment (relative_to), NOT str.startswith — a
+            # string prefix would treat sibling dirs (/tmp/x/t0 vs /tmp/x/t01) as
+            # inside (Greptile #114).
+            if sandbox_root is not None:
+                try:
+                    Path(base).resolve().relative_to(sandbox_root)
+                    continue  # inside the sandbox → keep
+                except ValueError:
+                    pass  # outside → fall through to strip
             try:
                 lg.removeHandler(h)
                 h.close()
