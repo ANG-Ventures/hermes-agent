@@ -43,6 +43,48 @@ def _tool_heavy_turn(n_pairs: int):
     return msgs
 
 
+def _register_runtime_for(model_slug: str) -> None:
+    """Register ``model_slug`` as the live 'main runtime' so the LCM summarizer's
+    ``call_llm(task="compression")`` → ``auto`` resolution picks it — exactly what
+    ``turn_context.py:95`` does on every real turn. Resolves the provider's
+    base_url + api_key from the built-in PROVIDER_REGISTRY (so claude-app → the
+    relay's /anthropic endpoint + CLAUDE_POOL_KEY, codex → its own, etc.).
+
+    Slug forms accepted: ``provider/model`` or a bare ``model`` (defaults to the
+    config's main provider).
+    """
+    import os as _os
+
+    from agent.auxiliary_client import set_runtime_main
+
+    if "/" in model_slug:
+        provider, model = model_slug.split("/", 1)
+    else:
+        provider, model = "claude-app", model_slug
+
+    base_url = ""
+    api_key = ""
+    api_mode = ""
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+        entry = PROVIDER_REGISTRY.get(provider)
+        if entry is not None:
+            base_url = getattr(entry, "inference_base_url", "") or ""
+            for k in getattr(entry, "api_key_env_vars", ()) or ():
+                if _os.environ.get(k):
+                    api_key = _os.environ[k]
+                    break
+    except Exception as exc:
+        print(f"[warn] provider registry lookup failed for {provider}: {exc}")
+
+    set_runtime_main(
+        provider=provider, model=model,
+        base_url=base_url, api_key=api_key, api_mode=api_mode,
+    )
+    print(f"[real-model] runtime registered: provider={provider} model={model} "
+          f"base_url={base_url or '(default)'} key={'set' if api_key else 'MISSING'}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--real-model", default=None,
@@ -96,6 +138,17 @@ def main() -> int:
     cfg = LCMConfig(**cfg_kwargs)
     eng = LCMEngine(config=cfg, hermes_home=tmp)
     eng.on_session_start("proof-sess")
+
+    if args.real_model:
+        # Mimic what a live turn does: the LCM summarizer calls
+        # call_llm(task="compression") which resolves "auto" → the agent's CURRENT
+        # main runtime via set_runtime_main() (turn_context.py:95). A bare script
+        # has no AIAgent, so nothing populates that — without this the summarizer
+        # falls through to the openrouter/nous auto-detect chain (unhealthy
+        # off-gateway) and 400s. Register the requested model's provider/base_url/
+        # key as the "main runtime" so the real-model path resolves exactly as it
+        # would inside the gateway.
+        _register_runtime_for(args.real_model)
 
     pre = _tool_heavy_turn(args.pairs)
     print(f"input: {len(pre)} messages")
