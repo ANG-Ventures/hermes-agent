@@ -656,6 +656,11 @@ class ContextCompressor(ContextEngine):
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
         self.awaiting_real_usage_after_compression = False
+        # Reset P2 skew calibration at the session boundary — skew is per-conversation
+        # (the singleton engine serves every session), so a low ratio learned in one
+        # conversation must NOT scale down a fresh session's first preflight before it
+        # has its own real usage (Greptile #111). Fresh session → skew 1.0 = raw rough.
+        self.reset_skew_calibration()
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Clear per-session compaction state at a real session boundary.

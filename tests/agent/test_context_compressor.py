@@ -141,6 +141,75 @@ class TestCalibration:
         assert compressor._current_skew() == 0.7  # floored, not 0.4
         assert compressor.calibrated_tokens(100_000) == 70_000
 
+    def test_reset_clears_skew_across_sessions(self, compressor):
+        """Greptile #111: the engine is a process-global singleton, so a skew learned
+        in one conversation must NOT leak into a fresh session's first preflight."""
+        compressor._skew_floor = 0.6
+        compressor.note_rough_sent(100_000)
+        compressor.update_from_response({"prompt_tokens": 60_000, "completion_tokens": 10})
+        assert compressor._current_skew() <= 0.65  # low skew learned
+        compressor.reset_skew_calibration()
+        # Fresh session: skew back to 1.0 identity until THIS session pairs a reading.
+        assert compressor._current_skew() == 1.0
+        assert compressor.calibrated_tokens(776_594) == 776_594
+        assert compressor._last_rough_sent == 0
+        assert compressor.rough_at_last_real == 0
+
+    def test_on_session_reset_resets_skew(self, compressor):
+        """The session-boundary reset path clears skew (wired into on_session_reset)."""
+        compressor._skew_floor = 0.6
+        compressor.note_rough_sent(100_000)
+        compressor.update_from_response({"prompt_tokens": 60_000, "completion_tokens": 10})
+        assert compressor._current_skew() < 1.0
+        compressor.on_session_reset()
+        assert compressor._current_skew() == 1.0
+
+
+class TestCalibrationConfigWiring:
+    """Greptile #111: compression.skew_floor / compression.calibration_hard_frac
+    constructor kwargs must actually take effect when passed (the agent_init wiring
+    feeds these from config)."""
+
+    def test_config_skew_floor_applied(self):
+        c = ContextCompressor(model="claude-opus-4-8", skew_floor=0.85)
+        assert c._skew_floor == 0.85
+
+    def test_config_hard_frac_applied(self):
+        c = ContextCompressor(model="claude-opus-4-8", calibration_hard_frac=0.90)
+        assert c._hard_frac == 0.90
+
+    def test_config_defaults_when_unset(self):
+        c = ContextCompressor(model="claude-opus-4-8")
+        assert c._skew_floor == 0.7
+        assert c._hard_frac == 0.95
+
+    def test_config_invalid_falls_back_to_default(self):
+        # Out-of-range / non-numeric → safe default, never a degenerate scale.
+        c = ContextCompressor(model="claude-opus-4-8", skew_floor=1.5, calibration_hard_frac=0)
+        assert c._skew_floor == 0.7
+        assert c._hard_frac == 0.95
+
+
+class TestCalibratedStoreUsesCalibrated:
+    """Greptile #111: the preflight must store the CALIBRATED estimate into the
+    real-usage slot (last_prompt_tokens), not the raw rough — otherwise a failed
+    provider call leaves the inflated raw masquerading as real usage and a later
+    check over-compacts a request the calibrated path decided should fit.
+
+    This guards the value semantics directly (the turn_context wiring is exercised
+    by the 413/preflight integration tests)."""
+
+    def test_calibrated_below_raw_when_skew_low(self, compressor):
+        compressor._skew_floor = 0.6
+        compressor.note_rough_sent(100_000)
+        compressor.update_from_response({"prompt_tokens": 60_000, "completion_tokens": 10})
+        raw = 776_594
+        calibrated = compressor.calibrated_tokens(raw)
+        # The value the preflight stores must be the calibrated one, strictly < raw.
+        assert calibrated < raw
+        # And it reflects the provider's measured accounting, not the inflated guess.
+        assert abs(calibrated - int(round(raw * compressor._current_skew()))) <= 1
+
 
 
 class TestCompress:

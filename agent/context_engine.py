@@ -128,6 +128,14 @@ class ContextEngine(ABC):
     _HARD_FRAC_DEFAULT = 0.95
     _SKEW_HISTORY = 5
 
+    def reset_skew_calibration(self) -> None:
+        """Clear per-conversation skew state at a session boundary. The engine is a
+        process-global singleton, so a skew learned in one conversation must not leak
+        into the next session's first preflight (Greptile #111)."""
+        self._recent_skews = []
+        self._last_rough_sent = 0
+        self.rough_at_last_real = 0
+
     def note_rough_sent(self, rough_tokens: int) -> None:
         """Stash the rough estimate of the request about to be sent so the next
         ``record_skew_from_real``/``update_from_response`` pairs it with the real

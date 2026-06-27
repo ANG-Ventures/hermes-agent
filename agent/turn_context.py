@@ -265,13 +265,18 @@ def build_turn_context(
         # window ceiling (dense-paste / 413 guard). Replaces the removed
         # should_defer_preflight_to_real_usage ratchet.
         _compressor.note_rough_sent(_preflight_tokens)
+        _calibrated = _compressor.calibrated_tokens(_preflight_tokens)
         _last = _compressor.last_prompt_tokens
-        # Do NOT overwrite the -1 sentinel (#36718).
-        if _last >= 0 and _preflight_tokens > _last:
-            _compressor.last_prompt_tokens = _preflight_tokens
+        # Do NOT overwrite the -1 sentinel (#36718). Store the CALIBRATED estimate,
+        # not the raw rough: this value lands in the real-usage slot, so if the
+        # provider call fails before update_from_response replaces it, the stale
+        # value must reflect the provider's measured accounting — otherwise a later
+        # compression check would treat the ~21%-inflated raw as real and compact a
+        # request the calibrated path had just decided should fit (Greptile #111).
+        if _last >= 0 and _calibrated > _last:
+            _compressor.last_prompt_tokens = _calibrated
 
         if _compressor.should_compress_calibrated(_preflight_tokens):
-            _calibrated = _compressor.calibrated_tokens(_preflight_tokens)
             logger.info(
                 "Preflight compression: calibrated ~%s (raw ~%s × skew %.3f) >= %s "
                 "threshold (model %s, ctx %s)",

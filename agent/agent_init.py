@@ -1376,6 +1376,12 @@ def init_agent(
     compression_protect_first = max(
         0, int(_compression_cfg.get("protect_first_n", 3))
     )
+    # P2 "compact on the truth" calibration knobs. None ⇒ constructor defaults
+    # (skew_floor 0.7, calibration_hard_frac 0.95). Read here so config.yaml
+    # `compression.skew_floor` / `compression.calibration_hard_frac` actually take
+    # effect (Greptile #111: constructor kwargs were unwired).
+    _compression_skew_floor = _compression_cfg.get("skew_floor")
+    _compression_calibration_hard_frac = _compression_cfg.get("calibration_hard_frac")
     compression_abort_on_summary_failure = str(
         _compression_cfg.get("abort_on_summary_failure", False)
     ).lower() in {"true", "1", "yes"}
@@ -1561,6 +1567,14 @@ def init_agent(
 
     if _selected_engine is not None:
         agent.context_compressor = _selected_engine
+        # P2 calibration knobs for plugin engines (e.g. LCM). The calibration
+        # methods live on the ContextEngine ABC and read `_skew_floor`/`_hard_frac`
+        # via getattr-with-default; plugin __init__ doesn't set them, so apply the
+        # validated config values here or they'd silently run defaults (Greptile #111).
+        if isinstance(_compression_skew_floor, (int, float)) and 0.0 < float(_compression_skew_floor) <= 1.0:
+            agent.context_compressor._skew_floor = float(_compression_skew_floor)
+        if isinstance(_compression_calibration_hard_frac, (int, float)) and 0.0 < float(_compression_calibration_hard_frac) <= 1.0:
+            agent.context_compressor._hard_frac = float(_compression_calibration_hard_frac)
         # Resolve context_length for plugin engines — mirrors switch_model() path
         from agent.model_metadata import get_model_context_length
         _plugin_ctx_len = get_model_context_length(
@@ -1606,6 +1620,8 @@ def init_agent(
             per_model_threshold=_per_model,
             global_threshold_percent=_global_compression_threshold,
             codex_gpt55_autoraise=_codex_gpt55_autoraise,
+            skew_floor=_compression_skew_floor,
+            calibration_hard_frac=_compression_calibration_hard_frac,
         )
     agent.compression_enabled = compression_enabled
 

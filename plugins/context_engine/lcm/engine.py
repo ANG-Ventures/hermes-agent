@@ -2040,6 +2040,11 @@ class LCMEngine(ContextEngine):
         """
         self._reset_session_counters()
         self._reset_compaction_progress()
+        # P2: skew calibration is per-conversation; clear it at a real session
+        # boundary so a ratio learned in one conversation can't scale down a fresh
+        # session's first preflight (Greptile #111). NOT called on the compression
+        # boundary path (same conversation continuing → skew is still valid there).
+        self.reset_skew_calibration()
 
     def _apply_session_start_metadata(self, session_id: str, kwargs: Dict[str, Any]) -> None:
         self._session_id = session_id
