@@ -35,23 +35,44 @@ SYSTEM = (
     "save=true ONLY if you would call mem0_remember on this excerpt."
 )
 
-def decide(transcript, k, model="gpt-5-nano"):
-    body = json.dumps({
+def decide(transcript, k, model="gpt-5-nano", url="https://api.openai.com/v1/chat/completions", auth=True):
+    payload = {
         "model": model,
         "messages": [
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": "Conversation excerpt:\n" + transcript},
         ],
-        "response_format": {"type": "json_object"},
-    }).encode()
-    r = urllib.request.Request("https://api.openai.com/v1/chat/completions", data=body, method="POST",
-                               headers={"Authorization": f"Bearer {k}", "Content-Type": "application/json"})
-    resp = json.loads(urllib.request.urlopen(r, timeout=60).read())
-    txt = resp["choices"][0]["message"]["content"]
-    try:
-        return bool(json.loads(txt).get("save"))
-    except Exception:
-        return "save" in txt.lower() and "true" in txt.lower()
+    }
+    if "openai.com" in url:
+        payload["response_format"] = {"type": "json_object"}
+    body = json.dumps(payload).encode()
+    headers = {"Content-Type": "application/json"}
+    if auth:
+        headers["Authorization"] = f"Bearer {k}"
+    import time as _t
+    last = None
+    for attempt in range(8):
+        try:
+            r = urllib.request.Request(url, data=body, method="POST", headers=headers)
+            resp = json.loads(urllib.request.urlopen(r, timeout=60).read())
+            txt = resp["choices"][0]["message"]["content"]
+            import re
+            m = re.search(r"\{[^}]*\"save\"[^}]*\}", txt)
+            if m:
+                try:
+                    return bool(json.loads(m.group(0)).get("save"))
+                except Exception:
+                    pass
+            return "\"save\": true" in txt.lower() or '"save":true' in txt.lower()
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code in (429, 500, 502, 503, 529):
+                _t.sleep(6 * (attempt + 1)); continue
+            raise
+        except Exception as e:
+            last = e
+            _t.sleep(3); continue
+    raise last
 
 
 CLAUDE_URL = os.environ.get("SAVE_EVAL_CLAUDE_URL", "http://localhost:18810/anthropic/v1/messages")
@@ -103,9 +124,18 @@ def wilson_lb(k, n, z=1.96):
 
 def main():
     k = _key()
-    backend = os.environ.get("SAVE_EVAL_BACKEND", "claude")
-    decide_fn = (lambda t: decide_claude(t)) if backend == "claude" else (lambda t: decide(t, k))
-    print(f"backend: {backend} ({'claude-opus-4-8 (real fork model)' if backend=='claude' else 'gpt-5-nano'})")
+    backend = os.environ.get("SAVE_EVAL_BACKEND", "bpp")
+    if backend == "bpp":
+        decide_fn = lambda t: decide(t, k, model="claude-opus-4-8",
+                                     url="http://localhost:18811/v1/chat/completions", auth=False)
+        label = "claude-opus-4-8 via claude-bpp (real fork model)"
+    elif backend == "claude":
+        decide_fn = lambda t: decide_claude(t)
+        label = "claude-opus-4-8 via claude-pool (real fork model)"
+    else:
+        decide_fn = lambda t: decide(t, k)
+        label = "gpt-5-nano"
+    print(f"backend: {backend} ({label})")
     rows = [json.loads(l) for l in open(FIX) if l.strip()]
     genuine = [r for r in rows if r["expect"] == "save"]
     nosave = [r for r in rows if r["expect"] == "no_save"]
