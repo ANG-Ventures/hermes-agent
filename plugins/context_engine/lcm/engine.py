@@ -645,6 +645,12 @@ class LCMEngine(ContextEngine):
         self.last_cache_read_tokens = int(usage.get("cache_read_tokens", 0) or 0)
         self.last_cache_write_tokens = int(usage.get("cache_write_tokens", 0) or 0)
         self.last_reasoning_tokens = int(usage.get("reasoning_tokens", 0) or 0)
+        # Pair the skew (P2 "compact on the truth" calibration) — the real
+        # prompt_tokens / the rough estimate stashed for this request. Recorded on
+        # the shared ContextEngine base so should_compress_calibrated can scale the
+        # rough estimate to the provider's real accounting.
+        if self.last_prompt_tokens > 0:
+            self.record_skew_from_real(self.last_prompt_tokens)
 
     @property
     def cache_read_ratio(self) -> float:
