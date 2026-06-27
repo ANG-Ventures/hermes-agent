@@ -424,11 +424,16 @@ def _dedup_norm_hash(text: str) -> str:
     return hashlib.md5(norm.encode("utf-8")).hexdigest()
 
 
-# Dedup Tier-2 thresholds (D-7). Two-band: >= IDENTICAL -> safe skip; [THRESHOLD, IDENTICAL)
-# -> AMBIGUOUS -> WRITE anyway (DD-1: cosine is sign-blind, dropping the newer fact is
-# unrecoverable). Defaults; overridable via mem0.json (dedup_cosine_threshold / _identical).
+# Dedup Tier-2 thresholds (D-7, calibrated by eval/dedup_threshold_sweep.py 2026-06-27).
+# CALIBRATION FINDING: on this store, reworded-same-fact cosines (0.58–0.92) and
+# contradiction cosines (0.61–0.99) OVERLAP — there is NO cosine threshold that catches
+# paraphrase-dupes without ALSO swallowing contradictions (value-flips like "weight 0.02"
+# vs "0.10" embed at ~0.99). So Tier-2 cosine CANNOT safely auto-skip on a fidelity-first
+# store. Resolution (matches DD-1): IDENTICAL is set to 0.995 — a near-verbatim safety belt
+# that Tier-1 exact-hash already covers — so Tier-2 effectively NEVER auto-skips; the
+# ambiguous band always WRITES. Real semantic dedup is deferred to Tier-4 (LLM reconcile).
 _DEDUP_COSINE_THRESHOLD = 0.95
-_DEDUP_COSINE_IDENTICAL = 0.985
+_DEDUP_COSINE_IDENTICAL = 0.995
 
 
 def _dedup_cosine_band(top_score, threshold=_DEDUP_COSINE_THRESHOLD, identical=_DEDUP_COSINE_IDENTICAL):

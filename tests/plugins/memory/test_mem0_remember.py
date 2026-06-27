@@ -172,7 +172,7 @@ def test_tier1_exact_hash_skip(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("top_cos,expect_write,expect_tag", [
-    (0.99, False, "skipped_identical"),   # >= IDENTICAL -> skip
+    (0.997, False, "skipped_identical"),  # >= IDENTICAL (0.995) -> near-verbatim skip
     (0.97, True, "wrote_ambiguous"),      # ambiguous band -> WRITE (DD-1)
     (0.50, True, "wrote"),                # below floor -> plain write
 ])
