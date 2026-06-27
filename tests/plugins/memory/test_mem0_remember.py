@@ -1,0 +1,171 @@
+"""Tests for the mem0_remember background-review write helper + dedup ladder.
+
+Covers spec 2026-06-27_mem0-in-background-review (registry-tool path per Phase-0
+probe 0.2): the helper writes infer=False stamped write_origin=background_review,
+and the dedup ladder (Tier-1 exact-hash, Tier-2 two-band cosine) gates the write.
+"""
+
+import json
+import urllib.request
+from urllib.parse import urlparse
+
+import pytest
+
+from plugins.memory.mem0 import Mem0MemoryProvider, REMEMBER_SCHEMA
+
+
+class _HTTPResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self):
+        if self._payload is None:
+            return b""
+        return json.dumps(self._payload).encode("utf-8")
+
+
+def _json_body(request):
+    if not request.data:
+        return None
+    return json.loads(request.data.decode("utf-8"))
+
+
+def _provider(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MEM0_HOST", "http://mem0.test")
+    monkeypatch.setenv("MEM0_ADMIN_API_KEY", "admin-key")
+    monkeypatch.setenv("MEM0_USER_ID", "ace")
+    monkeypatch.setenv("MEM0_AGENT_ID", "apollo")
+    monkeypatch.delenv("MEM0_API_KEY", raising=False)
+    p = Mem0MemoryProvider()
+    p.initialize("test-session")
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Task 1.1 — schema shape
+# ---------------------------------------------------------------------------
+
+def test_remember_schema_shape():
+    assert REMEMBER_SCHEMA["name"] == "mem0_remember"
+    props = REMEMBER_SCHEMA["parameters"]["properties"]
+    assert "fact" in props
+    assert REMEMBER_SCHEMA["parameters"]["required"] == ["fact"]
+    # Must carry the salience rubric so the model knows WHEN to save.
+    desc = REMEMBER_SCHEMA["description"].lower()
+    assert "durable" in desc
+    assert "work-narration" in desc or "do not save" in desc
+
+
+# ---------------------------------------------------------------------------
+# Task 1.2 — dispatch: infer=False + write_origin=background_review
+# ---------------------------------------------------------------------------
+
+def test_remember_writes_infer_false_with_review_origin(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_urlopen(request, timeout=0, context=None):
+        path = urlparse(request.full_url).path
+        body = _json_body(request)
+        calls.append((request.get_method(), path, body))
+        if request.get_method() == "POST" and path == "/search":
+            # No prior dup -> empty results so the write proceeds.
+            return _HTTPResponse({"results": []})
+        if request.get_method() == "POST" and path == "/memories":
+            return _HTTPResponse({"results": [{"id": "m-new", "memory": "stored"}]})
+        raise AssertionError(f"unexpected {request.get_method()} {path}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    p = _provider(monkeypatch, tmp_path)
+
+    out = json.loads(p.handle_tool_call("mem0_remember", {"fact": "Ace's backup brokerage is Fidelity."}))
+    assert out.get("result") in ("Fact stored.", "stored")
+
+    writes = [c for c in calls if c[0] == "POST" and c[1] == "/memories"]
+    assert len(writes) == 1, f"expected exactly one write, got {calls}"
+    body = writes[0][2]
+    assert body.get("infer") is False
+    meta = body.get("metadata", {})
+    assert meta.get("write_origin") == "background_review"
+    assert meta.get("write_kind") == "deliberate"
+
+
+# ---------------------------------------------------------------------------
+# Task D1 — Tier 1 exact-hash skip (normalize before hash)
+# ---------------------------------------------------------------------------
+
+def test_dedup_norm_hash_normalizes():
+    from plugins.memory.mem0 import _dedup_norm_hash
+    assert _dedup_norm_hash("  Ace USES Schwab ") == _dedup_norm_hash("ace uses schwab")
+    assert _dedup_norm_hash("a b") != _dedup_norm_hash("a c")
+
+
+def test_tier1_exact_hash_skip(monkeypatch, tmp_path):
+    """A row already carrying the candidate's dedup_hash -> skip, no write."""
+    calls = []
+
+    def fake_urlopen(request, timeout=0, context=None):
+        path = urlparse(request.full_url).path
+        body = _json_body(request)
+        calls.append((request.get_method(), path, body))
+        if request.get_method() == "POST" and path == "/search":
+            # Tier-1 uses search_meta_filtered -> nested filters:{dedup_hash:...}.
+            from plugins.memory.mem0 import _dedup_norm_hash
+            h = _dedup_norm_hash("Ace uses Schwab")
+            if (body or {}).get("filters", {}).get("dedup_hash") == h:
+                return _HTTPResponse({"results": [{"id": "m-old", "memory": "Ace uses Schwab", "score": 1.0}]})
+            return _HTTPResponse({"results": []})
+        if request.get_method() == "POST" and path == "/memories":
+            return _HTTPResponse({"results": [{"id": "m-new"}]})
+        raise AssertionError(f"unexpected {request.get_method()} {path}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    p = _provider(monkeypatch, tmp_path)
+
+    out = json.loads(p.handle_tool_call("mem0_remember", {"fact": "  ace uses schwab  "}))
+    assert out.get("dedup") == "skipped_exacthash", out
+    writes = [c for c in calls if c[0] == "POST" and c[1] == "/memories"]
+    assert len(writes) == 0, "Tier-1 must skip the write on an exact-hash dup"
+
+
+# ---------------------------------------------------------------------------
+# Task D2 — Tier 2 two-band cosine
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("top_cos,expect_write,expect_tag", [
+    (0.99, False, "skipped_identical"),   # >= IDENTICAL -> skip
+    (0.97, True, "wrote_ambiguous"),      # ambiguous band -> WRITE (DD-1)
+    (0.50, True, "wrote"),                # below floor -> plain write
+])
+def test_tier2_two_band(monkeypatch, tmp_path, top_cos, expect_write, expect_tag):
+    calls = []
+
+    def fake_urlopen(request, timeout=0, context=None):
+        path = urlparse(request.full_url).path
+        body = _json_body(request)
+        calls.append((request.get_method(), path, body))
+        if request.get_method() == "POST" and path == "/search":
+            if "filters" in (body or {}):
+                return _HTTPResponse({"results": []})  # Tier-1 (meta-filtered) miss
+            # Tier-2 candidate retrieval -> return one candidate text.
+            return _HTTPResponse({"results": [{"id": "m-near", "memory": "a near candidate fact"}]})
+        if request.get_method() == "POST" and path == "/memories":
+            return _HTTPResponse({"results": [{"id": "m-new"}]})
+        raise AssertionError(f"unexpected {request.get_method()} {path}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    p = _provider(monkeypatch, tmp_path)
+    # Deterministic, offline: force the client-side cosine to the parametrized value.
+    monkeypatch.setattr(p, "_dedup_embed", lambda texts: [[1.0, 0.0]] + [[1.0, 0.0]] * (len(texts) - 1))
+    monkeypatch.setattr(type(p), "_dedup_cos", staticmethod(lambda a, b: top_cos))
+
+    out = json.loads(p.handle_tool_call("mem0_remember", {"fact": "some candidate fact"}))
+    writes = [c for c in calls if c[0] == "POST" and c[1] == "/memories"]
+    assert (len(writes) == 1) == expect_write, f"cos={top_cos} writes={len(writes)} out={out}"
+    assert out.get("dedup") == expect_tag, out
