@@ -156,47 +156,59 @@ def test_estimator_additivity_scattered_partition():
     assert worst <= 4   # two-bucket ceil-rounding worst case (validate tol is ≥ this)
 
 
-# ───────────────────────── gross-error guard denominator (Greptile P1, #109) ────
+# ───────────────────────── gross-error guard denominator (Greptile P1 ×2, #109) ──
 
-def test_gross_guard_uses_comp_side_kept_not_pre_side():
-    """Greptile P1: when signature matching fails, the A-floor's pre-side kept can be
-    0 while the REAL kept tail (comp-side kept_tokens) is large. The render-vs-degrade
-    guard must key off the comp-side magnitude (max(kept_tokens, _kept_pre_tokens)),
-    or it reads 'tiny → safe' on exactly the worst misattribution case.
-
-    This asserts the guard *quantity* the consumer uses (max of both), reproducing
-    the pathological stats shape directly so the fix is locked regardless of how the
-    consumer is refactored."""
-    # A-floor produced kept_pre=0 (no signature match) but comp kept tail is large.
+def test_gross_guard_uses_raw_tail_not_sanitized_or_pre_side():
+    """Greptile P1 (×2): the guard must key off the RAW kept-tail size
+    (raw_tail_tokens = estimator(messages[-fresh_tail_count:])), because:
+      - kept_tokens (comp-side, sanitized) is stripped SMALL on a heavily-sanitized tail
+      - _kept_pre_tokens is 0 when the signature match fails
+    so both can stay under 10% while the true raw kept tail is larger. The consumer
+    uses max(raw_tail_tokens, kept_tokens, _kept_pre_tokens) → raw_tail dominates."""
     big_pre = 600_000
-    big_kept_comp = 120_000        # 20% of pre — must DEGRADE
+    # Heavily-sanitized + match-failed: comp kept stripped to 5k, pre-side kept 0,
+    # but the RAW tail is 90k (15% of pre) → MUST degrade.
     stats = CompactionStats(
         pre_messages=500, post_messages=20, eligible_count=500,
         kept_messages=18, summary_messages=1, anchor_messages=1,
-        cleared_count=0, folded_count=500,           # all went to folded (no match)
-        pre_tokens=big_pre, post_tokens=big_kept_comp + 5000,
-        kept_tokens=big_kept_comp,                   # comp-side: the TRUE magnitude
+        cleared_count=0, folded_count=500,
+        pre_tokens=big_pre, post_tokens=10_000,
+        kept_tokens=5_000,                  # sanitized comp-side: deceptively small
         summary_tokens=4000, anchor_tokens=1000, cleared_tokens=0,
-        folded_tokens=big_pre,                       # pre-side folded == pre (kept_pre=0)
-        kept_pre_tokens=0, kept_pre_messages=0,      # pre-side kept collapsed to 0
+        folded_tokens=big_pre,
+        kept_pre_tokens=0, kept_pre_messages=0,   # match failed → 0
         approx_attribution=True,
+        raw_tail_tokens=90_000,             # RAW tail: the true magnitude (15% of pre)
     )
-    # the guard quantity = max(comp-side, pre-side) — comp-side dominates here
-    gross_tok = max(stats.kept_tokens or 0, stats._kept_pre_tokens or 0)
-    assert gross_tok == big_kept_comp                # NOT 0 (the bug)
-    gross_frac = gross_tok / stats.pre_tokens
-    assert gross_frac > 0.10                         # → consumer degrades to two-line
+    gross_tok = max(stats.raw_tail_tokens or 0, stats.kept_tokens or 0, stats._kept_pre_tokens or 0)
+    assert gross_tok == 90_000              # raw_tail dominates the stripped/zero values
+    assert (gross_tok / stats.pre_tokens) > 0.10   # → consumer degrades to two-line
+    # the OLD (broken) guard would have used kept_tokens(5k) or kept_pre(0) → 0.83% → WRONGLY render
+    assert (stats.kept_tokens / stats.pre_tokens) < 0.10  # proves the old guard was fooled
 
-    # within-bound real session (kept tail 7% of pre) still renders
+    # within-bound real session (raw tail ~7% of pre) still renders
     ok_stats = CompactionStats(
         pre_messages=500, post_messages=20, eligible_count=500,
         kept_messages=18, summary_messages=1, anchor_messages=1,
         cleared_count=0, folded_count=480,
         pre_tokens=650_000, post_tokens=50_000,
-        kept_tokens=42_000,                          # ~6.5% of pre
-        summary_tokens=7000, anchor_tokens=1000, cleared_tokens=0,
+        kept_tokens=42_000, summary_tokens=7000, anchor_tokens=1000, cleared_tokens=0,
         folded_tokens=608_000, kept_pre_tokens=42_000, kept_pre_messages=20,
-        approx_attribution=True,
+        approx_attribution=True, raw_tail_tokens=46_000,   # ~7% of pre
     )
-    ok_gross = max(ok_stats.kept_tokens or 0, ok_stats._kept_pre_tokens or 0)
+    ok_gross = max(ok_stats.raw_tail_tokens or 0, ok_stats.kept_tokens or 0, ok_stats._kept_pre_tokens or 0)
     assert (ok_gross / ok_stats.pre_tokens) < 0.10   # → renders (labeled approx)
+
+
+def test_build_inturn_sets_raw_tail_tokens_on_floor():
+    """build_inturn_stats populates raw_tail_tokens = estimator(pre[-fresh_tail_count:])
+    when the A-floor fires, so the consumer guard has the match-independent bound."""
+    pre = [{"role": "user", "content": f"u{i} " + ("w" * 40)} for i in range(60)]
+    # sanitized comp tail that won't signature-match → A-floor
+    comp = [{"role": "system", "content": "anchor"},
+            {"role": "assistant", "content": "[Recent Summary (d0, node 1)] x [Expand for details: y]",
+             "_lcm_summary": True}] + [{"role": "user", "content": f"strip{i}"} for i in range(5)]
+    stats = build_inturn_stats(messages=pre, compressed=comp, estimator=_est,
+                               engine_is_lcm=True, sanitize=None, fresh_tail_count=32)
+    assert stats.approx_attribution is True
+    assert stats.raw_tail_tokens == int(_est(pre[-32:]))   # raw suffix, match-independent

@@ -1212,14 +1212,18 @@ def compress_context(
                 # kept tail exceeds the gross-error threshold; otherwise show the
                 # granular split LABELED approximate + emit the observability marker.
                 if getattr(_cand, "approx_attribution", False):
-                    # Gross-error magnitude = the true kept-tail size, which is the
-                    # COMP-side kept_tokens (directly measured from `compressed`),
-                    # NOT _kept_pre_tokens: when signature matching fails the pre-side
-                    # kept can be 0 while the real kept tail is large, so keying the
-                    # guard to _kept_pre_tokens would read "tiny → safe" on exactly the
-                    # worst misattribution case (Greptile P1, PR #109). Use the max of
-                    # both so neither a zero pre-side nor a zero comp-side under-reports.
-                    _gross_tok = max(_cand.kept_tokens or 0, _cand._kept_pre_tokens or 0)
+                    # Gross-error magnitude = the RAW kept-tail size
+                    # (estimator(messages[-fresh_tail_count:]) — match- AND
+                    # sanitize-independent). kept_tokens (comp-side) is stripped small
+                    # on a heavily-sanitized tail and _kept_pre_tokens is 0 when the
+                    # signature match fails, so BOTH can under-report the true raw tail
+                    # (Greptile P1 ×2, PR #109). Use raw_tail_tokens as the primary
+                    # bound, with the other two as a floor in case it's unavailable.
+                    _gross_tok = max(
+                        _cand.raw_tail_tokens or 0,
+                        _cand.kept_tokens or 0,
+                        _cand._kept_pre_tokens or 0,
+                    )
                     _pre_tok = _cand.pre_tokens or 0
                     _gross_frac = (_gross_tok / _pre_tok) if _pre_tok > 0 else 0.0
                     if _gross_frac > _APPROX_GROSS_MAX_FRAC:

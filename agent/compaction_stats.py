@@ -101,6 +101,17 @@ class CompactionStats:
     # so a heavy session silently running the floor is observable, never silent.
     approx_attribution: bool = False
 
+    # ── RAW kept-tail token UPPER BOUND (in-turn A-floor guard) ──
+    # estimator(messages[-fresh_tail_count:]) — the raw (pre-sanitize) size of the
+    # tail region the engine keeps. This is the TRUE magnitude of the A-floor's
+    # possible gross misattribution, and unlike kept_tokens (sanitized comp-side,
+    # can be stripped small) or kept_pre_tokens (0 when signature match fails), it is
+    # match- AND sanitize-INDEPENDENT — computed straight from the raw input suffix.
+    # The render-vs-degrade guard keys off this so a heavily-sanitized large tail
+    # can't slip under the threshold (Greptile P1 ×2, PR #109). None on the aligned
+    # / legacy paths (guard only applies to the approx_attribution floor).
+    raw_tail_tokens: Optional[int] = None
+
     # NOTE: deliberately NO validation in __post_init__ (keeps any raise off the
     # hot path; callers invoke validate()/assert_reconciles() explicitly).
 
@@ -927,6 +938,7 @@ def build_inturn_stats(
     kept_pre_messages = None
     kept_pre_tokens = None
     approx_attribution = False
+    raw_tail_tokens = None
     cut = None
     if sanitize is not None and fresh_tail_count:
         cut = find_inturn_kept_cut(pre_msgs, kept_rows, sanitize, fresh_tail_count)
@@ -953,6 +965,14 @@ def build_inturn_stats(
         kept_pre_tokens = int(estimator(kept_pre_rows)) if kept_pre_rows else 0
         folded_count = len(fold_rows)
         approx_attribution = True
+        # RAW kept-tail upper bound for the caller's gross-error guard: the raw
+        # (pre-sanitize) size of the tail region the engine keeps. Match- AND
+        # sanitize-independent (computed from the raw suffix), so a heavily-stripped
+        # tail can't make the guard under-report (Greptile P1 ×2). Use the engine's
+        # fresh_tail_count when known, else the comp-side kept count as a proxy.
+        _tail_n = int(fresh_tail_count) if fresh_tail_count else kept_messages
+        if _tail_n > 0:
+            raw_tail_tokens = int(estimator(pre_msgs[-_tail_n:])) if pre_msgs else 0
 
     folded_tokens = int(estimator(fold_rows)) if fold_rows else 0
     # Optional tool/other sub-split of the folded population (derive-by-subtraction,
@@ -986,4 +1006,5 @@ def build_inturn_stats(
         folded_other_count=_foc,
         folded_other_tokens=_fot,
         approx_attribution=approx_attribution,
+        raw_tail_tokens=raw_tail_tokens,
     )
