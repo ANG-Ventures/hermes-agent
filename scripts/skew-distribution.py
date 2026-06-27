@@ -46,7 +46,7 @@ def _percentile(sorted_vals, pct: float) -> float:
 def _iter_lines(paths):
     for p in paths:
         try:
-            with open(p, "r", errors="replace") as fh:
+            with open(p, "r", encoding="utf-8", errors="replace") as fh:
                 for line in fh:
                     yield line
         except OSError:
