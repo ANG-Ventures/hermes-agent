@@ -153,3 +153,46 @@ class TestDupOnReplayFix:
         eng._ingest_messages(replay)
         # SACRED no-loss: the 2 genuinely-new turns must be ingested (dup-over-loss).
         assert eng._store.get_session_count("S") >= n0 + 2
+
+    def test_preserved_objective_outside_compaction_head_does_not_skip(self, tmp_path):
+        """Greptile #107 P1 (2nd): a genuinely-new replay (NO real compaction
+        scaffold) whose turns include a message starting with the weak
+        '[Current user objective preserved from compacted history]' prefix —
+        which _is_replayed_context_scaffold_message also matches — must NOT
+        trigger the overlap skip, even when the trailing turns coincidentally
+        match the stored tail. The skip is gated on the STRONG compaction
+        signal (LCM system note / summary-node), not the weak prefix."""
+        import sqlite3
+        eng, db = _engine(tmp_path)
+        A = {"role": "user", "content": "AAA"}
+        B = {"role": "assistant", "content": "BBB"}
+        PREFIX = "[Current user objective preserved from compacted history]"
+        eng._store.append_batch("S", _base(20) + [dict(A), dict(B)])
+        # replay: genuinely-new turns; one trips the WEAK scaffold prefix, then
+        # [A,B] that coincidentally match the stored tail — must be ingested.
+        replay = [{"role": "user", "content": PREFIX + " do next"}, dict(A), dict(B)]
+        eng._ingest_cursor_needs_reconcile = True
+        eng._ingest_messages(replay)
+        # the genuinely-new A and B must each now appear twice (stored + new),
+        # i.e. the overlap skip did NOT consume them.
+        con = sqlite3.connect(db)
+        assert con.execute("SELECT COUNT(*) FROM messages WHERE content='AAA'").fetchone()[0] == 2
+        assert con.execute("SELECT COUNT(*) FROM messages WHERE content='BBB'").fetchone()[0] == 2
+
+    def test_strong_vs_weak_scaffold_signal(self, tmp_path):
+        """The strong-scaffold gate recognizes the LCM system note + summary-node
+        rows, but NOT the weak preserved-objective prefix alone."""
+        eng, _ = _engine(tmp_path)
+        assert eng._is_strong_compaction_scaffold(
+            {"role": "system", "content": SCAFFOLD}
+        )
+        assert eng._is_strong_compaction_scaffold(
+            {"role": "assistant", "content": SUMMARY}
+        )
+        assert not eng._is_strong_compaction_scaffold(
+            {"role": "user",
+             "content": "[Current user objective preserved from compacted history] x"}
+        )
+        assert not eng._is_strong_compaction_scaffold(
+            {"role": "user", "content": "an ordinary turn"}
+        )

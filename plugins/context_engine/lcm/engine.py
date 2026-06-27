@@ -3435,16 +3435,6 @@ class LCMEngine(ContextEngine):
         if not new_messages or not self._session_id:
             return 0
 
-        # Scaffold-evidence gate: only fire for a post-compaction replay. Check
-        # the FULL replay (the scaffold system row is typically cut by the
-        # cursor before new_messages is sliced).
-        has_scaffold = any(
-            self._is_replayed_context_scaffold_message(msg)
-            for msg in (full_replay or new_messages)
-        )
-        if not has_scaffold:
-            return 0
-
         # Identities of the candidate rows. Skip scaffold rows AND summary-node
         # rows (the compaction summary assistant message), which are active
         # context only and never stored as durable transcript rows.
@@ -3456,6 +3446,52 @@ class LCMEngine(ContextEngine):
             and not self._matches_ignore_message_patterns(msg)
         ]
         if not candidate:
+            return 0
+
+        # 🔴 SCAFFOLD MUST BE IN THE HEAD THAT PRECEDES THE STORED-TAIL RUN
+        # (Greptile #107 P1, 2nd): the overlap skip is only safe for a genuine
+        # post-compaction replay, whose shape is [scaffold/summary head] +
+        # [already-stored fresh tail]. So the scaffold evidence must sit in the
+        # head BEFORE the first candidate row — every new_messages row up to the
+        # first candidate must be scaffold/summary-only, and the head (incl. the
+        # part of full_replay that precedes new_messages) must contain real
+        # scaffold evidence. `_is_replayed_context_scaffold_message` also matches
+        # a preserved-objective message regardless of role/position; if such a
+        # message appears INTERLEAVED with genuinely-new turns (not as a clean
+        # compaction head), this gate must NOT fire, or we'd drop real new rows
+        # that coincidentally match the stored tail.
+        first_candidate_idx = candidate[0][0]
+        head_before_run = new_messages[:first_candidate_idx]
+        # Every row before the first candidate must be scaffold/summary scaffolding
+        # (i.e. the candidate run starts immediately after a pure scaffold head).
+        if any(
+            not self._is_replayed_context_scaffold_message(msg)
+            and not self._is_summary_node_replay_message(msg)
+            for msg in head_before_run
+        ):
+            return 0
+        # And real scaffold evidence must exist in that head — either in the
+        # rows preceding new_messages within the full replay (the scaffold system
+        # row is typically cut by the cursor) or in head_before_run itself.
+        # 🔴 Require the STRONG compaction signal (the LCM system note or an
+        # actual summary-node row), NOT the weak preserved-objective prefix
+        # alone: a genuinely-new user turn can legitimately start with
+        # "[Current user objective preserved from compacted history]" and
+        # `_is_replayed_context_scaffold_message` matches it regardless of
+        # role/position, so trusting it as proof-of-replay drops real new rows
+        # (Greptile #107 P1, 2nd). The strong signal only appears in a true
+        # post-compaction active context.
+        replay_head = list(full_replay or [])
+        if new_messages:
+            cut = len(replay_head) - len(new_messages)
+            preceding = replay_head[:cut] if cut > 0 else []
+        else:
+            preceding = replay_head
+        has_scaffold = any(
+            self._is_strong_compaction_scaffold(msg)
+            for msg in (list(preceding) + list(head_before_run))
+        )
+        if not has_scaffold:
             return 0
 
         try:
@@ -3505,6 +3541,27 @@ class LCMEngine(ContextEngine):
         # to the last matched candidate row).
         last_matched_new_idx = candidate[best - 1][0]
         return last_matched_new_idx + 1
+
+    def _is_strong_compaction_scaffold(self, msg: Dict[str, Any]) -> bool:
+        """Return true ONLY for the strong post-compaction active-context markers.
+
+        Unlike ``_is_replayed_context_scaffold_message`` (which also matches the
+        weak ``[Current user objective preserved from compacted history]``
+        prefix that a genuinely-new user turn could legitimately start with),
+        this recognizes only signals that appear EXCLUSIVELY in a real
+        post-compaction active context: the LCM system note, or a synthesized
+        summary-node row. Used to gate the stored-tail overlap skip so a
+        non-compaction replay carrying a preserved-objective message can never
+        trigger a (data-losing) overlap skip. (Greptile #107 P1, 2nd.)
+        """
+        role = str(msg.get("role") or "")
+        content = normalize_content_value(msg.get("content")) or ""
+        if role == "system" and (
+            "[Note: This conversation uses Lossless Context Management (LCM)." in content
+            and "Earlier turns have been compacted into hierarchical summaries below." in content
+        ):
+            return True
+        return self._is_summary_node_replay_message(msg)
 
     @staticmethod
     def _is_summary_node_replay_message(msg: Dict[str, Any]) -> bool:
