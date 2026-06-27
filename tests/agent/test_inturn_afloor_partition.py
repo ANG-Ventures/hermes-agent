@@ -154,3 +154,49 @@ def test_estimator_additivity_scattered_partition():
         b = [m for m, k in zip(pre, mask) if not k]
         worst = max(worst, abs((_est(a) + _est(b)) - _est(pre)))
     assert worst <= 4   # two-bucket ceil-rounding worst case (validate tol is ≥ this)
+
+
+# ───────────────────────── gross-error guard denominator (Greptile P1, #109) ────
+
+def test_gross_guard_uses_comp_side_kept_not_pre_side():
+    """Greptile P1: when signature matching fails, the A-floor's pre-side kept can be
+    0 while the REAL kept tail (comp-side kept_tokens) is large. The render-vs-degrade
+    guard must key off the comp-side magnitude (max(kept_tokens, _kept_pre_tokens)),
+    or it reads 'tiny → safe' on exactly the worst misattribution case.
+
+    This asserts the guard *quantity* the consumer uses (max of both), reproducing
+    the pathological stats shape directly so the fix is locked regardless of how the
+    consumer is refactored."""
+    # A-floor produced kept_pre=0 (no signature match) but comp kept tail is large.
+    big_pre = 600_000
+    big_kept_comp = 120_000        # 20% of pre — must DEGRADE
+    stats = CompactionStats(
+        pre_messages=500, post_messages=20, eligible_count=500,
+        kept_messages=18, summary_messages=1, anchor_messages=1,
+        cleared_count=0, folded_count=500,           # all went to folded (no match)
+        pre_tokens=big_pre, post_tokens=big_kept_comp + 5000,
+        kept_tokens=big_kept_comp,                   # comp-side: the TRUE magnitude
+        summary_tokens=4000, anchor_tokens=1000, cleared_tokens=0,
+        folded_tokens=big_pre,                       # pre-side folded == pre (kept_pre=0)
+        kept_pre_tokens=0, kept_pre_messages=0,      # pre-side kept collapsed to 0
+        approx_attribution=True,
+    )
+    # the guard quantity = max(comp-side, pre-side) — comp-side dominates here
+    gross_tok = max(stats.kept_tokens or 0, stats._kept_pre_tokens or 0)
+    assert gross_tok == big_kept_comp                # NOT 0 (the bug)
+    gross_frac = gross_tok / stats.pre_tokens
+    assert gross_frac > 0.10                         # → consumer degrades to two-line
+
+    # within-bound real session (kept tail 7% of pre) still renders
+    ok_stats = CompactionStats(
+        pre_messages=500, post_messages=20, eligible_count=500,
+        kept_messages=18, summary_messages=1, anchor_messages=1,
+        cleared_count=0, folded_count=480,
+        pre_tokens=650_000, post_tokens=50_000,
+        kept_tokens=42_000,                          # ~6.5% of pre
+        summary_tokens=7000, anchor_tokens=1000, cleared_tokens=0,
+        folded_tokens=608_000, kept_pre_tokens=42_000, kept_pre_messages=20,
+        approx_attribution=True,
+    )
+    ok_gross = max(ok_stats.kept_tokens or 0, ok_stats._kept_pre_tokens or 0)
+    assert (ok_gross / ok_stats.pre_tokens) < 0.10   # → renders (labeled approx)

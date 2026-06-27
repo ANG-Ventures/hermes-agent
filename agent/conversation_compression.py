@@ -1212,15 +1212,22 @@ def compress_context(
                 # kept tail exceeds the gross-error threshold; otherwise show the
                 # granular split LABELED approximate + emit the observability marker.
                 if getattr(_cand, "approx_attribution", False):
-                    _kept_pre_tok = _cand._kept_pre_tokens
+                    # Gross-error magnitude = the true kept-tail size, which is the
+                    # COMP-side kept_tokens (directly measured from `compressed`),
+                    # NOT _kept_pre_tokens: when signature matching fails the pre-side
+                    # kept can be 0 while the real kept tail is large, so keying the
+                    # guard to _kept_pre_tokens would read "tiny → safe" on exactly the
+                    # worst misattribution case (Greptile P1, PR #109). Use the max of
+                    # both so neither a zero pre-side nor a zero comp-side under-reports.
+                    _gross_tok = max(_cand.kept_tokens or 0, _cand._kept_pre_tokens or 0)
                     _pre_tok = _cand.pre_tokens or 0
-                    _gross_frac = (_kept_pre_tok / _pre_tok) if _pre_tok > 0 else 0.0
+                    _gross_frac = (_gross_tok / _pre_tok) if _pre_tok > 0 else 0.0
                     if _gross_frac > _APPROX_GROSS_MAX_FRAC:
                         # split could be materially wrong → honest two-line degrade
                         _warn_compaction_stats_once(
                             agent,
                             f"COMPACTION_STATS_APPROX_ATTRIBUTION in-turn "
-                            f"degraded (kept_pre {_kept_pre_tok} / pre {_pre_tok} "
+                            f"degraded (kept_tail {_gross_tok} / pre {_pre_tok} "
                             f"= {_gross_frac:.1%} > {_APPROX_GROSS_MAX_FRAC:.0%}); two-line",
                         )
                         _inturn_stats = None
@@ -1232,7 +1239,7 @@ def compress_context(
                         _warn_compaction_stats_once(
                             agent,
                             f"COMPACTION_STATS_APPROX_ATTRIBUTION in-turn "
-                            f"(engine={_engine_name}; kept_pre {_kept_pre_tok} / "
+                            f"(engine={_engine_name}; kept_tail {_gross_tok} / "
                             f"pre {_pre_tok} = {_gross_frac:.1%})",
                         )
                 else:
