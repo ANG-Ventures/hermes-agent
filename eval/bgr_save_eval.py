@@ -20,7 +20,7 @@ sys.path.insert(0, "/Users/alexgierczyk/.hermes/worktrees/bgr-mem0")
 from agent.background_review import _MEMORY_REVIEW_PROMPT, _MEMORY_REVIEW_MEM0_CLAUSE
 
 def _key():
-    for line in open("/Users/alexgierczyk/.hermes/.env"):
+    for line in open("/Users/alexgierczyk/.hermes/.env", encoding="utf-8"):
         if line.startswith("OPENAI" + "_API_" + "KEY="):
             return line.split("=", 1)[1].strip()
     return os.environ.get("OPENAI_API_KEY", "")
@@ -136,7 +136,7 @@ def main():
         decide_fn = lambda t: decide(t, k)
         label = "gpt-5-nano"
     print(f"backend: {backend} ({label})")
-    rows = [json.loads(l) for l in open(FIX) if l.strip()]
+    rows = [json.loads(l) for l in open(FIX, encoding="utf-8") if l.strip()]
     genuine = [r for r in rows if r["expect"] == "save"]
     nosave = [r for r in rows if r["expect"] == "no_save"]
 

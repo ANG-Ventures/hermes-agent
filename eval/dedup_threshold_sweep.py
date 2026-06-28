@@ -20,7 +20,7 @@ import json, os, sys, urllib.request, math
 FIX = os.path.join(os.path.dirname(__file__), "fixtures", "dedup_pairs.jsonl")
 
 def _key():
-    for line in open("/Users/alexgierczyk/.hermes/.env"):
+    for line in open("/Users/alexgierczyk/.hermes/.env", encoding="utf-8"):
         if line.startswith("OPENAI" + "_API_" + "KEY="):
             return line.split("=", 1)[1].strip()
     return os.environ.get("OPENAI_API_KEY", "")
@@ -39,7 +39,7 @@ def main():
     k = _key()
     if not k:
         print("no OPENAI key"); sys.exit(2)
-    pairs = [json.loads(l) for l in open(FIX) if l.strip()]
+    pairs = [json.loads(l) for l in open(FIX, encoding="utf-8") if l.strip()]
     # batch-embed all texts
     flat = []
     for p in pairs:
