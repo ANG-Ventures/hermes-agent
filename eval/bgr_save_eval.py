@@ -148,6 +148,32 @@ def main():
         decide_fn = lambda t: decide(t, k)
         label = "gpt-5-nano"
     print(f"backend: {backend} ({label})")
+
+    # Preflight: fail EARLY with a clear, actionable message instead of crash-looping
+    # on connection-refused (CI / a checkout without the local claude relay). The
+    # default backend uses the fork's real model (claude-opus-4-8) via a relay; a
+    # bare OPENAI_API_KEY does NOT reach it — that's the gpt5nano backend (weak,
+    # non-representative; see BGR-SAVE-EVAL-RESULT.md).
+    if backend in ("bpp", "claude"):
+        probe_url = ("http://localhost:18811/v1/chat/completions" if backend == "bpp"
+                     else CLAUDE_URL)
+        try:
+            import socket
+            from urllib.parse import urlparse as _up
+            u = _up(probe_url)
+            socket.create_connection((u.hostname, u.port or 80), timeout=3).close()
+        except Exception:
+            print(f"ERROR: backend '{backend}' needs a reachable claude relay at "
+                  f"{probe_url}, which is not up. This gate runs against the fork's "
+                  f"REAL model (claude-opus-4-8); a bare OPENAI_API_KEY does not reach "
+                  f"it. Options: point SAVE_EVAL_CLAUDE_URL at a reachable relay, or "
+                  f"run the non-representative gpt-5-nano path with "
+                  f"SAVE_EVAL_BACKEND=gpt5nano (requires OPENAI_API_KEY).")
+            sys.exit(2)
+    elif not k:
+        print("ERROR: gpt5nano backend requires OPENAI_API_KEY in the environment.")
+        sys.exit(2)
+
     rows = [json.loads(l) for l in open(FIX, encoding="utf-8") if l.strip()]
     genuine = [r for r in rows if r["expect"] == "save"]
     nosave = [r for r in rows if r["expect"] == "no_save"]
