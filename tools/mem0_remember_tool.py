@@ -58,6 +58,17 @@ def mem0_remember_tool(fact: str, **kwargs) -> str:
     if not fact:
         return tool_error("Missing required parameter: fact")
     provider = _get_write_provider()
+    # ENFORCE the single-tenant assumption the shared cached provider rests on
+    # (see _get_write_provider docstring): refuse to write unless pin_user_id is on,
+    # so every write is pinned to the one canonical user_id. On a multi-tenant mem0
+    # (pin_user_id=false, >1 user_id) the shared provider could cross namespaces — so
+    # fail CLOSED there rather than silently writing to the default/wrong user.
+    if not getattr(provider, "_pin_user_id", False):
+        return tool_error(
+            "mem0_remember is disabled: it requires pin_user_id=true (single-tenant "
+            "pinning). On a multi-tenant store the per-call user_id must be threaded "
+            "instead of using a shared provider. Refusing to write to avoid a "
+            "cross-namespace leak.")
     return provider.handle_tool_call("mem0_remember", {"fact": fact})
 
 

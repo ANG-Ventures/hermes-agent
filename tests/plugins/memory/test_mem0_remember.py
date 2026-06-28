@@ -100,6 +100,32 @@ def test_remember_writes_infer_false_with_review_origin(monkeypatch, tmp_path):
 # Task 1.3 — registry-tool registration (denied-not-absent)
 # ---------------------------------------------------------------------------
 
+def test_mem0_remember_fails_closed_without_pin_user_id():
+    """Greptile P1: the shared cached provider is only safe single-tenant. The tool
+    must REFUSE to write when pin_user_id is off (multi-tenant → would cross
+    namespaces), not silently write to the default user."""
+    import tools.mem0_remember_tool as trt
+
+    class _ProvPinOff:
+        _pin_user_id = False
+        def handle_tool_call(self, *a, **k):
+            raise AssertionError("must not reach write when pin_user_id is off")
+
+    class _ProvPinOn:
+        _pin_user_id = True
+        def handle_tool_call(self, name, args):
+            return '{"result": "Fact stored.", "dedup": "wrote"}'
+
+    trt._provider = _ProvPinOff()
+    out = trt.mem0_remember_tool(fact="Ace prefers X")
+    assert "disabled" in out.lower() and "pin_user_id" in out
+
+    trt._provider = _ProvPinOn()
+    out2 = trt.mem0_remember_tool(fact="Ace prefers X")
+    assert "stored" in out2.lower()
+    trt._provider = None  # reset cache for other tests
+
+
 def test_mem0_remember_is_registry_tool_in_memory_write_toolset():
     """mem0_remember registers in its OWN toolset 'memory_write' (NOT 'memory'),
     so it's parent-resident (cache-stable) but denied in the fork whose whitelist
