@@ -30,14 +30,24 @@ _provider_lock = threading.Lock()
 
 
 def _get_write_provider():
+    """Lazily build ONE process-wide manager-free provider for review writes.
+
+    SINGLE-TENANT ASSUMPTION (deliberate): this fleet runs mem0 with
+    ``pin_user_id=true`` (the S2 unification invariant), so every write is pinned
+    to the one canonical ``user_id`` regardless of which session/agent produced it
+    — ``agent_id`` is a provenance stamp, not an access boundary, and recall filters
+    on ``user_id`` only. A single cached provider is therefore correct here: there is
+    no second tenant to leak into. If this code is ever deployed on a MULTI-TENANT
+    mem0 (pin_user_id=false with >1 user_id), revisit — the write would then need the
+    active session's user_id threaded per-call instead of a shared instance. (Same
+    trigger as the documented [H1]/[H2] dispositions in skill mem0-selfhost-ops.)
+    """
     global _provider
     with _provider_lock:
         if _provider is not None:
             return _provider
         from plugins.memory.mem0 import Mem0MemoryProvider
         p = Mem0MemoryProvider()
-        # initialize() reads config/env and is idempotent; user_id is pinned to the
-        # canonical id by the plugin's own pin logic (pin_user_id).
         p.initialize("background-review-mem0-write")
         _provider = p
         return _provider

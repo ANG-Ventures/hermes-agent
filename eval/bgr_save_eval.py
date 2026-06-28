@@ -15,15 +15,27 @@ import json, os, sys, urllib.request, urllib.error, math
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures", "bgr_save_fixtures.jsonl")
 
-# Import the REAL clause + rubric the fork uses.
-sys.path.insert(0, "/Users/alexgierczyk/.hermes/worktrees/bgr-mem0")
+# Import the REAL clause + rubric the fork uses. Resolve the repo root from THIS file
+# (eval/ lives at the repo root), so it runs from any checkout, not an author-local path.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO_ROOT)
 from agent.background_review import _MEMORY_REVIEW_PROMPT, _MEMORY_REVIEW_MEM0_CLAUSE
 
 def _key():
-    for line in open("/Users/alexgierczyk/.hermes/.env", encoding="utf-8"):
-        if line.startswith("OPENAI" + "_API_" + "KEY="):
-            return line.split("=", 1)[1].strip()
-    return os.environ.get("OPENAI_API_KEY", "")
+    # Environment first (works on any machine / CI); the personal .env is an
+    # optional fallback for the author's box and must never crash when absent.
+    k = os.environ.get("OPENAI_API_KEY", "")
+    if k:
+        return k
+    env_path = os.path.expanduser("~/.hermes/.env")
+    try:
+        with open(env_path, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("OPENAI" + "_API_" + "KEY="):
+                    return line.split("=", 1)[1].strip()
+    except FileNotFoundError:
+        pass
+    return ""
 
 SYSTEM = (
     "You are the background self-improvement review pass of an AI assistant. You read a short "

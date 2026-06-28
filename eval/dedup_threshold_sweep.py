@@ -20,10 +20,18 @@ import json, os, sys, urllib.request, math
 FIX = os.path.join(os.path.dirname(__file__), "fixtures", "dedup_pairs.jsonl")
 
 def _key():
-    for line in open("/Users/alexgierczyk/.hermes/.env", encoding="utf-8"):
-        if line.startswith("OPENAI" + "_API_" + "KEY="):
-            return line.split("=", 1)[1].strip()
-    return os.environ.get("OPENAI_API_KEY", "")
+    # Environment first (CI/any machine); personal .env is an optional, non-crashing fallback.
+    k = os.environ.get("OPENAI_API_KEY", "")
+    if k:
+        return k
+    try:
+        with open(os.path.expanduser("~/.hermes/.env"), encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("OPENAI" + "_API_" + "KEY="):
+                    return line.split("=", 1)[1].strip()
+    except FileNotFoundError:
+        pass
+    return ""
 
 def embed(texts, k):
     body = json.dumps({"model": "text-embedding-3-small", "input": texts}).encode()
