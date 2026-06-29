@@ -114,12 +114,19 @@ class TestShouldExclude:
         """Apple's AdditionalDocumentation (extracted from a local Xcode) is Apple IP and must
         never enter the backup zip. The mobile-design/swiftui-skills skill reads them in-place
         from the live Xcode.app and never copies them — this is the belt against a stray copy
-        landing under a swiftui-docs/ dir. Backup ignores .gitignore, so the exclude must be here."""
+        landing under the skill's own swiftui-docs/ dir. Backup ignores .gitignore, so the
+        exclude must be here. SCOPED (parent/child) so a coincidental user dir named
+        swiftui-docs elsewhere is still backed up."""
         from hermes_cli.backup import _should_exclude
+        # IP copy under the skill's own dir → excluded (any depth above the skill)
         assert _should_exclude(Path("skills-shared/mobile-design/swiftui-skills/swiftui-docs/SwiftUI.md"))
-        assert _should_exclude(Path("swiftui-docs/Observation.md"))
+        assert _should_exclude(Path("swiftui-skills/swiftui-docs/Observation.md"))
         # a normal skill file in the same skill is NOT excluded
         assert not _should_exclude(Path("skills-shared/mobile-design/swiftui-skills/SKILL.md"))
+        # 🔴 a coincidental user dir named swiftui-docs NOT under swiftui-skills IS preserved
+        # (Greptile P2: a bare-name exclude would silently drop user data)
+        assert not _should_exclude(Path("workspace/my-notes/swiftui-docs/cheatsheet.md"))
+        assert not _should_exclude(Path("swiftui-docs/random-user-file.md"))
 
     def test_excludes_sqlite_sidecars(self):
         """SQLite WAL/SHM/journal sidecars must not ship alongside the
