@@ -28,7 +28,9 @@ logger = logging.getLogger(__name__)
 QMD_DEFAULTS: Dict[str, Any] = {
     "enabled": False,
     "url": "http://[::1]:8181/mcp",
-    "qmd_total_deadline_s": 4.0,   # whole-operation wall-clock deadline (INV-4)
+    "qmd_total_deadline_s": 6.0,   # whole-operation wall-clock deadline (INV-4); 6s catches
+                                   # real warm hybrid+rerank latency (measured 2.3-5.3s live,
+                                   # 2026-06-30) with margin, still bounded under the 10s join
     "mem0_budget_s": 6.0,          # the mem0 leg's own budget (INV-4a); +deadline <= join 10s
     "min_score": 0.5,             # provisional; post-rerank score (m1)
     "prefetch_limit": 3,
