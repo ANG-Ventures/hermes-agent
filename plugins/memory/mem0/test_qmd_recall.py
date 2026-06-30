@@ -33,6 +33,8 @@ def test_config_defaults_when_absent():
     assert cfg["exclude_path_globs"] == []
     assert cfg["intent_min_tokens"] == 1
     assert cfg["prefetch_rerank"] is True
+    assert cfg["use_rerank_score_floor"] is False
+    assert cfg["rerank_score_min"] == 0.50
     # budgets fit the join ceiling (INV-4a)
     # The runtime clamp (eff_deadline = min(qmd_deadline, join - mem0_elapsed - 0.25)) is what
     # actually guarantees the two legs never exceed the join ceiling — the nominal knobs need not
@@ -113,6 +115,39 @@ def test_parse_min_score_filters():
     payload = json.loads(FIXTURE.read_text())
     # an impossibly-high floor drops everything
     assert qr.parse_qmd_results(payload, min_score=2.0) == []
+
+
+def test_parse_semantic_floor_uses_rerank_score_not_blended_score():
+    payload = {"result": {"structuredContent": {"results": [
+        {"file": "obsidian/semantic.md", "title": "semantic", "score": 0.10, "rerankScore": 0.82, "line": 1, "docid": "#a"},
+        {"file": "obsidian/positional.md", "title": "positional", "score": 0.99, "rerankScore": 0.20, "line": 2, "docid": "#b"},
+        {"file": "obsidian/missing.md", "title": "missing", "score": 0.99, "line": 3, "docid": "#c"},
+        {"file": "obsidian/null.md", "title": "null", "score": 0.99, "rerankScore": None, "line": 4, "docid": "#d"},
+    ]}}}
+    hits = qr.parse_qmd_results(
+        payload,
+        min_score=0.95,               # ignored by semantic mode; blended score is display-only
+        use_rerank_score_floor=True,
+        rerank_score_min=0.50,
+    )
+    assert [h["file"] for h in hits] == ["obsidian/semantic.md"]
+    assert hits[0]["score"] == 0.10   # rendered score remains QMD's blended display score
+
+
+def test_build_query_args_semantic_floor_requests_explain_and_disables_blended_prefilter():
+    default_args = qr.build_qmd_query_args(
+        "local dns split", limit=3, min_score=0.45, collections=["obsidian"], rerank=True
+    )
+    assert default_args["minScore"] == 0.45
+    assert "explain" not in default_args
+
+    semantic_args = qr.build_qmd_query_args(
+        "local dns split", limit=3, min_score=0.45, collections=["obsidian"], rerank=True,
+        use_rerank_score_floor=True,
+    )
+    assert semantic_args["minScore"] == 0.0
+    assert semantic_args["explain"] is True
+    assert semantic_args["collections"] == ["obsidian"]
 
 
 def test_parse_exclude_globs_drops_match():
