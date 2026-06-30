@@ -26,6 +26,10 @@ from typing import Callable, Dict, List, Optional, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Module-level guard for lazily creating each adapter's per-instance reaction-seq
+# lock (the lazy-init itself must be race-free across the journal thread pool).
+_REACTION_SEQ_INIT_LOCK = threading.Lock()
+
 
 class _Snowflake:
     """Minimal object exposing ``.id`` — satisfies discord.py's Snowflake
@@ -1846,35 +1850,50 @@ class DiscordAdapter(BasePlatformAdapter):
     def _next_reaction_seq(self) -> int:
         """Monotonic per-key-safe sequence for journal events. Seeded once from
         the existing journal's last seq so a gateway restart never rewinds the
-        counter (which would make the core reject post-restart events as stale)."""
-        seq = getattr(self, "_reaction_seq", None)
-        if seq is None:
-            seq = 0
-            path = getattr(self, "_reaction_journal_path", None)
-            try:
-                if path and os.path.exists(path):
-                    with open(path, "r", encoding="utf-8") as fh:
-                        for line in fh:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                obj = json.loads(line)
-                                if not isinstance(obj, dict):
-                                    continue  # a non-dict line carries no seq
-                                s = int(obj.get("seq", 0))
-                                if s > seq:
-                                    seq = s
-                            except (ValueError, TypeError, AttributeError):
-                                # malformed line / non-int seq — skip it, never let
-                                # one bad line abort seeding (which would leave
-                                # _reaction_seq unset and silence the journal).
-                                continue
-            except OSError:
+        counter (which would make the core reject post-restart events as stale).
+
+        Thread-safe: called from a thread pool (via run_in_executor), so the
+        read-increment-write is guarded by a lock — otherwise two concurrent
+        burst events could mint the SAME seq and the core would drop one as a
+        duplicate/stale (silent loss)."""
+        lock = getattr(self, "_reaction_seq_lock", None)
+        if lock is None:
+            # First-call init is itself racy; create the lock under a class-level
+            # guard so all threads converge on one lock instance.
+            with _REACTION_SEQ_INIT_LOCK:
+                lock = getattr(self, "_reaction_seq_lock", None)
+                if lock is None:
+                    lock = threading.Lock()
+                    self._reaction_seq_lock = lock
+        with lock:
+            seq = getattr(self, "_reaction_seq", None)
+            if seq is None:
                 seq = 0
-        seq += 1
-        self._reaction_seq = seq
-        return seq
+                path = getattr(self, "_reaction_journal_path", None)
+                try:
+                    if path and os.path.exists(path):
+                        with open(path, "r", encoding="utf-8") as fh:
+                            for line in fh:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                try:
+                                    obj = json.loads(line)
+                                    if not isinstance(obj, dict):
+                                        continue  # a non-dict line carries no seq
+                                    s = int(obj.get("seq", 0))
+                                    if s > seq:
+                                        seq = s
+                                except (ValueError, TypeError, AttributeError):
+                                    # malformed line / non-int seq — skip it, never
+                                    # let one bad line abort seeding (which would
+                                    # leave _reaction_seq unset, silencing writes).
+                                    continue
+                except OSError:
+                    seq = 0
+            seq += 1
+            self._reaction_seq = seq
+            return seq
 
     async def _emit_reaction_journal(self, payload: Any, action: str) -> None:
         """Async wrapper: offload the blocking journal write to a thread so a

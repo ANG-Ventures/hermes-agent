@@ -130,6 +130,34 @@ def test_seq_seeding_survives_non_dict_lines(tmp_path):
     assert _lines(journal)[-1]["action"] == "add"
 
 
+def test_concurrent_seq_calls_are_unique(tmp_path):
+    # The seq generator is called from a thread pool (run_in_executor). Two
+    # concurrent burst events must NEVER mint the same seq, or the core drops one
+    # as a duplicate/stale → silent loss. Hammer it from many threads and assert
+    # every returned seq is distinct.
+    import threading as _t
+    journal = tmp_path / "reactions.jsonl"
+    s = _stub(journal)
+    out = []
+    out_lock = _t.Lock()
+    barrier = _t.Barrier(16)
+
+    def worker():
+        barrier.wait()  # maximize overlap on the read-increment-write
+        for _ in range(50):
+            v = s._next_reaction_seq()
+            with out_lock:
+                out.append(v)
+
+    threads = [_t.Thread(target=worker) for _ in range(16)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert len(out) == len(set(out)), "duplicate seq minted under concurrency"
+    assert sorted(out) == list(range(1, len(out) + 1)), "seqs not a clean monotonic run"
+
+
 def test_no_path_is_noop(tmp_path):
     journal = tmp_path / "reactions.jsonl"
     s = types.SimpleNamespace(name="discord", _reaction_journal_path=None)
