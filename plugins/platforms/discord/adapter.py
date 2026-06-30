@@ -976,6 +976,15 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             intents.voice_states = True
 
+            # Reaction journal (opt-in): only request the (non-privileged)
+            # reactions intent when a journal path is configured. This lets a
+            # downstream consumer durably capture raw reaction transitions
+            # (reaction_state / seed_triage). Default off → no behavior change
+            # and no extra gateway traffic for anyone who hasn't opted in.
+            self._reaction_journal_path = self.config.extra.get("reaction_journal") or None
+            if self._reaction_journal_path:
+                intents.reactions = True
+
             # Resolve proxy (DISCORD_PROXY > generic env vars > macOS system proxy)
             from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_bot
             proxy_url = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
@@ -1180,6 +1189,20 @@ class DiscordAdapter(BasePlatformAdapter):
                         else f"moved {before.channel.name} -> {after.channel.name}",
                         guild_id,
                     )
+
+            # Reaction journal (opt-in via discord.reaction_journal): append one
+            # JSON line per RAW reaction transition. Raw events fire regardless of
+            # message cache, so a reaction on an old/un-cached card is still
+            # captured. Schema matches the reaction_state core's journal contract:
+            # {channel_id, message_id, emoji, user_id, action, seq, ts}.
+            if self._reaction_journal_path:
+                @self._client.event
+                async def on_raw_reaction_add(payload):
+                    adapter_self._append_reaction_journal(payload, "add")
+
+                @self._client.event
+                async def on_raw_reaction_remove(payload):
+                    adapter_self._append_reaction_journal(payload, "remove")
 
             # Register slash commands
             if self._slash_commands:
@@ -1812,6 +1835,64 @@ class DiscordAdapter(BasePlatformAdapter):
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
         return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
+
+    def _next_reaction_seq(self) -> int:
+        """Monotonic per-key-safe sequence for journal events. Seeded once from
+        the existing journal's last seq so a gateway restart never rewinds the
+        counter (which would make the core reject post-restart events as stale)."""
+        seq = getattr(self, "_reaction_seq", None)
+        if seq is None:
+            seq = 0
+            path = getattr(self, "_reaction_journal_path", None)
+            try:
+                if path and os.path.exists(path):
+                    with open(path, "r", encoding="utf-8") as fh:
+                        for line in fh:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                s = int(json.loads(line).get("seq", 0))
+                                if s > seq:
+                                    seq = s
+                            except (ValueError, TypeError):
+                                continue
+            except OSError:
+                seq = 0
+        seq += 1
+        self._reaction_seq = seq
+        return seq
+
+    def _append_reaction_journal(self, payload: Any, action: str) -> None:
+        """Append one raw reaction transition to the configured journal, in the
+        reaction_state core's schema. Best-effort: a journal hiccup must never
+        crash the gateway's event loop (this runs inside a discord.py handler)."""
+        path = getattr(self, "_reaction_journal_path", None)
+        if not path:
+            return
+        try:
+            emoji = getattr(payload, "emoji", None)
+            # Standard emoji -> unicode char; custom -> "name:id" (matches the
+            # canonical Discord form the core stores verbatim).
+            emoji_id = getattr(emoji, "id", None)
+            if emoji_id:
+                emoji_str = f"{getattr(emoji, 'name', '')}:{emoji_id}"
+            else:
+                emoji_str = str(getattr(emoji, "name", emoji) or "")
+            event = {
+                "channel_id": str(getattr(payload, "channel_id", "")),
+                "message_id": str(getattr(payload, "message_id", "")),
+                "emoji": emoji_str,
+                "user_id": str(getattr(payload, "user_id", "")),
+                "action": action,
+                "seq": self._next_reaction_seq(),
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception as e:  # noqa: BLE001 - never let a journal error kill the loop
+            logger.debug("[%s] reaction-journal append soft-fail: %s", self.name, e)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction for normal Discord message events."""
