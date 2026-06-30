@@ -1198,11 +1198,11 @@ class DiscordAdapter(BasePlatformAdapter):
             if self._reaction_journal_path:
                 @self._client.event
                 async def on_raw_reaction_add(payload):
-                    adapter_self._append_reaction_journal(payload, "add")
+                    await adapter_self._emit_reaction_journal(payload, "add")
 
                 @self._client.event
                 async def on_raw_reaction_remove(payload):
-                    adapter_self._append_reaction_journal(payload, "remove")
+                    await adapter_self._emit_reaction_journal(payload, "remove")
 
             # Register slash commands
             if self._slash_commands:
@@ -1852,16 +1852,32 @@ class DiscordAdapter(BasePlatformAdapter):
                             if not line:
                                 continue
                             try:
-                                s = int(json.loads(line).get("seq", 0))
+                                obj = json.loads(line)
+                                if not isinstance(obj, dict):
+                                    continue  # a non-dict line carries no seq
+                                s = int(obj.get("seq", 0))
                                 if s > seq:
                                     seq = s
-                            except (ValueError, TypeError):
+                            except (ValueError, TypeError, AttributeError):
+                                # malformed line / non-int seq — skip it, never let
+                                # one bad line abort seeding (which would leave
+                                # _reaction_seq unset and silence the journal).
                                 continue
             except OSError:
                 seq = 0
         seq += 1
         self._reaction_seq = seq
         return seq
+
+    async def _emit_reaction_journal(self, payload: Any, action: str) -> None:
+        """Async wrapper: offload the blocking journal write to a thread so a
+        burst of reaction events can never stall the gateway's asyncio loop."""
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None, self._append_reaction_journal, payload, action)
+        except Exception as e:  # noqa: BLE001 - never let it bubble into the loop
+            logger.debug("[%s] reaction-journal emit soft-fail: %s", self.name, e)
 
     def _append_reaction_journal(self, payload: Any, action: str) -> None:
         """Append one raw reaction transition to the configured journal, in the
@@ -1888,7 +1904,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 "seq": self._next_reaction_seq(),
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
-            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            # makedirs once per process (the dir persists after the first write).
+            if not getattr(self, "_reaction_journal_dir_created", False):
+                os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+                self._reaction_journal_dir_created = True
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(event, ensure_ascii=False) + "\n")
         except Exception as e:  # noqa: BLE001 - never let a journal error kill the loop

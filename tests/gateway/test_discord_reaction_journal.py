@@ -89,6 +89,25 @@ def test_seq_resumes_above_existing_journal_max(tmp_path):
     assert s._next_reaction_seq() == 9
 
 
+def test_seq_seeding_survives_non_dict_lines(tmp_path):
+    # P1 regression: a valid-JSON-but-non-dict line (bare string/number/array) must
+    # NOT raise AttributeError out of seeding — which would leave _reaction_seq unset
+    # and permanently silence the journal for the rest of the process. The bad lines
+    # are skipped; the real max seq still wins.
+    journal = tmp_path / "reactions.jsonl"
+    journal.write_text(
+        json.dumps("just a string") + "\n"      # non-dict
+        + json.dumps([1, 2, 3]) + "\n"          # non-dict
+        + "42\n"                                # bare number
+        + json.dumps({"seq": 5}) + "\n",        # the real one
+        encoding="utf-8")
+    s = _stub(journal)
+    assert s._next_reaction_seq() == 6  # 5+1, not crashed, not reset to 1
+    # and a subsequent append actually writes (journal not silenced)
+    s._append_reaction_journal(_Payload("C1", "M1", "U1", _Emoji("✅")), "add")
+    assert _lines(journal)[-1]["action"] == "add"
+
+
 def test_no_path_is_noop(tmp_path):
     journal = tmp_path / "reactions.jsonl"
     s = types.SimpleNamespace(name="discord", _reaction_journal_path=None)
