@@ -231,7 +231,7 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://platform.claude.com/docs/en/about-claude/pricing",
         pricing_version="anthropic-pricing-2026-05",
     ),
-    # Claude Sonnet 5 (released 2026-06-30). List price $3/$15; cache read $0.20.
+    # Claude Sonnet 5 (released 2026-06-30). List price $3/$15; cache read $0.30 (0.1x input).
     # Intro pricing $2/$10 in/out runs through 2026-08-31 — the cost-book uses the
     # standing LIST rate (as the rest of this table does), so it does not under-count
     # once intro ends. Subscription relays (claude-app/-api-proxy/-bridge/-bpp) price
@@ -243,7 +243,7 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     ): PricingEntry(
         input_cost_per_million=Decimal("3.00"),
         output_cost_per_million=Decimal("15.00"),
-        cache_read_cost_per_million=Decimal("0.20"),
+        cache_read_cost_per_million=Decimal("0.30"),
         cache_write_cost_per_million=Decimal("3.75"),
         source="official_docs_snapshot",
         source_url="https://platform.claude.com/docs/en/about-claude/pricing",
