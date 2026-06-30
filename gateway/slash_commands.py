@@ -3570,6 +3570,37 @@ class GatewaySlashCommandsMixin:
             lines.append("Complete your top-up in the browser — credits will appear in /credits shortly.")
         return "\n".join(lines)
 
+    def _compact_account_limit_lines(self) -> list:
+        """Build the compact '📈 Account limits' block (one line per subscription).
+
+        DRY: loads the SAME ~/.hermes/scripts/claude_usage_lib.py that powers the
+        full /claude-usage report and calls its render_compact_lines() — so the
+        set of subscriptions (all Claude subs + Codex) tracks automatically with
+        the registry. Returns [] (header omitted) when nothing is available so
+        the caller can fall back to the single-provider snapshot. Never raises.
+        """
+        try:
+            import importlib.util
+            import os
+
+            lib_path = os.path.expanduser("~/.hermes/scripts/claude_usage_lib.py")
+            if not os.path.isfile(lib_path):
+                return []
+            spec = importlib.util.spec_from_file_location("claude_usage_lib", lib_path)
+            if spec is None or spec.loader is None:
+                return []
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            render = getattr(mod, "render_compact_lines", None)
+            if render is None:
+                return []
+            sub_lines = render() or []
+            if not sub_lines:
+                return []
+            return ["📈 **Account limits**", *sub_lines]
+        except Exception:
+            return []
+
     def _context_breakdown_lines(self, agent, source) -> list:
         """Render the per-category context breakdown for /usage.
 
@@ -3736,11 +3767,20 @@ class GatewaySlashCommandsMixin:
             provider = provider or persisted.get("billing_provider")
             base_url = base_url or persisted.get("billing_base_url")
 
-        # Fetch account usage off the event loop so slow provider APIs don't
-        # block the gateway. Failures are non-fatal -- account_lines stays [].
+        # Account limits — the DRY compact multi-subscription block (one line per
+        # sub: all Claude subs + Codex), sourced from the SAME claude_usage_lib
+        # render the full /claude-usage uses, so add/remove a subscription and
+        # both surfaces track automatically. Falls back to the single-provider
+        # snapshot when the shared lib isn't available. Off the event loop;
+        # fail-open (account_lines stays []).
         account_lines: list[str] = []
         credits_lines: list[str] = []
-        if provider:
+        try:
+            account_lines = await asyncio.to_thread(self._compact_account_limit_lines)
+        except Exception:
+            account_lines = []
+        if not account_lines and provider:
+            # Fallback: the resident provider's own snapshot (legacy single-sub).
             try:
                 account_snapshot = await asyncio.to_thread(
                     fetch_account_usage,
@@ -3771,13 +3811,15 @@ class GatewaySlashCommandsMixin:
         if agent and hasattr(agent, "session_total_tokens") and agent.session_api_calls > 0:
             lines = []
 
-            # Rate limits (when available from provider headers)
+            # Rate limits (provider throttling headroom) are surfaced DOWN next to
+            # the Account-limits section (both are "how close am I to a ceiling"),
+            # not at the top — see below. Compute the line here while the resident
+            # agent is in hand.
+            rate_limit_line = None
             rl_state = agent.get_rate_limit_state()
             if rl_state and rl_state.has_data:
                 from agent.rate_limit_tracker import format_rate_limit_compact
-                lines.append(t("gateway.usage.rate_limits", state=format_rate_limit_compact(rl_state)))
-                # No trailing blank here — the last-turn card below starts with its
-                # own leading blank line, so adding one would double-space.
+                rate_limit_line = t("gateway.usage.rate_limits", state=format_rate_limit_compact(rl_state))
 
             # The full last-turn card (PRD usage-format-codex Part A) is the SAME
             # renderer /context uses, and already carries Model / Agent / Session /
@@ -3818,6 +3860,12 @@ class GatewaySlashCommandsMixin:
             except Exception:
                 card = []
             if card:
+                # The shared card carries a leading blank line (it normally
+                # follows the rate-limits line). Now that the card is the FIRST
+                # block in /usage, drop that leading blank so the output doesn't
+                # open on an empty line.
+                if card and card[0] == "":
+                    card = card[1:]
                 lines.extend(card)
 
             # Per-category context breakdown (estimated — chars/4 heuristic).
@@ -3832,8 +3880,14 @@ class GatewaySlashCommandsMixin:
                 lines.append("")
                 lines.extend(breakdown_lines)
 
-            if account_lines:
+            # Rate limits + Account limits together — both answer "how close am I
+            # to a ceiling": rate limits = provider throttling headroom (this
+            # minute/hour), account limits = subscription quota (5h/7d windows).
+            if rate_limit_line or account_lines:
                 lines.append("")
+            if rate_limit_line:
+                lines.append(rate_limit_line)
+            if account_lines:
                 lines.extend(account_lines)
             if credits_lines:
                 lines.append("")

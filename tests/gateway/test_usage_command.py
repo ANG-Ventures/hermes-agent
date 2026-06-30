@@ -187,6 +187,14 @@ class TestUsageAccountSection:
         runner = _make_runner(SK, cached_agent=agent)
         event = MagicMock()
 
+        # Force the single-provider FALLBACK path this test covers: the DRY
+        # compact block (render_compact_lines via claude_usage_lib) returns []
+        # so /usage falls back to fetch_account_usage. (Stubbed because the codex
+        # snapshot reader bypasses the test sandbox and would otherwise return a
+        # real host snapshot.)
+        monkeypatch.setattr(
+            runner, "_compact_account_limit_lines", lambda: [],
+        )
         monkeypatch.setattr(
             "gateway.slash_commands.fetch_account_usage",
             lambda provider, base_url=None, api_key=None: object(),
@@ -204,7 +212,7 @@ class TestUsageAccountSection:
             mock_cost.return_value = MagicMock(amount_usd=None, status="included")
             result = await runner._handle_usage_command(event)
 
-        # The account-limits section is appended below the last-turn card.
+        # The account-limits section (single-provider fallback) appears below the card.
         assert "📈 **Account limits**" in result
         assert "Provider: openai-codex (Pro)" in result
 
@@ -235,6 +243,9 @@ class TestUsageAccountSection:
             return fn(*args, **kwargs)
 
         monkeypatch.setattr("gateway.run.asyncio.to_thread", _fake_to_thread)
+        # Force the single-provider fallback (DRY compact block returns []) so the
+        # persisted-provider fetch path under test is exercised deterministically.
+        monkeypatch.setattr(runner, "_compact_account_limit_lines", lambda: [])
         monkeypatch.setattr(
             "gateway.slash_commands.fetch_account_usage",
             lambda provider, base_url=None, api_key=None: object(),
@@ -257,6 +268,38 @@ class TestUsageAccountSection:
         assert account_call["kwargs"]["base_url"] == "https://chatgpt.com/backend-api/codex"
         assert "📊 **Session Info**" in result
         assert "📈 **Account limits**" in result
+
+    @pytest.mark.asyncio
+    async def test_compact_account_block_and_rate_limit_ordering(self, monkeypatch):
+        """The DRY compact multi-sub block renders, with the rate-limit line
+        directly ABOVE the Account-limits header (both are 'ceiling' info)."""
+        agent = _make_mock_agent()
+        runner = _make_runner(SK, cached_agent=agent)
+        session_entry = MagicMock()
+        session_entry.session_id = "sess-cmp"
+        runner.session_store.get_or_create_session.return_value = session_entry
+        runner.session_store.load_transcript.return_value = [{"role": "user", "content": "hi"}]
+        event = MagicMock()
+
+        # Stub the compact block (the DRY render_compact_lines path) deterministically.
+        monkeypatch.setattr(
+            runner, "_compact_account_limit_lines",
+            lambda: ["📈 **Account limits**",
+                     "✅ Claude (Max 20x): 73% used (5h · resets Tue 14:40)",
+                     "⚠️ OpenAI Codex (Pro): 81% used (7d · resets Sun 23:00)"],
+        )
+        with patch("agent.rate_limit_tracker.format_rate_limit_compact",
+                   return_value="Requests/min: 3388/4000 left"), \
+             patch("agent.account_usage.nous_credits_lines", lambda markdown=False: []):
+            result = await runner._handle_usage_command(event)
+
+        assert "📈 **Account limits**" in result
+        assert "Claude (Max 20x): 73% used" in result
+        assert "OpenAI Codex (Pro): 81% used" in result
+        # Rate-limit line sits directly above the Account-limits header.
+        rl_i = result.index("Rate Limits")
+        acct_i = result.index("📈 **Account limits**")
+        assert rl_i < acct_i, "rate limits must render above account limits"
 
 
 class TestUsageLastTurnSnapshot:
