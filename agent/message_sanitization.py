@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 # below as well as by run_agent and the CLI for paste-from-clipboard
 # scrubbing.
 _SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
+_INTERRUPT_CLOSE_CONTENT = "Operation interrupted."
 
 
 def _sanitize_surrogates(text: str) -> str:
@@ -386,7 +387,8 @@ def close_interrupted_tool_sequence(messages: list, final_response: Any = None) 
     text = final_response if isinstance(final_response, str) else ""
     messages.append({
         "role": "assistant",
-        "content": text.strip() or "Operation interrupted.",
+        "content": text.strip() or _INTERRUPT_CLOSE_CONTENT,
+        "_interrupt_close": True,
     })
     return True
 
