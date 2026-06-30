@@ -15,6 +15,28 @@ import types
 from plugins.platforms.discord.adapter import DiscordAdapter
 
 
+def test_yaml_config_bridges_reaction_journal_to_env(monkeypatch):
+    # config.yaml `discord.reaction_journal: <path>` must reach the adapter, which
+    # reads it from the DISCORD_REACTION_JOURNAL env var (the adapter is env-driven
+    # by convention). Without this bridge the feature is silently dead.
+    from plugins.platforms.discord.adapter import _apply_yaml_config
+    monkeypatch.delenv("DISCORD_REACTION_JOURNAL", raising=False)
+    yaml_cfg = {"discord": {"reaction_journal": "/tmp/r.jsonl"}}
+    _apply_yaml_config(yaml_cfg, yaml_cfg["discord"])
+    import os
+    assert os.environ.get("DISCORD_REACTION_JOURNAL") == "/tmp/r.jsonl"
+
+
+def test_yaml_config_env_takes_precedence(monkeypatch):
+    # An explicit env var must survive a config.yaml value (matches every other
+    # discord key's precedence contract).
+    import os
+    monkeypatch.setenv("DISCORD_REACTION_JOURNAL", "/preset")
+    from plugins.platforms.discord.adapter import _apply_yaml_config
+    _apply_yaml_config({"discord": {"reaction_journal": "/yaml"}}, {"reaction_journal": "/yaml"})
+    assert os.environ["DISCORD_REACTION_JOURNAL"] == "/preset"
+
+
 def _stub(journal_path):
     """A bare object carrying just what the journal methods touch, with the two
     real DiscordAdapter methods bound to it (avoids the full adapter ctor)."""
@@ -134,12 +156,18 @@ def test_journal_is_ingestible_by_reaction_state_core(tmp_path):
     import importlib.util
     from importlib.machinery import SourceFileLoader
     import sys
-    core_path = (tmp_path.home() / ".hermes" / "greenhouse" / "deployed"
-                 / "reaction-state" / "current")
-    if not core_path.exists():
+    # The core lives in the greenhouse-tools repo, not this checkout. Find any
+    # real reaction_state.py (worktree or deployed version dir); skip if absent.
+    gh = tmp_path.home() / ".hermes" / "greenhouse"
+    core_path = None
+    if gh.exists():
+        for cand in sorted(gh.glob("**/tools/reaction_state.py")):
+            if cand.is_file():
+                core_path = cand
+                break
+    if core_path is None:
         import pytest
         pytest.skip("reaction_state core not present in this checkout")
-    # the core file has no .py extension; load it explicitly via SourceFileLoader
     loader = SourceFileLoader("reaction_state", str(core_path))
     spec = importlib.util.spec_from_loader("reaction_state", loader)
     rs = importlib.util.module_from_spec(spec)

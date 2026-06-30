@@ -981,7 +981,14 @@ class DiscordAdapter(BasePlatformAdapter):
             # downstream consumer durably capture raw reaction transitions
             # (reaction_state / seed_triage). Default off → no behavior change
             # and no extra gateway traffic for anyone who hasn't opted in.
-            self._reaction_journal_path = self.config.extra.get("reaction_journal") or None
+            # Env-driven like the rest of this adapter: config.yaml
+            # ``discord.reaction_journal`` is translated to DISCORD_REACTION_JOURNAL
+            # by _apply_yaml_config (the apply_yaml_config_fn hook).
+            self._reaction_journal_path = (
+                os.getenv("DISCORD_REACTION_JOURNAL")
+                or self.config.extra.get("reaction_journal")
+                or None
+            )
             if self._reaction_journal_path:
                 intents.reactions = True
 
@@ -7418,6 +7425,12 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         if isinstance(ic, list):
             ic = ",".join(str(v) for v in ic)
         os.environ["DISCORD_IGNORED_CHANNELS"] = str(ic)
+    # reaction_journal: opt-in path to append raw reaction transitions to, in the
+    # reaction_state core's journal schema (durable triage state). Empty/unset =
+    # feature off (no reactions intent requested).
+    rj = discord_cfg.get("reaction_journal")
+    if rj is not None and not os.getenv("DISCORD_REACTION_JOURNAL"):
+        os.environ["DISCORD_REACTION_JOURNAL"] = str(rj)
     # allowed_channels: if set, bot ONLY responds in these channels (whitelist)
     ac = discord_cfg.get("allowed_channels")
     if ac is not None and not os.getenv("DISCORD_ALLOWED_CHANNELS"):
