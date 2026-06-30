@@ -1043,6 +1043,7 @@ class Mem0MemoryProvider(MemoryProvider):
             return
 
         def _run():
+            t_start = time.monotonic()
             try:
                 client = self._get_client()
                 # INV-8(ii) PREFETCH profile (the every-turn hot path). Ace's call
@@ -1077,16 +1078,30 @@ class Mem0MemoryProvider(MemoryProvider):
                 self._record_failure()
                 logger.debug("Mem0 prefetch failed: %s", e)
 
-            # INV-7: QMD leg is intent-gated (prefetch only) and bounded by its OWN
-            # wall-clock deadline; failures NEVER touch the mem0 block above.
+            # INV-4a/AC12: the mem0 leg has its OWN budget. If mem0 already overran it,
+            # the join ceiling is at risk — skip QMD entirely rather than stack a second
+            # multi-second leg on top of a slow mem0 (a slow mem0 must not be made worse
+            # by QMD). When mem0 was fast, the QMD leg gets the smaller of its own
+            # deadline and the time actually remaining before the join ceiling, so the
+            # two legs combined can never blow prefetch_join_timeout_s (INV-7).
             try:
-                if self._qmd_enabled and qmd_recall.is_lookup_intent(
-                    query, int(self._qmd_cfg.get("intent_min_tokens", 4))
+                mem0_budget = float(self._qmd_cfg.get("mem0_budget_s", 6.0))
+                mem0_elapsed = time.monotonic() - t_start
+                qmd_deadline = float(self._qmd_cfg.get("qmd_total_deadline_s", 4.0))
+                remaining = float(self._prefetch_join_timeout_s) - mem0_elapsed - 0.25
+                eff_deadline = min(qmd_deadline, remaining)
+                if (
+                    self._qmd_enabled
+                    and mem0_elapsed <= mem0_budget
+                    and eff_deadline >= 0.5
+                    and qmd_recall.is_lookup_intent(
+                        query, int(self._qmd_cfg.get("intent_min_tokens", 4))
+                    )
                 ):
                     hits = self._qmd_pointers(
                         query,
                         limit=int(self._qmd_cfg.get("prefetch_limit", 3)),
-                        deadline_s=float(self._qmd_cfg.get("qmd_total_deadline_s", 4.0)),
+                        deadline_s=eff_deadline,
                     )
                     block = qmd_recall.render_qmd_block(hits)
                     if block:
