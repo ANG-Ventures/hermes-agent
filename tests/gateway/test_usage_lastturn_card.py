@@ -132,14 +132,16 @@ def _demo_rec():
     }
 
 
-def test_compressions_row_after_cached():
-    """• Compressions: N renders immediately after the • Cached row."""
+def test_card_row_order_cached_before_context_window():
+    """Cached row sits ABOVE the Context-window row; Compressions follows."""
     from plugins.blackbox.last_turn import render_last_turn_record
     lines = render_last_turn_record(_demo_rec(), compressions=3)
     assert "• Compressions: 3" in lines
     cached_i = next(i for i, l in enumerate(lines) if l.startswith("• Cached:"))
+    ctx_i = next(i for i, l in enumerate(lines) if l.startswith("• Context window"))
     comp_i = next(i for i, l in enumerate(lines) if l.startswith("• Compressions:"))
-    assert comp_i == cached_i + 1, "Compressions must sit directly after Cached"
+    assert cached_i < ctx_i, "Cached must render above Context window"
+    assert ctx_i < comp_i, "Compressions follows the Context-window row"
 
 
 def test_compressions_row_omitted_when_none_or_zero():

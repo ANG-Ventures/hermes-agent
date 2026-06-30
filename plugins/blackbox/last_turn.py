@@ -314,6 +314,16 @@ def render_last_turn_record(rec: Dict[str, Any], compressions: "int | None" = No
             f"{_humanize_tok(int(lc_write or 0))} cache-write + "
             f"{_humanize_tok(int(lc_unc or 0))} uncached)"
         )
+
+    # Cached row sits ABOVE the Context-window row (Ace 2026-06-30): cache-hit
+    # rate then occupancy reads more naturally than the reverse.
+    cache_r = int(rec.get("cache_read", 0) or 0)
+    cache_w = int(rec.get("cache_write", 0) or 0)
+    prompt_total = in_tok + cache_r + cache_w
+    if prompt_total > 0 and cache_r:
+        cpct = cache_r / prompt_total * 100
+        lines.append(f"• Cached: {_humanize_tok(cache_r)}/{_humanize_tok(prompt_total)} {_cache_health(cpct)} {cpct:.0f}%")
+
     if length > 0:
         pct = used / length * 100
         lines.append(
@@ -322,13 +332,6 @@ def render_last_turn_record(rec: Dict[str, Any], compressions: "int | None" = No
         )
     elif used:
         lines.append(f"• Context window (last call): {_humanize_tok(used)}")
-
-    cache_r = int(rec.get("cache_read", 0) or 0)
-    cache_w = int(rec.get("cache_write", 0) or 0)
-    prompt_total = in_tok + cache_r + cache_w
-    if prompt_total > 0 and cache_r:
-        cpct = cache_r / prompt_total * 100
-        lines.append(f"• Cached: {_humanize_tok(cache_r)}/{_humanize_tok(prompt_total)} {_cache_health(cpct)} {cpct:.0f}%")
 
     try:
         _comp = int(compressions or 0)
