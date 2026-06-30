@@ -17937,13 +17937,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     reason_phrase=_reason_phrase,
                 )
                 if _surface_and_ask:
+                    agent._resume_summary_only = True
                     logger.info(
                         "RESUME_SUMMARY session_key=%s reason=%s history_len=%d",
                         session_key,
                         _reason,
                         len(agent_history or []),
                     )
+                else:
+                    agent._resume_summary_only = False
             elif _has_fresh_tool_tail:
+                agent._resume_summary_only = False
                 _persist_user_message_override = message
                 message = (
                     "[System note: A new message has arrived. The conversation "
@@ -17952,6 +17956,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "below FIRST. Do NOT re-execute old tool calls from the history.]\n\n"
                     + message
                 )
+            else:
+                agent._resume_summary_only = False
 
             # Consume one-shot /reload-skills note (if the user ran
             # /reload-skills since their last turn in this session). Same
