@@ -31,7 +31,7 @@ def test_config_defaults_when_absent():
     assert cfg["collections"] == ["obsidian", "skills", "plans", "projects"]
     assert "sessions" not in cfg["collections"] and "memories" not in cfg["collections"]
     assert cfg["exclude_path_globs"] == []
-    assert cfg["intent_min_tokens"] == 4
+    assert cfg["intent_min_tokens"] == 1
     assert cfg["prefetch_rerank"] is True
     # budgets fit the join ceiling (INV-4a)
     # The runtime clamp (eff_deadline = min(qmd_deadline, join - mem0_elapsed - 0.25)) is what
@@ -48,22 +48,33 @@ def test_config_overrides_merge():
 
 
 # ---- Task 2: intent gate (AC3, D-9/INV-7) ---------------------------------
+# The token-count floor defaults to 1 (the leader-word set is the real gate); these tests
+# exercise the SHIPPED default so a future floor bump that re-breaks short lookups is caught.
+_MT = qr.QMD_DEFAULTS["intent_min_tokens"]
+
+
 @pytest.mark.parametrize("q", [
     "where did we decide the local dns split",
     "is there a skill that covers reolink doorbell audio",
     "find the spec for the greenhouse nightly seeds build",
     "what did we conclude about the hdmi splitter edid",
+    # short, specific lookups the old min_tokens=4 floor wrongly dropped (the blocked.local.ace miss):
+    "reolink doorbell voice",
+    "local dns split",
+    "blocked.local.ace",
+    "unifi",
 ])
 def test_intent_true_for_lookups(q):
-    assert qr.is_lookup_intent(q, 4) is True
+    assert qr.is_lookup_intent(q, _MT) is True
 
 
 @pytest.mark.parametrize("q", [
+    # affirmations / imperatives — caught by the LEADER set regardless of length:
     "yes", "ok", "thanks", "ship it", "do it", "fix line 12", "go ahead",
-    "yes do that", "", "   ", "perfect, ship it",
+    "yes do that", "", "   ", "perfect, ship it", "run it", "no", "stop", "commit",
 ])
 def test_intent_false_for_non_lookups(q):
-    assert qr.is_lookup_intent(q, 4) is False
+    assert qr.is_lookup_intent(q, _MT) is False
 
 
 # ---- Task 3: render + join (m2, INV-7) ------------------------------------

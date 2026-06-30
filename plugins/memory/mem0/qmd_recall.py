@@ -43,7 +43,7 @@ QMD_DEFAULTS: Dict[str, Any] = {
     # allowlist — sessions & memories EXCLUDED by default (egress-aware, INV-5)
     "collections": ["obsidian", "skills", "plans", "projects"],
     "exclude_path_globs": [],      # client-side post-filter on `file` (INV-5/N3)
-    "intent_min_tokens": 4,
+    "intent_min_tokens": 1,  # the LEADER-word set (ok/yes/fix/run/ship...) is the real gate and catches affirmations at any length; the token-count floor only ever dropped legit SHORT lookups (a bare hostname "blocked.local.ace", a skill name "unifi") so it is set to 1. Proven safe 2026-06-30: 0 single-word non-lookups pass, 0 short lookups skipped.
     "prefetch_rerank": True,
 }
 
