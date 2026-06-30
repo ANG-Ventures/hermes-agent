@@ -1020,6 +1020,8 @@ class Mem0MemoryProvider(MemoryProvider):
                 deadline_s=float(deadline_s),
                 url=str(cfg.get("url") or "http://[::1]:8181/mcp"),
                 exclude_globs=cfg.get("exclude_path_globs") or None,
+                use_rerank_score_floor=self._truthy(cfg.get("use_rerank_score_floor", False)),
+                rerank_score_min=float(cfg.get("rerank_score_min", cfg.get("min_score", 0.5))),
             )
         except Exception as e:  # belt-and-suspenders; qmd_query already swallows
             logger.debug("QMD prefetch leg failed: %s", e)

@@ -132,6 +132,26 @@ def test_search_qmd_fail_keeps_mem0(monkeypatch):
     assert "docs" not in out  # qmd failed -> no docs, mem0 intact
 
 
+def test_provider_forwards_semantic_floor_config(monkeypatch):
+    seen = {}
+
+    def _spy(*a, **k):
+        seen.update(k)
+        return [_HIT]
+
+    monkeypatch.setattr(qmd_recall, "qmd_query", _spy)
+    p = _provider(qmd_enabled=True, mem0_rows=[{"memory": "fact one", "score": 0.9}])
+    p._qmd_enabled = True
+    p._qmd_cfg = qmd_recall.load_qmd_config({
+        "enabled": True,
+        "use_rerank_score_floor": True,
+        "rerank_score_min": 0.62,
+    })
+    json.loads(p.handle_tool_call("mem0_search", {"query": "local dns split"}))
+    assert seen["use_rerank_score_floor"] is True
+    assert seen["rerank_score_min"] == 0.62
+
+
 # ---- AC12 / INV-4a: mem0 over its own budget => QMD leg skipped ----------
 def test_mem0_over_budget_skips_qmd(monkeypatch):
     calls = {"n": 0}

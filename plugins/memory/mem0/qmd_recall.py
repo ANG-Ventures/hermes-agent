@@ -49,6 +49,12 @@ QMD_DEFAULTS: Dict[str, Any] = {
     "exclude_path_globs": [],      # client-side post-filter on `file` (INV-5/N3)
     "intent_min_tokens": 1,  # the LEADER-word set (ok/yes/fix/run/ship...) is the real gate and catches affirmations at any length; the token-count floor only ever dropped legit SHORT lookups (a bare hostname "blocked.local.ace", a skill name "unifi") so it is set to 1. Proven safe 2026-06-30: 0 single-word non-lookups pass, 0 short lookups skipped.
     "prefetch_rerank": True,
+    # Default-off semantic floor (depends on the local/upstream QMD rerankScore bridge).
+    # When enabled, qmd_query requests explain:true, lowers daemon-side blended minScore to
+    # 0.0, and filters client-side on the pure reranker score. Missing/null rerankScore is
+    # dropped, never silently treated as blended score (no fake-green on an unpatched daemon).
+    "use_rerank_score_floor": False,
+    "rerank_score_min": 0.50,
 }
 
 # leading tokens that mark a NON-lookup turn (affirmation / imperative-action) — D-9/INV-7
@@ -172,7 +178,9 @@ def is_lookup_intent(query: str, min_tokens: int) -> bool:
 
 
 def parse_qmd_results(payload: Any, min_score: float,
-                      exclude_globs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+                      exclude_globs: Optional[List[str]] = None, *,
+                      use_rerank_score_floor: bool = False,
+                      rerank_score_min: Optional[float] = None) -> List[Dict[str, Any]]:
     """Pure: extract the pointer list from a tools/call `query` response.
 
     GROUND-TRUTHED shape: result["structuredContent"]["results"] (top-level result keys are
@@ -194,7 +202,22 @@ def parse_qmd_results(payload: Any, min_score: float,
             score = float(r.get("score", 0) or 0)
         except (TypeError, ValueError):
             score = 0.0
-        if score < min_score:
+        if use_rerank_score_floor:
+            # QMD's blended `score` is positional (RRF + rerank blend). If the daemon exposes
+            # pure `rerankScore`, use it as the relevance floor; if it is absent/null/non-numeric
+            # (older/unpatched daemon, or rerank:false sentinel), DROP the row rather than falling
+            # back to the positional score and claiming semantic gating worked.
+            raw_semantic = r.get("rerankScore")
+            if raw_semantic is None:
+                continue
+            try:
+                semantic_score = float(raw_semantic)
+            except (TypeError, ValueError):
+                continue
+            floor = float(min_score if rerank_score_min is None else rerank_score_min)
+            if semantic_score < floor:
+                continue
+        elif score < min_score:
             continue
         f = str(r.get("file", "") or "")
         if any(fnmatch.fnmatch(f, g) for g in globs):
@@ -242,10 +265,35 @@ def _extract_json(raw: str) -> Optional[Any]:
         return None
 
 
+def build_qmd_query_args(query: str, *, limit: int, min_score: float,
+                         collections: Optional[List[str]], rerank: bool,
+                         use_rerank_score_floor: bool = False) -> Dict[str, Any]:
+    """Pure request builder for QMD's `query` tool.
+
+    Default path is byte/behavior-compatible with the original integration: no `explain`
+    field and the blended QMD `minScore` is sent as-is. The semantic-floor path is explicit
+    and default-off: ask QMD for `explain:true` / `rerankScore`, and do not let the blended
+    positional `minScore` pre-drop candidates before the client-side pure-rerank floor runs.
+    """
+    args: Dict[str, Any] = {
+        "searches": [{"type": "vec", "query": query}, {"type": "lex", "query": query}],
+        "limit": int(limit),
+        "minScore": 0.0 if use_rerank_score_floor else float(min_score),
+        "rerank": bool(rerank),
+    }
+    if use_rerank_score_floor:
+        args["explain"] = True
+    if collections:
+        args["collections"] = list(collections)
+    return args
+
+
 def qmd_query(query: str, *, limit: int, min_score: float,
               collections: Optional[List[str]], rerank: bool, deadline_s: float,
               url: str = "http://[::1]:8181/mcp",
-              exclude_globs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+              exclude_globs: Optional[List[str]] = None,
+              use_rerank_score_floor: bool = False,
+              rerank_score_min: Optional[float] = None) -> List[Dict[str, Any]]:
     """Hard-cancellable MCP `query` against the local QMD daemon. ANY failure -> [].
 
     A watchdog timer trips at `deadline_s` (wall-clock, whole operation incl. the 3-POST
@@ -335,14 +383,14 @@ def qmd_query(query: str, *, limit: int, min_score: float,
         h2["mcp-session-id"] = sid
         _post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, h2)
 
-        args: Dict[str, Any] = {
-            "searches": [{"type": "vec", "query": query}, {"type": "lex", "query": query}],
-            "limit": int(limit),
-            "minScore": float(min_score),
-            "rerank": bool(rerank),
-        }
-        if collections:
-            args["collections"] = list(collections)
+        args = build_qmd_query_args(
+            query,
+            limit=limit,
+            min_score=min_score,
+            collections=collections,
+            rerank=rerank,
+            use_rerank_score_floor=use_rerank_score_floor,
+        )
         st, data, _sid = _post({
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": {"name": "query", "arguments": args},
@@ -352,7 +400,13 @@ def qmd_query(query: str, *, limit: int, min_score: float,
         payload = _extract_json(data)
         if payload is None:
             return []
-        _results = parse_qmd_results(payload, min_score, exclude_globs)
+        _results = parse_qmd_results(
+            payload,
+            min_score,
+            exclude_globs,
+            use_rerank_score_floor=use_rerank_score_floor,
+            rerank_score_min=rerank_score_min,
+        )
         return _results
     except Exception as e:  # degraded-safe: ANY failure -> [] (INV-3)
         logger.debug("qmd_query degraded: %s", e)
