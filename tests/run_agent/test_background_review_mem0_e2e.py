@@ -42,6 +42,7 @@ worked — see mem0-selfhost-ops skill):
 """
 
 import os
+import re
 import subprocess
 import threading
 import time
@@ -164,23 +165,34 @@ def test_background_review_fork_writes_mem0_live():
     # Timestamp boundary for cleanup: the model REWORDS facts, so text-matching is
     # fragile (it can miss a reworded second fact). Delete by created_at window in
     # the finally block instead. Use the store's own clock to avoid skew.
-    started_at = _psql("select now() at time zone 'utc';").strip()
+    # (_psql already .strip()s its output.)
+    started_at = _psql("select now() at time zone 'utc';")
+    # Defensive: started_at is composed into SQL below via f-string. It's PG's own
+    # now() output (no injection vector), but assert the expected timestamp shape
+    # so a future change that derives it from less-trusted input fails loudly here.
+    assert re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", started_at), started_at
     try:
         result = agent.run_conversation(fact)
         assert result.get("final_response") is not None
 
-        # Join the bg-review daemon thread so we observe it finish.
-        joined = False
+        # Wait for the bg-review daemon thread to spawn AND finish. Thread.join()
+        # with a timeout returns whether the thread finished OR the timeout
+        # expired, so assert is_alive() is False afterward — a still-running fork
+        # means the review didn't actually complete in budget.
+        spawned = False
+        finished = False
         deadline = time.time() + 180
         while time.time() < deadline:
             threads = [t for t in threading.enumerate() if t.name == "bg-review"]
             if threads:
+                spawned = True
                 for t in threads:
                     t.join(timeout=max(1, deadline - time.time()))
-                joined = True
+                finished = all(not t.is_alive() for t in threads)
                 break
             time.sleep(1)
-        assert joined, "bg-review thread never spawned (memory review did not fire)"
+        assert spawned, "bg-review thread never spawned (memory review did not fire)"
+        assert finished, "bg-review thread did not finish within budget"
 
         # The fork must have invoked the mem0 writer.
         assert "mem0_remember" in fork_tool_calls, (
