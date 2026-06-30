@@ -221,8 +221,14 @@ def compute_last_turn_record(platform: str = "", chat_id: str = "") -> Dict[str,
 # --------------------------------------------------------------------------- #
 # Render (verbatim from blackbox-inspect — the /context last-turn card)
 # --------------------------------------------------------------------------- #
-def render_last_turn_record(rec: Dict[str, Any]) -> List[str]:
-    """Render the rich Blackbox last-turn block (matches the alert-card fields)."""
+def render_last_turn_record(rec: Dict[str, Any], compressions: "int | None" = None) -> List[str]:
+    """Render the rich Blackbox last-turn block (matches the alert-card fields).
+
+    ``compressions`` (optional): when provided (from the live resident agent's
+    context_compressor.compression_count), a "• Compressions: N" row is appended
+    right after the Cached row so /usage and /context show it inside the card
+    instead of orphaned below the footer. None / 0 ⇒ row omitted.
+    """
     from datetime import datetime
     try:
         from zoneinfo import ZoneInfo
@@ -323,6 +329,13 @@ def render_last_turn_record(rec: Dict[str, Any]) -> List[str]:
     if prompt_total > 0 and cache_r:
         cpct = cache_r / prompt_total * 100
         lines.append(f"• Cached: {_humanize_tok(cache_r)}/{_humanize_tok(prompt_total)} {_cache_health(cpct)} {cpct:.0f}%")
+
+    try:
+        _comp = int(compressions or 0)
+    except (TypeError, ValueError):
+        _comp = 0
+    if _comp > 0:
+        lines.append(f"• Compressions: {_comp}")
 
     lines.append(f"• Agent: {rec.get('profile') or '—'}")
     _model = rec.get("model") or "—"

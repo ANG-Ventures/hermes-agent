@@ -117,3 +117,33 @@ def test_fallback_label_override():
 def test_no_blackbox_no_thin_returns_empty():
     src = _Source("discord", "999999999999999999")
     assert _call(src, None) == []
+
+
+def _demo_rec():
+    import time
+    now = time.time()
+    return {
+        "found": True, "platform": "discord", "chat_id": "1", "chat_name": "x",
+        "model": "claude-opus-4-8", "provider": "claude-app", "profile": "default",
+        "ts_start": now - 10, "ts_end": now, "api_calls": 3, "tools": "[]",
+        "input_tokens": 100, "output_tokens": 50, "cache_read": 900, "cache_write": 0,
+        "reasoning": 0, "context_used": 1000, "context_length": 1_000_000,
+        "cost_usd": 0.01, "cost_status": "estimated",
+    }
+
+
+def test_compressions_row_after_cached():
+    """• Compressions: N renders immediately after the • Cached row."""
+    from plugins.blackbox.last_turn import render_last_turn_record
+    lines = render_last_turn_record(_demo_rec(), compressions=3)
+    assert "• Compressions: 3" in lines
+    cached_i = next(i for i, l in enumerate(lines) if l.startswith("• Cached:"))
+    comp_i = next(i for i, l in enumerate(lines) if l.startswith("• Compressions:"))
+    assert comp_i == cached_i + 1, "Compressions must sit directly after Cached"
+
+
+def test_compressions_row_omitted_when_none_or_zero():
+    from plugins.blackbox.last_turn import render_last_turn_record
+    assert not any("Compressions" in l for l in render_last_turn_record(_demo_rec(), compressions=None))
+    assert not any("Compressions" in l for l in render_last_turn_record(_demo_rec(), compressions=0))
+

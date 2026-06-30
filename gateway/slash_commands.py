@@ -3570,7 +3570,7 @@ class GatewaySlashCommandsMixin:
             lines.append("Complete your top-up in the browser — credits will appear in /credits shortly.")
         return "\n".join(lines)
 
-    def _render_last_turn_card(self, source, thin_snap, fallback_label=None) -> list:
+    def _render_last_turn_card(self, source, thin_snap, fallback_label=None, compressions=None) -> list:
         """Render the rich /context last-turn card for the invoking channel, or a
         reworded thin fallback. Returns a list of lines (may be empty).
 
@@ -3607,7 +3607,7 @@ class GatewaySlashCommandsMixin:
             if platform and chat_id:
                 if str(rec.get("platform", "")) == platform and str(rec.get("chat_id", "")) == chat_id:
                     try:
-                        return render_last_turn_record(rec)
+                        return render_last_turn_record(rec, compressions=compressions)
                     except Exception as e:
                         logger.warning("usage last-turn card: render failed (%s); using fallback", e)
                 else:
@@ -3620,7 +3620,7 @@ class GatewaySlashCommandsMixin:
                 # No channel bound (shouldn't happen for a messaging /usage) — the
                 # global-newest rec is acceptable; render it.
                 try:
-                    return render_last_turn_record(rec)
+                    return render_last_turn_record(rec, compressions=compressions)
                 except Exception as e:
                     logger.warning("usage last-turn card: render failed (%s); using fallback", e)
 
@@ -3734,22 +3734,25 @@ class GatewaySlashCommandsMixin:
             if rl_state and rl_state.has_data:
                 from agent.rate_limit_tracker import format_rate_limit_compact
                 lines.append(t("gateway.usage.rate_limits", state=format_rate_limit_compact(rl_state)))
-                lines.append("")
+                # No trailing blank here — the last-turn card below starts with its
+                # own leading blank line, so adding one would double-space.
 
             # The full last-turn card (PRD usage-format-codex Part A) is the SAME
             # renderer /context uses, and already carries Model / Agent / Session /
-            # API Calls / tokens — so the old session header + Model/Total/API-calls
-            # lines were redundant with it and have been removed (Ace, 2026-06-30).
-            # The card (cost, tokens in/out with finished/unfinished + uncached,
-            # context window, composition, session) follows directly.
+            # API Calls / tokens / Compressions — so the old session header +
+            # Model/Total/API-calls lines were redundant with it and were removed
+            # (Ace, 2026-06-30). The card (cost, tokens in/out with finished/
+            # unfinished + uncached, context window, cached, compressions, session)
+            # follows directly.
 
             # The rich /context last-turn card for THIS channel (replaces the old
             # hand-built input/output + char/4 composition block). When the
             # blackbox store has no turn recorded for this channel yet (e.g. the
             # agent is resident but its first turn hasn't landed in the store, or
             # tests), fall back to the resident agent's OWN session counters so the
-            # card is never emptier than the pre-card display. Compressions are
-            # still surfaced below from the live compressor.
+            # card is never emptier than the pre-card display. The live compressor's
+            # compression_count is threaded into the card (• Compressions: N row,
+            # right after Cached) instead of being appended orphaned below.
             def _as_int(v):
                 try:
                     return int(v or 0)
@@ -3762,18 +3765,18 @@ class GatewaySlashCommandsMixin:
                 "cache_write_tokens": _as_int(getattr(agent, "session_cache_write_tokens", 0)),
                 "reasoning_tokens": _as_int(getattr(agent, "session_reasoning_tokens", 0)),
             }
+            ctx = agent.context_compressor
+            _comp_count = _as_int(getattr(ctx, "compression_count", 0))
             try:
                 card = self._render_last_turn_card(
-                    source, agent_thin, fallback_label="session totals; first turn not yet recorded"
+                    source, agent_thin,
+                    fallback_label="session totals; first turn not yet recorded",
+                    compressions=_comp_count,
                 )
             except Exception:
                 card = []
             if card:
                 lines.extend(card)
-
-            ctx = agent.context_compressor
-            if ctx.compression_count:
-                lines.append(t("gateway.usage.label_compressions", count=ctx.compression_count))
 
             if account_lines:
                 lines.append("")
