@@ -3570,6 +3570,48 @@ class GatewaySlashCommandsMixin:
             lines.append("Complete your top-up in the browser — credits will appear in /credits shortly.")
         return "\n".join(lines)
 
+    def _context_breakdown_lines(self, agent, source) -> list:
+        """Render the per-category context breakdown for /usage.
+
+        Estimated (chars/4) — same engine the desktop popover uses (upstream
+        PR #54907/#55204; reuses agent.context_breakdown — no new tool/engine).
+        Returns an empty list and never raises on failure so /usage stays robust.
+        """
+        try:
+            from agent.context_breakdown import compute_session_context_breakdown
+
+            history: list = []
+            try:
+                entry = self.session_store.get_or_create_session(source)
+                history = self.session_store.load_transcript(entry.session_id) or []
+            except Exception:
+                history = []
+
+            payload = compute_session_context_breakdown(agent, history)
+            categories = payload.get("categories") or []
+            if not categories:
+                return []
+
+            total = payload.get("estimated_total") or 0
+            out = [t("gateway.usage.breakdown_header")]
+            for cat in categories:
+                tokens = int(cat.get("tokens") or 0)
+                if tokens <= 0:
+                    continue
+                cat_id = str(cat.get("id") or "")
+                label = t(f"gateway.usage.breakdown_cat_{cat_id}")
+                # Missing key → t() echoes the key back; fall back to the
+                # English label the engine already provides.
+                if label.endswith(f"breakdown_cat_{cat_id}"):
+                    label = str(cat.get("label") or cat_id)
+                pct = round(tokens / total * 100) if total else 0
+                out.append(
+                    t("gateway.usage.breakdown_line", label=label, count=f"{tokens:,}", pct=pct)
+                )
+            return out if len(out) > 1 else []
+        except Exception:
+            return []
+
     def _render_last_turn_card(self, source, thin_snap, fallback_label=None, compressions=None) -> list:
         """Render the rich /context last-turn card for the invoking channel, or a
         reworded thin fallback. Returns a list of lines (may be empty).
@@ -3777,6 +3819,18 @@ class GatewaySlashCommandsMixin:
                 card = []
             if card:
                 lines.extend(card)
+
+            # Per-category context breakdown (estimated — chars/4 heuristic).
+            # Same engine the desktop popover uses (upstream PR #54907/#55204):
+            # system prompt / tools / rules / skills / MCP / subagents / memory /
+            # conversation. Answers "where is my CURRENT context budget going",
+            # complementing the last-turn card above (which is "what the last
+            # turn cost"). Fail-open: any engine error → no breakdown, /usage
+            # otherwise unaffected.
+            breakdown_lines = self._context_breakdown_lines(agent, source)
+            if breakdown_lines:
+                lines.append("")
+                lines.extend(breakdown_lines)
 
             if account_lines:
                 lines.append("")
