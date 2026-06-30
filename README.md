@@ -1,4 +1,4 @@
-<p align="center">
+<p align="center"> <!-- greploop-rung2-drill-PR-edit -->
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>
 
