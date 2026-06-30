@@ -25,7 +25,7 @@ def test_config_defaults_when_absent():
     assert cfg["enabled"] is False
     assert cfg["qmd_total_deadline_s"] == 6.0
     assert cfg["mem0_budget_s"] == 6.0
-    assert cfg["min_score"] == 0.5
+    assert cfg["min_score"] == 0.45
     assert cfg["prefetch_limit"] == 3
     assert cfg["search_limit"] == 5
     assert cfg["collections"] == ["obsidian", "skills", "plans", "projects"]
