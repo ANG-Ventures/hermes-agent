@@ -32,6 +32,7 @@ from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 
 from .temporal_parse import created_at_in_window, parse_temporal_window
+from . import qmd_recall
 
 logger = logging.getLogger(__name__)
 
@@ -535,9 +536,12 @@ class Mem0MemoryProvider(MemoryProvider):
         self._temporal_overfetch = _TEMPORAL_DEFAULT_OVERFETCH
         self._capture = "auto"
         self._prefetch_result = ""
+        self._prefetch_qmd = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
         self._prefetch_join_timeout_s = 10.0
+        self._qmd_cfg = qmd_recall.load_qmd_config(None)
+        self._qmd_enabled = False
         self._sync_thread = None
         # Circuit breaker state
         self._consecutive_failures = 0
@@ -747,6 +751,11 @@ class Mem0MemoryProvider(MemoryProvider):
         # None/unset -> omitted from the body so the server resolves its own default
         # (INV-8(i)).
         self._keyword_search = self._config.get("keyword_search", None)
+        # QMD unified-recall fold-in (spec v0.3). Default-off; loaded from the `qmd`
+        # sub-block of mem0.json. Stores stay separate — this only adds a read-only
+        # local-document SEARCH leg to prefetch + mem0_search (INV-1, never writes).
+        self._qmd_cfg = qmd_recall.load_qmd_config(self._config.get("qmd"))
+        self._qmd_enabled = self._truthy(self._qmd_cfg.get("enabled", False))
         # W3-TEMPORAL (tau_m created_at window) — plugin-side, config-gated, reversible
         # (INV-4). Off by default so deploy is inert until the flag flips. When on,
         # mem0_search detects a temporal expression, resolves it to a created_at
@@ -996,15 +1005,38 @@ class Mem0MemoryProvider(MemoryProvider):
             "without being asked. Do NOT save work-narration, status, or transient state."
         )
 
+    def _qmd_pointers(self, query: str, *, limit: int, deadline_s: float) -> list:
+        """Run the read-only QMD document leg. Degraded-safe: any failure -> []."""
+        if not self._qmd_enabled:
+            return []
+        cfg = self._qmd_cfg
+        try:
+            return qmd_recall.qmd_query(
+                query,
+                limit=int(limit),
+                min_score=float(cfg.get("min_score", 0.5)),
+                collections=cfg.get("collections") or None,
+                rerank=self._truthy(cfg.get("prefetch_rerank", True)),
+                deadline_s=float(deadline_s),
+                url=str(cfg.get("url") or "http://[::1]:8181/mcp"),
+                exclude_globs=cfg.get("exclude_path_globs") or None,
+            )
+        except Exception as e:  # belt-and-suspenders; qmd_query already swallows
+            logger.debug("QMD prefetch leg failed: %s", e)
+            return []
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=self._prefetch_join_timeout_s)
         with self._prefetch_lock:
             result = self._prefetch_result
+            qmd_block = self._prefetch_qmd
             self._prefetch_result = ""
-        if not result:
-            return ""
-        return f"## Mem0 Memory\n{result}"
+            self._prefetch_qmd = ""
+        # mem0 block is rendered EXACTLY as before (byte-identical when QMD off, INV-6/AC1);
+        # the QMD block is strictly additive and only joined when present (INV-3a/m2).
+        mem0_block = f"## Mem0 Memory\n{result}" if result else ""
+        return qmd_recall.join_blocks(mem0_block, qmd_block)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if self._is_breaker_open():
@@ -1034,6 +1066,8 @@ class Mem0MemoryProvider(MemoryProvider):
                     keyword_search=self._keyword_search,
                     top_k=5,
                 )))
+                # INV-3a: commit the mem0 block FIRST — it is never dropped because the
+                # QMD leg is slow. QMD is strictly additive and runs after.
                 if results:
                     lines = [r.get("memory", "") for r in results if r.get("memory")]
                     with self._prefetch_lock:
@@ -1042,6 +1076,24 @@ class Mem0MemoryProvider(MemoryProvider):
             except Exception as e:
                 self._record_failure()
                 logger.debug("Mem0 prefetch failed: %s", e)
+
+            # INV-7: QMD leg is intent-gated (prefetch only) and bounded by its OWN
+            # wall-clock deadline; failures NEVER touch the mem0 block above.
+            try:
+                if self._qmd_enabled and qmd_recall.is_lookup_intent(
+                    query, int(self._qmd_cfg.get("intent_min_tokens", 4))
+                ):
+                    hits = self._qmd_pointers(
+                        query,
+                        limit=int(self._qmd_cfg.get("prefetch_limit", 3)),
+                        deadline_s=float(self._qmd_cfg.get("qmd_total_deadline_s", 4.0)),
+                    )
+                    block = qmd_recall.render_qmd_block(hits)
+                    if block:
+                        with self._prefetch_lock:
+                            self._prefetch_qmd = block
+            except Exception as e:
+                logger.debug("QMD prefetch leg failed: %s", e)
 
         self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="mem0-prefetch")
         self._prefetch_thread.start()
@@ -1156,10 +1208,24 @@ class Mem0MemoryProvider(MemoryProvider):
                 if window is not None:
                     results = self._apply_temporal_boost(results, window)
                 results = results[:top_k]
+                # INV-7/AC4: explicit search fans out to QMD regardless of the intent
+                # gate (the user chose to search). Additive `docs` key only; mem0 result
+                # is computed exactly as before. QMD off or empty -> no `docs` key, so the
+                # return is byte-identical to pre-change (INV-6/AC1, INV-8).
+                qmd_docs = self._qmd_pointers(
+                    query,
+                    limit=int(self._qmd_cfg.get("search_limit", 5)),
+                    deadline_s=float(self._qmd_cfg.get("qmd_total_deadline_s", 4.0)),
+                ) if self._qmd_enabled else []
                 if not results:
+                    if qmd_docs:
+                        return json.dumps({"result": "No relevant memories found.", "docs": qmd_docs})
                     return json.dumps({"result": "No relevant memories found."})
                 items = [{"memory": r.get("memory", ""), "score": r.get("score", 0)} for r in results]
-                return json.dumps({"results": items, "count": len(items)})
+                out = {"results": items, "count": len(items)}
+                if qmd_docs:
+                    out["docs"] = qmd_docs
+                return json.dumps(out)
             except Exception as e:
                 self._record_failure()
                 return tool_error(f"Search failed: {e}")
