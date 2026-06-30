@@ -21,6 +21,7 @@ def _make_mock_agent(**overrides):
         "session_output_tokens": 10_000,
         "session_cache_read_tokens": 5_000,
         "session_cache_write_tokens": 2_000,
+        "session_reasoning_tokens": 0,
     }
     defaults.update(overrides)
     for k, v in defaults.items():
@@ -80,12 +81,15 @@ class TestUsageCachedAgent:
             result = await runner._handle_usage_command(event)
 
         assert "claude-sonnet-4.6" in result
-        assert "35,000" in result  # input tokens
-        assert "10,000" in result  # output tokens
-        assert "50,000" in result  # total
-        assert "30,000" in result  # context
-        assert "Compressions: 1" in result
-        # Cost and cache-hit reporting is removed everywhere.
+        # The last-turn card (resident fallback from session counters, since the
+        # mock channel has no blackbox row) shows the new /context vocabulary.
+        assert "35,000" in result   # uncached (session_input_tokens)
+        assert "10,000" in result   # output billed (session_output_tokens)
+        assert "50,000" in result   # session total (header label_total)
+        assert "uncached" in result
+        assert "Total (billed in+out)" in result
+        # Cost and cache-hit reporting is removed everywhere (the rich-card "Turn
+        # Cost" only renders from a real blackbox row, never the thin fallback).
         assert "$" not in result
         assert "Cache read" not in result
         assert "Cache write" not in result
@@ -284,11 +288,18 @@ class TestUsageLastTurnSnapshot:
         with patch("agent.model_metadata.estimate_messages_tokens_rough", return_value=500):
             result = await runner._handle_usage_command(event)
 
-        # Real last-turn numbers must appear (not just the rough ~500 estimate).
-        assert "120,000" in result   # last-turn input
-        assert "8,000" in result     # last-turn output
+        # Real last-turn numbers must appear in the new /context card vocabulary
+        # (not just the rough ~500 estimate). Output + reasoning fold into one
+        # billed-out total (8,000 + 1,500 = 9,500); in billed = 120k+110k+2k = 232k.
+        assert "120,000" in result   # last-turn uncached input
         assert "110,000" in result   # last-turn cache read
+        assert "9,500" in result     # output billed (8,000 + 1,500 reasoning, folded)
+        assert "232,000" in result   # tokens-in billed
+        assert "Total (billed in+out): 241,500" in result
+        assert "uncached" in result
         assert "Last turn" in result or "last turn" in result.lower()
+        # Honest fallback label: the agent is genuinely not resident here.
+        assert "persisted; agent not resident" in result
 
     @pytest.mark.asyncio
     async def test_no_snapshot_still_falls_to_history(self):
