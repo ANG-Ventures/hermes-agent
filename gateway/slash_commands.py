@@ -3851,6 +3851,22 @@ class GatewaySlashCommandsMixin:
             }
             ctx = agent.context_compressor
             _comp_count = _as_int(getattr(ctx, "compression_count", 0))
+
+            # Per-category context breakdown (estimated — chars/4 heuristic) goes
+            # FIRST (Ace 2026-06-30): "where is my CURRENT context budget going"
+            # (system prompt / tools / rules / skills / MCP / subagents / memory /
+            # conversation) frames the rest. Same engine the desktop popover uses
+            # (upstream PR #54907/#55204). Fail-open: error → no breakdown.
+            breakdown_lines = self._context_breakdown_lines(agent, source)
+            if breakdown_lines:
+                lines.extend(breakdown_lines)
+
+            # The full last-turn card (PRD usage-format-codex Part A) — the SAME
+            # renderer /context uses — answers "what the last turn cost". When the
+            # blackbox store has no turn for this channel yet, fall back to the
+            # resident agent's OWN session counters so the card is never emptier
+            # than the pre-card display. compression_count is threaded in (•
+            # Compressions: N row, after Cached).
             try:
                 card = self._render_last_turn_card(
                     source, agent_thin,
@@ -3860,25 +3876,12 @@ class GatewaySlashCommandsMixin:
             except Exception:
                 card = []
             if card:
-                # The shared card carries a leading blank line (it normally
-                # follows the rate-limits line). Now that the card is the FIRST
-                # block in /usage, drop that leading blank so the output doesn't
-                # open on an empty line.
-                if card and card[0] == "":
+                # The card carries a leading blank line — keep it as a separator
+                # from the breakdown above, but strip it when the card is the very
+                # first block (no breakdown rendered) so /usage doesn't open blank.
+                if not breakdown_lines and card and card[0] == "":
                     card = card[1:]
                 lines.extend(card)
-
-            # Per-category context breakdown (estimated — chars/4 heuristic).
-            # Same engine the desktop popover uses (upstream PR #54907/#55204):
-            # system prompt / tools / rules / skills / MCP / subagents / memory /
-            # conversation. Answers "where is my CURRENT context budget going",
-            # complementing the last-turn card above (which is "what the last
-            # turn cost"). Fail-open: any engine error → no breakdown, /usage
-            # otherwise unaffected.
-            breakdown_lines = self._context_breakdown_lines(agent, source)
-            if breakdown_lines:
-                lines.append("")
-                lines.extend(breakdown_lines)
 
             # Rate limits + Account limits together — both answer "how close am I
             # to a ceiling": rate limits = provider throttling headroom (this

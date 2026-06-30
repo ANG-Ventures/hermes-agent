@@ -301,6 +301,37 @@ class TestUsageAccountSection:
         acct_i = result.index("📈 **Account limits**")
         assert rl_i < acct_i, "rate limits must render above account limits"
 
+    @pytest.mark.asyncio
+    async def test_context_breakdown_renders_above_last_turn_card(self, monkeypatch):
+        """Context breakdown ('where is my budget going') leads, above the
+        last-turn card ('what the last turn cost') — Ace 2026-06-30."""
+        agent = _make_mock_agent()
+        runner = _make_runner(SK, cached_agent=agent)
+        session_entry = MagicMock()
+        session_entry.session_id = "sess-order"
+        runner.session_store.get_or_create_session.return_value = session_entry
+        runner.session_store.load_transcript.return_value = [{"role": "user", "content": "hi"}]
+        event = MagicMock()
+
+        fake_bd = {
+            "categories": [
+                {"id": "system_prompt", "label": "System prompt", "tokens": 4000, "color": "x"},
+            ],
+            "estimated_total": 4000, "context_max": 200000,
+            "context_percent": 2, "context_used": 4000, "model": "m",
+        }
+        monkeypatch.setattr(runner, "_compact_account_limit_lines", lambda: [])
+        with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"), \
+             patch("agent.context_breakdown.compute_session_context_breakdown", return_value=fake_bd), \
+             patch("agent.account_usage.nous_credits_lines", lambda markdown=False: []):
+            result = await runner._handle_usage_command(event)
+
+        bd_i = result.index("Context breakdown")
+        lt_i = result.index("Last turn")
+        assert bd_i < lt_i, "context breakdown must render above the last-turn card"
+        # Output opens on the breakdown header, not a blank line.
+        assert result.lstrip("\n").startswith("🧩")
+
 
 class TestUsageLastTurnSnapshot:
     """Between-turn /usage reads the persisted last-turn snapshot (eviction-safe).
