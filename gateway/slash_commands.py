@@ -3736,14 +3736,12 @@ class GatewaySlashCommandsMixin:
                 lines.append(t("gateway.usage.rate_limits", state=format_rate_limit_compact(rl_state)))
                 lines.append("")
 
-            # Session token usage — header + model, then the full last-turn card
-            # (PRD usage-format-codex Part A). The card (cost, tokens in/out with
-            # finished/unfinished + uncached, context window, composition, session)
-            # is the SAME renderer /context uses, so the numbers match exactly.
-            lines.append(t("gateway.usage.header_session"))
-            lines.append(t("gateway.usage.label_model", model=agent.model))
-            lines.append(t("gateway.usage.label_total", count=f"{agent.session_total_tokens:,}"))
-            lines.append(t("gateway.usage.label_api_calls", count=agent.session_api_calls))
+            # The full last-turn card (PRD usage-format-codex Part A) is the SAME
+            # renderer /context uses, and already carries Model / Agent / Session /
+            # API Calls / tokens — so the old session header + Model/Total/API-calls
+            # lines were redundant with it and have been removed (Ace, 2026-06-30).
+            # The card (cost, tokens in/out with finished/unfinished + uncached,
+            # context window, composition, session) follows directly.
 
             # The rich /context last-turn card for THIS channel (replaces the old
             # hand-built input/output + char/4 composition block). When the

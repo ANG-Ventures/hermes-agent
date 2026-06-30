@@ -80,14 +80,18 @@ class TestUsageCachedAgent:
         with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"):
             result = await runner._handle_usage_command(event)
 
-        assert "claude-sonnet-4.6" in result
         # The last-turn card (resident fallback from session counters, since the
         # mock channel has no blackbox row) shows the new /context vocabulary.
+        # NOTE: the redundant "Session Token Usage" header + Model/Total/API-calls
+        # lines were removed (Ace, 2026-06-30) — the card owns those now, and the
+        # thin fallback (no blackbox row) carries the token split, not the model.
         assert "35,000" in result   # uncached (session_input_tokens)
         assert "10,000" in result   # output billed (session_output_tokens)
-        assert "50,000" in result   # session total (header label_total)
         assert "uncached" in result
         assert "Total (billed in+out)" in result
+        assert "Last turn" in result
+        # The old redundant header lines are gone.
+        assert "Session Token Usage" not in result
         # Cost and cache-hit reporting is removed everywhere (the rich-card "Turn
         # Cost" only renders from a real blackbox row, never the thin fallback).
         assert "$" not in result
@@ -97,9 +101,12 @@ class TestUsageCachedAgent:
 
     @pytest.mark.asyncio
     async def test_running_agent_preferred_over_cache(self):
-        """When agent is in both dicts, the running one wins."""
-        running = _make_mock_agent(session_api_calls=10, session_total_tokens=80_000)
-        cached = _make_mock_agent(session_api_calls=5, session_total_tokens=50_000)
+        """When agent is in both dicts, the running one wins — proven via the
+        card's token split (the redundant Total/API-calls header was removed)."""
+        running = _make_mock_agent(session_api_calls=10, session_total_tokens=80_000,
+                                   session_input_tokens=70_000)
+        cached = _make_mock_agent(session_api_calls=5, session_total_tokens=50_000,
+                                  session_input_tokens=35_000)
         runner = _make_runner(SK, agent=running, cached_agent=cached)
         event = MagicMock()
 
@@ -108,8 +115,10 @@ class TestUsageCachedAgent:
             mock_cost.return_value = MagicMock(amount_usd=None, status="unknown")
             result = await runner._handle_usage_command(event)
 
-        assert "80,000" in result   # running agent's total
-        assert "API calls: 10" in result
+        # The running agent's uncached count (70,000) drives the card, not the
+        # cached agent's (35,000).
+        assert "70,000" in result
+        assert "35,000" not in result
 
     @pytest.mark.asyncio
     async def test_sentinel_skipped_uses_cache(self):
@@ -126,8 +135,9 @@ class TestUsageCachedAgent:
             mock_cost.return_value = MagicMock(amount_usd=None, status="unknown")
             result = await runner._handle_usage_command(event)
 
-        assert "claude-sonnet-4.6" in result
-        assert "Session Token Usage" in result
+        # The cached agent's last-turn card renders (its uncached count = 35,000).
+        assert "35,000" in result
+        assert "Last turn" in result
 
     @pytest.mark.asyncio
     async def test_no_agent_anywhere_falls_to_history(self):
@@ -194,7 +204,7 @@ class TestUsageAccountSection:
             mock_cost.return_value = MagicMock(amount_usd=None, status="included")
             result = await runner._handle_usage_command(event)
 
-        assert "📊 **Session Token Usage**" in result
+        # The account-limits section is appended below the last-turn card.
         assert "📈 **Account limits**" in result
         assert "Provider: openai-codex (Pro)" in result
 

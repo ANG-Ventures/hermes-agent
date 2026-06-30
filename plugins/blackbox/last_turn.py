@@ -325,7 +325,10 @@ def render_last_turn_record(rec: Dict[str, Any]) -> List[str]:
         lines.append(f"• Cached: {_humanize_tok(cache_r)}/{_humanize_tok(prompt_total)} {_cache_health(cpct)} {cpct:.0f}%")
 
     lines.append(f"• Agent: {rec.get('profile') or '—'}")
-    lines.append(f"• Model: {rec.get('model') or '—'}")
+    _model = rec.get("model") or "—"
+    _prov = (rec.get("provider") or "").strip()
+    _model_disp = f"{_prov}/{_model}" if _prov and _model != "—" else _model
+    lines.append(f"• Model: {_model_disp}")
     lines.append(f"• Session: {_session_label(rec.get('platform',''), rec.get('chat_id',''), rec.get('chat_name',''))}")
 
     ts_start = rec.get("ts_start")

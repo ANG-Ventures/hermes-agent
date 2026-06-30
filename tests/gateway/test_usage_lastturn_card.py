@@ -87,6 +87,8 @@ def test_real_channel_renders_full_card(seeded_turn):
     assert "uncached" in text
     assert "Tokens out" in text
     assert "billed" in text
+    # Model line carries the provider prefix (the seeded turn is claude-app/claude-opus-4-8).
+    assert "• Model: claude-app/claude-opus-4-8" in text
 
 
 def test_channel_miss_falls_back_to_thin(seeded_turn):
