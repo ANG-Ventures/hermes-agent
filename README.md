@@ -1,4 +1,4 @@
-<p align="center">
+<p align="center"> <!-- main-side-conflicting-edit -->
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>
 
