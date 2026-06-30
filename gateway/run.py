@@ -2982,6 +2982,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Key: session_key, Value: AIAgent instance
         self._running_agents: Dict[str, Any] = {}
         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
+        # Per-session handle on the asyncio Task running that session's current turn.
+        # Captured synchronously at the slot-set (see _handle_message: no `await` between
+        # the slot-set and this capture) so it is the EXACT turn task — used by the
+        # background reaper to evict ONLY entries whose task is genuinely done()/cancelled
+        # (a leaked slot), never a live long-running turn. Cleared in _release_running_agent_state.
+        self._running_agent_tasks: Dict[str, Any] = {}
         self._session_initiated_restart: Dict[str, bool] = {}
         self._resumed_this_boot: set[str] = set()
         self._active_session_leases: Dict[str, Any] = {}
@@ -4423,7 +4429,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         try:
             from gateway.status import write_runtime_status
-            write_runtime_status(active_agents=self._running_agent_count())
+            write_runtime_status(
+                active_agents=self._running_agent_count(),
+                # The live running-session keys (excl. the pending sentinel) so the
+                # safe-restart watcher can do per-session quiescence (is MY session idle?)
+                # rather than waiting for the whole fleet to go idle.
+                active_agent_keys=list(self._snapshot_running_agents().keys()),
+            )
         except Exception:
             pass
 
@@ -9983,6 +9995,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._active_session_leases[_quick_key] = _active_session_lease
         self._running_agents[_quick_key] = _AGENT_PENDING_SENTINEL
         self._running_agents_ts[_quick_key] = time.time()
+        # 🔴 LOAD-BEARING NO-AWAIT INVARIANT (busy-gateway-quiescence reaper, RC-1):
+        # capture THIS turn's asyncio Task synchronously here, in the same straight-line
+        # block as the slot-set above and the `await _handle_message_with_agent` below.
+        # The turn runs INLINE in this handler coroutine, so `current_task()` IS the turn
+        # task. There MUST be NO `await` between the slot-set and this capture — an await
+        # would let the reaper observe a non-sentinel slot with no recorded task and
+        # mis-classify a just-launched live turn as a leaked/dead entry (INV-4 violation).
+        # If you add an `await` in this span, move this capture or the reaper breaks.
+        if not hasattr(self, "_running_agent_tasks"):
+            self._running_agent_tasks = {}  # self-heal for object.__new__ partials
+        self._running_agent_tasks[_quick_key] = asyncio.current_task()
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
@@ -15518,6 +15541,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Failed to release active session slot", exc_info=True)
         self._running_agents.pop(session_key, None)
         self._running_agents_ts.pop(session_key, None)
+        # Clear the turn-task handle alongside the slot (busy-gateway-quiescence reaper).
+        # This is the single chokepoint covering every turn-exit path, so the handle never
+        # outlives the slot. Idempotent: pop-on-absent is harmless, so a reaper eviction
+        # racing this finally double-releases safely (AC-10).
+        getattr(self, "_running_agent_tasks", {}).pop(session_key, None)
         if hasattr(self, "_busy_ack_ts"):
             self._busy_ack_ts.pop(session_key, None)
         # Turn boundary: a running-agent slot was just released.  Persist the
