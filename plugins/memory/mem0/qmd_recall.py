@@ -32,7 +32,12 @@ QMD_DEFAULTS: Dict[str, Any] = {
                                    # real warm hybrid+rerank latency (measured 2.3-5.3s live,
                                    # 2026-06-30) with margin, still bounded under the 10s join
     "mem0_budget_s": 6.0,          # the mem0 leg's own budget (INV-4a); +deadline <= join 10s
-    "min_score": 0.5,             # provisional; post-rerank score (m1)
+    "min_score": 0.45,            # RRF/rerank score is POSITIONAL not calibrated-relevance
+                                  # (rank1~0.9, rank2~0.5, tail 0.34-0.47 — identical for a real
+                                  # and a nonsense query; measured 2026-06-30). So this floor TRIMS
+                                  # the low-rank tail, it does NOT gate relevance. Relevance is
+                                  # protected by prefetch_limit + the intent gate. 0.45 keeps the
+                                  # legit rank-2 hit that 0.5 flakily clipped.
     "prefetch_limit": 3,
     "search_limit": 5,
     # allowlist — sessions & memories EXCLUDED by default (egress-aware, INV-5)
