@@ -132,6 +132,54 @@ def test_search_qmd_fail_keeps_mem0(monkeypatch):
     assert "docs" not in out  # qmd failed -> no docs, mem0 intact
 
 
+# ---- AC12 / INV-4a: mem0 over its own budget => QMD leg skipped ----------
+def test_mem0_over_budget_skips_qmd(monkeypatch):
+    calls = {"n": 0}
+
+    def _spy(*a, **k):
+        calls["n"] += 1
+        return [_HIT]
+    monkeypatch.setattr(qmd_recall, "qmd_query", _spy)
+
+    class _SlowClient:
+        def search(self, **k):
+            time.sleep(1.2)            # exceed the tiny mem0_budget below
+            return [{"memory": "slow fact"}]
+    p = Mem0MemoryProvider()
+    p._config = {}; p._rerank = False; p._keyword_search = None; p._temporal_search = False
+    p._consecutive_failures = 0; p._breaker_open_until = 0
+    p._drop_forgotten = lambda r: r; p._read_filters = lambda: {}
+    p._qmd_cfg = qmd_recall.load_qmd_config({"enabled": True, "mem0_budget_s": 0.5})
+    p._qmd_enabled = True
+    p._get_client = lambda: _SlowClient()
+    out = _run_prefetch(p, "where did we decide the local dns split")
+    assert "## Mem0 Memory" in out          # mem0 still returned
+    assert calls["n"] == 0                   # QMD skipped: mem0 blew its budget
+    assert "## Local Docs" not in out
+
+
+# ---- INV-1: no QMD output ever written back to mem0 -----------------------
+def test_no_write_path_from_qmd(monkeypatch):
+    writes = {"n": 0}
+
+    class _WriteSpyClient:
+        def search(self, **k):
+            return [{"memory": "fact"}]
+
+        def add(self, *a, **k):
+            writes["n"] += 1
+
+        def update(self, *a, **k):
+            writes["n"] += 1
+    monkeypatch.setattr(qmd_recall, "qmd_query", lambda *a, **k: [_HIT])
+    p = _provider(qmd_enabled=True, mem0_rows=[{"memory": "fact"}])
+    p._qmd_enabled = True
+    p._get_client = lambda: _WriteSpyClient()
+    _run_prefetch(p, "where did we decide the local dns split")
+    json.loads(p.handle_tool_call("mem0_search", {"query": "local dns split"}))
+    assert writes["n"] == 0                   # QMD recall never triggers a mem0 write
+
+
 # ---- INV-8 / AC7: tool schema byte-unchanged ------------------------------
 def test_search_schema_unchanged():
     # the model-facing schema must not gain a field (prompt-cache safety)
