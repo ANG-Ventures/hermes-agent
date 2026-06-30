@@ -360,8 +360,13 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     return "{}"
 
 
-def close_interrupted_tool_sequence(messages: list, final_response: Any = None) -> bool:
-    """Append a synthetic assistant turn when an interrupted tail is a tool result.
+def close_interrupted_tool_sequence(
+    messages: list,
+    final_response: Any = None,
+    *,
+    interrupted_assistant_tail: bool = False,
+) -> bool:
+    """Close interrupted message tails into an API-valid flagged assistant turn.
 
     A turn cut short by ``/stop`` can leave the transcript ending on a raw
     ``tool`` message (a tool finished, or its execution was cancelled, but the
@@ -382,7 +387,21 @@ def close_interrupted_tool_sequence(messages: list, final_response: Any = None) 
     if not messages:
         return False
     last = messages[-1]
-    if not isinstance(last, dict) or last.get("role") != "tool":
+    if not isinstance(last, dict):
+        return False
+    if (
+        interrupted_assistant_tail
+        and last.get("role") == "assistant"
+        and not last.get("tool_calls")
+    ):
+        last["_interrupt_close"] = True
+        return True
+    if last.get("role") == "assistant" and last.get("tool_calls"):
+        # A mid-API-call interrupt can persist assistant(tool_calls) before any
+        # matching tool result exists. Drop that dangling request and persist a
+        # plain flagged assistant close so the next API request is valid.
+        messages.pop()
+    elif last.get("role") != "tool":
         return False
     text = final_response if isinstance(final_response, str) else ""
     messages.append({
@@ -545,6 +564,7 @@ def _sanitize_structure_non_ascii(payload: Any) -> bool:
 
 __all__ = [
     "_SURROGATE_RE",
+    "_INTERRUPT_CLOSE_CONTENT",
     "close_interrupted_tool_sequence",
     "_sanitize_surrogates",
     "_SurrogateSplicer",
