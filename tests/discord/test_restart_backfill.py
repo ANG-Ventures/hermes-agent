@@ -566,3 +566,67 @@ async def test_backfill_thread_scoped_to_thread(_tmp_home):
     assert [m.id for m in adapter._dispatched] == [70080]
     assert thread_channel.history_calls, "the marked channel's history must be scanned"
 
+
+@pytest.mark.asyncio
+async def test_backfill_no_session_store_skips_entirely(_tmp_home):
+    """Greptile P2 / INV-9: with no session store wired, the transcript
+    authority is entirely unavailable — the sweep must recover NOTHING (fail
+    toward no-dup), never blind-re-inject. Guards an init-race where
+    _session_store is absent at backfill time."""
+    adapter, store, db = _build_adapter_with_store(_tmp_home)
+    adapter._session_store = None  # authority gone
+    author = _FakeAuthor(11111)
+    channel = _FakeChannel(987600, [])
+    channel._messages = [_make_msg(70600, author, channel)]
+    adapter._restart_recovery.mark_channel_active(str(channel.id))
+    adapter._client = SimpleNamespace(
+        user=_FakeAuthor(99999, "bot", bot=True),
+        get_channel=lambda _id: channel,
+        fetch_channel=AsyncMock(return_value=channel),
+    )
+    await adapter._backfill_missed_messages()
+    assert adapter._dispatched == [], "no session store ⇒ recover nothing (INV-9)"
+    assert channel.history_calls == [], "must not even scan when the authority is absent"
+
+
+def test_anchor_uses_shutdown_margin_not_lookback(_tmp_home):
+    """Greptile P2: the shutdown_ts branch of the anchor must be load-bearing.
+    A recent shutdown_ts anchors at shutdown_ts - MARGIN (300s), which is
+    NEWER (tighter) than the now-lookback floor (900s) — proving the branch
+    isn't dead code that always collapses to the floor."""
+    from plugins.platforms.discord.adapter import (
+        _RESTART_BACKFILL_ANCHOR_MARGIN_S, _DiscordRestartRecoveryState,
+    )
+    adapter, store, db = _build_adapter_with_store(_tmp_home)
+    now = 2_000_000_000.0
+    lookback = 900.0
+    # A shutdown ~30s ago (recent restart): anchor should be shutdown_ts - 300,
+    # NOT now - 900. Prove the two differ and the tighter (newer) one wins.
+    adapter._restart_recovery = _DiscordRestartRecoveryState(persist_interval_s=0.0)
+    adapter._restart_recovery.flush(shutdown_ts=now - 30)
+
+    anchor = adapter._restart_backfill_anchor_snowflake(now, lookback)
+    # Reverse the snowflake back to an epoch to compare.
+    anchor_epoch = ((anchor.id >> 22) + 1420070400000) / 1000.0
+    expected = (now - 30) - _RESTART_BACKFILL_ANCHOR_MARGIN_S
+    floor = now - lookback
+    assert abs(anchor_epoch - expected) < 1.0, "recent shutdown must anchor at shutdown_ts - margin"
+    assert anchor_epoch > floor, "the shutdown_ts branch must be tighter than the floor (not dead)"
+
+
+def test_anchor_falls_back_to_floor_on_long_outage(_tmp_home):
+    """The floor bounds a long outage: a shutdown_ts far in the past makes
+    shutdown_ts - margin older than now - lookback, so the floor takes over."""
+    from plugins.platforms.discord.adapter import _DiscordRestartRecoveryState
+    adapter, store, db = _build_adapter_with_store(_tmp_home)
+    now = 2_000_000_000.0
+    lookback = 900.0
+    adapter._restart_recovery = _DiscordRestartRecoveryState(persist_interval_s=0.0)
+    adapter._restart_recovery.flush(shutdown_ts=now - 100_000)  # ~28h ago
+
+    anchor = adapter._restart_backfill_anchor_snowflake(now, lookback)
+    anchor_epoch = ((anchor.id >> 22) + 1420070400000) / 1000.0
+    floor = now - lookback
+    assert abs(anchor_epoch - floor) < 1.0, "a long outage must clamp to the now-lookback floor"
+
+

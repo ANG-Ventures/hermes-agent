@@ -49,6 +49,13 @@ _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_NONCONVERSATIONAL_STATE_FILENAME = "discord_nonconversational_messages.json"
 _DISCORD_RESTART_RECOVERY_STATE_FILENAME = "discord_restart_recovery.json"
+# Anchor margin (s) subtracted from the persisted graceful-shutdown timestamp
+# when computing how far back the reconnect backfill scans channel.history.
+# shutdown_ts is stamped at drain-END, but the lost messages arrived DURING the
+# up-to-180s drain that preceded it, so the margin must exceed the drain window
+# to reach back before them: 180s drain + 120s headroom (mirrors the
+# safe-restart teardown/reconnect budgets). Bounded above by the lookback floor.
+_RESTART_BACKFILL_ANCHOR_MARGIN_S = 300.0
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
 # Typing-indicator loop: give up after this many CONSECUTIVE failed typing POSTs
@@ -5107,20 +5114,35 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> "_Snowflake":
         """Compute the ``after=`` anchor for the history scan (D-3).
 
-        ``ANCHOR = max(persisted_shutdown_ts - margin, now - lookback)`` as a
-        Discord snowflake. The margin is the full lookback window: the graceful
-        ``shutdown_ts`` is stamped at drain-END (~3 min AFTER a drain-window
-        message arrived), so anchoring at exactly ``shutdown_ts`` would scan
-        PAST the very messages we lost. Subtracting the lookback backs the
-        anchor up before the drain started; ``now - lookback`` is the absolute
-        floor bounding a multi-hour outage. Over-broad is safe — the transcript
-        authority (INV-1) dedups anything already processed; the anchor only
-        bounds how far back to look, never correctness.
+        ``ANCHOR = max(shutdown_ts - margin, now - lookback)`` as a Discord
+        snowflake. Two bounds, and the ``max`` picks the more-recent (tighter):
+
+        - ``shutdown_ts - margin`` — the "since we went down" anchor. The
+          graceful ``shutdown_ts`` is stamped in ``disconnect()`` at drain-END
+          (the adapter tears down *after* the up-to-180s agent drain), but the
+          lost messages arrived *during* that drain — i.e. up to a full
+          drain-duration BEFORE ``shutdown_ts``. So ``margin`` must exceed the
+          drain window (default 180s) + the reconnect gap to reach back before
+          the earliest lost message. ``_RESTART_BACKFILL_ANCHOR_MARGIN_S`` = 300
+          (180s drain + 120s headroom, matching the safe-restart budgets).
+        - ``now - lookback`` — the absolute floor (default 900s) that bounds a
+          multi-hour outage so we never scan hours of history (accepting that a
+          >lookback outage misses its oldest messages; documented R-5).
+
+        With ``margin`` (300s) < ``lookback`` (900s), a normal short restart
+        anchors at ``shutdown_ts - 300`` (a tight ~5-min scan that still reaches
+        before the drain), and only a long outage falls back to the floor. The
+        earlier bug used ``lookback`` as the margin, which made
+        ``shutdown_ts - lookback ≤ now - lookback = floor`` in every case — the
+        ``shutdown_ts`` branch was dead and every scan silently used the floor.
+        Over-broad is always safe — the transcript authority (INV-1) dedups
+        anything already processed; the anchor only bounds how far back to look,
+        never correctness.
         """
         floor = now - lookback_s
         shutdown_ts = self._restart_recovery.shutdown_ts
         if shutdown_ts is not None:
-            anchor_epoch = max(shutdown_ts - lookback_s, floor)
+            anchor_epoch = max(shutdown_ts - _RESTART_BACKFILL_ANCHOR_MARGIN_S, floor)
         else:
             anchor_epoch = floor
         # Discord snowflake: (ms_since_discord_epoch << 22). Discord epoch =
@@ -5190,6 +5212,20 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         if not self._discord_restart_backfill():
             return
+        # INV-9 (fail toward no-dup): the whole exactly-once guarantee rests on
+        # the session transcript as the dedup authority. With no session store
+        # wired (e.g. an initialization race, or a non-gateway construction),
+        # that authority is entirely unavailable — we could not confirm ANY
+        # message is absent, so recovering would blind-re-inject and duplicate
+        # already-processed turns. Skip the whole sweep rather than the
+        # per-message answerability gate (which can't fire because
+        # _resolve_session_id_for_message also returns None when store is None).
+        if getattr(self, "_session_store", None) is None:
+            logger.debug(
+                "[%s] backfill: no session store — skipping (INV-9 fail toward no-dup)",
+                self.name,
+            )
+            return
         if self._restart_backfill_lock.locked():
             # A concurrent sweep (reconnect flap) is already running (INV-6).
             return
@@ -5206,7 +5242,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             anchor = self._restart_backfill_anchor_snowflake(now, lookback_s)
 
-            recovered = 0
+            reinject_attempts = 0
             skipped_in_transcript = 0
             reinject_failed = 0
             unanswerable_channels = 0
@@ -5274,9 +5310,17 @@ class DiscordAdapter(BasePlatformAdapter):
                         # as a live message. A raised re-inject leaves the message
                         # absent from the transcript ⇒ recoverable next sweep
                         # (INV-8); reinject_failed is observability-only.
+                        #
+                        # NOTE this counts ATTEMPTS, not confirmed processings:
+                        # _dispatch_incoming_message can early-return without
+                        # raising (in-process _dedup hit racing a live delivery,
+                        # or an auth/mention gate), so reinject_attempts is an
+                        # upper bound on messages actually queued to
+                        # _handle_message. The transcript authority — not this
+                        # counter — is what guarantees exactly-once.
                         try:
                             await self._dispatch_incoming_message(msg)
-                            recovered += 1
+                            reinject_attempts += 1
                         except Exception:
                             reinject_failed += 1
                             logger.debug(
@@ -5294,18 +5338,19 @@ class DiscordAdapter(BasePlatformAdapter):
                     continue
 
             # One content-free summary line (privacy AC-12). WARNING when we
-            # recovered or failed a re-inject (or hit an unanswerable authority),
-            # else INFO.
+            # attempted a re-inject or failed one (or hit an unanswerable
+            # authority), else INFO. reinject_attempts is an upper bound (see the
+            # note at the increment) — not a proven-processed count.
             level = (
                 logging.WARNING
-                if (recovered or reinject_failed or unanswerable_channels)
+                if (reinject_attempts or reinject_failed or unanswerable_channels)
                 else logging.INFO
             )
             logger.log(
                 level,
-                "[%s] PHASE=restart_backfill channels=%d recovered=%d "
+                "[%s] PHASE=restart_backfill channels=%d reinject_attempts=%d "
                 "skipped_in_transcript=%d reinject_failed=%d unanswerable_channels=%d",
-                self.name, scanned_channels, recovered, skipped_in_transcript,
+                self.name, scanned_channels, reinject_attempts, skipped_in_transcript,
                 reinject_failed, unanswerable_channels,
             )
 
