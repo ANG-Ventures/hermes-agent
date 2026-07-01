@@ -56,6 +56,52 @@ jobs:
         id: classify
         uses: ./.github/actions/detect-changes
 
+      # ── SHADOW MODE: change-based test selection (observational only) ──────
+      # Computes the would-select test subset and logs it to the step summary.
+      # It does NOT gate anything yet — the full matrix still runs. This is the
+      # advisory soak: we compare "would-select" against reality across real PRs
+      # before ever narrowing. On non-pull_request events it's skipped (push /
+      # merge run the FULL suite unconditionally — a wrong narrowing can never
+      # reach main). See scripts/ci/select_tests.py + ci-test-suite-performance.
+      - name: Change-based selection (shadow)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
+          HERMES_REPO_ROOT: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          CHANGED="$(gh api --paginate \
+            "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" \
+            --jq '.files[].filename' || true)"
+          SEL="$(printf '%s\n' "${CHANGED:-}" | python3 scripts/ci/select_tests.py 2>/tmp/sel_err || echo ALL)"
+          REASON="$(cat /tmp/sel_err 2>/dev/null || true)"
+          TOTAL="$(find tests -name 'test_*.py' -not -path '*/__pycache__/*' | wc -l | tr -d ' ')"
+          {
+            echo "### Change-based test selection (SHADOW — not gating)"
+            if [ "$SEL" = "ALL" ]; then
+              echo ""
+              echo "**Verdict: FULL SUITE** (fail-open). Reason(s):"
+              echo '```'
+              echo "${REASON:-empty/unmapped diff}"
+              echo '```'
+            else
+              N="$(printf '%s\n' "$SEL" | grep -c '^tests/' || echo 0)"
+              echo ""
+              echo "**Verdict: would narrow to ${N}/${TOTAL} test files** (~$(( N * 100 / (TOTAL>0?TOTAL:1) ))% of suite)."
+              echo "_Shadow mode: the full matrix still ran. This measures the potential saving only._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Also emit a greppable marker for the divergence monitor.
+          if [ "$SEL" = "ALL" ]; then
+            echo "GREPLOOP-CI-SELECT verdict=ALL pr=${HEAD_SHA}"
+          else
+            N="$(printf '%s\n' "$SEL" | grep -c '^tests/' || echo 0)"
+            echo "GREPLOOP-CI-SELECT verdict=SUBSET n=${N} total=${TOTAL} pr=${HEAD_SHA}"
+          fi
+        continue-on-error: true
+
   # ─────────────────────────────────────────────────────────────────────
   # Lane-gated sub-workflows. Each runs in parallel after detect finishes.
   # Skipped workflows (if condition is false) don't spin up runners.
