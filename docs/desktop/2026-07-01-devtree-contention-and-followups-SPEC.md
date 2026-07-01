@@ -24,9 +24,12 @@ return.
 ## 2. Non-Goals
 - **NOT** making the dev tree "deploy-only" like the runtime tree — the dev tree legitimately hosts active
   development (30 worktrees fork from `main`; PRs merge to `main`; fork-syncs land on `main`). Root `main`
-  MUST keep advancing. Tier-3's goal is narrower: **no one ever has the root checkout *checked out on a
-  working branch* or builds/commits *in* it** — the root checkout stays parked and its `main` ref advances
-  only via a serialized, FF-only writer. (See D-5 for the corrected mechanism.)
+  MUST keep advancing. **Tier-3 does NOT make root `main` "unwritable" or the root checkout structurally
+  uneditable — a `--no-verify`-bypassable git hook provably cannot cage that (see `git-worktree-isolation`).
+  Tier-3's honest guarantee is narrower: (a) SERIALIZE the local writers that adopt `land-on-main.sh` (no
+  two racing FF/reset), and (b) DETECT (tripwire, not prevent) an in-place root-checkout mutation by a
+  caller that didn't adopt it.** Automated callers that bypass the writer remain a contention source — the
+  same bug class — so Tier-2's lint + the tripwire are how we *find* them, not a cage. (See D-5.)
 - **NOT** changing the runtime deploy-only split (already shipped, separate system).
 - **NOT** touching the ~30 existing feature worktrees or how PRs land (they keep forking from `main`).
 
@@ -86,23 +89,40 @@ C in the freshness helper (only it decides the pin).
 - **D-4: orphan-venv removal is a one-shot with a standing guard.** `rm -rf ~/.hermes/hermes-agent/venv`
   after re-proving nothing holds it + no gateway references it; then a cheap guard (a line in the existing
   fleet health check) that flags if a venv reappears in the dev tree.
-- **D-5: Tier-3 = "root checkout is never a working surface; `main` advances only via a serialized FF-only
-  writer" — NOT a runtime-style deploy-only tree.** The dev tree must keep advancing `main` (PRs, fork-sync,
-  worktrees fork from it), so the runtime "read-only import source" model does NOT apply. Concrete mechanism:
-  1. **The root checkout stays parked on `main` and is never `checkout`ed onto a working branch or committed
-     to in place.** All work — including doc/spec commits like this one — happens in a worktree, then lands
-     on `main` via a single sanctioned writer.
-  2. **A `fleet/land-on-main.sh` serialized FF-only writer:** acquires an `flock` on
-     `~/.hermes/hermes-agent/.git/main-land.lock`, `fetch`es, and `git merge --ff-only`s the requested
-     branch/ref into `main` (refuses non-FF, refuses a dirty root). Fork-syncs and agent doc-lands both go
-     through it → concurrent writers serialize instead of racing/resetting.
-  3. **A `pre-checkout`-style + extended `pre-commit` guard on the root checkout** refuses (a) a `checkout`
-     that moves the root off `main`, and (b) a commit authored in the root checkout that didn't come through
-     `land-on-main.sh` (detected via an env sentinel the writer sets). Worktrees are exempt (the existing
-     hook is already worktree-aware). Guard is bypassable (`--no-verify`) as a tripwire, per the existing
-     runtime-guard precedent — the *structural* control is that scripts use worktrees + the writer.
-  4. **`desktop-update.sh` (Tier-1) and any fleet script that advances `main` route through
-     `land-on-main.sh`** instead of a raw `git merge`/`checkout` on root.
+- **D-5: Tier-3 = SERIALIZE-the-adopters + DETECT-the-rest — NOT a structural cage and NOT a runtime-style
+  deploy-only tree.** Honest guarantee (per BL-1 fold): the writer serializes *local writers that adopt it*;
+  the hook is a *tripwire that detects, not prevents* in-place root-checkout mutation (`--no-verify` and
+  simple non-adoption both bypass it — a git hook provably cannot cage this). It measurably shrinks
+  contention (the only known writer — `desktop-update.sh` — and the fork-sync path both adopt it) but does
+  NOT eliminate the capability for a rogue/unported caller. Residual: any automated caller that doesn't
+  route through `land-on-main.sh` is the same contention bug class; Tier-2's lint is how we find them.
+  Concrete mechanism:
+  1. **The root checkout stays parked on `main`; adopting callers never `checkout` it onto a working branch
+     or commit in place.** All work — including doc/spec commits like this one — happens in a worktree, then
+     lands on `main` via the single sanctioned writer.
+  2. **`fleet/land-on-main.sh <branch|ref>` serialized FF-only writer:** acquires a non-blocking `flock`
+     (bounded wait, LOUD fail on timeout — never an unbounded block; R-5) on
+     `~/.hermes/hermes-agent/.git/main-land.lock`, then — **UNDER THE LOCK** — `fetch`es, re-checks
+     FF-ability against the just-fetched `origin/main`/target, refuses a dirty root (exit 3) and a non-FF
+     (exit 4) **loudly without ever resetting**, and on success FF-merges into `main`. The fetch+FF-check
+     MUST be under the lock (not before acquiring it) so a server-side advance observed mid-op can't race a
+     stale FF. **Local-writer serialization only** — see D-5.5 on PR merges.
+  3. **Extended root-checkout tripwire (extend the existing worktree-aware `pre-commit`; add a `pre-checkout`-
+     equivalent guard):** refuses (a) a commit authored in the root checkout without the writer's sentinel,
+     and (b) a `checkout` moving the root off `main`. Worktrees are EXEMPT (existing hook is worktree-aware).
+     Bypassable (`--no-verify`) by design — it's the tripwire half of D-5, not a cage.
+  4. **`desktop-update.sh` (Tier-1) and every fleet script that advances `main` route through
+     `land-on-main.sh`** instead of a raw `git merge`/`checkout`/`reset` on root.
+  5. **Sentinel threat model (RC-5):** the env sentinel the writer sets is *forgeable* (`SENTINEL=1 git
+     commit` bypasses it) — it gates *accidental* raw commits, NOT adversarial ones. It is an
+     accident-guard, not a security control. It MUST be scoped so a worktree commit spawned inside a
+     `land-on-main.sh`-invoked build cannot inherit it and mask a real violation (unset it before invoking
+     any child build; the build runs in a worktree which is exempt anyway).
+  6. **PR merges are OUT-OF-BAND (RC-2, BL-3):** a GitHub PR merge advances `origin/main` server-side; local
+     root `main` moves only on the next `fetch`+FF. `land-on-main.sh` therefore serializes **local writers
+     against each other**, NOT against GitHub. The writer treats an `origin/main` advance as out-of-band:
+     it `fetch`es under the lock and FFs onto whatever the server now has, failing loudly (never resetting)
+     if that makes the requested land non-FF. "PR merges route through the writer" is FALSE and was removed.
 - **D-6 (Ace, OQ-2 resolved): freshness pin = `apps/desktop` + `package-lock.json`.** Confirm the exact
   build-input set by reading `dist:mac`'s dependency graph in Phase 1; if the build bundles more shared
   inputs, add those paths (grep-confirmed).
@@ -110,12 +130,23 @@ C in the freshness helper (only it decides the pin).
 ## 6. Implementation Phases
 
 - **Phase 1 — C: freshness false-stale fix (smallest, unblocks a clean re-run).**
-  - *Unit/script:* `du_resolve_ref`/identity resolves the pin to the last `apps/desktop`-touching commit;
-    a docs-only commit on top does NOT flip identity to stale.
+  - *BLOCKING GATE (RC-7):* before writing the pin, **enumerate and grep-confirm the COMPLETE build-input
+    path set** by reading `dist:mac`'s actual dependency graph (`apps/desktop/package.json` `build`/`files`/
+    `extraResources`, `electron-builder` config, and the workspace deps `dist:mac` bundles). The pin MUST
+    cover every path whose change changes the built app. This is the correctness crux: a MISSING input makes
+    freshness UNDER-report stale (ships nothing when it should rebuild) — strictly worse than over-reporting.
+    Phase 1 does not proceed until the set is confirmed on disk.
+  - *Unit/script:* `du_resolve_ref`/identity resolves the pin to the last commit touching the confirmed
+    build-input set (`apps/desktop` + `package-lock.json` + any additions from the gate); a docs-only commit
+    on top does NOT flip identity to stale.
   - *E2E:* on the live Studio (installed `3fc83b17`), after the docs-only `0dd61f6b8` HEAD, `desktop-update.sh
-    --host self` reports **"already current"** (not "stale"), because the last `apps/desktop` commit is
+    --host self` reports **"already current"** (not "stale"), because the last build-input commit is
     still the installed one.
   - *Negative:* a real `apps/desktop/` change flips it to "stale → would rebuild."
+  - *Negative (RC-7, build-input completeness):* a change to a bundled-but-initially-unpinned input (e.g. a
+    workspace dep `dist:mac` bundles) MUST be caught by the enumeration step — i.e. the confirmation gate
+    fails if such a path exists outside the pin. Prove the enumeration is complete, not just that the two
+    obvious paths work.
   - *Verify with:* `bash ~/.hermes/fleet/desktop-update.sh --host self` → `GATE identity: PLAN — already current`.
 - **Phase 2 — A-Tier1: build in a throwaway worktree (the concrete contention fix).**
   - *Unit/script:* `du_build_and_install` creates `~/.hermes/worktrees/desktop-build-<ts>` at the pinned
@@ -140,63 +171,83 @@ C in the freshness helper (only it decides the pin).
     health run is clean.
   - *Verify with:* `ls ~/.hermes/hermes-agent/venv` → absent; gateways `state=running`.
 - **Phase 5 — A-Tier3: serialized FF-only writer for root `main` + root-checkout working-surface guard (D-5, IN SCOPE).**
-  - *Unit/script:* `fleet/land-on-main.sh <branch|ref>` acquires the `flock`, refuses a dirty root (exit≠0),
-    refuses a non-FF (exit≠0), and on success FF-merges into `main` with the sentinel set; two concurrent
-    invocations serialize (the second waits for the lock, then FFs on top or no-ops) — proven with two
-    background invocations racing.
-  - *E2E:* migrate this repo's own doc-land flow + the fork-sync flow to `land-on-main.sh`; a real land
-    advances `main` with the root checkout never leaving `main` (reflog shows no `checkout`-to-branch on
-    root).
+  - **Sequencing (RC-4):** land the writer + refusal gates (AC-8/AC-9) and the tripwire (AC-10) FIRST; do the
+    live fork-sync-path cutover (E2E below, AC-11) LAST, only after those pass. Rollback for the cutover:
+    revert the one runbook line — raw `git merge --ff-only fork/main` still works as the fallback path.
+  - *Unit/script:* `fleet/land-on-main.sh <branch|ref>` acquires the `flock`, then UNDER THE LOCK
+    `fetch`es + FF-checks, refuses a dirty root (exit 3), refuses a non-FF (exit 4) without resetting, and on
+    success FF-merges into `main` with the sentinel set; two concurrent invocations serialize (the second
+    waits for the lock, then FFs on top or no-ops) — proven with two background invocations racing.
+  - *Concurrency realism (RC-3, BL-2):* a race test that runs `land-on-main.sh` **concurrent with an
+    ephemeral build worktree (`with_ephemeral_worktree`)** AND a **simulated external `origin/main` advance**
+    (a pushed commit fetched mid-op) — the demonstrated failure mode was a build/checkout dance racing a ref
+    advance, not two lands. Assert: root `main` ends FF-advanced or loud-refused (never reset), the build
+    worktree is unaffected, and no interleaving corrupts root `main`.
+  - *E2E (do LAST, RC-4):* migrate this repo's own doc-land flow + the fork-sync flow to `land-on-main.sh`; a
+    real land advances `main` with the root checkout never leaving `main` (reflog shows no `checkout`-to-branch
+    on root).
   - *Negative/adversarial:* (a) a raw `git commit` in the root checkout WITHOUT the writer's sentinel is
     refused by the extended `pre-commit` guard (exit≠0); (b) a `git checkout <branch>` on the root is
-    refused; (c) both are EXEMPT in a worktree (the existing hook's worktree-awareness preserved — prove a
-    worktree commit still succeeds). Guard is `--no-verify`-bypassable (tripwire, not a cage) per the
-    runtime-guard precedent.
-  - *Verify with:* the race test (2 concurrent `land-on-main.sh` → both serialize, `main` FF-advanced, no
-    reset); a root-checkout raw-commit attempt → refused; a worktree commit → succeeds.
+    refused; (c) both are EXEMPT in a worktree — prove a worktree commit still succeeds, testing **both**
+    worktree locations (`~/.hermes/worktrees/*` AND any `~/Projects/wt*` form, RR-1). Guard is
+    `--no-verify`-bypassable (tripwire, not a cage) per the runtime-guard precedent.
+  - *Disk-headroom (RR-3):* a failed `npm ci` / near-full-filesystem mid-build MUST still leave root `main`
+    pristine (Tier-1's core invariant) — assert HEAD+status unchanged after an induced build failure.
+  - *Verify with:* the race test (concurrent land + build + external advance → serialize, `main` FF or
+    loud-refuse, no reset); a root-checkout raw-commit attempt → refused; a worktree commit (both locations)
+    → succeeds.
 
 ## 7. Security / Ops
 - All changes are reversible: Tier-1/2 change *where* the build runs (worktree vs root); C changes the
   freshness pin; B deletes a gitignored orphan with a pre-delete safety re-prove; Tier-3's writer/guard are
   additive (the `flock` + hook only *serialize/refuse* — they never rewrite history; `--no-verify` remains
   an escape hatch).
-- **Tier-3 must NOT block legitimate PR merges or fork-syncs** — they route THROUGH `land-on-main.sh` (FF),
-  they aren't forbidden. The guard refuses only *in-place working-surface* mutation of the root checkout.
+- **Tier-3 serializes LOCAL writers only; it does NOT block PR merges (they're server-side, out-of-band —
+  BL-3/D-5.6) or fork-syncs (those route THROUGH `land-on-main.sh` as FF, not forbidden).** The guard
+  refuses only *in-place working-surface* mutation of the root checkout, and only as a bypassable tripwire.
 - **Tier-3 interaction with the existing `pre-commit` runtime-guard:** extend that same hook (don't add a
   competing one); preserve its worktree-awareness so the 30 feature worktrees are unaffected.
 
 ## 8. Risks & Mitigations
 - **R-1: a throwaway worktree leaks disk if cleanup is skipped.** *Mitigation:* `trap 'git worktree remove
-  --force' EXIT` + a prune of stale `desktop-build-*` worktrees on each run (keep-none).
+  --force' EXIT` + a prune of stale `desktop-build-*` worktrees on each run (keep-none). Ensure the trap
+  captures build logs BEFORE removing the worktree on the failure path (RR-2).
 - **R-2: the MBP over-SSH worktree build needs the same isolation.** *Mitigation:* D-2 applies the worktree
   pattern to the MBP arm too; the hotfix-stash dance is retired (nothing to stash if root `main` is never
   checked out).
-- **R-3: freshness-on-apps/desktop-commit misses a change made OUTSIDE apps/desktop that the build bundles**
-  (e.g. a shared root `package-lock.json`). *Mitigation:* D-6 includes `package-lock.json` in the pin paths;
-  Phase 1 reads `dist:mac`'s dep graph to confirm the full build-input set.
+- **R-3: freshness pin misses a build input made OUTSIDE `apps/desktop` that the build bundles**
+  (e.g. a workspace dep or shared `package-lock.json`). *Mitigation:* D-6 + Phase-1 BLOCKING GATE (RC-7):
+  enumerate + grep-confirm the COMPLETE `dist:mac` build-input set on disk before writing the pin; a
+  bundled-but-unpinned input fails the confirmation. Under-reporting stale is the dangerous direction.
 - **R-4 (Tier-3): the writer/guard could block a legitimate land or fight the existing hook.** *Mitigation:*
-  route PR-merge + fork-sync THROUGH the writer (they FF, not forbidden); extend the existing worktree-aware
-  `pre-commit` rather than adding a second hook; keep `--no-verify` as the escape hatch; prove a worktree
-  commit still succeeds (negative test c).
+  fork-syncs route THROUGH the writer as FF (not forbidden); PR merges are out-of-band and NOT expected to
+  route through it (D-5.6); extend the existing worktree-aware `pre-commit` rather than adding a second hook;
+  keep `--no-verify` as the escape hatch; prove a worktree commit still succeeds (negative test c).
 - **R-5 (Tier-3): a `flock` held by a crashed writer wedges all lands.** *Mitigation:* `flock` auto-releases
   on holder death (kernel-managed, same as the safe-restart single-flight); use a non-blocking acquire with
   a bounded wait + LOUD failure, never an unbounded block.
-- **R-6 (Tier-3): can't force human/other-agent adoption of the writer.** *Mitigation:* the guard is the
-  tripwire (refuses raw root commits/checkouts), `land-on-main.sh` is the easy sanctioned path, and the
-  lint (Tier-2) flags any fleet script still doing raw root mutation. Full structural enforcement (removing
-  the capability) is explicitly a non-goal — a git hook provably can't cage this (see
-  `git-worktree-isolation` "a git hook CANNOT enforce it").
+- **R-6 (Tier-3): can't force human/other-agent adoption of the writer (this is the honest limit, BL-1).**
+  *Mitigation:* the guard is a tripwire (refuses raw root commits/checkouts — accident-grade, `--no-verify`-
+  and non-adoption-bypassable), `land-on-main.sh` is the easy sanctioned path, and the lint (Tier-2) flags
+  any fleet script still doing raw root mutation. Full structural enforcement (removing the capability) is
+  explicitly a non-goal / future item — a git hook provably can't cage this (see `git-worktree-isolation`
+  "a git hook CANNOT enforce it"). **The spec claims serialization-for-adopters + detection, nothing more.**
+- **R-7 (B venv guard, RC-6): a health-check line DETECTS, doesn't PREVENT, a reappeared venv.** *Mitigation:*
+  acceptable (detection-only, stated honestly); the guard matches `venv` at the **dev-tree root
+  specifically** (`~/.hermes/hermes-agent/venv`), NOT any `venv` under it (worktrees may legitimately create
+  their own); on match it routes to the health check's existing alert channel (#alerts) so a 320M reappearance
+  actually surfaces, not just logs.
 
 ## 9. Open Questions
 - **OQ-1 → RESOLVED (Ace, 2026-07-01): do Tier-3 now.** "That may happen, you just did it — let's do tier 3
   now." Tier-3 is in v0.1 scope (Phase 5), mechanism per D-5.
 - **OQ-2 → RESOLVED (Ace): freshness pin = `apps/desktop` + `package-lock.json`** (D-6), full build-input
   set confirmed against `dist:mac` in Phase 1.
-- **OQ-3 (remaining, for review):** should `land-on-main.sh` also become the *only* way fork-syncs land
-  (retiring the manual `git merge --ff-only fork/main` in the `hermes-fork-pr-contribution` runbook), or
-  just the way *agent/script* lands happen? (Recommendation: make it the sanctioned path for both, update
-  the fork-sync runbook to call it — one serialized writer is the whole point; a manual bypass reintroduces
-  the race.)
+- **OQ-3 (recommendation, pass-1 reviewer CONCURRED):** `land-on-main.sh` becomes the sanctioned path for
+  BOTH fork-syncs and agent/script lands (update the `hermes-fork-pr-contribution` runbook to call it) — a
+  manual `git merge --ff-only` bypass reintroduces the exact race. Note (BL-1/D-5.6): this only helps where
+  adopted, and PR merges remain out-of-band by nature; the writer serializes *local adopters*, nothing more.
+  Ace's call if he wants to keep the manual path as an explicit break-glass.
 
 ## 10. Acceptance Criteria
 - [ ] **AC-1 (C):** after a docs-only HEAD advance, `desktop-update.sh --host self` reports "already current"
@@ -222,10 +273,21 @@ C in the freshness helper (only it decides the pin).
   refused-in-root + succeeds-in-worktree runs.
 - [ ] **AC-11 (A-Tier3 land migration):** the fork-sync + agent doc-land flows route through
   `land-on-main.sh` (grep the runbook/scripts); a real land advances `main` without the root leaving `main`.
-  Evidence: grep + reflog.
+  Evidence: grep + reflog. **Do LAST (RC-4), after AC-8/9/10 pass; rollback = revert the runbook line.**
+- [ ] **AC-12 (A-Tier3 concurrency realism, RC-3/BL-2):** `land-on-main.sh` running concurrent with an
+  ephemeral build worktree AND a simulated external `origin/main` advance ends with root `main` FF-advanced
+  or loud-refused (never reset), build worktree unaffected. Evidence: race-test output.
+- [ ] **AC-13 (C build-input completeness, RC-7):** the Phase-1 enumeration gate confirms the COMPLETE
+  `dist:mac` build-input set on disk; a bundled-but-unpinned input fails the confirmation. Evidence:
+  enumeration output + a negative check proving an unpinned bundled path is caught.
+- [ ] **AC-14 (A-Tier1 disk-headroom, RR-3):** an induced `npm ci`/build failure mid-run leaves root `main`
+  HEAD+status pristine. Evidence: before/after capture across a forced-fail build.
+- [ ] **AC-15 (A-Tier3 worktree-exempt both locations, RR-1):** a worktree commit succeeds in BOTH
+  `~/.hermes/worktrees/*` and a `~/Projects/wt*`-style path (the hook's worktree-detection covers both).
+  Evidence: two worktree-commit runs.
 
 ## 11. Roadmap
 | Version | Ships | Trigger |
 |---|---|---|
-| v0.1 | Tier-1 (build-in-worktree) + Tier-2 (helper+lint) + **Tier-3 (serialized `land-on-main.sh` writer + root-checkout guard)** + B (orphan venv) + C (freshness) | now (Ace: do Tier-3 now) |
-| future | remove the raw-shell/`git` capability from agent profiles entirely (structural cage) | if the guard tripwire proves insufficient |
+| v0.1 | Tier-1 (build-in-worktree) + Tier-2 (helper+lint) + **Tier-3 (serialized `land-on-main.sh` writer + root-checkout tripwire)** + B (orphan venv) + C (freshness) | now (Ace: do Tier-3 now) |
+| future | remove the raw-shell/`git` capability from agent profiles entirely (the structural cage a git hook can't provide) | if the tripwire proves insufficient |
