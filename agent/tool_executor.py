@@ -76,6 +76,12 @@ _MAX_TOOL_WORKERS = 8
 _RESUME_SUMMARY_ONLY_BLOCK_MESSAGE = (
     "resumed turn is summarize-only; await user go"
 )
+_RESUME_SUMMARY_ONLY_READ_ONLY_TOOLS = frozenset({
+    "read_file",
+    "search_files",
+    "list_files",
+    "ls",
+})
 
 
 def _flush_session_db_after_tool_progress(
@@ -110,6 +116,10 @@ def _resume_summary_only_block_result(function_name: str) -> str:
     )
 
 
+def _is_resume_summary_only_read_tool(function_name: str) -> bool:
+    return function_name in _RESUME_SUMMARY_ONLY_READ_ONLY_TOOLS
+
+
 def _block_resume_summary_only_tools(agent, tool_calls, messages: list, effective_task_id: str) -> bool:
     """Block tool calls while the resume-summary-only interlock is active.
 
@@ -124,24 +134,35 @@ def _block_resume_summary_only_tools(agent, tool_calls, messages: list, effectiv
         getattr(getattr(tc, "function", None), "name", "") or "unknown"
         for tc in tool_calls
     ]
-    logger.warning(
-        "RESUME_AUTOCONTINUE_VIOLATION session_id=%s task_id=%s tools=%s",
-        getattr(agent, "session_id", "") or "",
-        effective_task_id or "",
-        ",".join(names),
-    )
+    forward_names = [name for name in names if not _is_resume_summary_only_read_tool(name)]
+    if forward_names:
+        logger.warning(
+            "RESUME_AUTOCONTINUE_VIOLATION session_id=%s task_id=%s tools=%s",
+            getattr(agent, "session_id", "") or "",
+            effective_task_id or "",
+            ",".join(forward_names),
+        )
+    else:
+        logger.debug(
+            "Blocked read-only tool call on resume-summary turn "
+            "session_id=%s task_id=%s tools=%s",
+            getattr(agent, "session_id", "") or "",
+            effective_task_id or "",
+            ",".join(names),
+        )
 
-    try:
-        cb = getattr(agent, "tool_progress_callback", None)
-        if cb:
-            cb(
-                "resume.autocontinue_violation",
-                ",".join(names),
-                _RESUME_SUMMARY_ONLY_BLOCK_MESSAGE,
-                {},
-            )
-    except Exception:
-        logger.debug("resume autocontinue violation notify failed", exc_info=True)
+    if forward_names:
+        try:
+            cb = getattr(agent, "tool_progress_callback", None)
+            if cb:
+                cb(
+                    "resume.autocontinue_violation",
+                    ",".join(forward_names),
+                    _RESUME_SUMMARY_ONLY_BLOCK_MESSAGE,
+                    {},
+                )
+        except Exception:
+            logger.debug("resume autocontinue violation notify failed", exc_info=True)
 
     for tc in tool_calls:
         name = getattr(getattr(tc, "function", None), "name", "") or "unknown"

@@ -64,6 +64,7 @@ def _tool_result_payload(messages):
 def test_resume_summary_only_blocks_forward_tool_call_and_logs(caplog):
     agent = _make_agent("terminal")
     agent._resume_summary_only = True
+    agent.tool_progress_callback = MagicMock()
     messages = []
     assistant_message = _assistant_message(
         _mock_tool_call("terminal", '{"command":"touch should-not-run"}', "call-1")
@@ -78,6 +79,8 @@ def test_resume_summary_only_blocks_forward_tool_call_and_logs(caplog):
     assert "summarize-only" in payload["error"]
     assert payload["resume_autocontinue_block"]["tool_name"] == "terminal"
     assert "RESUME_AUTOCONTINUE_VIOLATION" in caplog.text
+    agent.tool_progress_callback.assert_called_once()
+    assert agent.tool_progress_callback.call_args.args[0] == "resume.autocontinue_violation"
 
 
 def test_resume_summary_only_blocks_every_tool_round_in_same_turn():
@@ -98,6 +101,26 @@ def test_resume_summary_only_blocks_every_tool_round_in_same_turn():
 
     mock_hfc.assert_not_called()
     assert agent._resume_summary_only is True
+
+
+def test_resume_summary_only_read_tool_block_does_not_emit_violation(caplog):
+    agent = _make_agent("read_file")
+    agent._resume_summary_only = True
+    agent.tool_progress_callback = MagicMock()
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc:
+        agent._execute_tool_calls_sequential(
+            _assistant_message(_mock_tool_call("read_file", '{"path":"README.md"}', "call-1")),
+            messages,
+            "task-1",
+        )
+
+    mock_hfc.assert_not_called()
+    payload = _tool_result_payload(messages)
+    assert payload["resume_autocontinue_block"]["tool_name"] == "read_file"
+    assert "RESUME_AUTOCONTINUE_VIOLATION" not in caplog.text
+    agent.tool_progress_callback.assert_not_called()
 
 
 def test_normal_turn_executes_tools_without_interference():
