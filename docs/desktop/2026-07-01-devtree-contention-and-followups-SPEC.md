@@ -135,7 +135,11 @@ C in the freshness helper (only it decides the pin).
     `extraResources`, `electron-builder` config, and the workspace deps `dist:mac` bundles). The pin MUST
     cover every path whose change changes the built app. This is the correctness crux: a MISSING input makes
     freshness UNDER-report stale (ships nothing when it should rebuild) — strictly worse than over-reporting.
-    Phase 1 does not proceed until the set is confirmed on disk.
+    Phase 1 does not proceed until the set is confirmed on disk. **Enumeration must be MECHANICAL, not
+    hand-listed (Nit-2):** parse `electron-builder`'s `files`/`extraResources` + resolve workspace deps
+    programmatically and record the method, so a future dep addition re-runs the same enumeration rather
+    than trusting the v0.1 snapshot. (Caveat, stated honestly: this catches *known* build inputs; an unknown
+    unknown outside the parsed graph can't be tested for — the mechanical re-run is the mitigation.)
   - *Unit/script:* `du_resolve_ref`/identity resolves the pin to the last commit touching the confirmed
     build-input set (`apps/desktop` + `package-lock.json` + any additions from the gate); a docs-only commit
     on top does NOT flip identity to stale.
@@ -174,6 +178,11 @@ C in the freshness helper (only it decides the pin).
   - **Sequencing (RC-4):** land the writer + refusal gates (AC-8/AC-9) and the tripwire (AC-10) FIRST; do the
     live fork-sync-path cutover (E2E below, AC-11) LAST, only after those pass. Rollback for the cutover:
     revert the one runbook line — raw `git merge --ff-only fork/main` still works as the fallback path.
+    **The rollback path MUST NOT be caged by the checkout-guard it's meant to bypass (Nit-1):** when root is
+    already parked on `main`, `git merge --ff-only fork/main` needs NO `git checkout` and authors no commit
+    object in root, so neither the checkout-guard (D-5.3.b) nor the commit-sentinel guard (D-5.3.a) fires —
+    assert this explicitly in the rollback runbook (a raw FF-only fork-sync from a parked-on-`main` root
+    succeeds under the tripwire).
   - *Unit/script:* `fleet/land-on-main.sh <branch|ref>` acquires the `flock`, then UNDER THE LOCK
     `fetch`es + FF-checks, refuses a dirty root (exit 3), refuses a non-FF (exit 4) without resetting, and on
     success FF-merges into `main` with the sentinel set; two concurrent invocations serialize (the second
