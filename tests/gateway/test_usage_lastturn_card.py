@@ -9,9 +9,8 @@ Hermetic: the suite's autouse ``_hermetic_environment`` fixture (tests/conftest.
 already redirects HERMES_HOME to a per-test tempdir, so we seed the turn into THAT
 sandbox store via insert_turn — never touching the live ~/.hermes store.
 
-Run (from the worktree):
-  PYTHONPATH=$PWD HOME=/Users/alexgierczyk \
-    /Users/alexgierczyk/.hermes/hermes-agent/venv/bin/python -m pytest \
+Run (from the worktree, with the active venv):
+  PYTHONPATH=$PWD python -m pytest \
     tests/gateway/test_usage_lastturn_card.py -o addopts= -q
 """
 import time

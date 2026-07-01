@@ -3582,15 +3582,27 @@ class GatewaySlashCommandsMixin:
         try:
             import importlib.util
             import os
+            import sys
 
             lib_path = os.path.expanduser("~/.hermes/scripts/claude_usage_lib.py")
             if not os.path.isfile(lib_path):
                 return []
-            spec = importlib.util.spec_from_file_location("claude_usage_lib", lib_path)
-            if spec is None or spec.loader is None:
-                return []
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
+            # Cache the loaded module under a stable sys.modules key so the
+            # library's top-level imports (subprocess, sqlite3, etc.) are only
+            # executed once instead of re-run on every /usage call (Greptile P2).
+            _MOD_KEY = "_hermes_claude_usage_lib"
+            mod = sys.modules.get(_MOD_KEY)
+            if mod is None:
+                spec = importlib.util.spec_from_file_location(_MOD_KEY, lib_path)
+                if spec is None or spec.loader is None:
+                    return []
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules[_MOD_KEY] = mod
+                try:
+                    spec.loader.exec_module(mod)
+                except Exception:
+                    sys.modules.pop(_MOD_KEY, None)  # don't cache a half-loaded module
+                    raise
             render = getattr(mod, "render_compact_lines", None)
             if render is None:
                 return []
