@@ -62,6 +62,11 @@ CASES = {
         ["plugins/kanban/dashboard/dist/index.js"], _lanes()),
     "dashboard dist css → nothing heavy": (
         ["plugins/kanban/dashboard/dist/style.css"], _lanes()),
+    # Vite/webpack also emit index.html + asset-manifest.json into dist/ (Greptile P2).
+    "dashboard dist html → nothing heavy": (
+        ["plugins/kanban/dashboard/dist/index.html"], _lanes()),
+    "dashboard dist manifest json → nothing heavy": (
+        ["plugins/kanban/dashboard/dist/asset-manifest.json"], _lanes()),
     # But the plugin's .py backend is NOT under dist/ → still python-relevant.
     "dashboard plugin_api.py → python": (
         ["plugins/kanban/dashboard/plugin_api.py"], _lanes(python=True, scan=True)),

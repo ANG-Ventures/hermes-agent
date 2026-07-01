@@ -46,8 +46,11 @@ _PY_SKIP = ("docs/", "website/") + _FRONTEND
 # cannot import or execute Python — it's served as-is by ``serve_plugin_asset``.
 # Editing one must NOT trigger the whole pytest matrix. The plugin's ``.py``
 # backend (``plugin_api.py``) is NOT under ``dist/`` and stays python-relevant.
+# Covers the full set of Vite/webpack ``dist/`` outputs: scripts, styles, source
+# maps, fonts, images, plus ``index.html`` / ``asset-manifest.json`` / ``stats.json``.
 _BROWSER_ASSET_EXTS = (".js", ".mjs", ".css", ".map", ".woff", ".woff2", ".svg",
-                       ".png", ".jpg", ".jpeg", ".gif", ".ico")
+                       ".png", ".jpg", ".jpeg", ".gif", ".ico", ".html", ".json",
+                       ".txt", ".ttf", ".eot", ".webp", ".avif", ".wasm")
 
 
 def _is_built_dashboard_asset(p: str) -> bool:
