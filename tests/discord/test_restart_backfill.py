@@ -136,6 +136,69 @@ def _seed_session_for_channel(adapter, store, db, channel, author):
     return session_id
 
 
+@pytest.mark.asyncio
+async def test_normal_turn_persisted_id_makes_backfill_skip_it(_tmp_home):
+    """B1 / RC#1 (Opus code review): the exactly-once guarantee for a message
+    that was NORMALLY processed just before the restart. Prove end-to-end that:
+    (a) a user turn persisted via the REAL flush path carries a non-NULL
+    platform_message_id in its transcript row (the normal build_turn_context
+    stamp, NOT the interrupted-turn override), and (b) backfill then SKIPS it
+    (recovered=0, skipped_in_transcript=1) instead of re-processing it into a
+    duplicate reply.
+
+    This closes the reviewer's B1: without it, the exactly-once claim is a
+    happy-path assertion. A completed-pre-SIGTERM message with a NULL id would
+    read as 'absent' and get re-answered.
+    """
+    from run_agent import AIAgent
+    adapter, store, db = _build_adapter_with_store(_tmp_home)
+    author = _FakeAuthor(11111)
+    channel = _FakeChannel(987500, [])
+    msg = _make_msg(70500, author, channel, content="a normally-processed message")
+    channel._messages = [msg]
+    session_id = _seed_session_for_channel(adapter, store, db, channel, author)
+
+    # (a) Persist the user turn through the REAL _flush_messages_to_session_db,
+    # with the id stamped on the user dict exactly as build_turn_context does on
+    # the NORMAL path (no _persist_user_message_* override attrs set → the
+    # override arm is a no-op; the id rides on the dict itself).
+    class _StubAgent:
+        _session_db = db
+        _session_db_created = True
+        _last_flushed_db_idx = 0
+        _flushed_db_message_session_id = None
+        _persist_user_message_idx = None
+        _persist_user_message_override = None
+        _persist_user_message_timestamp = None
+        _persist_user_message_platform_id = None  # NORMAL path: no override
+
+        def _ensure_db_session(self):
+            pass
+
+        _apply_persist_user_message_override = AIAgent._apply_persist_user_message_override
+        _flush_messages_to_session_db = AIAgent._flush_messages_to_session_db
+
+    stub = _StubAgent()
+    stub.session_id = session_id
+    # build_turn_context stamps user_msg["platform_message_id"] on every turn.
+    normal_turn = [{"role": "user", "content": "a normally-processed message",
+                    "platform_message_id": "70500"}]
+    stub._flush_messages_to_session_db(normal_turn, conversation_history=[])
+
+    # Row carries the id (not NULL) — the authority answers True.
+    assert db.has_platform_message_id(session_id, "70500") is True
+
+    # (b) Backfill over the same channel must SKIP it — recovered nothing.
+    adapter._restart_recovery.mark_channel_active(str(channel.id))
+    adapter._client = SimpleNamespace(
+        user=_FakeAuthor(99999, "bot", bot=True),
+        get_channel=lambda _id: channel,
+        fetch_channel=AsyncMock(return_value=channel),
+    )
+    await adapter._backfill_missed_messages()
+    assert adapter._dispatched == [], "a normally-processed message must not be re-injected"
+
+
 # ── Tests ─────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio

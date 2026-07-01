@@ -6269,9 +6269,12 @@ class DiscordAdapter(BasePlatformAdapter):
         no bypass (a window message from an unauthorized user/channel is still
         rejected here).
         """
-        # Dedup: Discord RESUME replays events after reconnects (#4777). This
-        # also makes backfill idempotent against a live delivery of the same
-        # message (whichever reaches here first marks it seen).
+        # Dedup: Discord RESUME replays events after reconnects (#4777). NOTE
+        # this in-memory cache is PROCESS-LOCAL — it is empty in a freshly
+        # restarted process, so it provides NO cross-restart dedup. It only
+        # collapses a live re-delivery racing the backfill sweep WITHIN the new
+        # process. The cross-restart exactly-once guarantee rests solely on the
+        # transcript authority (has_platform_message_id), NOT on this cache.
         if self._dedup.is_duplicate(str(message.id)):
             return
 
@@ -6341,7 +6344,6 @@ class DiscordAdapter(BasePlatformAdapter):
             ]
             _other_bots_mentioned = bool(_other_bot_mentions)
 
-            _channel_id = str(message.channel.id)
             _parent_id = None
             if hasattr(message.channel, "parent_id") and message.channel.parent_id:
                 _parent_id = str(message.channel.parent_id)
