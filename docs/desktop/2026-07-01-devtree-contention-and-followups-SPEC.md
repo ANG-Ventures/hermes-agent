@@ -252,11 +252,12 @@ C in the freshness helper (only it decides the pin).
   now." Tier-3 is in v0.1 scope (Phase 5), mechanism per D-5.
 - **OQ-2 → RESOLVED (Ace): freshness pin = `apps/desktop` + `package-lock.json`** (D-6), full build-input
   set confirmed against `dist:mac` in Phase 1.
-- **OQ-3 (recommendation, pass-1 reviewer CONCURRED):** `land-on-main.sh` becomes the sanctioned path for
-  BOTH fork-syncs and agent/script lands (update the `hermes-fork-pr-contribution` runbook to call it) — a
-  manual `git merge --ff-only` bypass reintroduces the exact race. Note (BL-1/D-5.6): this only helps where
-  adopted, and PR merges remain out-of-band by nature; the writer serializes *local adopters*, nothing more.
-  Ace's call if he wants to keep the manual path as an explicit break-glass.
+- **OQ-3 → RESOLVED (Ace, 2026-07-01): `land-on-main.sh` is the sanctioned path for BOTH fork-syncs and
+  agent/script lands.** Update the `hermes-fork-pr-contribution` runbook to call it (Phase 5). The raw
+  `git merge --ff-only fork/main` stays available ONLY as an explicit, documented break-glass — and per
+  Nit-1 it must remain uncaged by the tripwire (a raw FF-only fork-sync from a parked-on-`main` root
+  succeeds). PR merges remain out-of-band by nature (D-5.6); the writer serializes local adopters, nothing
+  more.
 
 ## 10. Acceptance Criteria
 - [ ] **AC-1 (C):** after a docs-only HEAD advance, `desktop-update.sh --host self` reports "already current"
