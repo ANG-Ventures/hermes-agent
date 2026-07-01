@@ -111,19 +111,14 @@ def _resume_summary_only_block_result(function_name: str) -> str:
 
 
 def _block_resume_summary_only_tools(agent, tool_calls, messages: list, effective_task_id: str) -> bool:
-    """Consume the resume-summary-only interlock and block all tool calls.
+    """Block tool calls while the resume-summary-only interlock is active.
 
     The resumed empty-message turn may summarize prior work, but it must wait
-    for a human "go" before executing any tool. This gate is consumed once so
-    the next user-directed turn can act normally.
+    for a human "go" before executing any tool. The gateway clears this gate
+    at the start of the next genuine user turn, not between model rounds.
     """
     if not getattr(agent, "_resume_summary_only", False):
         return False
-
-    try:
-        agent._resume_summary_only = False
-    except Exception:
-        pass
 
     names = [
         getattr(getattr(tc, "function", None), "name", "") or "unknown"

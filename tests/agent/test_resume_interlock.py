@@ -73,27 +73,31 @@ def test_resume_summary_only_blocks_forward_tool_call_and_logs(caplog):
         agent._execute_tool_calls_sequential(assistant_message, messages, "task-1")
 
     mock_hfc.assert_not_called()
-    assert agent._resume_summary_only is False
+    assert agent._resume_summary_only is True
     payload = _tool_result_payload(messages)
     assert "summarize-only" in payload["error"]
     assert payload["resume_autocontinue_block"]["tool_name"] == "terminal"
     assert "RESUME_AUTOCONTINUE_VIOLATION" in caplog.text
 
 
-def test_resume_summary_only_clears_after_block_and_next_turn_executes():
+def test_resume_summary_only_blocks_every_tool_round_in_same_turn():
     agent = _make_agent("terminal")
     agent._resume_summary_only = True
-    assistant_message = _assistant_message(_mock_tool_call("terminal", "{}", "call-1"))
 
     with patch("run_agent.handle_function_call", return_value="executed") as mock_hfc:
-        agent._execute_tool_calls_sequential(assistant_message, [], "task-1")
+        agent._execute_tool_calls_sequential(
+            _assistant_message(_mock_tool_call("terminal", "{}", "call-1")),
+            [],
+            "task-1",
+        )
         agent._execute_tool_calls_sequential(
             _assistant_message(_mock_tool_call("terminal", "{}", "call-2")),
             [],
             "task-1",
         )
 
-    assert mock_hfc.call_count == 1
+    mock_hfc.assert_not_called()
+    assert agent._resume_summary_only is True
 
 
 def test_normal_turn_executes_tools_without_interference():
