@@ -31,6 +31,12 @@ logger = logging.getLogger(__name__)
 # ---- config defaults (D-5) -------------------------------------------------
 QMD_DEFAULTS: Dict[str, Any] = {
     "enabled": False,
+    # Sub-lane gates (only meaningful when `enabled` is true). Let an operator kill the
+    # every-turn PREFETCH lane (cost + noise) while keeping the explicit mem0_search fan-out —
+    # or vice versa — without turning the whole integration off. Both default true so flipping
+    # only `enabled` behaves exactly as before.
+    "prefetch_enabled": True,       # the automatic per-turn QMD leg in prefetch
+    "search_enabled": True,         # the QMD `docs` fan-out on an explicit mem0_search call
     "url": "http://[::1]:8181/mcp",
     "qmd_total_deadline_s": 6.0,   # whole-operation wall-clock deadline (INV-4); 6s catches
                                    # real warm hybrid+rerank latency (measured 2.3-5.3s live,

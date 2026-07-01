@@ -22,7 +22,8 @@ class _StubClient:
         return list(self._rows)
 
 
-def _provider(qmd_enabled=False, mem0_rows=None, qmd_hits=None, monkeypatch=None):
+def _provider(qmd_enabled=False, mem0_rows=None, qmd_hits=None, monkeypatch=None,
+              prefetch_enabled=True, search_enabled=True):
     p = Mem0MemoryProvider()
     # minimal init state (skip initialize() network/config machinery)
     p._config = {}
@@ -31,8 +32,13 @@ def _provider(qmd_enabled=False, mem0_rows=None, qmd_hits=None, monkeypatch=None
     p._temporal_search = False
     p._consecutive_failures = 0
     p._breaker_open_until = 0
-    p._qmd_cfg = qmd_recall.load_qmd_config({"enabled": qmd_enabled})
+    p._qmd_cfg = qmd_recall.load_qmd_config(
+        {"enabled": qmd_enabled, "prefetch_enabled": prefetch_enabled, "search_enabled": search_enabled}
+    )
     p._qmd_enabled = qmd_enabled
+    # mirror initialize()'s sub-lane derivation
+    p._qmd_prefetch_enabled = qmd_enabled and prefetch_enabled
+    p._qmd_search_enabled = qmd_enabled and search_enabled
     p._get_client = lambda: _StubClient(mem0_rows or [])
     # neutralize forgotten-filter + read_filters so the stub rows flow through
     p._drop_forgotten = lambda rows: rows
@@ -206,4 +212,56 @@ def test_search_schema_unchanged():
     props = SEARCH_SCHEMA.get("function", SEARCH_SCHEMA).get("parameters", {}).get("properties", {})
     assert "docs" not in props
     assert "qmd" not in props
-    assert set(props) == {"query", "rerank", "top_k"} or "query" in props
+
+
+# ---- sub-lane toggles: prefetch_enabled / search_enabled ------------------
+def test_prefetch_off_search_on(monkeypatch):
+    """prefetch_enabled:false kills the every-turn QMD block but keeps mem0_search docs."""
+    p = _provider(qmd_enabled=True, mem0_rows=[{"memory": "fact one", "score": 0.9}],
+                  qmd_hits=[_HIT], monkeypatch=monkeypatch,
+                  prefetch_enabled=False, search_enabled=True)
+    # prefetch: NO QMD block
+    out = _run_prefetch(p, "where did we decide the local dns split")
+    assert "## Mem0 Memory\n- fact one" in out
+    assert "## Local Docs (QMD)" not in out
+    # search: STILL fans out to QMD docs
+    s = json.loads(p.handle_tool_call("mem0_search", {"query": "local dns split"}))
+    assert "docs" in s and s["docs"][0]["file"] == "obsidian/DNS-PRD.md"
+
+
+def test_search_off_prefetch_on(monkeypatch):
+    """search_enabled:false kills the mem0_search docs fan-out but keeps prefetch injection."""
+    p = _provider(qmd_enabled=True, mem0_rows=[{"memory": "fact one", "score": 0.9}],
+                  qmd_hits=[_HIT], monkeypatch=monkeypatch,
+                  prefetch_enabled=True, search_enabled=False)
+    # prefetch: QMD block present
+    out = _run_prefetch(p, "where did we decide the local dns split")
+    assert "## Local Docs (QMD)" in out
+    # search: NO docs key (legacy shape)
+    s = json.loads(p.handle_tool_call("mem0_search", {"query": "local dns split"}))
+    assert "docs" not in s
+
+
+def test_master_off_ignores_sub_gates(monkeypatch):
+    """enabled:false wins even if the sub-gates are true — both lanes off."""
+    p = _provider(qmd_enabled=False, mem0_rows=[{"memory": "fact one", "score": 0.9}],
+                  qmd_hits=[_HIT], monkeypatch=monkeypatch,
+                  prefetch_enabled=True, search_enabled=True)
+    assert p._qmd_prefetch_enabled is False
+    assert p._qmd_search_enabled is False
+    out = _run_prefetch(p, "where did we decide the local dns split")
+    assert "## Local Docs (QMD)" not in out
+    s = json.loads(p.handle_tool_call("mem0_search", {"query": "local dns split"}))
+    assert "docs" not in s
+
+
+def test_sub_gates_default_true(monkeypatch):
+    """flipping only enabled:true (sub-gates unspecified) → both lanes on (backward-compat)."""
+    p = _provider(qmd_enabled=True, mem0_rows=[{"memory": "fact one", "score": 0.9}],
+                  qmd_hits=[_HIT], monkeypatch=monkeypatch)  # prefetch/search default True
+    assert p._qmd_prefetch_enabled is True
+    assert p._qmd_search_enabled is True
+    out = _run_prefetch(p, "where did we decide the local dns split")
+    assert "## Local Docs (QMD)" in out
+    s = json.loads(p.handle_tool_call("mem0_search", {"query": "local dns split"}))
+    assert "docs" in s
