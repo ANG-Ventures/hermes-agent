@@ -1,6 +1,6 @@
 # Desktop Backend → Runtime Deploy-Venv Migration — SPEC
 
-**Status:** DRAFT v0.4 — pass-3 folded (multi-doc/tab grammar, AC-3 fail-closed, rollback restore-gate, site-packages assert), for pass-4 (super-pass check)
+**Status:** APPROVED v1.0 — 4 Opus passes, super-pass (0 blockers, 0 required changes). Ready for prd-plan.
 **Owner:** Apollo
 **Date:** 2026-07-01
 **Parent:** `docs/desktop/2026-07-01-devtree-contention-and-followups-SPEC.md` (Phase B — unblocks AC-5)
