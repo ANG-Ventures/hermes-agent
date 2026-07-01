@@ -289,17 +289,22 @@ class TestUsageAccountSection:
                      "⚠️ OpenAI Codex (Pro): 81% used (7d · resets Sun 23:00)"],
         )
         with patch("agent.rate_limit_tracker.format_rate_limit_compact",
-                   return_value="Requests/min: 3388/4000 left"), \
+                   return_value="Requests/min: 3388/4000 left | Tokens/min: 318.0K/400.0K left"), \
              patch("agent.account_usage.nous_credits_lines", lambda markdown=False: []):
             result = await runner._handle_usage_command(event)
 
         assert "📈 **Account limits**" in result
         assert "Claude (Max 20x): 73% used" in result
         assert "OpenAI Codex (Pro): 81% used" in result
-        # Rate-limit line sits directly above the Account-limits header.
-        rl_i = result.index("Rate Limits")
-        acct_i = result.index("📈 **Account limits**")
-        assert rl_i < acct_i, "rate limits must render above account limits"
+        # Rate limits render as a readable block, separated from Account limits
+        # by a blank line.
+        lines = result.splitlines()
+        header_i = lines.index("⏱️ **Rate Limits:**")
+        acct_i = lines.index("📈 **Account limits**")
+        assert lines[header_i + 1] == "• Requests/min: 3388/4000 left"
+        assert lines[header_i + 2] == "• Tokens/min: 318.0K/400.0K left"
+        assert lines[header_i + 3] == ""
+        assert header_i < acct_i, "rate limits must render above account limits"
 
     @pytest.mark.asyncio
     async def test_context_breakdown_renders_above_last_turn_card(self, monkeypatch):

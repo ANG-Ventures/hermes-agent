@@ -3813,13 +3813,17 @@ class GatewaySlashCommandsMixin:
 
             # Rate limits (provider throttling headroom) are surfaced DOWN next to
             # the Account-limits section (both are "how close am I to a ceiling"),
-            # not at the top — see below. Compute the line here while the resident
-            # agent is in hand.
-            rate_limit_line = None
+            # not at the top — see below. Render them as a small block rather than
+            # a cramped pipe-separated row so the ceiling sections stay readable.
+            rate_limit_lines: list[str] = []
             rl_state = agent.get_rate_limit_state()
             if rl_state and rl_state.has_data:
                 from agent.rate_limit_tracker import format_rate_limit_compact
-                rate_limit_line = t("gateway.usage.rate_limits", state=format_rate_limit_compact(rl_state))
+                _compact_rl = format_rate_limit_compact(rl_state)
+                _rl_parts = [p.strip() for p in str(_compact_rl).split("|") if p.strip()]
+                if _rl_parts:
+                    rate_limit_lines.append(t("gateway.usage.rate_limits", state="").rstrip())
+                    rate_limit_lines.extend(f"• {p}" for p in _rl_parts)
 
             # The full last-turn card (PRD usage-format-codex Part A) is the SAME
             # renderer /context uses, and already carries Model / Agent / Session /
@@ -3886,10 +3890,12 @@ class GatewaySlashCommandsMixin:
             # Rate limits + Account limits together — both answer "how close am I
             # to a ceiling": rate limits = provider throttling headroom (this
             # minute/hour), account limits = subscription quota (5h/7d windows).
-            if rate_limit_line or account_lines:
+            if rate_limit_lines or account_lines:
                 lines.append("")
-            if rate_limit_line:
-                lines.append(rate_limit_line)
+            if rate_limit_lines:
+                lines.extend(rate_limit_lines)
+            if rate_limit_lines and account_lines:
+                lines.append("")
             if account_lines:
                 lines.extend(account_lines)
             if credits_lines:
