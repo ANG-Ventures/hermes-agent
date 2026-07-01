@@ -1524,3 +1524,43 @@ async def test_self_init_reason_does_not_drift_across_unrelated_later_shutdown(
         "classification drifted: a self-restart reason leaked into a later "
         "unrelated shutdown"
     )
+
+
+def test_interrupted_mark_logs_at_warning_survives_raised_threshold(tmp_path, monkeypatch, caplog):
+    """Review RC (SRE): the restart-continuity audit breadcrumb must survive a
+    gateway.run logger raised to WARNING+ — an INTERRUPTED mark is the diagnostic
+    case an operator greps when a restart goes wrong, so it logs at WARNING (its
+    clean sibling stays INFO)."""
+    import logging
+    runner, _adapter = _runner(tmp_path, monkeypatch)
+    entry = _entry(runner, "warnlvl")
+    runner._session_initiated_restart[entry.session_key] = True
+
+    # Also pin caplog propagation coupling (review residual): gateway.run must
+    # propagate for these audit logs to be visible.
+    assert logging.getLogger("gateway.run").propagate is True
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        runner._mark_resume_pending_for_shutdown(entry.session_key, interrupted=True)
+
+    warn_marks = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "PHASE=shutdown_mark" in r.getMessage()
+        and "reason=restart_consumed_interrupted" in r.getMessage()
+    ]
+    assert len(warn_marks) == 1, "interrupted mark must log at WARNING (survives raised threshold)"
+
+
+def test_clean_mark_stays_info(tmp_path, monkeypatch, caplog):
+    """The clean (non-interrupted, non-replay) mark stays at INFO — WARNING is
+    reserved for the diagnostic cases so routine shutdowns don't spam WARNING."""
+    import logging
+    runner, _adapter = _runner(tmp_path, monkeypatch)
+    entry = _entry(runner, "infolvl")
+
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        runner._mark_resume_pending_for_shutdown(entry.session_key)  # shutdown_timeout, clean
+
+    marks = [r for r in caplog.records if "PHASE=shutdown_mark" in r.getMessage()]
+    assert len(marks) == 1
+    assert marks[0].levelno == logging.INFO
