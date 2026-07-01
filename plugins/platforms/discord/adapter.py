@@ -48,6 +48,7 @@ _DISCORD_COMMAND_SYNC_POLICIES = {"safe", "bulk", "off"}
 _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_NONCONVERSATIONAL_STATE_FILENAME = "discord_nonconversational_messages.json"
+_DISCORD_RESTART_RECOVERY_STATE_FILENAME = "discord_restart_recovery.json"
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
 # Typing-indicator loop: give up after this many CONSECUTIVE failed typing POSTs
@@ -240,6 +241,143 @@ class _DiscordNonConversationalMessageTracker:
 
     def __contains__(self, message_id: str) -> bool:
         return str(message_id or "") in self._ids
+
+
+class _DiscordRestartRecoveryState:
+    """Durable state for restart drain-window message recovery (SPEC D-4).
+
+    Two artifacts, atomic-JSON persisted under the gateway state dir (mirrors
+    ``_DiscordNonConversationalMessageTracker``):
+
+    1. ``active_channels``: ``channel_id -> last_activity_ts`` (float epoch).
+       Marked on every authorized inbound (at the TOP of ``_handle_message`` —
+       so a drain-window message marks its channel *before* the gateway drops
+       it) AND on every conversational outbound ``send()`` (so bot-post-only
+       channels like #logs/#alerts are covered). Bounded to the N most-recently
+       active channels.
+    2. ``shutdown_ts``: float epoch written on graceful shutdown — the scan
+       anchor for backfill-on-reconnect.
+
+    Persistence is DEBOUNCED (at most once per ``persist_interval_s`` on change)
+    so a hard crash keeps a recent map, plus an explicit ``flush()`` on graceful
+    shutdown. There is NO message-id cursor here — the dedup authority is the
+    session transcript (``has_platform_message_id``), not this file. This stores
+    ONLY channel ids + timestamps (no message content, no message ids).
+    """
+
+    _MAX_CHANNELS = 500  # hard cap on the persisted active-channel map size
+
+    def __init__(
+        self,
+        max_channels: int = _MAX_CHANNELS,
+        persist_interval_s: float = 10.0,
+    ):
+        self._max_channels = max_channels
+        self._persist_interval_s = persist_interval_s
+        self._lock = threading.Lock()
+        self._active_channels: Dict[str, float] = {}
+        self._shutdown_ts: Optional[float] = None
+        self._last_persist_at: float = 0.0
+        self._load()
+
+    def _state_path(self) -> _Path:
+        from hermes_constants import get_hermes_home
+
+        return (
+            get_hermes_home()
+            / _DISCORD_COMMAND_SYNC_STATE_SUBDIR
+            / _DISCORD_RESTART_RECOVERY_STATE_FILENAME
+        )
+
+    def _load(self) -> None:
+        path = self._state_path()
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.debug("[Discord] Failed to load restart-recovery state", exc_info=True)
+            return
+        if not isinstance(data, dict):
+            return
+        raw_channels = data.get("active_channels")
+        if isinstance(raw_channels, dict):
+            for cid, ts in raw_channels.items():
+                try:
+                    self._active_channels[str(cid)] = float(ts)
+                except (TypeError, ValueError):
+                    continue
+        raw_shutdown = data.get("shutdown_ts")
+        if raw_shutdown is not None:
+            try:
+                self._shutdown_ts = float(raw_shutdown)
+            except (TypeError, ValueError):
+                self._shutdown_ts = None
+
+    def _bound_locked(self) -> None:
+        """Trim to the N most-recently-active channels. Caller holds the lock."""
+        if len(self._active_channels) <= self._max_channels:
+            return
+        # Keep the newest by timestamp.
+        kept = sorted(
+            self._active_channels.items(),
+            key=lambda kv: kv[1],
+        )[-self._max_channels:]
+        self._active_channels = dict(kept)
+
+    def _persist_locked(self) -> None:
+        """Write state atomically. Caller holds the lock."""
+        payload = {
+            "active_channels": self._active_channels,
+            "shutdown_ts": self._shutdown_ts,
+        }
+        try:
+            atomic_json_write(self._state_path(), payload, indent=None)
+            self._last_persist_at = time.time()
+        except Exception:
+            logger.debug("[Discord] Failed to persist restart-recovery state", exc_info=True)
+
+    def mark_channel_active(self, channel_id: Any, *, now: Optional[float] = None) -> None:
+        """Record channel activity (inbound or outbound). Debounced persist."""
+        key = str(channel_id or "").strip()
+        if not key:
+            return
+        ts = now if now is not None else time.time()
+        with self._lock:
+            self._active_channels[key] = ts
+            self._bound_locked()
+            # Debounce: only hit disk at most once per interval on change. The
+            # in-memory map is always current; a hard crash loses at most
+            # ``persist_interval_s`` of freshness (documented non-goal / R-4).
+            if ts - self._last_persist_at >= self._persist_interval_s:
+                self._persist_locked()
+
+    def flush(self, *, shutdown_ts: Optional[float] = None) -> None:
+        """Force a durable write, optionally stamping the shutdown anchor.
+
+        Called on graceful shutdown so the latest map + the shutdown_ts anchor
+        are on disk regardless of the debounce window.
+        """
+        with self._lock:
+            if shutdown_ts is not None:
+                self._shutdown_ts = shutdown_ts
+            self._persist_locked()
+
+    def recent_channels(self, lookback_s: float, *, now: Optional[float] = None) -> List[str]:
+        """Channel ids active within ``lookback_s`` of ``now``, newest-first."""
+        ref = now if now is not None else time.time()
+        with self._lock:
+            items = [
+                (cid, ts) for cid, ts in self._active_channels.items()
+                if ref - ts <= lookback_s
+            ]
+        items.sort(key=lambda kv: kv[1], reverse=True)
+        return [cid for cid, _ in items]
+
+    @property
+    def shutdown_ts(self) -> Optional[float]:
+        with self._lock:
+            return self._shutdown_ts
 
 
 def _metadata_marks_nonconversational(metadata: Optional[Dict[str, Any]]) -> bool:
