@@ -1,6 +1,6 @@
 # Desktop Backend → Runtime Deploy-Venv Migration — SPEC
 
-**Status:** DRAFT v0.1 — for prd-review
+**Status:** DRAFT v0.2 — pass-1 folded (BL-1/2/3 + RCs), for pass-2
 **Owner:** Apollo
 **Date:** 2026-07-01
 **Parent:** `docs/desktop/2026-07-01-devtree-contention-and-followups-SPEC.md` (Phase B — unblocks AC-5)
@@ -64,15 +64,28 @@ Introduce a single resolver, `resolveBackendRoot()`, mirroring `resolveUpdateRoo
 `resolveBackendRoot()` instead of the hardcoded `ACTIVE_HERMES_ROOT`. `createActiveBackend()` and the
 marker-independent path (`main.cjs:~2666`) both switch to the resolved root.
 
-### 4.2 The `config.yaml` override knob (B2)
-- Config key: **`desktop.backend_root`** (string path; default empty = auto-resolve per 4.1).
-- The Python side already reads `config.yaml`; the DESKTOP (Electron/JS) side reads it at spawn time. Two
-  viable wirings — decide in review (OQ-1):
-  - **(i)** JS reads `config.yaml` directly (it already parses YAML for other keys?) and sets
-    `HERMES_DESKTOP_BACKEND_ROOT` internally; user-facing docs point ONLY to `config.yaml`.
-  - **(ii)** a tiny `hermes` CLI subcommand / existing config-read path emits the resolved root the desktop
-    consumes.
-- Precedence: explicit `desktop.backend_root` > runtime tree (default) > dev tree (fallback).
+### 4.2 The `config.yaml` override knob (B2) — RESOLVED (pass-1 BL-1/BL-2)
+**Ground-truthed in review:** the Electron app has **NO YAML parser** (zero `yaml`/`js-yaml` in
+`apps/desktop/package.json` deps/devDeps; the only `.yaml` refs in `electron/*.cjs` are a MIME extension map).
+So a full YAML read in JS would mean adding a YAML dependency to Electron — rejected (avoidable weight). And
+there is **no existing "emit resolved backend root" CLI path** (`config` has `path`/`env-path` but nothing for
+this) — so option (ii) requires building a *new* emitter, which reintroduces a chicken-egg (which interpreter
+runs the emitter that tells you which interpreter to use?).
+
+**Chosen design — minimal targeted scalar read in JS, no YAML dep, no bootstrap interpreter (BL-1+BL-2):**
+- `config.yaml`'s `desktop.backend_root` is a single **scalar string** under a known key. The Electron side
+  reads ONLY that one value with a tiny targeted parser (a bounded line/regex scan for `backend_root:` under a
+  `desktop:` block — NOT a general YAML parser, no new dependency). Empty/absent → auto-resolve (4.1).
+- This **sidesteps the bootstrap chicken-egg entirely** (BL-2): choosing the backend root no longer requires
+  running any Python — the JS reads the file directly before spawning anything. No interpreter parses config
+  to decide which interpreter to use.
+- The value, once read, becomes the highest-precedence input to `resolveBackendRoot()` (via the internal
+  `HERMES_DESKTOP_BACKEND_ROOT` bridge var — internal only, user-facing docs reference `config.yaml`
+  exclusively, per the house rule).
+- Precedence: `config.yaml desktop.backend_root` > runtime tree (default, 4.1) > dev tree (fallback).
+- Robustness: a malformed/partial config read must FAIL SAFE to auto-resolve (never crash the spawn); a set
+  value that points at a non-existent tree logs a warning and falls through to auto-resolve (so a typo can't
+  brick the app).
 - This lets a RUNNING install repoint (set key → relaunch app) and prove AC-2 BEFORE any rebuild.
 
 ### 4.3 Build + ship (B1)
@@ -81,42 +94,52 @@ marker-independent path (`main.cjs:~2666`) both switch to the resolved root.
 - Version does not change (0.17.0), so freshness keys on the build-input commit (fix C) — the `apps/desktop`
   change flips the pin to stale → rebuild fires correctly.
 
-## 5. Open Questions (for review)
-- **OQ-1 (wiring, 4.2):** does the Electron main process already read `config.yaml`, or must we add a
-  config-read (option i vs ii)? Recommendation: whichever avoids a second YAML parser in JS — if the app
-  already reads config, extend it; else emit the resolved root from the Python config layer the app already
-  shells for the backend. Ground-truth in Phase 1.
-- **OQ-2 (fallback safety):** if the runtime tree exists but its venv is broken/mid-deploy, should the backend
-  fall back to the dev venv or FAIL LOUD? Recommendation: fall back to dev tree with a logged warning (an
-  app that won't start is worse than one on a slightly-staler-but-working venv), but surface the fallback in
-  the boot log so it's diagnosable.
-- **OQ-3 (AC-5 timing):** delete the dev venv in THIS spec's closeout, or leave it to the parent? Rec: delete
-  here (this spec is what makes it a true orphan) after AC-2/AC-4 proof, and flip the parent's AC-5 to done.
+## 5. Open Questions
+- **OQ-1 → RESOLVED (pass-1 BL-1):** neither (i) full-YAML-in-JS nor (ii) new-CLI-emitter — the app has no
+  YAML parser and no emitter exists, and (ii) reintroduces a bootstrap chicken-egg. **Chosen: JS reads the
+  single `desktop.backend_root` scalar with a bounded targeted parse (no dep, no interpreter), §4.2.**
+- **OQ-2 → RESOLVED (pass-1 RC):** broken/missing runtime venv → fall back to the dev tree so the app stays
+  usable, BUT the fallback is a **monitored condition, not a boot-log-into-the-void**: surface it via the
+  app's notify/UI path (a "running fallback dev backend" indicator) AND a boot-log line, so a silent stale-code
+  regression can't hide. AC-5 asserts both surfaces.
+- **OQ-3 → RESOLVED (Ace, decision):** delete the dev venv in THIS spec's Phase 4 (this spec is what makes it
+  a true orphan), after AC-2 proof, and flip the parent's AC-5 to done.
 
 ## 6. Implementation Phases (for prd-plan)
-- **Phase 1 — resolver + unit tests (no live change).** Add `resolveBackendRoot()` + config override; unit
-  tests for `buildDesktopBackendEnv`/`buildDesktopBackendPath` derivation from each precedence tier (extend
-  `backend-env.test.cjs` + a new `main`-level test). Ground-truth OQ-1 here.
-- **Phase 2 — live repoint WITHOUT rebuild (B2 proof).** Set `desktop.backend_root` on the running Studio
-  install, relaunch, prove the backend PID now runs `runtime/hermes-agent/venv/bin/python` (live `ps`/`lsof`)
-  and the app still signs in + round-trips a turn (supervised). This proves the knob before any rebuild.
-- **Phase 3 — rebuild + reinstall (B1).** `desktop-update.sh --apply` on both Macs; prove the DEFAULT (no
-  knob) now resolves the runtime tree post-rebuild; supervised sign-in both Macs.
+- **Phase 1 — resolver + config read + unit tests (no live change).** Add `resolveBackendRoot()` (three-tier
+  precedence) + the targeted `desktop.backend_root` scalar read; unit tests for
+  `buildDesktopBackendEnv`/`buildDesktopBackendPath` derivation AND the config-read parser (valid / absent /
+  malformed / points-at-missing-tree → fail-safe) across all precedence tiers.
+- **Phase 2 — live repoint WITHOUT rebuild (B2 proof, effect-gated).** Set `desktop.backend_root` on the
+  running Studio install, relaunch, prove the backend PID runs `runtime/hermes-agent/venv/bin/python`
+  (live `ps`/`lsof`) AND that a hermes module imported by the live backend has `__file__` under
+  `~/.hermes/runtime/hermes-agent` (the effect gate, BL-3), THEN sign-in + turn round-trip (supervised).
+- **Phase 3 — rebuild + reinstall (B1).** `desktop-update.sh --apply` both Macs; prove the DEFAULT (no knob)
+  resolves the runtime tree post-rebuild (same effect gate); supervised sign-in both Macs.
 - **Phase 4 — orphan the dev venv + close AC-5.** Re-prove nothing holds `~/.hermes/hermes-agent/venv`
-  (Phase-B `lsof` + guard), `rm -rf`, guard reports clean; flip parent AC-5 to done.
+  including the primary backend AND its `tui_gateway.slash_worker` children AND any transient child
+  (`lsof +D` + `ps` for all descendants, BL-3/AC-6), `rm -rf`, guard reports clean; flip parent AC-5 to done.
 
 ## 7. Acceptance Criteria
 - [ ] AC-1: `resolveBackendRoot()` returns the runtime tree by default when it exists; falls back to the dev
-  tree when it doesn't; `desktop.backend_root` overrides both (unit tests, all three tiers).
+  tree when it doesn't; `config.yaml desktop.backend_root` overrides both; malformed/missing-tree value
+  fails safe to auto-resolve (unit tests, all tiers + fail-safe).
 - [ ] AC-2: a freshly-launched desktop backend runs `~/.hermes/runtime/hermes-agent/venv/bin/python` with
-  PYTHONPATH → runtime tree (live `ps`/`lsof`), NOT the dev venv — proven first via the config knob
-  (Phase 2) then via the default post-rebuild (Phase 3).
-- [ ] AC-3: the desktop app signs in and round-trips a turn on the migrated backend (supervised, both Macs).
+  PYTHONPATH → runtime tree (live `ps`/`lsof`), NOT the dev venv — proven first via the knob (Phase 2) then
+  via the default post-rebuild (Phase 3).
+- [ ] **AC-3 (EFFECT gate, BL-3):** on the migrated backend, a hermes module imported by the live process
+  resolves its `__file__` under `~/.hermes/runtime/hermes-agent` (asserted, e.g. via a boot-logged resolved
+  module path or an introspection endpoint) — NOT merely "a turn round-tripped" (which a drift-tolerant
+  handshake passes regardless of tree). Sign-in + turn round-trip is required IN ADDITION, not instead.
 - [ ] AC-4: `config.yaml desktop.backend_root` overrides the default (set → relaunch → backend on the
   specified tree); empty → auto-resolve. User-facing docs reference `config.yaml` only (no raw env var).
-- [ ] AC-5: broken/missing runtime venv → documented fallback behavior (OQ-2) with a boot-log line.
-- [ ] AC-6: after migration, nothing holds `~/.hermes/hermes-agent/venv`; it is deleted; the Phase-B guard
-  reports clean; the parent spec's AC-5 is flipped to done.
+- [ ] AC-5: broken/missing runtime venv → fall back to the dev tree AND surface it on BOTH the app notify/UI
+  path and a boot-log line (monitored condition, not a silent log).
+- [ ] AC-6: after migration, nothing holds `~/.hermes/hermes-agent/venv` — the primary backend, its
+  `slash_worker` children, and any transient descendant all re-proven off it — it is deleted; the Phase-B
+  guard reports clean; the parent spec's AC-5 is flipped to done.
+- [ ] AC-7 (rollback): clearing `desktop.backend_root` (and, post-rebuild, reinstalling the prior .app from
+  the keep-last-3 backup) returns the backend to the dev tree — an explicit, tested revert path.
 
 ## 8. Risks
 - **R-1: an install with no runtime tree (fresh/CLI-only) must still work.** Mitigation: tier-3 fallback to
@@ -128,6 +151,12 @@ marker-independent path (`main.cjs:~2666`) both switch to the resolved root.
 - **R-4: house-rule violation (raw env var).** Mitigation: the user-facing knob is `config.yaml
   desktop.backend_root`; any internal `HERMES_DESKTOP_BACKEND_ROOT` is a JS-side bridge only, documented as
   internal.
+- **R-5 (pass-1): AC-3 as a proxy gate.** Mitigation: AC-3 is now an EFFECT gate (imported-module `__file__`
+  under the runtime tree), so a silent dev-tree fallback cannot pass it.
+- **R-6 (pass-1): concurrency — repointing a running install while a `deploy.sh` lands on the same runtime
+  tree.** Mitigation: `deploy.sh` is FF-only + serialized; the desktop backend imports at spawn (frozen in
+  `sys.modules`), so a concurrent FF doesn't move code under a running backend — but Phase 2 should not
+  relaunch the app mid-`deploy.sh`. Note it in the plan; low-risk given FF-only semantics.
 
 ## 9. Review / build discipline
 Touches `apps/desktop/` (a real desktop-app change) → its own `prd-review-pipeline` pass before build, per
