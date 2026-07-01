@@ -678,7 +678,10 @@ def _resume_reason_phrase(reason: Optional[str]) -> str:
 
 def _is_interrupt_close_tail(agent_history):
     t = agent_history[-1] if agent_history else {}
-    return t.get("role") == "assistant" and t.get("_interrupt_close") is True
+    return t.get("role") == "assistant" and (
+        t.get("_interrupt_close") is True
+        or t.get("finish_reason") == "interrupt_close"
+    )
 
 
 def _build_resume_pending_message(

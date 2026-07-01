@@ -28,6 +28,7 @@ def test_interrupt_close_tail_is_structurally_flagged():
         "role": "assistant",
         "content": "Operation interrupted.",
         "_interrupt_close": True,
+        "finish_reason": "interrupt_close",
     }
 
 
@@ -89,6 +90,7 @@ def test_dangling_assistant_tool_call_tail_is_removed_and_flagged():
             "role": "assistant",
             "content": "Operation interrupted.",
             "_interrupt_close": True,
+            "finish_reason": "interrupt_close",
         },
     ]
     _assert_api_valid(messages)
@@ -106,5 +108,6 @@ def test_interrupted_assistant_text_tail_is_marked_and_api_valid():
         "role": "assistant",
         "content": "I checked the gateway and",
         "_interrupt_close": True,
+        "finish_reason": "interrupt_close",
     }
     _assert_api_valid(messages)

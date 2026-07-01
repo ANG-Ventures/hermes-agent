@@ -360,6 +360,9 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     return "{}"
 
 
+_INTERRUPT_CLOSE_FINISH_REASON = "interrupt_close"
+
+
 def close_interrupted_tool_sequence(
     messages: list,
     final_response: Any = None,
@@ -395,6 +398,7 @@ def close_interrupted_tool_sequence(
         and not last.get("tool_calls")
     ):
         last["_interrupt_close"] = True
+        last["finish_reason"] = _INTERRUPT_CLOSE_FINISH_REASON
         return True
     if last.get("role") == "assistant" and last.get("tool_calls"):
         # A mid-API-call interrupt can persist assistant(tool_calls) before any
@@ -408,6 +412,7 @@ def close_interrupted_tool_sequence(
         "role": "assistant",
         "content": text.strip() or _INTERRUPT_CLOSE_CONTENT,
         "_interrupt_close": True,
+        "finish_reason": _INTERRUPT_CLOSE_FINISH_REASON,
     })
     return True
 
