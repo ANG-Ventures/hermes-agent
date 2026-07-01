@@ -987,6 +987,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # Persistent set of bot-authored lifecycle/status message IDs that
         # should not act as conversational history boundaries after restart.
         self._nonconversational_messages = _DiscordNonConversationalMessageTracker()
+        # Durable restart drain-window recovery state: which channels were
+        # recently active (inbound OR outbound) + the graceful-shutdown anchor,
+        # so a reconnect after a self-restart can backfill messages the gateway
+        # dropped mid-drain. Constructed lazily-safe (loads from disk on init).
+        self._restart_recovery = _DiscordRestartRecoveryState()
 
     def _handle_bot_task_done(self, task: asyncio.Task) -> None:
         """Surface post-startup discord.py task exits to the gateway supervisor.
@@ -1574,6 +1579,15 @@ class DiscordAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Discord."""
         self._disconnecting = True
+        # Drain-window recovery (D-4): stamp the graceful-shutdown anchor and
+        # force a durable write of the active-channel map, so the post-restart
+        # backfill knows how far back to scan (ANCHOR = shutdown_ts) and has the
+        # latest activity map regardless of the debounce window. Fail-open — a
+        # flush error must never block teardown.
+        try:
+            self._restart_recovery.flush(shutdown_ts=time.time())
+        except Exception:
+            logger.debug("[%s] restart-recovery shutdown flush failed", self.name, exc_info=True)
         # Cancel the liveness probe first so it can't fire a spurious fatal
         # error / reconnect while we're intentionally tearing the adapter down.
         await self._cancel_liveness_task()
@@ -2289,6 +2303,22 @@ class DiscordAdapter(BasePlatformAdapter):
                     self._nonconversational_messages.mark_many(message_ids)
                 elif not _looks_like_nonconversational_history_message(content):
                     self._last_self_message_id[_target_id] = message_ids[-1]
+                    # Drain-window recovery (D-4): a conversational outbound send
+                    # marks this channel active, so bot-post-only surfaces like
+                    # #logs/#alerts — where the bot posts but a user only
+                    # occasionally replies — are covered by the reconnect
+                    # backfill even when the drain-window message arrives after
+                    # the websocket has already closed (sub-window-2, where no
+                    # inbound mark can fire). Keyed by the effective channel
+                    # (thread id or channel id), matching D-6.
+                    try:
+                        self._restart_recovery.mark_channel_active(_target_id)
+                    except Exception:
+                        logger.debug(
+                            "[%s] restart-recovery outbound mark failed",
+                            self.name,
+                            exc_info=True,
+                        )
 
             return SendResult(
                 success=True,
@@ -6117,6 +6147,22 @@ class DiscordAdapter(BasePlatformAdapter):
             if require_mention and not is_free_channel and not in_bot_thread:
                 if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
                     return
+
+            # Drain-window recovery (D-4/D-8): mark this channel active BEFORE the
+            # message is dispatched to the gateway (`await self.handle_message`),
+            # which is where a message arriving mid-restart-drain is later
+            # dropped. Marking here — after the allow/ignore/mention gates, so
+            # only channels the bot actually serves are tracked, but before the
+            # drop — lets the post-reconnect backfill re-read this channel's
+            # history and recover the lost message. Keyed by the PHYSICAL arrival
+            # channel id (thread id in a thread, channel id otherwise) so the
+            # backfill scans exactly where the message landed, independent of any
+            # later auto-threading. DMs never reach here (excluded from the
+            # non-DM block above), matching D-6.
+            try:
+                self._restart_recovery.mark_channel_active(str(message.channel.id))
+            except Exception:
+                logger.debug("[%s] restart-recovery inbound mark failed", self.name, exc_info=True)
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
         # Messages already inside threads or DMs are unaffected.
