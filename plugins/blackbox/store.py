@@ -6,6 +6,7 @@ import json
 import logging
 import sqlite3
 import time
+import uuid
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -415,11 +416,14 @@ def reprice_unpriced(pricing_fn, *, apply: bool = False, limit: int | None = Non
         }
 
         if apply and candidates:
-            manifest = _db_path().parent / f"reprice-run-{time.strftime('%Y%m%d-%H%M%S')}.json"
-            manifest.write_text(json.dumps([c[0] for c in candidates]))
+            # Apply inside one transaction, capturing the turn_ids that ACTUALLY
+            # updated (rowcount == 1). A row a concurrent writer priced between
+            # SELECT and UPDATE fails the NULL guard → rowcount 0 → excluded, so
+            # the manifest never claims a row it didn't change.
+            committed_ids: list[str] = []
             with conn:  # single transaction
                 for turn_id, cost, status, perclass, _is_zero in candidates:
-                    conn.execute(
+                    cur = conn.execute(
                         "UPDATE turns SET cost_usd = ?, cost_status = ?, "
                         "cost_uncached_usd = ?, cost_cache_read_usd = ?, "
                         "cost_cache_write_usd = ?, cost_output_usd = ? "
@@ -436,6 +440,16 @@ def reprice_unpriced(pricing_fn, *, apply: bool = False, limit: int | None = Non
                             turn_id,
                         ),
                     )
+                    if cur.rowcount == 1:
+                        committed_ids.append(turn_id)
+            # Write the forward-only rollback manifest ONLY after the transaction
+            # committed, and only for rows that actually changed (D-7). A unique
+            # nonce prevents same-second back-to-back runs from clobbering each
+            # other's manifest.
+            if committed_ids:
+                nonce = uuid.uuid4().hex[:8]
+                manifest = _db_path().parent / f"reprice-run-{time.strftime('%Y%m%d-%H%M%S')}-{nonce}.json"
+                manifest.write_text(json.dumps(committed_ids))
         return result
     finally:
         conn.close()

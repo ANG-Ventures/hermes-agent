@@ -172,3 +172,16 @@ def test_apply_writes_rollback_manifest(store, real_pricing_fn, tmp_path):
     assert manifests, "expected a reprice-run manifest"
     ids = json.loads(manifests[0].read_text())
     assert "m1" in ids
+
+
+def test_no_manifest_when_nothing_changed(store, real_pricing_fn, tmp_path):
+    # A dry-run, or an apply with no eligible rows, must NOT drop a manifest
+    # (manifest is written only after rows actually commit).
+    from pathlib import Path
+
+    _seed(store, "d1", "openai", "claude-opus-4-8", i=1826, o=548, cr=282825)
+    store.reprice_unpriced(real_pricing_fn, apply=False)  # dry-run
+    store.reprice_unpriced(real_pricing_fn, apply=True)   # applies d1 → 1 manifest
+    store.reprice_unpriced(real_pricing_fn, apply=True)   # nothing left → no new manifest
+    manifests = list((Path(tmp_path) / "blackbox").glob("reprice-run-*.json"))
+    assert len(manifests) == 1, f"expected exactly one manifest, got {len(manifests)}"
