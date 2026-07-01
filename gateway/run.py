@@ -684,6 +684,21 @@ def _is_interrupt_close_tail(agent_history):
     )
 
 
+def _clear_resume_summary_only_for_human_turn(
+    agent: Any,
+    *,
+    is_resume_pending: bool,
+    message: Any,
+) -> None:
+    """Clear the summarize-only interlock at the next normal inbound turn."""
+    if is_resume_pending or message is None:
+        return
+    try:
+        agent._resume_summary_only = False
+    except Exception:
+        logger.debug("resume-summary interlock clear failed", exc_info=True)
+
+
 def _build_resume_pending_message(
     *,
     agent_history,
@@ -17928,6 +17943,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 agent_history
                 and agent_history[-1].get("role") == "tool"
                 and _interruption_is_fresh
+            )
+            _clear_resume_summary_only_for_human_turn(
+                agent,
+                is_resume_pending=_is_resume_pending,
+                message=message,
             )
 
             if _is_resume_pending:
