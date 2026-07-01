@@ -325,7 +325,12 @@ def render_last_turn_record(rec: Dict[str, Any], compressions: "int | None" = No
         lines.append(f"• Cached: {_humanize_tok(cache_r)}/{_humanize_tok(prompt_total)} {_cache_health(cpct)} {cpct:.0f}%")
 
     if length > 0:
-        pct = used / length * 100
+        # Clamp at 100%: last_prompt tokens can transiently overshoot the model
+        # max during streaming or before compression fires — users must never
+        # see >100% "of model max" (mirrors the clamp in agent/display.py,
+        # cli.py /stats, gateway status, and tools/memory_tool.py; see
+        # tests/run_agent/test_percentage_clamp.py).
+        pct = min(100, used / length * 100)
         lines.append(
             f"• Context window (last call): {_humanize_tok(used)}/{_humanize_tok(length)} "
             f"{_ctx_health(pct)} ({pct:.0f}% of model max)"
