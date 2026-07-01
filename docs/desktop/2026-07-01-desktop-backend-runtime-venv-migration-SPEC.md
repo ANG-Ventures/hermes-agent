@@ -1,6 +1,6 @@
 # Desktop Backend → Runtime Deploy-Venv Migration — SPEC
 
-**Status:** DRAFT v0.2 — pass-1 folded (BL-1/2/3 + RCs), for pass-2
+**Status:** DRAFT v0.3 — pass-2 folded (parser grammar, ready-file AC-3 mechanism, rollback+freshness cited), for pass-3
 **Owner:** Apollo
 **Date:** 2026-07-01
 **Parent:** `docs/desktop/2026-07-01-devtree-contention-and-followups-SPEC.md` (Phase B — unblocks AC-5)
@@ -86,13 +86,31 @@ runs the emitter that tells you which interpreter to use?).
 - Robustness: a malformed/partial config read must FAIL SAFE to auto-resolve (never crash the spawn); a set
   value that points at a non-existent tree logs a warning and falls through to auto-resolve (so a typo can't
   brick the app).
+- **Parser grammar (pass-2 BL-1 — pinned, NOT "whatever the regex matches"):** the scan is
+  indentation-anchored, not a bare token grep:
+  1. Find a top-level (column-0) `desktop:` key; only `backend_root:` nested under it (deeper indent, before
+     the next column-0 key) is accepted. A `backend_root:` under any OTHER block is IGNORED.
+  2. Strip a trailing `#` comment; a line whose first non-space char is `#` is a comment → ignored (a
+     commented-out `# backend_root:` never matches).
+  3. Accept the scalar unquoted, single-, or double-quoted; trim surrounding whitespace; expand a leading
+     `~`/`$HOME`. Empty value → auto-resolve.
+  4. First matching `backend_root:` under `desktop:` wins (duplicate keys → first).
+  5. **Flow-style (`desktop: {backend_root: /x}`) and any shape the scanner can't unambiguously read →
+     REJECT → auto-resolve** (fail-safe, not a guess). The accepted grammar is a *defined* set; everything
+     outside it deterministically falls to auto-resolve.
+  Each of these is a NAMED Phase-1 unit-test case (§6/AC-1): different-block false key, commented-out line,
+  trailing-comment, quoted path, `~`-expansion, flow-style, duplicate — each asserting the RIGHT tree (or
+  auto-resolve), never just "doesn't crash."
 - This lets a RUNNING install repoint (set key → relaunch app) and prove AC-2 BEFORE any rebuild.
 
 ### 4.3 Build + ship (B1)
 - The default change (4.1) only takes effect in a NEW build. Rebuild + reinstall both Macs via the shipped
   `~/.hermes/fleet/desktop-update.sh --host self|mbp --apply` (already builds in a throwaway worktree, Tier-1).
 - Version does not change (0.17.0), so freshness keys on the build-input commit (fix C) — the `apps/desktop`
-  change flips the pin to stale → rebuild fires correctly.
+  change flips the pin to stale → rebuild fires correctly. **Confirmed (pass-2):** `desktop-update.sh`'s
+  `du_build_input_sha` (fix C, shipped) keys on `desktop-build-inputs.sh`'s output = `apps/desktop` + resolved
+  `file:` workspace deps + root lockfile — so a change under `apps/desktop/` DOES advance the pin regardless of
+  the unchanged version string; the rebuild will fire (not a version-string no-op).
 
 ## 5. Open Questions
 - **OQ-1 → RESOLVED (pass-1 BL-1):** neither (i) full-YAML-in-JS nor (ii) new-CLI-emitter — the app has no
@@ -106,10 +124,13 @@ runs the emitter that tells you which interpreter to use?).
   a true orphan), after AC-2 proof, and flip the parent's AC-5 to done.
 
 ## 6. Implementation Phases (for prd-plan)
-- **Phase 1 — resolver + config read + unit tests (no live change).** Add `resolveBackendRoot()` (three-tier
-  precedence) + the targeted `desktop.backend_root` scalar read; unit tests for
-  `buildDesktopBackendEnv`/`buildDesktopBackendPath` derivation AND the config-read parser (valid / absent /
-  malformed / points-at-missing-tree → fail-safe) across all precedence tiers.
+- **Phase 1 — resolver + config read + ready-file emit + unit tests (no live behavior change).** Add
+  `resolveBackendRoot()` (three-tier precedence) + the targeted `desktop.backend_root` scalar read (grammar
+  §4.2); extend `_write_dashboard_ready_file` to emit `project_root` (AC-3 mechanism); unit tests for
+  `buildDesktopBackendEnv`/`buildDesktopBackendPath` derivation AND the config-read parser (the named grammar
+  cases: different-block false key / commented-out / trailing-comment / quoted / `~`-expansion / flow-style /
+  duplicate / missing-tree → fail-safe) across all precedence tiers. Also assert the tier-3 (no runtime tree)
+  AND broken-runtime-venv fallbacks BOTH hit the same surfaced-condition path (AC-5 / pass-2 residual).
 - **Phase 2 — live repoint WITHOUT rebuild (B2 proof, effect-gated).** Set `desktop.backend_root` on the
   running Studio install, relaunch, prove the backend PID runs `runtime/hermes-agent/venv/bin/python`
   (live `ps`/`lsof`) AND that a hermes module imported by the live backend has `__file__` under
@@ -127,10 +148,13 @@ runs the emitter that tells you which interpreter to use?).
 - [ ] AC-2: a freshly-launched desktop backend runs `~/.hermes/runtime/hermes-agent/venv/bin/python` with
   PYTHONPATH → runtime tree (live `ps`/`lsof`), NOT the dev venv — proven first via the knob (Phase 2) then
   via the default post-rebuild (Phase 3).
-- [ ] **AC-3 (EFFECT gate, BL-3):** on the migrated backend, a hermes module imported by the live process
-  resolves its `__file__` under `~/.hermes/runtime/hermes-agent` (asserted, e.g. via a boot-logged resolved
-  module path or an introspection endpoint) — NOT merely "a turn round-tripped" (which a drift-tolerant
-  handshake passes regardless of tree). Sign-in + turn round-trip is required IN ADDITION, not instead.
+- [ ] **AC-3 (EFFECT gate, BL-3 + pass-2 BL-2 — concrete mechanism):** the backend's existing dashboard
+  ready-file writer (`hermes_cli/web_server.py:_write_dashboard_ready_file`, currently emits `{"port": N}`) is
+  extended to ALSO emit `"project_root": str(PROJECT_ROOT)` (`PROJECT_ROOT = Path(__file__).parent.parent` —
+  the tree the backend is running from). The app's `backend-ready.cjs` `readDashboardReadyFile` asserts
+  `project_root` is under `~/.hermes/runtime/hermes-agent` on the migrated backend. This one-line additive
+  emit is a **Phase-1 deliverable** (not "e.g."). A silent dev-tree fallback fails this gate. Sign-in + turn
+  round-trip is required IN ADDITION.
 - [ ] AC-4: `config.yaml desktop.backend_root` overrides the default (set → relaunch → backend on the
   specified tree); empty → auto-resolve. User-facing docs reference `config.yaml` only (no raw env var).
 - [ ] AC-5: broken/missing runtime venv → fall back to the dev tree AND surface it on BOTH the app notify/UI
@@ -138,8 +162,12 @@ runs the emitter that tells you which interpreter to use?).
 - [ ] AC-6: after migration, nothing holds `~/.hermes/hermes-agent/venv` — the primary backend, its
   `slash_worker` children, and any transient descendant all re-proven off it — it is deleted; the Phase-B
   guard reports clean; the parent spec's AC-5 is flipped to done.
-- [ ] AC-7 (rollback): clearing `desktop.backend_root` (and, post-rebuild, reinstalling the prior .app from
-  the keep-last-3 backup) returns the backend to the dev tree — an explicit, tested revert path.
+- [ ] AC-7 (rollback, pass-2 — cite the real backup): the knob revert is `desktop.backend_root=""` + relaunch
+  (tested by AC-4's inverse). The post-rebuild revert reinstalls the prior `.app` from the EXISTING keep-last-3
+  backup: `desktop-update.sh` writes `du_backup_app` → `/Applications/.hermes-app-backups/Hermes.app.old-<ts>`
+  (`BACKUP_DIR_DEFAULT`, `BACKUP_KEEP_N=3`, both shipped). Phase 3 VERIFIES the prior `.app` backup exists +
+  is restorable (ditto back + `xattr -dr quarantine` + launch-verify) BEFORE the rebuild overwrites the live
+  app — a rollback that's exercised, not hoped.
 
 ## 8. Risks
 - **R-1: an install with no runtime tree (fresh/CLI-only) must still work.** Mitigation: tier-3 fallback to
