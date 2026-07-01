@@ -32,8 +32,16 @@ from gateway.config import PlatformConfig
 
 
 def _ensure_telegram_mock():
-    if "telegram" in sys.modules and hasattr(sys.modules["telegram"], "__file__"):
-        return
+    # Only shim when the REAL python-telegram-bot isn't already importable. A
+    # bare ``hasattr(mod, "__file__")`` is insufficient — a MagicMock satisfies
+    # any attribute — so a prior test's mock in sys.modules would be misread as
+    # "real telegram present" and skip our setup. Distinguish a genuine module
+    # (a real __file__ string, not a Mock) from a MagicMock explicitly.
+    existing = sys.modules.get("telegram")
+    if existing is not None and not isinstance(existing, MagicMock):
+        file_attr = getattr(existing, "__file__", None)
+        if isinstance(file_attr, str):
+            return
     telegram_mod = MagicMock()
     telegram_mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
     telegram_mod.constants.ParseMode.MARKDOWN_V2 = "MarkdownV2"
@@ -394,10 +402,12 @@ def test_ptb_application_stop_drains_queue():
         )
 
     source = app_path.read_text()
-    # Find the Application.stop coroutine and assert it awaits update_queue.join.
+    # Find the module-level ``Application`` class and its ``stop`` method. Iterate
+    # only top-level statements (not ast.walk) so we can't match a nested/inner
+    # class named Application, and stop at the first module-level match.
     tree = ast.parse(source)
     stop_fn = None
-    for cls in ast.walk(tree):
+    for cls in tree.body:
         if isinstance(cls, ast.ClassDef) and cls.name == "Application":
             for item in cls.body:
                 if isinstance(item, (ast.AsyncFunctionDef, ast.FunctionDef)) and (
@@ -405,8 +415,10 @@ def test_ptb_application_stop_drains_queue():
                 ):
                     stop_fn = item
                     break
+            break
     assert stop_fn is not None, (
-        f"could not find Application.stop in the installed PTB source at {app_path}"
+        f"could not find module-level Application.stop in the installed PTB "
+        f"source at {app_path}"
     )
     stop_src = ast.get_source_segment(source, stop_fn) or ""
     assert "update_queue.join" in stop_src, (
