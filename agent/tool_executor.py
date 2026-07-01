@@ -74,7 +74,7 @@ def _budget_for_agent(agent) -> BudgetConfig:
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
 _MAX_TOOL_WORKERS = 8
 _RESUME_SUMMARY_ONLY_BLOCK_MESSAGE = (
-    "resumed turn is summarize-only; await user go"
+    "resumed turn interrupted by restart — summarize-only; await user go"
 )
 _RESUME_SUMMARY_ONLY_READ_ONLY_TOOLS = frozenset({
     "read_file",

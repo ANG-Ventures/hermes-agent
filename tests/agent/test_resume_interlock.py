@@ -40,7 +40,7 @@ def _make_agent(*tool_names: str) -> AIAgent:
         patch("run_agent.OpenAI"),
     ):
         agent = AIAgent(
-            api_key="test-key-1234567890",
+            api_key="test-key-1234567890",  # gitleaks:allow (fixture constant, not a secret)
             base_url="https://openrouter.ai/api/v1",
             quiet_mode=True,
             skip_context_files=True,
