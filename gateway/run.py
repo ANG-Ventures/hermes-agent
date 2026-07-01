@@ -5517,6 +5517,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
         marked = self.session_store.mark_resume_pending(session_key, reason)
+        # PHASE observability (spec 2026-07-01 restart-reboot-continuity, INV-3/6):
+        # make the per-session mark DECISION visible — the reason chosen, whether
+        # this pass counted as an interrupted-turn mark, and whether a replay-mark
+        # was recorded. Session key + flags only, NO transcript content. Uses the
+        # module logger at INFO (no fsync / no rollover in the hot path — the
+        # 180s drain must never be blocked by logging).
+        logger.info(
+            "PHASE=shutdown_mark key=%s reason=%s interrupted=%s replay_marked=%s marked=%s",
+            session_key, reason, interrupted, alert, marked,
+        )
         return marked, reason, alert
 
     async def _notify_active_sessions_of_shutdown(self) -> None:
@@ -6796,6 +6806,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running_agents[entry.session_key] = _AGENT_PENDING_SENTINEL
             self._running_agents_ts[entry.session_key] = time.time()
             self._persist_active_agents()
+
+            # PHASE observability (spec 2026-07-01): a session PROACTIVELY resumed
+            # at boot (surface-and-wait) — reason + origin platform, no content.
+            logger.info(
+                "PHASE=boot_resume_scheduled key=%s reason=%s platform=%s",
+                entry.session_key,
+                getattr(entry, "resume_reason", None),
+                getattr(getattr(source, "platform", None), "value", None),
+            )
 
             # Empty-text internal event — the _is_resume_pending branch in
             # _handle_message_with_agent prepends the proper reason-aware
