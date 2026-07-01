@@ -28,7 +28,7 @@ def test_format_line_no_query_text_sentinel(tmp_path):
     # qlen carries the LENGTH of a sentinel-bearing query, never the text
     qr.emit_prefetch_usage(mode="warm", ms=10, n=1, qlen=len(SENT), typed="hybrid",
                            scope="all", path=log)
-    body = open(log).read()
+    body = open(log, encoding='utf-8').read()
     assert SENT not in body
     assert qr._USAGE_LINE_RE.match(body.strip())
 
@@ -58,7 +58,7 @@ def test_not_suppressed_when_env_zero(tmp_path, monkeypatch):
     log = str(tmp_path / "bg.log")
     monkeypatch.setenv("QMD_PREFETCH_NO_USAGE_LOG", "0")
     qr.emit_prefetch_usage(mode="warm", ms=10, n=1, qlen=5, path=log)
-    assert os.path.exists(log) and "lane=prefetch" in open(log).read()
+    assert os.path.exists(log) and "lane=prefetch" in open(log, encoding='utf-8').read()
 
 
 # ---- AC3: degrade-safe — a bad path NEVER raises --------------------------
@@ -89,12 +89,12 @@ def test_rotate_renames_not_truncates(tmp_path, monkeypatch):
         qr.emit_prefetch_usage(mode="warm", ms=i, n=0, qlen=0, path=log)
     # emit NEVER rotates (no .1 yet, all 18 lines live)
     assert not os.path.exists(log + ".1")
-    assert len(open(log).read().strip().splitlines()) == 18
+    assert len(open(log, encoding='utf-8').read().strip().splitlines()) == 18
     # the MONITOR rotates after reading → rename to .1, fresh empty live file
     rotated = qr.rotate_prefetch_log(path=log)
     assert rotated is True
     assert os.path.exists(log + ".1")
-    old = open(log + ".1").read().strip().splitlines()
+    old = open(log + ".1", encoding='utf-8').read().strip().splitlines()
     assert len(old) == 18  # nothing lost, nothing duplicated, full lines
     for ln in old:
         assert qr._USAGE_LINE_RE.match(ln)
