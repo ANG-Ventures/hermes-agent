@@ -14,22 +14,31 @@ const path = require('node:path')
 //   3. Scalar: unquoted / single- / double-quoted; surrounding whitespace trimmed; leading `~` or `$HOME`
 //      expanded. Empty → null.
 //   4. First matching `backend_root:` under `desktop:` wins.
-//   5. Rejected → null (fail-safe): tab-indented key, flow-style (`desktop: {…}`), multi-document content
-//      after the first `---`, and anything the scanner can't unambiguously read.
+//   5. Rejected → null (fail-safe): tab-indented key, flow-style (`desktop: {…}`), and multi-document
+//      content after a document separator (`---` that appears AFTER real content; a LEADING `---`
+//      document-start marker is honored as part of the first document), plus anything the scanner can't
+//      unambiguously read.
 function parseDesktopBackendRoot(configText) {
   if (typeof configText !== 'string' || configText.length === 0) return null
 
   const home = os.homedir()
   const lines = configText.split(/\r?\n/)
   let inDesktop = false
+  let seenContent = false // has meaningful content appeared? (distinguishes leading doc-start --- from a separator)
 
   for (const rawLine of lines) {
-    // Rule 5: stop at the first document separator — only the first YAML document is honored.
-    if (/^---\s*$/.test(rawLine)) break
+    // Rule 5: a `---` marker. A LEADING `---` (before any content) is a valid YAML document-start marker and
+    // is part of the first document → skip it. A `---` AFTER content is a multi-document separator → stop
+    // (only the first document is honored).
+    if (/^---\s*$/.test(rawLine)) {
+      if (seenContent) break
+      continue
+    }
 
     // Skip blank lines and full-line comments (Rule 2).
     const firstNonSpace = rawLine.replace(/^[ \t]*/, '')
     if (firstNonSpace === '' || firstNonSpace.startsWith('#')) continue
+    seenContent = true // a non-blank, non-comment line: subsequent `---` is a separator, not a doc-start
 
     // A column-0 (no leading whitespace) key. Tabs at col 0 are not valid block keys here.
     const isTopLevel = !/^[ \t]/.test(rawLine)

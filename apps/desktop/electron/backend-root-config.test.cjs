@@ -62,6 +62,15 @@ test('multi-document: key in first doc IS read', () => {
   const t = 'desktop:\n  backend_root: /doc1\n---\nother: 2\n'
   assert.equal(parseDesktopBackendRoot(t), '/doc1')
 })
+// --- leading `---` document-start marker (valid YAML, emitted by Helm/Ansible/etc.) is NOT a separator ---
+test('leading --- document-start marker: override under it IS read', () => {
+  const t = '---\ndesktop:\n  backend_root: /leadmarker\n'
+  assert.equal(parseDesktopBackendRoot(t), '/leadmarker')
+})
+test('leading --- after only comments/blanks: override still read', () => {
+  const t = '# config\n\n---\ndesktop:\n  backend_root: /aftercomment\n'
+  assert.equal(parseDesktopBackendRoot(t), '/aftercomment')
+})
 
 // --- tab-indented key -> reject (fail-safe to auto-resolve) ---
 test('tab-indented backend_root is rejected', () => {
