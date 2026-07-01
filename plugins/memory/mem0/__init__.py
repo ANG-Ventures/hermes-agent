@@ -754,8 +754,22 @@ class Mem0MemoryProvider(MemoryProvider):
         # QMD unified-recall fold-in (spec v0.3). Default-off; loaded from the `qmd`
         # sub-block of mem0.json. Stores stay separate — this only adds a read-only
         # local-document SEARCH leg to prefetch + mem0_search (INV-1, never writes).
-        self._qmd_cfg = qmd_recall.load_qmd_config(self._config.get("qmd"))
+        # Config block renamed `qmd` -> `mem0_qmd` (clearer: it's the mem0<->QMD integration,
+        # not QMD itself). Read the new key, fall back to the legacy `qmd` block so a
+        # config/code skew on a running gateway can never break recall.
+        self._qmd_cfg = qmd_recall.load_qmd_config(
+            self._config.get("mem0_qmd", self._config.get("qmd"))
+        )
         self._qmd_enabled = self._truthy(self._qmd_cfg.get("enabled", False))
+        # Sub-lane gates: each requires the master `enabled` AND its own toggle (default true, so
+        # flipping only `enabled` behaves exactly as before). Lets an operator kill just the
+        # every-turn PREFETCH lane (cost + noise) while keeping the explicit mem0_search fan-out.
+        self._qmd_prefetch_enabled = self._qmd_enabled and self._truthy(
+            self._qmd_cfg.get("prefetch_enabled", True)
+        )
+        self._qmd_search_enabled = self._qmd_enabled and self._truthy(
+            self._qmd_cfg.get("search_enabled", True)
+        )
         # W3-TEMPORAL (tau_m created_at window) — plugin-side, config-gated, reversible
         # (INV-4). Off by default so deploy is inert until the flag flips. When on,
         # mem0_search detects a temporal expression, resolves it to a created_at
@@ -1093,7 +1107,7 @@ class Mem0MemoryProvider(MemoryProvider):
                 remaining = float(self._prefetch_join_timeout_s) - mem0_elapsed - 0.25
                 eff_deadline = min(qmd_deadline, remaining)
                 if (
-                    self._qmd_enabled
+                    self._qmd_prefetch_enabled
                     and mem0_elapsed <= mem0_budget
                     and eff_deadline >= 0.5
                     and qmd_recall.is_lookup_intent(
@@ -1233,7 +1247,7 @@ class Mem0MemoryProvider(MemoryProvider):
                     query,
                     limit=int(self._qmd_cfg.get("search_limit", 5)),
                     deadline_s=float(self._qmd_cfg.get("qmd_total_deadline_s", 4.0)),
-                ) if self._qmd_enabled else []
+                ) if self._qmd_search_enabled else []
                 if not results:
                     if qmd_docs:
                         return json.dumps({"result": "No relevant memories found.", "docs": qmd_docs})
