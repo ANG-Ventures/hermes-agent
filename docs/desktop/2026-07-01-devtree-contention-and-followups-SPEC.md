@@ -260,39 +260,39 @@ C in the freshness helper (only it decides the pin).
   more.
 
 ## 10. Acceptance Criteria
-- [ ] **AC-1 (C):** after a docs-only HEAD advance, `desktop-update.sh --host self` reports "already current"
+- [x] **AC-1 (C):** after a docs-only HEAD advance, `desktop-update.sh --host self` reports "already current"
   when the installed SHA == last `apps/desktop`+`package-lock.json` commit. Evidence: the live PLAN output.
-- [ ] **AC-2 (A-Tier1):** an `--apply` run leaves root `main` HEAD + `git status` unchanged and the reflog
+- [x] **AC-2 (A-Tier1):** an `--apply` run leaves root `main` HEAD + `git status` unchanged and the reflog
   shows no `main` checkout/reset. Evidence: before/after capture + reflog grep.
-- [ ] **AC-3 (A-Tier1):** the app still installs correctly from the worktree build (version + SHA asserted).
+- [x] **AC-3 (A-Tier1):** the app still installs correctly from the worktree build (version + SHA asserted).
   Evidence: post-install identity gate green.
-- [ ] **AC-4 (A-Tier2):** the root-main-mutation lint returns 0 offenders across `fleet/`+`scripts/`.
+- [x] **AC-4 (A-Tier2):** the root-main-mutation lint returns 0 offenders across `fleet/`+`scripts/`.
   Evidence: lint run output.
-- [ ] **AC-5 (B):** `~/.hermes/hermes-agent/venv` is absent; all 6 gateways `state=running`; a fleet health
+- [~] **AC-5 (B):** `~/.hermes/hermes-agent/venv` is absent; all 6 gateways `state=running`; a fleet health
   run is clean. Evidence: `ls` + gateway states.
-- [ ] **AC-6 (B guard):** a re-created dev-tree venv is flagged by the health check. Evidence: touch a fake
+- [x] **AC-6 (B guard):** a re-created dev-tree venv is flagged by the health check. Evidence: touch a fake
   `venv/` → health check warns → remove.
-- [ ] **AC-7 (worktree cleanup):** no `desktop-build-*` worktree remains after a run (success OR failure).
+- [x] **AC-7 (worktree cleanup):** no `desktop-build-*` worktree remains after a run (success OR failure).
   Evidence: `git worktree list` clean post-run.
-- [ ] **AC-8 (A-Tier3 serialized writer):** two concurrent `land-on-main.sh` invocations serialize (no race,
+- [x] **AC-8 (A-Tier3 serialized writer):** two concurrent `land-on-main.sh` invocations serialize (no race,
   no reset); `main` ends FF-advanced. Evidence: race-test output + `main` reflog shows FF, no reset.
-- [ ] **AC-9 (A-Tier3 dirty/non-FF refusal):** `land-on-main.sh` refuses a dirty root (exit≠0) and a non-FF
+- [x] **AC-9 (A-Tier3 dirty/non-FF refusal):** `land-on-main.sh` refuses a dirty root (exit≠0) and a non-FF
   ref (exit≠0), mutating nothing. Evidence: both refusal runs + unchanged `main`.
-- [ ] **AC-10 (A-Tier3 root-checkout guard):** a raw `git commit`/`git checkout <branch>` in the root
+- [x] **AC-10 (A-Tier3 root-checkout guard):** a raw `git commit`/`git checkout <branch>` in the root
   checkout (no writer sentinel) is refused by the hook; the SAME operation in a worktree succeeds. Evidence:
   refused-in-root + succeeds-in-worktree runs.
-- [ ] **AC-11 (A-Tier3 land migration):** the fork-sync + agent doc-land flows route through
+- [x] **AC-11 (A-Tier3 land migration):** the fork-sync + agent doc-land flows route through
   `land-on-main.sh` (grep the runbook/scripts); a real land advances `main` without the root leaving `main`.
   Evidence: grep + reflog. **Do LAST (RC-4), after AC-8/9/10 pass; rollback = revert the runbook line.**
-- [ ] **AC-12 (A-Tier3 concurrency realism, RC-3/BL-2):** `land-on-main.sh` running concurrent with an
+- [x] **AC-12 (A-Tier3 concurrency realism, RC-3/BL-2):** `land-on-main.sh` running concurrent with an
   ephemeral build worktree AND a simulated external `origin/main` advance ends with root `main` FF-advanced
   or loud-refused (never reset), build worktree unaffected. Evidence: race-test output.
-- [ ] **AC-13 (C build-input completeness, RC-7):** the Phase-1 enumeration gate confirms the COMPLETE
+- [x] **AC-13 (C build-input completeness, RC-7):** the Phase-1 enumeration gate confirms the COMPLETE
   `dist:mac` build-input set on disk; a bundled-but-unpinned input fails the confirmation. Evidence:
   enumeration output + a negative check proving an unpinned bundled path is caught.
-- [ ] **AC-14 (A-Tier1 disk-headroom, RR-3):** an induced `npm ci`/build failure mid-run leaves root `main`
+- [x] **AC-14 (A-Tier1 disk-headroom, RR-3):** an induced `npm ci`/build failure mid-run leaves root `main`
   HEAD+status pristine. Evidence: before/after capture across a forced-fail build.
-- [ ] **AC-15 (A-Tier3 worktree-exempt both locations, RR-1):** a worktree commit succeeds in BOTH
+- [x] **AC-15 (A-Tier3 worktree-exempt both locations, RR-1):** a worktree commit succeeds in BOTH
   `~/.hermes/worktrees/*` and a `~/Projects/wt*`-style path (the hook's worktree-detection covers both).
   Evidence: two worktree-commit runs.
 
@@ -301,3 +301,26 @@ C in the freshness helper (only it decides the pin).
 |---|---|---|
 | v0.1 | Tier-1 (build-in-worktree) + Tier-2 (helper+lint) + **Tier-3 (serialized `land-on-main.sh` writer + root-checkout tripwire)** + B (orphan venv) + C (freshness) | now (Ace: do Tier-3 now) |
 | future | remove the raw-shell/`git` capability from agent profiles entirely (the structural cage a git hook can't provide) | if the tripwire proves insufficient |
+
+
+## 12. Build status & evidence (v0.1 executed 2026-07-01)
+**Shipped & proven (TDD, all green):** C, Tier-1, Tier-2, Tier-3, B-guard. ~40 new tests.
+- **AC-1/AC-13 (C):** `desktop-build-inputs.sh` mechanically enumerates apps/desktop + resolved `file:`
+  workspace deps (`apps/shared`) + root `package-lock.json`; live Studio PLAN reads `already current`
+  (was false-stale). Tests: `test_desktop_build_inputs.sh`, fix-C cases in `test_desktop_update.sh`.
+- **AC-2/3/7/14 (Tier-1):** `du_build_and_install` builds in a throwaway worktree; live smoke on the real
+  3000-commit tree left root HEAD/branch/worktree-count byte-identical, 0 new reflog moves, 0 leftover.
+  MBP arm worktree-isolated (stash dance retired). Tests: `test_desktop_update.sh` (66/66).
+- **AC-4 (Tier-2):** `with_ephemeral_worktree` (`dev-tree-guard.sh`, 8/8) + `lint-root-main-mutation.sh`
+  = 0 offenders live (7/7).
+- **AC-6 (B guard):** `runtime_tree_status.py --check-orphan-venv` (root-specific, ignores nested worktree
+  venvs, 15/15). **AC-5 (venv deletion): DEFERRED (decision A, 2026-07-01)** — the dev venv is NOT an orphan;
+  the installed desktop app backend (`backend-env.cjs`) runs Python from it. Deletion is gated on the
+  follow-up spec `2026-07-01-desktop-backend-runtime-venv-migration-SPEC.md` (decision B).
+- **AC-8/9/12 (Tier-3 writer):** `land-on-main.sh` serialized FF-only writer — race, refusals, and
+  concurrency-realism (land ∥ build ∥ external advance) all green (`test_land_on_main.sh`, 17/17).
+- **AC-10/11/15 + Nit-1 (Tier-3 tripwire + cutover):** pre-commit/post-checkout guards installed LIVE via
+  `install-hooks.sh`; live AC-10 proof = raw root commit REFUSED, `LAND_ON_MAIN=1` ALLOWED. Fork-sync +
+  dev-tree-current runbooks rewired to `land-on-main.sh` (raw FF = uncaged break-glass). This spec update
+  itself landed on `main` via the sanctioned worktree + `land-on-main.sh` path (the live AC-11 proof).
+  Tests: `test_root_checkout_guard.sh` (9/9).
