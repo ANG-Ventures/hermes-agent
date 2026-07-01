@@ -1,6 +1,6 @@
 # Desktop Backend → Runtime Deploy-Venv Migration — SPEC
 
-**Status:** DRAFT v0.3 — pass-2 folded (parser grammar, ready-file AC-3 mechanism, rollback+freshness cited), for pass-3
+**Status:** DRAFT v0.4 — pass-3 folded (multi-doc/tab grammar, AC-3 fail-closed, rollback restore-gate, site-packages assert), for pass-4 (super-pass check)
 **Owner:** Apollo
 **Date:** 2026-07-01
 **Parent:** `docs/desktop/2026-07-01-devtree-contention-and-followups-SPEC.md` (Phase B — unblocks AC-5)
@@ -95,12 +95,14 @@ runs the emitter that tells you which interpreter to use?).
   3. Accept the scalar unquoted, single-, or double-quoted; trim surrounding whitespace; expand a leading
      `~`/`$HOME`. Empty value → auto-resolve.
   4. First matching `backend_root:` under `desktop:` wins (duplicate keys → first).
-  5. **Flow-style (`desktop: {backend_root: /x}`) and any shape the scanner can't unambiguously read →
-     REJECT → auto-resolve** (fail-safe, not a guess). The accepted grammar is a *defined* set; everything
-     outside it deterministically falls to auto-resolve.
+  5. **Flow-style (`desktop: {backend_root: /x}`), multi-document YAML (a `---` document marker — the scan
+     stops at the FIRST `---` and only reads the first document), tab-indented `backend_root:` (YAML forbids
+     tabs; a tab-indented key → REJECT, never silently read as un-nested and pick up a sibling block's key),
+     and any shape the scanner can't unambiguously read → REJECT → auto-resolve** (fail-safe, not a guess).
+     The accepted grammar is a *defined* set; everything outside it deterministically falls to auto-resolve.
   Each of these is a NAMED Phase-1 unit-test case (§6/AC-1): different-block false key, commented-out line,
-  trailing-comment, quoted path, `~`-expansion, flow-style, duplicate — each asserting the RIGHT tree (or
-  auto-resolve), never just "doesn't crash."
+  trailing-comment, quoted path, `~`-expansion, flow-style, **multi-document `---`, tab-indented**, duplicate
+  — each asserting the RIGHT tree (or auto-resolve), never just "doesn't crash."
 - This lets a RUNNING install repoint (set key → relaunch app) and prove AC-2 BEFORE any rebuild.
 
 ### 4.3 Build + ship (B1)
@@ -144,7 +146,10 @@ runs the emitter that tells you which interpreter to use?).
 ## 7. Acceptance Criteria
 - [ ] AC-1: `resolveBackendRoot()` returns the runtime tree by default when it exists; falls back to the dev
   tree when it doesn't; `config.yaml desktop.backend_root` overrides both; malformed/missing-tree value
-  fails safe to auto-resolve (unit tests, all tiers + fail-safe).
+  fails safe to auto-resolve (unit tests, all tiers + fail-safe). **Also assert the DERIVED
+  `getVenvSitePackagesEntries(venvRoot)` + `pythonPathEntries` point at the RUNTIME venv (pass-3), not just
+  that `root` resolved** — a correct `root` with a stale `venvRoot` would still mis-spawn; both spawn sites
+  (`main.cjs:~1334`, `~2874`) derive from the resolved pair.
 - [ ] AC-2: a freshly-launched desktop backend runs `~/.hermes/runtime/hermes-agent/venv/bin/python` with
   PYTHONPATH → runtime tree (live `ps`/`lsof`), NOT the dev venv — proven first via the knob (Phase 2) then
   via the default post-rebuild (Phase 3).
@@ -154,7 +159,9 @@ runs the emitter that tells you which interpreter to use?).
   the tree the backend is running from). The app's `backend-ready.cjs` `readDashboardReadyFile` asserts
   `project_root` is under `~/.hermes/runtime/hermes-agent` on the migrated backend. This one-line additive
   emit is a **Phase-1 deliverable** (not "e.g."). A silent dev-tree fallback fails this gate. Sign-in + turn
-  round-trip is required IN ADDITION.
+  round-trip is required IN ADDITION. **Fail-closed (pass-3): a MISSING or empty `project_root` in the
+  ready-file = gate FAIL, not skip** — an un-rebuilt/older backend that never emits the key must NOT pass by
+  omission (that would resurrect the proxy-gate problem).
 - [ ] AC-4: `config.yaml desktop.backend_root` overrides the default (set → relaunch → backend on the
   specified tree); empty → auto-resolve. User-facing docs reference `config.yaml` only (no raw env var).
 - [ ] AC-5: broken/missing runtime venv → fall back to the dev tree AND surface it on BOTH the app notify/UI
@@ -162,12 +169,14 @@ runs the emitter that tells you which interpreter to use?).
 - [ ] AC-6: after migration, nothing holds `~/.hermes/hermes-agent/venv` — the primary backend, its
   `slash_worker` children, and any transient descendant all re-proven off it — it is deleted; the Phase-B
   guard reports clean; the parent spec's AC-5 is flipped to done.
-- [ ] AC-7 (rollback, pass-2 — cite the real backup): the knob revert is `desktop.backend_root=""` + relaunch
-  (tested by AC-4's inverse). The post-rebuild revert reinstalls the prior `.app` from the EXISTING keep-last-3
-  backup: `desktop-update.sh` writes `du_backup_app` → `/Applications/.hermes-app-backups/Hermes.app.old-<ts>`
-  (`BACKUP_DIR_DEFAULT`, `BACKUP_KEEP_N=3`, both shipped). Phase 3 VERIFIES the prior `.app` backup exists +
-  is restorable (ditto back + `xattr -dr quarantine` + launch-verify) BEFORE the rebuild overwrites the live
-  app — a rollback that's exercised, not hoped.
+- [ ] AC-7 (rollback, pass-2/3 — cite the real backup, gate the restore): the knob revert is
+  `desktop.backend_root=""` + relaunch (tested by AC-4's inverse). The post-rebuild revert reinstalls the prior
+  `.app` from the EXISTING keep-last-3 backup: `desktop-update.sh` writes `du_backup_app` →
+  `/Applications/.hermes-app-backups/Hermes.app.old-<ts>` (`BACKUP_DIR_DEFAULT`, `BACKUP_KEEP_N=3`, both
+  shipped). **The restore direction is a Phase-3 PRECONDITION GATE (pass-3): before the rebuild overwrites the
+  live app, ditto the current app to a throwaway path, restore it back + `xattr -dr quarantine` +
+  launch-verify, and ABORT the rebuild if that restore fails** — the rollback is exercised on the real target
+  first, not assumed.
 
 ## 8. Risks
 - **R-1: an install with no runtime tree (fresh/CLI-only) must still work.** Mitigation: tier-3 fallback to
