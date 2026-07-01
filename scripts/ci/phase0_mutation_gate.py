@@ -61,7 +61,7 @@ def _find_mutations(source: str):
 def _apply_mutation(path: Path, kind: str, lineno: int, new_op) -> str:
     """Apply the mutation at the given line via AST rewrite. Returns original
     source text (for revert)."""
-    src = path.read_text()
+    src = path.read_text(encoding="utf-8")
     tree = ast.parse(src)
 
     class Mut(ast.NodeTransformer):
@@ -86,7 +86,7 @@ def _apply_mutation(path: Path, kind: str, lineno: int, new_op) -> str:
 
     new_tree = Mut().visit(tree)
     ast.fix_missing_locations(new_tree)
-    path.write_text(ast.unparse(new_tree))
+    path.write_text(ast.unparse(new_tree), encoding="utf-8")
     return src
 
 
@@ -129,7 +129,7 @@ def main() -> int:
             p = repo_root / sf
             if not p.exists():
                 continue
-            muts = _find_mutations(p.read_text())
+            muts = _find_mutations(p.read_text(encoding="utf-8"))
             if not muts:
                 continue
             pr_had_target = True
@@ -140,7 +140,7 @@ def main() -> int:
                 try:
                     red = _run_selected(repo_root, py, selected)
                 finally:
-                    p.write_text(orig)  # revert
+                    p.write_text(orig, encoding="utf-8")  # revert
                 tried += 1
                 if red:
                     caught += 1
