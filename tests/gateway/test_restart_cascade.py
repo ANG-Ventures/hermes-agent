@@ -1176,3 +1176,177 @@ def test_shipped_breadcrumb_bodies_unchanged():
     # producer: boot_id refreshed every write
     status_src = inspect.getsource(gs)
     assert 'payload["boot_id"] = current_record["boot_id"]' in status_src
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# restart_consumed_interrupted (the self-initiated-restart-that-was-also-
+# drain-interrupted seam fix). Spec: 2026-07-01_restart-reboot-continuity-*.
+# A CLEAN self-restart stays restart_consumed (excluded from auto-resume, F1/F2
+# cascade guard). A self-restart that was STILL RUNNING at drain-timeout becomes
+# restart_consumed_interrupted → auto-resumes (surface-and-wait) → but still
+# records the F2 replay-mark so a genuine loop is bounded.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_clean_self_restart_stays_consumed_not_auto_resumed(tmp_path, monkeypatch):
+    """AC-2: a self-initiated restart that was NOT interrupted (marked at the
+    pre-drain site, interrupted=False) keeps the bare restart_consumed reason and
+    is NOT auto-resumed — the F1/F2 cascade guard is preserved."""
+    runner, _adapter = _runner(tmp_path, monkeypatch)
+    entry = _entry(runner)
+
+    runner._session_initiated_restart[entry.session_key] = True
+    # pre-drain site → interrupted defaults False
+    marked, reason, _alert = runner._mark_resume_pending_for_shutdown(entry.session_key)
+
+    assert marked is True
+    assert reason == "restart_consumed"
+    assert "restart_consumed" not in runner._AUTO_RESUME_REASONS
+    assert runner._schedule_resume_pending_sessions() == 0
+
+
+@pytest.mark.asyncio
+async def test_interrupted_self_restart_becomes_interrupted_reason_and_auto_resumes(
+    tmp_path, monkeypatch
+):
+    """AC-1 (core): a self-initiated restart STILL RUNNING at drain-timeout
+    (interrupted=True) gets restart_consumed_interrupted, which IS auto-resumed."""
+    runner, _adapter = _runner(tmp_path, monkeypatch)
+    entry = _entry(runner)
+
+    runner._session_initiated_restart[entry.session_key] = True
+    marked, reason, _alert = runner._mark_resume_pending_for_shutdown(
+        entry.session_key, interrupted=True
+    )
+
+    assert marked is True
+    assert reason == "restart_consumed_interrupted"
+    assert "restart_consumed_interrupted" in runner._AUTO_RESUME_REASONS
+    assert (
+        runner.session_store._entries[entry.session_key].resume_reason
+        == "restart_consumed_interrupted"
+    )
+    # It PROACTIVELY schedules a boot-time surface-and-wait turn (not silent).
+    assert runner._schedule_resume_pending_sessions() == 1
+    await asyncio.gather(*runner._background_tasks)
+
+
+def test_reason_discriminator_matrix(tmp_path, monkeypatch):
+    """The reason table: self-initiated × interrupted → reason. Non-initiated
+    interrupted stays shutdown_timeout (already auto-resumes, unaffected)."""
+    runner, _adapter = _runner(tmp_path, monkeypatch)
+    entry = _entry(runner)
+    sk = entry.session_key
+
+    # non-initiated, not interrupted → shutdown_timeout
+    assert runner._resume_reason_for_shutdown_mark(sk) == "shutdown_timeout"
+    # non-initiated, interrupted → still shutdown_timeout (reboot/plain-shutdown path)
+    assert runner._resume_reason_for_shutdown_mark(sk, interrupted=True) == "shutdown_timeout"
+
+    runner._session_initiated_restart[sk] = True
+    # self-initiated, not interrupted → restart_consumed (excluded, cascade guard)
+    assert runner._resume_reason_for_shutdown_mark(sk) == "restart_consumed"
+    # self-initiated, interrupted → the new reason (auto-resumes)
+    assert (
+        runner._resume_reason_for_shutdown_mark(sk, interrupted=True)
+        == "restart_consumed_interrupted"
+    )
+
+
+def test_restart_requested_interrupted_prefers_restart_timeout_when_not_self_initiated(
+    tmp_path, monkeypatch
+):
+    """A /restart-requested shutdown that did NOT set the per-session self-init
+    flag still resolves restart_timeout, not the new reason — the new reason is
+    strictly for the self-initiated path."""
+    runner, _adapter = _runner(tmp_path, monkeypatch)
+    entry = _entry(runner)
+    runner._restart_requested = True
+    # not self-initiated for this session
+    assert runner._resume_reason_for_shutdown_mark(entry.session_key, interrupted=True) == "restart_timeout"
+
+
+@pytest.mark.asyncio
+async def test_interrupted_reason_still_records_replay_mark_same_pass(tmp_path, monkeypatch):
+    """AC-2c (D-2 × D-6 interleaving): on ONE post-timeout pass for a session that
+    was _resumed_this_boot, self-restarted, and drain-interrupted again, the mark
+    writes restart_consumed_interrupted AND the replay-mark call still increments.
+    The reason-tag and the replay-mark are NOT mutually exclusive."""
+    monkeypatch.setenv("HERMES_RESTART_LOOP_THRESHOLD", "3")
+    monkeypatch.setenv("HERMES_RESTART_LOOP_WINDOW_SECS", "300")
+    runner, _adapter = _runner(tmp_path, monkeypatch)
+    entry = _entry(runner)
+    sk = entry.session_key
+
+    # Session was auto-resumed this boot, then self-restarts again.
+    runner._resumed_this_boot.add(sk)
+    runner._session_initiated_restart[sk] = True
+    runner._replay_marked_during_stop = set()
+
+    marked, reason, _alert = runner._mark_resume_pending_for_shutdown(sk, interrupted=True)
+
+    assert reason == "restart_consumed_interrupted"
+    # the replay-mark was recorded for this session this pass
+    counts = runner._load_restart_failure_counts()
+    assert len(counts.get(sk, {}).get("replay_marks", [])) == 1
+
+
+@pytest.mark.asyncio
+async def test_interrupted_reason_replay_loop_is_bounded_cross_cycle(tmp_path, monkeypatch):
+    """AC-2b (CROSS-CYCLE, the pass-3-sharpest gate): a session that self-restarts
+    AND is drain-interrupted every cycle (reason=restart_consumed_interrupted) must
+    STILL trip F2/suspend within the 300s window — driven as real resume→re-interrupt
+    cycles seeding _resumed_this_boot, NOT 3 marks in one pass. A build that failed to
+    wire the new reason through the _resumed_this_boot→replay-mark path would loop
+    forever and fail this test (fake-gate rejection)."""
+    monkeypatch.setenv("HERMES_RESTART_LOOP_THRESHOLD", "3")
+    monkeypatch.setenv("HERMES_RESTART_LOOP_WINDOW_SECS", "300")
+    runner, _adapter = _runner(tmp_path, monkeypatch)
+    entry = _entry(runner, "iloop")
+    sk = entry.session_key
+
+    # Boot 0: session self-initiated a restart AND was drain-interrupted →
+    # the new reason, which IS auto-resumed.
+    runner._session_initiated_restart[sk] = True
+    runner._mark_resume_pending_for_shutdown(sk, interrupted=True)
+    runner.session_store._entries[sk].last_resume_marked_at = datetime.now()
+    runner.session_store._save()
+    assert runner.session_store._entries[sk].resume_reason == "restart_consumed_interrupted"
+
+    scheduled_each_boot = []
+    suspended_at = None
+    for cycle in range(6):
+        booted, _ = _runner(tmp_path, monkeypatch)
+        booted.session_store._ensure_loaded()
+
+        n = booted._schedule_resume_pending_sessions()
+        scheduled_each_boot.append(n)
+        if n:
+            await asyncio.gather(*booted._background_tasks)
+
+        # The resumed turn self-restarts again and is drain-interrupted again.
+        booted._session_initiated_restart[sk] = True
+        booted._replay_marked_during_stop = set()
+        booted._mark_resume_pending_for_shutdown(sk, interrupted=True)
+
+        if booted.session_store._entries[sk].suspended:
+            suspended_at = cycle
+            break
+
+    assert suspended_at is not None, (
+        f"restart_consumed_interrupted replay loop never broke; "
+        f"scheduled per boot = {scheduled_each_boot}"
+    )
+    # After suspension a fresh boot schedules ZERO — cascade bounded.
+    final, _ = _runner(tmp_path, monkeypatch)
+    final.session_store._ensure_loaded()
+    assert final.session_store._entries[sk].suspended is True
+    assert final._schedule_resume_pending_sessions() == 0
+
+
+def test_new_reason_has_recovery_phrase(tmp_path, monkeypatch):
+    """The new reason maps to a concrete recovery-note phrase (not the generic
+    fallback) so the surfaced prompt reads correctly."""
+    from gateway.run import _resume_reason_phrase
+    assert _resume_reason_phrase("restart_consumed_interrupted") == "a gateway restart"
