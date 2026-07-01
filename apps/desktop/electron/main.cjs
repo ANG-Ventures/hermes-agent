@@ -365,7 +365,13 @@ function readDesktopBackendRootOverride() {
 // One shared surfaced-condition path for BOTH fallback triggers (absent runtime tree / broken runtime venv).
 let _backendFallbackSurfaced = false
 function surfaceBackendFallback(reason, root) {
-  const msg = `[backend] runtime tree unavailable (${reason}: ${root}) — falling back to dev tree ${ACTIVE_HERMES_ROOT}`
+  // Reason-accurate destination: 'runtime-unavailable' is the ONLY reason that actually lands on the dev
+  // tree (resolveBackendRoot tier-3). 'override-unusable' fires BEFORE tier-2 is tried, so the backend may
+  // still start from the runtime tree — don't claim "dev tree" before the destination is known.
+  const dest = reason === 'override-unusable'
+    ? `the runtime tree (or dev tree ${ACTIVE_HERMES_ROOT} if it too is unusable)`
+    : `dev tree ${ACTIVE_HERMES_ROOT}`
+  const msg = `[backend] backend root unusable (${reason}: ${root}) — falling back to ${dest}`
   console.warn(msg)
   // Surface once to the app (notify/UI) so a silent stale-code fallback is a monitored condition, not a
   // boot-log-into-the-void. rememberBoolLog/emitToRenderer are best-effort — never let this throw into spawn.
