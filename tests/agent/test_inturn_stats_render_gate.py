@@ -95,26 +95,28 @@ def test_gate_uses_formatter_allowlist_objects():
 
 
 def test_stats_gate_token_identity_and_lcm_scope():
-    """Source-structure contract (D-1): at the call site the gate consumes the exact
-    variables passed to _emit_compaction_announce as pre_tokens/post_tokens
-    (_pre_request_est / _compressed_est), and the gate call sits inside the
-    `_engine_name == "lcm"` scope (non-LCM never gated)."""
+    """Source-structure contract (D-1): the gate consumes the exact variables passed
+    to _emit_compaction_announce as pre_tokens/post_tokens (_pre_request_est /
+    _compressed_est), sits inside the `if _engine_name == "lcm":` branch, and the
+    NON-LCM path is left eligible (unchanged always-attempt behavior — Greptile #177)."""
     src = inspect.getsource(cc_mod)
+    # LCM branch: render-eligibility gate consuming the announce-call token variables
     m = re.search(
-        r"_inturn_stats_eligible\s*=\s*\(\s*_engine_name\s*==\s*\"lcm\"\s*\)\s*and\s*"
-        r"_inturn_stats_render_eligible\(\s*_status,\s*"
-        r"locals\(\)\.get\(\"_pre_request_est\"\),\s*_compressed_est,?\s*\)",
+        r"if _engine_name == \"lcm\":\s*"
+        r"_inturn_stats_eligible = _inturn_stats_render_eligible\(\s*_status,\s*"
+        r"locals\(\)\.get\(\"_pre_request_est\"\),\s*_compressed_est,?\s*\)\s*"
+        r"else:\s*"
+        r"_inturn_stats_eligible = True",
         src,
     )
-    assert m, "gate call-site must be LCM-scoped and consume _pre_request_est/_compressed_est"
+    assert m, "gate must be LCM-scoped, consume _pre_request_est/_compressed_est, and leave non-LCM eligible"
 
 
 # ────────────────────────── behavior through the announce block ──────────────────────────
 
-class _FakeLCMCompressor:
-    name = "lcm"
-
-    def __init__(self, status):
+class _FakeCompressor:
+    def __init__(self, status, name="lcm"):
+        self.name = name
         self._last_compression_status = status
         self.compression_count = 1
         self.protect_last_n = 4
@@ -123,9 +125,13 @@ class _FakeLCMCompressor:
         return list(msgs)
 
 
-def _run_announce_block(monkeypatch, caplog, status, messages=None, compressed=None):
+def _run_announce_block(monkeypatch, caplog, status, messages=None, compressed=None,
+                        engine="lcm", pre_tokens=None, post_tokens=None):
     """Drive the in-turn stats decision the way conversation_compression does:
-    gate → (skip | build). Mirrors the call-site shape without a full Agent."""
+    the REAL gate — LCM-scoped render-eligibility, non-LCM always eligible — then
+    (skip | build). Mirrors the call-site shape without a full Agent. ``pre_tokens``/
+    ``post_tokens`` let a conditional-status case exercise a REAL compression
+    (post < pre) rather than the identity default (Greptile #177 coverage)."""
     from agent.compaction_stats import build_inturn_stats
     from agent.model_metadata import estimate_messages_tokens_rough as _est
 
@@ -133,18 +139,22 @@ def _run_announce_block(monkeypatch, caplog, status, messages=None, compressed=N
         session_id = "S-test"
 
     agent = _Agent()
-    cc = _FakeLCMCompressor(status)
+    cc = _FakeCompressor(status, name=engine)
     messages = messages if messages is not None else [
         {"role": "user", "content": "u" * 200},
         {"role": "assistant", "content": "a" * 200},
     ] * 6
     compressed = compressed if compressed is not None else list(messages)
 
-    eligible = cc_mod._inturn_stats_render_eligible(
-        status, _est(messages), _est(compressed)
-    ) if status in _ANNOUNCE_STATUS_CONDITIONAL else cc_mod._inturn_stats_render_eligible(
-        status, 100, 50
-    )
+    # Real gate: LCM → render-eligibility on the announce-call token estimates;
+    # non-LCM → always eligible (unchanged).
+    _pre = pre_tokens if pre_tokens is not None else _est(messages)
+    _post = post_tokens if post_tokens is not None else _est(compressed)
+    if engine == "lcm":
+        eligible = cc_mod._inturn_stats_render_eligible(status, _pre, _post)
+    else:
+        eligible = True
+
     stats = None
     with caplog.at_level(logging.WARNING):
         if eligible:
@@ -152,7 +162,7 @@ def _run_announce_block(monkeypatch, caplog, status, messages=None, compressed=N
                 messages=messages,
                 compressed=compressed,
                 estimator=_est,
-                engine_is_lcm=True,
+                engine_is_lcm=(engine == "lcm"),
                 sanitize=cc._sanitize_active_context_messages,
                 fresh_tail_count=cc.protect_last_n,
                 on_tag_missing=lambda: _warn_compaction_stats_once(
@@ -161,18 +171,53 @@ def _run_announce_block(monkeypatch, caplog, status, messages=None, compressed=N
             )
             ok, _ = cand.validate()
             stats = cand if ok else None
-    return stats, caplog
+    return stats, caplog, eligible
 
 
 def test_inturn_stats_skipped_on_noop(monkeypatch, caplog):
-    stats, log = _run_announce_block(monkeypatch, caplog, "noop")
+    stats, log, eligible = _run_announce_block(monkeypatch, caplog, "noop")
+    assert not eligible
     assert stats is None
     assert "COMPACTION_STATS" not in log.text
 
 
 def test_inturn_stats_built_on_compacted(monkeypatch, caplog):
-    stats, _ = _run_announce_block(monkeypatch, caplog, "compacted")
+    stats, _, eligible = _run_announce_block(monkeypatch, caplog, "compacted")
+    assert eligible
     assert stats is not None  # regression: real compactions still build stats
+
+
+def test_inturn_stats_built_on_conditional_real_compression(monkeypatch, caplog):
+    """Greptile #177 coverage: a CONDITIONAL status ('sanitized') with an ACTUAL
+    compression (post < pre) is render-eligible and DOES build stats through the
+    integration path — not just the unconditional 'compacted' case."""
+    # 12 messages compress to a 4-message tail → post < pre for real
+    msgs = [{"role": "user" if i % 2 else "assistant", "content": f"m{i} " + "w" * 40}
+            for i in range(12)]
+    comp = list(msgs[-4:])
+    stats, _, eligible = _run_announce_block(
+        monkeypatch, caplog, "sanitized", messages=msgs, compressed=comp,
+    )
+    assert eligible, "conditional status with post<pre must be render-eligible"
+    assert stats is not None
+
+
+def test_inturn_stats_conditional_noop_not_built(monkeypatch, caplog):
+    """A CONDITIONAL status whose 'compression' is a no-op (post == pre) is NOT
+    render-eligible → no stats, no marker."""
+    stats, log, eligible = _run_announce_block(monkeypatch, caplog, "sanitized")
+    assert not eligible
+    assert stats is None
+    assert "COMPACTION_STATS" not in log.text
+
+
+def test_nonlcm_stats_not_suppressed_by_gate(monkeypatch, caplog):
+    """Greptile #177: the built-in (non-LCM) compressor path is UNCHANGED — the LCM
+    render gate must not suppress it even for a status the LCM allow-list would deny
+    ('noop'). Non-LCM is always eligible; its announce gating is elsewhere."""
+    stats, _, eligible = _run_announce_block(monkeypatch, caplog, "noop", engine="builtin")
+    assert eligible, "non-LCM must remain eligible regardless of status"
+    assert stats is not None
 
 
 # ────────────────────────── formatter stats=None tolerance ──────────────────────────

@@ -1587,21 +1587,27 @@ def compress_context(
             # ships wrong math or breaks the turn. Guarded by hasattr so built-in /
             # overflow / manual paths (no LCM marker shape) simply degrade.
             #
-            # P1 render gate (spec 2026-07-02, D-1/§5A): only build stats — and only
-            # emit COMPACTION_STATS_* degrade markers — when the announce will
-            # actually RENDER. The formatter default-denies noop/idle/running/
-            # bypassed and conditional statuses whose post<pre check fails; building
-            # stats for those emitted ~100%-kept_tail APPROX_ATTRIBUTION noise on
-            # every LCM no-op. LCM-scoped: the built-in path keeps its own gating
-            # (sid-rotation) and may not expose _last_compression_status. The gate
-            # consumes the EXACT variables the announce call passes as
-            # pre_tokens/post_tokens (_pre_request_est / _compressed_est) so gate
-            # and render cannot straddle an estimate boundary.
-            _inturn_stats_eligible = (_engine_name == "lcm") and _inturn_stats_render_eligible(
-                _status,
-                locals().get("_pre_request_est"),
-                _compressed_est,
-            )
+            # P1 render gate (spec 2026-07-02, D-1/§5A): for the LCM path, only build
+            # stats — and only emit COMPACTION_STATS_* degrade markers — when the
+            # announce will actually RENDER. The formatter default-denies noop/idle/
+            # running/bypassed and conditional statuses whose post<pre check fails;
+            # building stats for those emitted ~100%-kept_tail APPROX_ATTRIBUTION noise
+            # on every LCM no-op. The NON-LCM (built-in compressor) path is UNCHANGED:
+            # it always attempted the build before this PR and its announce gating is
+            # the sid-rotation logic in _format_compaction_announce, not a status
+            # allow-list; suppressing its stats here would silently degrade every
+            # built-in announce to two-line (Greptile #177). The gate consumes the
+            # EXACT variables the announce call passes as pre_tokens/post_tokens
+            # (_pre_request_est / _compressed_est) so gate and render can't straddle
+            # an estimate boundary.
+            if _engine_name == "lcm":
+                _inturn_stats_eligible = _inturn_stats_render_eligible(
+                    _status,
+                    locals().get("_pre_request_est"),
+                    _compressed_est,
+                )
+            else:
+                _inturn_stats_eligible = True  # built-in path: unchanged (always attempt)
             _inturn_stats = None
             if _inturn_stats_eligible:
                 try:
