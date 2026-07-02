@@ -3,6 +3,8 @@
 import io
 import json
 import sys
+import threading
+import time
 import types
 import urllib.error
 import urllib.request
@@ -608,11 +610,40 @@ def test_keyword_search_config_is_resolved_and_forwarded_from_both_call_sites(mo
     # queue_prefetch call-site forwards it (run synchronously by joining the thread)
     sent.clear()
     provider.queue_prefetch("what runs the relay", session_id="sess-kw")
-    t = getattr(provider, "_prefetch_thread", None)
-    if t is not None:
-        t.join(timeout=5)
+    future = getattr(provider, "_prefetch_future", None)
+    if future is not None:
+        future.result(timeout=5)
+    else:
+        t = getattr(provider, "_prefetch_thread", None)
+        if t is not None:
+            t.join(timeout=5)
     assert any(c.get("keyword_search") is True for c in sent), \
         "queue_prefetch did not forward keyword_search to the wire"
+
+
+def test_prefetch_reuses_worker_without_unbounded_active_thread_growth(monkeypatch, tmp_path):
+    provider = _selfhost_provider(monkeypatch, tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+
+    class _SlowClient:
+        def search(self, **kw):
+            started.set()
+            release.wait(timeout=5.0)
+            return {"results": []}
+
+    monkeypatch.setattr(provider, "_get_client", lambda: _SlowClient())
+    baseline = threading.active_count()
+    try:
+        for i in range(8):
+            provider.queue_prefetch(f"thread growth probe {i}", session_id="sess-thread-growth")
+
+        assert started.wait(timeout=1.0), "prefetch worker did not start"
+        time.sleep(0.1)
+        assert threading.active_count() <= baseline + 2
+    finally:
+        release.set()
+        provider.shutdown()
 
 
 def test_temporal_the_nth_does_not_fire_on_rank_ordinals():

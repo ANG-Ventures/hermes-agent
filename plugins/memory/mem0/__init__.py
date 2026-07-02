@@ -17,6 +17,8 @@ Or via $HERMES_HOME/mem0.json.
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+import concurrent.futures.thread as _threadpool
 import json
 import logging
 import os
@@ -27,6 +29,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
+import weakref
 
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
@@ -35,6 +38,37 @@ from .temporal_parse import created_at_in_window, parse_temporal_window
 from . import qmd_recall
 
 logger = logging.getLogger(__name__)
+
+
+class _DaemonThreadPoolExecutor(ThreadPoolExecutor):
+    """ThreadPoolExecutor whose workers preserve the old daemon-thread behavior."""
+
+    def _adjust_thread_count(self):
+        # Copy of concurrent.futures.thread.ThreadPoolExecutor with daemon=True.
+        # Do not register in _threads_queues: those atexit joins would undo the
+        # previous daemon-thread semantics for a stuck network call.
+        if self._idle_semaphore.acquire(timeout=0):
+            return
+
+        def weakref_cb(_, q=self._work_queue):
+            q.put(None)  # type: ignore[arg-type]
+
+        num_threads = len(self._threads)
+        if num_threads < self._max_workers:
+            thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
+            t = threading.Thread(
+                name=thread_name,
+                target=_threadpool._worker,
+                args=(
+                    weakref.ref(self, weakref_cb),
+                    self._work_queue,
+                    self._initializer,
+                    self._initargs,
+                ),
+                daemon=True,
+            )
+            t.start()
+            self._threads.add(t)  # type: ignore[attr-defined]
 
 # Circuit breaker: after this many consecutive failures, pause API calls
 # for _BREAKER_COOLDOWN_SECS to avoid hammering a down server.
@@ -549,10 +583,14 @@ class Mem0MemoryProvider(MemoryProvider):
         self._prefetch_qmd = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
+        self._prefetch_executor: Optional[ThreadPoolExecutor] = None
+        self._prefetch_future: Optional[Future] = None
+        self._prefetch_submit_lock = threading.Lock()
+        self._prefetch_pending: Optional[str] = None
+        self._prefetch_timed_out = False
         self._prefetch_join_timeout_s = 10.0
         self._qmd_cfg = qmd_recall.load_qmd_config(None)
         self._qmd_enabled = False
-        self._sync_thread = None
         # Circuit breaker state
         self._consecutive_failures = 0
         self._breaker_open_until = 0.0
@@ -1051,9 +1089,25 @@ class Mem0MemoryProvider(MemoryProvider):
             logger.debug("QMD prefetch leg failed: %s", e)
             return []
 
+    def _prefetch_executor_for_submit(self) -> ThreadPoolExecutor:
+        if self._prefetch_executor is None:
+            self._prefetch_executor = _DaemonThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="mem0-prefetch",
+            )
+        return self._prefetch_executor
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        if self._prefetch_thread and self._prefetch_thread.is_alive():
-            self._prefetch_thread.join(timeout=self._prefetch_join_timeout_s)
+        future = self._prefetch_future
+        if future and not future.done():
+            try:
+                future.result(timeout=self._prefetch_join_timeout_s)
+            except FutureTimeoutError:
+                with self._prefetch_submit_lock:
+                    if self._prefetch_future is future:
+                        self._prefetch_timed_out = True
+            except Exception as e:
+                logger.debug("Mem0 prefetch worker failed: %s", e)
         with self._prefetch_lock:
             result = self._prefetch_result
             qmd_block = self._prefetch_qmd
@@ -1068,7 +1122,7 @@ class Mem0MemoryProvider(MemoryProvider):
         if self._is_breaker_open():
             return
 
-        def _run():
+        def _run_once(run_query: str):
             t_start = time.monotonic()
             try:
                 client = self._get_client()
@@ -1083,11 +1137,11 @@ class Mem0MemoryProvider(MemoryProvider):
                 # — one of exactly two enumerated call-sites that send retrieval flags.
                 _pf_rerank = (
                     self._truthy(self._rerank)
-                    and not self._is_exact_token_query(query)
+                    and not self._is_exact_token_query(run_query)
                     and not self._rerank_killed()
                 )
                 results = self._drop_forgotten(self._unwrap_results(client.search(
-                    query=query,
+                    query=run_query,
                     filters=self._read_filters(),
                     rerank=_pf_rerank,
                     keyword_search=self._keyword_search,
@@ -1121,11 +1175,11 @@ class Mem0MemoryProvider(MemoryProvider):
                     and mem0_elapsed <= mem0_budget
                     and eff_deadline >= 0.5
                     and qmd_recall.is_lookup_intent(
-                        query, int(self._qmd_cfg.get("intent_min_tokens", 4))
+                        run_query, int(self._qmd_cfg.get("intent_min_tokens", 4))
                     )
                 ):
                     hits = self._qmd_pointers(
-                        query,
+                        run_query,
                         limit=int(self._qmd_cfg.get("prefetch_limit", 3)),
                         deadline_s=eff_deadline,
                     )
@@ -1136,8 +1190,38 @@ class Mem0MemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.debug("QMD prefetch leg failed: %s", e)
 
-        self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="mem0-prefetch")
-        self._prefetch_thread.start()
+        def _run_latest(first_query: str):
+            run_query = first_query
+            while True:
+                _run_once(run_query)
+                with self._prefetch_submit_lock:
+                    if self._prefetch_pending is None:
+                        return
+                    run_query = self._prefetch_pending
+                    self._prefetch_pending = None
+
+        with self._prefetch_submit_lock:
+            future = self._prefetch_future
+            if future and not future.done():
+                if self._prefetch_timed_out:
+                    if self._prefetch_executor is not None:
+                        self._prefetch_executor.shutdown(wait=False, cancel_futures=True)
+                    self._prefetch_executor = None
+                    self._prefetch_future = None
+                    self._prefetch_pending = None
+                    self._prefetch_timed_out = False
+                else:
+                    # Do not let the single-worker executor queue unbounded stale
+                    # prefetches. Keep only the latest request; the worker drains it
+                    # after the in-flight call completes.
+                    self._prefetch_pending = query
+                    return
+            self._prefetch_pending = None
+            self._prefetch_timed_out = False
+            self._prefetch_thread = None
+            self._prefetch_future = self._prefetch_executor_for_submit().submit(
+                _run_latest, query
+            )
 
     def _live_capture(self) -> str:
         """Re-resolve the capture flag from the LIVE source (env > mem0.json `capture` > default),
@@ -1907,9 +1991,19 @@ class Mem0MemoryProvider(MemoryProvider):
                            "irreversible": True})
 
     def shutdown(self) -> None:
-        for t in (self._prefetch_thread, self._sync_thread):
-            if t and t.is_alive():
-                t.join(timeout=5.0)
+        future = self._prefetch_future
+        if future and not future.done():
+            try:
+                future.result(timeout=5.0)
+            except FutureTimeoutError:
+                pass
+            except Exception as e:
+                logger.debug("Mem0 background worker failed during shutdown: %s", e)
+        if self._prefetch_executor is not None:
+            self._prefetch_executor.shutdown(wait=False, cancel_futures=True)
+        self._prefetch_executor = None
+        self._prefetch_future = None
+        self._prefetch_thread = None
         with self._client_lock:
             self._client = None
 
