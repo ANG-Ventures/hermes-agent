@@ -724,7 +724,9 @@ def test_fable_5_prices_at_premium_tier_across_notional_providers():
     )
     # 100000*10/1e6 + 10000*50/1e6 + 200000*1.00/1e6 + 4000*12.50/1e6 = 1.75
     expected = 1.75
-    for provider in list(_REPRESENTATIVE_NOTIONAL) + ["anthropic"]:
+    # "" and None cover the provider-less rows the blackbox store actually
+    # contains (priced via the vendor-inference fallback, not the notional map).
+    for provider in list(_REPRESENTATIVE_NOTIONAL) + ["anthropic", "", None]:
         result = estimate_usage_cost("claude-fable-5", usage, provider=provider)
         assert result.status == "estimated", f"{provider}: {result.status}"
         assert result.amount_usd is not None, f"{provider} priced None"
