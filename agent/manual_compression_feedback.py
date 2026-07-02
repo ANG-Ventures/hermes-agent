@@ -59,6 +59,7 @@ def summarize_manual_compression(
 
     enhanced = (
         non_chat_count is not None
+        and non_chat_tokens is not None
         and transcript_rewritten is not None
         and full_before_count is not None
         and non_chat_count > 0
@@ -120,8 +121,14 @@ def summarize_manual_compression(
         else:
             headline = f"Compressed: {before_count} → {after_count} messages"
 
-    if noop_chat:
-        if after_tokens == before_tokens:
+    # CASE C invariant (enhanced, no rewrite): the store is untouched, so the
+    # next request resends the ORIGINAL context regardless of what the
+    # compressor produced in memory. Force the unchanged token wording rather
+    # than trusting every caller to pass after_tokens == before_tokens.
+    _preserved = enhanced and not transcript_rewritten
+
+    if noop_chat or _preserved:
+        if after_tokens == before_tokens or _preserved:
             token_line = (
                 f"Approx request size: ~{before_tokens:,} tokens (unchanged)"
             )
@@ -137,7 +144,12 @@ def summarize_manual_compression(
         )
 
     note = None
-    if not noop_chat and after_count < before_count and after_tokens > before_tokens:
+    if (
+        not _preserved
+        and not noop_chat
+        and after_count < before_count
+        and after_tokens > before_tokens
+    ):
         note = (
             "Note: fewer messages can still raise this estimate when "
             "compression rewrites the transcript into denser summaries."

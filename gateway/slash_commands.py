@@ -3016,8 +3016,15 @@ class GatewaySlashCommandsMixin:
                 # schemas when available (_full_after_has_fixed=True), else the
                 # temp agent's memory-only fallback — the same basis used for
                 # `approx_tokens`, so before/after are finally comparable.
-                full_after_tokens = estimate_request_tokens_rough(
-                    _after_basis, system_prompt=_sys_prompt, tools=_tools
+                # No-rewrite path skips the estimate entirely: the reply says
+                # "unchanged" and never reads an after figure, and estimating
+                # over the full tool-heavy history is not free.
+                full_after_tokens = (
+                    estimate_request_tokens_rough(
+                        _after_basis, system_prompt=_sys_prompt, tools=_tools
+                    )
+                    if _rewritten
+                    else approx_tokens
                 )
                 # Both-axes feedback: chat delta AND the stored tool/system
                 # rows the rewrite dropped, so the headline reconciles with

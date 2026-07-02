@@ -167,3 +167,43 @@ def test_case_c_even_when_chat_would_have_compressed():
     assert s["noop"] is True
     assert "transcript preserved" in s["headline"]
     assert s["dropped_line"] is None
+
+
+def test_case_c_token_line_never_implies_change():
+    """Greptile P2 regression: in CASE C the helper itself must force the
+    'unchanged' token wording even when the caller passes divergent
+    before/after token figures (the compressor produced a smaller in-memory
+    list that never reached the store)."""
+    before = _chat(6)
+    after = [before[0], {"role": "assistant", "content": "s"}, before[-1]]
+    s = summarize_manual_compression(
+        before,
+        after,
+        10_000,
+        3_000,  # divergent after — must NOT be rendered as a range
+        non_chat_count=20,
+        non_chat_tokens=50_000,
+        transcript_rewritten=False,
+        full_before_count=26,
+    )
+    assert s["token_line"] == "Approx request size: ~10,000 tokens (unchanged)"
+    assert s["note"] is None
+
+
+def test_enhanced_requires_non_chat_tokens():
+    """Greptile P2 regression: the all-or-nothing gate must include
+    non_chat_tokens — otherwise the dropped line silently reads '~0 tokens
+    reclaimed'."""
+    msgs = _chat(4)
+    s = summarize_manual_compression(
+        msgs,
+        list(msgs),
+        100,
+        100,
+        non_chat_count=10,
+        # non_chat_tokens omitted
+        transcript_rewritten=True,
+        full_before_count=14,
+    )
+    assert s["enhanced"] is False
+    assert s["dropped_line"] is None
