@@ -1495,9 +1495,13 @@ def _sanitize_client_source(raw: object) -> str:
     """Normalize a client-declared source label; fall back to ``tui``.
 
     Untrusted client input feeds a persisted ``source``/``platform`` value, so
-    lowercase, strip, and accept only a conservative slug; reject → ``tui``.
+    accept only a genuine ``str`` (a JSON-RPC ``true``/``0`` is not a source
+    label — guard with ``isinstance`` so ``True`` can't coerce to ``"true"``),
+    lowercase, strip, and require a conservative slug; anything else → ``tui``.
     """
-    label = str(raw or "").strip().lower()
+    if not isinstance(raw, str):
+        return "tui"
+    label = raw.strip().lower()
     return label if _CLIENT_SOURCE_RE.match(label) else "tui"
 
 

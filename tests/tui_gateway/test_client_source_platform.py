@@ -45,6 +45,9 @@ import pytest
         ("1leading-digit", "tui"),  # must start with a letter
         ("x" * 40, "tui"),  # over length cap
         (123, "tui"),  # non-string
+        (True, "tui"),  # a JSON-RPC `true` must NOT coerce to the slug "true"
+        (0, "tui"),  # non-string falsy
+        ([], "tui"),  # non-string container
     ],
 )
 def test_sanitize_client_source(raw, expected):
