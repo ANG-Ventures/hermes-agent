@@ -475,6 +475,10 @@ class LCMConfig:
             "LCM_TARGET_RATIO",
             _hermes_compression_float("target_ratio", c.target_ratio),
         )
+        # Same (0, 1] range guard as the config-file path — an out-of-range
+        # env override must not defeat the clamp (Greptile PR review).
+        if not (0.0 < c.target_ratio <= 1.0):
+            c.target_ratio = 0.20
         c.leaf_chunk_tokens = _int("LCM_LEAF_CHUNK_TOKENS", c.leaf_chunk_tokens)
         c.context_threshold = _float(
             "LCM_CONTEXT_THRESHOLD",

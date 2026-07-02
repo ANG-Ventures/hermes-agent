@@ -91,6 +91,9 @@ _FROZEN_K_FORBIDDEN_CALLS = {
     "extend",
 }
 
+# Message-list variables whose growth inside the span breaks count-arithmetic.
+_FROZEN_K_LIST_VARS = {"working_messages", "pressure_messages", "messages"}
+
 
 def _frozen_k_span_growth_offenders(func_src: str) -> list[str]:
     """Return names of list-growing calls inside any `while` loop of the
@@ -100,10 +103,24 @@ def _frozen_k_span_growth_offenders(func_src: str) -> list[str]:
     offenders: list[str] = []
     for node in ast.walk(func):
         if isinstance(node, ast.While):
-            for call in ast.walk(node):
-                if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute):
-                    if call.func.attr in _FROZEN_K_FORBIDDEN_CALLS:
-                        offenders.append(call.func.attr)
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute):
+                    if sub.func.attr in _FROZEN_K_FORBIDDEN_CALLS:
+                        offenders.append(sub.func.attr)
+                # Augmented assignment growth: `working_messages += [...]`
+                # (Greptile PR review: AugAssign is not a Call node). Integer
+                # counters (`leaf_passes += 1`) are fine — flag only when the
+                # target is a message list or the RHS is a list expression.
+                elif isinstance(sub, ast.AugAssign) and isinstance(sub.op, ast.Add):
+                    target = sub.target
+                    name = (
+                        target.id
+                        if isinstance(target, ast.Name)
+                        else getattr(target, "attr", "?")
+                    )
+                    rhs_is_list = isinstance(sub.value, (ast.List, ast.ListComp))
+                    if name in _FROZEN_K_LIST_VARS or rhs_is_list:
+                        offenders.append(f"augassign:{name}")
     return offenders
 
 
@@ -418,7 +435,14 @@ class TestFrozenKBoundaryConsistency:
                     working_messages.insert(0, stub_row)
             """
         )
-        for fixture in (planted_wrapper, planted_primitive, planted_growth):
+        planted_augassign = textwrap.dedent(
+            """
+            def _compress_lossless(self, messages):
+                while leaf_passes < max_leaf_passes:
+                    working_messages += [stub_row]
+            """
+        )
+        for fixture in (planted_wrapper, planted_primitive, planted_growth, planted_augassign):
             assert _frozen_k_span_growth_offenders(fixture), (
                 "AST guard failed to flag a planted frozen-K span violation:\n"
                 + fixture
@@ -492,3 +516,22 @@ class TestRotateAndFailOpen:
         eng.update_model(model="claude-test", context_length=200_000)
         fallback = eng._build_fail_open_fallback_compressor()
         assert fallback.summary_target_ratio == 0.25
+
+
+class TestEnvRangeGuard:
+    def test_env_target_ratio_out_of_range_clamped(self, tmp_path: Path) -> None:
+        # Greptile PR review: the env override path must apply the same (0,1]
+        # guard as the config-file path.
+        for bad in ("1.5", "-0.2", "0"):
+            env = _clean_env(tmp_path)
+            env["LCM_TARGET_RATIO"] = bad
+            with patch.dict(os.environ, env, clear=True):
+                cfg = LCMConfig.from_env()
+            assert cfg.target_ratio == 0.20, f"env {bad!r} defeated the clamp"
+
+    def test_env_target_ratio_valid_applies(self, tmp_path: Path) -> None:
+        env = _clean_env(tmp_path)
+        env["LCM_TARGET_RATIO"] = "0.35"
+        with patch.dict(os.environ, env, clear=True):
+            cfg = LCMConfig.from_env()
+        assert cfg.target_ratio == 0.35
