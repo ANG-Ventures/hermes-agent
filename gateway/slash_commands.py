@@ -3106,7 +3106,7 @@ class GatewaySlashCommandsMixin:
                                 _s_why,
                             )
                     except Exception:
-                        logger.debug(
+                        logger.warning(
                             "Manual /compress granular stats build failed "
                             "(non-fatal, using two-line form)",
                             exc_info=True,

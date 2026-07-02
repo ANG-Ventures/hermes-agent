@@ -603,6 +603,9 @@ async def test_compress_command_renders_granular_breakdown_on_real_compression()
 
     # Granular block present: Messages/Context axis lines + removed buckets.
     assert "Messages:" in result
+    # The summary row must be classified as summary, not "kept chat"
+    # (built-in SUMMARY_PREFIX marker → kept 2 recent chat + 1 summary).
+    assert "kept 2 recent chat + 1 summary" in result
     assert "Context:" in result
     assert "Removed from live context" in result
     # Tool sub-split names the tool-result rows explicitly.
