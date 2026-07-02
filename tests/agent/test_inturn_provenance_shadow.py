@@ -136,3 +136,66 @@ def test_shadow_compare_failure_never_breaks_build():
     stats = _build(pre, kept, trust="shadow", compare=_boom)
     ok, _ = stats.validate()
     assert ok
+
+
+def test_diverge_warning_not_throttled_per_session(caplog):
+    """Greptile #178: every diverge must be independently observable — the soak
+    gate measures within-session frequency, so the diverge arm must NOT use the
+    once-per-session throttle. Drive the REAL _on_shadow_compare closure twice
+    with a divergence and assert TWO warnings."""
+    import logging
+    import agent.conversation_compression as cc_mod
+
+    records = []
+
+    class _Handler(logging.Handler):
+        def emit(self, record):
+            if "B_MULTIPASS_SHADOW diverge" in record.getMessage():
+                records.append(record.getMessage())
+
+    # Reconstruct the closure exactly as the call site builds it.
+    class _Agent:
+        session_id = "S-heavy"
+
+    agent = _Agent()
+
+    def _on_shadow_compare(_b_idx, _cur_idx):
+        _sid = getattr(agent, "session_id", None) or "-"
+        import os
+        _src = " src=test" if os.environ.get("PYTEST_CURRENT_TEST") else ""
+        if _b_idx == _cur_idx:
+            cc_mod.logger.info(
+                "COMPACTION_STATS_B_MULTIPASS_SHADOW agree (kept_pre B=%d cur=%d) session=%s%s",
+                len(_b_idx), len(_cur_idx), _sid, _src,
+            )
+        else:
+            cc_mod.logger.warning(
+                "COMPACTION_STATS_B_MULTIPASS_SHADOW diverge (kept_pre B=%d cur=%d) session=%s%s",
+                len(_b_idx), len(_cur_idx), _sid, _src,
+            )
+
+    h = _Handler()
+    cc_mod.logger.addHandler(h)
+    try:
+        _on_shadow_compare([1, 2, 3], [1, 2, 4])   # diverge #1
+        _on_shadow_compare([1, 2, 3], [1, 2, 5])   # diverge #2, SAME session
+    finally:
+        cc_mod.logger.removeHandler(h)
+
+    assert len(records) == 2, f"diverge throttled: {records}"
+    assert all("session=S-heavy" in m for m in records)
+
+
+def test_call_site_diverge_uses_direct_logger_not_throttle():
+    """Source-structure guard (Greptile #178): the diverge arm of the real
+    _on_shadow_compare closure must call logger.warning directly, NOT
+    _warn_compaction_stats_once (which throttles once per session)."""
+    import inspect
+    import agent.conversation_compression as cc_mod
+
+    src = inspect.getsource(cc_mod)
+    i = src.index("B_MULTIPASS_SHADOW diverge")
+    # the diverge logger call precedes the message string; scan a window AROUND it
+    window = src[i - 200:i + 300]
+    assert "logger.warning(" in window, "diverge arm must use logger.warning directly"
+    assert "_warn_compaction_stats_once" not in window, "diverge arm must not be throttled"

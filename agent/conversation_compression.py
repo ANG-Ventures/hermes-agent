@@ -1621,18 +1621,24 @@ def compress_context(
                     _trust = "single-pass" if _leaf_passes <= 1 else "shadow"
 
                     def _on_shadow_compare(_b_idx, _cur_idx):
+                        _sid = getattr(agent, "session_id", None) or "-"
+                        _src = " src=test" if os.environ.get("PYTEST_CURRENT_TEST") else ""
                         if _b_idx == _cur_idx:
                             logger.info(
                                 "COMPACTION_STATS_B_MULTIPASS_SHADOW agree "
-                                "(kept_pre B=%d cur=%d) session=%s",
-                                len(_b_idx), len(_cur_idx),
-                                getattr(agent, "session_id", None) or "-",
+                                "(kept_pre B=%d cur=%d) session=%s%s",
+                                len(_b_idx), len(_cur_idx), _sid, _src,
                             )
                         else:
-                            _warn_compaction_stats_once(
-                                agent,
-                                f"COMPACTION_STATS_B_MULTIPASS_SHADOW diverge "
-                                f"(kept_pre B={len(_b_idx)} cur={len(_cur_idx)})",
+                            # Direct (UN-throttled) warning: the soak gate needs EVERY
+                            # diverge event independently observable to measure within-
+                            # session frequency — _warn_compaction_stats_once would drop
+                            # all but the first per session (Greptile #178). Carries the
+                            # same session/src fields so the watcher attributes it.
+                            logger.warning(
+                                "COMPACTION_STATS_B_MULTIPASS_SHADOW diverge "
+                                "(kept_pre B=%d cur=%d) session=%s%s",
+                                len(_b_idx), len(_cur_idx), _sid, _src,
                             )
 
                     _cand = build_inturn_stats(
