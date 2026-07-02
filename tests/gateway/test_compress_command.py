@@ -722,7 +722,10 @@ async def test_compress_command_lcm_engine_uses_stored_basis_labels():
     # Storage-basis labels — the fix.
     assert "Stored transcript:" in result
     assert "Removed from stored transcript" in result
-    assert "kept in transcript" in result or "Replacement cost" not in result
+    # The replacement-cost line is present in this scenario; when present it must
+    # carry the stored-basis 'kept in transcript' wording (not 'kept in context').
+    if "Replacement cost" in result:
+        assert "kept in transcript" in result
     # The misleading live-wire wording must be gone from the manual path.
     assert "Context:" not in result
     assert "Removed from live context" not in result
