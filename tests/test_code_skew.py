@@ -71,6 +71,20 @@ class TestDetectCodeSkew:
         assert skew == ("abc1234567", "unresolved")
         assert called["n"] == 0
 
+    def test_same_sha_different_ref_is_not_skew(self, monkeypatch):
+        # Same commit SHA, only the branch/ref label differs -> no code changed,
+        # must NOT refuse (and must not even attempt a diff).
+        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:abc1234567890")
+        code_skew.record_boot_fingerprint()
+        monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/deploy:abc1234567890")
+        called = {"n": 0}
+        def _boom(b, d):
+            called["n"] += 1
+            return True
+        monkeypatch.setattr(code_skew, "_runtime_python_changed", _boom)
+        assert code_skew.detect_code_skew() is None
+        assert called["n"] == 0
+
     def test_unreadable_current_rev_does_not_false_positive(self, monkeypatch):
         monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:abc1234567890")
         code_skew.record_boot_fingerprint()

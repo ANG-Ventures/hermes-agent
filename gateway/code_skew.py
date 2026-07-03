@@ -144,6 +144,10 @@ def detect_code_skew() -> tuple[str, str] | None:
     boot_sha = _sha(_boot_fingerprint)
     disk_sha = _sha(current)
     if boot_sha is not None and disk_sha is not None:
+        if boot_sha == disk_sha:
+            # Same commit, only the ref/branch label differs — no code changed,
+            # so there's nothing to diff and no import risk. Don't refuse.
+            return None
         runtime_changed = _runtime_python_changed(boot_sha, disk_sha)
         if runtime_changed is False:
             # Drift confined to non-imported files (docs/skills/tests/locale/YAML).
