@@ -1,7 +1,7 @@
 import { atom } from 'nanostores'
 
 import { translateNow } from '@/i18n'
-import { copyTextToClipboard, renameDesktopPath, revealDesktopPath, trashDesktopPath } from '@/lib/desktop-fs'
+import { copyTextToClipboard, renameDesktopFile, revealDesktopFile, trashDesktopFile } from '@/lib/desktop-fs'
 import { notify, notifyError } from '@/store/notifications'
 import { notifyWorkspaceChanged } from '@/store/workspace-events'
 
@@ -50,7 +50,7 @@ export function cancelInlineRename(): void {
 
 export async function revealFile(path: string): Promise<void> {
   try {
-    await revealDesktopPath(path)
+    await revealDesktopFile(path)
   } catch (error) {
     notifyError(error, translateNow('errors.genericFailure'))
   }
@@ -79,11 +79,11 @@ export function toRelativePath(path: string, relativeTo: string): string {
 // ── Dialog-confirmed mutations (called by FileActionDialogs) ──────────────────
 
 export async function executeFileRename(path: string, newName: string): Promise<void> {
-  await renameDesktopPath(path, newName)
+  await renameDesktopFile(path, newName)
   notifyWorkspaceChanged()
 }
 
 export async function executeFileDelete(path: string): Promise<void> {
-  await trashDesktopPath(path)
+  await trashDesktopFile(path)
   notifyWorkspaceChanged()
 }
