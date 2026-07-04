@@ -48,6 +48,7 @@ class CaptureDrainWorker:
         backoff_base_s: float = 30.0,
         max_attempts: int = 5,
         breaker_open_fn: Optional[Callable[[], bool]] = None,
+        alert_fn: Optional[Callable[[str], None]] = None,
     ):
         self._q = queue
         self._add = add_fn
@@ -63,10 +64,11 @@ class CaptureDrainWorker:
         self._backoff = backoff_base_s
         self._max_attempts = max_attempts
         self._breaker_open = breaker_open_fn or (lambda: False)
+        self._alert = alert_fn or (lambda m: logger.error("mem0 capture alert: %s", m))
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
-        # observability counters (read by the digest)
-        self.stats = {"drained": 0, "dead": 0, "retried": 0, "reaped": 0, "scrubbed": 0}
+        # observability counters (read by the digest). scrub_dead = a secret MAY be live in the store.
+        self.stats = {"drained": 0, "dead": 0, "retried": 0, "reaped": 0, "scrubbed": 0, "scrub_dead": 0}
 
     # ---- lifecycle ---------------------------------------------------------
     def start(self) -> None:
@@ -204,8 +206,15 @@ class CaptureDrainWorker:
                                         max_attempts=self._max_attempts)
             if status == "dead":
                 self.stats["dead"] += 1
-                logger.error("capture SCRUB could not be verified after %d attempts; dead-lettered "
-                             "(a written row may carry a secret — investigate): %s", attempts, e)
+                # A scrub dead-letter is NOT a normal fault: a secret-bearing memory may still be
+                # LIVE and recallable in the store, and the queue will stop retrying. Escalate LOUDLY
+                # (Greptile P1) so an operator can scrub it out of band; also record it distinctly.
+                self.stats["scrub_dead"] += 1
+                self._alert(
+                    f"SECRET SCRUB DEAD-LETTERED for capture row {key!r} after {attempts} attempts — "
+                    f"a secret-bearing memory may remain recallable in mem0; manual scrub required: {e}")
+                logger.error("capture SCRUB dead-lettered after %d attempts (secret may be live — "
+                             "escalated): %s", attempts, e)
             else:
                 self.stats["retried"] += 1
                 logger.warning("capture post-write scrub failed; requeued to retry the scrub: %s", e)

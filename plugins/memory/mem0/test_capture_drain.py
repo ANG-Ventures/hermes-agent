@@ -254,3 +254,22 @@ def test_forget_failure_requeues_not_done(q):
     assert w.stats["scrubbed"] == 1
     assert all(tok not in r["memory"] for r in store.rows)
     assert q.counts()["done"] == 1
+
+
+def test_scrub_deadletter_escalates_loudly(q):
+    """Greptile P1: if the scrub keeps failing past max_attempts, the row dead-letters and the
+    queue stops retrying — a secret may remain live. That MUST fire a loud alert (not just a log)."""
+    alerts = []
+    store = FakeStore()
+    store.forget_raises = 99                  # forget always fails -> scrub can never complete
+    w = make_worker(q, store, backoff_base_s=0.0, max_attempts=2, alert_fn=alerts.append)
+    tok = "8905425635:" + "AAH3xY9zKq" + "_Wp0LmNoPqRsTuVwXyZ" + "012345"
+    _enq(q, f"token {tok} here")
+    # drain until the row dead-letters (max_attempts reached)
+    for _ in range(5):
+        w.drain_once()
+        if w.stats["scrub_dead"]:
+            break
+    assert w.stats["scrub_dead"] == 1
+    assert q.counts()["dead"] == 1
+    assert any("SCRUB DEAD-LETTERED" in a for a in alerts), f"expected a loud alert, got {alerts}"

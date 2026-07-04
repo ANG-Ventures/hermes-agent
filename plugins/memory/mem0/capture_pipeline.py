@@ -97,6 +97,7 @@ class CapturePipeline:
             model=model,
             write_filters=write_filters,
             breaker_open_fn=breaker_open_fn,
+            alert_fn=self._alert,
         )
         self._started = False
         self._lock = threading.Lock()
