@@ -1217,16 +1217,22 @@ class Mem0MemoryProvider(MemoryProvider):
             return None
 
     def _auto_capture_active(self) -> bool:
-        """True when per-turn auto-capture is configured ON (the shared, cross-process signal).
+        """True only when the FOREGROUND per-turn capture path would ACTUALLY write — i.e. capture is
+        configured on AND a certified capture pipeline is available (gate assets present + version
+        matches). This must mirror EXACTLY the condition under which sync_turn enqueues, so the D-7
+        interlock never suppresses the background writer (mem0_remember) in a state where the
+        foreground path is ALSO not writing (Greptile P1): capture=auto but gate missing/mismatched
+        would otherwise drop the fact on the floor from BOTH paths.
 
-        The D-7 interlock is inherently CROSS-PROCESS: the live foreground session and the
-        background-review fork are different processes, so the only signal they share is the
-        persisted `capture` config (resolved identically via resolve_capture). When capture is on,
-        the foreground path is the every-turn writer, so the background writer (mem0_remember) must
-        stand down. When capture is off/manual (the default until cutover), mem0_remember writes
-        normally. Read at DECISION TIME so a live flip is honored without a restart. Degrade-safe."""
+        The interlock is cross-process (foreground session vs background-review fork are separate
+        processes); the shared, decision-time signals are the persisted capture flag and the shipped,
+        version-pinned gate assets, both resolved identically in either process. Degrade-safe: any
+        error -> False (interlock does not block the background writer)."""
         try:
-            return capture_is_on(self._live_capture())
+            if not capture_is_on(self._live_capture()):
+                return False
+            pipe = self._get_capture_pipeline()
+            return bool(pipe is not None and pipe._certified)
         except Exception:
             return False
 

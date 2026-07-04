@@ -96,6 +96,35 @@ def test_remember_suppressed_when_autocapture_on(monkeypatch, tmp_path):
     assert not any(m == "POST" and pth == "/memories" for m, pth in calls)
 
 
+def test_remember_writes_when_capture_on_but_gate_uncertified(monkeypatch, tmp_path):
+    """Greptile P1: capture=auto but the certified gate is unavailable => the FOREGROUND path
+    (sync_turn) does NOT enqueue. The interlock must then NOT suppress mem0_remember, or the fact
+    is written by NEITHER path (silent loss). So the background writer must still write here."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MEM0_HOST", "http://mem0.test")
+    monkeypatch.setenv("MEM0_ADMIN_API_KEY", "admin-key")
+    monkeypatch.setenv("MEM0_USER_ID", "ace")
+    monkeypatch.setenv("MEM0_AGENT_ID", "apollo")
+    monkeypatch.setenv("MEM0_CAPTURE", "auto")   # capture ON...
+    calls = []
+
+    def fake_urlopen(request, timeout=0, context=None):
+        path = urlparse(request.full_url).path
+        calls.append((request.get_method(), path))
+        if request.get_method() == "POST" and path == "/search":
+            return _HTTPResponse({"results": []})   # no dup -> write proceeds
+        return _HTTPResponse({"results": [{"id": "m-new"}]})
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    p = Mem0MemoryProvider()
+    p.initialize("test-session")
+    # ...but force the pipeline to be UNCERTIFIED (gate missing) so sync_turn wouldn't enqueue.
+    monkeypatch.setattr(p, "_get_capture_pipeline", lambda: type("P", (), {"_certified": False})())
+    out = json.loads(p.handle_tool_call("mem0_remember", {"fact": "Ace's DNS is AdGuard."}))
+    assert out.get("status") != "skipped", out          # NOT suppressed
+    assert any(m == "POST" and pth == "/memories" for m, pth in calls)  # it wrote
+
+
 def test_remember_writes_infer_false_with_review_origin(monkeypatch, tmp_path):
     calls = []
 
