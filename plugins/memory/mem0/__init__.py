@@ -588,6 +588,11 @@ class Mem0MemoryProvider(MemoryProvider):
         self._prefetch_submit_lock = threading.Lock()
         self._prefetch_pending: Optional[str] = None
         self._prefetch_timed_out = False
+        # Rotation epoch: bumped whenever the prefetch executor is rotated on timeout.
+        # A zombie worker (the abandoned in-flight thread shutdown() can't kill) carries
+        # its submit-time epoch and must not write results or drain pending queries once
+        # the epoch has moved on (Greptile P1: zombie overwrites fresh results).
+        self._prefetch_epoch = 0
         self._prefetch_join_timeout_s = 10.0
         self._qmd_cfg = qmd_recall.load_qmd_config(None)
         self._qmd_enabled = False
@@ -1122,7 +1127,7 @@ class Mem0MemoryProvider(MemoryProvider):
         if self._is_breaker_open():
             return
 
-        def _run_once(run_query: str):
+        def _run_once(run_query: str, epoch: int):
             t_start = time.monotonic()
             try:
                 client = self._get_client()
@@ -1152,7 +1157,8 @@ class Mem0MemoryProvider(MemoryProvider):
                 if results:
                     lines = [r.get("memory", "") for r in results if r.get("memory")]
                     with self._prefetch_lock:
-                        self._prefetch_result = "\n".join(f"- {l}" for l in lines)
+                        if epoch == self._prefetch_epoch:
+                            self._prefetch_result = "\n".join(f"- {l}" for l in lines)
                 self._record_success()
             except Exception as e:
                 self._record_failure()
@@ -1186,16 +1192,17 @@ class Mem0MemoryProvider(MemoryProvider):
                     block = qmd_recall.render_qmd_block(hits)
                     if block:
                         with self._prefetch_lock:
-                            self._prefetch_qmd = block
+                            if epoch == self._prefetch_epoch:
+                                self._prefetch_qmd = block
             except Exception as e:
                 logger.debug("QMD prefetch leg failed: %s", e)
 
-        def _run_latest(first_query: str):
+        def _run_latest(first_query: str, epoch: int):
             run_query = first_query
             while True:
-                _run_once(run_query)
+                _run_once(run_query, epoch)
                 with self._prefetch_submit_lock:
-                    if self._prefetch_pending is None:
+                    if epoch != self._prefetch_epoch or self._prefetch_pending is None:
                         return
                     run_query = self._prefetch_pending
                     self._prefetch_pending = None
@@ -1210,6 +1217,10 @@ class Mem0MemoryProvider(MemoryProvider):
                     self._prefetch_future = None
                     self._prefetch_pending = None
                     self._prefetch_timed_out = False
+                    # Invalidate the abandoned worker: it may still be running inside a
+                    # stuck network call and must not write results or drain pending
+                    # queries once we hand the lane to a fresh executor.
+                    self._prefetch_epoch += 1
                 else:
                     # Do not let the single-worker executor queue unbounded stale
                     # prefetches. Keep only the latest request; the worker drains it
@@ -1220,7 +1231,7 @@ class Mem0MemoryProvider(MemoryProvider):
             self._prefetch_timed_out = False
             self._prefetch_thread = None
             self._prefetch_future = self._prefetch_executor_for_submit().submit(
-                _run_latest, query
+                _run_latest, query, self._prefetch_epoch
             )
 
     def _live_capture(self) -> str:

@@ -621,6 +621,58 @@ def test_keyword_search_config_is_resolved_and_forwarded_from_both_call_sites(mo
         "queue_prefetch did not forward keyword_search to the wire"
 
 
+def test_prefetch_zombie_worker_cannot_overwrite_fresh_results(monkeypatch, tmp_path):
+    """Greptile P1 (PR #171): after an executor rotation on timeout, the abandoned
+    worker's in-flight search may still complete later. Its stale results must NOT
+    overwrite the fresh executor's results (epoch guard on the write side), and it
+    must NOT drain pending queries submitted for the new epoch."""
+    provider = _selfhost_provider(monkeypatch, tmp_path)
+    zombie_started = threading.Event()
+    zombie_release = threading.Event()
+
+    class _ZombieClient:
+        def search(self, **kw):
+            q = kw.get("query", "")
+            if q == "zombie query":
+                zombie_started.set()
+                zombie_release.wait(timeout=10.0)
+                return {"results": [{"memory": "STALE zombie data"}]}
+            return {"results": [{"memory": "FRESH data"}]}
+
+    monkeypatch.setattr(provider, "_get_client", lambda: _ZombieClient())
+    try:
+        # 1. zombie worker starts and hangs inside its network call
+        provider.queue_prefetch("zombie query", session_id="sess-zombie")
+        assert zombie_started.wait(timeout=2.0), "zombie worker did not start"
+
+        # 2. caller times out on it -> rotation path fires on the next submit
+        provider._prefetch_timed_out = True
+        old_epoch = provider._prefetch_epoch
+        provider.queue_prefetch("fresh query", session_id="sess-zombie")
+        assert provider._prefetch_epoch == old_epoch + 1, "rotation did not bump epoch"
+
+        # 3. fresh worker completes and commits its results
+        fresh_future = provider._prefetch_future
+        assert fresh_future is not None
+        fresh_future.result(timeout=5)
+        with provider._prefetch_lock:
+            assert "FRESH" in provider._prefetch_result
+
+        # 4. zombie finally completes -- its write must be discarded
+        zombie_release.set()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with provider._prefetch_lock:
+                assert "STALE" not in provider._prefetch_result, \
+                    "zombie overwrote fresh prefetch results"
+            time.sleep(0.05)
+        with provider._prefetch_lock:
+            assert "FRESH" in provider._prefetch_result, "fresh results were lost"
+    finally:
+        zombie_release.set()
+        provider.shutdown()
+
+
 def test_prefetch_reuses_worker_without_unbounded_active_thread_growth(monkeypatch, tmp_path):
     provider = _selfhost_provider(monkeypatch, tmp_path)
     started = threading.Event()
