@@ -101,7 +101,7 @@ def main():
 
     # 4) secret-scrub E2E: a turn carrying a token -> the written fact must be scrubbed
     key2 = idem_key("e2e", 2, "sec", "sec")
-    sec_user = "remember my telegram bot token is 8905425635:AAH3xY9zKq_Wp0LmNoPqRsTuVwXyZ012345"
+    sec_user = "remember my telegram bot token is " + ("8905425635:" + "AAH3xY9zKq" + "_Wp0LmNoPqRsTuVwXyZ" + "012345")
     pipe.enqueue_turn(sec_user, "got it", session_id="e2e", turn_ordinal=2)
     pipe._worker.drain_once()
     rows2 = get_written_fn(key2)

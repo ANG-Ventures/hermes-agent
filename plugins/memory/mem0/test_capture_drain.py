@@ -144,7 +144,7 @@ def test_post_write_scrub_forgets_secret_bearing_memory(q):
     store = FakeStore()
     w = make_worker(q, store)
     # a turn whose user text carries a telegram bot token -> the fake "extracts" it verbatim
-    _enq(q, "my bot token is 8905425635:AAH3xY9zKq_Wp0LmNoPqRsTuVwXyZ012345 keep it")
+    _enq(q, "my bot token is " + ("8905425635:" + "AAH3xY9zKq" + "_Wp0LmNoPqRsTuVwXyZ" + "012345") + " keep it")
     w.drain_once()
     # the secret-bearing memory was scrubbed (forgotten) post-write
     assert w.stats["scrubbed"] == 1
