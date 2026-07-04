@@ -137,10 +137,11 @@ class CaptureDrainWorker:
             # "already-written". Two cases (Greptile P1):
             #  - FIRST lease (attempts==0): nothing was written yet, so a bounded retry that may
             #    eventually dead-letter is fine — there's no secret to abandon.
-            #  - a LATER lease (attempts>0): a PRIOR lease may have committed add() before crashing,
-            #    so a row (possibly secret-bearing) may already be live. We must NOT dead-letter and
-            #    abandon it — requeue indefinitely (like the scrub path) so it's eventually read+scrubbed.
-            prior_write_possible = int(row.get("attempts", 0)) > 0
+            #  - a LATER lease (attempts>0) OR a row whose add already COMMITTED on a prior lease
+            #    (add_committed=1, which survives a crash+reap that reset attempts to 0): a row
+            #    (possibly secret-bearing) may already be live. We must NOT dead-letter and abandon
+            #    it — requeue indefinitely (like the scrub path) so it's eventually read+scrubbed.
+            prior_write_possible = int(row.get("attempts", 0)) > 0 or bool(row.get("add_committed"))
             attempts = int(row.get("attempts", 0)) + 1
             backoff = min(self._backoff * (2 ** min(attempts - 1, 12)), self._scrub_backoff_cap_s)
             if prior_write_possible:
@@ -180,6 +181,10 @@ class CaptureDrainWorker:
         try:
             self._add(messages, kwargs)
             self._q.record_verdict(key, "ok")
+            # STICKY signal (Greptile P1): a remote row now exists. Survives a crash+reap that resets
+            # attempts to 0, so a later idem-check failure knows a possibly-secret-bearing row is live
+            # and must not be abandoned.
+            self._q.mark_add_committed(key)
         except Exception as e:
             # transient model/network fault -> requeue with backoff (bounded), or dead-letter
             self._q.record_verdict(key, "fault")

@@ -295,3 +295,26 @@ def test_idem_check_failure_after_prior_write_never_deadletters(q):
     assert q.counts()["pending"] == 1              # still retriable
     assert store.add_calls == 0                    # never re-added (can't confirm it's new)
     assert any("IDEM-CHECK STUCK" in a for a in alerts), f"expected escalation, got {alerts}"
+
+
+def test_add_committed_flag_blocks_deadletter_after_reap_reset(q):
+    """Greptile P1: add() committed on a prior lease, then a crash+reap reset attempts to 0. A later
+    persistent idem-check failure must STILL not dead-letter — the sticky add_committed flag (which
+    survives the reap) tells the drainer a possibly-secret-bearing row is live."""
+    alerts = []
+    store = FakeStore(recall_raises=99)   # idem check always fails now
+    w = make_worker(q, store, backoff_base_s=0.0, max_attempts=2, alert_fn=alerts.append)
+    key = _enq(q, "some fact")
+    # simulate: a prior lease committed the add, then crashed+reaped -> attempts back to 0
+    w._q.mark_add_committed(key)
+    assert q.counts()["pending"] == 1 and w._q.lease_one() is not None  # leased for this drain
+    # put it back to pending with attempts still 0 (reap-style), add_committed stays 1
+    import sqlite3
+    conn = sqlite3.connect(w._q.db_path)
+    conn.execute("UPDATE capture_queue SET status='pending', attempts=0, next_attempt_at=0 WHERE idem_key=?", (key,))
+    conn.commit(); conn.close()
+    for _ in range(5):
+        w.drain_once()
+    assert q.counts()["dead"] == 0                 # add_committed prevented abandonment despite attempts=0
+    assert store.add_calls == 0
+    assert any("IDEM-CHECK STUCK" in a for a in alerts), f"expected escalation, got {alerts}"

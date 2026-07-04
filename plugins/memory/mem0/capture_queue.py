@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS capture_queue (
     next_attempt_at REAL NOT NULL DEFAULT 0,
     leased_until    REAL,
     model_verdict   TEXT,
+    add_committed   INTEGER NOT NULL DEFAULT 0,
     last_error      TEXT,
     created_at      REAL NOT NULL,
     updated_at      REAL NOT NULL
@@ -92,6 +93,10 @@ class CaptureQueue:
         conn = self._connect()
         try:
             conn.executescript(_SCHEMA)
+            # Idempotent migration for DBs created before add_committed existed.
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(capture_queue)")}
+            if "add_committed" not in cols:
+                conn.execute("ALTER TABLE capture_queue ADD COLUMN add_committed INTEGER NOT NULL DEFAULT 0")
         finally:
             conn.close()
 
@@ -159,6 +164,21 @@ class CaptureQueue:
             conn.execute(
                 "UPDATE capture_queue SET model_verdict=?, updated_at=? WHERE idem_key=?",
                 (verdict, now, key),
+            )
+        finally:
+            conn.close()
+
+    def mark_add_committed(self, key: str, *, now: Optional[float] = None) -> None:
+        """Set a STICKY flag (survives re-leasing, unlike model_verdict which lease_one clears) the
+        instant a server add() has committed. The drainer uses it to know a remote row may exist even
+        after a crash+reap reset attempts to 0, so an idem-check failure on a later lease never
+        dead-letters and abandons a possibly-secret-bearing written row."""
+        now = time.time() if now is None else now
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE capture_queue SET add_committed=1, updated_at=? WHERE idem_key=?",
+                (now, key),
             )
         finally:
             conn.close()
