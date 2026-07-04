@@ -25,6 +25,14 @@ logger = logging.getLogger(__name__)
 _ASSET_DIR = os.path.join(os.path.dirname(__file__), "assets")
 _DEFAULT_QUEUE_PATH = "~/.hermes/state/mem0-capture/capture_queue.db"
 
+# The gate version that was actually CERTIFIED by the A0 eval (gpt-5.4-mini, P=0.97 LB 0.92, n=90).
+# This is PINNED IN CODE on purpose (Greptile P1): the D-11 guard must compare the shipped asset
+# against a fixed, human-reviewed value — not against the asset's own self-reported version, which
+# would let any swapped-in gate self-certify. The <hash> segment is the sha256[:12] of the certified
+# gate STRING, so editing capture_gate_v3.txt without re-running the eval + bumping this constant
+# breaks certification and auto-capture fail-safes OFF.
+PINNED_GATE_VERSION = "v3:a1f60b86c7d6"
+
 
 def load_certified_gate() -> tuple[str, str]:
     """Return (gate_string, gate_version). Empty gate ('','') if assets missing -> capture stays off
@@ -41,6 +49,18 @@ def load_certified_gate() -> tuple[str, str]:
     except Exception as e:
         logger.warning("mem0 capture: certified gate assets not loadable (%s) — capture disabled", e)
     return "", ""
+
+
+def gate_string_matches_version(gate: str, version: str) -> bool:
+    """True iff the gate STRING actually hashes to the hash embedded in its version tag
+    (v<n>:<sha256[:12]>). Prevents a hand-edited gate keeping a certified-looking version tag."""
+    try:
+        import hashlib
+        want = version.split(":", 1)[1]
+        got = hashlib.sha256(gate.encode("utf-8")).hexdigest()[:len(want)]
+        return bool(want) and got == want
+    except Exception:
+        return False
 
 
 def bgr_write_allowed(capture_is_on: bool) -> bool:
@@ -65,7 +85,7 @@ class CapturePipeline:
         breaker_open_fn: Optional[Callable[[], bool]] = None,
         alert_fn: Optional[Callable[[str], None]] = None,
         queue_path: Optional[str] = None,
-        expected_gate_version: Optional[str] = None,  # None => whatever the assets certify
+        expected_gate_version: Optional[str] = None,  # None => the code-pinned PINNED_GATE_VERSION
     ):
         try:
             from .capture_queue import CaptureQueue
@@ -77,8 +97,16 @@ class CapturePipeline:
         self._capture_on = capture_on_fn
         self._alert = alert_fn or (lambda m: logger.warning("mem0 capture alert: %s", m))
         self._gate, self._gate_version = load_certified_gate()
-        self._expected_version = expected_gate_version or self._gate_version
-        self._certified = bool(self._gate) and self._gate_version == self._expected_version
+        # D-11 gate-version guard (Greptile P1): compare the shipped asset against the CODE-PINNED
+        # certified version (default), NOT the asset's own self-reported version — otherwise any
+        # swapped-in gate self-certifies. Also verify the gate STRING actually hashes to the version
+        # tag, so a hand-edited gate that kept a certified-looking tag is rejected.
+        self._expected_version = expected_gate_version or PINNED_GATE_VERSION
+        self._certified = (
+            bool(self._gate)
+            and self._gate_version == self._expected_version
+            and gate_string_matches_version(self._gate, self._gate_version)
+        )
         if not self._certified:
             self._alert(
                 f"mem0 auto-capture DISABLED: gate version mismatch/absent "

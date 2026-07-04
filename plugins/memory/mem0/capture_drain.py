@@ -65,6 +65,10 @@ class CaptureDrainWorker:
         self._max_attempts = max_attempts
         self._breaker_open = breaker_open_fn or (lambda: False)
         self._alert = alert_fn or (lambda m: logger.error("mem0 capture alert: %s", m))
+        # Scrub failures never dead-letter (a secret must not be abandoned): requeue indefinitely
+        # with a capped backoff, and escalate once at this attempt threshold.
+        self._scrub_backoff_cap_s = 3600.0
+        self._scrub_alert_after = max(self._max_attempts, 3)
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         # observability counters (read by the digest). scrub_dead = a secret MAY be live in the store.
@@ -200,22 +204,23 @@ class CaptureDrainWorker:
                                    dropped[0].get("reason"))
             return False
         except Exception as e:
+            # A scrub that can't be PROVEN clean must NOT be abandoned: a dead-letter here would
+            # leave a secret-bearing memory live+recallable with no automatic path to scrub it
+            # (Greptile P1). So scrub failures requeue INDEFINITELY with a capped backoff (the scrub
+            # is cheap + idempotent), and escalate LOUDLY once they cross a threshold so an operator
+            # can intervene — but the automatic retry never stops.
             attempts = int(row.get("attempts", 0)) + 1
-            status = self._q.mark_retry(key, backoff_s=self._backoff * (2 ** (attempts - 1)),
-                                        error=f"scrub-failed: {str(e)[:280]}",
-                                        max_attempts=self._max_attempts)
-            if status == "dead":
-                self.stats["dead"] += 1
-                # A scrub dead-letter is NOT a normal fault: a secret-bearing memory may still be
-                # LIVE and recallable in the store, and the queue will stop retrying. Escalate LOUDLY
-                # (Greptile P1) so an operator can scrub it out of band; also record it distinctly.
-                self.stats["scrub_dead"] += 1
+            backoff = min(self._backoff * (2 ** min(attempts - 1, 12)), self._scrub_backoff_cap_s)
+            self._q.mark_scrub_retry(key, backoff_s=backoff, error=f"scrub-failed: {str(e)[:280]}")
+            self.stats["retried"] += 1
+            if attempts == self._scrub_alert_after:
+                self.stats["scrub_dead"] += 1   # "a secret may be live" signal for the digest
                 self._alert(
-                    f"SECRET SCRUB DEAD-LETTERED for capture row {key!r} after {attempts} attempts — "
-                    f"a secret-bearing memory may remain recallable in mem0; manual scrub required: {e}")
-                logger.error("capture SCRUB dead-lettered after %d attempts (secret may be live — "
-                             "escalated): %s", attempts, e)
+                    f"SECRET SCRUB STUCK for capture row {key!r} after {attempts} attempts — a "
+                    f"secret-bearing memory may remain recallable in mem0; auto-retry continues but "
+                    f"manual scrub advised: {e}")
+                logger.error("capture SCRUB stuck after %d attempts (secret may be live — escalated, "
+                             "still retrying): %s", attempts, e)
             else:
-                self.stats["retried"] += 1
                 logger.warning("capture post-write scrub failed; requeued to retry the scrub: %s", e)
             return True

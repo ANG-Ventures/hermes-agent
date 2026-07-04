@@ -208,6 +208,35 @@ class CaptureQueue:
         finally:
             conn.close()
 
+    def mark_scrub_retry(self, key: str, *, backoff_s: float, error: str = "",
+                         now: Optional[float] = None) -> str:
+        """A POST-WRITE SCRUB failure: the add already succeeded but the row's scrub couldn't be
+        proven clean. Unlike mark_retry, this NEVER dead-letters — abandoning the row would leave a
+        secret-bearing memory live/recallable with no automatic scrub path (a scrub is cheap +
+        idempotent, so retrying forever is safe). ++attempts and reschedule as pending. Always
+        returns 'pending'."""
+        now = time.time() if now is None else now
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT attempts FROM capture_queue WHERE idem_key=?", (key,)).fetchone()
+            attempts = (row["attempts"] if row else 0) + 1
+            conn.execute(
+                "UPDATE capture_queue SET status='pending', attempts=?, next_attempt_at=?, "
+                "leased_until=NULL, last_error=?, updated_at=? WHERE idem_key=?",
+                (attempts, now + backoff_s, error[:500], now, key),
+            )
+            conn.execute("COMMIT")
+            return "pending"
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
     # ---- reaper (D-10): expired-lease inflight rows -> pending -------------
     def reap(self, *, now: Optional[float] = None, backoff_s: float = 30.0,
              max_attempts: int = 5) -> Dict[str, int]:

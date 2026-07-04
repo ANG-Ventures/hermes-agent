@@ -1131,12 +1131,14 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def _live_capture(self) -> str:
         """Re-resolve the capture flag from the LIVE source (env > mem0.json `capture` > default),
-        so a flip is honored without a provider restart (fixes the flip-lag footgun). Cheap: the
-        mem0.json read is TTL-cached ~5s. On any error, falls back to the init-time self._capture.
-        Also updates self._capture so the interlock + logs stay consistent."""
+        so a flip is honored without a provider restart (fixes the flip-lag footgun). The mem0.json
+        read is TTL-cached for a short window (~0.5s) to coalesce bursts within a single turn while
+        keeping an operator's on<->off flip effectively immediate (Greptile P1). On any error, falls
+        back to the init-time self._capture. Also updates self._capture so interlock + logs stay
+        consistent."""
         import time as _time
         now = _time.monotonic()
-        ttl = getattr(self, "_live_capture_ttl", 5.0)
+        ttl = getattr(self, "_live_capture_ttl", 0.5)
         cached_at = getattr(self, "_live_capture_at", 0.0)
         if now - cached_at < ttl and getattr(self, "_live_capture_val", None) is not None:
             return self._live_capture_val

@@ -48,6 +48,20 @@ def test_certified_gate_loads():
     assert version.startswith("v3:"), f"expected v3 gate version, got {version!r}"
 
 
+def test_pinned_version_matches_shipped_asset():
+    """The code-pinned certified version MUST equal the shipped asset's version, and the gate string
+    must hash to it — otherwise the whole guard is inert. Guards against shipping a mismatched pin."""
+    gate, version = cp.load_certified_gate()
+    assert version == cp.PINNED_GATE_VERSION, "shipped gate version drifted from the code pin"
+    assert cp.gate_string_matches_version(gate, version)
+
+
+def test_tampered_gate_does_not_self_certify(tmp_path):
+    """Greptile P1: a gate whose STRING was edited but kept a certified-looking version tag must NOT
+    certify — the hash check catches it."""
+    assert cp.gate_string_matches_version("totally different gate text", cp.PINNED_GATE_VERSION) is False
+
+
 # ---- D-11 gate-version guard -----------------------------------------------
 def test_active_when_certified_and_on(tmp_path):
     p = make_pipeline(tmp_path, FakeStore(), capture_on=True)
