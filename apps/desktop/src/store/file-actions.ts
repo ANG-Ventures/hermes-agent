@@ -1,9 +1,35 @@
 import { atom } from 'nanostores'
 
 import { translateNow } from '@/i18n'
-import { copyTextToClipboard, renameDesktopPath, revealDesktopPath, trashDesktopPath } from '@/lib/desktop-fs'
+import {
+  copyTextToClipboard,
+  isDesktopFsRemoteMode,
+  renameDesktopFile,
+  revealDesktopFile,
+  trashDesktopFile
+} from '@/lib/desktop-fs'
 import { notify, notifyError } from '@/store/notifications'
 import { notifyWorkspaceChanged } from '@/store/workspace-events'
+
+// Defense in depth for the one data-loss bug (BUG-E): the desktop-fs *File
+// facades ALREADY throw in remote mode (enforced by the eslint import-boundary
+// rule), but a thrown error only surfaces AFTER the user has opened the rename
+// input / delete dialog. For a wrong-machine mutation we also block at the
+// entry point so the destructive affordance never even appears. Both layers
+// intentionally coexist: the facade is the enforced safety net, this is the UX.
+function blockRemoteFileAction(action: string): boolean {
+  if (!isDesktopFsRemoteMode()) {
+    return false
+  }
+
+  notify({
+    kind: 'warning',
+    message: `This file lives on the gateway; ${action} is not available for a remote file.`,
+    title: 'Remote file action unavailable'
+  })
+
+  return true
+}
 
 // Shared file-row actions for BOTH trees (the file browser + the review/git
 // tree): reveal, copy path, rename, delete. Rename/delete route through a single
@@ -26,6 +52,10 @@ export type FileActionDialog = { kind: 'delete' } & FileActionTarget
 export const $fileActionDialog = atom<FileActionDialog | null>(null)
 
 export function requestFileDelete(target: FileActionTarget): void {
+  if (blockRemoteFileAction('Delete')) {
+    return
+  }
+
   $fileActionDialog.set({ kind: 'delete', ...target })
 }
 
@@ -39,6 +69,10 @@ export function closeFileActionDialog(): void {
 export const $renamingPath = atom<null | string>(null)
 
 export function beginInlineRename(path: string): void {
+  if (blockRemoteFileAction('Rename')) {
+    return
+  }
+
   $renamingPath.set(path)
 }
 
@@ -49,8 +83,12 @@ export function cancelInlineRename(): void {
 // ── Direct (no-dialog) actions ───────────────────────────────────────────────
 
 export async function revealFile(path: string): Promise<void> {
+  if (blockRemoteFileAction('Reveal')) {
+    return
+  }
+
   try {
-    await revealDesktopPath(path)
+    await revealDesktopFile(path)
   } catch (error) {
     notifyError(error, translateNow('errors.genericFailure'))
   }
@@ -79,11 +117,19 @@ export function toRelativePath(path: string, relativeTo: string): string {
 // ── Dialog-confirmed mutations (called by FileActionDialogs) ──────────────────
 
 export async function executeFileRename(path: string, newName: string): Promise<void> {
-  await renameDesktopPath(path, newName)
+  if (blockRemoteFileAction('Rename')) {
+    return
+  }
+
+  await renameDesktopFile(path, newName)
   notifyWorkspaceChanged()
 }
 
 export async function executeFileDelete(path: string): Promise<void> {
-  await trashDesktopPath(path)
+  if (blockRemoteFileAction('Delete')) {
+    return
+  }
+
+  await trashDesktopFile(path)
   notifyWorkspaceChanged()
 }

@@ -2840,6 +2840,20 @@ class GatewaySlashCommandsMixin:
                 if m.get("role") in {"user", "assistant"} and m.get("content")
             ]
 
+            # The rows EXCLUDED from the chat-only compression input: tool
+            # results, system rows, contentless (tool-call-only) turns. When
+            # the transcript rewrite below happens, these stored rows are
+            # dropped — usually the bulk of a tool-heavy session. Measure
+            # them so the feedback can reconcile both axes instead of
+            # claiming "No changes" over a six-figure token cut (#F1,
+            # 2026-07-02 spec: compress-feedback-honesty).
+            non_chat_rows = [
+                m
+                for m in history
+                if not (m.get("role") in {"user", "assistant"} and m.get("content"))
+            ]
+            non_chat_count = len(non_chat_rows)
+
             # Boundary-aware split: only the head is summarized; the most
             # recent `keep_last` exchanges are preserved verbatim. The
             # split snaps the tail to a user-turn start so the rejoined
@@ -2885,8 +2899,20 @@ class GatewaySlashCommandsMixin:
                 #
                 # The compressor itself is fed the full-request estimate so its
                 # pressure logic reflects reality (#6217).
-                _sys_prompt = getattr(tmp_agent, "_cached_system_prompt", "") or ""
-                _tools = getattr(tmp_agent, "tools", None) or None
+                #
+                # F3 (2026-07-02 honesty spec): resolve the REAL fixed overhead
+                # (resident agent's system prompt + full tool schemas) ONCE,
+                # up front, and use it for BOTH the before and after estimates.
+                # The temp agent here is memory-only (empty system prompt,
+                # tools=[memory]), so measuring "before" with its overhead
+                # under-reports by the entire fixed cost while the line claims
+                # "includes chat, system, tools".
+                _tmp_sys = getattr(tmp_agent, "_cached_system_prompt", "") or ""
+                _tmp_tools = getattr(tmp_agent, "tools", None) or None
+                _real_sys, _real_tools = self._resolve_fixed_overhead(session_key)
+                _full_after_has_fixed = bool(_real_sys or _real_tools)
+                _sys_prompt = _real_sys if _full_after_has_fixed else _tmp_sys
+                _tools = _real_tools if _full_after_has_fixed else _tmp_tools
                 approx_tokens = estimate_request_tokens_rough(
                     history, system_prompt=_sys_prompt, tools=_tools
                 )
@@ -2914,6 +2940,7 @@ class GatewaySlashCommandsMixin:
                 # transcript replaced with the compacted set).
                 new_session_id = tmp_agent.session_id
                 rotated = new_session_id != session_entry.session_id
+                _old_session_id = session_entry.session_id
                 _in_place = bool(getattr(tmp_agent, "_last_compaction_in_place", False))
                 if rotated:
                     session_entry.session_id = new_session_id
@@ -2945,10 +2972,22 @@ class GatewaySlashCommandsMixin:
                         "preserving original transcript instead of overwriting "
                         "it (#44794)."
                     )
-                # Reset stored token count — transcript changed, old value is stale
-                self.session_store.update_session(
-                    session_entry.session_key, last_prompt_tokens=0
-                )
+                # Whether the STORED transcript actually changed. Downstream
+                # feedback must be computed on this basis — when no rewrite
+                # happened, the next request resends the ORIGINAL transcript
+                # (tool rows included), so an "after" measured over the
+                # chat-only `compressed` list would claim a shrink that never
+                # occurred (#F2).
+                _rewritten = bool(rotated or _in_place)
+                if _rewritten:
+                    # Reset stored token count — transcript changed, old value
+                    # is stale. On a preserved transcript the real provider-
+                    # measured count is still valid; zeroing it would destroy
+                    # the only tokenizer-truth figure for the next /compress
+                    # or /usage (#F4).
+                    self.session_store.update_session(
+                        session_entry.session_key, last_prompt_tokens=0
+                    )
                 # After-compression estimates.
                 #  • chat_after  — user/hermes turns only (headline + Chat size).
                 #  • full_after  — PRE-FLIGHT estimate of the NEXT request: the
@@ -2959,29 +2998,134 @@ class GatewaySlashCommandsMixin:
                 #    so it under-reported by the entire ~30k fixed overhead
                 #    (e.g. "56,965 -> 3,436"). Now it reflects what's actually
                 #    sent next turn.
-                chat_after_tokens = estimate_messages_tokens_rough(compressed)
-                _real_sys, _real_tools = self._resolve_fixed_overhead(session_key)
-                if _real_sys or _real_tools:
-                    full_after_tokens = estimate_request_tokens_rough(
-                        compressed, system_prompt=_real_sys, tools=_real_tools
+                #    Basis: the rows the next request will actually carry —
+                #    `compressed` after a real rewrite, the ORIGINAL `history`
+                #    when the store was preserved (#F2).
+                _after_basis = compressed if _rewritten else history
+                chat_after_tokens = (
+                    estimate_messages_tokens_rough(compressed)
+                    if _rewritten
+                    else chat_before_tokens
+                )
+                non_chat_tokens = (
+                    estimate_messages_tokens_rough(non_chat_rows)
+                    if non_chat_rows
+                    else 0
+                )
+                # Fixed overhead already resolved up front (F3): _sys_prompt /
+                # _tools hold the resident agent's real system prompt + tool
+                # schemas when available (_full_after_has_fixed=True), else the
+                # temp agent's memory-only fallback — the same basis used for
+                # `approx_tokens`, so before/after are finally comparable.
+                # No-rewrite path skips the estimate entirely: the reply says
+                # "unchanged" and never reads an after figure, and estimating
+                # over the full tool-heavy history is not free.
+                full_after_tokens = (
+                    estimate_request_tokens_rough(
+                        _after_basis, system_prompt=_sys_prompt, tools=_tools
                     )
-                    _full_after_has_fixed = True
-                else:
-                    # No resident agent (post-restart / evicted): fall back to
-                    # the transcript-only estimate and flag it so the label is
-                    # honest about the missing fixed overhead.
-                    full_after_tokens = estimate_request_tokens_rough(
-                        compressed, system_prompt=_sys_prompt, tools=_tools
-                    )
-                    _full_after_has_fixed = False
-                # Chat-only before/after drives the headline (message counts)
-                # and the "Chat size" token line.
+                    if _rewritten
+                    else approx_tokens
+                )
+                # Both-axes feedback: chat delta AND the stored tool/system
+                # rows the rewrite dropped, so the headline reconciles with
+                # the token math (#F1/#F5).
                 summary = summarize_manual_compression(
                     msgs,
                     compressed,
                     chat_before_tokens,
                     chat_after_tokens,
+                    non_chat_count=non_chat_count,
+                    non_chat_tokens=non_chat_tokens,
+                    transcript_rewritten=_rewritten,
+                    full_before_count=len(history),
                 )
+                # Granular reconciling breakdown (the same CompactionStats +
+                # renderer the auto-compaction announce uses): Messages /
+                # Context / per-bucket "Removed from live context" lines with
+                # the tool-vs-other sub-split. Built ONLY when the rewrite
+                # actually happened; degrades to the enhanced two-line form on
+                # ANY failure — a reconcile bug must never break /compress or
+                # ship wrong math (same contract as the hygiene announce).
+                _granular = None
+                _granular_has_wire = False
+                if _rewritten and len(compressed) != len(history):
+                    try:
+                        from agent.compaction_stats import build_hygiene_stats
+                        from agent.conversation_compression import (
+                            _format_granular_announce,
+                        )
+                        from agent.provider_model_util import format_provider_model
+
+                        _engine_name = getattr(compressor, "name", None)
+                        _stats = build_hygiene_stats(
+                            raw_history=history,
+                            eligible_msgs=msgs,
+                            compressed=compressed,
+                            estimator=estimate_messages_tokens_rough,
+                            engine_is_lcm=(_engine_name == "lcm"),
+                        )
+                        _s_ok, _s_why = _stats.validate()
+                        if _s_ok:
+                            _prov = (
+                                runtime_kwargs.get("provider")
+                                if isinstance(runtime_kwargs, dict)
+                                else None
+                            )
+                            _model_part = (
+                                format_provider_model(_prov, model) if model else ""
+                            )
+                            if _engine_name == "lcm":
+                                _model_part = (
+                                    f"{_model_part} · engine: lcm"
+                                    if _model_part
+                                    else "engine: lcm"
+                                )
+                            _granular = _format_granular_announce(
+                                f"🗜️ {summary['headline']}",
+                                _stats,
+                                _model_part,
+                                False,
+                                None,
+                                None,
+                                basis="stored",
+                                # Wire-first (Ace 2026-07-02): when the REAL
+                                # provider-measured before-count exists, the
+                                # block's Context line carries the wire story
+                                # (measured before → next-request estimate)
+                                # and the trailing Full-request line below is
+                                # skipped as a duplicate.
+                                wire_before=real_before_tokens,
+                                wire_after=full_after_tokens,
+                            )
+                            _granular_has_wire = (
+                                real_before_tokens > 0 and full_after_tokens > 0
+                            )
+                            # Honest, store-correct recovery pointer.
+                            if _engine_name == "lcm":
+                                _granular += (
+                                    "\n↩ Nothing lost — original messages preserved "
+                                    "in lcm.db (recover with lcm_grep / lcm_expand)"
+                                )
+                            elif rotated:
+                                _granular += (
+                                    f"\n↩ previous transcript preserved: "
+                                    f"{_old_session_id} (searchable via session_search)"
+                                )
+                        else:
+                            logger.warning(
+                                "Manual /compress granular stats reconcile "
+                                "failed (%s) — using two-line form",
+                                _s_why,
+                            )
+                    except Exception:
+                        logger.warning(
+                            "Manual /compress granular stats build failed "
+                            "(non-fatal, using two-line form)",
+                            exc_info=True,
+                        )
+                        _granular = None
+                        _granular_has_wire = False
                 # Detect summary-generation failure so we can surface a
                 # visible warning to the user even on the manual /compress
                 # path (otherwise the failure is silently logged).
@@ -3001,26 +3145,43 @@ class GatewaySlashCommandsMixin:
                 # from current files (SOUL.md, memory, etc.).
                 self._evict_cached_agent(session_key)
                 self._cleanup_agent_resources(tmp_agent)
-            lines = [f"🗜️ {summary['headline']}"]
-            if focus_topic:
-                lines.append(t("gateway.compress.focus_line", topic=focus_topic))
-
-            # Line 1 — Chat size: the conversation turns only (user/hermes),
-            # excluding system prompt, tool schemas, and tool results. This is
-            # the original "Approx request size" figure, now explicitly labelled
-            # so it isn't confused with the real context window.
-            if summary["noop"] and chat_after_tokens == chat_before_tokens:
-                lines.append(
-                    t("gateway.compress.chat_size_unchanged", before=chat_before_tokens)
-                )
+            # Headline + per-axis lines. When the granular reconciling
+            # breakdown built successfully (rewrite happened, stats validated),
+            # it REPLACES the headline/chat/dropped lines with the full
+            # Messages/Context/Removed-buckets block — the same renderer the
+            # auto-compaction announce uses. The Full-request line below still
+            # appends (its scope is chat+system+tools, complementary to the
+            # granular block's transcript-only Context line).
+            if _granular:
+                lines = [_granular]
+                if focus_topic:
+                    lines.append(t("gateway.compress.focus_line", topic=focus_topic))
             else:
-                lines.append(
-                    t(
-                        "gateway.compress.chat_size",
-                        before=chat_before_tokens,
-                        after=chat_after_tokens,
+                lines = [f"🗜️ {summary['headline']}"]
+                if focus_topic:
+                    lines.append(t("gateway.compress.focus_line", topic=focus_topic))
+
+                # Line 1 — Chat size. Enhanced mode (tool-heavy stored transcript)
+                # renders the reconciling per-axis lines from the summary helper:
+                # the chat line + the dropped tool/system rows line. Classic mode
+                # keeps the original chat_size locale lines.
+                if summary.get("enhanced"):
+                    if summary.get("chat_line"):
+                        lines.append(summary["chat_line"])
+                    if summary.get("dropped_line"):
+                        lines.append(summary["dropped_line"])
+                elif summary["noop"] and chat_after_tokens == chat_before_tokens:
+                    lines.append(
+                        t("gateway.compress.chat_size_unchanged", before=chat_before_tokens)
                     )
-                )
+                else:
+                    lines.append(
+                        t(
+                            "gateway.compress.chat_size",
+                            before=chat_before_tokens,
+                            after=chat_after_tokens,
+                        )
+                    )
 
             # Line 2 — Full request size: what the model is actually sent
             # (chat + system + tools + tool results). The "before" is the REAL
@@ -3029,7 +3190,26 @@ class GatewaySlashCommandsMixin:
             # full-request estimate (~ prefix). The "after" is always an
             # estimate — the real post-compression count doesn't exist until
             # the next live API call.
-            if real_before_tokens > 0:
+            #
+            # Wire-first: when the granular block already rendered the wire
+            # story on its Context line (measured before → next-request
+            # estimate), this line would be a duplicate — skip it.
+            #
+            # When the stored transcript was NOT rewritten, the next request
+            # resends the same context — say "unchanged" instead of printing a
+            # before → after pair whose delta is pure estimator noise (#F2).
+            if not _rewritten:
+                _fr_before = (
+                    f"{real_before_tokens:,}"
+                    if real_before_tokens > 0
+                    else f"~{approx_tokens:,}"
+                )
+                lines.append(
+                    t("gateway.compress.full_request_unchanged", before=_fr_before)
+                )
+            elif _granular_has_wire:
+                pass  # wire story already on the granular Context line
+            elif real_before_tokens > 0:
                 lines.append(
                     t(
                         "gateway.compress.full_request_real",
@@ -3048,7 +3228,8 @@ class GatewaySlashCommandsMixin:
             # Honesty note: when no resident agent was available to supply the
             # real fixed overhead, the "after" omits system prompt + tool
             # schemas (~tens of k tokens). Say so rather than under-report.
-            if not _full_after_has_fixed:
+            # Only relevant when an "after" estimate was actually shown.
+            if _rewritten and not _full_after_has_fixed:
                 lines.append(t("gateway.compress.full_request_no_fixed"))
 
             if summary["note"]:

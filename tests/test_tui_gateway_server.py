@@ -2037,6 +2037,77 @@ def test_session_title_falls_back_to_queue_when_row_create_fails(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_session_pin_updates_db_and_echoes_session_info(monkeypatch):
+    calls = []
+    emitted = []
+
+    class _FakeDB:
+        def set_session_pinned(self, key, pinned):
+            calls.append((key, pinned))
+            return True
+
+    session = _session(session_key="session-key")
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(
+        server,
+        "_emit_session_info_for_session",
+        lambda sid, sess: emitted.append((sid, dict(sess))),
+    )
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.pin",
+                "params": {"session_id": "sid", "pinned": True},
+            }
+        )
+
+        assert resp["result"] == {"pinned": True, "session_key": "session-key"}
+        assert calls == [("session-key", True)]
+        assert session["pinned"] is True
+        assert emitted == [("sid", {**session})]
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_session_pin_missing_session_matches_title_error_contract():
+    title = server.handle_request(
+        {"id": "same", "method": "session.title", "params": {"session_id": "dead"}}
+    )
+    pin = server.handle_request(
+        {
+            "id": "same",
+            "method": "session.pin",
+            "params": {"session_id": "dead", "pinned": True},
+        }
+    )
+
+    assert pin == title == {
+        "jsonrpc": "2.0",
+        "id": "same",
+        "error": {"code": 4001, "message": "session not found"},
+    }
+
+
+def test_session_pin_db_unavailable_uses_title_db_error_code(monkeypatch):
+    server._sessions["sid"] = _session(session_key="session-key")
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_db_error", "missing state")
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.pin",
+                "params": {"session_id": "sid", "pinned": True},
+            }
+        )
+        assert resp["error"]["code"] == 5007
+        assert resp["error"]["message"] == "state.db unavailable: missing state"
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_notification_event_routing_by_session_key(monkeypatch):
     """Background-process events surface only in the session that owns them."""
     mine = _session(session_key="mine")
@@ -3876,6 +3947,264 @@ def test_session_compress_syncs_session_key_after_rotation(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_compress_history_identity_noop_does_not_swap_or_bump():
+    live_history = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+        {"role": "assistant", "content": "four"},
+    ]
+    before_messages = list(live_history)
+    seen = {}
+
+    class _Agent:
+        def _compress_context(self, messages, system_message, **kwargs):
+            seen["messages"] = messages
+            seen["force"] = kwargs.get("force")
+            return messages, system_message
+
+    session = _session(
+        agent=_Agent(),
+        history=live_history,
+        history_version=7,
+    )
+
+    removed, _usage = server._compress_session_history(
+        session,
+        approx_tokens=123,
+        before_messages=before_messages,
+        history_version=7,
+    )
+
+    assert removed == 0
+    assert seen == {"messages": before_messages, "force": True}
+    assert session["history"] is live_history
+    assert session["history_version"] == 7
+
+
+def test_compress_history_same_length_rebuild_swaps_and_bumps():
+    live_history = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+        {"role": "assistant", "content": "four"},
+    ]
+    before_messages = list(live_history)
+    rebuilt = [
+        {"role": "system", "content": "summary"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+        {"role": "assistant", "content": "four"},
+    ]
+    seen = {}
+
+    class _Agent:
+        def _compress_context(self, messages, system_message, **kwargs):
+            seen["messages"] = messages
+            seen["force"] = kwargs.get("force")
+            return rebuilt, system_message
+
+    session = _session(
+        agent=_Agent(),
+        history=live_history,
+        history_version=7,
+    )
+
+    removed, _usage = server._compress_session_history(
+        session,
+        approx_tokens=123,
+        before_messages=before_messages,
+        history_version=7,
+    )
+
+    assert removed == 0
+    assert seen == {"messages": before_messages, "force": True}
+    assert session["history"] is rebuilt
+    assert session["history_version"] == 8
+
+
+def test_slash_exec_compress_bypasses_worker_and_returns_live_output(monkeypatch):
+    class _ExplodingWorker:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("slash worker should not run for /compress")
+
+    history = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+        {"role": "assistant", "content": "four"},
+    ]
+    server._sessions["sid"] = _session(
+        agent=types.SimpleNamespace(model="live-model", session_id="session-key"),
+        history=history,
+    )
+
+    def fake_compress(session, focus_topic=None, **_kwargs):
+        assert focus_topic == "focus"
+        with session["history_lock"]:
+            session["history"] = list(session["history"][:2])
+            session["history_version"] = int(session.get("history_version", 0)) + 1
+        return 2, {"total": 42}
+
+    monkeypatch.setattr(server, "_SlashWorker", _ExplodingWorker)
+    monkeypatch.setattr(server, "_compress_session_history", fake_compress)
+    monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_session_info", lambda _agent, *a: {"model": "live-model"})
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "slash.exec",
+                "params": {"command": "compress focus", "session_id": "sid"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert "result" in resp, resp
+    assert "warning" not in resp["result"]
+    assert "messages" in resp["result"]["output"]
+    assert "4018" not in resp["result"]["output"]
+
+
+def test_slash_exec_compress_reports_existing_compression(monkeypatch):
+    lock = threading.Lock()
+    assert lock.acquire(blocking=False)
+    history = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+        {"role": "assistant", "content": "four"},
+    ]
+    server._sessions["sid"] = _session(
+        agent=types.SimpleNamespace(model="live-model", session_id="session-key"),
+        history=history,
+        manual_compression_lock=lock,
+    )
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "slash.exec",
+                "params": {"command": "compress", "session_id": "sid"},
+            }
+        )
+    finally:
+        lock.release()
+        server._sessions.pop("sid", None)
+
+    assert resp is not None
+    assert "result" in resp, resp
+    assert resp["result"]["output"].startswith("already compressing this session")
+
+
+def test_command_dispatch_compress_returns_honest_live_output(monkeypatch):
+    history = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+        {"role": "assistant", "content": "four"},
+    ]
+    server._sessions["sid"] = _session(
+        agent=types.SimpleNamespace(model="live-model", session_id="session-key"),
+        history=history,
+    )
+
+    def fake_compress(session, focus_topic=None, **_kwargs):
+        with session["history_lock"]:
+            session["history"] = list(session["history"][:2])
+            session["history_version"] = int(session.get("history_version", 0)) + 1
+        return 2, {"total": 42}
+
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"quick_commands": {}})
+    monkeypatch.setattr(server, "_compress_session_history", fake_compress)
+    monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_session_info", lambda _agent, *a: {"model": "live-model"})
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "command.dispatch",
+                "params": {"arg": "", "name": "compress", "session_id": "sid"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert resp["result"]["type"] == "exec"
+    assert "messages" in resp["result"]["output"]
+
+
+def test_slash_exec_live_read_commands_bypass_worker(monkeypatch):
+    class _ExplodingWorker:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("slash worker should not run for live read commands")
+
+    agent = types.SimpleNamespace(
+        model="live-model",
+        provider="live-provider",
+        session_api_calls=2,
+        session_input_tokens=100,
+        session_output_tokens=20,
+        session_reasoning_tokens=5,
+        session_prompt_tokens=120,
+        session_completion_tokens=20,
+        session_total_tokens=140,
+        context_compressor=types.SimpleNamespace(
+            last_prompt_tokens=80,
+            context_length=1000,
+            compression_count=1,
+        ),
+        _cached_system_prompt="live system prompt",
+    )
+    history = [
+        {"role": "user", "content": "live question"},
+        {"role": "assistant", "content": "live answer"},
+    ]
+
+    class _DB:
+        def get_session(self, key):
+            assert key == "session-key"
+            return {"title": "Live title", "started_at": 1_700_000_000}
+
+    server._sessions["sid"] = _session(agent=agent, history=history)
+    monkeypatch.setattr(server, "_SlashWorker", _ExplodingWorker)
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+
+    cases = {
+        "usage": "Total tokens:                 140",
+        "history": "live question",
+        "prompt": "live system prompt",
+        "status": "Tokens: 140",
+        "model": "live-model (live-provider)",
+        "clear": "left unchanged",
+        "models": "/model",
+        "rename": "/title",
+        "effort": "/reasoning",
+    }
+
+    try:
+        for command, expected in cases.items():
+            resp = server.handle_request(
+                {
+                    "id": command,
+                    "method": "slash.exec",
+                    "params": {"command": command, "session_id": "sid"},
+                }
+            )
+            assert "result" in resp, (command, resp)
+            assert expected in resp["result"]["output"]
+            assert "(._.)" not in resp["result"]["output"]
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_prompt_submit_sets_approval_session_key(monkeypatch):
     from tools.approval import get_current_session_key
 
@@ -5372,7 +5701,7 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     release_build = threading.Event()
     build_entered = threading.Event()
 
-    def _slow_make_agent(sid, key, session_id=None, session_db=None):
+    def _slow_make_agent(sid, key, session_id=None, session_db=None, **_kw):
         build_started.set()
         build_entered.set()
         release_build.wait(timeout=3.0)
@@ -5494,7 +5823,7 @@ def test_session_create_no_race_keeps_worker_alive(monkeypatch):
             self.base_url = ""
             self.api_key = ""
 
-    monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_db=None: _FakeAgent())
+    monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_db=None, **_kw: _FakeAgent())
     monkeypatch.setattr(server, "_SlashWorker", _FakeWorker)
     monkeypatch.setattr(
         server,
@@ -5611,7 +5940,7 @@ def test_session_create_continues_when_state_db_is_unavailable(monkeypatch):
 
     emits = []
 
-    monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_db=None: _FakeAgent())
+    monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_db=None, **_kw: _FakeAgent())
     monkeypatch.setattr(server, "_SlashWorker", _FakeWorker)
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_session_info", lambda _a, *a2: {"model": "x"})
@@ -6158,6 +6487,7 @@ def test_session_active_list_reports_live_sessions(monkeypatch):
         "last_active": 20.0,
         "message_count": 1,
         "model": "model-a",
+        "pinned": False,
         "preview": "find docs",
         "session_key": "key-a",
         "started_at": 10.0,

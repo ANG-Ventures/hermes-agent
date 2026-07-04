@@ -699,6 +699,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- Intentionally asymmetric: rewind_count bumps per rewind_to_message call;
     -- redo_count bumps once per /redo command, regardless of M.
     redo_count INTEGER,
+    pinned INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
@@ -2599,6 +2600,63 @@ class SessionDB:
             return rowcount
         rowcount = self._execute_write(_do)
         return rowcount > 0
+
+    def set_session_pinned(self, session_id: str, pinned: bool) -> bool:
+        """Pin or unpin a session.
+
+        Pins are a server-owned visibility flag for the desktop sidebar. For
+        compression chains, update the whole logical conversation: the desktop
+        renders roots projected forward to their latest continuation but keys
+        the pin on the lineage root, so updating only one row lets a sibling in
+        the chain resurrect stale state on the next list refresh.
+
+        Returns True when the target session exists (including idempotent
+        writes that leave the value unchanged), False for unknown ids.
+        """
+        value = 1 if pinned else 0
+
+        def _do(conn):
+            exists = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if not exists:
+                return 0
+            conn.execute(
+                """
+                WITH RECURSIVE
+                  ancestors(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT parent.id
+                    FROM ancestors a
+                    JOIN sessions child ON child.id = a.id
+                    JOIN sessions parent ON parent.id = child.parent_session_id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  descendants(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT child.id
+                    FROM descendants d
+                    JOIN sessions parent ON parent.id = d.id
+                    JOIN sessions child ON child.parent_session_id = parent.id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  lineage(id) AS (
+                    SELECT id FROM ancestors
+                    UNION
+                    SELECT id FROM descendants
+                  )
+                UPDATE sessions
+                SET pinned = ?
+                WHERE id IN (SELECT id FROM lineage)
+                """,
+                (session_id, session_id, value),
+            )
+            return 1
+
+        return bool(self._execute_write(_do))
 
     def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
         """Look up a session by exact title. Returns session dict or None."""
@@ -4703,6 +4761,39 @@ class SessionDB:
         with self._lock:
             cursor = self._conn.execute(f"SELECT COUNT(*) FROM sessions s{where_sql}", params)
             return cursor.fetchone()[0]
+
+    def session_counts_by_source(
+        self,
+        include_archived: bool = False,
+        archived_only: bool = False,
+        include_children: bool = False,
+    ) -> Dict[str, int]:
+        """Count sessions by source without hydrating session rows.
+
+        Mirrors the picker/listing surface by hiding non-listable child rows
+        unless ``include_children`` is set. Empty/NULL sources retain the legacy
+        dashboard stats fallback of ``"cli"``.
+        """
+        where_clauses = []
+
+        if not include_children:
+            where_clauses.append(_LISTABLE_CHILD_SQL)
+            where_clauses.append(f"{_delegate_from_json('s.model_config')} IS NULL")
+        if archived_only:
+            where_clauses.append("s.archived = 1")
+        elif not include_archived:
+            where_clauses.append("s.archived = 0")
+
+        where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        query = f"""
+            SELECT COALESCE(NULLIF(s.source, ''), 'cli') AS source, COUNT(*) AS count
+            FROM sessions s{where_sql}
+            GROUP BY COALESCE(NULLIF(s.source, ''), 'cli')
+            ORDER BY source
+        """
+        with self._lock:
+            rows = self._conn.execute(query).fetchall()
+        return {str(row["source"] or "cli"): int(row["count"]) for row in rows}
 
     def message_count(self, session_id: str = None) -> int:
         """Count messages, optionally for a specific session."""

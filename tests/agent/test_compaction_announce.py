@@ -13,6 +13,7 @@ import pytest
 from agent.conversation_compression import (
     _extract_compaction_summary_snippet,
     _format_compaction_announce,
+    _format_granular_announce,
     _emit_compaction_announce,
 )
 
@@ -737,6 +738,126 @@ def _good_stats(**ov):
     )
     base.update(ov)
     return CompactionStats(**base)
+
+
+class TestGranularBasisLabel:
+    """The granular renderer must label its numbers by the population they were
+    measured over. Auto-announce feeds the LIVE message list (wire savings →
+    'Context:' / 'live context'); manual /compress feeds the STORED transcript
+    (storage reclaimed → 'Stored transcript:' / 'stored transcript'). Same
+    stats, different honest labels. Regression for the 689K-vs-303K mislabel
+    (2026-07-02)."""
+
+    def test_default_basis_is_live_wording(self):
+        s = _good_stats()
+        out = _format_granular_announce(
+            "🗜️ Context compacted", s, "m · engine: lcm", False, None, None
+        )
+        assert "Context:" in out
+        assert "Removed from live context" in out
+        assert "kept in context" in out
+        assert "freed ~" in out
+        # stored wording must NOT leak into the live path
+        assert "Stored transcript:" not in out
+        assert "stored transcript" not in out
+        assert "kept in transcript" not in out
+
+    def test_stored_basis_relabels_without_touching_numbers(self):
+        s = _good_stats()
+        live = _format_granular_announce(
+            "🗜️ head", s, "m", False, None, None
+        )
+        stored = _format_granular_announce(
+            "🗜️ head", s, "m", False, None, None, basis="stored"
+        )
+        # storage wording present
+        assert "Stored transcript:" in stored
+        assert "Removed from stored transcript" in stored
+        assert "kept in transcript" in stored
+        assert "reclaimed ~" in stored  # freed_verb
+        # live wording absent
+        assert "Removed from live context" not in stored
+        assert "kept in context" not in stored
+        # the NUMBERS are identical between the two bases — only labels differ
+        import re
+        nums = lambda t: re.findall(r"~?\d[\d,]*[KM]?", t)
+        assert nums(live) == nums(stored)
+
+    def test_stored_basis_keeps_full_request_line_separate(self):
+        # The renderer never emits the wire-truth Full-request line itself; that
+        # is the caller's job. Confirm the block stays transcript-scoped so the
+        # caller's provider-measured line reads as the wire truth beside it.
+        s = _good_stats()
+        stored = _format_granular_announce(
+            "🗜️ Compacted stored transcript: 748 → 34 messages",
+            s, "m", False, None, None, basis="stored",
+        )
+        assert "Full request size" not in stored  # caller appends it, not the renderer
+
+
+class TestGranularWireFirst:
+    """Wire-first /compress feedback (Ace 2026-07-02): when the caller supplies
+    the REAL provider-measured before-count + a next-request estimate, the
+    stored-basis block's prominent token line becomes the WIRE story (exact
+    measured before, ~estimated after), and the archive totals are demoted into
+    the Removed header as an explicit 'token-est' parenthetical. One number
+    story — the footer figure and the /compress figure can no longer disagree."""
+
+    def test_wire_mode_context_line_uses_measured_numbers(self):
+        s = _good_stats()
+        out = _format_granular_announce(
+            "🗜️ head", s, "m", False, None, None,
+            basis="stored", wire_before=236_012, wire_after=80_143,
+        )
+        # exact measured before (commas, no ~), estimated after (~)
+        assert "Context:   236,012 → ~80,143 tokens" in out
+        # freed/pct computed on WIRE numbers: 155,869 → ~155K, 66%
+        assert "freed ~155K, 66% smaller" in out
+        assert "before measured, after next-request estimate" in out
+        # the stored-transcript label must NOT be the prominent line anymore
+        assert "Stored transcript:" not in out
+
+    def test_wire_mode_demotes_archive_totals_into_removed_header(self):
+        s = _good_stats()
+        out = _format_granular_announce(
+            "🗜️ head", s, "m", False, None, None,
+            basis="stored", wire_before=236_012, wire_after=80_143,
+        )
+        # archive story explicitly labeled as token-est, in the Removed header
+        assert "Removed from stored transcript (716 messages," in out
+        assert "token-est reclaimed from archive):" in out
+        # kept-in-transcript replacement-cost wording unchanged
+        assert "kept in transcript" in out
+
+    def test_wire_mode_no_net_reduction_guard(self):
+        s = _good_stats()
+        out = _format_granular_announce(
+            "🗜️ head", s, "m", False, None, None,
+            basis="stored", wire_before=50_000, wire_after=60_000,
+        )
+        assert "no net reduction expected" in out
+        assert "% smaller" not in out
+
+    def test_wire_mode_requires_both_numbers(self):
+        # Missing/zero wire numbers → unchanged stored-basis rendering
+        s = _good_stats()
+        for wb, wa in ((0, 80_143), (236_012, 0), (None, None)):
+            out = _format_granular_announce(
+                "🗜️ head", s, "m", False, None, None,
+                basis="stored", wire_before=wb, wire_after=wa,
+            )
+            assert "Stored transcript:" in out
+            assert "token-est reclaimed from archive" not in out
+
+    def test_wire_kwargs_ignored_on_live_basis(self):
+        # Auto-announce path must stay byte-identical even if kwargs leak in
+        s = _good_stats()
+        live_plain = _format_granular_announce("h", s, "m", False, None, None)
+        live_kw = _format_granular_announce(
+            "h", s, "m", False, None, None,
+            wire_before=236_012, wire_after=80_143,
+        )
+        assert live_kw == live_plain
 
 
 class TestProviderModelSplit:

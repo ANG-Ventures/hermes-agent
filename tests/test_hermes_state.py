@@ -1680,6 +1680,34 @@ class TestCounts:
         assert db.session_count(source="cli") == 2
         assert db.session_count(source="telegram") == 1
 
+    def test_session_counts_by_source_matches_list_sessions_rich_histogram(self, db):
+        db.create_session(session_id="cli-1", source="cli")
+        db.create_session(session_id="blank-source", source="")
+        db.create_session(session_id="telegram-1", source="telegram")
+        db.create_session(session_id="archived-1", source="slack")
+        db.create_session(
+            session_id="delegate-child",
+            source="tool",
+            parent_session_id="cli-1",
+            model_config={"_delegate_from": "cli-1"},
+        )
+        db.set_session_archived("archived-1", True)
+
+        def legacy_histogram(*, include_archived=False):
+            counts = {}
+            for session in db.list_sessions_rich(
+                limit=10000,
+                include_archived=include_archived,
+            ):
+                source = str(session.get("source") or "cli")
+                counts[source] = counts.get(source, 0) + 1
+            return counts
+
+        assert db.session_counts_by_source() == legacy_histogram()
+        assert db.session_counts_by_source(include_archived=True) == legacy_histogram(
+            include_archived=True
+        )
+
     def test_session_count_by_cwd_prefix(self, db):
         db.create_session("s1", "cli", cwd="/repo")
         db.create_session("s2", "cli", cwd="/repo-wt-feature")
@@ -2224,6 +2252,44 @@ class TestSessionTitle:
         session = db.get_session("s1")
         assert session["title"] == "Before End"
         assert session["ended_at"] is not None
+
+
+class TestSessionPinned:
+    def test_pinned_defaults_false_and_roundtrips_through_reopen(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            db.create_session(session_id="s1", source="cli")
+            assert db.get_session("s1")["pinned"] == 0
+
+            assert db.set_session_pinned("s1", True) is True
+        finally:
+            db.close()
+
+        reopened = SessionDB(db_path=db_path)
+        try:
+            session = reopened.get_session("s1")
+            assert session["pinned"] == 1
+            rich = reopened.list_sessions_rich(limit=10)
+            assert [(row["id"], bool(row["pinned"])) for row in rich] == [("s1", True)]
+        finally:
+            reopened.close()
+
+    def test_set_pinned_nonexistent_session(self, db):
+        assert db.set_session_pinned("missing", True) is False
+
+    def test_projected_compression_tip_keeps_root_pin(self, db):
+        db.create_session("root", source="cli")
+        db.end_session("root", "compression")
+        db.create_session("tip", source="cli", parent_session_id="root")
+        db.append_message("tip", "user", "hello")
+
+        assert db.set_session_pinned("root", True) is True
+
+        [row] = db.list_sessions_rich(limit=10, order_by_last_active=True)
+        assert row["id"] == "tip"
+        assert row["_lineage_root_id"] == "root"
+        assert bool(row["pinned"]) is True
 
 
 class TestSessionTitleLineage:

@@ -368,9 +368,19 @@ class LCMEngine(ContextEngine):
         self.last_reasoning_tokens = 0
         self.cache_metrics_available = False
         self.compression_count = 0
+        # Leaf-pass count of the most recent compress() that reached assembly;
+        # the in-turn stats consumer reads this to decide provenance trust
+        # (single-pass = trusted; multi-pass = shadow until PR-C).
+        self.last_leaf_passes = 0
         # run_agent.py reads these for preflight checks
         self.protect_first_n = 3
         self.protect_last_n = self._config.fresh_tail_count
+        # Token-budgeted fresh tail (compression.target_ratio support).
+        # Budget is derived when a context window is known (_set_context_length);
+        # 0 = legacy fixed-count tail. _last_fresh_tail_count tracks the dynamic
+        # count actually used by the most recent compress() pass (D-7 rotate floor).
+        self._fresh_tail_token_budget = 0
+        self._last_fresh_tail_count = self._config.fresh_tail_count
         # run_agent.py reads these for context probing
         self._context_probed = False
         self._context_probe_persistable = False
@@ -541,7 +551,73 @@ class LCMEngine(ContextEngine):
         self.threshold_tokens = int(
             parsed_context_length * self._config.context_threshold
         )
+        self._refresh_fresh_tail_token_budget()
         return True
+
+    def _refresh_fresh_tail_token_budget(self) -> None:
+        """Recompute the token-budgeted fresh-tail target (D-11/I-2/I-4).
+
+        budget = target_ratio × threshold_tokens (or the explicit
+        ``fresh_tail_token_budget`` override), capped at
+        ``fresh_tail_max_tokens`` and at 0.9 × threshold_tokens (convergence
+        clamp: compaction must always be able to shrink the context below the
+        trigger). Any degenerate input leaves the budget at 0 → legacy
+        fixed-count tail.
+        """
+        self._fresh_tail_token_budget = 0
+        try:
+            if not self._config.fresh_tail_token_budget_enabled:
+                return
+            if self.threshold_tokens <= 0:
+                return
+            explicit = int(self._config.fresh_tail_token_budget or 0)
+            budget = explicit if explicit > 0 else int(
+                self._config.target_ratio * self.threshold_tokens
+            )
+            caps = [budget, int(0.9 * self.threshold_tokens)]
+            max_tokens = int(self._config.fresh_tail_max_tokens or 0)
+            if max_tokens > 0:
+                caps.append(max_tokens)
+            self._fresh_tail_token_budget = max(0, min(caps))
+        except Exception:
+            self._fresh_tail_token_budget = 0
+
+    def _dynamic_fresh_tail_count(self, messages: List[Dict[str, Any]]) -> int:
+        """Message count for the fresh tail under the token budget (D-11).
+
+        Walks backward from the newest message accumulating estimated tokens
+        (``count_message_tokens``) until the budget is spent. Floored at the
+        legacy ``fresh_tail_count`` (I-3) so the tail is never smaller than
+        today's fixed count; any error or degenerate budget reproduces the
+        legacy count exactly (I-4).
+        """
+        base = max(1, int(self._config.fresh_tail_count))
+        budget = getattr(self, "_fresh_tail_token_budget", 0)
+        if budget <= 0:
+            return base
+        try:
+            used = 0
+            count = 0
+            for msg in reversed(messages):
+                msg_tokens = count_message_tokens(msg)
+                if used + msg_tokens > budget and count >= base:
+                    break
+                used += msg_tokens
+                count += 1
+            # NOTE (pass-3 B-NEW-2, ground-truthed): the result may exceed
+            # len(messages) on a short list — that is the LEGACY semantic
+            # (protect_last_n is a constant fresh_tail_count today regardless
+            # of list length) and every consumer already clamps:
+            # _fresh_tail_start floors the cut at 0, and
+            # find_inturn_kept_cut computes lo = max(0, n - count - slack).
+            # Clamping here would CHANGE legacy behavior on short lists (I-4).
+            return max(base, count)
+        except Exception:
+            return base
+
+    def _fresh_tail_start(self, messages: List[Dict[str, Any]]) -> int:
+        """Index where the fresh tail begins (single chokepoint, I-5)."""
+        return max(0, len(messages) - self._dynamic_fresh_tail_count(messages))
 
     def _session_metadata_matches_active_runtime(
         self,
@@ -740,7 +816,7 @@ class LCMEngine(ContextEngine):
         if not messages:
             return False, "empty message list"
         n = len(messages)
-        fresh_tail_start = max(0, n - self._config.fresh_tail_count)
+        fresh_tail_start = self._fresh_tail_start(messages)
         leading_anchor_count = self._leading_anchor_count(messages)
         if fresh_tail_start <= leading_anchor_count:
             return False, "no eligible raw backlog outside fresh tail"
@@ -955,6 +1031,16 @@ class LCMEngine(ContextEngine):
         working_messages = self._ingest_messages(messages)
         anchor_source_messages = list(working_messages)
         pressure_messages = messages if len(messages) == len(working_messages) else working_messages
+        # Frozen-K (D-11): the dynamic fresh-tail count is computed ONCE per
+        # compress() pass, on the post-ingest working list. Every in-pass cut
+        # uses `len(current_list) - K`, which names the same physical tail rows
+        # at each site because the leaf loop only REMOVES rows from the front
+        # region (scaffold-drop / compacted-chunk removal); the only
+        # list-growing transform (_sanitize_active_context_messages stub
+        # insertion) runs strictly after the last cut, on the already-cut tail.
+        frozen_fresh_tail_count = self._dynamic_fresh_tail_count(working_messages)
+        self._last_fresh_tail_count = frozen_fresh_tail_count
+        self.protect_last_n = frozen_fresh_tail_count
         leaf_compacted_this_turn = False
         dropped_replayed_scaffold_messages = False
         leaf_passes = 0
@@ -984,7 +1070,7 @@ class LCMEngine(ContextEngine):
 
         while leaf_passes < max_leaf_passes:
             n = len(working_messages)
-            fresh_tail_start = max(0, n - self._config.fresh_tail_count)
+            fresh_tail_start = max(0, n - frozen_fresh_tail_count)
 
             # Keep only a real system prompt anchored. Gateway sessions may
             # pass only conversation messages, so index 0 can be an old user
@@ -1006,7 +1092,7 @@ class LCMEngine(ContextEngine):
                 working_messages = working_messages[:leading_anchor_count] + working_messages[candidate_start:]
                 pressure_messages = pressure_messages[:leading_anchor_count] + pressure_messages[candidate_start:]
                 n = len(working_messages)
-                fresh_tail_start = max(0, n - self._config.fresh_tail_count)
+                fresh_tail_start = max(0, n - frozen_fresh_tail_count)
                 if fresh_tail_start <= leading_anchor_count:
                     noop_reason = "selected leaf chunk lacks raw store lineage"
                     break
@@ -1090,12 +1176,12 @@ class LCMEngine(ContextEngine):
                     break
                 leading_anchor_count = self._leading_anchor_count(working_messages)
                 remaining_raw = working_messages[
-                    leading_anchor_count:max(0, len(working_messages) - self._config.fresh_tail_count)
+                    leading_anchor_count:max(0, len(working_messages) - frozen_fresh_tail_count)
                 ]
                 if not remaining_raw:
                     break
                 pressure_remaining_raw = pressure_messages[
-                    leading_anchor_count:max(0, len(pressure_messages) - self._config.fresh_tail_count)
+                    leading_anchor_count:max(0, len(pressure_messages) - frozen_fresh_tail_count)
                 ]
                 remaining_raw_tokens = count_messages_tokens(pressure_remaining_raw)
                 remaining_threshold = self._working_leaf_chunk_tokens(remaining_raw_tokens)
@@ -1173,41 +1259,54 @@ class LCMEngine(ContextEngine):
         leading_anchor_count = self._leading_anchor_count(working_messages)
         anchor_leading_count = self._leading_anchor_count(anchor_source_messages)
         self._pending_context_anchor_messages = anchor_source_messages[anchor_leading_count:]
-        # ── Option B provenance stamp (single-pass only) ──────────────────────────
+        # ── Option B provenance stamp (all leaf passes) ───────────────────────────
         # Stamp each fresh-tail row handed to _assemble_context with `_src_idx` = its
         # index into the ORIGINAL `messages`, so the in-turn compaction-stats consumer
         # can read the EXACT pre-side kept partition off the returned `compressed` (the
         # rows' shallow-copies carry the key through every sanitize/trim/rewrite stage
         # by construction; synthetic stubs lack it). The fresh tail is a SUFFIX of the
-        # original `messages` — single-pass leaf-fold only removes a chunk from the
-        # FRONT (between anchor and tail), never the trailing rows — so a tail row at
-        # offset `off` maps to `messages[len(messages) - (len(tail) - off)]` regardless
-        # of how much the front shrank (this is why we index from the END, not by the
-        # working_messages position, which Greptile #110 correctly flagged would never
-        # engage post-fold). Guarded to single-pass + a per-row identity check so a
-        # mis-mapped index is never stamped. The consumer harvests then STRIPS
-        # `_src_idx` before `compressed` flows onward; `_`-prefixed = transport-stripped
-        # as a backstop.
+        # original `messages` for ANY number of leaf passes (spec 2026-07-02 §0.6,
+        # five-step proof): (1) ingest is a 1:1 order-preserving rewrite; (2) every
+        # in-loop mutation removes rows ONLY from the front region — scaffold drop and
+        # compacted-chunk removal both slice strictly before fresh_tail_start, and
+        # _select_oldest_leaf_chunk picks a contiguous FRONT prefix; (3) summary rows
+        # go to the DAG (_dag.add_node), NEVER into working_messages — summaries are
+        # prepended inside _assemble_context, after this stamp; (4) frozen-K: the tail
+        # count is computed once per compress(), so "the last K rows" names the same
+        # physical rows after every pass; (4b) the stub-inserting sanitize runs ONLY
+        # inside/after _assemble_context — i.e. strictly after this stamp — so a stub
+        # can never shift the end-anchored index. Hence a tail row at offset `off`
+        # maps to `messages[len(messages) - (len(tail) - off)]` regardless of how much
+        # the front shrank or how many passes removed it (end-anchored indexing —
+        # Greptile #110 flagged working-position indexing would never engage
+        # post-fold). Guarded per-row on role + tool_call_id + tool_calls arity
+        # (structural fields that survive content rewrites); the consumer is the real
+        # gate — harvest validates indices in-range + no-dup and the reconcile check
+        # falls to the A-floor if anything is off, so a wrong stamp can never ship a
+        # confidently-wrong split. Multi-pass consumption is SHADOW-ONLY until PR-C
+        # (the consumer displays current behavior and logs agree/diverge). The
+        # consumer harvests then STRIPS `_src_idx` before `compressed` flows onward;
+        # `_`-prefixed = transport-stripped as a backstop.
+        self.last_leaf_passes = leaf_passes
         tail_rows = working_messages[leading_anchor_count:]
-        if leaf_passes == 1 and tail_rows and len(tail_rows) <= len(messages):
+        if leaf_passes >= 1 and tail_rows and len(tail_rows) <= len(messages):
             n_msgs = len(messages)
             n_tail = len(tail_rows)
             stamped_tail = []
             for off, row in enumerate(tail_rows):
                 src_idx = n_msgs - (n_tail - off)
-                # The fresh tail is a suffix of `messages` (1:1 order-preserving
-                # ingest + front-only fold), so the suffix index is structurally
-                # correct. ingest SHALLOW-COPIES rows, so an `is` identity check would
-                # never match (Greptile #110): guard instead on a cheap role match
-                # (content may be quarantine-rewritten). The consumer is the real
-                # gate — harvest validates indices in-range + the reconcile check
-                # falls to the A-floor if anything is off, so a wrong stamp can never
-                # ship a confidently-wrong split.
+                # ingest SHALLOW-COPIES rows, so an `is` identity check would never
+                # match (Greptile #110): guard on structural fields instead. Content
+                # may be quarantine/redact-rewritten; role, tool_call_id, and
+                # tool_calls arity survive those 1:1 rewrites.
                 if (
                     isinstance(row, dict)
                     and 0 <= src_idx < n_msgs
                     and isinstance(messages[src_idx], dict)
                     and messages[src_idx].get("role") == row.get("role")
+                    and messages[src_idx].get("tool_call_id") == row.get("tool_call_id")
+                    and len(messages[src_idx].get("tool_calls") or [])
+                    == len(row.get("tool_calls") or [])
                 ):
                     row = dict(row)
                     row["_src_idx"] = src_idx
@@ -1366,7 +1465,9 @@ class LCMEngine(ContextEngine):
             threshold_percent=self.threshold_percent,
             protect_first_n=self.protect_first_n,
             protect_last_n=self.protect_last_n,
-            summary_target_ratio=0.20,
+            # D-10: honor the configured compression.target_ratio (was a
+            # hardcoded 0.20 that ignored the operator's setting).
+            summary_target_ratio=self._config.target_ratio,
             quiet_mode=True,
             summary_model_override=self.summary_model or self._config.summary_model,
             base_url=self.base_url,
@@ -1875,7 +1976,7 @@ class LCMEngine(ContextEngine):
 
     def _raw_backlog_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         n = len(messages)
-        fresh_tail_start = max(0, n - self._config.fresh_tail_count)
+        fresh_tail_start = self._fresh_tail_start(messages)
         leading_anchor_count = self._leading_anchor_count(messages)
         if fresh_tail_start <= leading_anchor_count:
             return []
@@ -5011,7 +5112,15 @@ class LCMEngine(ContextEngine):
         if self._session_stateless:
             return {"ok": False, "reason": "session_stateless", "session_id": session_id}
 
-        fresh_tail_count = max(1, int(self._config.fresh_tail_count))
+        # D-7: never advance the frontier past rows that may still be inside
+        # the (possibly wider, token-budgeted) in-memory fresh tail — use the
+        # max of the static config count and the dynamic count last used by
+        # compress().
+        fresh_tail_count = max(
+            1,
+            int(self._config.fresh_tail_count),
+            int(getattr(self, "_last_fresh_tail_count", 0) or 0),
+        )
         total_count = int(self._store.get_session_count(session_id))
 
         state = self._lifecycle.get_by_conversation(conversation_id)

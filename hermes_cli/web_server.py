@@ -1932,6 +1932,33 @@ async def _git_op(fn, *args):
         raise HTTPException(status_code=400, detail=str(exc) or "git operation failed")
 
 
+async def _blocking_io(fn, *args):
+    """Run a blocking read on the default executor instead of the event loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, fn, *args)
+
+
+_SESSION_DB_HEAVY_READ_SEMAPHORES: Dict[int, asyncio.Semaphore] = {}
+
+
+def _session_db_heavy_read_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    key = id(loop)
+    semaphore = _SESSION_DB_HEAVY_READ_SEMAPHORES.get(key)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(2)
+        _SESSION_DB_HEAVY_READ_SEMAPHORES[key] = semaphore
+    return semaphore
+
+
+async def _session_db_read(fn, *args, heavy: bool = False):
+    """Run a blocking SessionDB read off-loop, bounding heavyweight scans."""
+    if heavy:
+        async with _session_db_heavy_read_semaphore():
+            return await _blocking_io(fn, *args)
+    return await _blocking_io(fn, *args)
+
+
 def _git_path(path: str) -> str:
     return str(_fs_path(path))
 
@@ -2172,18 +2199,12 @@ async def get_status(profile: Optional[str] = None):
 
         active_sessions = 0
         try:
-            from hermes_state import SessionDB
-            db = SessionDB()
-            try:
-                sessions = db.list_sessions_rich(limit=50)
-                now = time.time()
-                active_sessions = sum(
-                    1 for s in sessions
-                    if s.get("ended_at") is None
-                    and (now - s.get("last_active", s.get("started_at", 0))) < 300
-                )
-            finally:
-                db.close()
+            active_sessions = await _session_db_read(
+                _read_active_session_count,
+                requested_profile
+                if requested_profile and requested_profile.lower() != "current"
+                else None,
+            )
         except Exception:
             pass
 
@@ -2274,6 +2295,21 @@ async def get_status(profile: Optional[str] = None):
     finally:
         if status_scope is not None:
             status_scope.__exit__(*sys.exc_info())
+
+
+def _read_active_session_count(profile: Optional[str] = None) -> int:
+    """Blocking active-session status read; callers must offload it."""
+    db = _open_session_db_for_profile(profile)
+    try:
+        sessions = db.list_sessions_rich(limit=50)
+        now = time.time()
+        return sum(
+            1 for s in sessions
+            if s.get("ended_at") is None
+            and (now - s.get("last_active", s.get("started_at", 0))) < 300
+        )
+    finally:
+        db.close()
 
 
 _WINDOWS_11_MIN_BUILD = 22000
@@ -3450,55 +3486,86 @@ async def get_sessions(
     if profile:
         profile_name, _ = _cron_profile_home(profile)
     try:
-        db = _open_session_db_for_profile(profile)
-        try:
-            min_message_count = max(0, min_messages)
-            archived_only = archived == "only"
-            include_archived = archived == "include"
-            # Optional source scoping: ``source`` includes a single class,
-            # ``exclude_sources`` (comma-separated) drops classes. The desktop
-            # uses these to split recents (exclude=cron) from the cron-jobs
-            # section (source=cron) into two independent lists.
-            exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
-            sessions = db.list_sessions_rich(
-                source=source or None,
-                exclude_sources=exclude_list or None,
-                cwd_prefix=(cwd_prefix or None),
-                limit=limit,
-                offset=offset,
-                min_message_count=min_message_count,
-                include_archived=include_archived,
-                archived_only=archived_only,
-                order_by_last_active=order == "recent",
+        min_message_count = max(0, min_messages)
+        archived_only = archived == "only"
+        include_archived = archived == "include"
+        # Optional source scoping: ``source`` includes a single class,
+        # ``exclude_sources`` (comma-separated) drops classes. The desktop
+        # uses these to split recents (exclude=cron) from the cron-jobs
+        # section (source=cron) into two independent lists.
+        exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
+        sessions, total = await _session_db_read(
+            _read_sessions_page,
+            profile,
+            source or None,
+            exclude_list or None,
+            cwd_prefix or None,
+            limit,
+            offset,
+            min_message_count,
+            include_archived,
+            archived_only,
+            order == "recent",
+            heavy=int(limit or 0) >= 1000,
+        )
+        now = time.time()
+        for s in sessions:
+            s["is_active"] = (
+                s.get("ended_at") is None
+                and (now - s.get("last_active", s.get("started_at", 0))) < 300
             )
-            total = db.session_count(
-                source=source or None,
-                cwd_prefix=(cwd_prefix or None),
-                exclude_sources=exclude_list or None,
-                min_message_count=min_message_count,
-                include_archived=include_archived,
-                archived_only=archived_only,
-                exclude_children=True,
-            )
-            now = time.time()
-            for s in sessions:
-                s["is_active"] = (
-                    s.get("ended_at") is None
-                    and (now - s.get("last_active", s.get("started_at", 0))) < 300
-                )
-                if profile_name:
-                    s["profile"] = profile_name
-                    s["is_default_profile"] = profile_name == "default"
-                # SQLite stores the flag as 0/1; expose a real JSON boolean.
-                s["archived"] = bool(s.get("archived"))
-            return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
-        finally:
-            db.close()
+            if profile_name:
+                s["profile"] = profile_name
+                s["is_default_profile"] = profile_name == "default"
+            # SQLite stores the flag as 0/1; expose a real JSON boolean.
+            s["archived"] = bool(s.get("archived"))
+            s["pinned"] = bool(s.get("pinned"))
+        return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
     except HTTPException:
         raise
     except Exception:
         _log.exception("GET /api/sessions failed")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+def _read_sessions_page(
+    profile: Optional[str],
+    source: Optional[str],
+    exclude_sources: Optional[List[str]],
+    cwd_prefix: Optional[str],
+    limit: int,
+    offset: int,
+    min_message_count: int,
+    include_archived: bool,
+    archived_only: bool,
+    order_by_last_active: bool,
+):
+    """Blocking sessions-page read; callers must offload it."""
+    db = _open_session_db_for_profile(profile)
+    try:
+        sessions = db.list_sessions_rich(
+            source=source,
+            exclude_sources=exclude_sources,
+            cwd_prefix=cwd_prefix,
+            limit=limit,
+            offset=offset,
+            min_message_count=min_message_count,
+            include_archived=include_archived,
+            archived_only=archived_only,
+            order_by_last_active=order_by_last_active,
+        )
+        total = db.session_count(
+            source=source,
+            cwd_prefix=cwd_prefix,
+            exclude_sources=exclude_sources,
+            min_message_count=min_message_count,
+            include_archived=include_archived,
+            archived_only=archived_only,
+            exclude_children=True,
+        )
+        return sessions, total
+    finally:
+        db.close()
 
 
 @app.get("/api/profiles/sessions")
@@ -3601,6 +3668,7 @@ def get_profiles_sessions(
                     and (now - s.get("last_active", s.get("started_at", 0))) < 300
                 )
                 s["archived"] = bool(s.get("archived"))
+                s["pinned"] = bool(s.get("pinned"))
                 merged.append(s)
         except Exception as exc:
             errors.append({"profile": name, "error": str(exc)})
@@ -3635,153 +3703,162 @@ async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] =
     if not q or not q.strip():
         return {"results": []}
     try:
-        db = _open_session_db_for_profile(profile)
-        try:
-            safe_limit = max(1, min(int(limit or 20), 100))
-
-            # Walk parent_session_id to the compression root, memoized so a
-            # chain of compression segments only costs one walk. We deliberately
-            # stop at branch/delegate edges: those sessions may diverge from the
-            # parent and should remain searchable on their own.
-            root_cache: dict = {}
-
-            def compression_root(session_id: str) -> str:
-                if not session_id:
-                    return session_id
-                if session_id in root_cache:
-                    return root_cache[session_id]
-                chain = []
-                cur = session_id
-                visited = set()
-                root = session_id
-                while cur and cur not in visited:
-                    visited.add(cur)
-                    chain.append(cur)
-                    if cur in root_cache:
-                        root = root_cache[cur]
-                        break
-                    try:
-                        s = db.get_session(cur)
-                    except Exception:
-                        s = None
-                    if not s:
-                        root = cur
-                        break
-                    parent = s.get("parent_session_id") if isinstance(s, dict) else None
-                    if not parent:
-                        root = cur
-                        break
-                    try:
-                        parent_session = db.get_session(parent)
-                    except Exception:
-                        parent_session = None
-                    if not parent_session:
-                        root = cur
-                        break
-                    parent_ended_at = parent_session.get("ended_at")
-                    started_at = s.get("started_at")
-                    is_compression_edge = (
-                        parent_session.get("end_reason") == "compression"
-                        and parent_ended_at is not None
-                        and started_at is not None
-                        and started_at >= parent_ended_at
-                    )
-                    if not is_compression_edge:
-                        root = cur
-                        break
-                    cur = parent
-                for node in chain:
-                    root_cache[node] = root
-                return root
-
-            tip_cache: dict = {}
-
-            def lineage_tip(root_id: str) -> str:
-                if root_id in tip_cache:
-                    return tip_cache[root_id]
-                tip = root_id
-                try:
-                    resolved = db.get_compression_tip(root_id)
-                    if resolved:
-                        tip = resolved
-                except Exception:
-                    pass
-                tip_cache[root_id] = tip
-                return tip
-
-            # Both ID matches and content matches share one keyspace, keyed by
-            # compression lineage root, so an id-hit and a content-hit on the
-            # same logical conversation collapse to a single result. The first
-            # hit for a lineage wins; ID matches run first and take priority.
-            seen: dict = {}
-
-            def add_lineage_result(raw_sid: str, payload: dict) -> None:
-                if not raw_sid:
-                    return
-                root = compression_root(raw_sid)
-                if root in seen or len(seen) >= safe_limit:
-                    return
-                payload = dict(payload)
-                payload["session_id"] = lineage_tip(root)
-                payload["lineage_root"] = root
-                seen[root] = payload
-
-            # Direct ID matches first: users often paste a session id from CLI,
-            # logs, or another Hermes surface. FTS can't find those unless the
-            # id happens to appear in message text. search_sessions_by_id is
-            # SQL-bounded, so this stays cheap even with thousands of sessions.
-            for row in db.search_sessions_by_id(q, limit=safe_limit, include_archived=True):
-                sid = row.get("id")
-                preview = (row.get("preview") or "").strip()
-                snippet = preview or f"Session ID: {sid}"
-                add_lineage_result(
-                    sid,
-                    {
-                        "snippet": snippet,
-                        "role": None,
-                        "source": row.get("source"),
-                        "model": row.get("model"),
-                        "session_started": row.get("started_at"),
-                    },
-                )
-
-            # Auto-add prefix wildcards so partial words match
-            # e.g. "nimb" → "nimb*" matches "nimby"
-            # Preserve quoted phrases and existing wildcards as-is
-            import re
-            terms = []
-            for token in re.findall(r'"[^"]*"|\S+', q.strip()):
-                if token.startswith('"') or token.endswith("*"):
-                    terms.append(token)
-                else:
-                    terms.append(token + "*")
-            prefix_query = " ".join(terms)
-            # Over-fetch so lineage dedup can still surface `limit` distinct
-            # conversations even when several hits collapse onto one root.
-            fetch_limit = max(safe_limit * 5, 50)
-            matches = db.search_messages(query=prefix_query, limit=fetch_limit)
-
-            for m in matches:
-                if len(seen) >= safe_limit:
-                    break
-                add_lineage_result(
-                    m["session_id"],
-                    {
-                        "snippet": m.get("snippet", ""),
-                        "role": m.get("role"),
-                        "source": m.get("source"),
-                        "model": m.get("model"),
-                        "session_started": m.get("session_started"),
-                    },
-                )
-            return {"results": list(seen.values())}
-        finally:
-            db.close()
+        safe_limit = max(1, min(int(limit or 20), 100))
+        return await _session_db_read(
+            _read_session_search,
+            profile,
+            q,
+            safe_limit,
+            heavy=True,
+        )
     except HTTPException:
         raise
     except Exception:
         _log.exception("GET /api/sessions/search failed")
         raise HTTPException(status_code=500, detail="Search failed")
+
+
+def _read_session_search(profile: Optional[str], q: str, safe_limit: int):
+    """Blocking search-session read; callers must offload it."""
+    db = _open_session_db_for_profile(profile)
+    try:
+        # Walk parent_session_id to the compression root, memoized so a
+        # chain of compression segments only costs one walk. We deliberately
+        # stop at branch/delegate edges: those sessions may diverge from the
+        # parent and should remain searchable on their own.
+        root_cache: dict = {}
+
+        def compression_root(session_id: str) -> str:
+            if not session_id:
+                return session_id
+            if session_id in root_cache:
+                return root_cache[session_id]
+            chain = []
+            cur = session_id
+            visited = set()
+            root = session_id
+            while cur and cur not in visited:
+                visited.add(cur)
+                chain.append(cur)
+                if cur in root_cache:
+                    root = root_cache[cur]
+                    break
+                try:
+                    s = db.get_session(cur)
+                except Exception:
+                    s = None
+                if not s:
+                    root = cur
+                    break
+                parent = s.get("parent_session_id") if isinstance(s, dict) else None
+                if not parent:
+                    root = cur
+                    break
+                try:
+                    parent_session = db.get_session(parent)
+                except Exception:
+                    parent_session = None
+                if not parent_session:
+                    root = cur
+                    break
+                parent_ended_at = parent_session.get("ended_at")
+                started_at = s.get("started_at")
+                is_compression_edge = (
+                    parent_session.get("end_reason") == "compression"
+                    and parent_ended_at is not None
+                    and started_at is not None
+                    and started_at >= parent_ended_at
+                )
+                if not is_compression_edge:
+                    root = cur
+                    break
+                cur = parent
+            for node in chain:
+                root_cache[node] = root
+            return root
+
+        tip_cache: dict = {}
+
+        def lineage_tip(root_id: str) -> str:
+            if root_id in tip_cache:
+                return tip_cache[root_id]
+            tip = root_id
+            try:
+                resolved = db.get_compression_tip(root_id)
+                if resolved:
+                    tip = resolved
+            except Exception:
+                pass
+            tip_cache[root_id] = tip
+            return tip
+
+        # Both ID matches and content matches share one keyspace, keyed by
+        # compression lineage root, so an id-hit and a content-hit on the
+        # same logical conversation collapse to a single result. The first
+        # hit for a lineage wins; ID matches run first and take priority.
+        seen: dict = {}
+
+        def add_lineage_result(raw_sid: str, payload: dict) -> None:
+            if not raw_sid:
+                return
+            root = compression_root(raw_sid)
+            if root in seen or len(seen) >= safe_limit:
+                return
+            payload = dict(payload)
+            payload["session_id"] = lineage_tip(root)
+            payload["lineage_root"] = root
+            seen[root] = payload
+
+        # Direct ID matches first: users often paste a session id from CLI,
+        # logs, or another Hermes surface. FTS can't find those unless the
+        # id happens to appear in message text. search_sessions_by_id is
+        # SQL-bounded, so this stays cheap even with thousands of sessions.
+        for row in db.search_sessions_by_id(q, limit=safe_limit, include_archived=True):
+            sid = row.get("id")
+            preview = (row.get("preview") or "").strip()
+            snippet = preview or f"Session ID: {sid}"
+            add_lineage_result(
+                sid,
+                {
+                    "snippet": snippet,
+                    "role": None,
+                    "source": row.get("source"),
+                    "model": row.get("model"),
+                    "session_started": row.get("started_at"),
+                },
+            )
+
+        # Auto-add prefix wildcards so partial words match
+        # e.g. "nimb" → "nimb*" matches "nimby"
+        # Preserve quoted phrases and existing wildcards as-is
+        terms = []
+        for token in re.findall(r'"[^"]*"|\S+', q.strip()):
+            if token.startswith('"') or token.endswith("*"):
+                terms.append(token)
+            else:
+                terms.append(token + "*")
+        prefix_query = " ".join(terms)
+        # Over-fetch so lineage dedup can still surface `limit` distinct
+        # conversations even when several hits collapse onto one root.
+        fetch_limit = max(safe_limit * 5, 50)
+        matches = db.search_messages(query=prefix_query, limit=fetch_limit)
+
+        for m in matches:
+            if len(seen) >= safe_limit:
+                break
+            add_lineage_result(
+                m["session_id"],
+                {
+                    "snippet": m.get("snippet", ""),
+                    "role": m.get("role"),
+                    "source": m.get("source"),
+                    "model": m.get("model"),
+                    "session_started": m.get("session_started"),
+                },
+            )
+        return {"results": list(seen.values())}
+    finally:
+        db.close()
 
 
 def _normalize_config_for_web(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -8001,6 +8078,11 @@ async def get_session_stats(profile: Optional[str] = None):
     Registered before ``/api/sessions/{session_id}`` so the literal ``stats``
     path isn't captured as a session id by the parameterized route.
     """
+    return await _blocking_io(_read_session_stats, profile)
+
+
+def _read_session_stats(profile: Optional[str] = None):
+    """Blocking SessionDB stats read; callers must offload from async handlers."""
     db = _open_session_db_for_profile(profile)
     try:
         total = db.session_count(include_archived=True)
@@ -8009,9 +8091,7 @@ async def get_session_stats(profile: Optional[str] = None):
         messages = db.message_count()
         by_source: Dict[str, int] = {}
         try:
-            for s in db.list_sessions_rich(limit=10000, include_archived=True):
-                src = str(s.get("source") or "cli")
-                by_source[src] = by_source.get(src, 0) + 1
+            by_source = db.session_counts_by_source(include_archived=True)
         except Exception:
             pass
         return {
@@ -8042,14 +8122,20 @@ def _open_session_db_for_profile(profile: Optional[str]):
 
 @app.get("/api/sessions/{session_id}")
 async def get_session_detail(session_id: str, profile: Optional[str] = None):
+    session = await _session_db_read(_read_session_detail, session_id, profile)
+    if profile:
+        session["profile"] = _cron_profile_home(profile)[0]
+    return session
+
+
+def _read_session_detail(session_id: str, profile: Optional[str] = None):
+    """Blocking session-detail read; callers must offload it."""
     db = _open_session_db_for_profile(profile)
     try:
         sid = db.resolve_session_id(session_id)
         session = db.get_session(sid) if sid else None
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
-        if profile:
-            session["profile"] = _cron_profile_home(profile)[0]
         return session
     finally:
         db.close()
@@ -8110,6 +8196,7 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
 class SessionRename(BaseModel):
     title: Optional[str] = None
     archived: Optional[bool] = None
+    pinned: Optional[bool] = None
     # Mutate a session belonging to another profile (opens its state.db). Omit
     # for the current/default profile.
     profile: Optional[str] = None
@@ -8120,30 +8207,53 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
     """Update a session: rename (or clear its title) and/or archive it.
 
     ``title`` renames (empty/null clears the title); ``archived`` soft-hides or
-    restores the session. Either field may be omitted. ``profile`` targets
+    restores the session; ``pinned`` updates the sidebar pin flag. Any field may
+    be omitted. ``profile`` targets
     another profile's session.
     """
-    db = _open_session_db_for_profile(body.profile)
+    return await _session_db_read(
+        _rename_session_record,
+        session_id,
+        body.profile,
+        body.title,
+        body.archived,
+        body.pinned,
+    )
+
+
+def _rename_session_record(
+    session_id: str,
+    profile: Optional[str],
+    title: Optional[str],
+    archived: Optional[bool],
+    pinned: Optional[bool],
+):
+    """Blocking session update/read; callers must offload it."""
+    db = _open_session_db_for_profile(profile)
     try:
         sid = db.resolve_session_id(session_id)
         if not sid:
             raise HTTPException(status_code=404, detail="Session not found")
-        if body.title is None and body.archived is None:
+        if title is None and archived is None and pinned is None:
             raise HTTPException(
                 status_code=400,
-                detail="Nothing to update; provide 'title' and/or 'archived'.",
+                detail="Nothing to update; provide 'title', 'archived', and/or 'pinned'.",
             )
-        if body.title is not None:
+        if title is not None:
             try:
-                db.set_session_title(sid, body.title or "")
+                db.set_session_title(sid, title or "")
             except ValueError as e:
                 # Title too long, invalid characters, or already in use.
                 raise HTTPException(status_code=400, detail=str(e))
-        if body.archived is not None:
-            db.set_session_archived(sid, body.archived)
+        if archived is not None:
+            db.set_session_archived(sid, archived)
+        if pinned is not None:
+            db.set_session_pinned(sid, pinned)
         result = {"ok": True, "title": db.get_session_title(sid) or ""}
-        if body.archived is not None:
-            result["archived"] = bool(body.archived)
+        if archived is not None:
+            result["archived"] = bool(archived)
+        if pinned is not None:
+            result["pinned"] = bool(pinned)
         return result
     finally:
         db.close()

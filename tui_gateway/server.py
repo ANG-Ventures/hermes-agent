@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -1206,6 +1207,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 # id — pass it through so the upgrade continues that session
                 # instead of starting a fresh one under the same key.
                 kw = {"session_db": session_db}
+                # The deferred build happens turns after session.create/resume,
+                # so carry the originating client (desktop/dashboard/…) off the
+                # session dict rather than losing it to the "tui" default.
+                kw["source"] = _session_source(current)
                 if resume_sid := current.get("resume_session_id"):
                     kw["session_id"] = resume_sid
                 resume_overrides = current.get("resume_runtime_overrides")
@@ -1473,6 +1478,31 @@ def _display_session_cwd(session: dict | None) -> str:
         _persist_session_git_meta(session, healed)
 
     return healed
+
+
+# A client (Ink stdio, desktop app, dashboard SPA, future mobile) may name
+# itself via the ``source`` param on session.create/resume so telemetry and the
+# blackbox ``platform`` dimension can tell them apart — they all share this one
+# JSON-RPC server, so without a self-declared label every client records as
+# "tui". The label is free-form (new clients name themselves; no central enum to
+# keep in sync — see the "fixed set of platform names goes stale" note below),
+# but it flows into a persisted DB dimension, so it is sanitized to a short
+# slug and anything malformed/absent falls back to "tui" (the stdio default).
+_CLIENT_SOURCE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,23}$")
+
+
+def _sanitize_client_source(raw: object) -> str:
+    """Normalize a client-declared source label; fall back to ``tui``.
+
+    Untrusted client input feeds a persisted ``source``/``platform`` value, so
+    accept only a genuine ``str`` (a JSON-RPC ``true``/``0`` is not a source
+    label — guard with ``isinstance`` so ``True`` can't coerce to ``"true"``),
+    lowercase, strip, and require a conservative slug; anything else → ``tui``.
+    """
+    if not isinstance(raw, str):
+        return "tui"
+    label = raw.strip().lower()
+    return label if _CLIENT_SOURCE_RE.match(label) else "tui"
 
 
 def _session_source(session: dict | None) -> str:
@@ -2808,13 +2838,50 @@ def _sync_agent_model_with_config(sid: str, session: dict) -> None:
         )
 
 
+class _ManualCompressionInProgress(RuntimeError):
+    pass
+
+
+def _manual_compression_lock(session: dict) -> threading.Lock:
+    with session["history_lock"]:
+        lock = session.get("manual_compression_lock")
+        if lock is None:
+            lock = threading.Lock()
+            session["manual_compression_lock"] = lock
+        return lock
+
+
 def _compress_session_history(
     session: dict,
-    focus_topic: str | None = None,
-    approx_tokens: int | None = None,
-    before_messages: list | None = None,
-    history_version: int | None = None,
-) -> tuple[int, dict]:
+    focus_topic: Optional[str] = None,
+    approx_tokens: Optional[int] = None,
+    before_messages: Optional[list] = None,
+    history_version: Optional[int] = None,
+) -> tuple:
+    lock = _manual_compression_lock(session)
+    if not lock.acquire(blocking=False):
+        raise _ManualCompressionInProgress(
+            "already compressing this session — wait for the current /compress to finish"
+        )
+    try:
+        return _compress_session_history_locked(
+            session,
+            focus_topic=focus_topic,
+            approx_tokens=approx_tokens,
+            before_messages=before_messages,
+            history_version=history_version,
+        )
+    finally:
+        lock.release()
+
+
+def _compress_session_history_locked(
+    session: dict,
+    focus_topic: Optional[str] = None,
+    approx_tokens: Optional[int] = None,
+    before_messages: Optional[list] = None,
+    history_version: Optional[int] = None,
+) -> tuple:
     from agent.model_metadata import estimate_request_tokens_rough
 
     agent = session["agent"]
@@ -2848,11 +2915,19 @@ def _compress_session_history(
         None,
         approx_tokens=approx_tokens,
         focus_topic=focus_topic or None,
+        force=True,
     )
     with session["history_lock"]:
         if int(session.get("history_version", 0)) != history_version:
             # External mutation during compaction — drop the compressed
             # result so we don't clobber concurrent edits.
+            usage = _get_usage(agent)
+            return 0, usage
+        if compressed is history:
+            # The compressor's lock-skip/no-op paths return the exact input
+            # list object. Do not swap the live history or bump the write-fence
+            # version for a no-op; a same-length but distinct rebuilt transcript
+            # still lands below.
             usage = _get_usage(agent)
             return 0, usage
         session["history"] = compressed
@@ -3050,7 +3125,8 @@ def _current_profile_name() -> str:
 # checkout), surfacing a one-click "update to align" prompt instead of failing
 # cryptically downstream. Bump whenever the desktop's backend contract changes.
 # v2: adds the file.attach RPC (remote-gateway non-image file upload).
-DESKTOP_BACKEND_CONTRACT = 2
+# v3: adds server-side pinned sessions (`pinned` session rows + session.pin).
+DESKTOP_BACKEND_CONTRACT = 3
 
 
 def _session_info(agent, session: dict | None = None) -> dict:
@@ -3107,6 +3183,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "personality": str(personality or ""),
         "running": bool((session or {}).get("running")),
         "title": _session_live_title(session or {}, session_key) if session_key else "",
+        "pinned": _session_live_pinned(session or {}, session_key) if session_key else False,
         "desktop_contract": DESKTOP_BACKEND_CONTRACT,
         "version": "",
         "release_date": "",
@@ -4036,6 +4113,8 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
             # session set). See the cross-session-contamination note in
             # _apply_model_switch.
             model_override=session.get("model_override"),
+            # Preserve the originating client (desktop/dashboard/…) across /new.
+            source=_session_source(session),
         )
     finally:
         _clear_session_context(tokens)
@@ -4184,6 +4263,7 @@ def _make_agent(
     provider_override: str | None = None,
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
+    source: str | None = None,
 ):
     from run_agent import AIAgent
 
@@ -4326,7 +4406,10 @@ def _make_agent(
         provider_sort=_pr.get("sort"),
         provider_require_parameters=_pr.get("require_parameters", False),
         provider_data_collection=_pr.get("data_collection"),
-        platform="tui",
+        # Which client drove this session (desktop / dashboard / mobile / tui).
+        # Sanitized at the RPC edge; ``None`` (stdio Ink, internal rebuilds)
+        # keeps the historical "tui" default so nothing regresses.
+        platform=_sanitize_client_source(source),
         session_id=session_id or key,
         session_db=session_db if session_db is not None else _get_db(),
         ephemeral_system_prompt=system_prompt or None,
@@ -4347,6 +4430,7 @@ def _init_session(
     cols: int = 80,
     cwd: str | None = None,
     session_db=None,
+    source: str | None = None,
 ):
     now = time.time()
     with _sessions_lock:
@@ -4373,6 +4457,11 @@ def _init_session(
             # Honored on rebuild (/new, resume) so a switch in THIS session
             # never leaks into siblings via process-global env vars.
             "model_override": None,
+            # Originating client (desktop/dashboard/mobile/tui). Keeps this
+            # session dict's source in step with the agent's platform so a turn's
+            # HERMES_SESSION_SOURCE (DB-row source) and blackbox platform agree.
+            # None (stdio Ink, internal rebuilds) → the historical "tui" default.
+            "source": _sanitize_client_source(source),
             # Pin async event emissions to whichever transport created the
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,
@@ -4876,7 +4965,7 @@ def _(rid, params: dict) -> dict:
     except Exception:
         explicit_cwd = False
     resolved_cwd = _completion_cwd(params)
-    source = str(params.get("source") or "tui").strip() or "tui"
+    source = _sanitize_client_source(params.get("source"))
     _enable_gateway_prompts()
 
     # ``profile`` (app-global remote mode): a new chat started under a non-launch
@@ -5036,6 +5125,7 @@ def _(rid, params: dict) -> dict:
                         "started_at": s.get("started_at") or 0,
                         "message_count": s.get("message_count") or 0,
                         "source": s.get("source") or "",
+                        "pinned": bool(s.get("pinned")),
                     }
                     for s in rows
                 ]
@@ -5506,6 +5596,12 @@ def _(rid, params: dict) -> dict:
                 target,
                 session_id=target,
                 session_db=db,
+                # Prefer the client's declared source on this resume; else keep
+                # the label the session was persisted with (never silently
+                # relabel a desktop/dashboard session to "tui" on resume).
+                source=_sanitize_client_source(
+                    params.get("source") or found.get("source")
+                ),
                 **stored_runtime_overrides,
             )
         finally:
@@ -5556,6 +5652,9 @@ def _(rid, params: dict) -> dict:
                     cols=cols,
                     cwd=profile_resume_cwd,
                     session_db=db,
+                    source=_sanitize_client_source(
+                        params.get("source") or found.get("source")
+                    ),
                 )
             finally:
                 if init_home_token is not None:
@@ -5659,6 +5758,22 @@ def _session_live_title(session: dict, key: str) -> str:
     return title
 
 
+def _session_live_pinned(session: dict, key: str) -> bool:
+    if "pinned" in session:
+        return bool(session.get("pinned"))
+    db = _get_db()
+    if db is not None:
+        try:
+            row = db.get_session(key)
+            if row is not None:
+                pinned = bool(row.get("pinned"))
+                session["pinned"] = pinned
+                return pinned
+        except Exception:
+            pass
+    return False
+
+
 def _session_live_item(sid: str, session: dict, current_sid: str = "") -> dict:
     key = _session_lookup_key(session, fallback=sid)
     agent = session.get("agent")
@@ -5677,6 +5792,7 @@ def _session_live_item(sid: str, session: dict, current_sid: str = "") -> dict:
         "message_count": len(history),
         "model": str(getattr(agent, "model", "") or _resolve_model()),
         "preview": preview,
+        "pinned": _session_live_pinned(session, key),
         "session_key": key,
         "started_at": float(session.get("created_at") or now),
         "status": status,
@@ -5935,6 +6051,30 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"pending": True, "title": title})
     except ValueError as e:
         return _err(rid, 4022, str(e))
+    except Exception as e:
+        return _err(rid, 5007, str(e))
+
+
+@method("session.pin")
+def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    assert session is not None
+    db = _get_db()
+    if db is None:
+        return _db_unavailable_error(rid, code=5007)
+    key = session["session_key"]
+    pinned = bool(params.get("pinned"))
+    try:
+        if not db.set_session_pinned(key, pinned):
+            _ensure_session_db_row(session)
+            with _session_db(session) as scoped_db:
+                if scoped_db is None or not scoped_db.set_session_pinned(key, pinned):
+                    return _err(rid, 5007, "session pin failed")
+        session["pinned"] = pinned
+        _emit_session_info_for_session(params.get("session_id", ""), session)
+        return _ok(rid, {"pinned": pinned, "session_key": key})
     except Exception as e:
         return _err(rid, 5007, str(e))
 
@@ -7749,6 +7889,8 @@ def _(rid, params: dict) -> dict:
             # reverts to neutral whether compaction succeeded, was a
             # no-op, or raised.
             _status_update(sid, "ready")
+    except _ManualCompressionInProgress as e:
+        return _err(rid, 4009, str(e))
     except Exception as e:
         return _err(rid, 5005, str(e))
 
@@ -7876,11 +8018,28 @@ def _(rid, params: dict) -> dict:
     try:
         tokens = _set_session_context(new_key)
         try:
-            agent = _make_agent(new_sid, new_key, session_id=new_key)
+            agent = _make_agent(
+                new_sid,
+                new_key,
+                session_id=new_key,
+                # A branch inherits its parent's client label unless the caller
+                # names one explicitly, so a forked chat stays attributed to the
+                # desktop/dashboard it was branched from.
+                source=_sanitize_client_source(
+                    params.get("source") or _session_source(session)
+                ),
+            )
         finally:
             _clear_session_context(tokens)
         _init_session(
-            new_sid, new_key, agent, list(history), cols=session.get("cols", 80)
+            new_sid,
+            new_key,
+            agent,
+            list(history),
+            cols=session.get("cols", 80),
+            source=_sanitize_client_source(
+                params.get("source") or _session_source(session)
+            ),
         )
         if new_sid in _sessions:
             _sessions[new_sid]["active_session_lease"] = lease
@@ -11235,6 +11394,150 @@ _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset(
 
 _WORKER_BLOCKED_COMMANDS: frozenset[str] = frozenset({"snapshot", "snap"})
 
+_LIVE_SESSION_DIRECT_COMMANDS = frozenset(
+    {
+        "clear",
+        "compress",
+        "effort",
+        "history",
+        "models",
+        "prompt",
+        "rename",
+        "status",
+        "usage",
+    }
+)
+
+
+def _format_live_usage_output(session: dict) -> str:
+    agent = session.get("agent")
+    if agent is None:
+        return "(._.) No active agent -- send a message first."
+    usage = _get_usage(agent)
+    with session["history_lock"]:
+        message_count = len(session.get("history", []))
+    lines = [
+        "Session Token Usage",
+        "────────────────────────────────────────",
+        f"Model: {usage.get('model') or getattr(agent, 'model', '') or '(unknown)'}",
+        f"Input tokens:                 {int(usage.get('input') or 0):,}",
+        f"Output tokens:                {int(usage.get('output') or 0):,}",
+    ]
+    reasoning = int(usage.get("reasoning") or 0)
+    if reasoning:
+        lines.append(f"Reasoning tokens:             {reasoning:,}")
+    lines.extend(
+        [
+            f"Prompt tokens:                {int(usage.get('prompt') or 0):,}",
+            f"Completion tokens:            {int(usage.get('completion') or 0):,}",
+            f"Total tokens:                 {int(usage.get('total') or 0):,}",
+            f"API calls:                    {int(usage.get('calls') or 0):,}",
+        ]
+    )
+    if usage.get("context_max"):
+        lines.append(
+            "Current context:              "
+            f"{int(usage.get('context_used') or 0):,} / "
+            f"{int(usage.get('context_max') or 0):,} "
+            f"({int(usage.get('context_percent') or 0)}%)"
+        )
+    lines.extend(
+        [
+            f"Messages:                     {message_count:,}",
+            f"Compressions:                 {int(usage.get('compressions') or 0):,}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _format_live_history_output(session: dict) -> str:
+    with session["history_lock"]:
+        history = list(session.get("history", []))
+    db = _get_db()
+    if db is not None and session.get("session_key"):
+        try:
+            history = db.get_messages_as_conversation(
+                session["session_key"], include_ancestors=True
+            )
+        except Exception:
+            pass
+    messages = _history_to_messages(history)
+    if not messages:
+        return "No conversation history yet."
+    lines = ["Conversation History", "────────────────────────────────────────"]
+    for idx, message in enumerate(messages, start=1):
+        role = str(message.get("role") or "unknown")
+        label = "You" if role == "user" else "Hermes" if role == "assistant" else role.title()
+        text = str(message.get("text") or message.get("context") or "").strip()
+        if len(text) > 400:
+            text = f"{text[:400]}..."
+        lines.append(f"[{label} #{idx}] {text or '(no text)'}")
+    return "\n".join(lines)
+
+
+def _format_live_prompt_output(session: dict) -> str:
+    agent = session.get("agent")
+    if agent is None:
+        return "No active agent -- send a message first."
+    prompt = (
+        getattr(agent, "ephemeral_system_prompt", None)
+        or getattr(agent, "_cached_system_prompt", None)
+        or ""
+    )
+    if not prompt:
+        return "Current system prompt is not built yet; send a message first."
+    return f"Current system prompt:\n{prompt}"
+
+
+def _format_live_model_output(session: dict) -> str:
+    agent = session.get("agent")
+    model = getattr(agent, "model", "") if agent is not None else ""
+    provider = getattr(agent, "provider", "") if agent is not None else ""
+    if model and provider:
+        return f"Current model: {model} ({provider})"
+    if model:
+        return f"Current model: {model}"
+    return "Current model: (unknown)"
+
+
+def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg: str) -> Optional[str]:
+    name = (name or "").lstrip("/").lower()
+    arg = arg or ""
+    if name == "model" and not arg.strip():
+        return _format_live_model_output(session or {})
+    if name not in _LIVE_SESSION_DIRECT_COMMANDS:
+        return None
+    if name == "compress":
+        if session is None:
+            return "no active session for /compress"
+        return _mirror_slash_side_effects(sid, session, f"/compress {arg}".strip())
+    if name == "usage":
+        if session is None:
+            return "(._.) No active agent -- send a message first."
+        return _format_live_usage_output(session)
+    if name == "history":
+        if session is None:
+            return "No conversation history yet."
+        return _format_live_history_output(session)
+    if name == "prompt":
+        if session is None:
+            return "No active agent -- send a message first."
+        return _format_live_prompt_output(session)
+    if name == "status":
+        response = _methods["session.status"]("status", {"session_id": sid})
+        if response.get("error"):
+            return str(response["error"].get("message") or "status unavailable")
+        return str(response.get("result", {}).get("output") or "")
+    if name == "clear":
+        return "Screen clear is terminal-only; desktop/TUI chat left unchanged."
+    if name == "models":
+        return "Use /model to view or switch the current model; desktop users can also open the model picker."
+    if name == "rename":
+        return "Use /title <name> to rename this session."
+    if name == "effort":
+        return "Use /reasoning <effort> to change reasoning effort."
+    return None
+
 
 @method("commands.catalog")
 def _(rid, params: dict) -> dict:
@@ -11493,6 +11796,12 @@ def _(rid, params: dict) -> dict:
                 )
     except Exception:
         pass
+
+    live_output = _live_slash_command_output(
+        params.get("session_id", ""), session, name, arg
+    )
+    if live_output is not None:
+        return _ok(rid, {"type": "exec", "output": live_output or "(no output)"})
 
     # ── Commands that queue messages onto _pending_input in the CLI ───
     # In the TUI the slash worker subprocess has no reader for that queue,
@@ -12545,6 +12854,8 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             from tools.process_registry import process_registry
 
             process_registry.kill_all()
+    except _ManualCompressionInProgress as e:
+        return str(e)
     except Exception as e:
         return f"live session sync failed: {e}"
     return ""
@@ -12622,6 +12933,12 @@ def _(rid, params: dict) -> dict:
             return _ok(rid, {"output": str(result or "(no output)")})
         except Exception as e:
             return _ok(rid, {"output": f"Plugin command error: {e}"})
+
+    live_output = _live_slash_command_output(
+        params.get("session_id", ""), session, _cmd_base, _cmd_arg
+    )
+    if live_output is not None:
+        return _ok(rid, {"output": live_output or "(no output)"})
 
     worker = session.get("slash_worker")
     if not worker:
