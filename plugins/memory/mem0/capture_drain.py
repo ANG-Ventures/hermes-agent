@@ -180,11 +180,13 @@ class CaptureDrainWorker:
             kwargs["model"] = self._model
         try:
             added_count = self._add(messages, kwargs)
-            self._q.record_verdict(key, "ok")
-            # STICKY signal (Greptile P1): a remote row now exists. Survives a crash+reap that resets
-            # attempts to 0, so a later idem-check failure knows a possibly-secret-bearing row is live
-            # and must not be abandoned.
+            # STICKY signal FIRST (Greptile P1): the remote row now exists. Persist add_committed
+            # BEFORE record_verdict so a crash in this window can't leave a written row with no
+            # durable "a write happened" marker. It survives a crash+reap that resets attempts to 0,
+            # so a later idem-check failure knows a possibly-secret-bearing row is live and must not
+            # be abandoned.
             self._q.mark_add_committed(key)
+            self._q.record_verdict(key, "ok")
         except Exception as e:
             # transient model/network fault -> requeue with backoff (bounded), or dead-letter
             self._q.record_verdict(key, "fault")
