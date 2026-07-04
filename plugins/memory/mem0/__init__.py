@@ -345,7 +345,13 @@ class _DirectRestMem0Client:
         log as agent_id=null in recall_events (digest "unattributed"); correct recall
         scope is user-only, and attribution must never narrow results.
         """
-        body = {"query": query or "", "user_id": self._user_id,
+        # The self-host server REJECTS an empty/whitespace-only query with HTTP 400 ("Invalid
+        # query: cannot be empty or whitespace-only") even when a metadata `filters` clause is the
+        # real selector. For a pure metadata-equality lookup (e.g. capture_idem reconcile) there is
+        # no semantic query, so send a minimal non-empty placeholder; the `filters` clause does the
+        # actual selection. (Probed 2026-07-03: ""→400, "."→200 with the filter honored.)
+        q = query if (query and query.strip()) else "."
+        body = {"query": q, "user_id": self._user_id,
                 "filters": dict(meta_filters or {}), "top_k": top_k}
         return self._request("POST", "/search", body=body)
 
