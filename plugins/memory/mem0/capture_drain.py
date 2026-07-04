@@ -179,7 +179,7 @@ class CaptureDrainWorker:
         if self._model:
             kwargs["model"] = self._model
         try:
-            self._add(messages, kwargs)
+            added_count = self._add(messages, kwargs)
             self._q.record_verdict(key, "ok")
             # STICKY signal (Greptile P1): a remote row now exists. Survives a crash+reap that resets
             # attempts to 0, so a later idem-check failure knows a possibly-secret-bearing row is live
@@ -199,15 +199,16 @@ class CaptureDrainWorker:
             return True
 
         # POST-WRITE SCRUB (INV-4). See _scrub_written_or_requeue — fail-closed: never complete a row
-        # whose scrub boundary we could not prove clean.
-        if self._scrub_written_or_requeue(key, row):
+        # whose scrub boundary we could not prove clean. require_rows when the server said it wrote
+        # >=1 memory: an empty read then means index-lag (eventual consistency), not "nothing written".
+        if self._scrub_written_or_requeue(key, row, require_rows=bool(added_count)):
             return True
 
         self._q.mark_done(key)
         self.stats["drained"] += 1
         return True
 
-    def _scrub_written_or_requeue(self, key, row) -> bool:
+    def _scrub_written_or_requeue(self, key, row, *, require_rows: bool = False) -> bool:
         """Deterministically scrub the rows written for `key` and FORGET any secret-bearing one.
         The salience gate is NOT a reliable secret boundary (it leaked a bot token in the eval), so
         this is defense-in-depth (INV-4). FAIL-CLOSED (Greptile P1): if the rows can't be READ or a
@@ -215,12 +216,22 @@ class CaptureDrainWorker:
         recallable behind a done row. The scrub is idempotent (scanning a clean row is a no-op), so
         it's safe to re-run on the exactly-once shortcut path too.
 
+        require_rows: set True when THIS drain just committed add() — the server's metadata search is
+        eventually-consistent, so an EMPTY read right after the write is INCONCLUSIVE (the row exists
+        but isn't index-visible yet). Treat empty-as-inconclusive and requeue rather than completing
+        and leaving a just-written secret unscanned (Greptile P1). On the exactly-once shortcut path
+        (require_rows=False) an empty read is fine — the row genuinely extracted nothing.
+
         Returns True if the row was requeued/dead-lettered (caller must stop); False if clean.
         """
         if not (self._get_written and self._forget):
             return False
         try:
             written = self._get_written(key)   # [{id, memory}] — may raise on transient search fault
+            if require_rows and not written:
+                raise RuntimeError(
+                    "post-add scrub read returned 0 rows for a just-written add (metadata search "
+                    "not yet consistent) — inconclusive, failing closed until the row is visible")
             for r in written:
                 txt = r.get("memory", "") or ""
                 _, dropped = self._scrub([txt])

@@ -32,6 +32,7 @@ class FakeStore:
         text = messages[0]["content"]
         self._id += 1
         self.rows.append({"id": f"m{self._id}", "memory": text, "capture_idem": idem})
+        return 1   # server extracted+wrote 1 memory (drives require_rows in the post-write scrub)
 
     def recall_idem(self, key):
         self.recall_calls += 1
@@ -233,6 +234,32 @@ def test_exactly_once_shortcut_still_scrubs(q):
     assert w.stats["scrubbed"] == 1
     assert all(tok not in r["memory"] for r in store.rows)   # secret forgotten
     assert store.add_calls == 1                              # shortcut did NOT re-add
+    assert q.counts()["done"] == 1
+
+
+def test_empty_scrub_read_after_successful_add_requeues(q):
+    """Greptile P1: mem0's metadata search is eventually-consistent. If add() wrote >=1 memory but the
+    immediate scrub read returns empty (not yet index-visible), the row must NOT complete — that
+    would leave a just-written secret unscanned. It requeues until the row is visible."""
+    class LagStore(FakeStore):
+        def __init__(self):
+            super().__init__()
+            self.getwritten_calls = 0
+        def get_written(self, key):
+            self.getwritten_calls += 1
+            # first read after the add sees nothing (index lag); later reads see the row
+            if self.getwritten_calls <= 1:
+                return []
+            return [r for r in self.rows if r["capture_idem"] == key]
+    store = LagStore()
+    w = make_worker(q, store, backoff_base_s=0.0)
+    _enq(q, "some benign fact")
+    w.drain_once()
+    assert store.add_calls == 1              # the add happened (returned count=1)
+    assert w.stats["retried"] == 1           # empty read after write -> requeued, NOT completed
+    assert q.counts()["done"] == 0
+    # next drain: idem shortcut finds the now-visible row and scrubs+completes
+    w.drain_once()
     assert q.counts()["done"] == 1
 
 

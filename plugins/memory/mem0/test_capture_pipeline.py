@@ -20,6 +20,7 @@ class FakeStore:
         idem = (kwargs.get("metadata") or {}).get("capture_idem", "")
         self._id += 1
         self.rows.append({"id": f"m{self._id}", "memory": messages[0]["content"], "capture_idem": idem})
+        return 1
     def recall_idem(self, k): return sum(1 for r in self.rows if r["capture_idem"] == k)
     def get_written(self, k): return [r for r in self.rows if r["capture_idem"] == k]
     def forget(self, mid): self.rows = [r for r in self.rows if r["id"] != mid]

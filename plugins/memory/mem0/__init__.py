@@ -252,7 +252,11 @@ class _DirectRestMem0Client:
         # lands under this client's user/agent, never globally on the shared store (B4).
         scoped = self._scope({"user_id": kwargs.get("user_id"), "agent_id": kwargs.get("agent_id")})
         body.update(scoped)
-        for key in ("metadata", "infer", "run_id"):
+        # prompt = the salience gate (server-side extraction custom_instructions); model_chain =
+        # A-full per-call model fallback. Both MUST reach the wire or auto-capture extracts with the
+        # server default + no gate. (They were previously dropped — the server ignores unknown keys,
+        # so an old server simply falls back to its default, which is safe.)
+        for key in ("metadata", "infer", "run_id", "prompt", "model_chain"):
             if key in kwargs and kwargs[key] is not None:
                 body[key] = kwargs[key]
         return self._request("POST", "/memories", body=body)
@@ -1173,13 +1177,28 @@ class Mem0MemoryProvider(MemoryProvider):
         degrade-safe: on any construction error, returns None and capture stays off (INV-3)."""
         pipe = getattr(self, "_capture_pipeline", None)
         if pipe is not None:
+            # If capture was OFF at build time (worker not started) and has since been flipped ON,
+            # an idle agent may have inherited un-drained rows that never got a start signal
+            # (Greptile P1). Re-check on every access so a live enable activates the drain+reaper.
+            try:
+                pipe.maybe_start_pending()
+            except Exception:
+                pass
             return pipe
         try:
             from . import capture_pipeline, capture_scrub
 
-            def _add(messages, kwargs):
-                self._get_client().add(messages, **kwargs)
+            def _add(messages, kwargs) -> int:
+                # Returns the number of memories the server extracted+wrote for this turn, so the
+                # drainer knows whether to EXPECT rows in the post-write scrub read (0 extracted =>
+                # an empty scrub read is correct; >0 => an empty read is index-lag, must requeue).
+                resp = self._get_client().add(messages, **kwargs)
                 self._record_success()
+                try:
+                    results = resp.get("results", []) if isinstance(resp, dict) else (resp or [])
+                    return len(results)
+                except Exception:
+                    return 0
 
             def _recall_idem(key: str) -> int:
                 # NOTE: must RAISE on transient failure (do NOT swallow to 0). The drain worker
