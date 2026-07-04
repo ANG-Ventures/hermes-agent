@@ -17,7 +17,7 @@ import capture_pipeline as cp
 import capture_scrub as scrub
 from capture_queue import idem_key
 
-CFG = json.load(open(os.path.expanduser("~/.hermes/mem0.json")))
+CFG = json.load(open(os.path.expanduser("~/.hermes/mem0.json"), encoding="utf-8"))
 HOST = CFG["host"].rstrip("/")
 KEY = CFG["admin_api_key"]
 CA = CFG["ca_bundle"]
