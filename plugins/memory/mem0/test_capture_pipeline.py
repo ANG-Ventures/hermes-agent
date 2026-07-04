@@ -132,6 +132,27 @@ def test_worker_starts_even_when_enqueue_is_duplicate(tmp_path):
     p.stop()
 
 
+def test_startup_drains_inherited_rows_without_a_new_turn(tmp_path):
+    """Greptile P1: after a restart with pending rows, an IDLE agent (no new turn) must still drain.
+    A pipeline built over a queue that already has pending work + active capture starts the worker
+    at construction — not only when a turn arrives."""
+    qpath = str(tmp_path / "cq.db")
+    # simulate a prior process leaving a pending row in the durable queue
+    from capture_queue import CaptureQueue
+    CaptureQueue(qpath).enqueue(idem_key("s", 1, "inherited fact", "ok"),
+                                {"user": "inherited fact", "assistant": "ok"})
+    store = FakeStore()
+    # build a fresh pipeline over that same queue with capture active — no enqueue_turn call
+    p = cp.CapturePipeline(
+        capture_on_fn=lambda: True, add_fn=store.add, recall_idem_fn=store.recall_idem,
+        scrub_fn=lambda f: scrub.filter_facts(f), forget_fn=store.forget, get_written_fn=store.get_written,
+        write_filters={"user_id": "ace"}, model="gpt-5.4-mini", queue_path=qpath)
+    assert p._started is True           # started at construction because pending work existed
+    p._worker.drain_once()              # drive one drain to prove it processes the inherited row
+    assert len(store.rows) == 1
+    p.stop()
+
+
 def test_live_capture_flip_honored(tmp_path):
     """capture_on is read fresh each call — an off->on flip mid-process is honored (no restart)."""
     state = {"on": False}

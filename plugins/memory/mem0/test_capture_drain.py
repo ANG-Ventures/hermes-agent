@@ -277,3 +277,21 @@ def test_scrub_deadletter_escalates_loudly(q):
     w.drain_once()
     assert all(tok not in r["memory"] for r in store.rows)
     assert q.counts()["done"] == 1
+
+
+def test_idem_check_failure_after_prior_write_never_deadletters(q):
+    """Greptile P1: if a PRIOR lease may have committed add() (attempts>0), a persistent idem-check
+    failure must NEVER dead-letter — that would abandon a possibly-secret-bearing live row with no
+    scrub path. It requeues indefinitely (never 'dead') and escalates loudly at the threshold."""
+    alerts = []
+    store = FakeStore(recall_raises=99)   # idem check always fails
+    w = make_worker(q, store, backoff_base_s=0.0, max_attempts=2, alert_fn=alerts.append)
+    # seed the row with attempts=1 so the drainer treats it as "a prior lease may have written"
+    key = _enq(q, "some fact")
+    w._q.mark_scrub_retry(key, backoff_s=0.0)   # bumps attempts to 1, keeps pending
+    for _ in range(6):
+        w.drain_once()
+    assert q.counts()["dead"] == 0                 # never abandoned
+    assert q.counts()["pending"] == 1              # still retriable
+    assert store.add_calls == 0                    # never re-added (can't confirm it's new)
+    assert any("IDEM-CHECK STUCK" in a for a in alerts), f"expected escalation, got {alerts}"

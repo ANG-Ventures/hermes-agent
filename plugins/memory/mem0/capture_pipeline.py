@@ -129,6 +129,22 @@ class CapturePipeline:
         )
         self._started = False
         self._lock = threading.Lock()
+        # Startup drain path (Greptile P1): if this process inherited pending/expired rows from a
+        # prior lifetime AND capture is active, start the worker+reaper NOW — don't wait for a new
+        # turn to arrive (an idle agent would otherwise never drain durable rows).
+        self.maybe_start_pending()
+
+    def maybe_start_pending(self) -> None:
+        """Start the drain+reaper worker if capture is active and there is un-drained work already in
+        the durable queue. Safe to call any time; no-op if already started, inactive, or empty."""
+        try:
+            if self._started or not self.active:
+                return
+            counts = self._queue.counts()
+            if (counts.get("pending", 0) + counts.get("inflight", 0)) > 0:
+                self.start()
+        except Exception as e:
+            logger.warning("mem0 capture: startup-drain check failed (non-fatal): %s", e)
 
     @property
     def active(self) -> bool:

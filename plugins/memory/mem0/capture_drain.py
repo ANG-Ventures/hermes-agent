@@ -133,14 +133,36 @@ class CaptureDrainWorker:
                 self.stats["drained"] += 1
                 return True
         except Exception as e:
+            # The idem check FAILED (transient search fault) so we can't tell "new" from
+            # "already-written". Two cases (Greptile P1):
+            #  - FIRST lease (attempts==0): nothing was written yet, so a bounded retry that may
+            #    eventually dead-letter is fine — there's no secret to abandon.
+            #  - a LATER lease (attempts>0): a PRIOR lease may have committed add() before crashing,
+            #    so a row (possibly secret-bearing) may already be live. We must NOT dead-letter and
+            #    abandon it — requeue indefinitely (like the scrub path) so it's eventually read+scrubbed.
+            prior_write_possible = int(row.get("attempts", 0)) > 0
             attempts = int(row.get("attempts", 0)) + 1
+            backoff = min(self._backoff * (2 ** min(attempts - 1, 12)), self._scrub_backoff_cap_s)
+            if prior_write_possible:
+                self._q.mark_scrub_retry(key, backoff_s=backoff,
+                                         error=f"idem-check-failed(post-write): {str(e)[:260]}")
+                self.stats["retried"] += 1
+                if attempts == self._scrub_alert_after:
+                    self.stats["scrub_dead"] += 1
+                    self._alert(
+                        f"CAPTURE IDEM-CHECK STUCK for row {key!r} after {attempts} attempts after a "
+                        f"possible prior write — a memory (maybe secret-bearing) may be live+unscanned; "
+                        f"auto-retry continues but manual check advised: {e}")
+                logger.warning("capture idem pre-check failed after possible prior write; requeued "
+                               "(never dead-letter, no re-add): %s", e)
+                return True
             status = self._q.mark_retry(key, backoff_s=self._backoff * (2 ** (attempts - 1)),
                                         error=f"idem-check-failed: {str(e)[:280]}",
                                         max_attempts=self._max_attempts)
             if status == "dead":
                 self.stats["dead"] += 1
-                logger.error("capture idem-check unresolved after %d attempts; dead-lettered "
-                             "(did NOT re-add to avoid duplicates): %s", attempts, e)
+                logger.error("capture idem-check unresolved after %d attempts on first lease; "
+                             "dead-lettered (nothing written yet — no secret abandoned): %s", attempts, e)
             else:
                 self.stats["retried"] += 1
                 logger.warning("capture idem pre-check failed; requeued (fail-closed, no re-add): %s", e)
