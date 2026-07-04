@@ -13,7 +13,7 @@ import capture_scrub as scrub
 
 class FakeStore:
     """Minimal fake of the mem0 client for add / recall-by-idem / get-written / forget."""
-    def __init__(self, fail_times=0, recall_raises=0, getwritten_raises=0):
+    def __init__(self, fail_times=0, recall_raises=0, getwritten_raises=0, fail_error=None):
         self.rows = []          # [{id, memory, capture_idem}]
         self._id = 0
         self.fail_times = fail_times
@@ -22,11 +22,14 @@ class FakeStore:
         self.getwritten_raises = getwritten_raises
         self.recall_calls = 0
         self.getwritten_calls = 0
+        # the exception add() raises while failing; default is an AMBIGUOUS fault (server may have
+        # committed). Pass a clearly-pre-send error to exercise the bounded/dead-letter path.
+        self.fail_error = fail_error or RuntimeError("simulated transient 500")
 
     def add(self, messages, kwargs):
         self.add_calls += 1
         if self.add_calls <= self.fail_times:
-            raise RuntimeError("simulated transient 500")
+            raise self.fail_error
         idem = (kwargs.get("metadata") or {}).get("capture_idem", "")
         # simulate server extraction: 1 durable fact per turn (+ echo the user text so a secret shows)
         text = messages[0]["content"]
@@ -143,7 +146,8 @@ def test_transient_fault_retries_then_recovers(q):
 
 
 def test_dead_letter_after_max_attempts(q):
-    store = FakeStore(fail_times=99)     # always fails
+    # a clearly PRE-SEND failure (connection refused) means nothing was written -> bounded path/dead
+    store = FakeStore(fail_times=99, fail_error=ConnectionRefusedError("connection refused"))
     w = make_worker(q, store, max_attempts=3)
     _enq(q, "User likes X.")
     for _ in range(3):
@@ -152,6 +156,21 @@ def test_dead_letter_after_max_attempts(q):
         q._connect().execute("UPDATE capture_queue SET next_attempt_at=0 WHERE status='pending'")
     assert q.counts()["dead"] == 1
     assert w.stats["dead"] >= 1
+
+
+def test_ambiguous_add_fault_never_deadletters(q):
+    """Greptile P1: a timeout/500/read-error can hit AFTER the server committed /memories, so the
+    add may be live+unscanned. Such an ambiguous fault must NEVER dead-letter (it would abandon a
+    possibly-written, never-scanned row) — requeue forever + escalate."""
+    alerts = []
+    store = FakeStore(fail_times=99)  # default 500 error = ambiguous (server may have committed)
+    w = make_worker(q, store, max_attempts=2, backoff_base_s=0.0, alert_fn=alerts.append)
+    _enq(q, "User likes Y.")
+    for _ in range(6):
+        w.drain_once()
+    assert q.counts()["dead"] == 0                 # never abandoned on an ambiguous fault
+    assert q.counts()["pending"] == 1              # still retriable
+    assert any("ADD AMBIGUOUS" in a for a in alerts), f"expected escalation, got {alerts}"
 
 
 def test_post_write_scrub_forgets_secret_bearing_memory(q):

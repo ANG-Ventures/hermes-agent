@@ -188,14 +188,36 @@ class CaptureDrainWorker:
             self._q.mark_add_committed(key)
             self._q.record_verdict(key, "ok")
         except Exception as e:
-            # transient model/network fault -> requeue with backoff (bounded), or dead-letter
             self._q.record_verdict(key, "fault")
             attempts = int(row.get("attempts", 0)) + 1
+            # AMBIGUOUS-WRITE FAIL-CLOSED (Greptile P1): a timeout / read error / broken pipe can
+            # occur AFTER the server already committed /memories, so the add may be live+unscanned.
+            # We cannot dead-letter and abandon it. Only a clearly PRE-SEND failure (connection
+            # refused / name resolution / no route) means nothing was written -> bounded retry is
+            # safe. Everything else is treated as "maybe written" -> requeue forever + escalate.
+            msg = f"{type(e).__name__} {e}".lower()
+            clearly_not_sent = any(m in msg for m in (
+                "refused", "name or service", "nodename", "no route", "getaddrinfo",
+                "failed to establish", "cannot connect", "connection error"))
+            if not clearly_not_sent:
+                backoff = min(self._backoff * (2 ** min(attempts - 1, 12)), self._scrub_backoff_cap_s)
+                self._q.mark_scrub_retry(key, backoff_s=backoff, error=f"add-ambiguous: {str(e)[:270]}")
+                self.stats["retried"] += 1
+                if attempts == self._scrub_alert_after:
+                    self.stats["scrub_dead"] += 1
+                    self._alert(
+                        f"CAPTURE ADD AMBIGUOUS for row {key!r} after {attempts} attempts (a timeout/"
+                        f"read error may have left a written, unscanned memory live); auto-retry "
+                        f"continues but manual check advised: {e}")
+                logger.warning("capture add failed AMBIGUOUSLY (maybe committed); requeued "
+                               "fail-closed (never dead-letter): %s", e)
+                return True
             status = self._q.mark_retry(key, backoff_s=self._backoff * (2 ** (attempts - 1)),
                                         error=str(e)[:300], max_attempts=self._max_attempts)
             if status == "dead":
                 self.stats["dead"] += 1
-                logger.warning("capture turn dead-lettered after %d attempts: %s", attempts, e)
+                logger.warning("capture turn dead-lettered after %d attempts (pre-send failure, "
+                               "nothing written): %s", attempts, e)
             else:
                 self.stats["retried"] += 1
             return True

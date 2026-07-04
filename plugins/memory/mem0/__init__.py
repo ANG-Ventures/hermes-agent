@@ -1190,15 +1190,20 @@ class Mem0MemoryProvider(MemoryProvider):
 
             def _add(messages, kwargs) -> int:
                 # Returns the number of memories the server extracted+wrote for this turn, so the
-                # drainer knows whether to EXPECT rows in the post-write scrub read (0 extracted =>
-                # an empty scrub read is correct; >0 => an empty read is index-lag, must requeue).
+                # drainer knows whether to EXPECT rows in the post-write scrub read. FAIL-CLOSED
+                # (Greptile P1): if the response shape is anything we can't confidently parse as an
+                # explicit empty result, return 1 (assume >=1 written) so the scrub REQUIRES rows —
+                # an unknown success shape must never let an empty read be read as "nothing written".
                 resp = self._get_client().add(messages, **kwargs)
                 self._record_success()
                 try:
-                    results = resp.get("results", []) if isinstance(resp, dict) else (resp or [])
-                    return len(results)
+                    if isinstance(resp, dict) and "results" in resp:
+                        return len(resp["results"] or [])
+                    if isinstance(resp, list):
+                        return len(resp)
                 except Exception:
-                    return 0
+                    pass
+                return 1   # unknown/opaque success shape -> assume a write happened (require_rows)
 
             def _recall_idem(key: str) -> int:
                 # NOTE: must RAISE on transient failure (do NOT swallow to 0). The drain worker
