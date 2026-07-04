@@ -1187,6 +1187,20 @@ class Mem0MemoryProvider(MemoryProvider):
             self._capture_pipeline = None
             return None
 
+    def _auto_capture_active(self) -> bool:
+        """True when per-turn auto-capture is configured ON (the shared, cross-process signal).
+
+        The D-7 interlock is inherently CROSS-PROCESS: the live foreground session and the
+        background-review fork are different processes, so the only signal they share is the
+        persisted `capture` config (resolved identically via resolve_capture). When capture is on,
+        the foreground path is the every-turn writer, so the background writer (mem0_remember) must
+        stand down. When capture is off/manual (the default until cutover), mem0_remember writes
+        normally. Read at DECISION TIME so a live flip is honored without a restart. Degrade-safe."""
+        try:
+            return capture_is_on(self._capture)
+        except Exception:
+            return False
+
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Enqueue the completed turn for durable, salience-gated, server-side auto-capture.
 
@@ -1342,17 +1356,15 @@ class Mem0MemoryProvider(MemoryProvider):
             if not fact:
                 return tool_error("Missing required parameter: fact")
             # D-7 CROSS-PROCESS INTERLOCK (Greptile P1 — now ENFORCED, not just defined):
-            # when foreground per-turn auto-capture is ON, the background-review writer must NOT
-            # also write, or the two writers race overlapping facts. capture_is_on is read at
-            # DECISION TIME (each call) so a live capture flip is honored without a restart.
-            try:
-                from .capture_pipeline import bgr_write_allowed
-            except ImportError:
-                from capture_pipeline import bgr_write_allowed
-            if not bgr_write_allowed(capture_is_on(self._capture)):
-                logger.info("mem0_remember suppressed: auto-capture is ON (D-7 interlock)")
+            # when foreground per-turn auto-capture is genuinely ACTIVE, the background-review writer
+            # must NOT also write, or the two writers race overlapping facts. Key on the pipeline's
+            # real activity (certified gate AND capture on), NOT merely the configured capture value —
+            # so mem0_remember still writes when auto-capture isn't actually running (no certified
+            # pipeline). Read at DECISION TIME so a live capture flip is honored without a restart.
+            if self._auto_capture_active():
+                logger.info("mem0_remember suppressed: auto-capture is ACTIVE (D-7 interlock)")
                 return json.dumps({"status": "skipped",
-                                   "reason": "auto-capture on; background write suppressed (D-7 interlock)"})
+                                   "reason": "auto-capture active; background write suppressed (D-7 interlock)"})
             try:
                 result = self._dedup_then_write(client, fact)
                 self._record_success()

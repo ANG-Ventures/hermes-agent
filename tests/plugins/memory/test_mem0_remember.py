@@ -43,6 +43,10 @@ def _provider(monkeypatch, tmp_path):
     monkeypatch.setenv("MEM0_USER_ID", "ace")
     monkeypatch.setenv("MEM0_AGENT_ID", "apollo")
     monkeypatch.delenv("MEM0_API_KEY", raising=False)
+    # These tests exercise the mem0_remember dedup/write path. mem0_remember is the background-review
+    # writer, and the D-7 interlock suppresses it when per-turn auto-capture is ON. Pin capture=off
+    # so the write path is reachable (this also matches the live default until the capture cutover).
+    monkeypatch.setenv("MEM0_CAPTURE", "off")
     p = Mem0MemoryProvider()
     p.initialize("test-session")
     return p
@@ -66,6 +70,31 @@ def test_remember_schema_shape():
 # ---------------------------------------------------------------------------
 # Task 1.2 — dispatch: infer=False + write_origin=background_review
 # ---------------------------------------------------------------------------
+
+def test_remember_suppressed_when_autocapture_on(monkeypatch, tmp_path):
+    """D-7 interlock: when per-turn auto-capture is configured ON, the background writer
+    (mem0_remember) must self-suppress (no write) so the two writers can't race."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MEM0_HOST", "http://mem0.test")
+    monkeypatch.setenv("MEM0_ADMIN_API_KEY", "admin-key")
+    monkeypatch.setenv("MEM0_USER_ID", "ace")
+    monkeypatch.setenv("MEM0_AGENT_ID", "apollo")
+    monkeypatch.setenv("MEM0_CAPTURE", "auto")   # capture ON -> interlock active
+    calls = []
+
+    def fake_urlopen(request, timeout=0, context=None):
+        calls.append((request.get_method(), urlparse(request.full_url).path))
+        return _HTTPResponse({"results": []})
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    p = Mem0MemoryProvider()
+    p.initialize("test-session")
+    out = json.loads(p.handle_tool_call("mem0_remember", {"fact": "Ace's DNS is AdGuard."}))
+    assert out.get("status") == "skipped"
+    assert "interlock" in out.get("reason", "").lower()
+    # crucially: NO write happened (the interlock fired before any /memories POST)
+    assert not any(m == "POST" and pth == "/memories" for m, pth in calls)
+
 
 def test_remember_writes_infer_false_with_review_origin(monkeypatch, tmp_path):
     calls = []
