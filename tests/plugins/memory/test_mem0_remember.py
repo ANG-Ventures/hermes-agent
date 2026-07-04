@@ -125,6 +125,27 @@ def test_remember_writes_when_capture_on_but_gate_uncertified(monkeypatch, tmp_p
     assert any(m == "POST" and pth == "/memories" for m, pth in calls)  # it wrote
 
 
+def test_live_capture_flip_is_immediate_no_lag(monkeypatch, tmp_path):
+    """Greptile P1: an operator flipping mem0.json capture auto->off must take effect on the NEXT
+    decision (no TTL lag). _live_capture invalidates by file mtime, so a fresh write is seen at once."""
+    import json as _json, os as _os, time as _time
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MEM0_HOST", "http://mem0.test")
+    monkeypatch.setenv("MEM0_ADMIN_API_KEY", "admin-key")
+    monkeypatch.setenv("MEM0_USER_ID", "ace")
+    monkeypatch.setenv("MEM0_AGENT_ID", "apollo")
+    monkeypatch.delenv("MEM0_CAPTURE", raising=False)   # so mem0.json is the source
+    cfg = tmp_path / "mem0.json"
+    cfg.write_text(_json.dumps({"capture": "auto"}), encoding="utf-8")
+    p = Mem0MemoryProvider()
+    p.initialize("test-session")
+    assert p._live_capture() == "auto"
+    # operator flips to off; bump mtime to be safe on coarse-resolution filesystems
+    cfg.write_text(_json.dumps({"capture": "off"}), encoding="utf-8")
+    _os.utime(cfg, (_time.time() + 2, _time.time() + 2))
+    assert p._live_capture() == "off"   # picked up immediately, no restart / no TTL wait
+
+
 def test_remember_writes_infer_false_with_review_origin(monkeypatch, tmp_path):
     calls = []
 

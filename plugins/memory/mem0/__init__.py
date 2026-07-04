@@ -1137,26 +1137,30 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def _live_capture(self) -> str:
         """Re-resolve the capture flag from the LIVE source (env > mem0.json `capture` > default),
-        so a flip is honored without a provider restart (fixes the flip-lag footgun). The mem0.json
-        read is TTL-cached for a short window (~0.5s) to coalesce bursts within a single turn while
-        keeping an operator's on<->off flip effectively immediate (Greptile P1). On any error, falls
-        back to the init-time self._capture. Also updates self._capture so interlock + logs stay
-        consistent."""
-        import time as _time
-        now = _time.monotonic()
-        ttl = getattr(self, "_live_capture_ttl", 0.5)
-        cached_at = getattr(self, "_live_capture_at", 0.0)
-        if now - cached_at < ttl and getattr(self, "_live_capture_val", None) is not None:
-            return self._live_capture_val
+        so a flip is honored WITHOUT a provider restart and WITHOUT lag (fixes the flip-lag footgun).
+
+        Cache invalidation is by mem0.json MTIME + the env var, not a time window: the hot path only
+        does a cheap stat(), and re-reads/parses the file only when it actually changed. So an
+        operator's auto<->off flip is picked up on the very next capture decision — no rollback lag
+        (Greptile P1) — while steady-state calls stay cheap. On any error, falls back to the
+        init-time self._capture. Also updates self._capture so interlock + logs stay consistent."""
         try:
             from hermes_constants import get_hermes_home
-            cfg_capture = None
             cfg_path = get_hermes_home() / "mem0.json"
-            if cfg_path.exists():
+            try:
+                mtime = cfg_path.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            env_val = os.environ.get("MEM0_CAPTURE")
+            sig = (mtime, env_val)
+            if sig == getattr(self, "_live_capture_sig", None) and getattr(self, "_live_capture_val", None) is not None:
+                return self._live_capture_val
+            cfg_capture = None
+            if mtime and cfg_path.exists():
                 cfg_capture = json.loads(cfg_path.read_text(encoding="utf-8")).get("capture")
-            value, source = resolve_capture(os.environ.get("MEM0_CAPTURE"), cfg_capture)
+            value, source = resolve_capture(env_val, cfg_capture)
             self._live_capture_val = value
-            self._live_capture_at = now
+            self._live_capture_sig = sig
             # keep the frozen fields in sync so the interlock / logs reflect the live decision
             self._capture, self._capture_source = value, source
             return value
