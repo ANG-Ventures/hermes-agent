@@ -1190,12 +1190,22 @@ class Mem0MemoryProvider(MemoryProvider):
                 # Must RAISE on transient failure: the drainer's post-write scrub fails CLOSED
                 # (requeues) if it cannot read the rows it just wrote, so a secret is never left
                 # recallable behind a completed queue row (Greptile P1). Fetch a HIGH ceiling of
-                # rows for the idem key — NOT one page — so a long turn that extracted many memories
-                # can't hide a secret-bearing row beyond page 1 that then completes unscanned.
+                # rows for the idem key — NOT one page.
+                # COMPLETENESS GUARD (Greptile P1): if the result HITS the cap, we cannot prove we
+                # saw every row (mem0 may have extracted more, or the backend may cap top_k). Rather
+                # than scan a partial set and complete the item — leaving a possible secret beyond
+                # the window — RAISE, which routes into the fail-closed scrub-requeue. In practice a
+                # single turn yields a handful of facts, so this never trips; it just makes "assumed
+                # complete" impossible.
                 resp = self._get_client().search_meta_filtered(
                     "", {"capture_idem": key}, top_k=_CAPTURE_SCRUB_MAX_ROWS)
+                rows = self._unwrap_results(resp)
+                if len(rows) >= _CAPTURE_SCRUB_MAX_ROWS:
+                    raise RuntimeError(
+                        f"capture scrub read hit the {_CAPTURE_SCRUB_MAX_ROWS}-row cap for "
+                        f"capture_idem={key!r}; cannot prove the page is complete — failing closed")
                 return [{"id": r.get("id", ""), "memory": r.get("memory", "")}
-                        for r in self._unwrap_results(resp)]
+                        for r in rows]
 
             def _forget(mid: str):
                 # Must RAISE on failure (Greptile P1): the drain worker's scrub fails CLOSED and
