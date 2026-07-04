@@ -1129,35 +1129,95 @@ class Mem0MemoryProvider(MemoryProvider):
         self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="mem0-prefetch")
         self._prefetch_thread.start()
 
+    def _get_capture_pipeline(self):
+        """Lazy-build the A-lite capture pipeline (queue + drain worker + gate-version guard +
+        cross-process bgr interlock). Composed, not inlined — see capture_pipeline.py. Built once,
+        degrade-safe: on any construction error, returns None and capture stays off (INV-3)."""
+        pipe = getattr(self, "_capture_pipeline", None)
+        if pipe is not None:
+            return pipe
+        try:
+            from . import capture_pipeline, capture_scrub
+
+            def _add(messages, kwargs):
+                self._get_client().add(messages, **kwargs)
+                self._record_success()
+
+            def _recall_idem(key: str) -> int:
+                try:
+                    resp = self._get_client().search_meta_filtered(
+                        "", {"capture_idem": key}, top_k=5)
+                    rows = self._unwrap_results(resp)
+                    return len(rows)
+                except Exception:
+                    return 0
+
+            def _get_written(key: str):
+                try:
+                    resp = self._get_client().search_meta_filtered(
+                        "", {"capture_idem": key}, top_k=10)
+                    return [{"id": r.get("id", ""), "memory": r.get("memory", "")}
+                            for r in self._unwrap_results(resp)]
+                except Exception:
+                    return []
+
+            def _forget(mid: str):
+                try:
+                    self._get_client().update(mid, text=f"{_FORGOTTEN_PREFIX} [secret-scrubbed]",
+                                              metadata={"forgotten": True, "capture_scrubbed": True})
+                except Exception as e:
+                    logger.warning("mem0 capture scrub-forget failed for %s: %s", mid, e)
+
+            pipe = capture_pipeline.CapturePipeline(
+                capture_on_fn=lambda: capture_is_on(self._capture),
+                add_fn=_add,
+                recall_idem_fn=_recall_idem,
+                scrub_fn=lambda facts: capture_scrub.filter_facts(facts),
+                forget_fn=_forget,
+                get_written_fn=_get_written,
+                write_filters=self._write_filters(write_kind="auto"),
+                model=str(self._config.get("capture_model", "gpt-5.4-mini")),
+                breaker_open_fn=self._is_breaker_open,
+                alert_fn=lambda m: logger.warning("MEM0-CAPTURE-ALERT %s", m),
+            )
+            self._capture_pipeline = pipe
+            return pipe
+        except Exception as e:
+            logger.warning("mem0 capture pipeline unavailable (capture disabled): %s", e)
+            self._capture_pipeline = None
+            return None
+
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        """Send the turn to Mem0 for server-side fact extraction (non-blocking)."""
-        # Recall-only mode: skip per-turn auto-capture. Explicit mem0_conclude
-        # writes and prefetch/search recall still work. Uses the shared
-        # capture_is_on() so the "what counts as on" set has ONE definition.
+        """Enqueue the completed turn for durable, salience-gated, server-side auto-capture.
+
+        A-lite: the ONLY synchronous step is a tiny durable enqueue (INV-3, never blocks the turn);
+        the background drain worker does the slow server-side extraction (mem0 runs the salience gate
+        as custom_instructions) + retry + secret-scrub. Capture only fires when capture_is_on AND the
+        certified gate version matches (D-11). Degrade-safe: any failure leaves the turn untouched.
+        """
         if not capture_is_on(self._capture):
             return
-        if self._is_breaker_open():
+        pipe = self._get_capture_pipeline()
+        if pipe is None:
             return
+        try:
+            # a stable per-turn ordinal so the idempotency key is deterministic across retries
+            self._capture_turn_ordinal = getattr(self, "_capture_turn_ordinal", 0) + 1
+            pipe.enqueue_turn(user_content, assistant_content,
+                              session_id=session_id or "default",
+                              turn_ordinal=self._capture_turn_ordinal)
+        except Exception as e:
+            logger.warning("mem0 sync_turn enqueue failed (turn not captured): %s", e)
 
-        def _sync():
-            try:
-                client = self._get_client()
-                messages = [
-                    {"role": "user", "content": user_content},
-                    {"role": "assistant", "content": assistant_content},
-                ]
-                client.add(messages, **self._write_filters(write_kind="auto"))
-                self._record_success()
-            except Exception as e:
-                self._record_failure()
-                logger.warning("Mem0 sync failed: %s", e)
-
-        # Wait for any previous sync before starting a new one
-        if self._sync_thread and self._sync_thread.is_alive():
-            self._sync_thread.join(timeout=5.0)
-
-        self._sync_thread = threading.Thread(target=_sync, daemon=True, name="mem0-sync")
-        self._sync_thread.start()
+    def capture_stats(self) -> Dict[str, Any]:
+        """Observability for the daily digest: certified?, gate version, queue depth, drain counters."""
+        pipe = getattr(self, "_capture_pipeline", None)
+        if pipe is None:
+            return {"capture": self._capture, "pipeline": "not-built"}
+        try:
+            return {"capture": self._capture, **pipe.stats()}
+        except Exception as e:
+            return {"capture": self._capture, "error": str(e)[:120]}
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         schemas = [PROFILE_SCHEMA, SEARCH_SCHEMA, CONCLUDE_SCHEMA]

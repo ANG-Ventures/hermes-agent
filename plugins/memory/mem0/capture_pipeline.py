@@ -67,8 +67,12 @@ class CapturePipeline:
         queue_path: Optional[str] = None,
         expected_gate_version: Optional[str] = None,  # None => whatever the assets certify
     ):
-        from capture_queue import CaptureQueue
-        from capture_drain import CaptureDrainWorker
+        try:
+            from .capture_queue import CaptureQueue
+            from .capture_drain import CaptureDrainWorker
+        except ImportError:  # flat import (unit tests run with PYTHONPATH=<dir>)
+            from capture_queue import CaptureQueue
+            from capture_drain import CaptureDrainWorker
 
         self._capture_on = capture_on_fn
         self._alert = alert_fn or (lambda m: logger.warning("mem0 capture alert: %s", m))
@@ -124,7 +128,10 @@ class CapturePipeline:
         if not self.active:
             return False
         try:
-            from capture_queue import idem_key
+            try:
+                from .capture_queue import idem_key
+            except ImportError:
+                from capture_queue import idem_key
             key = idem_key(session_id, turn_ordinal, user_content, assistant_content)
             enq = self._queue.enqueue(key, {"user": user_content, "assistant": assistant_content,
                                             "session_id": session_id})
