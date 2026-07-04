@@ -135,8 +135,12 @@ class CapturePipeline:
             key = idem_key(session_id, turn_ordinal, user_content, assistant_content)
             enq = self._queue.enqueue(key, {"user": user_content, "assistant": assistant_content,
                                             "session_id": session_id})
-            # lazy-start the worker on first real enqueue (so an idle off->on flip spins it up)
-            if enq and not self._started:
+            # Start the worker whenever capture is active and it isn't running yet — NOT only on a
+            # brand-new insert (Greptile P1). After a restart with pending/expired rows already in
+            # SQLite, a duplicate enqueue returns False; gating start on `enq` would leave those
+            # durable rows (and the reaper) idle until some later unique turn. Reaching an active
+            # enqueue means there is work to drain, so ensure the drain+reaper loop is up.
+            if not self._started:
                 self.start()
             return enq
         except Exception as e:

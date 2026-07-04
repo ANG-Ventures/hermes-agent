@@ -46,6 +46,9 @@ class FakeStore:
         return [r for r in self.rows if r["capture_idem"] == key]
 
     def forget(self, mid):
+        if getattr(self, "forget_raises", 0) > 0:
+            self.forget_raises -= 1
+            raise RuntimeError("simulated transient update 503")
         self.rows = [r for r in self.rows if r["id"] != mid]
 
 
@@ -230,4 +233,24 @@ def test_exactly_once_shortcut_still_scrubs(q):
     assert w.stats["scrubbed"] == 1
     assert all(tok not in r["memory"] for r in store.rows)   # secret forgotten
     assert store.add_calls == 1                              # shortcut did NOT re-add
+    assert q.counts()["done"] == 1
+
+
+def test_forget_failure_requeues_not_done(q):
+    """If FORGET of a secret-bearing memory fails (transient), the row must NOT be marked done —
+    requeue so the forget retries. Otherwise the secret stays recallable behind a completed row."""
+    store = FakeStore()
+    store.forget_raises = 1                  # first forget attempt raises
+    w = make_worker(q, store, backoff_base_s=0.0)
+    tok = "8905425635:" + "AAH3xY9zKq" + "_Wp0LmNoPqRsTuVwXyZ" + "012345"
+    _enq(q, f"token {tok} here")
+    w.drain_once()
+    assert store.add_calls == 1              # added
+    assert w.stats["scrubbed"] == 0          # forget failed -> not counted as scrubbed
+    assert w.stats["retried"] == 1           # requeued (fail-closed)
+    assert q.counts()["done"] == 0
+    # second drain: forget now succeeds -> secret scrubbed, row completes
+    w.drain_once()
+    assert w.stats["scrubbed"] == 1
+    assert all(tok not in r["memory"] for r in store.rows)
     assert q.counts()["done"] == 1

@@ -1129,6 +1129,32 @@ class Mem0MemoryProvider(MemoryProvider):
         self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="mem0-prefetch")
         self._prefetch_thread.start()
 
+    def _live_capture(self) -> str:
+        """Re-resolve the capture flag from the LIVE source (env > mem0.json `capture` > default),
+        so a flip is honored without a provider restart (fixes the flip-lag footgun). Cheap: the
+        mem0.json read is TTL-cached ~5s. On any error, falls back to the init-time self._capture.
+        Also updates self._capture so the interlock + logs stay consistent."""
+        import time as _time
+        now = _time.monotonic()
+        ttl = getattr(self, "_live_capture_ttl", 5.0)
+        cached_at = getattr(self, "_live_capture_at", 0.0)
+        if now - cached_at < ttl and getattr(self, "_live_capture_val", None) is not None:
+            return self._live_capture_val
+        try:
+            from hermes_constants import get_hermes_home
+            cfg_capture = None
+            cfg_path = get_hermes_home() / "mem0.json"
+            if cfg_path.exists():
+                cfg_capture = json.loads(cfg_path.read_text(encoding="utf-8")).get("capture")
+            value, source = resolve_capture(os.environ.get("MEM0_CAPTURE"), cfg_capture)
+            self._live_capture_val = value
+            self._live_capture_at = now
+            # keep the frozen fields in sync so the interlock / logs reflect the live decision
+            self._capture, self._capture_source = value, source
+            return value
+        except Exception:
+            return self._capture
+
     def _get_capture_pipeline(self):
         """Lazy-build the A-lite capture pipeline (queue + drain worker + gate-version guard +
         cross-process bgr interlock). Composed, not inlined — see capture_pipeline.py. Built once,
@@ -1162,14 +1188,17 @@ class Mem0MemoryProvider(MemoryProvider):
                         for r in self._unwrap_results(resp)]
 
             def _forget(mid: str):
-                try:
-                    self._get_client().update(mid, text=f"{_FORGOTTEN_PREFIX} [secret-scrubbed]",
-                                              metadata={"forgotten": True, "capture_scrubbed": True})
-                except Exception as e:
-                    logger.warning("mem0 capture scrub-forget failed for %s: %s", mid, e)
+                # Must RAISE on failure (Greptile P1): the drain worker's scrub fails CLOSED and
+                # requeues if a forget of a secret-bearing memory doesn't land. Swallowing here would
+                # let the row be marked done with the secret still recallable.
+                self._get_client().update(mid, text=f"{_FORGOTTEN_PREFIX} [secret-scrubbed]",
+                                          metadata={"forgotten": True, "capture_scrubbed": True})
 
             pipe = capture_pipeline.CapturePipeline(
-                capture_on_fn=lambda: capture_is_on(self._capture),
+                # LIVE capture source (Greptile P1 — flip-lag footgun): resolve the capture flag at
+                # DECISION TIME from the same precedence resolver, not the value frozen at init, so a
+                # live capture flip (off<->on) is honored without a provider restart.
+                capture_on_fn=lambda: capture_is_on(self._live_capture()),
                 add_fn=_add,
                 recall_idem_fn=_recall_idem,
                 scrub_fn=lambda facts: capture_scrub.filter_facts(facts),
@@ -1197,7 +1226,7 @@ class Mem0MemoryProvider(MemoryProvider):
         stand down. When capture is off/manual (the default until cutover), mem0_remember writes
         normally. Read at DECISION TIME so a live flip is honored without a restart. Degrade-safe."""
         try:
-            return capture_is_on(self._capture)
+            return capture_is_on(self._live_capture())
         except Exception:
             return False
 
@@ -1208,8 +1237,10 @@ class Mem0MemoryProvider(MemoryProvider):
         the background drain worker does the slow server-side extraction (mem0 runs the salience gate
         as custom_instructions) + retry + secret-scrub. Capture only fires when capture_is_on AND the
         certified gate version matches (D-11). Degrade-safe: any failure leaves the turn untouched.
+        Reads the LIVE capture flag (self._live_capture) so an off->on/on->off flip takes effect
+        without a restart (flip-lag footgun).
         """
-        if not capture_is_on(self._capture):
+        if not capture_is_on(self._live_capture()):
             return
         pipe = self._get_capture_pipeline()
         if pipe is None:

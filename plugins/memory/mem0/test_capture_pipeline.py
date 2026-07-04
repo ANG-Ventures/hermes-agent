@@ -101,6 +101,23 @@ def test_duplicate_turn_enqueue_is_noop(tmp_path):
     p.stop()
 
 
+def test_worker_starts_even_when_enqueue_is_duplicate(tmp_path):
+    """Greptile P1: after a restart with rows already in SQLite, the next enqueue may be a duplicate
+    (returns False). The drain/reaper worker must still START (there is durable work to drain), not
+    stay idle until some later unique turn."""
+    store = FakeStore()
+    p = make_pipeline(tmp_path, store, capture_on=True)
+    # pre-seed a pending row directly in the queue (simulating a prior process's un-drained work)
+    p._queue.enqueue(idem_key("s", 1, "prior fact", "ok"),
+                     {"user": "prior fact", "assistant": "ok"})
+    assert p._started is False
+    # a DUPLICATE enqueue (same key) returns False, but must still spin up the worker
+    got = p.enqueue_turn("prior fact", "ok", session_id="s", turn_ordinal=1)
+    assert got is False                 # duplicate
+    assert p._started is True           # ...yet the worker started so the pending row drains
+    p.stop()
+
+
 def test_live_capture_flip_honored(tmp_path):
     """capture_on is read fresh each call — an off->on flip mid-process is honored (no restart)."""
     state = {"on": False}
