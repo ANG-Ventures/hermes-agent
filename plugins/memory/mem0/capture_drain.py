@@ -114,13 +114,31 @@ class CaptureDrainWorker:
         ]
         # EXACTLY-ONCE (D-8): if the add already ran on a prior lease (crash before mark_done),
         # rows exist -> mark done WITHOUT re-adding.
+        # FAIL-CLOSED (Greptile P1): if the idem check itself FAILS (transient search fault), we
+        # cannot tell "new" from "already-written". Re-adding on an unknown = duplicate rows the
+        # SQLite queue can't prevent. So on an idem-check error, REQUEUE (bounded) instead of adding.
         try:
             if self._recall_idem(key) > 0:
+                # rows already exist. Still run the scrub before completing — a prior lease may have
+                # added but crashed/failed BEFORE the scrub ran, so the shortcut must not skip it.
+                if self._scrub_written_or_requeue(key, row):
+                    return True
                 self._q.mark_done(key)
                 self.stats["drained"] += 1
                 return True
         except Exception as e:
-            logger.debug("idem pre-check failed (proceeding to add): %s", e)
+            attempts = int(row.get("attempts", 0)) + 1
+            status = self._q.mark_retry(key, backoff_s=self._backoff * (2 ** (attempts - 1)),
+                                        error=f"idem-check-failed: {str(e)[:280]}",
+                                        max_attempts=self._max_attempts)
+            if status == "dead":
+                self.stats["dead"] += 1
+                logger.error("capture idem-check unresolved after %d attempts; dead-lettered "
+                             "(did NOT re-add to avoid duplicates): %s", attempts, e)
+            else:
+                self.stats["retried"] += 1
+                logger.warning("capture idem pre-check failed; requeued (fail-closed, no re-add): %s", e)
+            return True
 
         # SERVER-SIDE extraction + gate. Stamp capture_idem so the reconcile can find the rows.
         kwargs = dict(self._write_filters)
@@ -147,23 +165,48 @@ class CaptureDrainWorker:
                 self.stats["retried"] += 1
             return True
 
-        # POST-WRITE SCRUB (INV-4 defense-in-depth for A-lite). The salience gate is NOT a reliable
-        # secret boundary (it leaked a bot token in the eval), so deterministically scan the facts
-        # that were just written and FORGET any that carry a secret.
-        try:
-            if self._get_written and self._forget:
-                written = self._get_written(key)   # [{id, memory}]
-                for r in written:
-                    txt = r.get("memory", "") or ""
-                    _, dropped = self._scrub([txt])
-                    if dropped:
-                        self._forget(r.get("id", ""))
-                        self.stats["scrubbed"] += 1
-                        logger.warning("capture scrubbed a secret-bearing memory (reason=%s)",
-                                       dropped[0].get("reason"))
-        except Exception as e:
-            logger.debug("post-write scrub error (non-fatal): %s", e)
+        # POST-WRITE SCRUB (INV-4). See _scrub_written_or_requeue — fail-closed: never complete a row
+        # whose scrub boundary we could not prove clean.
+        if self._scrub_written_or_requeue(key, row):
+            return True
 
         self._q.mark_done(key)
         self.stats["drained"] += 1
         return True
+
+    def _scrub_written_or_requeue(self, key, row) -> bool:
+        """Deterministically scrub the rows written for `key` and FORGET any secret-bearing one.
+        The salience gate is NOT a reliable secret boundary (it leaked a bot token in the eval), so
+        this is defense-in-depth (INV-4). FAIL-CLOSED (Greptile P1): if the rows can't be READ or a
+        FORGET fails, requeue (bounded) instead of completing — a secret must never be left
+        recallable behind a done row. The scrub is idempotent (scanning a clean row is a no-op), so
+        it's safe to re-run on the exactly-once shortcut path too.
+
+        Returns True if the row was requeued/dead-lettered (caller must stop); False if clean.
+        """
+        if not (self._get_written and self._forget):
+            return False
+        try:
+            written = self._get_written(key)   # [{id, memory}] — may raise on transient search fault
+            for r in written:
+                txt = r.get("memory", "") or ""
+                _, dropped = self._scrub([txt])
+                if dropped:
+                    self._forget(r.get("id", ""))   # may raise; requeue below if so
+                    self.stats["scrubbed"] += 1
+                    logger.warning("capture scrubbed a secret-bearing memory (reason=%s)",
+                                   dropped[0].get("reason"))
+            return False
+        except Exception as e:
+            attempts = int(row.get("attempts", 0)) + 1
+            status = self._q.mark_retry(key, backoff_s=self._backoff * (2 ** (attempts - 1)),
+                                        error=f"scrub-failed: {str(e)[:280]}",
+                                        max_attempts=self._max_attempts)
+            if status == "dead":
+                self.stats["dead"] += 1
+                logger.error("capture SCRUB could not be verified after %d attempts; dead-lettered "
+                             "(a written row may carry a secret — investigate): %s", attempts, e)
+            else:
+                self.stats["retried"] += 1
+                logger.warning("capture post-write scrub failed; requeued to retry the scrub: %s", e)
+            return True

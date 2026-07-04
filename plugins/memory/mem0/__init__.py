@@ -1144,22 +1144,22 @@ class Mem0MemoryProvider(MemoryProvider):
                 self._record_success()
 
             def _recall_idem(key: str) -> int:
-                try:
-                    resp = self._get_client().search_meta_filtered(
-                        "", {"capture_idem": key}, top_k=5)
-                    rows = self._unwrap_results(resp)
-                    return len(rows)
-                except Exception:
-                    return 0
+                # NOTE: must RAISE on transient failure (do NOT swallow to 0). The drain worker
+                # treats an idem-check error as "unknown" and requeues fail-closed, so a transient
+                # search fault never causes a duplicate re-add (Greptile P1).
+                resp = self._get_client().search_meta_filtered(
+                    "", {"capture_idem": key}, top_k=5)
+                rows = self._unwrap_results(resp)
+                return len(rows)
 
             def _get_written(key: str):
-                try:
-                    resp = self._get_client().search_meta_filtered(
-                        "", {"capture_idem": key}, top_k=10)
-                    return [{"id": r.get("id", ""), "memory": r.get("memory", "")}
-                            for r in self._unwrap_results(resp)]
-                except Exception:
-                    return []
+                # Must RAISE on transient failure: the drainer's post-write scrub fails CLOSED
+                # (requeues) if it cannot read the rows it just wrote, so a secret is never left
+                # recallable behind a completed queue row (Greptile P1).
+                resp = self._get_client().search_meta_filtered(
+                    "", {"capture_idem": key}, top_k=10)
+                return [{"id": r.get("id", ""), "memory": r.get("memory", "")}
+                        for r in self._unwrap_results(resp)]
 
             def _forget(mid: str):
                 try:
@@ -1341,6 +1341,18 @@ class Mem0MemoryProvider(MemoryProvider):
             fact = args.get("fact", "")
             if not fact:
                 return tool_error("Missing required parameter: fact")
+            # D-7 CROSS-PROCESS INTERLOCK (Greptile P1 — now ENFORCED, not just defined):
+            # when foreground per-turn auto-capture is ON, the background-review writer must NOT
+            # also write, or the two writers race overlapping facts. capture_is_on is read at
+            # DECISION TIME (each call) so a live capture flip is honored without a restart.
+            try:
+                from .capture_pipeline import bgr_write_allowed
+            except ImportError:
+                from capture_pipeline import bgr_write_allowed
+            if not bgr_write_allowed(capture_is_on(self._capture)):
+                logger.info("mem0_remember suppressed: auto-capture is ON (D-7 interlock)")
+                return json.dumps({"status": "skipped",
+                                   "reason": "auto-capture on; background write suppressed (D-7 interlock)"})
             try:
                 result = self._dedup_then_write(client, fact)
                 self._record_success()

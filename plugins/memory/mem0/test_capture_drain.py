@@ -13,11 +13,15 @@ import capture_scrub as scrub
 
 class FakeStore:
     """Minimal fake of the mem0 client for add / recall-by-idem / get-written / forget."""
-    def __init__(self, fail_times=0):
+    def __init__(self, fail_times=0, recall_raises=0, getwritten_raises=0):
         self.rows = []          # [{id, memory, capture_idem}]
         self._id = 0
         self.fail_times = fail_times
         self.add_calls = 0
+        self.recall_raises = recall_raises      # raise on the first N recall_idem calls (transient)
+        self.getwritten_raises = getwritten_raises
+        self.recall_calls = 0
+        self.getwritten_calls = 0
 
     def add(self, messages, kwargs):
         self.add_calls += 1
@@ -30,9 +34,15 @@ class FakeStore:
         self.rows.append({"id": f"m{self._id}", "memory": text, "capture_idem": idem})
 
     def recall_idem(self, key):
+        self.recall_calls += 1
+        if self.recall_calls <= self.recall_raises:
+            raise RuntimeError("simulated transient search 503")
         return sum(1 for r in self.rows if r["capture_idem"] == key)
 
     def get_written(self, key):
+        self.getwritten_calls += 1
+        if self.getwritten_calls <= self.getwritten_raises:
+            raise RuntimeError("simulated transient search 503")
         return [r for r in self.rows if r["capture_idem"] == key]
 
     def forget(self, mid):
@@ -168,3 +178,56 @@ def test_breaker_open_skips(q):
     assert w.drain_once() is False
     assert store.add_calls == 0
     assert q.counts()["pending"] == 1   # untouched, will drain when breaker closes
+
+
+# ---- Greptile P1 fail-closed regressions -----------------------------------
+def test_idem_check_failure_requeues_without_readd(q):
+    """If the idem pre-check raises (transient search fault), the drainer must NOT re-add (would
+    duplicate) — it requeues fail-closed."""
+    store = FakeStore(recall_raises=1)   # first recall_idem raises
+    w = make_worker(q, store, backoff_base_s=0.0)   # no backoff so the requeued row is immediately due
+    _enq(q, "User's DNS is AdGuard.")
+    w.drain_once()
+    assert store.add_calls == 0             # did NOT add on the unknown
+    assert w.stats["retried"] == 1
+    assert q.counts()["pending"] == 1       # requeued
+    # next drain: recall now succeeds (0 rows) -> proceeds to add exactly once
+    w.drain_once()
+    assert store.add_calls == 1
+    assert q.counts()["done"] == 1
+
+
+def test_scrub_read_failure_requeues_not_done(q):
+    """If the post-write scrub can't READ the written rows (transient), the row must NOT be marked
+    done (a secret could be left recallable) — requeue so the scrub retries."""
+    store = FakeStore(getwritten_raises=1)  # first get_written raises, AFTER the add succeeded
+    w = make_worker(q, store, backoff_base_s=0.0)
+    _enq(q, "some benign fact")
+    w.drain_once()
+    assert store.add_calls == 1             # the add happened
+    assert w.stats["retried"] == 1          # but the row was requeued, not completed
+    assert q.counts()["done"] == 0
+    assert q.counts()["pending"] == 1
+    # second drain: idem pre-check now finds the existing row -> marks done WITHOUT re-adding
+    w.drain_once()
+    assert store.add_calls == 1             # NOT re-added (exactly-once preserved)
+    assert q.counts()["done"] == 1
+
+
+def test_exactly_once_shortcut_still_scrubs(q):
+    """A prior lease added a SECRET-bearing row but crashed before scrubbing. On the next drain the
+    exactly-once shortcut (idem>0) must STILL run the scrub — not skip it and leave the secret."""
+    store = FakeStore()
+    w = make_worker(q, store, backoff_base_s=0.0)
+    tok = "8905425635:" + "AAH3xY9zKq" + "_Wp0LmNoPqRsTuVwXyZ" + "012345"
+    key = _enq(q, f"my bot token is {tok} keep it")
+    # simulate the prior lease: the row was ADDED but never scrubbed/marked done
+    store.add([{"role": "user", "content": f"my bot token is {tok} keep it"}],
+              {"metadata": {"capture_idem": key}})
+    assert len(store.rows) == 1
+    # now drain: idem>0 shortcut fires -> must scrub the secret before completing
+    w.drain_once()
+    assert w.stats["scrubbed"] == 1
+    assert all(tok not in r["memory"] for r in store.rows)   # secret forgotten
+    assert store.add_calls == 1                              # shortcut did NOT re-add
+    assert q.counts()["done"] == 1
