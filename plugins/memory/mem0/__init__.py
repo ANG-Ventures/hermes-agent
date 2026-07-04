@@ -61,6 +61,12 @@ _DEFAULT_DESTRUCTIVE = {
 # Anything else (notably "off") = recall-only.
 _CAPTURE_ON = ("auto", "on", "true", "1")
 
+# Upper bound on rows the post-write scrub fetches for one capture_idem. Must be high enough that a
+# long turn extracting many memories can't hide a secret-bearing row beyond the fetched page and then
+# complete unscanned (Greptile P1). A single turn realistically yields a handful of facts; 500 is a
+# safe ceiling well above any real extraction.
+_CAPTURE_SCRUB_MAX_ROWS = 500
+
 # W3-TEMPORAL defaults (all overridable via $HERMES_HOME/mem0.json).
 # tz = the calendar-day reference zone for "the 20th"/"yesterday" (PT, matching the
 # digest's DST-correct PT-day bounds). overfetch = how many candidates to pull from
@@ -1176,16 +1182,18 @@ class Mem0MemoryProvider(MemoryProvider):
                 # treats an idem-check error as "unknown" and requeues fail-closed, so a transient
                 # search fault never causes a duplicate re-add (Greptile P1).
                 resp = self._get_client().search_meta_filtered(
-                    "", {"capture_idem": key}, top_k=5)
+                    "", {"capture_idem": key}, top_k=_CAPTURE_SCRUB_MAX_ROWS)
                 rows = self._unwrap_results(resp)
                 return len(rows)
 
             def _get_written(key: str):
                 # Must RAISE on transient failure: the drainer's post-write scrub fails CLOSED
                 # (requeues) if it cannot read the rows it just wrote, so a secret is never left
-                # recallable behind a completed queue row (Greptile P1).
+                # recallable behind a completed queue row (Greptile P1). Fetch a HIGH ceiling of
+                # rows for the idem key — NOT one page — so a long turn that extracted many memories
+                # can't hide a secret-bearing row beyond page 1 that then completes unscanned.
                 resp = self._get_client().search_meta_filtered(
-                    "", {"capture_idem": key}, top_k=10)
+                    "", {"capture_idem": key}, top_k=_CAPTURE_SCRUB_MAX_ROWS)
                 return [{"id": r.get("id", ""), "memory": r.get("memory", "")}
                         for r in self._unwrap_results(resp)]
 
