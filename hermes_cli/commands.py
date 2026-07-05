@@ -90,6 +90,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="<platform>", cli_only=True),
     CommandDef("branch", "Branch the current session (explore a different path)", "Session",
                aliases=("fork",), args_hint="[name]"),
+    CommandDef("boomerang", "Run a task autonomously in an isolated subagent that inherits this "
+               "session's context; a summary returns here when it finishes", "Session",
+               aliases=("br",), args_hint="<task>"),
     CommandDef("compress", "Compress conversation context (add 'here [N]' to keep recent N turns)", "Session",
                args_hint="[here [N] | focus topic]"),
     CommandDef("rollback", "List or restore filesystem checkpoints", "Session",
