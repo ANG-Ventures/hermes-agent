@@ -101,6 +101,12 @@ _CAPTURE_ON = ("auto", "on", "true", "1")
 # safe ceiling well above any real extraction.
 _CAPTURE_SCRUB_MAX_ROWS = 500
 
+# Max combined user+assistant characters an auto-captured turn may have. Above this a turn is a
+# system/review/tool-dump prompt (no durable user facts) that the extraction provider rejects as
+# malformed (HTTP 502) — capturing it just poison-loops the queue. ~16k chars is far above any real
+# conversational exchange but below the multi-KB review prompts that trip the provider.
+_CAPTURE_MAX_TURN_CHARS = 16000
+
 # W3-TEMPORAL defaults (all overridable via $HERMES_HOME/mem0.json).
 # tz = the calendar-day reference zone for "the 20th"/"yesterday" (PT, matching the
 # digest's DST-correct PT-day bounds). overfetch = how many candidates to pull from
@@ -1403,6 +1409,15 @@ class Mem0MemoryProvider(MemoryProvider):
         without a restart (flip-lag footgun).
         """
         if not capture_is_on(self._live_capture()):
+            return
+        # SIZE CAP: skip oversized turns. A very large turn is a system/review/tool-dump prompt
+        # (e.g. a multi-KB adversarial-review or background-process payload), NOT a conversational
+        # exchange with durable user facts to extract — and the extraction provider REJECTS an
+        # oversized prompt (HTTP 502 "provider rejected as malformed"), which would poison-loop the
+        # queue on a row that can never succeed. Cheap char-length gate on the combined content.
+        if (len(user_content or "") + len(assistant_content or "")) > _CAPTURE_MAX_TURN_CHARS:
+            logger.debug("mem0 sync_turn: turn exceeds capture size cap (%d chars) — skipped",
+                         len(user_content or "") + len(assistant_content or ""))
             return
         pipe = self._get_capture_pipeline()
         if pipe is None:

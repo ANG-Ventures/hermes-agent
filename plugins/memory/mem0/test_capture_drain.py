@@ -173,6 +173,21 @@ def test_ambiguous_add_fault_never_deadletters(q):
     assert any("ADD AMBIGUOUS" in a for a in alerts), f"expected escalation, got {alerts}"
 
 
+def test_deterministic_reject_dead_letters(q):
+    """A DETERMINISTIC provider rejection (payload malformed / 400) means nothing was written AND
+    retrying the same payload can never succeed — bounded retry then dead-letter (poison row), not
+    an infinite ambiguous requeue."""
+    store = FakeStore(fail_times=99,
+                      fail_error=RuntimeError("HTTP 502 Bad Gateway: Provider rejected the request as malformed"))
+    w = make_worker(q, store, max_attempts=3)
+    _enq(q, "a giant review prompt that the extractor rejects")
+    for _ in range(3):
+        w.drain_once()
+        q._connect().execute("UPDATE capture_queue SET next_attempt_at=0 WHERE status='pending'")
+    assert q.counts()["dead"] == 1                 # poison row dead-lettered (not looping forever)
+    assert w.stats["dead"] >= 1
+
+
 def test_post_write_scrub_forgets_secret_bearing_memory(q):
     store = FakeStore()
     w = make_worker(q, store)

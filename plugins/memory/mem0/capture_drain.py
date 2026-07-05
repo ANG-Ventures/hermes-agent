@@ -192,14 +192,20 @@ class CaptureDrainWorker:
             attempts = int(row.get("attempts", 0)) + 1
             # AMBIGUOUS-WRITE FAIL-CLOSED (Greptile P1): a timeout / read error / broken pipe can
             # occur AFTER the server already committed /memories, so the add may be live+unscanned.
-            # We cannot dead-letter and abandon it. Only a clearly PRE-SEND failure (connection
-            # refused / name resolution / no route) means nothing was written -> bounded retry is
-            # safe. Everything else is treated as "maybe written" -> requeue forever + escalate.
+            # We cannot dead-letter and abandon it. Two exceptions where nothing was written, so the
+            # bounded/dead-letter path is safe (no secret to abandon):
+            #  - a clearly PRE-SEND failure (connection refused / name resolution / no route), and
+            #  - a DETERMINISTIC request REJECTION (the provider rejected the payload as malformed /
+            #    a 400/413 bad-request): the server did NOT store anything, AND retrying the same
+            #    payload forever can never succeed — bounded retry then dead-letter (poison row).
             msg = f"{type(e).__name__} {e}".lower()
             clearly_not_sent = any(m in msg for m in (
                 "refused", "name or service", "nodename", "no route", "getaddrinfo",
                 "failed to establish", "cannot connect", "connection error"))
-            if not clearly_not_sent:
+            deterministic_reject = any(m in msg for m in (
+                "provider rejected", "provider_bad_request", "malformed", "http 400", "http 413",
+                "request entity too large", "invalid request"))
+            if not clearly_not_sent and not deterministic_reject:
                 backoff = min(self._backoff * (2 ** min(attempts - 1, 12)), self._scrub_backoff_cap_s)
                 self._q.mark_scrub_retry(key, backoff_s=backoff, error=f"add-ambiguous: {str(e)[:270]}")
                 self.stats["retried"] += 1
