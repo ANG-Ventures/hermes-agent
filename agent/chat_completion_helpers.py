@@ -753,6 +753,30 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
+def _pool_affinity_headers(agent) -> dict:
+    """Return the x-hermes-session affinity header for the claude relay POOL only.
+
+    The pool (claude-app :18810 / claude-bpp :18811) uses this opaque per-conversation
+    id to pin a conversation to one subscription for prompt-cache preservation
+    (reset-weighted router, spec 2026-07-05). It is:
+      * PER-REQUEST — read off the live ``agent.session_id`` at call-build time, so it
+        rotates correctly when compaction mints a child session id (NOT a static
+        default_header, NOT the HERMES_SESSION_ID ContextVar which could go stale
+        across the httpx worker-thread boundary → cross-conversation key bleed).
+      * POOL-SCOPED — only stamped when the provider is a local pool relay, so it is
+        never sent to a direct Anthropic endpoint or any third party. The relay strips
+        it before dispatching upstream (routing metadata on a loopback hop, no egress,
+        no telemetry).
+    """
+    provider = (getattr(agent, "provider", "") or "").strip().lower()
+    if provider not in ("claude-app", "claude-bpp"):
+        return {}
+    sid = getattr(agent, "session_id", None)
+    if not sid or not isinstance(sid, str):
+        return {}
+    return {"x-hermes-session": sid}
+
+
 def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     tools_for_api = agent.tools
@@ -765,7 +789,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
         if ephemeral_out is not None:
             agent._ephemeral_max_output_tokens = None  # consume immediately
-        return _transport.build_kwargs(
+        _kwargs = _transport.build_kwargs(
             model=agent.model,
             messages=anthropic_messages,
             tools=tools_for_api,
@@ -778,6 +802,15 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             fast_mode=(agent.request_overrides or {}).get("speed") == "fast",
             drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)),
         )
+        # Stamp the pool affinity header (per-request, pool-scoped) so the relay's
+        # reset-weighted router can pin this conversation to one sub for the prompt
+        # cache. Merges into any existing extra_headers (e.g. anthropic-beta).
+        _aff = _pool_affinity_headers(agent)
+        if _aff:
+            _eh = dict(_kwargs.get("extra_headers") or {})
+            _eh.update(_aff)
+            _kwargs["extra_headers"] = _eh
+        return _kwargs
 
     # AWS Bedrock native Converse API — bypasses the OpenAI client entirely.
     # The adapter handles message/tool conversion and boto3 calls directly.
