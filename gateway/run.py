@@ -10244,7 +10244,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return "Failed to prepare MoA turn."
 
         if canonical == "boomerang":
-            # /boomerang <task> (alias /br): rewrite into a boomerang skill
+            # /boomerang <task>: rewrite into a boomerang skill
             # invocation and fall through to normal dispatch so it runs as an
             # agent turn (the /moa event.text-rewrite pattern). The skill tells
             # the agent to delegate_task(inherit_context=true, ...) with the
@@ -10252,7 +10252,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session asynchronously when it finishes.
             boomerang_task = event.get_command_args().strip()
             if not boomerang_task:
-                return ("Usage: /boomerang <task>  (alias /br)\n"
+                return ("Usage: /boomerang <task>\n"
                         "Runs the task autonomously in an isolated subagent that "
                         "inherits this session's context; a summary returns here "
                         "when it finishes.")

@@ -92,7 +92,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                aliases=("fork",), args_hint="[name]"),
     CommandDef("boomerang", "Run a task autonomously in an isolated subagent that inherits this "
                "session's context; a summary returns here when it finishes", "Session",
-               aliases=("br",), args_hint="<task>"),
+               args_hint="<task>"),
     CommandDef("compress", "Compress conversation context (add 'here [N]' to keep recent N turns)", "Session",
                args_hint="[here [N] | focus topic]"),
     CommandDef("rollback", "List or restore filesystem checkpoints", "Session",
@@ -1173,11 +1173,11 @@ _SLACK_PRIORITY_CANONICALS = ("debug",)
 #   - billing: the terminal-billing surface (buy/auto-reload/limit); /hermes billing.
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
-#   - boomerang/br: power-user subagent-dispatch command (+ its alias); routed
-#     via /hermes boomerang on Slack so the two names don't displace existing
-#     native slashes at the 50-command cap (same rationale as moa).
+#   - boomerang: power-user subagent-dispatch command; routed via /hermes
+#     boomerang on Slack so it doesn't displace an existing native slash at
+#     the 50-command cap (same rationale as moa).
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "version", "billing", "moa", "boomerang", "br", "debug"})
+_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "version", "billing", "moa", "boomerang", "debug"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

@@ -8563,14 +8563,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._pending_agent_seed = payload
             _cprint(f"  MoA one-shot queued with preset {preset}; previous model will be restored after this turn.")
         elif canonical == "boomerang":
-            # /boomerang <task> (alias /br): queue a boomerang skill invocation as
+            # /boomerang <task>: queue a boomerang skill invocation as
             # the next agent turn. The skill drives delegate_task(inherit_context=
             # true, ...) with the autonomous-execution contract; the child's summary
             # re-enters the session when it finishes.
             parts = cmd_original.split(None, 1)
             payload = parts[1].strip() if len(parts) > 1 else ""
             if not payload:
-                _cprint("  Usage: /boomerang <task>  (alias /br)")
+                _cprint("  Usage: /boomerang <task>")
                 _cprint("  Runs the task autonomously in an isolated subagent that "
                         "inherits this session's context; a summary returns when done.")
                 return True
