@@ -214,6 +214,13 @@ def test_classify_add_error_status_codes():
     assert C(RuntimeError("HTTP 500 Internal Server Error")) == "possibly_written"
     assert C(ConnectionRefusedError("Connection refused")) == "not_sent"
     assert C(RuntimeError("getaddrinfo failed: nodename nor servname")) == "not_sent"
+    # httpx/requests-style QUOTED status phrase (Greptile P1): code lives inside "'400 Bad Request'",
+    # not after an HTTP/status marker — must still classify as deterministic.
+    assert C(RuntimeError("Client error '400 Bad Request' for url 'https://mem0/memories'")) == "deterministic_client_error"
+    assert C(RuntimeError("Server error '502 Bad Gateway' for url ...")) == "possibly_written"
+    assert C(RuntimeError("httpx.HTTPStatusError: Client error '413 Request Entity Too Large'")) == "deterministic_client_error"
+    # a quoted 3-digit number WITHOUT an HTTP reason word must NOT be read as a status (fail-closed)
+    assert C(RuntimeError("could not open '404 files' in the batch")) == "possibly_written"
     # opaque error with a stray 3-digit number that is NOT an HTTP status -> fail-closed, not 4xx
     assert C(RuntimeError("read timed out after processing id 404abcdef")) == "possibly_written"
     assert C(RuntimeError("something totally opaque")) == "possibly_written"

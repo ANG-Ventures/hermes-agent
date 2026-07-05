@@ -30,17 +30,34 @@ from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# HTTP status appearing in an add() error string, e.g. "HTTP 400: ...", "HTTPError 413",
-# "status_code=422", "status: 400". Anchored to an explicit status marker so a stray 3-digit
-# number in the body (a memory id fragment, a byte count) can't be misread as a status.
-_STATUS_RE = _re.compile(
+# HTTP status appearing in an add() error string. Two anchored shapes, so a stray 3-digit number in
+# the body (a memory id fragment, a byte count) can't be misread as a status:
+#   (a) after an explicit marker:  "HTTP 400: ...", "HTTPError 413", "status_code=422", "status: 400"
+#   (b) inside an httpx/requests-style quoted status phrase, where the code is followed by a
+#       recognised HTTP reason word: "Client error '400 Bad Request' for url ...",
+#       "Server error \"502 Bad Gateway\"".  We require the reason word so a quoted '404 files' in
+#       free text can't trip it.
+_STATUS_MARKER_RE = _re.compile(
     r"(?:http(?:\s*error)?|status(?:[_ ]?code)?)\s*[:=]?\s*(\d{3})", _re.IGNORECASE)
+_STATUS_QUOTED_RE = _re.compile(
+    r"['\"]\s*(\d{3})\s+(?:bad request|unauthorized|forbidden|not found|method not allowed|"
+    r"not acceptable|request timeout|conflict|gone|length required|precondition|payload too large|"
+    r"request entity too large|uri too long|unsupported media|unprocessable|too many requests|"
+    r"internal server error|not implemented|bad gateway|service unavailable|gateway timeout)",
+    _re.IGNORECASE)
 # Words that indicate the request never left the client (nothing was written -> bounded retry is safe).
 _NOT_SENT_MARKERS = (
     "refused", "name or service", "nodename", "no route", "getaddrinfo",
     "failed to establish", "cannot connect", "connection error",
     "connection reset", "connection aborted", "broken pipe on send",
 )
+
+
+def _status_from_msg(msg: str):
+    """Extract an HTTP status code from an error string, or None. Tries the explicit-marker shape
+    first, then the quoted httpx/requests reason-phrase shape."""
+    m = _STATUS_MARKER_RE.search(msg) or _STATUS_QUOTED_RE.search(msg)
+    return int(m.group(1)) if m else None
 
 
 def _classify_add_error(exc: Exception) -> str:
@@ -57,9 +74,8 @@ def _classify_add_error(exc: Exception) -> str:
           possible secret-bearing row).
     """
     msg = f"{type(exc).__name__} {exc}".lower()
-    m = _STATUS_RE.search(msg)
-    if m:
-        code = int(m.group(1))
+    code = _status_from_msg(msg)
+    if code is not None:
         # 408 Request Timeout / 429 Too Many Requests are transient 4xx -> retryable, and the
         # server may have partially processed -> treat as possibly_written (fail-closed).
         if code in (408, 429):
