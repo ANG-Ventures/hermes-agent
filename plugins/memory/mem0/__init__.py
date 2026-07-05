@@ -350,9 +350,16 @@ class _DirectRestMem0Client:
         # real selector. For a pure metadata-equality lookup (e.g. capture_idem reconcile) there is
         # no semantic query, so send a minimal non-empty placeholder; the `filters` clause does the
         # actual selection. (Probed 2026-07-03: ""→400, "."→200 with the filter honored.)
+        # FAIL-CLOSED (Greptile): the "." placeholder is only safe BECAUSE a real metadata filter
+        # narrows the result. With NO filter, "." would degrade into a broad match over all memories
+        # and callers could treat unrelated rows as hits. This method is metadata-equality ONLY, so
+        # an empty filter is a caller bug — refuse it rather than silently broad-search.
+        filters = dict(meta_filters or {})
+        if not filters:
+            raise ValueError("search_meta_filtered requires a non-empty metadata filter "
+                             "(it is metadata-equality only; use search() for a semantic query)")
         q = query if (query and query.strip()) else "."
-        body = {"query": q, "user_id": self._user_id,
-                "filters": dict(meta_filters or {}), "top_k": top_k}
+        body = {"query": q, "user_id": self._user_id, "filters": filters, "top_k": top_k}
         return self._request("POST", "/search", body=body)
 
     def get_all(self, filters=None, **kwargs):

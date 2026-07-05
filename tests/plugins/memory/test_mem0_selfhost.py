@@ -307,6 +307,11 @@ def test_search_meta_filtered_coerces_empty_query_to_nonempty():
     # a real query is passed through untouched
     client.search_meta_filtered("real query", {"capture_idem": "abc"})
     assert sent[-1]["query"] == "real query"
+    # FAIL-CLOSED: an empty metadata filter is refused (the "." placeholder would broad-search)
+    import pytest as _pytest
+    for bad in (None, {}):
+        with _pytest.raises(ValueError):
+            client.search_meta_filtered("", bad)
 
 
 def test_direct_rest_client_scopes_writes_both_reads_user_only():
