@@ -2788,7 +2788,11 @@ def delegate_task(
                     else (acp_args if acp_args is not None else creds.get("args"))
                 ),
                 role=effective_role,
-                inherit_context=bool(t.get("inherit_context")),
+                inherit_context=bool(
+                    t.get("inherit_context")
+                    if "inherit_context" in t
+                    else inherit_context
+                ),
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -3685,6 +3689,10 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "string",
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
+                        },
+                        "inherit_context": {
+                            "type": "boolean",
+                            "description": "Per-task boomerang inheritance override. See top-level 'inherit_context'. Defaults to the top-level value when omitted.",
                         },
                     },
                     "required": ["goal"],

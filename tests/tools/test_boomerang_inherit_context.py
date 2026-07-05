@@ -194,3 +194,59 @@ class TestInheritContextIntegration:
         pf = captured.get("prefill_messages")
         # default path forwards parent's boot-seed prefill (None here), never the history
         assert pf is None or "SECRET_SHOULD_NOT_LEAK" not in str(pf)
+
+    def _capture_all_child_kwargs(self, **delegate_kwargs):
+        """Like _capture_child_kwargs but returns the list of every child's kwargs
+        (batch fan-out constructs N children)."""
+        from unittest.mock import patch, MagicMock
+        captured = []
+
+        def _fake_aiagent(**kwargs):
+            captured.append(kwargs)
+            child = MagicMock()
+            child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1,
+            }
+            child._delegate_depth = 1
+            child.get_activity_summary.return_value = {"api_call_count": 1}
+            return child
+
+        with patch("run_agent.AIAgent", side_effect=_fake_aiagent):
+            delegate_task(**delegate_kwargs)
+        return captured
+
+    def test_batch_top_level_inherit_context_propagates_to_each_task(self):
+        # Greptile P1 regression: tasks=[...] + top-level inherit_context=True must
+        # fold the parent context into EVERY batch child (was silently dropped).
+        history = [{"role": "user", "content": "BATCH_MARKER established fact"}]
+        parent = self._make_parent(history)
+        kids = self._capture_all_child_kwargs(
+            tasks=[{"goal": "task A"}, {"goal": "task B"}],
+            inherit_context=True,
+            parent_agent=parent,
+        )
+        assert len(kids) == 2, f"expected 2 batch children, got {len(kids)}"
+        for k in kids:
+            pf = k.get("prefill_messages")
+            assert isinstance(pf, list) and len(pf) == 1, f"batch child missing folded context: {pf!r}"
+            assert pf[0]["role"] == "user"
+            assert "BATCH_MARKER" in pf[0]["content"]
+
+    def test_batch_per_task_override_wins_over_top_level(self):
+        # Per-task inherit_context=False overrides top-level True for that task only.
+        history = [{"role": "user", "content": "OVERRIDE_MARKER fact"}]
+        parent = self._make_parent(history)
+        kids = self._capture_all_child_kwargs(
+            tasks=[{"goal": "inherits"}, {"goal": "opts out", "inherit_context": False}],
+            inherit_context=True,
+            parent_agent=parent,
+        )
+        assert len(kids) == 2
+        pf0, pf1 = kids[0].get("prefill_messages"), kids[1].get("prefill_messages")
+        assert isinstance(pf0, list) and "OVERRIDE_MARKER" in pf0[0]["content"]
+        assert pf1 is None or "OVERRIDE_MARKER" not in str(pf1)
+
+    def test_schema_batch_task_item_advertises_inherit_context(self):
+        item_props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]["tasks"]["items"]["properties"]
+        assert "inherit_context" in item_props
+        assert item_props["inherit_context"]["type"] == "boolean"
