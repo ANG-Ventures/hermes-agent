@@ -1410,15 +1410,25 @@ class Mem0MemoryProvider(MemoryProvider):
         """
         if not capture_is_on(self._live_capture()):
             return
-        # SIZE CAP: skip oversized turns. A very large turn is a system/review/tool-dump prompt
-        # (e.g. a multi-KB adversarial-review or background-process payload), NOT a conversational
-        # exchange with durable user facts to extract — and the extraction provider REJECTS an
-        # oversized prompt (HTTP 502 "provider rejected as malformed"), which would poison-loop the
-        # queue on a row that can never succeed. Cheap char-length gate on the combined content.
-        if (len(user_content or "") + len(assistant_content or "")) > _CAPTURE_MAX_TURN_CHARS:
-            logger.debug("mem0 sync_turn: turn exceeds capture size cap (%d chars) — skipped",
-                         len(user_content or "") + len(assistant_content or ""))
+        # SIZE CAP (Greptile P1: don't drop a user fact just because the ASSISTANT side is large).
+        # The poison case the provider rejects (HTTP 502 "provider rejected as malformed") is a giant
+        # *input* — a pasted multi-KB review/system/tool-dump prompt with no durable user facts. That
+        # lives in user_content. A normal turn with a small user fact ("my DNS is AdGuard") but a huge
+        # assistant/tool response is legitimate and MUST still be captured. So:
+        #   - if the USER side alone exceeds the cap -> skip (true poison prompt, can't succeed), else
+        #   - keep the turn but TRUNCATE the assistant side to the remaining budget, preserving the
+        #     user fact while staying under the provider's malformed-payload ceiling.
+        user_content = user_content or ""
+        assistant_content = assistant_content or ""
+        if len(user_content) > _CAPTURE_MAX_TURN_CHARS:
+            logger.debug("mem0 sync_turn: user content exceeds capture size cap (%d chars) — skipped",
+                         len(user_content))
             return
+        budget = _CAPTURE_MAX_TURN_CHARS - len(user_content)
+        if len(assistant_content) > budget:
+            logger.debug("mem0 sync_turn: assistant content truncated %d->%d chars to fit size cap "
+                         "(user fact preserved)", len(assistant_content), budget)
+            assistant_content = assistant_content[:budget]
         pipe = self._get_capture_pipeline()
         if pipe is None:
             return
