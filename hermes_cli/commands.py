@@ -1173,8 +1173,11 @@ _SLACK_PRIORITY_CANONICALS = ("debug",)
 #   - billing: the terminal-billing surface (buy/auto-reload/limit); /hermes billing.
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
+#   - boomerang/br: power-user subagent-dispatch command (+ its alias); routed
+#     via /hermes boomerang on Slack so the two names don't displace existing
+#     native slashes at the 50-command cap (same rationale as moa).
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "version", "billing", "moa", "debug"})
+_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "version", "billing", "moa", "boomerang", "br", "debug"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
