@@ -382,15 +382,26 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
          resumed histories. Refs #29148, #49147.
       1. Stray ``tool`` messages whose ``tool_call_id`` doesn't match
          any preceding assistant tool_call — dropped.
+      1.5. An ``assistant(tool_calls)`` turn whose tool_call ids get NO
+         matching ``tool`` result in the run immediately after it (an
+         UNANSWERED tool_use — a guaranteed provider 400). None-answered →
+         strip the tool_calls (keep the text) or drop the turn; partially
+         answered → drop only the unanswered call entries. This catches a
+         duplicate/orphan buried MID-history (e.g. an FTS write-corruption /
+         restart-storm double-write, or a host-fed broken history) that the
+         dangling-TAIL stripper and Pass 0 (adjacent-assistant merge) both miss.
       2. Consecutive ``user`` messages — merged with newline separator
          so no user input is lost.
 
-    Deliberately does NOT rewind orphan ``assistant(tool_calls)+tool``
-    pairs that precede a user message — that pattern IS valid when the
-    previous turn completed normally and the user jumped in to redirect
-    before the model got a continuation turn (the ongoing dialog
-    pattern). The empty-response scaffolding stripper handles the
-    genuinely-broken variant via its flag-gated rewind.
+    Deliberately does NOT touch an ``assistant`` turn that either carries NO
+    ``tool_calls`` (or whose calls WERE answered) followed by a ``user``
+    message — that pattern IS valid when the previous turn completed normally
+    and the user jumped in to redirect before the model got a continuation turn
+    (the ongoing dialog pattern). Pass 1.5 only ever acts on tool_calls with
+    zero/partial results (an unconditional-400 shape), never on the valid
+    redirect; and duplicate tool_use ids that ARE each answered are left alone
+    (Anthropic accepts them). The empty-response scaffolding stripper handles
+    the genuinely-broken TAIL variant via its flag-gated rewind.
 
     Returns the number of repairs made (for logging/telemetry).
     """
@@ -491,6 +502,107 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                 # are orphans.
                 known_tool_ids = set()
             filtered.append(msg)
+
+    # Pass 1.5: repair an ``assistant(tool_calls)`` turn whose tool_call ids
+    # get NO matching ``tool`` result in the contiguous tool-run immediately
+    # following it. This is an UNANSWERED tool_use — a guaranteed provider 400
+    # ("`tool_use` ids were found without `tool_result` blocks immediately
+    # after: toolu_..." on Anthropic; "assistant message with 'tool_calls' must
+    # be followed by tool messages" on OpenAI/DeepSeek/Kimi). It slips past the
+    # dangling-TAIL stripper (which only inspects the last message) and past
+    # Pass 0 (which only merges ADJACENT assistants), so a duplicate/orphan
+    # buried MID-history — e.g. a tool-call row double-written during an FTS
+    # write-corruption / restart storm, or a host-fed broken history — reaches
+    # the wire and 400s. On 2026-07-04 exactly this shape (an orphaned
+    # assistant tool_use whose byte-identical twin later in the same session WAS
+    # answered) wedged a session and, via the fallback walk, spammed ~20 status
+    # messages across 11 subs.
+    #
+    # This does NOT touch the valid "assistant answered, user redirected"
+    # pattern the docstring protects: that assistant turn carries NO tool_calls
+    # (or its calls WERE answered). We only ever act on tool_calls with zero or
+    # partial results — an unconditional-400 shape, not a stylistic one. Codex
+    # Responses interim turns (which legitimately carry unanswered interim tool
+    # state for the encrypted replay chain) are exempt, same as Pass 0.
+    deorphaned: List[Dict] = []
+    n = len(filtered)
+    i = 0
+    while i < n:
+        msg = filtered[i]
+        calls = msg.get("tool_calls") if isinstance(msg, dict) else None
+        if (
+            isinstance(msg, dict)
+            and msg.get("role") == "assistant"
+            and calls
+            and not _is_codex_interim(msg)
+        ):
+            # Collect the ids answered by the contiguous ``tool`` run that
+            # immediately follows this assistant turn.
+            answered: set = set()
+            j = i + 1
+            while j < n and isinstance(filtered[j], dict) and filtered[j].get("role") == "tool":
+                tc_id = filtered[j].get("tool_call_id")
+                if tc_id:
+                    answered.add(tc_id)
+                j += 1
+            call_ids = [
+                tc.get("id") for tc in calls
+                if isinstance(tc, dict) and tc.get("id")
+            ]
+            # Any call without an id is treated as unanswerable (can't be
+            # matched to a result), so it counts as unanswered.
+            unanswered_calls = [
+                tc for tc in calls
+                if not (isinstance(tc, dict) and tc.get("id") in answered)
+            ]
+            if unanswered_calls and len(unanswered_calls) == len(calls):
+                # NONE answered — the whole tool-call turn is an orphan.
+                text = msg.get("content")
+                has_text = (isinstance(text, str) and text.strip()) or (
+                    isinstance(text, list) and len(text) > 0
+                )
+                if has_text:
+                    # Keep the model's text as a plain assistant turn; drop the
+                    # unanswered tool_calls so nothing demands a missing result.
+                    repaired = dict(msg)
+                    repaired.pop("tool_calls", None)
+                    deorphaned.append(repaired)
+                    logger.debug(
+                        "Pass 1.5: stripped %d unanswered tool_call(s) from a "
+                        "mid-history assistant turn (kept its text)",
+                        len(calls),
+                    )
+                else:
+                    # No salvageable content — drop the whole orphan turn.
+                    logger.debug(
+                        "Pass 1.5: dropped a mid-history assistant(tool_calls) "
+                        "turn with %d unanswered call(s) and no text content",
+                        len(calls),
+                    )
+                repairs += 1
+                i += 1
+                continue
+            if unanswered_calls:
+                # PARTIAL: some ids answered, some not. Keep only the answered
+                # tool_calls (and their results, which follow); drop the
+                # unanswered call entries so the turn stays wire-valid.
+                repaired = dict(msg)
+                repaired["tool_calls"] = [
+                    tc for tc in calls
+                    if isinstance(tc, dict) and tc.get("id") in answered
+                ]
+                deorphaned.append(repaired)
+                repairs += 1
+                logger.debug(
+                    "Pass 1.5: dropped %d unanswered tool_call(s) from a "
+                    "mid-history assistant turn, kept %d answered",
+                    len(unanswered_calls), len(call_ids) - len(unanswered_calls),
+                )
+                i += 1
+                continue
+        deorphaned.append(msg)
+        i += 1
+    filtered = deorphaned
 
     # Pass 2: merge consecutive user messages. Preserves all user input
     # so nothing the user typed is lost.
