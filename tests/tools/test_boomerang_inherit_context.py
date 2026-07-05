@@ -250,3 +250,51 @@ class TestInheritContextIntegration:
         item_props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]["tasks"]["items"]["properties"]
         assert "inherit_context" in item_props
         assert item_props["inherit_context"]["type"] == "boolean"
+
+
+class TestModelDispatchThreadsInheritContext:
+    """Greptile P1 (the load-bearing one): the LIVE model-facing dispatcher
+    AIAgent._dispatch_delegate_task must forward inherit_context, or a
+    model-emitted delegate_task(inherit_context=true) silently drops it and the
+    whole /boomerang feature ships dark. This is the real production path;
+    the registry lambda is only a fallback."""
+
+    def test_dispatcher_forwards_inherit_context_to_delegate_task(self):
+        from unittest.mock import patch, MagicMock
+        import run_agent
+
+        agent = MagicMock()
+        agent._delegate_depth = 0
+
+        captured = {}
+
+        def _fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        with patch("tools.delegate_tool.delegate_task", side_effect=_fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                agent, {"goal": "do it", "inherit_context": True}
+            )
+
+        assert "inherit_context" in captured, "dispatcher dropped inherit_context (feature ships dark)"
+        assert captured["inherit_context"] is True
+
+    def test_dispatcher_default_inherit_context_is_none_not_forced(self):
+        # When the model omits it, the dispatcher passes None (delegate_task then
+        # defaults to no inheritance) — never accidentally forces it on.
+        from unittest.mock import patch, MagicMock
+        import run_agent
+
+        agent = MagicMock()
+        agent._delegate_depth = 0
+        captured = {}
+
+        def _fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        with patch("tools.delegate_tool.delegate_task", side_effect=_fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(agent, {"goal": "do it"})
+
+        assert captured.get("inherit_context") is None
