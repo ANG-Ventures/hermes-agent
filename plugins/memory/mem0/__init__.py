@@ -784,7 +784,7 @@ class Mem0MemoryProvider(MemoryProvider):
     #     trims a truly-orthogonal candidate slipping into a substantive query's top-5.
     # Both fail OPEN to today's behavior on any error; both stamp a greppable outcome.
 
-    _PREFETCH_FLOOR_DEFAULT_COSINE = 0.25    # Gate B fallback; operational value in mem0.json (D-6)
+    _PREFETCH_FLOOR_DEFAULT_COSINE = 0.10    # Gate B fallback (benchmarked 2026-07-06: 0.10=recall .959/prec .983; operational value in mem0.json, D-6)
     _PREFETCH_FLOOR_COSINE_CLAMP = 0.95      # D-7: an impossible threshold can never fully starve recall
     _PREFETCH_FLOOR_DEFAULT_MIN_CONTENT = 1  # Gate A fallback; PINNED at 1 (INV-7 — a 1-content-token command must pass)
     _PREFETCH_FLOOR_MAX_EMBED_TIMEOUT_S = 3.0

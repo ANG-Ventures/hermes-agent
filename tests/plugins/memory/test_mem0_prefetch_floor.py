@@ -112,7 +112,7 @@ def test_gate_b_drops_low_cosine(monkeypatch, tmp_path):
     """INV-1: candidates with /search score 1.0 but true cosine below the floor are dropped.
     Uses cosine, NOT the saturated score."""
     p = _provider(monkeypatch, tmp_path)
-    _write_floor_cfg(tmp_path, {"enabled": True, "min_cosine": 0.25})
+    _write_floor_cfg(tmp_path, {"enabled": True, "min_cosine": 0.10})
     embeds = [_Q, _NEAR, _NEAR, _ORTHO, _ORTHO]
     monkeypatch.setattr(p, "_dedup_embed", lambda texts, *, timeout=15: embeds)
     results = _results("near1", "near2", "junk1", "junk2")
@@ -123,8 +123,8 @@ def test_gate_b_drops_low_cosine(monkeypatch, tmp_path):
 
 def test_gate_b_saturated_score_does_not_save_low_cosine(monkeypatch, tmp_path):
     p = _provider(monkeypatch, tmp_path)
-    _write_floor_cfg(tmp_path, {"enabled": True, "min_cosine": 0.25})
-    low_cos = _unit([0.1, 0.99, 0.0])  # cosine ~0.1
+    _write_floor_cfg(tmp_path, {"enabled": True, "min_cosine": 0.10})
+    low_cos = _unit([0.02, 0.999, 0.0])  # cosine ~0.02, well below the 0.10 floor
     monkeypatch.setattr(p, "_dedup_embed", lambda texts, *, timeout=15: [_Q, low_cos])
     results = [{"memory": "off-topic but scored 1.0", "score": 1.0}]
     kept, outcome = p._apply_gate_b_cosine("real query", results, budget_s=3.0)
@@ -135,7 +135,7 @@ def test_gate_b_saturated_score_does_not_save_low_cosine(monkeypatch, tmp_path):
 def test_gate_b_fail_open_on_embed_none(monkeypatch, tmp_path):
     """INV-2/INV-6: embed failure → full un-floored passthrough + failed_open."""
     p = _provider(monkeypatch, tmp_path)
-    _write_floor_cfg(tmp_path, {"enabled": True, "min_cosine": 0.25})
+    _write_floor_cfg(tmp_path, {"enabled": True, "min_cosine": 0.10})
     monkeypatch.setattr(p, "_dedup_embed", lambda texts, *, timeout=15: None)
     results = _results("a", "b", "c")
     kept, outcome = p._apply_gate_b_cosine("real query", results, budget_s=3.0)
@@ -145,7 +145,7 @@ def test_gate_b_fail_open_on_embed_none(monkeypatch, tmp_path):
 
 def test_gate_b_fail_open_on_short_vec(monkeypatch, tmp_path):
     p = _provider(monkeypatch, tmp_path)
-    _write_floor_cfg(tmp_path, {"enabled": True, "min_cosine": 0.25})
+    _write_floor_cfg(tmp_path, {"enabled": True, "min_cosine": 0.10})
     monkeypatch.setattr(p, "_dedup_embed", lambda texts, *, timeout=15: [_Q, _NEAR])  # need 4
     results = _results("a", "b", "c")
     kept, outcome = p._apply_gate_b_cosine("real query", results, budget_s=3.0)
@@ -156,7 +156,7 @@ def test_gate_b_fail_open_on_short_vec(monkeypatch, tmp_path):
 def test_gate_b_no_budget_fails_open_without_embed(monkeypatch, tmp_path):
     """INV-5: below 1s budget → fail open fast, never issue a doomed embed call."""
     p = _provider(monkeypatch, tmp_path)
-    _write_floor_cfg(tmp_path, {"enabled": True, "min_cosine": 0.25})
+    _write_floor_cfg(tmp_path, {"enabled": True, "min_cosine": 0.10})
     called = {"embed": False}
 
     def _spy(texts, *, timeout=15):
@@ -189,7 +189,7 @@ def test_gate_b_disabled_passthrough_no_embed(monkeypatch, tmp_path):
 def test_gate_b_exact_token_query_bypasses(monkeypatch, tmp_path):
     """D-5: exact-token queries bypass Gate B (cosine unreliable for that class)."""
     p = _provider(monkeypatch, tmp_path)
-    _write_floor_cfg(tmp_path, {"enabled": True, "min_cosine": 0.25})
+    _write_floor_cfg(tmp_path, {"enabled": True, "min_cosine": 0.10})
     called = {"embed": False}
 
     def _spy(texts, *, timeout=15):
@@ -205,7 +205,7 @@ def test_gate_b_exact_token_query_bypasses(monkeypatch, tmp_path):
 
 def test_gate_b_unforeseen_exception_fails_open(monkeypatch, tmp_path):
     p = _provider(monkeypatch, tmp_path)
-    _write_floor_cfg(tmp_path, {"enabled": True, "min_cosine": 0.25})
+    _write_floor_cfg(tmp_path, {"enabled": True, "min_cosine": 0.10})
 
     def _boom(texts, *, timeout=15):
         raise RuntimeError("kaboom")
@@ -223,7 +223,7 @@ def test_gate_b_unforeseen_exception_fails_open(monkeypatch, tmp_path):
 def test_floor_default_on_when_unset(monkeypatch, tmp_path):
     p = _provider(monkeypatch, tmp_path)
     assert p._prefetch_floor_enabled() is True
-    assert p._prefetch_floor_cosine() == pytest.approx(0.25)
+    assert p._prefetch_floor_cosine() == pytest.approx(0.10)
     assert p._prefetch_min_content_tokens() == 1
 
 
@@ -239,7 +239,7 @@ def test_floor_cosine_clamped_out_of_range(monkeypatch, tmp_path):
 def test_floor_garbage_cosine_falls_to_default(monkeypatch, tmp_path):
     p = _provider(monkeypatch, tmp_path)
     _write_floor_cfg(tmp_path, {"enabled": True, "min_cosine": "abc"})
-    assert p._prefetch_floor_cosine() == pytest.approx(0.25)
+    assert p._prefetch_floor_cosine() == pytest.approx(0.10)
 
 
 def test_floor_partial_json_failsafe(monkeypatch, tmp_path):
@@ -247,7 +247,7 @@ def test_floor_partial_json_failsafe(monkeypatch, tmp_path):
     p = _provider(monkeypatch, tmp_path)
     (tmp_path / "mem0.json").write_text('{"prefetch_relevance_floor": {"enabled": tr')  # truncated
     assert p._prefetch_floor_enabled() is True
-    assert p._prefetch_floor_cosine() == pytest.approx(0.25)
+    assert p._prefetch_floor_cosine() == pytest.approx(0.10)
     assert p._prefetch_min_content_tokens() == 1
 
 
