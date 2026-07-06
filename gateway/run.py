@@ -4854,6 +4854,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return result
 
     @staticmethod
+    def _reasoning_effort_label(reasoning_cfg: dict | None) -> str:
+        """Render a reasoning-effort config dict into a display label.
+
+        Shared by the ``/new`` reset banner and the ``/model`` switch
+        confirmation so both surfaces describe the effective reasoning effort
+        the same way. ``None`` → ``"medium (default)"``;
+        ``{"enabled": False}`` → ``"none"``; otherwise the configured effort.
+        """
+        if reasoning_cfg is None:
+            return "medium (default)"
+        if not reasoning_cfg.get("enabled", True):
+            return "none"
+        return str(reasoning_cfg.get("effort", "medium"))
+
+    @staticmethod
     def _parse_reasoning_command_args(raw_args: str) -> tuple[str, bool]:
         """Parse `/reasoning` args into `(value, persist_global)`.
 
@@ -9624,6 +9639,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _cmd_def_inner and _cmd_def_inner.name == "model":
                 return "Agent is running — wait or /stop first, then switch models."
 
+            # /boomerang starts a NEW agent turn (it rewrites into a subagent
+            # dispatch), so it cannot run mid-turn — refuse while busy, like /moa.
+            if _cmd_def_inner and _cmd_def_inner.name == "boomerang":
+                return "Agent is running — wait or /stop first, then /boomerang."
+
             # /codex-runtime must not be used while the agent is running.
             # Switching mid-turn would split a turn across two transports.
             if _cmd_def_inner and _cmd_def_inner.name == "codex-runtime":
@@ -10222,6 +10242,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event._moa_disable_after_turn = True
             except Exception:
                 return "Failed to prepare MoA turn."
+
+        if canonical == "boomerang":
+            # /boomerang <task>: rewrite into a boomerang skill
+            # invocation and fall through to normal dispatch so it runs as an
+            # agent turn (the /moa event.text-rewrite pattern). The skill tells
+            # the agent to delegate_task(inherit_context=true, ...) with the
+            # autonomous-execution contract; the child's summary re-enters this
+            # session asynchronously when it finishes.
+            boomerang_task = event.get_command_args().strip()
+            if not boomerang_task:
+                return ("Usage: /boomerang <task>\n"
+                        "Runs the task autonomously in an isolated subagent that "
+                        "inherits this session's context; a summary returns here "
+                        "when it finishes.")
+            try:
+                from agent.skill_commands import (
+                    build_skill_invocation_message,
+                    resolve_skill_command_key,
+                )
+                cmd_key = resolve_skill_command_key("boomerang")
+                msg = build_skill_invocation_message(cmd_key, boomerang_task) if cmd_key else None
+                if not msg:
+                    # Skill not installed — degrade to an inline instruction so the
+                    # feature still works without the boomerang skill present.
+                    msg = (
+                        f"Boomerang this task: {boomerang_task}\n\n"
+                        "Use delegate_task with inherit_context=true so the subagent "
+                        "inherits this conversation's context. Instruct it to execute "
+                        "autonomously (make reasonable assumptions, do NOT stop to ask; "
+                        "if blocked, complete what you can and report the blocker), and "
+                        "to end with a structured summary (Outcome / Changed / "
+                        "Commands+validation / Blockers). Its summary will re-enter this "
+                        "session when it finishes — acknowledge the dispatch and continue."
+                    )
+                event.text = msg
+            except Exception as _boom_exc:
+                logger.warning("boomerang command rewrite failed: %s", _boom_exc)
+                return "Failed to prepare the boomerang turn."
 
         if canonical == "subgoal":
             return await self._handle_subgoal_command(event)
@@ -12619,13 +12677,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # override, so config.yaml is the effective level at reset time.
         reasoning_label = None
         try:
-            reasoning_cfg = self._load_reasoning_config()
-            if reasoning_cfg is None:
-                reasoning_label = "medium (default)"
-            elif not reasoning_cfg.get("enabled", True):
-                reasoning_label = "none"
-            else:
-                reasoning_label = str(reasoning_cfg.get("effort", "medium"))
+            reasoning_label = self._reasoning_effort_label(self._load_reasoning_config())
         except Exception:
             reasoning_label = None
 

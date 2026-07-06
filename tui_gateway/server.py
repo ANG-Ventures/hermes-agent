@@ -228,7 +228,7 @@ try:
         2, int(os.environ.get("HERMES_TUI_RPC_POOL_WORKERS") or "8")
     )
 except (ValueError, TypeError):
-    _rpc_pool_workers = 4
+    _rpc_pool_workers = 8
 _pool = concurrent.futures.ThreadPoolExecutor(
     max_workers=_rpc_pool_workers,
     thread_name_prefix="tui-rpc",
@@ -991,6 +991,177 @@ def _emit(event: str, sid: str, payload: dict | None = None):
     if payload is not None:
         params["payload"] = payload
     write_json({"jsonrpc": "2.0", "method": "event", "params": params})
+
+
+_compute_host_supervisor = None
+_compute_host_supervisor_lock = threading.Lock()
+
+
+def _inside_compute_host_child() -> bool:
+    return os.environ.get("HERMES_COMPUTE_HOST_CHILD") == "1"
+
+
+def _turn_isolation_enabled(cfg: dict | None = None) -> bool:
+    if _inside_compute_host_child():
+        return False
+    isolation_cfg = cfg or _load_dashboard_process_isolation_config()
+    return bool(isolation_cfg.get("turn_isolation"))
+
+
+def _session_uses_compute_host(session: dict, cfg: dict | None = None) -> bool:
+    if not _turn_isolation_enabled(cfg):
+        return False
+    # Phase 1 routes lazy/dashboard sessions whose live AIAgent has not been
+    # built inside the serving process. Already-built in-process sessions keep
+    # the historical path unless a prior isolated turn marked host ownership.
+    return bool(session.get("_compute_host_active")) or (
+        session.get("agent") is None and session.get("agent_ready") is not None
+    )
+
+
+def _get_compute_host_supervisor(cfg: dict | None = None):
+    global _compute_host_supervisor
+    isolation_cfg = cfg or _load_dashboard_process_isolation_config()
+    with _compute_host_supervisor_lock:
+        if _compute_host_supervisor is None:
+            from tui_gateway.host_supervisor import HostSupervisor
+
+            _compute_host_supervisor = HostSupervisor(
+                rpc_sink=write_json,
+                heartbeat_secs=int(isolation_cfg.get("compute_host_heartbeat_secs") or 15),
+                respawn_max=int(isolation_cfg.get("compute_host_respawn_max") or 3),
+            )
+        return _compute_host_supervisor
+
+
+def _compute_host_turn_frame(rid: str, sid: str, session: dict, text: Any) -> dict:
+    with session["history_lock"]:
+        history = list(session.get("history", []))
+        history_version = int(session.get("history_version", 0))
+        attached_images = list(session.get("attached_images", []))
+    return {
+        "type": "turn.start",
+        "sid": sid,
+        "request_id": rid,
+        "session_key": session.get("session_key") or sid,
+        "text": text,
+        "history": history,
+        "history_version": history_version,
+        "cols": int(session.get("cols", 80) or 80),
+        "cwd": _session_cwd(session),
+        "profile_home": session.get("profile_home") or "",
+        "model_override": session.get("model_override"),
+        "reasoning_config_override": session.get("create_reasoning_override"),
+        "service_tier_override": session.get("create_service_tier_override"),
+        "source": _session_source(session),
+        "attached_images": attached_images,
+    }
+
+
+def _metadata_mirror(session: dict | None) -> dict:
+    mirror = (session or {}).get("_metadata_mirror")
+    return mirror if isinstance(mirror, dict) else {}
+
+
+def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> None:
+    """Mirror host-owned session metadata in the serving process.
+
+    The compute host is the only writer of live agent/history state while turn
+    isolation is active. The serving process keeps read metadata from the last
+    host frame so UI reads do not construct a second in-process agent.
+    """
+    if not isinstance(frame, dict):
+        return
+    with session.get("history_lock", threading.Lock()):
+        if frame.get("session_key"):
+            session["session_key"] = str(frame.get("session_key"))
+        if frame.get("history_version") is not None:
+            try:
+                session["history_version"] = max(
+                    int(session.get("history_version", 0)),
+                    int(frame.get("history_version") or 0),
+                )
+            except Exception:
+                pass
+        if frame.get("message_count") is not None:
+            try:
+                session["_metadata_message_count"] = int(frame.get("message_count") or 0)
+            except Exception:
+                pass
+    info = frame.get("session_info")
+    if isinstance(info, dict):
+        mirror = dict(_metadata_mirror(session))
+        mirror.update(info)
+        session["_metadata_mirror"] = mirror
+        session["_metadata_mirror_updated_at"] = time.time()
+
+
+def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
+    is_error = frame.get("type") == "turn.error"
+    with session["history_lock"]:
+        if frame.get("session_key"):
+            session["session_key"] = str(frame.get("session_key"))
+        if frame.get("history_version") is not None:
+            try:
+                session["history_version"] = max(
+                    int(session.get("history_version", 0)),
+                    int(frame.get("history_version") or 0),
+                )
+            except Exception:
+                pass
+        session["running"] = False
+        session["last_active"] = time.time()
+        _clear_inflight_turn(session)
+    if is_error:
+        message = str(frame.get("message") or "compute host turn failed")
+        _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
+    _apply_compute_host_metadata_mirror(session, frame)
+    try:
+        info = _session_info(session.get("agent"), session)
+    except TypeError:
+        info = _session_info(session.get("agent"))
+    if not frame.get("session_info_emitted"):
+        _emit("session.info", sid, info)
+    _drain_queued_prompt(rid, sid, session)
+
+
+def _submit_prompt_to_compute_host(rid: str, sid: str, session: dict, text: Any) -> dict:
+    cfg = _load_dashboard_process_isolation_config()
+    frame = _compute_host_turn_frame(rid, sid, session, text)
+
+    def _complete(done: dict) -> None:
+        _on_compute_host_turn_done(rid, sid, session, done)
+
+    try:
+        _get_compute_host_supervisor(cfg).submit_turn(frame, on_complete=_complete)
+    except Exception as exc:
+        with session["history_lock"]:
+            session["running"] = False
+            _clear_inflight_turn(session)
+        return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
+    with session["history_lock"]:
+        session["_compute_host_active"] = True
+        session["attached_images"] = []
+    return _ok(rid, {"status": "streaming", "turn_isolation": True})
+
+
+def _send_compute_host_control(
+    sid: str,
+    *,
+    route_name: str,
+    command: str = "",
+    payload: dict | None = None,
+    wait: bool = True,
+) -> dict:
+    frame = dict(payload or {})
+    frame.setdefault("type", "control")
+    frame.setdefault("command", command)
+    return _get_compute_host_supervisor().control(
+        sid,
+        route_name=route_name,
+        payload=frame,
+        wait=wait,
+    )
 
 
 def _emit_approval_request(sid: str, data: dict | None) -> None:
@@ -1760,6 +1931,48 @@ def _set_session_cwd(session: dict, cwd: str) -> str:
 # same shape so `config.get indicator` and the live TUI render agree.
 _INDICATOR_STYLES: tuple[str, ...] = ("ascii", "emoji", "kaomoji", "unicode")
 _INDICATOR_DEFAULT = "kaomoji"
+
+_DASHBOARD_TURN_ISOLATION_DEFAULT = False
+_DASHBOARD_COMPUTE_HOST_HEARTBEAT_SECS_DEFAULT = 15
+_DASHBOARD_COMPUTE_HOST_RESPAWN_MAX_DEFAULT = 3
+
+
+def _coerce_int_config_value(value: Any, default: int, *, min_value: int) -> int:
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        return default
+    return coerced if coerced >= min_value else default
+
+
+def _load_dashboard_process_isolation_config(cfg: dict | None = None) -> dict[str, Any]:
+    """Return dashboard process-isolation config with read-site defaults.
+
+    ``_load_cfg()`` intentionally returns raw ``config.yaml`` plus the managed
+    overlay; it does not deep-merge ``hermes_cli.config.DEFAULT_CONFIG``. Keep
+    the Phase-0 defaults here so dashboard runtime and the REST editor's
+    DEFAULT_CONFIG-backed schema cannot drift.
+    """
+    root = _load_cfg() if cfg is None else cfg
+    dashboard = root.get("dashboard") if isinstance(root, dict) else {}
+    if not isinstance(dashboard, dict):
+        dashboard = {}
+    return {
+        "turn_isolation": is_truthy_value(
+            dashboard.get("turn_isolation"),
+            default=_DASHBOARD_TURN_ISOLATION_DEFAULT,
+        ),
+        "compute_host_heartbeat_secs": _coerce_int_config_value(
+            dashboard.get("compute_host_heartbeat_secs"),
+            _DASHBOARD_COMPUTE_HOST_HEARTBEAT_SECS_DEFAULT,
+            min_value=1,
+        ),
+        "compute_host_respawn_max": _coerce_int_config_value(
+            dashboard.get("compute_host_respawn_max"),
+            _DASHBOARD_COMPUTE_HOST_RESPAWN_MAX_DEFAULT,
+            min_value=0,
+        ),
+    }
 
 
 def _load_cfg() -> dict:
@@ -3129,12 +3342,23 @@ def _current_profile_name() -> str:
 DESKTOP_BACKEND_CONTRACT = 3
 
 
+def _session_usage_snapshot(session: dict | None) -> dict:
+    agent = (session or {}).get("agent")
+    mirror_usage = _metadata_mirror(session).get("usage")
+    if (session or {}).get("_compute_host_active") and isinstance(mirror_usage, dict):
+        return dict(mirror_usage)
+    if agent is not None:
+        return _get_usage(agent)
+    return dict(mirror_usage) if isinstance(mirror_usage, dict) else {}
+
+
 def _session_info(agent, session: dict | None = None) -> dict:
     if session is None:
         for candidate in _sessions.values():
             if candidate.get("agent") is agent:
                 session = candidate
                 break
+    mirror = _metadata_mirror(session)
     cwd = _display_session_cwd(session)
     session_key = str(
         (session or {}).get("session_key") or getattr(agent, "session_id", "") or ""
@@ -3148,7 +3372,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         and reasoning_config.get("enabled") is not False
     ):
         reasoning_effort = str(reasoning_config.get("effort", "") or "")
-    service_tier = getattr(agent, "service_tier", None) or ""
+    service_tier = getattr(agent, "service_tier", None) or mirror.get("service_tier") or ""
     # Effective approval-bypass state — the same three sources that
     # check_all_command_guards() ORs together: persistent config
     # (approvals.mode=off), the process-scoped --yolo env, and the
@@ -3170,14 +3394,14 @@ def _session_info(agent, session: dict | None = None) -> dict:
     except Exception:
         yolo = False
     info: dict = {
-        "model": getattr(agent, "model", ""),
-        "provider": getattr(agent, "provider", ""),
+        "model": mirror.get("model", getattr(agent, "model", "")),
+        "provider": mirror.get("provider", getattr(agent, "provider", "")),
         "reasoning_effort": reasoning_effort,
         "service_tier": service_tier,
         "fast": service_tier == "priority",
         "yolo": yolo,
-        "tools": {},
-        "skills": {},
+        "tools": dict(mirror.get("tools") or {}) if isinstance(mirror.get("tools"), dict) else {},
+        "skills": dict(mirror.get("skills") or {}) if isinstance(mirror.get("skills"), dict) else {},
         "cwd": cwd,
         "branch": _git_branch_for_cwd(cwd),
         "personality": str(personality or ""),
@@ -3189,7 +3413,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "release_date": "",
         "update_behind": None,
         "update_command": "",
-        "usage": _get_usage(agent),
+        "usage": _session_usage_snapshot(session),
         "profile_name": _current_profile_name(),
     }
     try:
@@ -3199,22 +3423,24 @@ def _session_info(agent, session: dict | None = None) -> dict:
         info["release_date"] = __release_date__
     except Exception:
         pass
-    try:
-        from model_tools import get_toolset_for_tool
+    if agent is not None and not (session or {}).get("_compute_host_active"):
+        try:
+            from model_tools import get_toolset_for_tool
 
-        for t in getattr(agent, "tools", []) or []:
-            name = t["function"]["name"]
-            info["tools"].setdefault(get_toolset_for_tool(name) or "other", []).append(
-                name
-            )
-    except Exception:
-        pass
-    try:
-        from hermes_cli.banner import get_available_skills
+            info["tools"] = {}
+            for t in getattr(agent, "tools", []) or []:
+                name = t["function"]["name"]
+                info["tools"].setdefault(get_toolset_for_tool(name) or "other", []).append(
+                    name
+                )
+        except Exception:
+            pass
+        try:
+            from hermes_cli.banner import get_available_skills
 
-        info["skills"] = get_available_skills()
-    except Exception:
-        pass
+            info["skills"] = get_available_skills()
+        except Exception:
+            pass
     try:
         from tools.mcp_tool import get_mcp_status
 
@@ -3222,7 +3448,11 @@ def _session_info(agent, session: dict | None = None) -> dict:
     except Exception:
         info["mcp_servers"] = []
     try:
-        info["system_prompt"] = getattr(agent, "_cached_system_prompt", "") or ""
+        info["system_prompt"] = (
+            mirror.get("system_prompt")
+            if "system_prompt" in mirror
+            else getattr(agent, "_cached_system_prompt", "") or ""
+        )
     except Exception:
         pass
     try:
@@ -3233,9 +3463,10 @@ def _session_info(agent, session: dict | None = None) -> dict:
         info["update_command"] = recommended_update_command()
     except Exception:
         pass
-    warn = _probe_credentials(agent)
-    if warn:
-        info["credential_warning"] = warn
+    if agent is not None and not (session or {}).get("_compute_host_active"):
+        warn = _probe_credentials(agent)
+        if warn:
+            info["credential_warning"] = warn
     return info
 
 
@@ -3250,7 +3481,7 @@ def _tool_ctx(name: str, args: dict) -> str:
 
 def _emit_session_info_for_session(sid: str, session: dict) -> None:
     agent = session.get("agent")
-    if agent is None:
+    if agent is None and not _metadata_mirror(session):
         return
     try:
         _emit("session.info", sid, _session_info(agent, session))
@@ -4892,6 +5123,11 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any)
             agent.interrupt()
         except Exception:
             pass
+    elif mode != "queue" and _session_uses_compute_host(session):
+        try:
+            _get_compute_host_supervisor().interrupt(sid)
+        except Exception:
+            pass
     _enqueue_prompt(session, text, transport)
     session["last_active"] = time.time()
     return _ok(rid, {"status": "queued"})
@@ -4913,7 +5149,16 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
     try:
-        _run_prompt_submit(rid, sid, session, queued["text"])
+        if _session_uses_compute_host(session):
+            resp = _submit_prompt_to_compute_host(rid, sid, session, queued["text"])
+            if resp.get("error"):
+                message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
+                with session["history_lock"]:
+                    session["running"] = False
+                    _clear_inflight_turn(session)
+                _emit("error", sid, {"message": message})
+        else:
+            _run_prompt_submit(rid, sid, session, queued["text"])
     except Exception as exc:
         print(
             f"[tui_gateway] queued prompt dispatch failed: "
@@ -6302,11 +6547,9 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     agent = session.get("agent")
-    usage: dict = (
-        _get_usage(agent)
-        if agent is not None
-        else {"calls": 0, "input": 0, "output": 0, "total": 0}
-    )
+    usage: dict = _session_usage_snapshot(session)
+    if agent is None and not usage:
+        usage = {"calls": 0, "input": 0, "output": 0, "total": 0}
     # Nous credits block — agent-independent (a portal fetch), so it shows even
     # with zero API calls or on a resumed session. The TUI /usage panel renders
     # these lines regardless of `calls`. Fail-open: [] when not logged into Nous
@@ -6329,7 +6572,7 @@ def _(rid, params: dict) -> dict:
         return err
     agent = session.get("agent")
     if agent is None:
-        usage = _get_usage(None)
+        usage = _session_usage_snapshot(session) or _get_usage(None)
         return _ok(
             rid,
             {
@@ -6337,8 +6580,8 @@ def _(rid, params: dict) -> dict:
                 "context_max": usage.get("context_max", 0) or 0,
                 "context_percent": usage.get("context_percent", 0) or 0,
                 "context_used": usage.get("context_used", 0) or 0,
-                "estimated_total": 0,
-                "model": "",
+                "estimated_total": usage.get("context_used", 0) or usage.get("total", 0) or 0,
+                "model": _metadata_mirror(session).get("model", ""),
             },
         )
     with session["history_lock"]:
@@ -7613,9 +7856,10 @@ def _(rid, params: dict) -> dict:
             updated = _dt(meta.get(field), created)
             break
 
-    usage = _get_usage(agent) if agent is not None else {}
-    provider = getattr(agent, "provider", None) or "unknown"
-    model = getattr(agent, "model", None) or "(unknown)"
+    mirror = _metadata_mirror(session)
+    usage = _session_usage_snapshot(session)
+    provider = getattr(agent, "provider", None) or mirror.get("provider") or "unknown"
+    model = getattr(agent, "model", None) or mirror.get("model") or "(unknown)"
     lines = [
         "Hermes TUI Status",
         "",
@@ -7799,6 +8043,26 @@ def _redo_session_core(rid, session: dict, n: int) -> dict:
 
 @method("session.compress")
 def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    if _session_uses_compute_host(session):
+        sid = str(params.get("session_id") or "")
+        focus_topic = str(params.get("focus_topic", "") or "").strip()
+        command = "/compress" + (f" {focus_topic}" if focus_topic else "")
+        try:
+            ack = _send_compute_host_control(
+                sid,
+                route_name="session.compress",
+                command=command,
+                wait=True,
+            )
+        except Exception as exc:
+            return _err(rid, 5019, f"compute-host compress failed: {exc}")
+        if ack.get("type") in {"control.error", "error"}:
+            return _err(rid, 4009, str(ack.get("message") or "compute-host compress failed"))
+        _apply_compute_host_metadata_mirror(session, ack)
+        return _ok(rid, {"status": "compressed", "turn_isolation": True, "host_ack": ack})
     session, err = _sess(params, rid)
     if err:
         return err
@@ -8052,6 +8316,27 @@ def _(rid, params: dict) -> dict:
 
 @method("session.interrupt")
 def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    if _session_uses_compute_host(session):
+        sid = str(params.get("session_id") or "")
+        if session.get("running"):
+            try:
+                _get_compute_host_supervisor().interrupt(sid, request_id=f"interrupt-{rid}")
+            except Exception as exc:
+                return _err(rid, 5019, f"compute-host interrupt failed: {exc}")
+        with session["history_lock"]:
+            session["_turn_cancel_requested"] = True
+            session["queued_prompt"] = None
+        _clear_pending(sid)
+        try:
+            from tools.approval import resolve_gateway_approval
+
+            resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
+        except Exception:
+            pass
+        return _ok(rid, {"status": "interrupted", "turn_isolation": True})
     session, err = _sess(params, rid)
     if err:
         return err
@@ -8363,6 +8648,8 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    isolation_cfg = _load_dashboard_process_isolation_config()
+    turn_isolation = _session_uses_compute_host(session, isolation_cfg)
     # Re-bind to the current client transport for this request. This keeps
     # streaming events on the active websocket even if an earlier disconnect
     # or fallback moved the session transport to stdio.
@@ -8403,6 +8690,9 @@ def _(rid, params: dict) -> dict:
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
+
+    if turn_isolation:
+        return _submit_prompt_to_compute_host(rid, sid, session, text)
 
     # Persist the DB row lazily, now that the user has actually sent a message.
     _ensure_session_db_row(session)
@@ -11284,6 +11574,16 @@ def _(rid, params: dict) -> dict:
                     },
                 )
 
+        if session and _session_uses_compute_host(session):
+            try:
+                ack = _get_compute_host_supervisor().reload_mcp(
+                    str(params.get("session_id") or ""),
+                    request_id=f"reload-mcp-{rid}",
+                )
+            except Exception as exc:
+                return _err(rid, 5019, f"compute-host reload_mcp failed: {exc}")
+            return _ok(rid, {"status": "reloaded", "turn_isolation": True, "host_ack": ack})
+
         from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools
 
         shutdown_mcp_servers()
@@ -11408,18 +11708,23 @@ _LIVE_SESSION_DIRECT_COMMANDS = frozenset(
     }
 )
 
+_ISOLATED_SESSION_READ_COMMANDS = frozenset({"context", "tools", "help"})
+
 
 def _format_live_usage_output(session: dict) -> str:
     agent = session.get("agent")
-    if agent is None:
+    usage = _session_usage_snapshot(session)
+    if agent is None and not usage:
         return "(._.) No active agent -- send a message first."
-    usage = _get_usage(agent)
-    with session["history_lock"]:
-        message_count = len(session.get("history", []))
+    if session.get("_metadata_message_count") is not None:
+        message_count = int(session.get("_metadata_message_count") or 0)
+    else:
+        with session["history_lock"]:
+            message_count = len(session.get("history", []))
     lines = [
         "Session Token Usage",
         "────────────────────────────────────────",
-        f"Model: {usage.get('model') or getattr(agent, 'model', '') or '(unknown)'}",
+        f"Model: {usage.get('model') or _metadata_mirror(session).get('model') or getattr(agent, 'model', '') or '(unknown)'}",
         f"Input tokens:                 {int(usage.get('input') or 0):,}",
         f"Output tokens:                {int(usage.get('output') or 0):,}",
     ]
@@ -11477,16 +11782,95 @@ def _format_live_history_output(session: dict) -> str:
 
 def _format_live_prompt_output(session: dict) -> str:
     agent = session.get("agent")
-    if agent is None:
+    mirror = _metadata_mirror(session)
+    if agent is None and "system_prompt" not in mirror:
         return "No active agent -- send a message first."
     prompt = (
-        getattr(agent, "ephemeral_system_prompt", None)
+        mirror.get("system_prompt")
+        or getattr(agent, "ephemeral_system_prompt", None)
         or getattr(agent, "_cached_system_prompt", None)
         or ""
     )
     if not prompt:
         return "Current system prompt is not built yet; send a message first."
     return f"Current system prompt:\n{prompt}"
+
+
+def _format_live_context_output(session: dict) -> str:
+    messages = []
+    db = _get_db()
+    if db is not None and session.get("session_key"):
+        try:
+            messages = _history_to_messages(
+                db.get_messages_as_conversation(session["session_key"], include_ancestors=True)
+            )
+        except Exception:
+            messages = []
+    if not messages:
+        with session["history_lock"]:
+            messages = _history_to_messages(list(session.get("history", [])))
+    usage = _session_usage_snapshot(session)
+    mirror = _metadata_mirror(session)
+    lines = [
+        f"Conversation: {len(messages)} messages" if messages else "Conversation is empty (no messages yet)."
+    ]
+    roles: dict[str, int] = {}
+    for msg in messages:
+        role = str(msg.get("role") or "unknown")
+        roles[role] = roles.get(role, 0) + 1
+    lines.append(
+        f"  user: {roles.get('user', 0)}, assistant: {roles.get('assistant', 0)}, "
+        f"tool: {roles.get('tool', 0)}, system: {roles.get('system', 0)}"
+    )
+    model = mirror.get("model") or usage.get("model") or ""
+    provider = mirror.get("provider") or "auto"
+    if model:
+        lines.append(f"Model: {model}")
+    lines.append(f"Provider: {provider}")
+    context_used = int(usage.get("context_used") or usage.get("total") or 0)
+    context_max = int(usage.get("context_max") or 0)
+    if context_used:
+        if context_max:
+            usage_pct = (context_used / context_max) * 100
+            lines.append(
+                f"Context usage: ~{context_used:,} / {context_max:,} tokens ({usage_pct:.1f}%)"
+            )
+        else:
+            lines.append(f"Context usage: ~{context_used:,} tokens")
+    if usage.get("compressions"):
+        lines.append(f"Compressions: {int(usage.get('compressions') or 0):,}")
+    return "\n".join(lines)
+
+
+def _format_live_tools_output(session: dict) -> str:
+    info = _session_info(session.get("agent"), session)
+    groups = info.get("tools") if isinstance(info, dict) else {}
+    if not isinstance(groups, dict) or not groups:
+        return "No tools available."
+    names: list[str] = []
+    for group_names in groups.values():
+        if isinstance(group_names, list):
+            names.extend(str(name) for name in group_names)
+    names = sorted(set(names))
+    if not names:
+        return "No tools available."
+    return "Available tools ({}):\n{}".format(
+        len(names), "\n".join(f"  {name}" for name in names)
+    )
+
+
+def _format_live_help_output() -> str:
+    try:
+        from hermes_cli.commands import COMMANDS_BY_CATEGORY
+
+        lines = ["Available commands:", ""]
+        for category, commands in COMMANDS_BY_CATEGORY.items():
+            lines.append(f"{category}:")
+            for cmd, desc in commands.items():
+                lines.append(f"  {cmd:<15} {desc}")
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"help unavailable: {exc}"
 
 
 def _format_live_model_output(session: dict) -> str:
@@ -11506,6 +11890,16 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
     if name == "model" and not arg.strip():
         return _format_live_model_output(session or {})
     if name not in _LIVE_SESSION_DIRECT_COMMANDS:
+        if not (
+            name in _ISOLATED_SESSION_READ_COMMANDS
+            and session is not None
+            and _session_uses_compute_host(session)
+        ):
+            return None
+
+    if name in _ISOLATED_SESSION_READ_COMMANDS and not (
+        session is not None and _session_uses_compute_host(session)
+    ):
         return None
     if name == "compress":
         if session is None:
@@ -11528,6 +11922,16 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
         if response.get("error"):
             return str(response["error"].get("message") or "status unavailable")
         return str(response.get("result", {}).get("output") or "")
+    if name == "context":
+        if session is None:
+            return "Conversation is empty (no messages yet)."
+        return _format_live_context_output(session)
+    if name == "tools":
+        if session is None:
+            return "No tools available."
+        return _format_live_tools_output(session)
+    if name == "help":
+        return _format_live_help_output()
     if name == "clear":
         return "Screen clear is terminal-only; desktop/TUI chat left unchanged."
     if name == "models":
@@ -12782,6 +13186,21 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
     # with the session.compress / session.undo guards and the gateway
     # runner's running-agent /model guard.
     _MUTATES_WHILE_RUNNING = {"model", "personality", "prompt", "compress"}
+    if _session_uses_compute_host(session) and name in _MUTATES_WHILE_RUNNING:
+        route_name = f"slash.{name}"
+        try:
+            ack = _send_compute_host_control(
+                sid,
+                route_name=route_name,
+                command=command,
+                wait=True,
+            )
+        except Exception as exc:
+            return f"compute-host {route_name} failed: {exc}"
+        if ack.get("type") in {"control.error", "error"}:
+            return str(ack.get("message") or f"compute-host {route_name} failed")
+        _apply_compute_host_metadata_mirror(session, ack)
+        return str(ack.get("output") or "")
     if name in _MUTATES_WHILE_RUNNING and session.get("running"):
         return f"session busy — /interrupt the current turn before running /{name}"
 
@@ -12863,7 +13282,7 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
 
 @method("slash.exec")
 def _(rid, params: dict) -> dict:
-    session, err = _sess(params, rid)
+    session, err = _sess_nowait(params, rid)
     if err:
         return err
 
@@ -12939,6 +13358,10 @@ def _(rid, params: dict) -> dict:
     )
     if live_output is not None:
         return _ok(rid, {"output": live_output or "(no output)"})
+
+    session, err = _sess(params, rid)
+    if err:
+        return err
 
     worker = session.get("slash_worker")
     if not worker:
