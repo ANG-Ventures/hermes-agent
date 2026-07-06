@@ -754,22 +754,29 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 def _pool_affinity_headers(agent) -> dict:
-    """Return the x-hermes-session affinity header for the claude relay POOL only.
+    """Return the x-hermes-session affinity header for the claude relay POOL.
 
-    The pool (claude-app :18810 / claude-bpp :18811) uses this opaque per-conversation
-    id to pin a conversation to one subscription for prompt-cache preservation
-    (reset-weighted router, spec 2026-07-05). It is:
+    The pool uses this opaque per-conversation id to pin a conversation to one
+    subscription for prompt-cache preservation (reset-weighted router, spec
+    2026-07-05). It is:
       * PER-REQUEST — read off the live ``agent.session_id`` at call-build time, so it
         rotates correctly when compaction mints a child session id (NOT a static
         default_header, NOT the HERMES_SESSION_ID ContextVar which could go stale
         across the httpx worker-thread boundary → cross-conversation key bleed).
-      * POOL-SCOPED — only stamped when the provider is a local pool relay, so it is
-        never sent to a direct Anthropic endpoint or any third party. The relay strips
-        it before dispatching upstream (routing metadata on a loopback hop, no egress,
-        no telemetry).
+      * POOL-SCOPED — only stamped for ``claude-app`` (the api-proxy pool, api_mode
+        ``anthropic_messages``), so it is never sent to a direct Anthropic endpoint
+        or any third party. The relay strips it before dispatching upstream (routing
+        metadata on a loopback hop, no egress, no telemetry).
+
+    SCOPE NOTE (Greptile #205): ``claude-bpp`` (the bridge pool) resolves to
+    api_mode ``chat_completions`` — a DIFFERENT branch of ``build_api_kwargs`` — and
+    is a secondary failover surface with its own separate daemon + affinity map that
+    agents rarely route to as primary. It is deliberately OUT of scope here so this
+    helper only claims what the anthropic_messages wiring actually stamps. Wiring the
+    bpp chat_completions path is a documented follow-up, not a silent gap.
     """
     provider = (getattr(agent, "provider", "") or "").strip().lower()
-    if provider not in ("claude-app", "claude-bpp"):
+    if provider != "claude-app":
         return {}
     sid = getattr(agent, "session_id", None)
     if not sid or not isinstance(sid, str):

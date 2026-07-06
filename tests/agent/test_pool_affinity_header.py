@@ -19,9 +19,11 @@ def test_stamp_present_for_claude_app():
     assert h == {"x-hermes-session": "20260705_120000_abc123"}
 
 
-def test_stamp_present_for_claude_bpp():
-    h = _pool_affinity_headers(_agent("claude-bpp"))
-    assert h == {"x-hermes-session": "20260705_120000_abc123"}
+def test_stamp_absent_for_claude_bpp_out_of_scope():
+    # Greptile #205: claude-bpp resolves to api_mode chat_completions (a different
+    # build_api_kwargs branch, separate daemon + affinity map) — deliberately OUT of
+    # scope so the helper only claims what the anthropic_messages wiring stamps.
+    assert _pool_affinity_headers(_agent("claude-bpp")) == {}
 
 
 def test_stamp_absent_for_direct_anthropic():
