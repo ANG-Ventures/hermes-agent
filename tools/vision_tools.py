@@ -1746,6 +1746,14 @@ async def video_analyze_tool(
                 # BEFORE handing the URL to yt-dlp (mirrors the direct-download
                 # path's _validate_image_url_async, minus the image-shape check
                 # that a page URL would fail). Blocks e.g. cloud metadata IPs.
+                # KNOWN LIMITATION: this validates the initial URL only. yt-dlp
+                # performs its own fetches and can follow redirects to internal
+                # targets after this point; it exposes no redirect hook to
+                # re-validate (unlike _download_video's httpx redirect guard).
+                # Fully closing that would require reimplementing yt-dlp's fetch
+                # layer, which is disproportionate — the always-blocked metadata
+                # floor still applies to the initial URL, and this is strictly
+                # safer than the pre-PR behavior (no validation at all).
                 from tools.url_safety import async_is_safe_url
                 if not await async_is_safe_url(resolved_url):
                     raise PermissionError(
