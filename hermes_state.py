@@ -162,6 +162,8 @@ T = TypeVar("T")
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
 SCHEMA_VERSION = 18
+_EFFECTIVE_LAST_ACTIVE_BACKFILL_META_KEY = "effective_last_active_backfill_version"
+_EFFECTIVE_LAST_ACTIVE_BACKFILL_VERSION = "2"
 
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
@@ -1402,6 +1404,36 @@ class SessionDB:
             hidden_params,
         )
 
+    def _record_effective_last_active_backfill(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "INSERT OR REPLACE INTO state_meta (key, value) VALUES (?, ?)",
+            (
+                _EFFECTIVE_LAST_ACTIVE_BACKFILL_META_KEY,
+                _EFFECTIVE_LAST_ACTIVE_BACKFILL_VERSION,
+            ),
+        )
+        try:
+            journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            conn.execute(
+                "INSERT OR REPLACE INTO state_meta (key, value) VALUES (?, ?)",
+                ("effective_last_active_migration_journal_mode", str(journal_mode)),
+            )
+        except sqlite3.OperationalError:
+            pass
+
+    def _needs_effective_last_active_backfill(self, conn: sqlite3.Connection) -> bool:
+        try:
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (_EFFECTIVE_LAST_ACTIVE_BACKFILL_META_KEY,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return True
+        if row is None:
+            return True
+        value = row["value"] if isinstance(row, sqlite3.Row) else row[0]
+        return value != _EFFECTIVE_LAST_ACTIVE_BACKFILL_VERSION
+
     def expected_effective_last_active(self, session_id: str) -> Optional[float]:
         with self._lock:
             return self._expected_effective_last_active(self._conn, session_id)
@@ -1414,6 +1446,7 @@ class SessionDB:
     def backfill_effective_last_active(self) -> None:
         def _do(conn):
             self._backfill_effective_last_active(conn)
+            self._record_effective_last_active_backfill(conn)
         self._execute_write(_do)
 
     def audit_effective_last_active(self, limit: int = 100) -> List[Dict[str, Any]]:
@@ -1578,7 +1611,9 @@ class SessionDB:
         The schema_version table is retained for future data migrations
         (transforming existing rows) which cannot be handled declaratively.
         """
-        cursor = self._conn.cursor()
+        conn = self._conn
+        assert conn is not None
+        cursor = conn.cursor()
 
         cursor.executescript(SCHEMA_SQL)
 
@@ -1626,6 +1661,7 @@ class SessionDB:
                 "INSERT INTO schema_version (version) VALUES (?)",
                 (SCHEMA_VERSION,),
             )
+            self._record_effective_last_active_backfill(conn)
         else:
             current_version = row["version"] if isinstance(row, sqlite3.Row) else row[0]
             # Data migrations that can't be expressed declaratively (row
@@ -1758,20 +1794,16 @@ class SessionDB:
                     )
                 except sqlite3.OperationalError:
                     pass
-            if current_version < 18:
+            if current_version < 18 or self._needs_effective_last_active_backfill(conn):
                 # v18: denormalized session-list recency/visibility marker.
                 # The column itself is declaratively added above; the data
-                # migration is a re-runnable CTE backfill. Record journal mode
-                # for the WAL-vs-DELETE liveness contract in the rollout notes.
-                self._backfill_effective_last_active(self._conn)
-                try:
-                    journal_mode = cursor.execute("PRAGMA journal_mode").fetchone()[0]
-                    cursor.execute(
-                        "INSERT OR REPLACE INTO state_meta (key, value) VALUES (?, ?)",
-                        ("effective_last_active_migration_journal_mode", str(journal_mode)),
-                    )
-                except sqlite3.OperationalError:
-                    pass
+                # migration is a re-runnable CTE backfill. The meta marker is
+                # deliberately separate from schema_version so builds that
+                # already stamped v18 but left stale v1 values get one exact
+                # repair on open. Record journal mode for the WAL-vs-DELETE
+                # liveness contract in the rollout notes.
+                self._backfill_effective_last_active(conn)
+                self._record_effective_last_active_backfill(conn)
             if current_version < SCHEMA_VERSION and fts_migrations_complete:
                 cursor.execute(
                     "UPDATE schema_version SET version = ?",
