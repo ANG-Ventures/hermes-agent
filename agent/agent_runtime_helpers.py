@@ -27,6 +27,7 @@ import json
 import logging
 import re
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -536,24 +537,35 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
             and calls
             and not _is_codex_interim(msg)
         ):
-            # Collect the ids answered by the contiguous ``tool`` run that
-            # immediately follows this assistant turn.
-            answered: set = set()
+            # Count the ids answered by the contiguous ``tool`` run that
+            # immediately follows this assistant turn. A MULTISET (count), not a
+            # set: each tool_call entry needs its OWN matching result, so a turn
+            # with duplicate ids ``[X, X]`` answered by a single ``tool`` result
+            # for X has ONE answered and ONE unanswered call — not two answered.
+            # (A set would over-count: one result would "satisfy" every duplicate
+            # entry, leaving the turn with more tool_calls than tool results — a
+            # 400 this pass is meant to prevent. Greptile P1 on #196.)
+            answered_counts: "Counter[str]" = Counter()
             j = i + 1
             while j < n and isinstance(filtered[j], dict) and filtered[j].get("role") == "tool":
                 tc_id = filtered[j].get("tool_call_id")
                 if tc_id:
-                    answered.add(tc_id)
+                    answered_counts[tc_id] += 1
                 j += 1
-            call_ids = [
-                tc.get("id") for tc in calls
-                if isinstance(tc, dict) and tc.get("id")
-            ]
-            # Any call without an id is treated as unanswerable (can't be
-            # matched to a result), so it counts as unanswered.
+            # Consume the answered budget left-to-right: a call is "answered"
+            # only while its id still has an unconsumed result. Calls with no id
+            # are unanswerable (can't be matched to a result) → unanswered.
+            _remaining = dict(answered_counts)
+            answered_flags = []  # parallel to ``calls``: True = this entry answered
+            for tc in calls:
+                _cid = tc.get("id") if isinstance(tc, dict) else None
+                if _cid and _remaining.get(_cid, 0) > 0:
+                    _remaining[_cid] -= 1
+                    answered_flags.append(True)
+                else:
+                    answered_flags.append(False)
             unanswered_calls = [
-                tc for tc in calls
-                if not (isinstance(tc, dict) and tc.get("id") in answered)
+                tc for tc, ok in zip(calls, answered_flags) if not ok
             ]
             if unanswered_calls and len(unanswered_calls) == len(calls):
                 # NONE answered — the whole tool-call turn is an orphan.
@@ -583,20 +595,21 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                 i += 1
                 continue
             if unanswered_calls:
-                # PARTIAL: some ids answered, some not. Keep only the answered
-                # tool_calls (and their results, which follow); drop the
-                # unanswered call entries so the turn stays wire-valid.
+                # PARTIAL: some entries answered, some not. Keep only the
+                # answered tool_calls (and their results, which follow); drop the
+                # unanswered call entries so the turn stays wire-valid. Uses the
+                # per-entry ``answered_flags`` (count-based) so a ``[X, X]`` turn
+                # with one X result keeps exactly ONE X, not both.
                 repaired = dict(msg)
                 repaired["tool_calls"] = [
-                    tc for tc in calls
-                    if isinstance(tc, dict) and tc.get("id") in answered
+                    tc for tc, ok in zip(calls, answered_flags) if ok
                 ]
                 deorphaned.append(repaired)
                 repairs += 1
                 logger.debug(
                     "Pass 1.5: dropped %d unanswered tool_call(s) from a "
                     "mid-history assistant turn, kept %d answered",
-                    len(unanswered_calls), len(call_ids) - len(unanswered_calls),
+                    len(unanswered_calls), len(calls) - len(unanswered_calls),
                 )
                 i += 1
                 continue

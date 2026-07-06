@@ -685,3 +685,53 @@ def test_repair_incident_shape_duplicate_first_orphan_second_answered():
     # The answered twin + its result survive.
     assert any(m.get("role") == "tool" and m.get("tool_call_id") == "toolu_dup"
                for m in messages)
+
+
+def test_repair_duplicate_ids_in_one_turn_countmatched_not_setmatched():
+    """Greptile P1 (#196): an assistant turn with DUPLICATE ids in ONE turn
+    ``tool_calls=[X, X]`` answered by only a SINGLE ``tool`` result for X must
+    keep exactly ONE X (count-based), not both (set-based would leave 2 calls /
+    1 result → still a 400)."""
+    agent = _bare_agent()
+    messages = [
+        {"role": "user", "content": "run X twice"},
+        {"role": "assistant", "content": "",
+         "tool_calls": [
+             {"id": "X", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+             {"id": "X", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+         ]},
+        {"role": "tool", "tool_call_id": "X", "content": "one result"},
+        {"role": "assistant", "content": "done"},
+    ]
+
+    repairs = AIAgent._repair_message_sequence(agent, messages)
+
+    assert repairs >= 1
+    tc_turn = next(m for m in messages if m.get("role") == "assistant" and m.get("tool_calls"))
+    # exactly ONE X kept — matches the single result; wire-valid.
+    assert [tc["id"] for tc in tc_turn["tool_calls"]] == ["X"]
+    n_results = sum(1 for m in messages if m.get("role") == "tool" and m.get("tool_call_id") == "X")
+    assert len(tc_turn["tool_calls"]) == n_results  # calls == results for id X
+
+
+def test_repair_duplicate_ids_in_one_turn_both_answered_kept():
+    """Counterpart: ``[X, X]`` answered by TWO results for X (a real parallel
+    call reusing an id) → both kept, untouched."""
+    agent = _bare_agent()
+    messages = [
+        {"role": "user", "content": "run X twice"},
+        {"role": "assistant", "content": "",
+         "tool_calls": [
+             {"id": "X", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+             {"id": "X", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+         ]},
+        {"role": "tool", "tool_call_id": "X", "content": "r1"},
+        {"role": "tool", "tool_call_id": "X", "content": "r2"},
+        {"role": "assistant", "content": "done"},
+    ]
+    original = [dict(m) for m in messages]
+
+    repairs = AIAgent._repair_message_sequence(agent, messages)
+
+    assert repairs == 0
+    assert messages == original
