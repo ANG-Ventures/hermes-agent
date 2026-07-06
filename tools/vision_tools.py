@@ -1609,7 +1609,8 @@ async def _download_video_via_ytdlp(url: str, dest_dir: Path) -> Path:
     fmt = "b[height<=480][ext=mp4]/b[ext=mp4]/b[height<=480]/b"
     base = [
         "yt-dlp", "-q", "--no-warnings", "--no-playlist",
-        "-f", fmt, "--max-filesize", "45M",
+        # 35M raw keeps the ~1.37x base64 data-URL under _MAX_VIDEO_BASE64_BYTES (50M).
+        "-f", fmt, "--max-filesize", "35M",
         "-o", out_tmpl,
     ]
     # Cookie support: many sites (YouTube especially) gate anonymous fetches
@@ -1661,6 +1662,7 @@ async def _download_video_via_ytdlp(url: str, dest_dir: Path) -> Path:
         )
         got = _find_output()
     if got is None:
+        _clean_partials()
         raise ValueError(
             "yt-dlp could not fetch a compact video from this URL. "
             f"stderr: {(proc.stderr or '').strip()[:300]}"
