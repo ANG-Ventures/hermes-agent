@@ -735,3 +735,49 @@ def test_repair_duplicate_ids_in_one_turn_both_answered_kept():
 
     assert repairs == 0
     assert messages == original
+
+
+def test_repair_drops_surplus_duplicate_tool_result():
+    """Greptile P1 (#196) inverse: ONE assistant call for X followed by TWO
+    ``tool`` results for X → Anthropic 400s ('each tool_use must have a single
+    result. Found multiple tool_result blocks with id'). Pass 1 must drop the
+    surplus result, keeping one-result-per-call."""
+    agent = _bare_agent()
+    messages = [
+        {"role": "user", "content": "run X"},
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "X", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "X", "content": "r1"},
+        {"role": "tool", "tool_call_id": "X", "content": "r2 (surplus)"},
+        {"role": "assistant", "content": "done"},
+    ]
+
+    repairs = AIAgent._repair_message_sequence(agent, messages)
+
+    assert repairs >= 1
+    x_results = [m for m in messages if m.get("role") == "tool" and m.get("tool_call_id") == "X"]
+    assert len(x_results) == 1  # surplus dropped
+    assert x_results[0]["content"] == "r1"  # the FIRST result is kept
+
+
+def test_repair_two_calls_two_results_same_id_kept():
+    """Symmetric counterpart: TWO calls for X answered by TWO results for X →
+    both results kept (parallel-call id reuse is valid; budget = 2)."""
+    agent = _bare_agent()
+    messages = [
+        {"role": "user", "content": "run X twice"},
+        {"role": "assistant", "content": "",
+         "tool_calls": [
+             {"id": "X", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+             {"id": "X", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+         ]},
+        {"role": "tool", "tool_call_id": "X", "content": "r1"},
+        {"role": "tool", "tool_call_id": "X", "content": "r2"},
+        {"role": "assistant", "content": "done"},
+    ]
+    original = [dict(m) for m in messages]
+
+    repairs = AIAgent._repair_message_sequence(agent, messages)
+
+    assert repairs == 0
+    assert messages == original

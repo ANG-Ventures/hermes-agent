@@ -474,9 +474,10 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
         collapsed.append(msg)
 
     # Pass 1: drop stray tool messages that don't follow a known
-    # assistant tool_call_id. Uses a rolling set of known ids refreshed
-    # on each assistant message.
-    known_tool_ids: set = set()
+    # assistant tool_call_id, AND drop SURPLUS duplicate results beyond the
+    # number of calls issued for an id. Uses a rolling per-id answer BUDGET
+    # (count) refreshed on each assistant message.
+    known_tool_budget: "Counter[str]" = Counter()
     filtered: List[Dict] = []
     for msg in collapsed:
         if not isinstance(msg, dict):
@@ -484,24 +485,34 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
             continue
         role = msg.get("role")
         if role == "assistant":
-            known_tool_ids = set()
+            # Reset the answer budget for this assistant turn: each tool_call id
+            # may be answered by AT MOST as many tool results as it was issued
+            # (normally once). A COUNT, not a set, so a SURPLUS duplicate result
+            # for the same id is dropped — Anthropic 400s "each tool_use must
+            # have a single result. Found multiple `tool_result` blocks with id"
+            # otherwise (a symptom of the same double-write corruption Pass 1.5
+            # repairs on the call side). Greptile P1 on #196.
+            known_tool_budget = Counter()
             for tc in (msg.get("tool_calls") or []):
                 tc_id = tc.get("id") if isinstance(tc, dict) else None
                 if tc_id:
-                    known_tool_ids.add(tc_id)
+                    known_tool_budget[tc_id] += 1
             filtered.append(msg)
         elif role == "tool":
             tc_id = msg.get("tool_call_id")
-            if tc_id and tc_id in known_tool_ids:
+            if tc_id and known_tool_budget.get(tc_id, 0) > 0:
+                known_tool_budget[tc_id] -= 1  # consume one answer slot
                 filtered.append(msg)
             else:
+                # No matching (or no REMAINING) call for this id → orphan/surplus
+                # result. Dropping a surplus keeps the turn at one-result-per-call.
                 repairs += 1
         else:
             if role == "user":
                 # A user turn closes the tool-result run; subsequent
                 # tool messages without a fresh assistant tool_call
                 # are orphans.
-                known_tool_ids = set()
+                known_tool_budget = Counter()
             filtered.append(msg)
 
     # Pass 1.5: repair an ``assistant(tool_calls)`` turn whose tool_call ids
