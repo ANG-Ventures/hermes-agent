@@ -242,6 +242,18 @@ class TestInheritContextIntegration:
         assert pf[0]["role"] == "user"
         assert "12 percent" in pf[0]["content"]
 
+    def test_empty_session_messages_does_not_fall_through_to_conversation_history(self):
+        """Greptile P2: a gateway parent with _session_messages == [] (fresh/closed
+        turn) has genuinely nothing to inherit. The `is None` (not truthiness) check
+        must NOT fall through to conversation_history — and the fold of [] yields
+        None, so the child gets no prefill (correct: nothing to inherit)."""
+        parent = self._make_gateway_parent([])  # present but EMPTY
+        captured = self._capture_child_kwargs(
+            goal="do a scoped task", inherit_context=True, parent_agent=parent,
+        )
+        pf = captured.get("prefill_messages")
+        assert pf is None, f"empty transcript should fold to no prefill, got {pf!r}"
+
     def test_inherit_false_default_does_not_seed_conversation_history(self):
         history = [{"role": "user", "content": "SECRET_SHOULD_NOT_LEAK to the child"}]
         parent = self._make_parent(history)

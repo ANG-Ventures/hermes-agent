@@ -1449,10 +1449,14 @@ def _build_child_agent(
             # which set conversation_history on a FakeParent — passed. Prefer the
             # gateway source, fall back to the CLI one. (background_review.py reads
             # `_session_messages` the same way.)
-            _parent_history = (
-                getattr(parent_agent, "_session_messages", None)
-                or getattr(parent_agent, "conversation_history", None)
-            )
+            # Discriminate PRESENT-BUT-EMPTY from ABSENT with `is None`: a gateway
+            # agent with `_session_messages == []` (fresh/closed turn) genuinely has
+            # nothing to inherit and must NOT fall through to the (absent, → None)
+            # `conversation_history` — a truthiness `or` would, harmlessly here but
+            # sloppily (Greptile P2). `_fold_...([], ...)` already returns None.
+            _parent_history = getattr(parent_agent, "_session_messages", None)
+            if _parent_history is None:
+                _parent_history = getattr(parent_agent, "conversation_history", None)
             _folded = _fold_conversation_history_to_context(
                 _parent_history, _max_tokens
             )
