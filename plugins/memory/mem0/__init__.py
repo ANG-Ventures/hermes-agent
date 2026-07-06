@@ -807,7 +807,7 @@ class Mem0MemoryProvider(MemoryProvider):
         "and", "then", "also", "too", "let", "lets", "let's", "us",
         "to", "for", "of", "is", "are", "am", "be", "can", "could", "would",
         "should", "will", "i", "my", "me", "we", "our", "your",
-        "please.", "bet", "word", "facts", "true", "indeed", "absolutely",
+        "bet", "word", "facts", "true", "indeed", "absolutely",
         "definitely", "certainly", "totally", "exactly", "yea",
         "hmm", "hm", "mhm", "mmhm", "uh", "um", "oh", "ah", "ha", "haha", "lol",
         "so", "well", "just", "now", "here", "there", "yet", "still",
@@ -1374,11 +1374,17 @@ class Mem0MemoryProvider(MemoryProvider):
                         )
                     # INV-3a: commit the mem0 block FIRST — it is never dropped because the
                     # QMD leg is slow. QMD is strictly additive and runs after.
-                    if results:
-                        lines = [r.get("memory", "") for r in results if r.get("memory")]
-                        with self._prefetch_lock:
-                            if epoch == self._prefetch_epoch:
+                    # Gate B may drain ALL candidates (empty results); make "inject nothing"
+                    # EXPLICIT like Gate A does — never rely on _prefetch_result being pre-cleared
+                    # by a preceding prefetch() (a double queue_prefetch could otherwise leave a
+                    # prior query's stale block; Greptile #212 P2).
+                    with self._prefetch_lock:
+                        if epoch == self._prefetch_epoch:
+                            if results:
+                                lines = [r.get("memory", "") for r in results if r.get("memory")]
                                 self._prefetch_result = "\n".join(f"- {l}" for l in lines)
+                            else:
+                                self._prefetch_result = ""
                     self._record_success()
             except Exception as e:
                 self._record_failure()

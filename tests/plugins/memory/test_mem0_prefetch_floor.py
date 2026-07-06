@@ -216,6 +216,34 @@ def test_gate_b_unforeseen_exception_fails_open(monkeypatch, tmp_path):
     assert outcome == "failed_open"
 
 
+def test_gate_b_drain_all_clears_prefetch_result(monkeypatch, tmp_path):
+    """Greptile #212 P2: when Gate B drops EVERY candidate on a substantive query, the
+    worker must EXPLICITLY set _prefetch_result="" — never leave a prior query's stale
+    block behind (the 'inject nothing' contract must be enforced, not assumed pre-cleared)."""
+    p = _provider(monkeypatch, tmp_path)
+    _write_floor_cfg(tmp_path, {"enabled": True, "min_cosine": 0.10})
+    # Simulate a prior query having left a stale block resident.
+    p._prefetch_result = "- STALE memory from an earlier query"
+    # A substantive query whose candidates all fall below the floor.
+    ortho = _unit([0.0, 1.0, 0.0])
+    monkeypatch.setattr(p, "_get_client", lambda: type("C", (), {
+        "search": lambda self, **kw: {"results": [{"memory": "off-topic", "score": 1.0}]}})())
+    monkeypatch.setattr(p, "_drop_forgotten", lambda x: x)
+    monkeypatch.setattr(p, "_unwrap_results", lambda x: x.get("results", x))
+    monkeypatch.setattr(p, "_read_filters", lambda: {})
+    monkeypatch.setattr(p, "_dedup_embed", lambda texts, *, timeout=15: [_Q, ortho])
+    # Drive one real prefetch worker cycle.
+    p.queue_prefetch("what temperature is the guest room", session_id="s")
+    import time as _t
+    for _ in range(50):
+        fut = getattr(p, "_prefetch_future", None)
+        if fut and fut.done():
+            break
+        _t.sleep(0.05)
+    # The stale block MUST have been cleared (drain-all → inject nothing).
+    assert p._prefetch_result == "", f"stale block leaked: {p._prefetch_result!r}"
+
+
 # ---------------------------------------------------------------------------
 # Config: thresholds, clamps, fail-safes
 # ---------------------------------------------------------------------------
