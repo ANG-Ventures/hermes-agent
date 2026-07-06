@@ -331,6 +331,16 @@ def test_gemini_bridge_has_known_pricing():
         assert has_known_pricing(model, provider="gemini-bridge"), model
 
 
+def test_gemini_bridge_unknown_alias_routes_unknown_not_google():
+    """An unrecognized bridge model (not in the alias map AND no known vendor
+    prefix) must route as 'unknown', NOT masquerade as a priced Google route —
+    otherwise a misspelled/unsupported model looks valid in diagnostics/rollups."""
+    for bogus in ("mistral-large", "totally-made-up", "flash", "opus"):
+        route = resolve_billing_route(bogus, provider="gemini-bridge")
+        assert route.provider == "unknown", f"{bogus}: {route.provider}"
+        assert route.billing_mode == "unknown", f"{bogus}: {route.billing_mode}"
+
+
 _CODEX_STUB_METADATA = {
     "gpt-5.5": {"pricing": {"prompt": "0.000005", "completion": "0.00003"}},
     "gpt-5.4": {"pricing": {"prompt": "0.0000025", "completion": "0.000015"}},

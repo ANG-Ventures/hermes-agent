@@ -797,7 +797,18 @@ def resolve_billing_route(
     # single-vendor notional-Anthropic relays above.
     if is_notional_subscription_bridge(provider_name):
         canonical = _normalize_gemini_bridge_model(model)
-        vendor = _infer_vendor_from_model(canonical) or "google"
+        vendor = _infer_vendor_from_model(canonical)
+        if not vendor:
+            # An alias/model we don't recognize (missing from the map AND naming no
+            # known vendor prefix) must NOT masquerade as a priced Google route — a
+            # misspelled/unsupported bridge model should surface as unknown in
+            # diagnostics/rollups, not as a silently-wrong Google price.
+            return BillingRoute(
+                provider="unknown",
+                model=canonical,
+                base_url=base_url or "",
+                billing_mode="unknown",
+            )
         return BillingRoute(
             provider=vendor,
             model=canonical,
