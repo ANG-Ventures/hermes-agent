@@ -68,6 +68,50 @@ def is_notional_anthropic_provider(provider_name: Optional[str]) -> bool:
         _NOTIONAL_ANTHROPIC_FN_RE.match(p)
     )
 
+
+# Local subscription BRIDGE that fronts the Google AI Ultra sub via the
+# Antigravity CLI (`agy`). Marginal cash cost is $0 (flat $100/mo Ultra sub), but
+# for fleet cost *visibility* we price its turns at the underlying vendors' official
+# rates and label the result "estimated" — mirroring the notional-Anthropic relays.
+# Unlike those single-vendor relays, this bridge is POLY-VENDOR: the one endpoint
+# fronts Gemini 3.x AND Claude Opus/Sonnet 4.6 AND GPT-OSS 120B, so a turn is routed
+# to the vendor INFERRED from its (alias-normalized) model id, not to a fixed vendor.
+NOTIONAL_SUBSCRIPTION_BRIDGE_PROVIDERS = frozenset({
+    "gemini-bridge",
+})
+
+# The gemini-bridge exposes short model ALIASES that are not pricing keys; map each
+# to the canonical (priced) model id of the real model the Ultra sub fronts. Mirrors
+# `_MODEL_ALIASES` in ~/.hermes/gemini-bridge/gemini_bridge.py (kept in sync there).
+_GEMINI_BRIDGE_MODEL_ALIASES = {
+    "gemini-flash": "gemini-3.5-flash",
+    "gemini-3.5-flash": "gemini-3.5-flash",
+    "gemini-pro": "gemini-3.1-pro",
+    "gemini-3.1-pro": "gemini-3.1-pro",
+    "claude-opus": "claude-opus-4-6",
+    "claude-sonnet": "claude-sonnet-4-6",
+    "gpt-oss": "gpt-oss-120b",
+}
+
+
+def is_notional_subscription_bridge(provider_name: Optional[str]) -> bool:
+    """True if a provider key is a notional (subscription-fronting) poly-vendor bridge.
+
+    Currently just the gemini-bridge (Google AI Ultra sub via agy). Its model id is
+    normalized through ``_GEMINI_BRIDGE_MODEL_ALIASES`` then priced under the vendor
+    inferred from the id (google/anthropic/openai) at official-docs rates.
+    """
+    p = (provider_name or "").strip().lower()
+    return bool(p) and p in NOTIONAL_SUBSCRIPTION_BRIDGE_PROVIDERS
+
+
+def _normalize_gemini_bridge_model(model: str) -> str:
+    """Map a gemini-bridge alias (gemini-flash, claude-opus, gpt-oss, …) to its
+    canonical priced model id. Strips a leading ``gemini-bridge/`` provider prefix
+    first, and passes through an already-canonical id unchanged."""
+    name = (model or "").split("/")[-1].lower().strip()
+    return _GEMINI_BRIDGE_MODEL_ALIASES.get(name, name)
+
 # Notional pricing for ChatGPT-subscription Codex providers (openai-codex).
 # Marginal cash cost is $0 (covered by a flat ChatGPT subscription), but for
 # fleet cost *visibility* we price these at OpenRouter's live catalog rates for
@@ -562,6 +606,41 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://ai.google.dev/pricing",
         pricing_version="google-pricing-2026-03-16",
     ),
+    # Gemini 3.x — fronted by the Google AI Ultra subscription (gemini-bridge).
+    # Rates from the OpenRouter catalog (2026-07-05); the AI Studio pricing page
+    # lists the same tiers. Priced here so notional gemini-bridge turns resolve.
+    (
+        "google",
+        "gemini-3.5-flash",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("1.50"),
+        output_cost_per_million=Decimal("9.00"),
+        source="official_docs_snapshot",
+        source_url="https://ai.google.dev/pricing",
+        pricing_version="google-pricing-2026-07",
+    ),
+    (
+        "google",
+        "gemini-3.1-pro",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("12.00"),
+        source="official_docs_snapshot",
+        source_url="https://ai.google.dev/pricing",
+        pricing_version="google-pricing-2026-07",
+    ),
+    # GPT-OSS 120B — the open-weight model the Ultra sub also fronts via agy.
+    # Rate from the OpenRouter catalog (2026-07-05).
+    (
+        "openai",
+        "gpt-oss-120b",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.03"),
+        output_cost_per_million=Decimal("0.15"),
+        source="official_docs_snapshot",
+        source_url="https://openrouter.ai/openai/gpt-oss-120b",
+        pricing_version="openai-pricing-2026-07",
+    ),
     # AWS Bedrock — pricing per the Bedrock pricing page.
     # Bedrock charges the same per-token rates as the model provider but
     # through AWS billing.  These are the on-demand prices (no commitment).
@@ -706,6 +785,22 @@ def resolve_billing_route(
         return BillingRoute(
             provider="anthropic",
             model=model.split("/")[-1],
+            base_url=base_url or "",
+            billing_mode="official_docs_snapshot",
+        )
+
+    # Notional pricing for the poly-vendor Google AI Ultra bridge (gemini-bridge).
+    # Marginal cash cost is $0 (flat Ultra sub), but for cost *visibility* we
+    # normalize its alias (gemini-flash/claude-opus/gpt-oss/…) to the canonical
+    # model id and route to the vendor INFERRED from that id (google/anthropic/
+    # openai), priced at official-docs rates. A poly-vendor analogue of the
+    # single-vendor notional-Anthropic relays above.
+    if is_notional_subscription_bridge(provider_name):
+        canonical = _normalize_gemini_bridge_model(model)
+        vendor = _infer_vendor_from_model(canonical) or "google"
+        return BillingRoute(
+            provider=vendor,
+            model=canonical,
             base_url=base_url or "",
             billing_mode="official_docs_snapshot",
         )
