@@ -2454,6 +2454,10 @@ class TestSilentDelivery:
         assert sil("```text\n[SILENT]\n```")
         assert sil("2 deals filtered.\n\n`[SILENT]`")
         assert sil("`[SILENT]` No changes detected")
+        # Greptile edge cases: multi-word fence info string + multi-backtick runs.
+        assert sil("```text block\n[SILENT]\n```")
+        assert sil("``[SILENT]``")
+        assert sil("``[SILENT]`` No changes detected")
         # Deliver: real content, mid-sentence quotes, bare words, junk.
         assert not sil("Daily report: 4 PRs merged.")
         assert not sil("I stayed [SILENT] but here is the report: 3 items.")

@@ -371,14 +371,15 @@ def _is_cron_silence_response(text: str) -> bool:
         t = s.strip()
         if t.startswith("```") and t.endswith("```") and len(t) >= 6:
             inner = t[3:-3]
-            # Drop an opening-fence info string (e.g. ```text) if present.
+            # Drop the whole opening-fence info-string line (```, ```text,
+            # ```text block, …) — anything up to the first newline is the fence
+            # header, never sentinel content.
             if "\n" in inner:
-                first, rest = inner.split("\n", 1)
-                if first.strip() and " " not in first.strip() and "`" not in first:
-                    inner = rest
+                inner = inner.split("\n", 1)[1]
             t = inner.strip()
-        while len(t) >= 2 and t.startswith("`") and t.endswith("`"):
-            t = t[1:-1].strip()
+        # Strip symmetric runs of backticks (``[SILENT]``, ``` `x` ```, …).
+        while len(t) >= 2 and t[0] == "`" and t[-1] == "`":
+            t = t.strip("`").strip()
         return t
 
     def _is_token(line: str) -> bool:
@@ -396,13 +397,14 @@ def _is_cron_silence_response(text: str) -> bool:
     # Bracketed sentinel used as a same-line prefix — the documented cron
     # pattern "[SILENT] No changes detected".  Restricted to the bracketed
     # form so a bare word like "Silent retry succeeded" is NOT swallowed.
-    # Peel a single leading inline code-span first so "`[SILENT]` note" also
-    # counts (same "format the literal" reflex as the whole-value case).
+    # Peel a leading inline code-span (any backtick-run length) first so
+    # "`[SILENT]` note" / "``[SILENT]`` note" also count (same reflex).
     head = stripped
     if head.startswith("`"):
-        end = head.find("`", 1)
-        if end != -1:
-            head = head[1:end].strip()
+        run = len(head) - len(head.lstrip("`"))
+        close = head.find("`" * run, run)
+        if close != -1:
+            head = head[run:close].strip()
     if head.upper().startswith("[SILENT]"):
         return True
     return False
