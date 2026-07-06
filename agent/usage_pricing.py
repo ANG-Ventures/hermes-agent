@@ -93,6 +93,14 @@ _GEMINI_BRIDGE_MODEL_ALIASES = {
     "gpt-oss": "gpt-oss-120b",
 }
 
+# The exact set of canonical models the bridge actually fronts (the alias-map
+# values). Only these route to a priced vendor; anything else — including a
+# prefix-shaped typo/unsupported id like "gemini-2.0-flash" that _infer_vendor
+# WOULD map to google — is deliberately routed "unknown" so a misconfigured or
+# unsupported bridge model surfaces in diagnostics instead of masquerading as a
+# valid priced route.
+_GEMINI_BRIDGE_CANONICAL_MODELS = frozenset(_GEMINI_BRIDGE_MODEL_ALIASES.values())
+
 
 def is_notional_subscription_bridge(provider_name: Optional[str]) -> bool:
     """True if a provider key is a notional (subscription-fronting) poly-vendor bridge.
@@ -797,12 +805,20 @@ def resolve_billing_route(
     # single-vendor notional-Anthropic relays above.
     if is_notional_subscription_bridge(provider_name):
         canonical = _normalize_gemini_bridge_model(model)
+        # Only price models the bridge actually fronts. An id that isn't a known
+        # fronted model — even a prefix-valid one like "gemini-2.0-flash" that
+        # _infer_vendor_from_model would map to google — routes "unknown" so a
+        # misconfigured/unsupported bridge model surfaces in diagnostics/rollups
+        # instead of masquerading as a valid priced route.
+        if canonical not in _GEMINI_BRIDGE_CANONICAL_MODELS:
+            return BillingRoute(
+                provider="unknown",
+                model=canonical,
+                base_url=base_url or "",
+                billing_mode="unknown",
+            )
         vendor = _infer_vendor_from_model(canonical)
         if not vendor:
-            # An alias/model we don't recognize (missing from the map AND naming no
-            # known vendor prefix) must NOT masquerade as a priced Google route — a
-            # misspelled/unsupported bridge model should surface as unknown in
-            # diagnostics/rollups, not as a silently-wrong Google price.
             return BillingRoute(
                 provider="unknown",
                 model=canonical,

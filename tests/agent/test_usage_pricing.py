@@ -332,13 +332,19 @@ def test_gemini_bridge_has_known_pricing():
 
 
 def test_gemini_bridge_unknown_alias_routes_unknown_not_google():
-    """An unrecognized bridge model (not in the alias map AND no known vendor
-    prefix) must route as 'unknown', NOT masquerade as a priced Google route —
-    otherwise a misspelled/unsupported model looks valid in diagnostics/rollups."""
-    for bogus in ("mistral-large", "totally-made-up", "flash", "opus"):
-        route = resolve_billing_route(bogus, provider="gemini-bridge")
-        assert route.provider == "unknown", f"{bogus}: {route.provider}"
-        assert route.billing_mode == "unknown", f"{bogus}: {route.billing_mode}"
+    """An unrecognized bridge model must route as 'unknown', NOT masquerade as a
+    priced route — covers BOTH (a) no known vendor prefix, and (b) a prefix-VALID
+    but unsupported id the bridge doesn't actually front (e.g. gemini-2.0-flash,
+    a real Google model but NOT one the Ultra bridge serves). Either way, pricing
+    it would misclassify a typo/misconfig as a valid route in diagnostics."""
+    bogus = (
+        "mistral-large", "totally-made-up", "flash", "opus",  # no vendor prefix
+        "gemini-2.0-flash", "gemini-2.5-flash", "claude-opus-4-8", "gpt-5.5",  # prefix-valid, not fronted
+    )
+    for model in bogus:
+        route = resolve_billing_route(model, provider="gemini-bridge")
+        assert route.provider == "unknown", f"{model}: {route.provider}"
+        assert route.billing_mode == "unknown", f"{model}: {route.billing_mode}"
 
 
 _CODEX_STUB_METADATA = {
