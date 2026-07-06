@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import sqlite3
@@ -64,6 +65,10 @@ def _append(db: SessionDB, session_id: str, content: str, ts: float, *, role: st
 
 def _ordered_ids(db: SessionDB, **kwargs) -> list[str]:
     return [row["id"] for row in db.list_sessions_rich(order_by_last_active=True, **kwargs)]
+
+
+def _rows_bytes(rows: list[dict]) -> bytes:
+    return json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
 
 
 class TestEffectiveLastActiveSchema:
@@ -164,6 +169,72 @@ class TestEffectiveLastActiveSchema:
             assert first["tool-root"] is None
             assert first["root"] == 140.0
             assert first["tip"] is None
+        finally:
+            db.close()
+
+    def test_v18_stale_backfill_marker_repairs_on_open_without_manual_backfill(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            _create_session(db, "stale-root", started_at=100.0)
+            _append(db, "stale-root", "stale root", 120.0)
+            db.end_session("stale-root", "compression")
+            _create_session(db, "stale-tip", started_at=130.0, parent_session_id="stale-root")
+            _append(db, "stale-tip", "fresh continuation", 200.0)
+            _create_session(db, "stale-other", started_at=140.0)
+            _append(db, "stale-other", "middle standalone", 150.0)
+            _create_session(db, "archived-stale", started_at=300.0)
+            _append(db, "archived-stale", "archived newest", 400.0)
+            db.set_session_archived("archived-stale", True)
+
+            with db._lock:
+                # Simulate the live failure shape: schema_version is already current
+                # and the old additive-column backfill marker is present, but the
+                # denormalized root value is stale behind its continuation tip.
+                conn = db._conn
+                assert conn is not None
+                conn.execute(
+                    "UPDATE sessions SET effective_last_active = ? WHERE id = ?",
+                    (120.0, "stale-root"),
+                )
+                conn.execute(
+                    "UPDATE schema_version SET version = ?",
+                    (hermes_state.SCHEMA_VERSION,),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO state_meta (key, value) VALUES (?, ?)",
+                    (hermes_state._EFFECTIVE_LAST_ACTIVE_BACKFILL_META_KEY, "1"),
+                )
+                conn.commit()
+        finally:
+            db.close()
+
+        db = SessionDB(db_path=db_path)
+        try:
+            assert _stored(db, "stale-root") == db.expected_effective_last_active("stale-root") == 200.0
+            with db._lock:
+                conn = db._conn
+                assert conn is not None
+                marker = conn.execute(
+                    "SELECT value FROM state_meta WHERE key = ?",
+                    (hermes_state._EFFECTIVE_LAST_ACTIVE_BACKFILL_META_KEY,),
+                ).fetchone()
+            assert marker is not None
+            assert marker["value"] == hermes_state._EFFECTIVE_LAST_ACTIVE_BACKFILL_VERSION
+
+            cases = [
+                ("default", {}),
+                ("include_archived", {"include_archived": True}),
+                ("id_query", {"id_query": "stale"}),
+            ]
+            for label, kwargs in cases:
+                actual = db.list_sessions_rich(
+                    order_by_last_active=True,
+                    limit=10,
+                    **kwargs,
+                )
+                expected = db.list_sessions_rich_cte_oracle(limit=10, **kwargs)
+                assert _rows_bytes(actual) == _rows_bytes(expected), label
         finally:
             db.close()
 
