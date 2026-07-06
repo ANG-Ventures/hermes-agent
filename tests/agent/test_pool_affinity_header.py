@@ -85,6 +85,34 @@ def test_lane_cron_background():
     assert _pool_lane(_agent(delegate_depth=0, platform="cron")) == "background"
 
 
+def test_lane_headless_cli_background():
+    # a headless CLI / systemd / docker run: platform is empty/cli, NOT a live
+    # messaging surface -> background (Greptile #206: must not eat interactive headroom).
+    assert _pool_lane(_agent(delegate_depth=0, platform="cli")) == "background"
+    assert _pool_lane(_agent(delegate_depth=0, platform="")) == "background"
+    assert _pool_lane(_agent(delegate_depth=0, platform=None)) == "background"
+
+
+def test_lane_unknown_platform_is_background():
+    # any source that isn't a known interactive messaging surface -> background
+    assert _pool_lane(_agent(platform="scheduler")) == "background"
+    assert _pool_lane(_agent(platform="batch-job")) == "background"
+
+
+def test_lane_session_source_env_fallback(monkeypatch):
+    # platform empty but HERMES_SESSION_SOURCE=cron -> background (codebase idiom)
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "cron")
+    assert _pool_lane(_agent(platform=None)) == "background"
+    # HERMES_SESSION_SOURCE names a live surface -> interactive
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "discord")
+    assert _pool_lane(_agent(platform=None)) == "interactive"
+
+
+def test_lane_interactive_surfaces_stay_interactive():
+    for p in ("discord", "telegram", "slack", "whatsapp", "imessage", "tui", "desktop"):
+        assert _pool_lane(_agent(platform=p)) == "interactive", p
+
+
 def test_lane_critical_aux_is_interactive():
     # B1: compaction/title/vision of a live top-level turn is ON the critical path
     # (the user turn blocks on it) -> interactive, must NOT be damped.

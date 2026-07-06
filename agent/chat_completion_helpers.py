@@ -759,7 +759,7 @@ def _pool_lane(agent, aux_task=None) -> str:
     background under contention so a burst of background work can't degrade a live
     interactive turn.
 
-      * A top-level (non-delegated, non-cron) main turn → ``interactive``.
+      * A top-level (non-delegated, non-cron/headless) main turn → ``interactive``.
       * A subagent (``_delegate_depth > 0``) or a cron/headless run → ``background``.
       * Auxiliary calls (``aux_task`` set): CRITICAL aux (compaction/title/vision on a
         live top-level turn's critical path — the user turn blocks on it) → ``interactive``
@@ -767,14 +767,42 @@ def _pool_lane(agent, aux_task=None) -> str:
         subagent/cron principal) → ``background``.
     """
     delegated = int(getattr(agent, "_delegate_depth", 0) or 0) > 0
-    is_cron = (getattr(agent, "platform", "") or "").strip().lower() == "cron"
+    noninteractive = _is_noninteractive_principal(agent)
     if aux_task is not None:
         # critical aux (on a live top-level turn's path) stays interactive (B1);
-        # off-path aux (subagent/cron principal) is background.
-        return "background" if (delegated or is_cron) else "interactive"
-    if delegated or is_cron:
+        # off-path aux (subagent/cron/headless principal) is background.
+        return "background" if (delegated or noninteractive) else "interactive"
+    if delegated or noninteractive:
         return "background"
     return "interactive"
+
+
+# The messaging platforms that represent a LIVE, human-facing conversation whose turn a
+# person is actively waiting on. A request whose source is NOT one of these (cron,
+# headless CLI, systemd/docker service, background job) is non-interactive → background.
+# This mirrors the codebase idiom `agent.platform or HERMES_SESSION_SOURCE (default cli)`
+# used by background_review / conversation_compression, rather than matching the single
+# literal "cron" (which false-negatived every headless run to interactive — Greptile #206).
+_INTERACTIVE_PLATFORMS = frozenset({
+    "discord", "telegram", "slack", "whatsapp", "imessage", "signal", "sms",
+    "messenger", "instagram", "matrix", "teams", "line", "wechat", "webhook",
+    "tui", "desktop", "web", "api",
+})
+
+
+def _is_noninteractive_principal(agent) -> bool:
+    """True when the request's PRINCIPAL is not a live human-facing conversation — a
+    cron/scheduled run, a headless CLI/service run, or anything whose source isn't a
+    known interactive messaging surface. Resolved the same way the rest of the codebase
+    resolves the session source: ``agent.platform`` first, else ``HERMES_SESSION_SOURCE``
+    (default ``cli`` → non-interactive). Empty/unknown → treat as non-interactive
+    (background) so scheduled/headless bursts can NOT claim interactive headroom."""
+    src = (getattr(agent, "platform", "") or "").strip().lower()
+    if not src:
+        src = (os.environ.get("HERMES_SESSION_SOURCE", "") or "").strip().lower()
+    if not src:
+        return True   # no signal at all → non-interactive (safe: don't grant headroom)
+    return src not in _INTERACTIVE_PLATFORMS
 
 
 def _pool_lane_src(agent, aux_task=None) -> str:
@@ -782,7 +810,11 @@ def _pool_lane_src(agent, aux_task=None) -> str:
     signals (platform, delegate_depth, aux_task) alongside the lane verdict — the lane
     must be validatable against its inputs, not against itself. Routing-only, stripped
     upstream (never egresses)."""
-    platform = (getattr(agent, "platform", "") or "").strip().lower() or "-"
+    platform = (getattr(agent, "platform", "") or "").strip().lower()
+    # reflect the SAME source the classifier used (platform, else HERMES_SESSION_SOURCE)
+    # so the logged inputs actually explain the lane verdict, not a partial view.
+    if not platform:
+        platform = (os.environ.get("HERMES_SESSION_SOURCE", "") or "").strip().lower() or "-"
     dd = int(getattr(agent, "_delegate_depth", 0) or 0)
     task = aux_task if aux_task is not None else "-"
     return f"platform={platform};delegate_depth={dd};aux_task={task}"
