@@ -1332,6 +1332,14 @@ class GatewaySlashCommandsMixin:
                             "api_mode": result.api_mode,
                         }
 
+                        # Announce the deliberate switch to the conversation (P2).
+                        await _self._announce_switch(
+                            event.source,
+                            "Model",
+                            f"{_cur_provider}/{_cur_model}",
+                            f"{result.target_provider}/{result.new_model}",
+                        )
+
                         # Evict cached agent so the next turn creates a fresh
                         # agent from the override rather than relying on the
                         # stale cache signature to trigger a rebuild.
@@ -1573,6 +1581,16 @@ class GatewaySlashCommandsMixin:
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
             }
+
+            # Announce the deliberate switch to the conversation (P2). Compares the
+            # (provider, model, api_mode) route so a same-slug/different-endpoint
+            # switch still announces; silent on a true no-op. Best-effort.
+            await self._announce_switch(
+                event.source,
+                "Model",
+                f"{current_provider}/{current_model}",
+                f"{result.target_provider}/{result.new_model}",
+            )
 
             # Evict cached agent so the next turn creates a fresh agent from the
             # override rather than relying on cache signature mismatch detection.
@@ -2444,12 +2462,22 @@ class GatewaySlashCommandsMixin:
 
         # Effort level change
         effort = args.strip()
+        # Capture the resolved effective effort BEFORE applying so the announce
+        # compares old vs new correctly (P2). Uses the config-fallback-inclusive
+        # label, not the footer's "" sentinel.
+        _old_effort = self._resolved_effort_label(
+            source=event.source, session_key=session_key,
+        )
         if effort == "reset":
             if persist_global:
                 return t("gateway.reasoning.reset_global_unsupported")
             self._set_session_reasoning_override(session_key, None)
             self._reasoning_config = self._load_reasoning_config()
             self._evict_cached_agent(session_key)
+            _new_effort = self._resolved_effort_label(
+                source=event.source, session_key=session_key,
+            )
+            await self._announce_switch(event.source, "Reasoning", _old_effort, _new_effort)
             return t("gateway.reasoning.reset_done")
         if effort == "none":
             parsed = {"enabled": False}
@@ -2466,13 +2494,25 @@ class GatewaySlashCommandsMixin:
             if _save_config_key("agent.reasoning_effort", effort):
                 self._set_session_reasoning_override(session_key, None)
                 self._evict_cached_agent(session_key)
+                _new_effort = self._resolved_effort_label(
+                    source=event.source, session_key=session_key,
+                )
+                await self._announce_switch(event.source, "Reasoning", _old_effort, _new_effort)
                 return t("gateway.reasoning.set_global", effort=effort)
             self._set_session_reasoning_override(session_key, parsed)
             self._evict_cached_agent(session_key)
+            _new_effort = self._resolved_effort_label(
+                source=event.source, session_key=session_key,
+            )
+            await self._announce_switch(event.source, "Reasoning", _old_effort, _new_effort)
             return t("gateway.reasoning.set_global_save_failed", effort=effort)
 
         self._set_session_reasoning_override(session_key, parsed)
         self._evict_cached_agent(session_key)
+        _new_effort = self._resolved_effort_label(
+            source=event.source, session_key=session_key,
+        )
+        await self._announce_switch(event.source, "Reasoning", _old_effort, _new_effort)
         return t("gateway.reasoning.set_session", effort=effort)
 
     async def _handle_memory_command(self, event: MessageEvent) -> str:

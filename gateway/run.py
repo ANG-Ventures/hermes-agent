@@ -4953,6 +4953,80 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "none"
         return str(cfg.get("effort", "") or "").strip()
 
+    def _resolved_effort_label(
+        self,
+        *,
+        source: Optional[SessionSource] = None,
+        session_key: Optional[str] = None,
+    ) -> str:
+        """Effective reasoning effort INCLUDING the config fallback — the baseline
+        for the deliberate-switch announce (P2).
+
+        Distinct from ``_reasoning_effort_for_footer`` (which returns ``""`` for a
+        no-override session so the FOOTER applies its own config fallback): the
+        announce must compare the *resolved effective* effort on both sides, so a
+        no-override session at config default ``xhigh`` yields ``"xhigh"`` here (NOT
+        ``""``) — otherwise ``/reasoning xhigh`` on a defaulted session would compute
+        ``"" != "xhigh"`` and spuriously announce a genuine no-op.
+        """
+        cfg = self._resolve_session_reasoning_config(
+            source=source, session_key=session_key,
+        )
+        if cfg is None:
+            cfg = self._load_reasoning_config()
+        if cfg is None:
+            return "medium"  # _load_reasoning_config None == medium default
+        if not cfg.get("enabled", True):
+            return "none"
+        return str(cfg.get("effort", "medium") or "medium").strip()
+
+    @staticmethod
+    def _switch_announce_enabled(user_config: Optional[dict]) -> bool:
+        """Read model.announce_switch (default True). Any of false/0/no/off → off."""
+        try:
+            gate = ((user_config or {}).get("model") or {}).get("announce_switch", True)
+        except Exception:
+            return True
+        return str(gate).strip().lower() not in {"false", "0", "no", "off"}
+
+    async def _announce_switch(
+        self,
+        source: "SessionSource",
+        kind: str,
+        old: str,
+        new: str,
+    ) -> None:
+        """Post one channel-visible switch line for a deliberate /reasoning or /model
+        switch (P2). ``kind`` ∈ {"Reasoning", "Model"}.
+
+        Best-effort: never raises, so the switch handler always returns its
+        confirmation even if the announce send fails. Silent on a no-op
+        (``old == new``). Gated by ``model.announce_switch`` (default on). Uses the
+        gateway out-of-band ``adapter.send`` rail — the SAME rail the hygiene
+        compaction announce uses — because the slash handlers run in the gateway
+        before/without a live AIAgent (so ``_emit_status`` is not in scope here).
+        """
+        try:
+            if not old or not new or old == new:
+                return
+            try:
+                cfg = _load_gateway_config()
+            except Exception:
+                cfg = None
+            if not self._switch_announce_enabled(cfg):
+                return
+            adapter = self.adapters.get(source.platform)
+            if not (adapter and source.chat_id):
+                return
+            meta = None
+            try:
+                meta = self._thread_metadata_for_source(source, None)
+            except Exception:
+                meta = None
+            await adapter.send(source.chat_id, f"\U0001f500 {kind}: {old} \u2192 {new}", metadata=meta)
+        except Exception:
+            logger.debug("switch announce skipped (non-fatal)", exc_info=True)
+
     def _set_session_reasoning_override(
         self,
         session_key: str,
