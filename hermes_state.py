@@ -3848,6 +3848,9 @@ class SessionDB:
                     1 if msg.get("observed") else 0,
                 ),
             )
+            self._bump_effective_last_active_for_message(
+                conn, session_id, message_timestamp
+            )
             inserted += 1
             if tool_calls is not None:
                 tool_calls_total += (
