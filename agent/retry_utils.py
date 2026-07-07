@@ -156,21 +156,33 @@ def resolve_retry_after(
         pool-at-capacity 503 from the local relay is a self-describing
         transient that emits a bounded ``Retry-After``; honoring it beats
         blind jitter. Any other reason → ``None`` (jitter).
-      * Do NOT honor on the LAST retry before fallback activation
-        (``retry_count >= max_retries - 1``): the fallback chain hits boxes
-        directly (bypassing a saturated relay) and may serve immediately, so
-        waiting the relay-informed delay would slow the fast escape hatch.
+      * The caller activates its fallback chain at ``retry_count >=
+        max_retries``, so the honor-reachable retries are ``1 .. max_retries-1``.
+        Reserve the LAST reachable retry for jitter (so the fast direct-box
+        fallback isn't delayed by a relay-informed wait) — but ONLY when there
+        are at least TWO reachable retries to spare one. When ``max_retries==2``
+        there is a single reachable retry; skipping it would make the whole
+        overload feature a no-op, so it IS honored (Greptile #223 P1).
       * A non-numeric value (e.g. an HTTP-date ``Retry-After``, RFC-valid but
         not a bare number) is NOT parsed here → ``None`` (jitter). This is
         deliberate: overload/backpressure sources emit numeric seconds; date
         parsing would be scope creep.
       * The honored value is clamped to a class-specific cap
         (rate-limit 600s, overload 60s) and floored at 0.
+
+    ``retry_count`` is the caller's 1-based attempt number (incremented before
+    this runs); ``max_retries`` is the retry ceiling.
     """
     if not (is_rate_limit or is_overload):
         return None
-    # Final pre-fallback retry: jitter to the fast direct-box fallback instead.
-    if retry_count >= max_retries - 1:
+    # Past/at the fallback threshold → don't honor (defensive; the caller
+    # normally activates fallback before reaching here).
+    if retry_count >= max_retries:
+        return None
+    # Reserve the final reachable retry for a fast jitter→fallback, but only
+    # when there are ≥2 reachable retries (max_retries ≥ 3) so we don't spend
+    # our only reachable retry and disable the feature (Greptile #223 P1).
+    if max_retries >= 3 and retry_count >= max_retries - 1:
         return None
     if raw_value in (None, ""):
         return None

@@ -255,23 +255,29 @@ def test_retry_after_rate_limit_capped_at_600():
 
 
 def test_retry_after_not_honored_on_final_pre_fallback_retry():
-    # AC-8 / RC-1: do NOT honor on the LAST retry before fallback activation, so
-    # the fast direct-box fallback chain isn't delayed. The contract is
-    # `retry_count >= max_retries - 1 -> None`, independent of the caller's
-    # 0/1-based convention. The real caller (conversation_loop) is 1-based
-    # (retry_count is incremented before this runs), so with max_retries=3 it
-    # honors attempt 1 and jitters attempt 2 (the last before the
-    # retry_count>=max_retries fallback trigger at 3).
+    # AC-8 / RC-1: reserve the LAST reachable retry for a fast jitter→fallback,
+    # but ONLY when there are ≥2 reachable retries (max_retries ≥ 3). The caller
+    # is 1-based (retry_count incremented before this runs) and activates
+    # fallback at retry_count >= max_retries, so reachable retries are 1..N-1.
+    # max_retries=3 -> reachable {1,2}: honor 1, jitter 2 (the last reachable).
     assert _honor(retry_count=1, max_retries=3) == 8.0   # 1 < 3-1=2 -> honor
-    assert _honor(retry_count=2, max_retries=3) is None  # 2 >= 2 -> final -> jitter
-    # boundary: honor iff retry_count < max_retries-1 (i.e. <= max_retries-2)
+    assert _honor(retry_count=2, max_retries=3) is None  # last reachable -> jitter
+    # boundary: honor iff retry_count < max_retries-1 (when max_retries >= 3)
     assert _honor(retry_count=3, max_retries=5) == 8.0   # 3 < 5-1=4 -> honor
-    assert _honor(retry_count=4, max_retries=5) is None  # 4 >= 4 -> jitter
+    assert _honor(retry_count=4, max_retries=5) is None  # last reachable -> jitter
+
+
+def test_retry_after_honored_when_only_one_reachable_retry():
+    # Greptile #223 P1: with max_retries=2 there is exactly ONE reachable retry
+    # (retry_count=1); reserving it for jitter would make the whole overload
+    # feature a no-op. So it MUST be honored.
+    assert _honor(retry_count=1, max_retries=2) == 8.0
 
 
 def test_retry_after_max_retries_1_never_honors():
-    # config-edge: with max_retries=1, retry_count(0) >= max_retries-1(0) -> jitter.
-    assert _honor(retry_count=0, max_retries=1) is None
+    # max_retries=1: zero reachable retries (retry_count 1 >= max_retries 1) ->
+    # never honored (straight to fallback).
+    assert _honor(retry_count=1, max_retries=1) is None
 
 
 def test_retry_after_http_date_falls_through_to_jitter():
