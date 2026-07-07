@@ -90,6 +90,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="<platform>", cli_only=True),
     CommandDef("branch", "Branch the current session (explore a different path)", "Session",
                aliases=("fork",), args_hint="[name]"),
+    CommandDef("merge", "Merge a branched Discord thread back into its parent session", "Session",
+               gateway_only=True),
     CommandDef("boomerang", "Run a task autonomously in an isolated subagent that inherits this "
                "session's context; a summary returns here when it finishes", "Session",
                args_hint="<task>"),
