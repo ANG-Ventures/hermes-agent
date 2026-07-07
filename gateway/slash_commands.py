@@ -181,7 +181,7 @@ class GatewaySlashCommandsMixin:
 
         # Clear any session-scoped model/reasoning overrides so the next agent
         # picks up configured defaults instead of previous session switches.
-        self._session_model_overrides.pop(session_key, None)
+        self._set_session_model_override(session_key, None)
         self._set_session_reasoning_override(session_key, None)
         if hasattr(self, "_pending_model_notes"):
             self._pending_model_notes.pop(session_key, None)
@@ -1324,13 +1324,13 @@ class GatewaySlashCommandsMixin:
                             f"via {result.provider_label or result.target_provider}. "
                             f"Adjust your self-identification accordingly.]"
                         )
-                        _self._session_model_overrides[_session_key] = {
+                        _self._set_session_model_override(_session_key, {
                             "model": result.new_model,
                             "provider": result.target_provider,
                             "api_key": result.api_key,
                             "base_url": result.base_url,
                             "api_mode": result.api_mode,
-                        }
+                        })
 
                         # Announce the deliberate switch to the conversation (P2).
                         await _self._announce_switch(
@@ -1574,13 +1574,14 @@ class GatewaySlashCommandsMixin:
             )
 
             # Store session override so next agent creation uses the new model
-            self._session_model_overrides[session_key] = {
+            # (single door — also persists the config-backed identity, RC-2/P3b).
+            self._set_session_model_override(session_key, {
                 "model": result.new_model,
                 "provider": result.target_provider,
                 "api_key": result.api_key,
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
-            }
+            })
 
             # Announce the deliberate switch to the conversation (P2). Compares the
             # (provider, model, api_mode) route so a same-slug/different-endpoint

@@ -3264,6 +3264,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # dormant before the drained backlog has a chance to update the clock.
         self._scale_to_zero_cooldown_until: float = 0.0
 
+        # Rehydrate session-scoped /reasoning + /model overrides persisted on the
+        # SessionEntry so they survive a gateway restart (P3). Best-effort; runs
+        # after session_store + the override dicts exist. Provider config is loaded
+        # lazily per-resolve, so the model leg re-resolves credentials on demand.
+        try:
+            self._rehydrate_session_overrides()
+        except Exception:
+            logger.debug("session-override rehydrate skipped (non-fatal)", exc_info=True)
+
+
+    def _rehydrate_session_overrides(self) -> None:
+        """Repopulate the in-memory /reasoning + /model override dicts from the
+        persisted SessionEntry fields on gateway boot (P3).
+
+        Reasoning overrides carry no secret and rehydrate directly. Model overrides
+        persist only their identity ({model, provider, api_mode}); their api_key and
+        base_url are re-resolved from provider config here (never read from disk),
+        and an entry whose provider is no longer configured is skipped (fail-open to
+        the config default rather than booting a broken client).
+        """
+        store = getattr(self, "session_store", None)
+        if store is None:
+            return
+        try:
+            store._ensure_loaded()  # noqa: SLF001 — populate _entries before we read
+        except Exception:
+            pass
+        try:
+            entries = store.entries()
+        except Exception:
+            return
+        for entry in entries:
+            key = getattr(entry, "session_key", None)
+            if not key:
+                continue
+            # --- reasoning (P3a): no secret, direct rehydrate ---
+            ro = getattr(entry, "reasoning_override", None)
+            if isinstance(ro, dict) and ro:
+                self._session_reasoning_overrides[key] = dict(ro)
+            # --- model (P3b): re-resolve credentials, skip if unresolvable ---
+            mo = getattr(entry, "model_override_identity", None)
+            if isinstance(mo, dict) and mo.get("model") and mo.get("provider"):
+                try:
+                    resolved = self._reresolve_model_override_credentials(mo)
+                except Exception:
+                    resolved = None
+                if resolved is not None:
+                    self._session_model_overrides[key] = resolved
+                else:
+                    logger.debug(
+                        "model override rehydrate skipped for %s (provider %r unresolvable)",
+                        key, mo.get("provider"),
+                    )
 
     def _wire_teams_pipeline_runtime(self) -> None:
         """Bind the Teams meeting pipeline runtime to Graph webhook ingress.
@@ -5032,7 +5085,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         reasoning_config: Optional[dict],
     ) -> None:
-        """Set or clear the session-scoped reasoning override."""
+        """Set or clear the session-scoped reasoning override.
+
+        Write-through: the override is ALSO persisted onto the SessionEntry so it
+        survives a gateway restart (P3a) — the in-memory dict alone is lost on
+        restart, silently reverting /reasoning high to the config default. Because
+        this setter is the single door every clear-point already calls
+        (/new, /reset, /reasoning reset, auto-reset, finalization), clearing the
+        override (reasoning_config=None) also nulls the persisted field, so a
+        conversation boundary still clears it (durability, not scope).
+        """
         if not session_key:
             return
         if not hasattr(self, "_session_reasoning_overrides"):
@@ -5041,6 +5103,120 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._session_reasoning_overrides.pop(session_key, None)
         else:
             self._session_reasoning_overrides[session_key] = dict(reasoning_config)
+        # Persist onto the session entry (best-effort — a persistence hiccup must
+        # never break the in-memory switch the user just made).
+        try:
+            store = getattr(self, "session_store", None)
+            entry = store.entry_for(session_key) if store is not None else None
+            if entry is not None:
+                entry.reasoning_override = (
+                    dict(reasoning_config) if reasoning_config is not None else None
+                )
+                store.persist()
+        except Exception:
+            logger.debug("reasoning-override persist skipped (non-fatal)", exc_info=True)
+
+    @staticmethod
+    def _reresolve_model_override_credentials(identity: dict) -> Optional[dict]:
+        """Re-resolve a persisted model override's api_key + base_url from provider
+        config on boot (P3b/RC-3) — NEVER read from disk.
+
+        ``identity`` carries only {model, provider, api_mode}. Returns a full runtime
+        override dict (with re-resolved api_key/base_url) or None when the provider is
+        no longer configured / resolution yields no usable credential (fail-open to
+        the config default rather than booting a broken client).
+        """
+        model = (identity or {}).get("model")
+        provider = (identity or {}).get("provider")
+        if not model or not provider:
+            return None
+        try:
+            from hermes_cli.model_switch import switch_model
+            from hermes_cli.config import get_compatible_custom_providers
+        except Exception:
+            return None
+        try:
+            cfg = _load_gateway_config() or {}
+        except Exception:
+            cfg = {}
+        user_provs = cfg.get("providers")
+        try:
+            custom_provs = get_compatible_custom_providers(cfg)
+        except Exception:
+            custom_provs = cfg.get("custom_providers")
+        try:
+            result = switch_model(
+                raw_input=model,
+                current_provider=provider,
+                current_model=model,
+                explicit_provider=provider,
+                user_providers=user_provs,
+                custom_providers=custom_provs,
+            )
+        except Exception:
+            return None
+        if result is None or not getattr(result, "api_key", None):
+            return None
+        return {
+            "model": getattr(result, "new_model", model),
+            "provider": getattr(result, "target_provider", provider),
+            "api_key": result.api_key,
+            "base_url": getattr(result, "base_url", None),
+            "api_mode": getattr(result, "api_mode", identity.get("api_mode")),
+        }
+
+    def _model_override_is_persistable(self, override: dict) -> Optional[dict]:
+        """Return the persistable IDENTITY ({model, provider, api_mode}) for a model
+        override IFF it is provider-config-resolvable (P3b/RC-4/C7) — else None.
+
+        Config-resolvability is a faithful proxy for credential provenance here
+        because the gateway /model surface carries NO inline api_key/base_url (C7:
+        parse_model_flags accepts only --provider/--global/--session/--refresh). So an
+        override whose (provider, model) re-resolves cleanly can be safely
+        reconstructed on boot; one that can't (a provider removed from config, an
+        ad-hoc endpoint) is NOT persisted — persisting it would silently re-route to
+        the config endpoint on restart (the silent-drift class P3 exists to kill).
+        """
+        model = (override or {}).get("model")
+        provider = (override or {}).get("provider")
+        if not model or not provider:
+            return None
+        identity = {"model": model, "provider": provider, "api_mode": override.get("api_mode")}
+        # It is persistable iff we can re-resolve a credential for it right now.
+        if self._reresolve_model_override_credentials(identity) is None:
+            return None
+        return identity
+
+    def _set_session_model_override(
+        self,
+        session_key: str,
+        override: Optional[dict],
+    ) -> None:
+        """Single door for setting/clearing a session-scoped /model override (P3b/RC-2).
+
+        Sets or pops the in-memory dict AND writes/nulls the persisted identity on the
+        SessionEntry (config-backed-only per RC-4) AND saves. Routing every clear-site
+        through this door means a missed/future ``.pop`` can't leave a persisted
+        override that wrongly outlives a /new (the dual-maintenance anti-pattern).
+        """
+        if not session_key:
+            return
+        if not hasattr(self, "_session_model_overrides"):
+            self._session_model_overrides = {}
+        if override is None:
+            self._session_model_overrides.pop(session_key, None)
+        else:
+            self._session_model_overrides[session_key] = dict(override)
+        try:
+            store = getattr(self, "session_store", None)
+            entry = store.entry_for(session_key) if store is not None else None
+            if entry is not None:
+                entry.model_override_identity = (
+                    self._model_override_is_persistable(override) if override is not None else None
+                )
+                store.persist()
+        except Exception:
+            logger.debug("model-override persist skipped (non-fatal)", exc_info=True)
 
     @staticmethod
     def _load_service_tier() -> str | None:
@@ -8171,7 +8347,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # session is still alive and a resumed turn rebuilds
                         # its agent from these overrides. Only true session
                         # finalization, /new, and /reset clear them.)
-                        self._session_model_overrides.pop(key, None)
+                        self._set_session_model_override(key, None)
                         self._set_session_reasoning_override(key, None)
                         if hasattr(self, "_pending_model_notes"):
                             self._pending_model_notes.pop(key, None)
@@ -10732,6 +10908,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             _restore = getattr(event, "_moa_restore_override", None)
             if _restore is None:
+                # NOTE(P3b/RC-2): MoA per-turn override restore is a TRANSIENT
+                # in-memory-only save/restore around a single turn, NOT a
+                # conversation boundary — it must NOT touch the persisted
+                # SessionEntry identity (persisting/clearing it here would corrupt
+                # the durable override across a restart). So this pair deliberately
+                # uses the raw in-memory dict, not _set_session_model_override.
                 self._session_model_overrides.pop(quick_key, None)
             else:
                 self._session_model_overrides[quick_key] = _restore
@@ -11307,7 +11489,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session-scoped transient state so the fresh session does not
             # inherit the previous conversation's model/reasoning overrides
             # or a queued "/model switched" note.
-            self._session_model_overrides.pop(session_key, None)
+            self._set_session_model_override(session_key, None)
             self._set_session_reasoning_override(session_key, None)
             if hasattr(self, "_pending_model_notes"):
                 self._pending_model_notes.pop(session_key, None)
@@ -12341,7 +12523,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 new_entry = self.session_store.reset_session(session_key)
                 self._evict_cached_agent(session_key)
-                self._session_model_overrides.pop(session_key, None)
+                self._set_session_model_override(session_key, None)
                 self._set_session_reasoning_override(session_key, None)
                 if hasattr(self, "_pending_model_notes"):
                     self._pending_model_notes.pop(session_key, None)
