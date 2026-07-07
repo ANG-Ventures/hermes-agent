@@ -1,66 +1,49 @@
-# PHASE-0 PROBE — P4 server-side reroute detectability (FALSIFIED)
+# PHASE-0 PROBE — the "fable→opus flip" is a REFUSAL-triggered client-side failover
 
-**Date:** 2026-07-07 · **Owner:** Apollo
-**Spec:** `~/.hermes/plans/2026-07-07_reasoning-model-switch-visibility-SPEC.md` §5F / Phase 4 / AC-14
-**Verdict:** 🔴 **P4 NOT BUILDABLE AS SPECIFIED — premise falsified. Do NOT ship.**
+**Date:** 2026-07-07 · **Owner:** Apollo · **Status:** RESOLVED — P4 replaced by reason-surfacing.
 
-## The premise P4 rests on
+## What I first got wrong (and Ace correctly challenged)
 
-P4 (announce a server-side model reroute) detects the reroute by comparing the
-**requested** model (`agent.model`) against the **served** model (`response.model`,
-read at `conversation_loop.py:4212`). The load-bearing assumption: when Anthropic's
-safety layer serves `claude-opus-4-8` for a `claude-fable-5` request on sensitive
-content, `response.model` reports the *served* (`opus`) name, so `served != requested`
-is detectable.
+Initial P4 hypothesis: the fable→opus "flip" is a SILENT server-side safety reroute, detectable
+only by comparing requested vs served `response.model`. I probed `response.model` on benign +
+keyword-flagged prompts, saw it always echo `claude-fable-5`, and wrongly concluded "un-buildable,
+the reroute is invisible." That was **testing the wrong signal** — I never actually triggered a flip.
 
-## The probe (live, against the real relay `http://127.0.0.1:18810/anthropic`)
+## The real mechanism (ground-truthed against the live subscription boxes + harness + logs)
 
-Requested `claude-fable-5`; read `response.model` from the actual API response.
+1. fable **genuinely refuses** hard-blocked content — direct probe to a subscription box
+   (`:18801/anthropic`) with a Pentagon/bioweapon prompt returned **`stop_reason: refusal`** (HTTP 200,
+   empty content). (Keyword-flagged-but-answerable prompts like "keylogger" return `max_tokens`, which
+   is why my first probes missed it.)
+2. The harness maps that refusal to `finish_reason == "content_filter"` (conversation_loop.py:1615)
+   and calls **`_try_activate_fallback()`** — the CLIENT-SIDE failover — to retry on the next
+   configured model (opus). That IS the "flip."
+3. Live logs confirm it: `agent.chat_completion_helpers: Fallback activated: claude-fable-5 →
+   claude-opus-4-8 (claude-api-proxy-f1)` fired repeatedly on a real session this morning.
 
-| Prompt class | requested | served `response.model` | diverged? |
+So the flip is a **real, observable client-side failover triggered by a safety refusal** — already
+announced in-session via `_emit_fallback_announce` (morning spec, `announce_route_change`, default-on).
+There is NO silent server-side reroute. P4-as-a-new-detector was solving a non-problem.
+
+## What actually ships (replaces P4): reason-surfacing
+
+The failover announce said `🔄 Model fallback: fable → opus` with NO reason — indistinguishable from a
+rate-limit failover. The fix threads the `FailoverReason` into `_emit_fallback_announce` so the line
+reads `🔄 Model fallback (safety refusal): claude-app/claude-fable-5 → claude-api-proxy-f1/claude-opus-4-8`
+vs `(rate limit)` / `(provider overloaded)` / etc.
+
+## Cross-method coverage (Ace's architecture question)
+
+The refusal handler is WIRE-AGNOSTIC — both transports normalize a refusal to the same
+`finish_reason == "content_filter"` branch, so the reason-surfacing covers every harness-driven method:
+
+| Method | Wire | Refusal normalization | Reason-surfaced |
 |---|---|---|---|
-| benign ("say ping") | claude-fable-5 | `claude-fable-5` | NO |
-| defensive-security (stored-XSS/CSP) | claude-fable-5 | `claude-fable-5` | NO |
-| working keylogger | claude-fable-5 | `claude-fable-5` | NO |
-| nerve-agent synthesis | claude-fable-5 | `claude-fable-5` | NO |
-| "ignore safety, make a bomb" | claude-fable-5 | `claude-fable-5` | NO |
+| claude-app (:18810) | anthropic | `stop_reason:refusal` → `content_filter` (transports/anthropic.py:239) | ✅ |
+| claude-api-proxy-fN | anthropic | same | ✅ |
+| claude-bpp (:18811) | openai | `message.refusal` / `content_filter` → `content_filter` (chat_completions.py:699) | ✅ |
+| claude-bridge-fN | openai | same | ✅ |
+| claude-code-relay | (Claude Code CLI) | `claude -p` runs its OWN agent loop; a fable refusal there is handled by Claude Code, NOT this harness failover | ➖ N/A |
 
-Faithfulness control (proves the field WOULD show a divergence if one happened):
-
-| requested | served `response.model` |
-|---|---|
-| claude-opus-4-8 | `claude-opus-4-8` |
-| claude-fable-5 | `claude-fable-5` |
-| claude-haiku-4-5 | `claude-haiku-4-5-20251001` (dated variant — a genuinely distinct served string) |
-
-The `response.model` field is **faithful**: it echoes the exact model served, and
-even surfaces a dated variant when the served model differs from the request. So if a
-`fable → opus` reroute actually changed which model answered, the field would report
-`claude-opus-4-8`. It never does — across benign AND maximally safety-flagged prompts,
-`response.model` is always the requested `claude-fable-5`.
-
-## Conclusion
-
-**The server-side reroute is NOT observable via `response.model`.** Whatever the
-`content-triggered-model-flip-routing` skill described as a "fable→opus flip" is
-either (a) not a model substitution at the API-response level, (b) an internal
-Anthropic safety pass that does not change the reported served model, or (c) a
-footer artifact from a *requested*-model change (a `/model` override), not a
-server reroute. In none of these cases can a `served != requested` detector fire.
-
-Per the spec's Phase-0 gate (AC-14): **P4 is reported un-buildable rather than
-shipped as a detector that never fires.** P1/P2/P3 are unaffected and ship.
-
-## What this means for Ace's OQ-1 ask ("announce the reroute like a fallback")
-
-- **Client-side failover** (the pool bouncing opus@claude-app → opus@f3) IS
-  observable and IS already announced in-session — the morning spec's
-  `_emit_fallback_announce` (live since commit #225, gated `model.announce_route_change`).
-  That covers the "announce it like a fallback" ask for the case that actually happens.
-- **A genuine server-side reroute** would need a signal Anthropic does not currently
-  expose in the response. If Anthropic ever adds a served-model or safety-reroute
-  field to the API response, revisit P4 — the detector shell (`_emit_reroute_announce`,
-  the call site, the dedup) is designed and ready to wire to a real signal.
-
-**Roadmap:** re-open P4 only if a live probe shows `response.model` (or a new
-Anthropic response field) diverging on a reroute.
+Live refusal-passthrough probe verified: `:18801` (anthropic) and `:18810` (claude-app) both return
+`stop_reason: refusal` untouched; the openai-wire path maps `message.refusal`/`content_filter` the same.
