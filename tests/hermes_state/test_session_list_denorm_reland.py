@@ -351,13 +351,100 @@ def test_every_sessiondb_message_insert_path_is_effective_last_active_adjacent()
     ]
     assert offenders == []
 
-    recompute_required = ["replace_messages", "archive_and_compact"]
+    recompute_required = [
+        "replace_messages",
+        "archive_and_compact",
+        "update_session_meta",
+    ]
     missing_recompute = [
         name
         for name in recompute_required
         if "_recompute_effective_last_active_for_session" not in methods[name]
     ]
     assert missing_recompute == []
+
+
+def test_update_session_meta_visibility_flip_matches_cte_oracle(tmp_path):
+    """Greptile P1 regression: rewriting model_config via update_session_meta can
+    flip a row's session.list visibility (it carries the _delegate_from marker).
+    The denorm path keys visibility on the stored effective_last_active column, so
+    if update_session_meta doesn't recompute it, a row made delegate-only keeps a
+    stale non-NULL value and stays visible (or a cleared row stays hidden) — the
+    flag-on denorm output then diverges from the CTE oracle. Both directions must
+    stay byte-identical to the oracle after the mutation.
+    """
+    _write_dashboard_flag(True)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        _seed_session(db, "row-A", started_at=100.0, message_ts=1000.0)
+        _seed_session(db, "row-B", started_at=200.0, message_ts=2000.0)
+
+        def _assert_matches_oracle(context):
+            got = db.list_sessions_rich(order_by_last_active=True, limit=10)
+            oracle = db.list_sessions_rich(
+                order_by_last_active=True, limit=10, _force_cte_oracle=True
+            )
+            assert _normalized(got) == _normalized(oracle), context
+
+        # Baseline: both visible, both paths agree.
+        _assert_matches_oracle("baseline")
+
+        # Make row-B delegate-only AFTER write → must vanish from BOTH paths.
+        db.update_session_meta("row-B", json.dumps({"_delegate_from": "parent-x"}))
+        assert "row-B" not in [
+            r["id"] for r in db.list_sessions_rich(order_by_last_active=True, limit=10)
+        ]
+        _assert_matches_oracle("after making row-B delegate-only")
+
+        # Clear the marker → row-B must reappear in BOTH paths.
+        db.update_session_meta("row-B", json.dumps({}))
+        assert "row-B" in [
+            r["id"] for r in db.list_sessions_rich(order_by_last_active=True, limit=10)
+        ]
+        _assert_matches_oracle("after clearing row-B delegate marker")
+    finally:
+        db.close()
+
+
+def test_id_query_deep_chain_matches_cte_oracle(tmp_path):
+    """Greptile P2 regression: the denorm id_query recursion previously capped at
+    depth < 100 while the legacy CTE search is unbounded, so a compression chain
+    whose matching tip sits beyond depth 100 was found by the oracle but missed by
+    the flag-on denorm path — the same session.list search returning different rows
+    once the flag is enabled. Compression edges are tree-structured (one parent per
+    child), so the recursion terminates without the magic cap. A >100-deep chain
+    searched by its deep tip id must resolve identically in both paths.
+    """
+    _write_dashboard_flag(True)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        depth = 130
+        prev = None
+        for i in range(depth):
+            sid = f"c{i:03d}"
+            db.create_session(sid, source="cli", model="test-model", parent_session_id=prev)
+            db.append_message(sid, role="user", content=f"turn {i}", timestamp=1000.0 + i)
+            if prev is not None:
+                db._execute_write(
+                    lambda conn, p=prev: conn.execute(
+                        "UPDATE sessions SET ended_at = ?, end_reason = 'compression' WHERE id = ?",
+                        (999.0, p),
+                    )
+                )
+            prev = sid
+
+        deep_tip = f"c{depth - 1:03d}"  # depth 129, well beyond the old cap
+        got = db.list_sessions_rich(order_by_last_active=True, limit=10, id_query=deep_tip)
+        oracle = db.list_sessions_rich(
+            order_by_last_active=True, limit=10, id_query=deep_tip, _force_cte_oracle=True
+        )
+        assert _normalized(got) == _normalized(oracle)
+        # And the deep-tip search actually resolves to a row (not an empty result
+        # from a truncated recursion). Before the fix the denorm path returned []
+        # for a tip beyond depth 100 while the oracle found it.
+        assert len(got) == 1, got
+    finally:
+        db.close()
 
 
 @pytest.mark.skipif(

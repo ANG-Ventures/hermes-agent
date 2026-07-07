@@ -2405,12 +2405,21 @@ class SessionDB:
         Uses COALESCE so that passing model=None leaves the stored model
         column unchanged.  Routes through _execute_write for the standard
         BEGIN IMMEDIATE + jitter-retry + lock guarantee.
+
+        Rewriting ``model_config`` can flip a row's session.list *visibility*
+        (it carries the ``_delegate_from`` / ``_branched_from`` markers the
+        visible-clause keys on), so the denormalized ``effective_last_active``
+        must be recomputed here — otherwise a row made delegate-only keeps a
+        stale non-NULL recency and stays visible in the flag-on denorm path
+        (or vice-versa), diverging from the CTE oracle. Mirrors the recompute
+        every other model_config-mutating path already performs.
         """
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
                 (model_config_json, model, session_id),
             )
+            self._recompute_effective_last_active_for_session(conn, session_id)
         self._execute_write(_do)
 
     def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
@@ -3284,7 +3293,6 @@ class SessionDB:
                 "      AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL "
                 "      AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL "
                 "      AND COALESCE(child.source, '') != 'tool' "
-                "      AND id_chain.depth < 100 "
                 "  ) "
                 "  SELECT 1 FROM id_chain WHERE LOWER(cur_id) LIKE ? ESCAPE '\\' LIMIT 1"
                 "))"
