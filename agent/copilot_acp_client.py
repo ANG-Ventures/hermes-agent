@@ -111,6 +111,51 @@ def _build_subprocess_env() -> dict[str, str]:
     return env
 
 
+# The local Claude Relay pool endpoint. A Claude ACP adapter spawned here rides
+# the pool (load-balanced across all Max subs, on subscription credits) exactly
+# like `claude -p` via the claude-code-relay shim, instead of going direct to
+# Anthropic. See skill `claude-code-relay`.
+_CLAUDE_RELAY_BASE_URL = "http://127.0.0.1:18810"
+# Substrings that identify a Claude (Anthropic-wire) ACP adapter command line.
+# Codex/Gemini/Copilot adapters speak other wires and must NOT be pointed here.
+_CLAUDE_ACP_MARKERS = ("claude-agent-acp", "claude-code-acp", "claude-code")
+
+
+def _claude_relay_env_patch(command: str, args: list[str]) -> dict[str, str]:
+    """Relay-routing env for a Claude ACP adapter subprocess, or {} if N/A.
+
+    Mirrors the claude-code-relay shim: point ANTHROPIC_BASE_URL at the pool,
+    supply a placeholder key (the pool injects the real per-sub token), and stamp
+    the x-hermes-* routing headers (which the pool reads then STRIPS before
+    Anthropic — INV-1, never egress). Applied ONLY when:
+      * the ACP command line looks like a Claude adapter, AND
+      * the caller has not already set ANTHROPIC_BASE_URL (an explicit endpoint
+        wins — bespoke override), AND
+      * the pool endpoint is not disabled via config.
+
+    background lane by default (a delegated ACP spawn is not a live-watched turn).
+    Returns {} for non-Claude adapters (codex/gemini/copilot) so their auth is
+    untouched.
+    """
+    blob = " ".join([command, *args]).lower()
+    if not any(m in blob for m in _CLAUDE_ACP_MARKERS):
+        return {}
+    if os.environ.get("ANTHROPIC_BASE_URL", "").strip():
+        return {}  # explicit endpoint already set — don't override
+    import uuid
+    key = os.environ.get("CLAUDE_POOL_KEY", "").strip() or "claude-pool-local-placeholder"
+    sid = uuid.uuid4().hex
+    return {
+        "ANTHROPIC_BASE_URL": _CLAUDE_RELAY_BASE_URL,
+        "ANTHROPIC_API_KEY": key,
+        "ANTHROPIC_CUSTOM_HEADERS": (
+            f"x-hermes-session: {sid}\n"
+            f"x-hermes-lane: background\n"
+            f"x-hermes-lane-src: platform=claude-agent-acp;delegate_depth=1;aux_task=0"
+        ),
+    }
+
+
 def _jsonrpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
     return {
         "jsonrpc": "2.0",
@@ -502,6 +547,11 @@ class CopilotACPClient:
         return completion
 
     def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+        # For a Claude ACP adapter, route the subprocess through the Claude Relay
+        # pool (affinity + background lane; x-hermes-* stripped before Anthropic).
+        # No-op for non-Claude adapters or when ANTHROPIC_BASE_URL is already set.
+        _subproc_env = _build_subprocess_env()
+        _subproc_env.update(_claude_relay_env_patch(self._acp_command, self._acp_args))
         try:
             proc = subprocess.Popen(
                 [self._acp_command] + self._acp_args,
@@ -511,7 +561,7 @@ class CopilotACPClient:
                 text=True,
                 bufsize=1,
                 cwd=self._acp_cwd,
-                env=_build_subprocess_env(),
+                env=_subproc_env,
             )
         except FileNotFoundError as exc:
             raise RuntimeError(

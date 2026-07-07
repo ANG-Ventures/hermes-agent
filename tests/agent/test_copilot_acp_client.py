@@ -312,3 +312,56 @@ def test_run_prompt_passes_home_when_parent_env_is_clean(monkeypatch, tmp_path):
 
     assert "env" in captured["kwargs"]
     assert captured["kwargs"]["env"]["HOME"]
+
+
+# ── Claude Relay env injection (claude-code-relay for the ACP path) ──────────
+# A Claude ACP adapter spawned via CopilotACPClient must ride the Claude Relay
+# pool (like `claude -p` via the shim): ANTHROPIC_BASE_URL -> pool + the
+# x-hermes-* routing headers. Non-Claude adapters (copilot/codex) must be left
+# untouched. See skill `claude-code-relay`.
+
+
+def _make_claude_acp_client(tmp_path):
+    return CopilotACPClient(
+        acp_command="npx",
+        acp_args=["-y", "@agentclientprotocol/claude-agent-acp"],
+        acp_cwd=str(tmp_path),
+    )
+
+
+def test_claude_acp_gets_relay_env(monkeypatch, tmp_path):
+    # No pre-set ANTHROPIC_BASE_URL -> the pool env is injected.
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.delenv("CLAUDE_POOL_KEY", raising=False)
+    captured = {}
+    client = _make_claude_acp_client(tmp_path)
+    with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
+        with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
+            client._run_prompt("hi", timeout_seconds=1)
+    env = captured["kwargs"]["env"]
+    assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:18810"
+    assert "x-hermes-lane: background" in env["ANTHROPIC_CUSTOM_HEADERS"]
+    assert "x-hermes-session:" in env["ANTHROPIC_CUSTOM_HEADERS"]
+    assert env["ANTHROPIC_API_KEY"]  # placeholder present
+
+
+def test_claude_acp_respects_explicit_base_url(monkeypatch, tmp_path):
+    # A caller-set ANTHROPIC_BASE_URL wins — we must NOT override it.
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://bespoke.example/v1")
+    captured = {}
+    client = _make_claude_acp_client(tmp_path)
+    with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
+        with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
+            client._run_prompt("hi", timeout_seconds=1)
+    assert captured["kwargs"]["env"]["ANTHROPIC_BASE_URL"] == "https://bespoke.example/v1"
+
+
+def test_non_claude_acp_untouched(monkeypatch, tmp_path):
+    # A Copilot (non-Claude) adapter must NOT be pointed at the Claude pool.
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    captured = {}
+    client = _make_home_client(tmp_path)  # command="copilot"
+    with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
+        with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
+            client._run_prompt("hi", timeout_seconds=1)
+    assert "ANTHROPIC_BASE_URL" not in captured["kwargs"]["env"]
