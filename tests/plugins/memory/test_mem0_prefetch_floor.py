@@ -440,3 +440,15 @@ def test_rerank_gap_missing_score_fails_open(monkeypatch, tmp_path):
     results = [{"memory": "a", "score": 1.0, "rerank_score": 5.0}, {"memory": "b", "score": 1.0}]
     kept, outcome = p._apply_rerank_gap("q", results)
     assert kept == results and outcome == "gap_failed_open"
+
+
+def test_rerank_gap_negative_config_clamped_not_fail_closed(monkeypatch, tmp_path):
+    """A config typo like max_gap:-1 must NOT silently clear all L2 survivors.
+    Negative gap is clamped to the default (6.0), keeping recall open."""
+    p = _provider(monkeypatch, tmp_path)
+    _write_cfg_block(tmp_path, "prefetch_rerank_gap", {"enabled": True, "max_gap": -1.0})
+    results = _rr_results(("top", 5.0), ("near", 2.5), ("far", 1.0))
+    kept, outcome = p._apply_rerank_gap("q", results)
+    # clamped to 6.0 → top=5.0, keep >= -1.0: all three survive, nothing wrongly dropped.
+    assert [r["memory"] for r in kept] == ["top", "near", "far"]
+    assert outcome == "gap_kept_3_of_3"

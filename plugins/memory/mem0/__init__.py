@@ -1043,6 +1043,10 @@ class Mem0MemoryProvider(MemoryProvider):
             gap = float(cfg.get("max_gap", 6.0))
         except (TypeError, ValueError):
             gap = 6.0
+        # A negative gap would make `(top - s) <= gap` unmatchable and silently
+        # clear every L2 survivor — a config typo must not fail closed. Clamp.
+        if gap < 0:
+            gap = 6.0
         return enabled, gap
 
     def _apply_rerank_gap(self, query, results):
@@ -1535,8 +1539,8 @@ class Mem0MemoryProvider(MemoryProvider):
                     # placed in front of the model; `floor_outcome` says which path decided it.
                     # No memory text (privacy). This is the top-level recall observability row.
                     logger.info(
-                        "mem0.prefetch injected=%d floor_outcome=%s rr_outcome=%s rerank=%s exact=%s q=%s",
-                        _injected, _floor_outcome, _rr_outcome, _pf_rerank,
+                        "mem0.prefetch injected=%d floor_outcome=%s rr_outcome=%s gap_outcome=%s rerank=%s exact=%s q=%s",
+                        _injected, _floor_outcome, _rr_outcome, _gap_outcome, _pf_rerank,
                         self._is_exact_token_query(run_query),
                         self._prefetch_query_hash(run_query),
                     )
