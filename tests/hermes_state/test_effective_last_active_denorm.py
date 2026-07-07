@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -61,6 +63,35 @@ def _create_session(db: SessionDB, session_id: str, source: str = "cli", *, star
 
 def _append(db: SessionDB, session_id: str, content: str, ts: float, *, role: str = "user") -> None:
     db.append_message(session_id, role, content, timestamp=ts)
+
+
+def _flush_via_agent(db: SessionDB, session_id: str, messages: list[dict],
+                     conversation_history: list[dict] | None = None) -> None:
+    """Drive the real live-agent flush method without constructing an LLM client."""
+    from run_agent import AIAgent
+
+    agent: Any = object.__new__(AIAgent)
+    agent._session_db = db
+    agent._session_db_created = True
+    agent.session_id = session_id
+    agent._last_flushed_db_idx = 0
+    agent._flushed_db_message_ids = set()
+    agent._flushed_db_row_ids = {}
+    agent._interrupt_close_repersisted_ids = set()
+    agent._flushed_db_message_session_id = None
+    agent._persist_user_message_idx = None
+    agent._persist_user_message_override = None
+    agent._persist_user_message_timestamp = None
+    agent._persist_user_message_platform_id = None
+
+    AIAgent._flush_messages_to_session_db(agent, messages, conversation_history or [])
+
+
+def _flush_one_turn(db: SessionDB, session_id: str, *, role: str, content: str, ts: float) -> None:
+    history = db.get_messages_as_conversation(session_id, include_timestamp=True)
+    messages = list(history)
+    messages.append({"role": role, "content": content, "timestamp": ts})
+    _flush_via_agent(db, session_id, messages, history)
 
 
 def _ordered_ids(db: SessionDB, **kwargs) -> list[str]:
@@ -271,6 +302,107 @@ class TestEffectiveLastActiveSchema:
 
 
 class TestEffectiveLastActiveQueryAndMaintenance:
+    def test_live_agent_flush_path_bumps_recency_and_matches_cte_oracle(self, tmp_path):
+        db = _db(tmp_path)
+        try:
+            _create_session(db, "old-active", started_at=10.0)
+            _create_session(db, "newer-started", started_at=200.0)
+            assert _ordered_ids(db, limit=2) == ["newer-started", "old-active"]
+
+            _flush_one_turn(
+                db,
+                "old-active",
+                role="user",
+                content="live flush should refresh recency",
+                ts=300.0,
+            )
+
+            assert _stored(db, "old-active") == 300.0
+            actual = db.list_sessions_rich(order_by_last_active=True, limit=2)
+            expected = db.list_sessions_rich_cte_oracle(limit=2)
+            assert _rows_bytes(actual) == _rows_bytes(expected)
+            assert [row["id"] for row in actual] == ["old-active", "newer-started"]
+        finally:
+            db.close()
+
+    def test_live_agent_flush_churn_copy_matches_cte_for_default_and_archived(self, tmp_path):
+        source_path = tmp_path / "source.db"
+        copy_path = tmp_path / "copy.db"
+        db = SessionDB(db_path=source_path)
+        try:
+            _create_session(db, "chain-root", started_at=10.0)
+            db.end_session("chain-root", "compression")
+            _create_session(db, "chain-tip", started_at=20.0, parent_session_id="chain-root")
+            _create_session(db, "standalone-a", started_at=100.0)
+            _create_session(db, "standalone-b", started_at=300.0)
+            _create_session(db, "archived-live", started_at=50.0)
+            db.set_session_archived("archived-live", True)
+        finally:
+            db.close()
+
+        shutil.copy2(source_path, copy_path)
+        db = SessionDB(db_path=copy_path)
+        try:
+            for session_id, ts in (
+                ("standalone-a", 250.0),
+                ("chain-tip", 600.0),
+                ("standalone-b", 450.0),
+                ("archived-live", 700.0),
+                ("standalone-a", 650.0),
+            ):
+                _flush_one_turn(
+                    db,
+                    session_id,
+                    role="user",
+                    content=f"turn at {ts}",
+                    ts=ts,
+                )
+
+            assert _stored(db, "chain-root") == 600.0
+            assert _stored(db, "chain-tip") is None
+            assert _stored(db, "standalone-a") == 650.0
+            assert _stored(db, "standalone-b") == 450.0
+            assert _stored(db, "archived-live") == 700.0
+
+            cases = [
+                ("default", {}),
+                ("include_archived", {"include_archived": True}),
+            ]
+            for label, kwargs in cases:
+                actual = db.list_sessions_rich(
+                    order_by_last_active=True,
+                    limit=10,
+                    **kwargs,
+                )
+                expected = db.list_sessions_rich_cte_oracle(limit=10, **kwargs)
+                assert _rows_bytes(actual) == _rows_bytes(expected), label
+        finally:
+            db.close()
+
+    def test_direct_message_insert_chokepoint_bumps_effective_last_active(self, tmp_path):
+        db = _db(tmp_path)
+        try:
+            _create_session(db, "old-active", started_at=10.0)
+            _create_session(db, "newer-started", started_at=200.0)
+            assert _ordered_ids(db, limit=2) == ["newer-started", "old-active"]
+
+            def _do(conn):
+                return db._insert_message_rows(
+                    conn,
+                    "old-active",
+                    [{"role": "user", "content": "direct insert", "timestamp": 300.0}],
+                )
+
+            assert db._execute_write(_do) == (1, 0)
+
+            assert _stored(db, "old-active") == 300.0
+            actual = db.list_sessions_rich(order_by_last_active=True, limit=2)
+            expected = db.list_sessions_rich_cte_oracle(limit=2)
+            assert _rows_bytes(actual) == _rows_bytes(expected)
+            assert [row["id"] for row in actual] == ["old-active", "newer-started"]
+        finally:
+            db.close()
+
     def test_two_stage_query_matches_cte_oracle_with_deny_chain_ties_and_projection(self, tmp_path):
         db = _db(tmp_path)
         try:
@@ -500,6 +632,27 @@ def test_parent_session_id_writers_are_maintenance_adjacent():
     for match in writers:
         window = source[match.start(): match.start() + 900]
         assert "effective_last_active" in window or "_recompute" in window or "INSERT INTO sessions" in window
+
+
+def test_message_insert_writers_are_effective_last_active_maintenance_adjacent():
+    source = (Path(__file__).parents[2] / "hermes_state.py").read_text()
+    writers = list(
+        re.finditer(
+            r"INSERT\s+INTO\s+messages\s*\(",
+            source,
+            flags=re.IGNORECASE,
+        )
+    )
+    assert len(writers) == 3
+    for match in writers:
+        window = source[match.start(): match.start() + 2400]
+        if "_fts_health_probe" in window:
+            assert "ROLLBACK" in window
+            continue
+        assert (
+            "_bump_effective_last_active_for_message" in window
+            or "_recompute_effective_last_active" in window
+        )
 
 
 def test_list_deny_sources_single_sourced():
