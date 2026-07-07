@@ -145,8 +145,13 @@ class TestSingleDoorGrep:
     def test_model_command_has_no_inline_credential_flag(self):
         # C7/INV-PROV: parse_model_flags accepts no --api-key/--base-url. If a future
         # edit adds one, this fails loudly (persistence provenance must be revisited).
+        # Check the executable body only (strip the docstring, which mentions the flag
+        # names in prose explaining WHY they're forbidden).
         src = (REPO / "hermes_cli" / "model_switch.py").read_text()
         m = re.search(r"def parse_model_flags\(.*?\n(?:.*?\n)*?    return ", src)
         body = m.group(0) if m else ""
-        assert "api-key" not in body and "api_key" not in body
-        assert "base-url" not in body and "base_url" not in body
+        # Drop the triple-quoted docstring.
+        body_no_doc = re.sub(r'"""(?:.|\n)*?"""', "", body)
+        low = body_no_doc.lower()
+        assert "api-key" not in low and "api_key" not in low, body_no_doc
+        assert "base-url" not in low and "base_url" not in low, body_no_doc
