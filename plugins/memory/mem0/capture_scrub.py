@@ -49,6 +49,16 @@ _SECRET_PATTERNS = [
     (re.compile(r"(?i)\b(?:secret|token|passwd|password|api[_-]?key)\b\s*[:=]\s*['\"]?[A-Za-z0-9/+=_-]{20,}"), "labeled_secret_assignment"),
 ]
 
+# Natural-language credential disclosure is handled by a code helper (below) rather than a single
+# mega-regex, because the real discriminator between a leaked secret and an innocent English
+# sentence ("password does not work", "password is required") is the *shape of the value token*,
+# which needs character-class counting that regex does poorly. A cred word near a secret-shaped
+# value = drop.
+_CRED_WORD = re.compile(r"(?i)\b(?:pass(?:word|code|phrase)|passwd|pwd)\b")
+_QUOTES = "'\"`\u2018\u2019\u201c\u201d"
+_QUOTED_VAL = re.compile(r"[" + _QUOTES + r"]([^" + _QUOTES + r"\s]{6,64})[" + _QUOTES + r"]")
+_BARE_TOKEN = re.compile(r"[^\s'\"`,;]{8,64}")
+
 # A 1Password reference (op://...) is SAFE-BY-DESIGN — it's a pointer, not a secret. Never drop it.
 _OP_REF = re.compile(r"\bop://[^\s'\"]+")
 
@@ -80,6 +90,85 @@ def _looks_high_entropy_secret(token: str) -> bool:
     return _shannon_entropy(token) >= 3.5
 
 
+# Common English words that can follow "password" without being a leaked value — guards the bare
+# path against sentences like "password is required/unknown/correct/working/rotated/different".
+_CRED_STOPWORDS = frozenset({
+    "is", "was", "are", "the", "a", "an", "to", "for", "of", "on", "in", "and", "or", "not",
+    "required", "correct", "incorrect", "unknown", "working", "works", "rotated", "changed",
+    "different", "same", "valid", "invalid", "empty", "missing", "set", "reset", "stored",
+    "saved", "does", "did", "must", "should", "authentication", "auth", "field", "prompt",
+    "step", "wall", "manager", "protected", "account", "login", "user", "reuse", "reused",
+    "hash", "hashed", "policy", "recovery", "confirmation", "known", "provided", "above",
+})
+
+# Product names / proper-noun compounds that carry a digit or mixed-case (so they pass the
+# secret-shape test) but are common non-secrets appearing near the word "password".
+_CRED_NONSECRET_WORDS = frozenset({
+    "1password", "lastpass", "bitwarden", "keepassxc", "keepass", "dashlane",
+    "nordpass", "protonpass", "onepassword", "macos", "iphone", "ipados",
+})
+
+
+def _looks_like_password_value(token: str) -> bool:
+    """True if `token` looks like an actual literal password/secret value rather than an English
+    word or identifier. The bare (unquoted) path is deliberately STRICT to avoid flagging
+    hyphenated compounds ('nexus-command', 'Plex-owned'), URLs, and file paths that legitimately
+    appear near the word 'password'."""
+    t = token.strip(".,;:!?)('\"`\u2018\u2019\u201c\u201d")
+    if len(t) < 8 or len(t) > 64:
+        return False
+    if t.lower() in _CRED_STOPWORDS:
+        return False
+    # Known product / proper-noun compounds that carry a digit+case but are NOT secrets.
+    if t.lower() in _CRED_NONSECRET_WORDS:
+        return False
+    # URLs / paths / emails are not bare password values
+    if "://" in t or "/" in t or "@" in t or "\\" in t:
+        return False
+    # A hyphenated lowercase word-compound (nexus-command, plex-owned, cross-seed) is an
+    # identifier, not a secret — reject unless it also carries a digit or a symbol beyond '-'.
+    core = t
+    has_digit = bool(re.search(r"\d", core))
+    has_special = bool(re.search(r"[!@#$%^&*_+=~<>?]", core))  # NOT counting '-' or '.'
+    has_upper = bool(re.search(r"[A-Z]", core))
+    has_lower = bool(re.search(r"[a-z]", core))
+    if "-" in core and not (has_digit or has_special):
+        return False
+    # secret-shaped: a digit or a strong symbol alongside letters, OR long mixed-case with digit
+    if (has_digit or has_special) and (has_upper or has_lower):
+        return True
+    return False
+
+
+def _scan_nl_credentials(text: str) -> List[str]:
+    """Detect natural-language credential disclosure: a credential word ('password', 'passcode',
+    'passphrase', 'passwd', 'pwd') sitting near a value token that looks like a real secret. Two
+    value shapes are caught: a QUOTED value (>=6 chars, no internal whitespace) or a BARE
+    secret-shaped token within a short window after the cred word. Long-lowercase quoted values
+    (e.g. a 10-char generated password like 'wuppfxqxqq') also count when quoted, since quoting a
+    word right after 'password' is itself the disclosure signal."""
+    hits: List[str] = []
+    for m in _CRED_WORD.finditer(text):
+        window = text[m.end(): m.end() + 60]
+        # 1) quoted value anywhere in the window
+        matched = False
+        for qm in _QUOTED_VAL.finditer(window):
+            val = qm.group(1)
+            # a quoted token right after a cred word is a disclosure unless it's an obvious label
+            if len(val) >= 6 and val.lower() not in _CRED_STOPWORDS and " " not in val:
+                hits.append("nl_credential_quoted")
+                matched = True
+                break
+        if matched:
+            continue
+        # 2) bare secret-shaped token in the window
+        for bm in _BARE_TOKEN.finditer(window):
+            if _looks_like_password_value(bm.group(0)):
+                hits.append("nl_credential_bare")
+                break
+    return hits
+
+
 def scan(text: str, *, entropy_check: bool = False) -> List[str]:
     """Return a list of matched secret-pattern names in `text`. Empty = clean.
     op:// references are stripped before scanning so they never count as a hit."""
@@ -90,6 +179,7 @@ def scan(text: str, *, entropy_check: bool = False) -> List[str]:
     for pat, name in _SECRET_PATTERNS:
         if pat.search(scrubbed):
             hits.append(name)
+    hits.extend(_scan_nl_credentials(scrubbed))
     if entropy_check:
         for tok in re.findall(r"[A-Za-z0-9._+=/-]{24,}", scrubbed):
             if _looks_high_entropy_secret(tok):
