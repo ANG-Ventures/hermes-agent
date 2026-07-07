@@ -4913,6 +4913,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return overrides[resolved_session_key]
         return self._load_reasoning_config()
 
+    def _reasoning_effort_for_footer(
+        self,
+        *,
+        source: Optional[SessionSource] = None,
+        session_key: Optional[str] = None,
+    ) -> str:
+        """Bare effort string for the runtime footer, honoring the session override.
+
+        The runtime footer's ``reasoning`` field previously fell back to the global
+        ``agent.reasoning_effort`` config default whenever the caller passed no value,
+        so a ``/reasoning <level>`` SESSION override was invisible — the footer showed
+        the config default while the turn actually ran at the override (the reported
+        ``r:xhigh``-when-set-to-``high`` bug). This resolves the SESSION-aware value:
+
+        - no override → ``""`` so ``build_footer_line`` keeps its existing config
+          fallback (byte-compatible with the prior behavior);
+        - an explicit ``{"enabled": False}`` override → ``"none"``;
+        - otherwise the overridden effort (``"high"``, ``"xhigh"``, …).
+        """
+        cfg = self._resolve_session_reasoning_config(
+            source=source, session_key=session_key,
+        )
+        overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
+        resolved_key = session_key
+        if not resolved_key and source is not None:
+            try:
+                resolved_key = self._session_key_for_source(source)
+            except Exception:
+                resolved_key = None
+        # Only treat the resolved config as a session override when one is actually
+        # set for this session; otherwise return "" and let the footer's config
+        # fallback render the default (unchanged behavior for the no-override path).
+        if not (resolved_key and resolved_key in overrides):
+            return ""
+        if cfg is None:
+            return ""
+        if not cfg.get("enabled", True):
+            return "none"
+        return str(cfg.get("effort", "") or "").strip()
+
     def _set_session_reasoning_override(
         self,
         session_key: str,
@@ -12106,6 +12146,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
+                    reasoning=(
+                        self._reasoning_effort_for_footer(
+                            source=source, session_key=session_key,
+                        )
+                        or None
+                    ),
                     message_count=_footer_msg_count,
                     message_limit=_footer_msg_limit,
                 )
