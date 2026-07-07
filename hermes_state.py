@@ -2410,12 +2410,22 @@ class SessionDB:
         stale non-NULL recency and stays visible in the flag-on denorm path
         (or vice-versa), diverging from the CTE oracle. Mirrors the recompute
         every other model_config-mutating path already performs.
+
+        The marker flip can also MOVE the row between compression roots (a
+        continuation child that branches away from its root, or a row that
+        joins/leaves a chain), so the row's *previous* recency root must be
+        recomputed too — otherwise the old root keeps an effective_last_active
+        that still folds in the departed child's messages and sorts ahead of
+        the CTE path. Capture the previous root BEFORE the write, like the
+        other linkage-changing paths (see create_session/upsert).
         """
         def _do(conn):
+            previous_root_id = self._resolve_effective_last_active_root(conn, session_id)
             conn.execute(
                 "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
                 (model_config_json, model, session_id),
             )
+            self._recompute_effective_last_active(conn, previous_root_id)
             self._recompute_effective_last_active_for_session(conn, session_id)
         self._execute_write(_do)
 

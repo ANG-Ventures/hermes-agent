@@ -406,6 +406,58 @@ def test_update_session_meta_visibility_flip_matches_cte_oracle(tmp_path):
         db.close()
 
 
+def test_update_session_meta_recomputes_previous_root(tmp_path):
+    """Greptile P4 regression: a model_config marker flip can MOVE a row between
+    compression roots (a continuation child branching away from its root). The P1
+    fix recomputed the row's NEW root but not its PREVIOUS root, so the old root
+    kept an effective_last_active that still folded in the departed child's fresh
+    message and sorted ahead of the CTE path. update_session_meta must capture the
+    previous root BEFORE the write and recompute it after (like the other
+    linkage-changing paths). Mutation-proven: drop the previous-root recompute → RED.
+    """
+    _write_dashboard_flag(True)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        # root (compression) -> child continuation carrying the fresh message.
+        _seed_session(db, "root", started_at=1000.0, message_ts=1000.0)
+        db._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE sessions SET ended_at = ?, end_reason = 'compression' WHERE id = ?",
+                (1001.0, "root"),
+            )
+        )
+        db.create_session("child", source="cli", model="test-model", parent_session_id="root")
+        db.append_message("child", role="user", content="c", timestamp=5000.0)
+        db.recompute_effective_last_active("root")
+        # rival timestamp sits between root's own recency (1000) and the child's (5000).
+        _seed_session(db, "rival", started_at=1500.0, message_ts=3000.0)
+
+        # Precondition: root's stored recency currently folds in the child (5000).
+        assert (
+            db._conn.execute(
+                "SELECT effective_last_active FROM sessions WHERE id = ?", ("root",)
+            ).fetchone()[0]
+            == 5000.0
+        )
+
+        # Branch the child away from root → root's recency must drop back to 1000.
+        db.update_session_meta("child", json.dumps({"_branched_from": "root"}))
+        assert (
+            db._conn.execute(
+                "SELECT effective_last_active FROM sessions WHERE id = ?", ("root",)
+            ).fetchone()[0]
+            == 1000.0
+        ), "previous root kept stale recency including the departed child's message"
+
+        got = db.list_sessions_rich(order_by_last_active=True, limit=10)
+        oracle = db.list_sessions_rich(
+            order_by_last_active=True, limit=10, _force_cte_oracle=True
+        )
+        assert _normalized(got) == _normalized(oracle)
+    finally:
+        db.close()
+
+
 def test_id_query_deep_chain_matches_cte_oracle(tmp_path):
     """Greptile P2 regression: the denorm id_query recursion previously capped at
     depth < 100 while the legacy CTE search is unbounded, so a compression chain
