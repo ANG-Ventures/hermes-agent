@@ -222,6 +222,10 @@ NL_CRED_CORPUS = [
     ("login password bare colon", f"the Ubuntu login password for nexus-command: {_NLP_ZXCV}."),
     ("usenet password bare", f"Newshosting credentials: username 66pcl49wv3, password {_NLP_USENET}, server"),
     ("passphrase quoted", f"passphrase recovered as '{_NLP_PASSPHRASE}'; kill-switch exists"),
+    # Greptile #214 P1: multi-word passphrase (internal spaces) must be caught
+    ("multiword passphrase", "the vault passphrase is 'correct horse battery staple' per the note"),
+    # Greptile #214 P2: pure-digit PIN after a connector must be caught
+    ("numeric pin bare", "the router admin password is 84719263 as printed on the label"),
 ]
 
 
@@ -242,6 +246,11 @@ def test_scrubber_nl_credentials_no_false_positives():
         "the passkey wall was bypassed and we reached the password step at https://example.com/login",
         "Assistant offered to change the RDP password upon user confirmation.",
         "User keeps the sudo password in 1Password under op://Engineering/nexus/password.",
+        # Greptile #214 P1: quoted product names near a cred word must NOT be scrubbed
+        "the password manager is \"Bitwarden\" and syncs across devices",
+        "User's preferred password app is \"1Password\" on all machines",
+        "the password field on the login form is currently disabled",
+        "User's Plex server listens on port 32400 for the local network",
     ]
     for f in clean:
         assert scrub.is_secret(f) is False, f"false positive on: {f}"

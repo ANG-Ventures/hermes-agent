@@ -55,9 +55,17 @@ _SECRET_PATTERNS = [
 # which needs character-class counting that regex does poorly. A cred word near a secret-shaped
 # value = drop.
 _CRED_WORD = re.compile(r"(?i)\b(?:pass(?:word|code|phrase)|passwd|pwd)\b")
+# The cred word is a noun modifier here, not a disclosure ('password manager', 'password field').
+_CRED_ROLE_NOUN = re.compile(
+    r"(?i)(?:manager|managers|app|apps|application|field|fields|box|prompt|step|screen|wall|"
+    r"policy|policies|reset|resets|recovery|rotation|entry|entries|store|vault|hint|hints|"
+    r"strength|length|requirement|requirements|protection|protected|authentication|form)\b"
+)
 _QUOTES = "'\"`\u2018\u2019\u201c\u201d"
-_QUOTED_VAL = re.compile(r"[" + _QUOTES + r"]([^" + _QUOTES + r"\s]{6,64})[" + _QUOTES + r"]")
+_QUOTED_VAL = re.compile(r"[" + _QUOTES + r"]([^" + _QUOTES + r"]{5,64})[" + _QUOTES + r"]")
 _BARE_TOKEN = re.compile(r"[^\s'\"`,;]{8,64}")
+# A connector that signals an actual value follows ('password is X', 'password: X', 'password = X').
+_CRED_CONNECTOR = re.compile(r"(?i)^\s*\w{0,20}\s*(?:\bis\b|\bwas\b|\bset to\b|[:=])\s*$")
 
 # A 1Password reference (op://...) is SAFE-BY-DESIGN — it's a pointer, not a secret. Never drop it.
 _OP_REF = re.compile(r"\bop://[^\s'\"]+")
@@ -143,19 +151,33 @@ def _looks_like_password_value(token: str) -> bool:
 def _scan_nl_credentials(text: str) -> List[str]:
     """Detect natural-language credential disclosure: a credential word ('password', 'passcode',
     'passphrase', 'passwd', 'pwd') sitting near a value token that looks like a real secret. Two
-    value shapes are caught: a QUOTED value (>=6 chars, no internal whitespace) or a BARE
-    secret-shaped token within a short window after the cred word. Long-lowercase quoted values
-    (e.g. a 10-char generated password like 'wuppfxqxqq') also count when quoted, since quoting a
-    word right after 'password' is itself the disclosure signal."""
+    value shapes are caught: a QUOTED value or a BARE secret-shaped token within a short window
+    after the cred word.
+
+    Guards against false positives: a cred word used as a NOUN MODIFIER ('password manager',
+    'password app/field/policy/step/prompt/reset') is not a disclosure, and a quoted value that is
+    a known product name ('1Password', 'Bitwarden') is not a secret.
+    """
     hits: List[str] = []
     for m in _CRED_WORD.finditer(text):
+        # Skip 'password manager/app/field/...' — the cred word is modifying a noun, not disclosing.
+        after = text[m.end(): m.end() + 12].lstrip()
+        if _CRED_ROLE_NOUN.match(after):
+            continue
         window = text[m.end(): m.end() + 60]
-        # 1) quoted value anywhere in the window
         matched = False
+        # 1) quoted value in the window
         for qm in _QUOTED_VAL.finditer(window):
-            val = qm.group(1)
-            # a quoted token right after a cred word is a disclosure unless it's an obvious label
-            if len(val) >= 6 and val.lower() not in _CRED_STOPWORDS and " " not in val:
+            val = qm.group(1).strip()
+            low = val.lower()
+            if low in _CRED_STOPWORDS or low in _CRED_NONSECRET_WORDS:
+                continue  # quoted product/label name, not a secret
+            # a multi-word quoted value is a passphrase iff it has >=3 tokens (correct horse battery
+            # staple) OR any token is secret-shaped; a 1-2 word quoted proper noun is not.
+            words = val.split()
+            if len(words) >= 3 or any(_looks_like_password_value(w) for w in words) or (
+                len(words) == 1 and len(val) >= 6
+            ):
                 hits.append("nl_credential_quoted")
                 matched = True
                 break
@@ -163,9 +185,18 @@ def _scan_nl_credentials(text: str) -> List[str]:
             continue
         # 2) bare secret-shaped token in the window
         for bm in _BARE_TOKEN.finditer(window):
-            if _looks_like_password_value(bm.group(0)):
+            tok = bm.group(0)
+            if _looks_like_password_value(tok):
                 hits.append("nl_credential_bare")
                 break
+            # pure-digit PIN (>=6 digits) ONLY when it directly follows a value connector, so we
+            # don't flag ports/IDs/counts that merely sit near the word 'password'.
+            core = tok.strip(".,;:!?)('\"`\u2018\u2019\u201c\u201d")
+            if core.isdigit() and len(core) >= 6:
+                pre = window[: bm.start()]
+                if _CRED_CONNECTOR.search(pre[-12:]) or pre.strip() in ("is", "was", ":", "="):
+                    hits.append("nl_credential_bare")
+                    break
     return hits
 
 
