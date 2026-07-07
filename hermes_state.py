@@ -1244,7 +1244,6 @@ class SessionDB:
                   AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL
                   AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL
                   AND COALESCE(child.source, '') != 'tool'
-                  AND ancestors.depth < 100
             )
             SELECT id FROM ancestors ORDER BY depth DESC LIMIT 1
             """,
@@ -1275,7 +1274,6 @@ class SessionDB:
                   AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL
                   AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL
                   AND COALESCE(child.source, '') != 'tool'
-                  AND chain.depth < 100
             )
             SELECT MAX(COALESCE(
                 (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = chain.cur_id),
@@ -1397,7 +1395,6 @@ class SessionDB:
                   AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
                   AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
                   AND COALESCE(child.source, '') != 'tool'
-                  AND chain.depth < 100
             ),
             chain_max AS (
                 SELECT root_id,

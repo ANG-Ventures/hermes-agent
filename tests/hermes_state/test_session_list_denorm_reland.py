@@ -447,6 +447,63 @@ def test_id_query_deep_chain_matches_cte_oracle(tmp_path):
         db.close()
 
 
+def test_deep_chain_stored_recency_matches_unbounded_oracle(tmp_path):
+    """Greptile P3 regression: the id_query search recursion was unbounded (P2 fix)
+    but the CTEs that compute the STORED effective_last_active (root-resolve,
+    _expected_effective_last_active, and the backfill recompute-all) still capped at
+    depth < 100. So a >100-deep compression chain whose freshest message is past hop
+    100 had its stored recency truncated to the 100-hop max — the denorm path then
+    ordered/paginated on a stale value that diverges from the unbounded CTE oracle.
+    A recompute (backfill-on-open, visibility flip, archive_and_compact) would even
+    REGRESS an already-correct value back to the truncated one. All recency CTEs must
+    be unbounded to match the oracle. Mutation-proven: restore any cap → this REDs.
+    """
+    _write_dashboard_flag(True)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        depth = 130
+        prev = None
+        for i in range(depth):
+            sid = f"c{i:03d}"
+            if prev is not None:
+                db._execute_write(
+                    lambda conn, p=prev: conn.execute(
+                        "UPDATE sessions SET ended_at = ?, end_reason = 'compression' WHERE id = ?",
+                        (999.0, p),
+                    )
+                )
+            db.create_session(sid, source="cli", model="test-model", parent_session_id=prev)
+            # Deepest hop (past 100) carries the freshest timestamp.
+            db.append_message(sid, role="user", content=f"t{i}", timestamp=1000.0 + i * 10.0)
+            prev = sid
+
+        deep_tip_ts = 1000.0 + (depth - 1) * 10.0  # 2290.0, at hop 129
+        root = "c000"
+
+        # The fresh per-row oracle must see the deep tip (unbounded).
+        assert db.expected_effective_last_active(root) == deep_tip_ts
+
+        # And a recompute (what backfill-on-open / visibility-flip / compaction do)
+        # must NOT truncate the stored value back to the 100-hop max.
+        db.recompute_effective_last_active(root)
+        stored = db._conn.execute(
+            "SELECT effective_last_active FROM sessions WHERE id = ?", (root,)
+        ).fetchone()[0]
+        assert stored == deep_tip_ts, f"stored recency truncated to {stored}, expected {deep_tip_ts}"
+
+        # A rival session whose timestamp sits between hop-100 and the deep tip must
+        # rank BELOW the deep chain's root in both paths.
+        db.create_session("rival", source="cli", model="test-model")
+        db.append_message("rival", role="user", content="rival", timestamp=1000.0 + 115 * 10.0)
+        got = db.list_sessions_rich(order_by_last_active=True, limit=10)
+        oracle = db.list_sessions_rich(
+            order_by_last_active=True, limit=10, _force_cte_oracle=True
+        )
+        assert _normalized(got) == _normalized(oracle)
+    finally:
+        db.close()
+
+
 @pytest.mark.skipif(
     not os.environ.get("SESSION_LIST_REAL_COPY_DB"),
     reason="set SESSION_LIST_REAL_COPY_DB=/path/to/state.db for real-copy churn check",
