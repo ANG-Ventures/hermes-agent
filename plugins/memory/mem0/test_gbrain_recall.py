@@ -186,23 +186,71 @@ def test_fail_open_token_mint_fails(monkeypatch):
     assert gbrain_recall.gbrain_search("q", limit=3, min_score=0.5, deadline_s=4.0) == []
 
 
-def test_deadline_honored_slow_backend(monkeypatch):
-    """A backend that hangs longer than the deadline must return [] promptly-ish
-    (bounded by deadline, not by the hang)."""
-    def slow(path, body):
-        if path == "/token":
-            return 200, json.dumps({"access_token": "t", "expires_in": 3600})
-        time.sleep(3.0)
-        return 200, json.dumps(_mcp_payload([_ROW]))
+def test_deadline_honored_slow_backend():
+    """A backend that hangs longer than the deadline must return [] promptly —
+    bounded by the deadline, not by the hang. Uses a REAL localhost socket so the
+    watchdog's SHUT_RDWR actually fires (a monkeypatched _http_post can't be
+    interrupted, which made the old assertion vacuous — Greptile #248)."""
+    import socket
+    import threading as _th
 
-    _mock_http(monkeypatch, slow)
-    t0 = time.monotonic()
-    out = gbrain_recall.gbrain_search("q", limit=3, min_score=0.5, deadline_s=0.5)
-    elapsed = time.monotonic() - t0
-    # The mock sleeps through the watchdog (no real socket to shut), so we only
-    # assert the result contract here; the real-socket cancel is covered by the
-    # integration test's deadline assertion.
-    assert out == [] or elapsed < 4.0
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(2)
+    port = srv.getsockname()[1]
+    stop = _th.Event()
+
+    def _serve():
+        while not stop.is_set():
+            try:
+                srv.settimeout(0.2)
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            try:
+                req = conn.recv(65536).decode("utf-8", "replace")
+                if "POST /token" in req:
+                    body = json.dumps({"access_token": "t", "expires_in": 3600})
+                    conn.sendall(
+                        f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n{body}".encode()
+                    )
+                    conn.close()
+                else:
+                    # Hang: never respond. The client-side watchdog must cut this.
+                    stop.wait(10.0)
+                    conn.close()
+            except Exception:
+                pass
+
+    th = _th.Thread(target=_serve, daemon=True)
+    th.start()
+    try:
+        t0 = time.monotonic()
+        out = gbrain_recall.gbrain_search(
+            "q", limit=3, min_score=0.5, deadline_s=0.5,
+            url=f"http://127.0.0.1:{port}",
+            creds_path=_write_creds_tmp(),
+        )
+        elapsed = time.monotonic() - t0
+        assert out == []                      # fail-open, no partial junk
+        assert elapsed < 2.0, f"deadline not enforced: {elapsed:.2f}s"  # 0.5s deadline + slack, NOT the 10s hang
+    finally:
+        stop.set()
+        try:
+            srv.close()
+        except Exception:
+            pass
+
+
+def _write_creds_tmp():
+    import tempfile
+    f = tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False)
+    f.write("GBRAIN_RAIL_CLIENT_ID=test\nGBRAIN_RAIL_CLIENT_SECRET=test\n")
+    f.close()
+    return f.name
 
 
 def test_creds_file_parsing(tmp_path):

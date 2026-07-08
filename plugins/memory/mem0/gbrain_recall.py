@@ -66,6 +66,7 @@ _TOKEN_REFRESH_MARGIN_S = 120.0
 # (base_url, creds_path) so tests / multi-instance configs can't cross-feed.
 _token_lock = threading.Lock()
 _token_cache: Dict[Any, Dict[str, Any]] = {}
+_mint_locks: Dict[Any, threading.Lock] = {}  # per-key mint serialization (stampede guard)
 
 
 def load_gbrain_config(raw: Optional[dict]) -> Dict[str, Any]:
@@ -133,40 +134,58 @@ def _http_post(base_url: str, path: str, body: bytes, headers: Dict[str, str],
 
 def _get_token(base_url: str, creds_path: str, timeout_s: float) -> Optional[str]:
     """Cached bearer for the warm serve. One /token round-trip per process per
-    token lifetime (server TTL ~3600s); refreshed <120s from expiry. Never raises."""
+    token lifetime (server TTL ~3600s); refreshed <120s from expiry. Never raises.
+
+    Stampede-safe: a per-key mint lock serializes concurrent minters; each minter
+    re-checks the cache after acquiring it, so N threads racing an empty/expired
+    cache produce exactly ONE /token round-trip (Greptile #248)."""
     key = (base_url, os.path.expanduser(creds_path or ""))
-    now = time.time()
-    with _token_lock:
+
+    def _cached() -> Optional[str]:
         ent = _token_cache.get(key)
-        if ent and ent.get("token") and float(ent.get("expires_at", 0)) > now + _TOKEN_REFRESH_MARGIN_S:
+        if ent and ent.get("token") and float(ent.get("expires_at", 0)) > time.time() + _TOKEN_REFRESH_MARGIN_S:
             return ent["token"]
-    creds = _read_client_creds(creds_path)
-    if not creds:
         return None
-    try:
-        body = urlencode({
-            "grant_type": "client_credentials",
-            "client_id": creds["client_id"],
-            "client_secret": creds["client_secret"],
-        }).encode("utf-8")
-        st, data = _http_post(
-            base_url, "/token", body,
-            {"Content-Type": "application/x-www-form-urlencoded"},
-            timeout_s,
-        )
-        if st != 200:
-            return None
-        d = json.loads(data)
-        tok = d.get("access_token")
-        if not tok:
-            return None
-        expires_at = now + float(d.get("expires_in", 3600) or 3600)
+
+    with _token_lock:
+        tok = _cached()
+        if tok:
+            return tok
+        mint_lock = _mint_locks.setdefault(key, threading.Lock())
+
+    with mint_lock:
+        # Re-check under the mint lock: a racing thread may have minted while we waited.
         with _token_lock:
-            _token_cache[key] = {"token": tok, "expires_at": expires_at}
-        return tok
-    except Exception as e:
-        logger.debug("gbrain token mint failed: %s", e)
-        return None
+            tok = _cached()
+            if tok:
+                return tok
+        creds = _read_client_creds(creds_path)
+        if not creds:
+            return None
+        try:
+            body = urlencode({
+                "grant_type": "client_credentials",
+                "client_id": creds["client_id"],
+                "client_secret": creds["client_secret"],
+            }).encode("utf-8")
+            st, data = _http_post(
+                base_url, "/token", body,
+                {"Content-Type": "application/x-www-form-urlencoded"},
+                timeout_s,
+            )
+            if st != 200:
+                return None
+            d = json.loads(data)
+            tok = d.get("access_token")
+            if not tok:
+                return None
+            expires_at = time.time() + float(d.get("expires_in", 3600) or 3600)
+            with _token_lock:
+                _token_cache[key] = {"token": tok, "expires_at": expires_at}
+            return tok
+        except Exception as e:
+            logger.debug("gbrain token mint failed: %s", e)
+            return None
 
 
 def _invalidate_token(base_url: str, creds_path: str) -> None:
