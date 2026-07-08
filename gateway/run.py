@@ -5203,6 +5203,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         if not hasattr(self, "_session_model_overrides"):
             self._session_model_overrides = {}
+        # Stamp "the user changed the override target this turn" for the NEXT
+        # turn's pre-run recovery announce: the shared recovery_should_announce
+        # predicate suppresses the manual /model re-target (or clear) transition
+        # for exactly one turn, so the user's own switch never reads as a
+        # system "recovery" (the #236 manual-dance carve-out). This door is the
+        # ONLY user-action path; rehydrate + MOA quick-swaps write the dict
+        # directly and correctly do NOT stamp.
+        if not hasattr(self, "_override_target_just_changed"):
+            self._override_target_just_changed = {}
+        self._override_target_just_changed[session_key] = True
         if override is None:
             self._session_model_overrides.pop(session_key, None)
         else:
@@ -6533,149 +6543,93 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Announce a model RECOVERY (return-to-primary) and persist the served
         route, at the ONE unified recovery-announce site.
 
-        Two paths return a session to its primary model — both surface here:
-          • cache-warm restore (same agent restored at the turn prologue) →
-            recovery_via="new turn".
-          • re-init (agent cache evicted/rebuilt → a fresh agent inited on the
-            config default, no fallback state to restore) → recovery_via=
-            "re-init" (its silent snap-back was previously invisible — the fix).
+        PERSIST the route this turn actually served on (identity-only
+        ``{provider, model}``) — the single writer of ``last_served_identity``.
 
-        The announce is keyed on the FINAL served route: we compare the session's
-        PREVIOUS served route (``last_served_identity``, persisted at the prior
-        turn's end) against THIS turn's served ``(served_provider, served_model)``
-        (post any mid-turn failover). Only a genuine model change announces; a
-        re-init that happens to serve the same model is silent. The durable sink
-        line is written gate-independently; the chat emit is gated on
-        ``model.announce_recovery``. Then we persist this turn's served route for
-        the next comparison. Identity-only (``{provider, model}``) — never a
-        secret. Best-effort: never raises into the turn.
+        This site is deliberately PERSIST-ONLY (restructured from #238, which
+        also emitted recovery announces here keyed on the final served route).
+        That keying had two structural faults:
+          • a restore that was re-failed-over mid-turn (the refusing-pin case)
+            ends the turn back on the fallback, so ``prev == now`` and the
+            restore leg was invisible; and
+          • a turn whose FAILOVER changed the final route emitted a spurious
+            "recovery" line at end-of-turn describing the failover backwards
+            (the failover announce had already fired mid-turn).
+        Announces now live where the transitions actually happen, in real
+        chronological order:
+          • failover          → mid-turn switch site (unchanged),
+          • restore leg       → inline in ``restore_primary_runtime`` (rider
+                                "restore"),
+          • re-init snap-back → the pre-run site ``_announce_reinit_recovery``
+                                (rider "re-init"), which compares the fresh
+                                agent's starting route against the value THIS
+                                method persisted last turn.
+        All announce sites route their gate through the ONE shared predicate
+        ``agent.agent_runtime_helpers.recovery_should_announce`` (Momus MB-1).
 
-        Concurrency: the persist is routed through ``session_store.update_session``
-        so it happens UNDER the store's lock (every other write path does the
-        same); we never write ``_entries``/``_save()`` directly here.
-
-        A session with an active ``/model`` override is EXCLUDED: while a user has
-        deliberately pinned a model, route changes are user-driven (e.g. opus →
-        fable → opus via ``/model``), not system recoveries — announcing them
-        would be a false positive and pollute the durable audit sink.
+        Concurrency: the persist goes through ``session_store.update_session``
+        so it happens UNDER the store's lock. ``was_reinit`` is retained for
+        signature stability at the call site (the announce riders that used it
+        now live at the announcing sites). Best-effort: never raises.
         """
         if not (agent and session_key and served_model and served_provider):
             return
         try:
             served_identity = {"provider": served_provider, "model": served_model}
-            # Read prior state under the store lock (mirrors every other reader).
-            lock = getattr(self.session_store, "_lock", None)
-            if lock is not None:
-                lock.acquire()
-            try:
-                entry = self.session_store._entries.get(session_key)
-                prev_identity = getattr(entry, "last_served_identity", None) if entry else None
-                has_model_override = bool(getattr(entry, "model_override_identity", None)) if entry else False
-            finally:
-                if lock is not None:
-                    lock.release()
-
-            if entry is None:
-                return
-            # Skip while a deliberate /model override is active — route changes
-            # are user-driven, not system recoveries (Greptile P2: no false
-            # "recovery" sink lines on a user opus→fable→opus /model dance).
-            if not has_model_override and isinstance(prev_identity, dict):
-                prev_route = (prev_identity.get("provider"), prev_identity.get("model"))
-                now_route = (served_provider, served_model)
-                # Announce only a genuine model return: the previous served model
-                # differs from this turn's, and we know what it was.
-                if prev_route != now_route and prev_route[1]:
-                    recovery_via = "new turn" if not was_reinit else "re-init"
-                    try:
-                        from agent.chat_completion_helpers import (
-                            _append_route_change,
-                            _emit_fallback_announce,
-                        )
-                        # Durable sink line always (gate-independent).
-                        _append_route_change(
-                            "recovery",
-                            prev_route[0], prev_route[1],
-                            served_provider, served_model,
-                        )
-                        announce = False
-                        try:
-                            from hermes_cli.config import read_raw_config
-                            raw = read_raw_config() or {}
-                            mcfg = raw.get("model", {}) if isinstance(raw, dict) else {}
-                            announce = bool(mcfg.get("announce_recovery", False))
-                        except Exception:
-                            pass  # config read failure → default-off (silent)
-                        _emit_fallback_announce(
-                            agent, prev_route[1], served_model, served_provider,
-                            old_provider=prev_route[0],
-                            announce_enabled=announce,
-                            record_event=False,
-                            kind="recovery",
-                            recovery_via=recovery_via,
-                        )
-                    except Exception:
-                        logger.debug("recovery announce failed", exc_info=True)
-            # Persist THIS turn's served route for the next comparison — UNDER the
-            # store lock, via update_session (never a bare _entries/_save here).
+            # Persist THIS turn's served route for the next turn's pre-run
+            # comparison — UNDER the store lock, via update_session (never a
+            # bare _entries/_save here).
             self.session_store.update_session(session_key, served_identity=served_identity)
         except Exception:
-            logger.debug("served-route announce/persist failed", exc_info=True)
+            logger.debug("served-route persist failed", exc_info=True)
 
-    def _announce_prologue_recovery(
+    def _announce_reinit_recovery(
         self,
         *,
         agent,
         session_key,
         applied_provider,
         applied_model,
-        override_target_changed: bool = False,
     ) -> None:
-        """Announce a model RECOVERY (restore) at the TURN PROLOGUE — the PRIMARY
-        fix for the restore leg being invisible under a refusing ``/model`` pin
-        (SPEC §2a/§3, Momus RC-1).
+        """Announce the RE-INIT snap-back at the PRE-RUN site — before
+        ``run_conversation`` — for a turn served by a FRESH agent (SPEC §2a /
+        Momus RC-1).
 
-        Root cause it addresses: the unified end-of-turn announce
-        (``_announce_and_persist_served_route``) is keyed on the FINAL served
-        route. Under a ``/model`` pin to a model that auto-refuses (e.g. fable),
-        the turn STARTS on fable (the restore), refuses, and ENDS on opus — so by
-        end-of-turn the fable route is gone and ``prev_route(opus) ==
-        now_route(opus)`` short-circuits the announce (route-equality guard).
-        This fires at the prologue, where the fable route actually EXISTS, keyed
-        on the APPLIED route (``turn_route``) rather than the served route, so the
-        restore leg surfaces for BOTH the cache-warm and re-init sub-cases (the
-        re-init leg is carried ONLY by this site — the gate-narrow does nothing
-        for it).
+        The re-init leg: the agent cache was evicted/rebuilt (idle-TTL / LRU /
+        config-signature / cross-process write), so a fresh agent inits directly
+        on its resolved starting route with no ``_fallback_activated`` to
+        restore — ``restore_primary_runtime`` returns at its first guard and the
+        inline restore emit never fires. This site compares the fresh agent's
+        STARTING route (``applied_*``, read pre-run — the only moment it exists
+        when the turn later fails over) against the session's persisted
+        ``last_served_identity`` and announces the snap-back with the "re-init"
+        rider. Cached-agent turns are NOT announced here — their restore leg is
+        the inline emit in ``restore_primary_runtime`` (rider "restore").
 
-        Gated to ``/model``-override sessions ONLY: for a non-override session the
-        end-of-turn site already surfaces the restore leg correctly (its "new
-        turn"/"re-init" riders), and firing here would double-announce / regress
-        those riders. Under an override the applied (pinned) route is the point
-        the fable route exists.
+        The manual ``/model`` carve-out (#236): ``_set_session_model_override``
+        stamps ``_override_target_just_changed[session_key]`` when the USER
+        switches/clears the pin; this site consumes the stamp (pop — exactly one
+        turn) and feeds it to the shared ``recovery_should_announce`` predicate,
+        which suppresses the user's own re-target/clear transition while still
+        announcing a system snap-back to a STANDING pin.
 
-        Invariants:
-          • INV-1 cache-sacred: read + status-emit + a sink append only — no
-            prompt/toolset/history mutation.
+        Invariants (mirror the inline restore emit):
+          • INV-1 cache-sacred: read + status-emit + sink append only.
           • INV-2 identity-only: ``{provider, model}`` — never a secret.
-          • INV-3 best-effort: wrapped so it NEVER raises into the turn.
-          • INV-4 symmetry: reuses ``_emit_fallback_announce`` (kind="recovery",
-            recovery_via="restore") — same formatter as the failover leg.
-          • INV-5 NO persist: this site MUST NOT write ``last_served_identity`` —
-            the end-of-turn site owns the single persist under the store lock; a
-            prologue double-persist would corrupt the next comparison.
-
-        Same-turn dedup: sets ``agent._prologue_recovery_announced`` to the
-        ``(prev_route, applied_route)`` transition it announced, so on the rare
-        turn a pinned model STOPS refusing (turn ends on the pinned model, so the
-        end-of-turn site sees the SAME transition) the end-of-turn site skips its
-        emit/sink but still persists — one recovery line per leg per turn.
+          • INV-3 best-effort: never raises into the turn.
+          • INV-4 symmetry: same formatter (``_emit_fallback_announce``,
+            kind="recovery").
+          • INV-5 NO persist: ``last_served_identity`` is written only by
+            ``_announce_and_persist_served_route`` at end of turn.
         """
-        # Reset the per-turn dedup marker up front (best-effort) so a stale value
-        # from a prior turn on a cached agent can never mask the end-of-turn site.
+        # Consume the one-turn manual-switch stamp regardless of what we decide
+        # below (a stale stamp must never suppress a LATER genuine recovery).
         try:
-            agent._prologue_recovery_announced = None
+            _target_changed = bool(
+                getattr(self, "_override_target_just_changed", {}).pop(session_key, False)
+            )
         except Exception:
-            pass
+            _target_changed = False
         if not (agent and session_key and applied_model and applied_provider):
             return
         try:
@@ -6691,32 +6645,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if lock is not None:
                     lock.release()
 
-            if entry is None:
-                return
-            # PROLOGUE announce is override-only (see docstring): a non-override
-            # session's restore leg is already surfaced at the end-of-turn site.
-            if not override_identity:
-                return
-            if not isinstance(prev_identity, dict):
+            if entry is None or not isinstance(prev_identity, dict):
                 return
             prev_route = (prev_identity.get("provider"), prev_identity.get("model"))
             applied_route = (applied_provider, applied_model)
-            # Nothing to recover from, or no genuine model return.
-            if not prev_route[1] or prev_route == applied_route:
-                return
-            # Manual-dance suppression (#236, mirrors the end-of-turn gate): a
-            # route that lands on the override target AND whose target CHANGED
-            # this turn is the user's own /model switch, not a system recovery.
-            _ovr_route = (override_identity.get("provider"), override_identity.get("model"))
-            if override_target_changed and _ovr_route == applied_route:
+            override_target = None
+            if isinstance(override_identity, dict):
+                override_target = (override_identity.get("provider"), override_identity.get("model"))
+            from agent.agent_runtime_helpers import recovery_should_announce
+            # ONE shared predicate with the inline restore site (Momus MB-1).
+            if not recovery_should_announce(
+                prev_route, applied_route,
+                override_target=override_target,
+                override_target_changed=_target_changed,
+            ):
                 return
             try:
                 from agent.chat_completion_helpers import (
                     _append_route_change,
                     _emit_fallback_announce,
                 )
-                # Durable sink line always (gate-independent — mirrors the
-                # end-of-turn site's contract).
+                # Durable sink line always (gate-independent).
                 _append_route_change(
                     "recovery",
                     prev_route[0], prev_route[1],
@@ -6736,19 +6685,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     announce_enabled=announce,
                     record_event=False,
                     kind="recovery",
-                    recovery_via="restore",
+                    recovery_via="re-init",
                 )
-                # Record the transition for the end-of-turn same-turn dedup.
+                # Per-turn marker (test observability + parity with the inline
+                # restore site's marker).
                 try:
-                    agent._prologue_recovery_announced = (prev_route, applied_route)
+                    agent._recovery_emitted_this_turn = (prev_route, applied_route)
                 except Exception:
                     pass
             except Exception:
-                logger.debug("prologue recovery announce failed", exc_info=True)
-            # NOTE (INV-5): deliberately NO persist here — the end-of-turn site
-            # owns the single last_served_identity write under the store lock.
+                logger.debug("re-init recovery announce failed", exc_info=True)
         except Exception:
-            logger.debug("prologue recovery announce/read failed", exc_info=True)
+            logger.debug("re-init recovery announce/read failed", exc_info=True)
 
     def _suspend_stuck_loop_sessions(self) -> int:
         """Suspend sessions that have been active across too many restarts.
@@ -19493,6 +19441,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # backfill against has_platform_message_id. SPEC D-10.
                 if event_message_id is not None:
                     _conversation_kwargs["persist_user_platform_id"] = str(event_message_id)
+                # Re-init snap-back announce (PRE-RUN — the only moment a fresh
+                # agent's starting route is observable before a mid-turn
+                # failover replaces it; SPEC §2a / Momus RC-1). Cached agents
+                # are handled by the inline restore emit in
+                # restore_primary_runtime instead.
+                if not reused_cached_agent:
+                    self._announce_reinit_recovery(
+                        agent=agent,
+                        session_key=session_key,
+                        applied_provider=getattr(agent, "provider", None),
+                        applied_model=getattr(agent, "model", None),
+                    )
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)
@@ -19528,11 +19488,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _resolved_model = getattr(_agent, "model", None) if _agent else None
             _resolved_provider = getattr(_agent, "provider", None) if _agent else None
 
-            # Unified model-recovery announce (re-init snap-back + cache-warm
-            # restore), keyed on the FINAL served route — see
-            # _announce_and_persist_served_route. Both recovery paths surface at
-            # this ONE site (the #236 inline restore announce was removed from
-            # restore_primary_runtime), distinguished by the recovery_via rider.
+            # Persist the FINAL served route for the next turn's pre-run
+            # comparison (persist-only — announces fire where the transitions
+            # happen: failover mid-turn, restore inline in
+            # restore_primary_runtime, re-init at the pre-run site above).
             self._announce_and_persist_served_route(
                 agent=_agent,
                 session_key=session_key,
