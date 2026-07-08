@@ -4371,7 +4371,10 @@ class GatewaySlashCommandsMixin:
             await self._session_db.append_message(
                 session_id=source_session_id,
                 role="user",
-                content=t("gateway.merge.source_marker", target=target_title, when=_ts),
+                content=t(
+                    "gateway.merge.source_marker" if is_thread_form else "gateway.merge.source_marker_named",
+                    target=target_title, when=_ts,
+                ),
             )
         except Exception as exc:
             logger.debug("merge: source-marker append skipped: %s", exc)
@@ -4415,8 +4418,10 @@ class GatewaySlashCommandsMixin:
             dest_chat = target_origin.thread_id or target_origin.chat_id
             if dest_adapter is not None and dest_chat:
                 try:
-                    note = t("gateway.merge.target_note", source=source_title,
-                             turns=turns_folded, record=md_note)
+                    note = t(
+                        "gateway.merge.target_note" if is_thread_form else "gateway.merge.target_note_named",
+                        source=source_title, turns=turns_folded, record=md_note,
+                    )
                     await dest_adapter.send(str(dest_chat), note)
                     posted_note = True
                 except Exception as exc:
