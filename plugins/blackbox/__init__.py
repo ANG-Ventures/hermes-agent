@@ -195,6 +195,27 @@ def _normalize_record_provider_model(provider: str, model: str) -> tuple[str, st
     prefix, _, rest = mdl.partition("/")
     if not rest:
         return prov, mdl
+    # When the dedicated provider column is itself an AGGREGATOR, the model's
+    # prefix is that aggregator's vendor namespace (openrouter | anthropic/…)
+    # and IS the canonical id the pricing route needs — leave it verbatim
+    # (OQ-1). Only a first-class direct route composite is a leak.
+    _prov_norm = prov.strip().lower()
+    if _prov_norm:
+        try:
+            from hermes_cli.model_normalize import _AGGREGATOR_PROVIDERS
+
+            if _prov_norm in _AGGREGATOR_PROVIDERS:
+                return prov, mdl
+        except Exception:
+            pass
+        try:
+            from hermes_cli.providers import get_provider
+
+            _d = get_provider(_prov_norm)
+            if _d is not None and getattr(_d, "is_aggregator", False):
+                return prov, mdl
+        except Exception:
+            pass
     if _is_first_class_provider_prefix(prefix):
         # Trust the dedicated provider column when populated; else adopt prefix.
         return (prov or prefix), rest
