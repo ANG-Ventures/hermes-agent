@@ -198,6 +198,31 @@ class TestResolveChannelPrompts:
         assert captured.get("chat_id") == "999"
         assert captured.get("parent_chat_id") == "200"
 
+    def test_build_slash_event_thread_prefers_resolved_parent_object(self):
+        """Uses the shared _get_parent_channel_id resolver: a resolved parent
+        object wins over a (possibly-absent) bare parent_id — matching the
+        regular-message path so the two can't drift (Greptile #230 P2)."""
+        import sys
+        discord_mod = sys.modules["discord"]
+        adapter = _make_adapter()
+        adapter.config.extra = {}
+        captured = {}
+        adapter.build_source = lambda **kw: (captured.update(kw) or SimpleNamespace(**kw))
+        adapter._get_effective_topic = MagicMock(return_value=None)
+
+        thread_channel = discord_mod.Thread()
+        thread_channel.id = 999
+        thread_channel.name = "t"
+        thread_channel.guild = SimpleNamespace(name="W")
+        thread_channel.parent = SimpleNamespace(id=200)  # resolved object
+        thread_channel.parent_id = None                  # bare id absent
+        interaction = SimpleNamespace(
+            channel_id=999, channel=thread_channel,
+            user=SimpleNamespace(id=1, display_name="B"),
+        )
+        adapter._build_slash_event(interaction, "/branch")
+        assert captured.get("parent_chat_id") == "200"
+
     @pytest.mark.asyncio
     async def test_dispatch_thread_session_inherits_parent_channel_prompt(self):
         adapter = _make_adapter()

@@ -4730,9 +4730,12 @@ class DiscordAdapter(BasePlatformAdapter):
         # message path sets this via build_source(parent_chat_id=…); the native
         # slash path must mirror it or those handlers silently lose the parent
         # (bug: /branch fell back to classic in-place branch inside a thread).
+        # Use the SAME resolver as the message path (_get_parent_channel_id:
+        # resolved channel.parent.id first, bare channel.parent_id fallback) so
+        # the two paths can't drift on a resolved-parent-without-parent_id case.
         parent_chat_id = None
         if is_thread:
-            parent_chat_id = str(getattr(interaction.channel, "parent_id", "") or "") or None
+            parent_chat_id = self._get_parent_channel_id(interaction.channel)
 
         source = self.build_source(
             chat_id=str(interaction.channel_id),
