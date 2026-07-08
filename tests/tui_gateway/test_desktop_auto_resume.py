@@ -436,3 +436,75 @@ def test_signal_shutdown_writes_marker_but_sigkill_cannot(tmp_path, signum, expe
     db = SessionDB(db_path=home / "state.db")
     marker = db.get_desktop_resume_marker("desktop-session")
     assert (marker is not None) is expect_marker
+
+
+def test_get_db_boot_sweep_purges_expired_markers_and_breakers(monkeypatch, tmp_path):
+    """AC-10 (RC-5): the TTL sweep must actually FIRE on first DB open — the
+    method exists but is inert unless wired into the boot maintenance window.
+    Seed an already-expired marker + an aged-out breaker, reset the _get_db
+    singleton pointed at this db, and assert _get_db() purges them on open.
+    Mutation-proof: remove the sweep call in _get_db → expired rows survive → RED.
+    """
+    db_path = tmp_path / "state.db"
+    seed = SessionDB(db_path=db_path)
+    seed.create_session("stale-desktop", source="desktop", model="test-model")
+    now = 10_000.0
+    # An already-EXPIRED marker (expires_at in the past) — the stale/never-resumed
+    # path that would otherwise accrete forever. No claim: a claim would consume
+    # the marker, and we want the SWEEP to be what removes it.
+    seed.upsert_desktop_resume_marker(
+        "stale-desktop",
+        reason=server.DESKTOP_REASON_EXTERNAL_RESTART_INTERRUPTED,
+        prompt="continue",
+        created_at=now - 100_000.0,
+        ttl_seconds=1.0,  # expires_at ~= now - 100000, already past
+        reason_priority=server.DESKTOP_REASON_PRIORITIES[
+            server.DESKTOP_REASON_EXTERNAL_RESTART_INTERRUPTED
+        ],
+    )
+    # An aged-out breaker row (updated far beyond the 48h TTL) on a DIFFERENT
+    # session so it doesn't touch the marker above. Seed it directly since a live
+    # claim would stamp updated_at=now (not aged). The breaker table FKs to
+    # sessions(id), so the session row must exist first.
+    seed.create_session("aged-breaker", source="desktop", model="test-model")
+    seed._execute_write(
+        lambda conn: conn.execute(
+            "INSERT INTO desktop_resume_breakers "
+            "(session_id, window_started_at, replay_count, updated_at) VALUES (?, ?, ?, ?)",
+            ("aged-breaker", now - 1_000_000.0, 2, now - 1_000_000.0),
+        )
+    )
+    seed.close()
+
+    # Sanity: BEFORE the boot sweep, both rows are present (get_* / a direct read
+    # do not filter on expiry — only the sweep DELETEs them).
+    pre = SessionDB(db_path=db_path)
+    assert pre.get_desktop_resume_marker("stale-desktop") is not None
+    assert (
+        pre._conn.execute(
+            "SELECT COUNT(*) FROM desktop_resume_breakers WHERE session_id = ?",
+            ("aged-breaker",),
+        ).fetchone()[0]
+        == 1
+    )
+    pre.close()
+
+    # Reset the _get_db singleton and point SessionDB() at our seeded db.
+    monkeypatch.setattr(server, "_db", None, raising=False)
+    monkeypatch.setattr(server, "_db_error", None, raising=False)
+    import hermes_state as _hs
+    monkeypatch.setattr(_hs, "SessionDB", lambda *a, **k: SessionDB(db_path=db_path))
+
+    db = server._get_db()
+    assert db is not None
+    # Boot sweep fired → the expired marker AND the aged breaker are gone.
+    assert db.get_desktop_resume_marker("stale-desktop") is None
+    assert (
+        db._conn.execute(
+            "SELECT COUNT(*) FROM desktop_resume_breakers WHERE session_id = ?",
+            ("aged-breaker",),
+        ).fetchone()[0]
+        == 0
+    )
+    db.close()
+    monkeypatch.setattr(server, "_db", None, raising=False)

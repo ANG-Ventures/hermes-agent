@@ -943,6 +943,16 @@ def _get_db():
                 exc,
             )
             return None
+        # AC-10 (RC-5): TTL-sweep the desktop auto-resume markers/breakers once on
+        # first DB open (the same boot maintenance window the recency backfill uses),
+        # so markers that reach the stale path or are never resumed, and aged-out
+        # breaker rows, cannot accrete in state.db indefinitely. Gated on the feature
+        # flag and best-effort — a sweep failure must never break db availability.
+        if _desktop_auto_resume_enabled():
+            try:
+                _db.sweep_desktop_auto_resume_state()
+            except Exception as exc:  # noqa: BLE001 - maintenance is best-effort
+                logger.debug("desktop auto-resume boot sweep skipped: %s", exc)
     return _db
 
 
