@@ -6622,6 +6622,134 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("served-route announce/persist failed", exc_info=True)
 
+    def _announce_prologue_recovery(
+        self,
+        *,
+        agent,
+        session_key,
+        applied_provider,
+        applied_model,
+        override_target_changed: bool = False,
+    ) -> None:
+        """Announce a model RECOVERY (restore) at the TURN PROLOGUE — the PRIMARY
+        fix for the restore leg being invisible under a refusing ``/model`` pin
+        (SPEC §2a/§3, Momus RC-1).
+
+        Root cause it addresses: the unified end-of-turn announce
+        (``_announce_and_persist_served_route``) is keyed on the FINAL served
+        route. Under a ``/model`` pin to a model that auto-refuses (e.g. fable),
+        the turn STARTS on fable (the restore), refuses, and ENDS on opus — so by
+        end-of-turn the fable route is gone and ``prev_route(opus) ==
+        now_route(opus)`` short-circuits the announce (route-equality guard).
+        This fires at the prologue, where the fable route actually EXISTS, keyed
+        on the APPLIED route (``turn_route``) rather than the served route, so the
+        restore leg surfaces for BOTH the cache-warm and re-init sub-cases (the
+        re-init leg is carried ONLY by this site — the gate-narrow does nothing
+        for it).
+
+        Gated to ``/model``-override sessions ONLY: for a non-override session the
+        end-of-turn site already surfaces the restore leg correctly (its "new
+        turn"/"re-init" riders), and firing here would double-announce / regress
+        those riders. Under an override the applied (pinned) route is the point
+        the fable route exists.
+
+        Invariants:
+          • INV-1 cache-sacred: read + status-emit + a sink append only — no
+            prompt/toolset/history mutation.
+          • INV-2 identity-only: ``{provider, model}`` — never a secret.
+          • INV-3 best-effort: wrapped so it NEVER raises into the turn.
+          • INV-4 symmetry: reuses ``_emit_fallback_announce`` (kind="recovery",
+            recovery_via="restore") — same formatter as the failover leg.
+          • INV-5 NO persist: this site MUST NOT write ``last_served_identity`` —
+            the end-of-turn site owns the single persist under the store lock; a
+            prologue double-persist would corrupt the next comparison.
+
+        Same-turn dedup: sets ``agent._prologue_recovery_announced`` to the
+        ``(prev_route, applied_route)`` transition it announced, so on the rare
+        turn a pinned model STOPS refusing (turn ends on the pinned model, so the
+        end-of-turn site sees the SAME transition) the end-of-turn site skips its
+        emit/sink but still persists — one recovery line per leg per turn.
+        """
+        # Reset the per-turn dedup marker up front (best-effort) so a stale value
+        # from a prior turn on a cached agent can never mask the end-of-turn site.
+        try:
+            agent._prologue_recovery_announced = None
+        except Exception:
+            pass
+        if not (agent and session_key and applied_model and applied_provider):
+            return
+        try:
+            # Read prior state under the store lock (mirrors every other reader).
+            lock = getattr(self.session_store, "_lock", None)
+            if lock is not None:
+                lock.acquire()
+            try:
+                entry = self.session_store._entries.get(session_key)
+                prev_identity = getattr(entry, "last_served_identity", None) if entry else None
+                override_identity = getattr(entry, "model_override_identity", None) if entry else None
+            finally:
+                if lock is not None:
+                    lock.release()
+
+            if entry is None:
+                return
+            # PROLOGUE announce is override-only (see docstring): a non-override
+            # session's restore leg is already surfaced at the end-of-turn site.
+            if not override_identity:
+                return
+            if not isinstance(prev_identity, dict):
+                return
+            prev_route = (prev_identity.get("provider"), prev_identity.get("model"))
+            applied_route = (applied_provider, applied_model)
+            # Nothing to recover from, or no genuine model return.
+            if not prev_route[1] or prev_route == applied_route:
+                return
+            # Manual-dance suppression (#236, mirrors the end-of-turn gate): a
+            # route that lands on the override target AND whose target CHANGED
+            # this turn is the user's own /model switch, not a system recovery.
+            _ovr_route = (override_identity.get("provider"), override_identity.get("model"))
+            if override_target_changed and _ovr_route == applied_route:
+                return
+            try:
+                from agent.chat_completion_helpers import (
+                    _append_route_change,
+                    _emit_fallback_announce,
+                )
+                # Durable sink line always (gate-independent — mirrors the
+                # end-of-turn site's contract).
+                _append_route_change(
+                    "recovery",
+                    prev_route[0], prev_route[1],
+                    applied_provider, applied_model,
+                )
+                announce = False
+                try:
+                    from hermes_cli.config import read_raw_config
+                    raw = read_raw_config() or {}
+                    mcfg = raw.get("model", {}) if isinstance(raw, dict) else {}
+                    announce = bool(mcfg.get("announce_recovery", False))
+                except Exception:
+                    pass  # config read failure → default-off (silent)
+                _emit_fallback_announce(
+                    agent, prev_route[1], applied_model, applied_provider,
+                    old_provider=prev_route[0],
+                    announce_enabled=announce,
+                    record_event=False,
+                    kind="recovery",
+                    recovery_via="restore",
+                )
+                # Record the transition for the end-of-turn same-turn dedup.
+                try:
+                    agent._prologue_recovery_announced = (prev_route, applied_route)
+                except Exception:
+                    pass
+            except Exception:
+                logger.debug("prologue recovery announce failed", exc_info=True)
+            # NOTE (INV-5): deliberately NO persist here — the end-of-turn site
+            # owns the single last_served_identity write under the store lock.
+        except Exception:
+            logger.debug("prologue recovery announce/read failed", exc_info=True)
+
     def _suspend_stuck_loop_sessions(self) -> int:
         """Suspend sessions that have been active across too many restarts.
 
