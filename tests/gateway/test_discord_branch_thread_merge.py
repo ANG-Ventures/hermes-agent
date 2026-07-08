@@ -540,9 +540,54 @@ class TestMergeCommand:
         assert len(folds) == 1
         assert "SUMMARY BODY" in folds[0]["content"]
         assert "merged into" in result.lower()
-        # current session's transcript is NOT mutated (read-only).
+        # The SOURCE session is summarized (read-only) but gets a small marker
+        # appended so a resumed branch knows it was already merged — it must NOT
+        # receive the full fold, only the [MERGED — …] breadcrumb.
         cur_msgs = session_db.get_messages_as_conversation("current_sess")
         assert not any("MERGED SESSION" in str(m.get("content", "")) for m in cur_msgs)
+        markers = [m for m in cur_msgs if "[MERGED —" in str(m.get("content", ""))]
+        assert len(markers) == 1
+        assert "Target Convo" in markers[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_merge_note_is_terse_turn_count_not_summary_dump(self, session_db):
+        """The visible 'merged in' note states the turn count + record path — it
+        does NOT dump the full summary into the channel (Ace, 2026-07-08)."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock()
+        adapter.archive_thread = AsyncMock(return_value=True)
+        runner = self._runner_with_summary(
+            session_db, adapter, summary="THIS LONG SUMMARY SHOULD NOT APPEAR IN THE NOTE")
+
+        _seed_session(session_db, "parent_sess", title="Parent")
+        _seed_session(session_db, "branch_sess", title="Explore",
+                      parent="parent_sess",
+                      model_config={"_branched_from": "parent_sess", "_branch_point_len": 1})
+        source = _discord_source(chat_type="thread", chat_id="tN",
+                                 thread_id="tN", parent_chat_id="host")
+        current = _entry(build_session_key(source), "branch_sess", source)
+        runner.session_store.get_or_create_session.return_value = current
+        # 1 inherited + 2 new user turns after the branch point.
+        runner.session_store.load_transcript.return_value = [
+            {"role": "user", "content": "inherited"},
+            {"role": "user", "content": "new q1"},
+            {"role": "assistant", "content": "new a1"},
+            {"role": "user", "content": "new q2"},
+        ]
+        parent_src = _discord_source(chat_type="group", chat_id="parent_origin")
+        runner.session_store.lookup_by_session_id.return_value = _entry(
+            build_session_key(parent_src), "parent_sess", parent_src)
+        runner._gateway_session_origin_for_id = lambda sid: parent_src
+
+        await runner._handle_merge_command(_event("/merge", source))
+
+        adapter.send.assert_awaited()
+        note = adapter.send.await_args.args[1]
+        # Note goes to the target's origin, mentions the 2 new user turns, and
+        # does NOT contain the raw summary body.
+        assert adapter.send.await_args.args[0] == "parent_origin"
+        assert "2 new turn" in note
+        assert "THIS LONG SUMMARY" not in note
 
     @pytest.mark.asyncio
     async def test_merge_named_writes_md_record(self, session_db, tmp_path, monkeypatch):
