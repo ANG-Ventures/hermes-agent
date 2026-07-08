@@ -116,6 +116,91 @@ def _float_value(value: Any) -> float:
         return 0.0
 
 
+def _is_first_class_provider_prefix(prefix: str) -> bool:
+    """True when *prefix* is a real, first-class provider the fleet routes
+    through DIRECTLY (not an aggregator's vendor namespace).
+
+    C-1 splits a composite ``<prefix>/<model>`` in the recorded ``model`` column
+    only when ``prefix`` is a first-class provider id — the ``claude-apx-6/…`` /
+    ``claude-app/…`` leak class. An aggregator vendor slug
+    (``anthropic/claude-haiku-4.5`` on openrouter, ``meta-llama/…``,
+    ``nous/…``) is the CANONICAL model id the pricing route needs, so it is
+    left verbatim (OQ-1 resolution: aggregator-prefixed ids are correct).
+
+    Resolution is defensive — a lookup failure returns False so an ambiguous
+    prefix is left untouched (never a mis-split that mislabels a chart row).
+    """
+    p = (prefix or "").strip().lower()
+    if not p:
+        return False
+    # Aggregators keep their vendor/model form — never split.
+    try:
+        from hermes_cli.model_normalize import _AGGREGATOR_PROVIDERS
+
+        if p in _AGGREGATOR_PROVIDERS:
+            return False
+    except Exception:
+        pass
+    # A registered provider PROFILE (bundled/user plugin) whose canonical name
+    # matches the prefix is a first-class direct route — the fN proxies
+    # (claude-apx-6, claude-api-proxy-f5→claude-apx-5) and similar resolve here.
+    try:
+        from providers import get_provider_profile
+
+        prof = get_provider_profile(p)
+        if prof is not None and not getattr(prof, "is_aggregator", False):
+            return True
+    except Exception:
+        pass
+    # Fall back to the CLI provider catalog: a resolvable, non-aggregator
+    # provider id is also first-class. ``get_provider`` returns None for an
+    # unknown id and an aggregator ProviderDef carries is_aggregator=True.
+    try:
+        from hermes_cli.providers import get_provider
+
+        d = get_provider(p)
+        if d is not None and not getattr(d, "is_aggregator", False):
+            # Guard against the alias-fallthrough where an unknown id resolves
+            # to a DIFFERENT aggregator (e.g. "openai" → openrouter): only a
+            # provider whose own id equals the prefix counts as first-class.
+            if str(getattr(d, "id", "")).strip().lower() == p:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _normalize_record_provider_model(provider: str, model: str) -> tuple[str, str]:
+    """Strip a first-class-provider ``<prefix>/`` from ``model`` before it lands
+    in ``turns.db.model`` (C-1 telemetry-only fix).
+
+    A row whose ``model`` carries the whole ``<provider>/<model>`` composite
+    becomes a phantom \"Spend by model\" chart row that never rolls up with its
+    bare form (Ace's 2026-07-05 phantom twin). This runs at the RECORDING
+    boundary only — it rewrites the telemetry row, never live inference/model
+    state — so it is inference-safe and cache-safe by construction.
+
+    Behavior:
+      - ``model`` = ``<prefix>/<rest>`` and ``prefix`` is a first-class provider
+        → strip the prefix from ``model``; keep the dedicated ``provider``
+        column value if set, else adopt the prefix.
+      - aggregator vendor prefix (``anthropic/claude-haiku-4.5`` on openrouter)
+        → left VERBATIM (that prefix is the real model id).
+      - bare ``model`` with no ``/`` → untouched.
+    """
+    prov = str(provider or "")
+    mdl = str(model or "")
+    if "/" not in mdl:
+        return prov, mdl
+    prefix, _, rest = mdl.partition("/")
+    if not rest:
+        return prov, mdl
+    if _is_first_class_provider_prefix(prefix):
+        # Trust the dedicated provider column when populated; else adopt prefix.
+        return (prov or prefix), rest
+    return prov, mdl
+
+
 def _session_state(session_id: str) -> dict[str, Any]:
     with _lock:
         return _sessions.setdefault(
@@ -218,6 +303,15 @@ def _build_record(
     is_subagent = bool(usage.get("is_subagent"))
     if is_subagent and not bool(cfg.get("record_subagents", True)):
         return None
+
+    # C-1: strip a first-class-provider prefix from the composite model id
+    # before it reaches turns.db (and the cost/chart path below), so a
+    # `claude-app/claude-opus-4-8` composite records as provider=claude-app,
+    # model=claude-opus-4-8 and rolls up with its bare form instead of becoming
+    # a phantom "Spend by model" twin. Telemetry-boundary only — the live
+    # agent's model/provider are untouched. Aggregator vendor slugs are left
+    # verbatim (they ARE the canonical model id).
+    provider, model = _normalize_record_provider_model(provider, model)
 
     now = time.time()
     state = _session_state(session_id)
