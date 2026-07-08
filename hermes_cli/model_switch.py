@@ -2599,8 +2599,8 @@ def _apply_picker_preferences(
         if hide_set:
             rows = [
                 r for r in rows
-                if str(r.get("slug", "")).lower() not in hide_set
-                or str(r.get("slug", "")).lower() == _cur  # never hide current
+                if str(r.get("slug", "")).strip().lower() not in hide_set
+                or str(r.get("slug", "")).strip().lower() == _cur  # never hide current
             ]
 
     order = picker_cfg.get("order") or []
@@ -2611,10 +2611,14 @@ def _apply_picker_preferences(
             if str(s).strip()
         }
         # Stable sort: listed slugs by their rank (front), unlisted keep original
-        # order after them (rank = +inf preserves the incoming sequence).
+        # order after them. The fallback sentinel is len(order)+1 — strictly
+        # greater than any real rank index (which is < len(order)) even when
+        # `order` contains blank entries that were filtered out of `rank`.
         rows = sorted(
             rows,
-            key=lambda r: rank.get(str(r.get("slug", "")).lower(), len(rank) + 1),
+            key=lambda r: rank.get(
+                str(r.get("slug", "")).strip().lower(), len(order) + 1
+            ),
         )
 
     return rows

@@ -552,3 +552,39 @@ def test_picker_prefs_unknown_slugs_ignored(monkeypatch):
         _rows("openrouter", "yunwu"))
     assert [r["slug"] for r in out] == ["yunwu", "openrouter"]
 
+
+def test_picker_order_with_blank_entries_still_front_anchors(monkeypatch):
+    """Blank/empty entries in order must not corrupt the fallback rank.
+
+    Regression for the len(rank)+1 collision (Greptile #240 P2): with
+    order=["a","","","c"], rank={a:0,c:3}; a naive len(rank)+1 == 3 fallback
+    would tie with c's rank and a stable sort could leave an unlisted row
+    ahead of c. Using len(order)+1 keeps every listed slug strictly ahead of
+    every unlisted one.
+    """
+    _picker_cfg(monkeypatch, order=["a", "", "", "c"])
+    out = model_switch._apply_picker_preferences(
+        _rows("unlisted", "c", "a"))
+    slugs = [r["slug"] for r in out]
+    assert slugs == ["a", "c", "unlisted"], slugs
+    # both listed slugs strictly precede the unlisted row
+    assert slugs.index("c") < slugs.index("unlisted")
+
+
+def test_picker_prefs_whitespace_slug_matches(monkeypatch):
+    """Row slugs with surrounding whitespace still hide/order correctly.
+
+    Regression for the strip asymmetry (Greptile #240 P2): keys were built with
+    .strip().lower() but lookups only .lower(); a padded slug slipped through.
+    """
+    _picker_cfg(monkeypatch, hide=["anthropic"], order=["yunwu"])
+    rows = [
+        {"slug": " anthropic ", "name": "A", "models": ["m"]},
+        {"slug": "  yunwu", "name": "Y", "models": ["m"]},
+        {"slug": "openrouter", "name": "O", "models": ["m"]},
+    ]
+    out = [r["slug"] for r in model_switch._apply_picker_preferences(rows)]
+    assert " anthropic " not in out            # hidden despite whitespace
+    assert out[0] == "  yunwu"                  # ordered first despite whitespace
+
+
