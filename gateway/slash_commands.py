@@ -4292,10 +4292,13 @@ class GatewaySlashCommandsMixin:
         # copy back re-summarizes context the parent already has. The named form
         # has no shared prefix, so it summarizes the whole source session.
         summarize_history = source_history
-        if is_thread_form and isinstance(branch_point_len, int) and 0 <= branch_point_len < len(source_history):
-            delta = source_history[branch_point_len:]
-            if delta:  # guard: never summarize an empty slice
-                summarize_history = delta
+        if is_thread_form and isinstance(branch_point_len, int) and branch_point_len >= 0:
+            # The delta is authoritative once we have a valid branch point: even
+            # branch_point_len == len(source_history) (zero new turns) must yield
+            # an EMPTY delta → no_new_turns, NOT a re-summary of the whole copy.
+            summarize_history = source_history[branch_point_len:]
+            if not summarize_history:
+                return t("gateway.merge.no_new_turns")
         if not summarize_history:
             return t("gateway.merge.no_new_turns")
 

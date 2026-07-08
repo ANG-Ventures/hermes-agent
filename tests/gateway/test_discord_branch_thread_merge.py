@@ -453,6 +453,38 @@ class TestMergeCommand:
         assert "INHERITED" not in contents
 
     @pytest.mark.asyncio
+    async def test_merge_thread_no_new_turns_does_not_refold(self, session_db):
+        """A branch with ZERO new turns (branch_point_len == len) must return
+        no_new_turns and fold NOTHING — not re-summarize the inherited copy."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock()
+        adapter.archive_thread = AsyncMock(return_value=True)
+        runner = self._runner_with_summary(session_db, adapter)
+
+        _seed_session(session_db, "parent_sess", title="Parent")
+        _seed_session(session_db, "branch_sess", title="Explore",
+                      parent="parent_sess",
+                      model_config={"_branched_from": "parent_sess", "_branch_point_len": 2})
+        source = _discord_source(chat_type="thread", chat_id="t0",
+                                 thread_id="t0", parent_chat_id="chan")
+        current = _entry(build_session_key(source), "branch_sess", source)
+        runner.session_store.get_or_create_session.return_value = current
+        # Exactly the 2 inherited turns, nothing new.
+        runner.session_store.load_transcript.return_value = [
+            {"role": "user", "content": "INHERITED q"},
+            {"role": "assistant", "content": "INHERITED a"},
+        ]
+        runner.session_store.lookup_by_session_id.return_value = None
+
+        result = await runner._handle_merge_command(_event("/merge", source))
+
+        assert "nothing new" in result.lower() or "no turns" in result.lower()
+        parent_msgs = session_db.get_messages_as_conversation("parent_sess")
+        assert not any("BRANCHED THREAD MERGED" in str(m.get("content", ""))
+                       for m in parent_msgs)
+        adapter.archive_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_merge_thread_uses_branched_from_marker(self, session_db):
         adapter = MagicMock()
         adapter.send = AsyncMock()
