@@ -330,9 +330,10 @@ def _make_claude_acp_client(tmp_path):
 
 
 def test_claude_acp_gets_relay_env(monkeypatch, tmp_path):
-    # No pre-set ANTHROPIC_BASE_URL -> the pool env is injected.
+    # No pre-set ANTHROPIC_BASE_URL + relay reachable -> the pool env is injected.
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     monkeypatch.delenv("CLAUDE_POOL_KEY", raising=False)
+    monkeypatch.setattr("agent.copilot_acp_client._relay_reachable", lambda *a, **k: True)
     captured = {}
     client = _make_claude_acp_client(tmp_path)
     with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
@@ -345,9 +346,53 @@ def test_claude_acp_gets_relay_env(monkeypatch, tmp_path):
     assert env["ANTHROPIC_API_KEY"]  # placeholder present
 
 
+def test_plain_claude_cli_acp_gets_relay_env(monkeypatch, tmp_path):
+    # Greptile #222: `claude --acp --stdio` (Claude Code CLI as its own ACP agent)
+    # has no adapter-package arg but MUST still be pooled.
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setattr("agent.copilot_acp_client._relay_reachable", lambda *a, **k: True)
+    captured = {}
+    client = CopilotACPClient(acp_command="claude", acp_args=["--acp", "--stdio"], acp_cwd=str(tmp_path))
+    with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
+        with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
+            client._run_prompt("hi", timeout_seconds=1)
+    assert captured["kwargs"]["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:18810"
+
+
+def test_non_claude_adapter_with_claude_code_in_a_path_arg_untouched(monkeypatch, tmp_path):
+    # Greptile #222: a codex/copilot adapter whose ARG is a PATH or model value
+    # containing "claude-code" must NOT be misclassified as a Claude adapter.
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setattr("agent.copilot_acp_client._relay_reachable", lambda *a, **k: True)
+    captured = {}
+    client = CopilotACPClient(
+        acp_command="npx",
+        acp_args=["-y", "@zed-industries/codex-acp", "--config", "/opt/claude-code/x.toml"],
+        acp_cwd=str(tmp_path),
+    )
+    with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
+        with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
+            client._run_prompt("hi", timeout_seconds=1)
+    assert "ANTHROPIC_BASE_URL" not in captured["kwargs"]["env"]
+
+
+def test_claude_acp_fail_open_when_relay_unreachable(monkeypatch, tmp_path):
+    # Greptile #222: if the local relay isn't running, don't strand a Claude ACP
+    # adapter on a dead endpoint — leave it on its inherited routing.
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setattr("agent.copilot_acp_client._relay_reachable", lambda *a, **k: False)
+    captured = {}
+    client = _make_claude_acp_client(tmp_path)
+    with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
+        with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
+            client._run_prompt("hi", timeout_seconds=1)
+    assert "ANTHROPIC_BASE_URL" not in captured["kwargs"]["env"]
+
+
 def test_claude_acp_respects_explicit_base_url(monkeypatch, tmp_path):
     # A caller-set ANTHROPIC_BASE_URL wins — we must NOT override it.
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://bespoke.example/v1")
+    monkeypatch.setattr("agent.copilot_acp_client._relay_reachable", lambda *a, **k: True)
     captured = {}
     client = _make_claude_acp_client(tmp_path)
     with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
@@ -359,6 +404,7 @@ def test_claude_acp_respects_explicit_base_url(monkeypatch, tmp_path):
 def test_non_claude_acp_untouched(monkeypatch, tmp_path):
     # A Copilot (non-Claude) adapter must NOT be pointed at the Claude pool.
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setattr("agent.copilot_acp_client._relay_reachable", lambda *a, **k: True)
     captured = {}
     client = _make_home_client(tmp_path)  # command="copilot"
     with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):

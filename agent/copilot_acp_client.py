@@ -135,9 +135,52 @@ def _build_subprocess_env() -> dict[str, str]:
 # like `claude -p` via the claude-code-relay shim, instead of going direct to
 # Anthropic. See skill `claude-code-relay`.
 _CLAUDE_RELAY_BASE_URL = "http://127.0.0.1:18810"
-# Substrings that identify a Claude (Anthropic-wire) ACP adapter command line.
-# Codex/Gemini/Copilot adapters speak other wires and must NOT be pointed here.
-_CLAUDE_ACP_MARKERS = ("claude-agent-acp", "claude-code-acp", "claude-code")
+
+
+def _is_claude_acp(command: str, args: list[str]) -> bool:
+    """True iff (command, args) launches a Claude (Anthropic-wire) ACP adapter.
+
+    Precise, not substring-greedy (Greptile #222): a codex/copilot/gemini adapter
+    invoked with a PATH or model/config ARG that merely contains "claude-code"
+    must NOT be misclassified. So we match structurally:
+      * the command basename is `claude` (the Claude Code CLI acting as its own
+        ACP agent, e.g. `claude --acp --stdio`), OR
+      * an npm-style package token (`@scope/pkg` or bare `pkg`) among the args
+        equals/ends-with a known Claude ACP adapter package.
+    A raw path like `/some/claude-code/thing` or `--model claude-code-x` won't
+    match because it isn't the command basename nor an npm package token.
+    """
+    base = os.path.basename((command or "").strip()).lower()
+    # strip a .exe/.cmd suffix (Windows shims)
+    base = base.rsplit(".", 1)[0] if base.endswith((".exe", ".cmd")) else base
+    if base == "claude":
+        return True
+    # npm adapter packages: @agentclientprotocol/claude-agent-acp,
+    # @zed-industries/claude-code-acp (deprecated alias), and the bare names.
+    _claude_pkgs = ("claude-agent-acp", "claude-code-acp")
+    for a in args:
+        tok = (a or "").strip().lower()
+        if not tok or tok.startswith("-"):
+            continue  # skip flags/values like `-y`, `--model`
+        # an npm package token: bare name or @scope/name — compare the final segment
+        leaf = tok.rsplit("/", 1)[-1]
+        if leaf in _claude_pkgs:
+            return True
+    return False
+
+
+def _relay_reachable(base_url: str = _CLAUDE_RELAY_BASE_URL, timeout: float = 1.5) -> bool:
+    """Cheap liveness probe of the relay's /health (Greptile #222: don't strand a
+    Claude ACP adapter on a host where the pool isn't running). Fail-open: if the
+    relay is down/unreachable we return False so the caller leaves the adapter on
+    its inherited routing rather than forcing a connection-refused."""
+    import urllib.request
+    import urllib.error
+    try:
+        with urllib.request.urlopen(base_url.rstrip("/") + "/health", timeout=timeout) as r:
+            return 200 <= r.status < 300
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
 
 
 def _claude_relay_env_patch(command: str, args: list[str]) -> dict[str, str]:
@@ -146,21 +189,24 @@ def _claude_relay_env_patch(command: str, args: list[str]) -> dict[str, str]:
     Mirrors the claude-code-relay shim: point ANTHROPIC_BASE_URL at the pool,
     supply a placeholder key (the pool injects the real per-sub token), and stamp
     the x-hermes-* routing headers (which the pool reads then STRIPS before
-    Anthropic — INV-1, never egress). Applied ONLY when:
-      * the ACP command line looks like a Claude adapter, AND
-      * the caller has not already set ANTHROPIC_BASE_URL (an explicit endpoint
+    Anthropic — INV-1, never egress). Applied ONLY when ALL hold:
+      * (command, args) is a Claude ACP adapter (`_is_claude_acp`), AND
+      * the caller has not already set ANTHROPIC_BASE_URL (explicit endpoint
         wins — bespoke override), AND
-      * the pool endpoint is not disabled via config.
+      * the relay is actually reachable (`_relay_reachable`) — otherwise we leave
+        the adapter on its inherited/direct routing rather than breaking a
+        previously-working adapter on a host with no local pool.
 
     background lane by default (a delegated ACP spawn is not a live-watched turn).
     Returns {} for non-Claude adapters (codex/gemini/copilot) so their auth is
     untouched.
     """
-    blob = " ".join([command, *args]).lower()
-    if not any(m in blob for m in _CLAUDE_ACP_MARKERS):
+    if not _is_claude_acp(command, args):
         return {}
     if os.environ.get("ANTHROPIC_BASE_URL", "").strip():
         return {}  # explicit endpoint already set — don't override
+    if not _relay_reachable():
+        return {}  # pool not running here — don't strand the adapter (fail-open)
     import uuid
     key = os.environ.get("CLAUDE_POOL_KEY", "").strip() or "claude-pool-local-placeholder"
     sid = uuid.uuid4().hex
