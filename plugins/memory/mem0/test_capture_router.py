@@ -132,7 +132,7 @@ def test_router_dispatch_prefs_to_mem0_world_to_staged(tmp_path):
     assert res["destination"] == "staging"
     staged = res["staged_path"]
     assert os.path.exists(staged)
-    body = open(staged).read()
+    body = open(staged, encoding="utf-8").read()
     assert body.startswith("---")
     assert "source_turn: t001" in body
     assert "session: sess1" in body

@@ -179,7 +179,13 @@ class BridgeExtractor:
     def _op_read(ref: str) -> str:
         import subprocess
         try:
-            out = subprocess.run(["op", "read", ref], capture_output=True, text=True, timeout=20)
+            out = subprocess.run(
+                ["op", "read", ref],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                stdin=subprocess.DEVNULL,
+            )
             if out.returncode == 0:
                 return out.stdout.strip()
             logger.warning("capture-router: op read %s failed rc=%s", ref, out.returncode)
