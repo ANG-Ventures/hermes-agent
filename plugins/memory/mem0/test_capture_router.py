@@ -238,6 +238,75 @@ def test_build_router_constructs_when_enabled(tmp_path):
     assert r._staging_mode is True
 
 
+def test_build_router_wires_bridge_knobs(tmp_path):
+    """primary/fallback URLs + secret refs are config knobs, not hardcoded (Greptile #250 P1)."""
+    cfg = {"mem0_capture_router": {
+        "enabled": True, "staging_dir": str(tmp_path / "s"),
+        "primary_url": "http://10.0.0.9:1111/v1/chat/completions",
+        "fallback_url": "http://10.0.0.10:2222/v1/chat/completions",
+        "primary_secret_ref": "op://V/p/secret",
+        "fallback_secret_ref": "op://V/f/secret",
+    }}
+    r = build_router_from_config(cfg)
+    ex = r._extractor
+    assert ex._primary_url == "http://10.0.0.9:1111/v1/chat/completions"
+    assert ex._fallback_url == "http://10.0.0.10:2222/v1/chat/completions"
+    assert ex._primary_ref == "op://V/p/secret"
+    assert ex._fallback_ref == "op://V/f/secret"
+
+
+def test_secret_cache_ttl_and_single_mint():
+    """TTL'd secret cache + per-ref lock: concurrent first calls mint ONCE; expiry re-mints
+    (Greptile #250 P2 x2)."""
+    import threading as _t
+    mints = []
+
+    def fake_auth(ref):
+        mints.append(ref)
+        return f"tok-{len(mints)}"
+
+    ex = BridgeExtractor(auth_fn=fake_auth)
+    # concurrent first use -> exactly one mint
+    out = []
+    threads = [_t.Thread(target=lambda: out.append(ex._secret("op://x"))) for _ in range(8)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert len(mints) == 1 and set(out) == {"tok-1"}
+    # expire the entry -> next call re-mints
+    tok, _ts = ex._secret_cache["op://x"]
+    ex._secret_cache["op://x"] = (tok, _ts - ex._secret_ttl_s - 1)
+    assert ex._secret("op://x") == "tok-2"
+    assert len(mints) == 2
+    # invalidate_secret -> re-mint on demand (rotation heal path)
+    ex.invalidate_secret("op://x")
+    assert ex._secret("op://x") == "tok-3"
+
+
+def test_auth_shaped_error_refreshes_secret_and_retries():
+    """A 401 from the bridge invalidates the cached secret and retries once with a fresh one."""
+    import urllib.error as _ue
+    mints = []
+    calls = []
+
+    def fake_auth(ref):
+        mints.append(ref)
+        return f"tok-{len(mints)}"
+
+    def fake_http(url, body, headers, timeout):
+        calls.append(headers["Authorization"])
+        if headers["Authorization"] == "Bearer tok-1":
+            raise _ue.HTTPError(url, 401, "unauthorized", None, None)
+        inner = json.dumps({"candidates": []})
+        return json.dumps({"choices": [{"message": {"content": inner}}], "usage": {}})
+
+    ex = BridgeExtractor(auth_fn=fake_auth, http_fn=fake_http)
+    res = ex.extract("sys", "u", "a")
+    assert res["provider"] == "codex-bridge"      # healed on primary, no fallback needed
+    assert res["candidates"] == []
+    assert calls == ["Bearer tok-1", "Bearer tok-2"]
+    assert len(mints) == 2
+
+
 # ---------------------------------------------------------------------------
 # FLAG-OFF INERTNESS in the drain worker (byte-identical behavior)
 # ---------------------------------------------------------------------------

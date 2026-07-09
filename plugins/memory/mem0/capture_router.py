@@ -36,7 +36,9 @@ import json
 import logging
 import os
 import re
+import threading
 import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -172,7 +174,13 @@ class BridgeExtractor:
         self._timeout_s = timeout_s
         self._http = http_fn or self._default_http
         self._auth = auth_fn or self._op_read
-        self._secret_cache: Dict[str, str] = {}
+        # ref -> (secret, fetched_at). TTL'd so a rotated 1Password token recovers without a
+        # process restart (Greptile #250 P2); per-ref locks so concurrent first-turn passes
+        # don't spawn duplicate `op read` subprocesses (Greptile #250 P2).
+        self._secret_cache: Dict[str, Tuple[str, float]] = {}
+        self._secret_ttl_s = 3600.0
+        self._secret_locks: Dict[str, threading.Lock] = {}
+        self._secret_locks_guard = threading.Lock()
 
     # -- provider plumbing --------------------------------------------------
     @staticmethod
@@ -194,9 +202,29 @@ class BridgeExtractor:
         return ""
 
     def _secret(self, ref: str) -> str:
-        if ref not in self._secret_cache:
-            self._secret_cache[ref] = self._auth(ref) or ""
-        return self._secret_cache[ref]
+        now = time.time()
+        hit = self._secret_cache.get(ref)
+        if hit is not None and (now - hit[1]) < self._secret_ttl_s:
+            return hit[0]
+        with self._secret_locks_guard:
+            lock = self._secret_locks.setdefault(ref, threading.Lock())
+        with lock:
+            # double-check under the lock — the other pass may have minted while we waited
+            hit = self._secret_cache.get(ref)
+            if hit is not None and (time.time() - hit[1]) < self._secret_ttl_s:
+                return hit[0]
+            secret = self._auth(ref) or ""
+            if secret:
+                self._secret_cache[ref] = (secret, time.time())
+            else:
+                # failed fetch: cache briefly (60s) so a down `op` doesn't stampede,
+                # but recover quickly once it's back
+                self._secret_cache[ref] = ("", time.time() - self._secret_ttl_s + 60.0)
+            return secret
+
+    def invalidate_secret(self, ref: str) -> None:
+        """Drop a cached secret (called on auth-shaped errors so rotation heals mid-process)."""
+        self._secret_cache.pop(ref, None)
 
     @staticmethod
     def _default_http(url: str, body: bytes, headers: Dict[str, str], timeout: float) -> str:
@@ -227,19 +255,33 @@ class BridgeExtractor:
             raise ValueError(f"unparseable extraction output: {text[:200]}")
         return cands, usage, latency
 
+    def _call_with_auth_retry(self, url: str, secret_ref: str, model: str, system_prompt: str,
+                              user: str, assistant: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any], float]:
+        """_call, but on an auth-shaped failure (401/403) drop the cached secret and retry once —
+        so a rotated 1Password token heals mid-process instead of failing until restart."""
+        try:
+            return self._call(url, secret_ref, model, system_prompt, user, assistant)
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                logger.warning("capture-router: auth-shaped %s from %s — refreshing secret and retrying",
+                               e.code, url)
+                self.invalidate_secret(secret_ref)
+                return self._call(url, secret_ref, model, system_prompt, user, assistant)
+            raise
+
     def extract(self, system_prompt: str, user: str, assistant: str) -> Dict[str, Any]:
         """One pass. Returns {candidates, usage, latency, provider} or {error, ...}. codex PRIMARY,
         gemini FALLBACK on any exception/timeout. Never raises (fail-soft — a pass failure yields no
         candidates rather than breaking the turn)."""
         try:
-            cands, usage, latency = self._call(
+            cands, usage, latency = self._call_with_auth_retry(
                 self._primary_url, self._primary_ref, self._model, system_prompt, user, assistant)
             return {"candidates": cands, "usage": usage, "latency": latency, "provider": "codex-bridge"}
         except Exception as primary_err:
             logger.warning("capture-router: primary (codex-bridge) pass failed, trying fallback: %s",
                            primary_err)
             try:
-                cands, usage, latency = self._call(
+                cands, usage, latency = self._call_with_auth_retry(
                     self._fallback_url, self._fallback_ref, self._fallback_model,
                     system_prompt, user, assistant)
                 return {"candidates": cands, "usage": usage, "latency": latency,
@@ -425,6 +467,14 @@ def build_router_from_config(cfg: Dict[str, Any]) -> Optional[CaptureRouter]:
         return None
     try:
         extractor = BridgeExtractor(
+            primary_url=str(router_cfg.get(
+                "primary_url", "http://127.0.0.1:18812/v1/chat/completions")),
+            fallback_url=str(router_cfg.get(
+                "fallback_url", "http://192.168.1.216:18813/v1/chat/completions")),
+            primary_secret_ref=str(router_cfg.get(
+                "primary_secret_ref", "op://Engineering/codex-bridge/secret")),
+            fallback_secret_ref=str(router_cfg.get(
+                "fallback_secret_ref", "op://Engineering/gemini-bridge/secret")),
             model=str(router_cfg.get("model", "gpt-5.4-mini")),
             fallback_model=router_cfg.get("fallback_model") or None,
             timeout_s=float(router_cfg.get("timeout_s", 180.0)),
