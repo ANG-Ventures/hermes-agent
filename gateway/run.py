@@ -6595,6 +6595,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self.session_store.update_session(session_key, served_identity=served_identity)
         except Exception:
             logger.debug("served-route persist failed", exc_info=True)
+        # Consume the one-turn manual-switch stamp at end of EVERY turn, so it
+        # can never outlive its one-turn window (Greptile #249 P2). The pre-run
+        # re-init site pops it too when it runs (fresh-agent turns), but a run
+        # of CACHED-agent turns after a /model switch would otherwise leave the
+        # stamp set until the next fresh agent — which could wrongly suppress a
+        # genuine LATER recovery. This end-of-turn pop runs on cached AND fresh
+        # turns, bounding the stamp to exactly the turn it was set for. (Today a
+        # /model switch also evicts the cache, so the next turn is fresh anyway;
+        # this makes correctness independent of that cross-file coupling.)
+        try:
+            getattr(self, "_override_target_just_changed", {}).pop(session_key, None)
+        except Exception:
+            pass
 
     def _announce_reinit_recovery(
         self,

@@ -403,3 +403,30 @@ class TestManualSwitchStamp:
         runner._session_model_overrides = {key: {"model": "x"}}
         runner._set_session_model_override(key, None)
         assert runner._override_target_just_changed.get(key) is True
+
+    def test_stamp_cleared_at_end_of_every_turn(self, env):
+        # Greptile #249 P2: the stamp must not outlive its one-turn window even
+        # if the following turns land on a CACHED agent (pre-run site skipped).
+        # The end-of-turn persist site pops it unconditionally.
+        tmp_path, store, runner = env
+        key = "agent:main:discord:c1:c1"
+        store._entries[key] = _entry(key, last_served=dict(SERVED_OPUS))
+        runner._override_target_just_changed = {key: True}
+        agent = _agent()
+        # A cached-agent turn: only the end-of-turn persist runs (no pre-run pop).
+        _persist(runner, agent, key, *OPUS)
+        assert key not in runner._override_target_just_changed  # stamp cleared
+
+    def test_lingering_stamp_cannot_suppress_a_later_recovery(self, env):
+        # End-to-end of the P2 concern: switch turn stamps → a cached turn ends
+        # and clears the stamp → a LATER fresh-agent recovery is NOT suppressed.
+        tmp_path, store, runner = env
+        key = "agent:main:discord:c1:c1"
+        store._entries[key] = _entry(key, last_served=dict(SERVED_OPUS), override=dict(PIN))
+        runner._override_target_just_changed = {key: True}
+        # Cached turn clears the stamp at end-of-turn.
+        _persist(runner, _agent(), key, *OPUS)
+        # Later fresh-agent turn: genuine refusing-pin recovery announces.
+        agent2 = _agent()
+        _reinit(runner, agent2, key, *FABLE)
+        assert len(agent2._announced) == 1
