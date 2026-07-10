@@ -209,3 +209,47 @@ describe('useSessionChanges B2 materialization', () => {
     expect(result.messages[1]?.parts).toEqual([{ type: 'text', text: 'new assistant' }])
   })
 })
+
+describe('useSessionChanges B3 partial turns', () => {
+  it('renders a polled assistant tool-call prefix as the existing pending tool-call shape', () => {
+    const result = appendFetchedMessages([], [
+      {
+        id: 20,
+        role: 'assistant',
+        content: '',
+        tool_calls: [
+          {
+            id: 'call-1',
+            function: { name: 'search_files', arguments: { query: 'needle' } }
+          }
+        ]
+      }
+    ])
+
+    expect(result.messages).toHaveLength(1)
+    expect(result.messages[0]?.id).toBe('20')
+    const [part] = result.messages[0]?.parts ?? []
+
+    expect(part).toEqual(
+      expect.objectContaining({
+        toolCallId: 'call-1',
+        toolName: 'search_files',
+        type: 'tool-call'
+      })
+    )
+    expect(part && 'result' in part).toBe(false)
+  })
+
+  it('keeps the cursor at the last rendered/deduped id when a fetched row is not rendered', () => {
+    expect(
+      advanceCursorAfterRows(
+        20,
+        [
+          { id: 21, role: 'assistant', content: 'rendered' },
+          { id: 22, role: 'assistant', content: 'not rendered yet' }
+        ],
+        [message('21', 'assistant')]
+      )
+    ).toBe(21)
+  })
+})
