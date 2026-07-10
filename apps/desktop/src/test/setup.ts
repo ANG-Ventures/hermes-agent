@@ -1,4 +1,4 @@
-import { vi } from 'vitest'
+import { beforeEach, vi } from 'vitest'
 
 const makeStorage = (): Storage => {
   const values = new Map<string, string>()
@@ -19,6 +19,10 @@ const makeStorage = (): Storage => {
   }
 }
 
+// jsdom SHIPS a localStorage, so the stub is only a fallback for bare
+// environments (Greptile #274 P2: the guard means jsdom uses its own real
+// storage — which is fine; isolation comes from the beforeEach clear below,
+// which works for BOTH the real jsdom storage and the stub).
 if (typeof window !== 'undefined' && !window.localStorage) {
   Object.defineProperty(window, 'localStorage', {
     configurable: true,
@@ -88,3 +92,19 @@ if (typeof HTMLCanvasElement !== 'undefined') {
     () => 'data:image/png;base64,'
   ) as typeof HTMLCanvasElement.prototype.toDataURL
 }
+
+// Per-test isolation (Greptile #274 P2s): clear storage state and reset the
+// module-scope canvas mock call counts so no test observes a sibling's calls.
+beforeEach(() => {
+  if (typeof window !== 'undefined' && window.localStorage) {
+    window.localStorage.clear()
+  }
+  if (typeof window !== 'undefined' && window.sessionStorage) {
+    window.sessionStorage.clear()
+  }
+  for (const fn of Object.values(canvasContext)) {
+    if (typeof fn === 'function' && 'mockClear' in fn) {
+      ;(fn as ReturnType<typeof vi.fn>).mockClear()
+    }
+  }
+})
