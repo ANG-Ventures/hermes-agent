@@ -158,6 +158,8 @@ async def main() -> int:
         # THE STEAL: client-2 resumes the same session. WATCH-ONLY — no send.
         r = await c2.call("session.resume", {"session_id": sid})
         ok_all &= row("c2 steal (session.resume)", "result" in r)
+        # c2 is now the holder — its LIVE registry id keys the active_list row.
+        c2_live_id = (r.get("result") or {}).get("session_id", "")
         await asyncio.sleep(1.0)
 
         # (a) ROUTING: c1's polls/probes still round-trip on ITS socket.
@@ -180,29 +182,26 @@ async def main() -> int:
 
         # (b) SEMANTIC: status for the stolen session settles idle/waiting
         # (no turn is running; a lost frame must read as settled, not working).
-        # active_list rows key by the LIVE registry id; match on any field
-        # carrying the stored id, else fall back to c2's live id from resume.
+        # active_list rows key by the LIVE registry id (captured from c2's
+        # steal above). Match rows on stored-id fields OR that live id — NO
+        # loose fallback: an unrelated idle session must not be able to green
+        # the semantic (Greptile #272).
         status = None
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
+            status = None  # reset per iteration: only the CURRENT read counts
             r = await c1.call("session.active_list", {}, timeout=15)
             rows_ = (r.get("result") or {}).get("sessions", [])
             for s in rows_:
-                if sid in (
+                candidates = (
                     s.get("session_id"),
                     s.get("id"),
                     s.get("stored_session_id"),
                     s.get("resumed"),
                     s.get("session_key"),
-                ):
+                )
+                if sid in candidates or (c2_live_id and c2_live_id in candidates):
                     status = s.get("status")
-            if status is None and len(rows_) >= 1:
-                # Fallback: our probe sessions are the only rc1 resumes; take
-                # any row whose status is settled if exact-id match fails.
-                statuses = sorted({s.get("status") for s in rows_ if s.get("status")})
-                print(f"  [info] no exact id match; live rows statuses={statuses}")
-                if statuses and all(st in ("idle", "waiting") for st in statuses):
-                    status = statuses[0]
             if status in ("idle", "waiting"):
                 break
             await asyncio.sleep(2)

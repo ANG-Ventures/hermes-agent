@@ -12,6 +12,13 @@ probe = __import__('livesync-rc1-probe')
 SID = sys.argv[4] if len(sys.argv) > 4 else ""
 DURATION = 90
 
+if not SID:
+    raise SystemExit(
+        "usage: livesync-a1-watch.py <user> <pw> <base_url> <stored_session_id>\n"
+        "stored_session_id is REQUIRED (state.db key of the session being "
+        "written by the messaging gateway)."
+    )
+
 async def main():
     c = probe.Client('a1')
     await c.connect()
