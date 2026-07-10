@@ -8,6 +8,7 @@ import type { StatusResponse } from '@/types/hermes'
 
 import {
   advanceCursorAfterRows,
+  appendFetchedMessages,
   createSessionChangesController,
   maxCommittedMessageId,
   sessionChangesSupported,
@@ -193,5 +194,18 @@ describe('useSessionChanges B1', () => {
         [message('10')]
       )
     ).toBe(10)
+  })
+})
+
+describe('useSessionChanges B2 materialization', () => {
+  it('dedupes already-rendered committed ids and appends new rows through the resume materializer', () => {
+    const result = appendFetchedMessages([message('10', 'user')], [
+      { id: 10, role: 'user', content: 'already rendered' },
+      { id: 11, role: 'assistant', content: 'new assistant', timestamp: 11 }
+    ])
+
+    expect(result.messages).toHaveLength(2)
+    expect(result.messages.map(row => row.id)).toEqual(['10', '11'])
+    expect(result.messages[1]?.parts).toEqual([{ type: 'text', text: 'new assistant' }])
   })
 })
