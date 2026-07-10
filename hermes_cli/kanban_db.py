@@ -5113,7 +5113,10 @@ def decompose_triage_task(
         # orchestration run shares the same directory.
         _board_ws_upgraded = False
         if root_ws_kind == "scratch" and not root_ws_path:
-            _board_meta = read_board_metadata()
+            # Resolve the ACTIVE board, not the hardcoded default — a
+            # named board carries its own default_workdir. Mirrors the
+            # board-resolution create_task() uses for dir/worktree tasks.
+            _board_meta = read_board_metadata(get_current_board())
             _board_default = _board_meta.get("default_workdir")
             if _board_default:
                 root_ws_kind = "dir"
