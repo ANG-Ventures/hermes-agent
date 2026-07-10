@@ -764,6 +764,54 @@ def _localhost_to_ipv4(url: str) -> str:
     )
 
 
+def _is_lmstudio_models_payload(response: Any) -> bool:
+    """Return True only if an `/api/v1/models` 200 is genuinely LM Studio.
+
+    LM Studio's native listing is `{"data": [{...lm-studio fields...}]}` (its
+    REST API also nests under `data`, but each entry carries LM Studio-native
+    fields the OpenAI envelope never has: `loaded_instances`, a `state`, a
+    `type` like "llm"/"embeddings", `max_context_length`, `arch`, or a
+    publisher-qualified `key`). A generic OpenAI-compatible server (e.g. a
+    loopback Claude/Anthropic proxy that answers `/api/v1/models` for model-name
+    validation) returns `{"object":"list","data":[{"id","object":"model",...}]}`
+    with NONE of those fields. Distinguishing on the entry SHAPE — not a bare
+    200 — stops the misdetection that routed such proxies into the LM Studio
+    metadata parser and collapsed their context_length to a probe-tier default.
+
+    Fails closed: any parse error or unrecognized shape returns False (the
+    caller then continues its detection waterfall / OpenAI-compat path).
+    """
+    _LMSTUDIO_ENTRY_MARKERS = (
+        "loaded_instances",
+        "state",
+        "type",
+        "max_context_length",
+        "arch",
+        "publisher",
+    )
+    try:
+        data = response.json()
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    # An explicit OpenAI list envelope is a strong NEGATIVE signal — LM Studio's
+    # native payload does not stamp object="list".
+    if data.get("object") == "list":
+        return False
+    entries = data.get("models")
+    if not isinstance(entries, list):
+        # Some LM Studio builds key the native listing under `data`; accept it
+        # only when the entries actually look LM Studio-native (below).
+        entries = data.get("data")
+    if not isinstance(entries, list) or not entries:
+        return False
+    first = entries[0]
+    if not isinstance(first, dict):
+        return False
+    return any(marker in first for marker in _LMSTUDIO_ENTRY_MARKERS)
+
+
 def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
     """Detect which local server is running at base_url by probing known endpoints.
 
@@ -796,10 +844,26 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
     result: Optional[str] = None
     try:
         with httpx.Client(timeout=2.0, headers=headers) as client:
-            # LM Studio exposes /api/v1/models — check first (most specific)
+            # LM Studio exposes /api/v1/models — check first (most specific).
+            #
+            # A 200 alone is NOT sufficient: other OpenAI-compatible local
+            # servers (e.g. a loopback Anthropic/Claude proxy that also answers
+            # `/api/v1/models` so harness model-name validation works) return a
+            # 200 here too, with the standard OpenAI listing shape
+            # (`{"object":"list","data":[{"id",...}]}`). Classifying those as
+            # LM Studio sends the caller down the LM Studio metadata parser,
+            # which looks for the LM Studio-native shape and finds nothing — so
+            # context_length resolves to None and the caller falls back to a
+            # probe-tier default (the 128K-on-a-1M-model over-compaction bug).
+            #
+            # LM Studio's native `/api/v1/models` is distinguishable: it returns
+            # a top-level `models` array whose entries carry LM Studio-specific
+            # fields (`loaded_instances`, a `state`, and a `type` like "llm"),
+            # NOT the OpenAI `{"object":"list","data":[...]}` envelope. Require
+            # that signature so a generic OpenAI listing can't be misdetected.
             try:
                 r = client.get(f"{lmstudio_url}/api/v1/models")
-                if r.status_code == 200:
+                if r.status_code == 200 and _is_lmstudio_models_payload(r):
                     result = "lm-studio"
             except Exception:
                 pass
