@@ -23,6 +23,7 @@ export interface SessionChangesTiming {
 
 export interface UseSessionChangesArgs {
   activeSessionId: string | null
+  busy: boolean
   currentView: string
   messages: ChatMessage[]
   requestGateway: GatewayRequest
@@ -38,6 +39,8 @@ export interface SessionChangesController {
   cursor: number
   disabled: boolean
   renderedIds: Set<string>
+  suspended: boolean
+  unstampedOptimisticIds: Set<string>
 }
 
 export function sessionChangesSupported(status: StatusResponse | null): boolean {
@@ -84,7 +87,9 @@ export function createSessionChangesController(messages: readonly ChatMessage[])
   return {
     cursor: maxCommittedMessageId(messages),
     disabled: false,
-    renderedIds: new Set(messages.map(message => message.id))
+    renderedIds: new Set(messages.map(message => message.id)),
+    suspended: false,
+    unstampedOptimisticIds: new Set()
   }
 }
 
@@ -109,9 +114,28 @@ export function appendFetchedMessages(
 
   return {
     cursor: advanceCursorAfterRows(0, fetchedRows, appendable, renderedIds),
-    messages: [...current, ...appendable],
+    messages: orderCommittedMessages([...current, ...appendable]),
     renderedIds
   }
+}
+
+export function orderCommittedMessages(messages: ChatMessage[]): ChatMessage[] {
+  return [...messages].sort((a, b) => {
+    const left = Number(a.id)
+    const right = Number(b.id)
+    const leftCommitted = Number.isInteger(left)
+    const rightCommitted = Number.isInteger(right)
+
+    if (leftCommitted && rightCommitted) {
+      return left - right
+    }
+
+    if (leftCommitted !== rightCommitted) {
+      return leftCommitted ? -1 : 1
+    }
+
+    return 0
+  })
 }
 
 export function advanceCursorAfterRows(
@@ -139,12 +163,59 @@ export function advanceCursorAfterRows(
   return cursor
 }
 
+function optimisticTranscriptIds(messages: readonly ChatMessage[]): string[] {
+  return messages
+    .filter(message => !Number.isInteger(Number(message.id)) && (message.id.startsWith('user-') || message.pending))
+    .map(message => message.id)
+}
+
+export function extractCommittedMessageIds(payload: unknown): string[] {
+  const row = payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : {}
+  const arrayValue = row.message_ids ?? row.row_ids ?? row.committed_ids
+  const ids = Array.isArray(arrayValue) ? arrayValue : []
+  const scalarIds = [row.user_message_id, row.assistant_message_id, row.message_id]
+
+  return [...ids, ...scalarIds]
+    .map(value => (value === undefined || value === null || value === '' ? '' : String(value)))
+    .filter(Boolean)
+}
+
+export function stampOptimisticTranscriptRows(messages: readonly ChatMessage[], committedIds: readonly string[]) {
+  if (!committedIds.length) {
+    return {
+      messages: [...messages],
+      stampedIds: new Set<string>()
+    }
+  }
+
+  const stampedIds = new Set<string>()
+  let nextIdIndex = 0
+  const next = messages.map(message => {
+    if (Number.isInteger(Number(message.id)) || nextIdIndex >= committedIds.length) {
+      return message
+    }
+
+    if (!message.id.startsWith('user-') && !message.pending) {
+      return message
+    }
+
+    const id = committedIds[nextIdIndex]
+    nextIdIndex += 1
+    stampedIds.add(id)
+
+    return { ...message, id, pending: false }
+  })
+
+  return { messages: next, stampedIds }
+}
+
 function isWindowFocused(): boolean {
   return typeof document.hasFocus === 'function' ? document.hasFocus() : true
 }
 
 export function useSessionChanges({
   activeSessionId,
+  busy,
   currentView,
   messages,
   requestGateway,
@@ -159,6 +230,7 @@ export function useSessionChanges({
   const focusedRef = useRef(isWindowFocused())
   const inFlightRef = useRef(false)
   const sessionIdRef = useRef(activeSessionId)
+  const wasBusyRef = useRef(busy)
 
   const eligible = Boolean(activeSessionId && currentView === 'chat' && supported && focusedRef.current)
 
@@ -183,7 +255,7 @@ export function useSessionChanges({
   const pollOnce = useCallback(async () => {
     const sessionId = sessionIdRef.current
 
-    if (!sessionId || controllerRef.current.disabled || inFlightRef.current) {
+    if (!sessionId || controllerRef.current.disabled || controllerRef.current.suspended || inFlightRef.current) {
       return
     }
 
@@ -220,12 +292,35 @@ export function useSessionChanges({
   const schedulePollTimer = useCallback(() => {
     clearPollTimer()
 
-    if (!eligible || controllerRef.current.disabled) {
+    if (!eligible || controllerRef.current.disabled || controllerRef.current.suspended) {
       return
     }
 
     pollTimerRef.current = window.setInterval(() => void pollOnce(), timing.pollIntervalMs)
   }, [clearPollTimer, eligible, pollOnce, timing.pollIntervalMs])
+
+  useEffect(() => {
+    if (busy === wasBusyRef.current) {
+      return
+    }
+
+    wasBusyRef.current = busy
+
+    if (busy) {
+      controllerRef.current.suspended = true
+      controllerRef.current.unstampedOptimisticIds = new Set(optimisticTranscriptIds(messages))
+      clearPollTimer()
+
+      return
+    }
+
+    controllerRef.current.suspended = false
+    schedulePollTimer()
+
+    if (eligible && !controllerRef.current.disabled) {
+      void pollOnce()
+    }
+  }, [busy, clearPollTimer, eligible, messages, pollOnce, schedulePollTimer])
 
   useEffect(() => {
     schedulePollTimer()
@@ -272,6 +367,30 @@ export function useSessionChanges({
   }, [clearPollTimer, currentView, pollOnce, schedulePollTimer, supported, timing.refocusDebounceMs])
 
   return {
+    markFrame: useCallback(() => undefined, []),
+    markTurnComplete: useCallback(
+      (sessionId: string, payload: unknown) => {
+        if (!sessionId || sessionId !== sessionIdRef.current) {
+          return
+        }
+
+        const committedIds = extractCommittedMessageIds(payload)
+
+        if (!committedIds.length) {
+          return
+        }
+
+        updateSessionState(sessionId, state => {
+          const stamped = stampOptimisticTranscriptRows(state.messages, committedIds)
+
+          controllerRef.current.renderedIds = new Set(stamped.messages.map(message => message.id))
+          controllerRef.current.unstampedOptimisticIds.clear()
+
+          return { ...state, messages: stamped.messages }
+        })
+      },
+      [updateSessionState]
+    ),
     pollOnce
   }
 }

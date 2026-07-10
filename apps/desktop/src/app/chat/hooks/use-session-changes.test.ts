@@ -10,8 +10,10 @@ import {
   advanceCursorAfterRows,
   appendFetchedMessages,
   createSessionChangesController,
+  extractCommittedMessageIds,
   maxCommittedMessageId,
   sessionChangesSupported,
+  stampOptimisticTranscriptRows,
   useSessionChanges
 } from './use-session-changes'
 
@@ -251,5 +253,55 @@ describe('useSessionChanges B3 partial turns', () => {
         [message('21', 'assistant')]
       )
     ).toBe(21)
+  })
+})
+
+describe('useSessionChanges B4 own-turn suspension helpers', () => {
+  it('stamps optimistic transcript rows from completion frame committed ids', () => {
+    const stamped = stampOptimisticTranscriptRows(
+      [
+        message('user-temp', 'user'),
+        { ...message('assistant-stream-1', 'assistant'), pending: true }
+      ],
+      extractCommittedMessageIds({ message_ids: [100, 103] })
+    )
+
+    expect(stamped.messages.map(row => row.id)).toEqual(['100', '103'])
+    expect([...stamped.stampedIds]).toEqual(['100', '103'])
+  })
+
+  it('drops own rows re-returned by the post-completion poll after stamping', () => {
+    const stamped = stampOptimisticTranscriptRows(
+      [
+        message('user-temp', 'user'),
+        { ...message('assistant-stream-1', 'assistant'), pending: true }
+      ],
+      ['100', '101']
+    )
+    const result = appendFetchedMessages(stamped.messages, [
+      { id: 100, role: 'user', content: 'own user' },
+      { id: 101, role: 'assistant', content: 'own assistant' }
+    ])
+
+    expect(result.messages.map(row => row.id)).toEqual(['100', '101'])
+  })
+
+  it('renders remote ids interleaved between own ids and advances only through rendered rows', () => {
+    const stamped = stampOptimisticTranscriptRows(
+      [
+        message('user-temp', 'user'),
+        { ...message('assistant-stream-1', 'assistant'), pending: true }
+      ],
+      ['100', '103']
+    )
+    const result = appendFetchedMessages(stamped.messages, [
+      { id: 100, role: 'user', content: 'own user' },
+      { id: 101, role: 'user', content: 'remote user' },
+      { id: 102, role: 'assistant', content: 'remote assistant' },
+      { id: 103, role: 'assistant', content: 'own assistant' }
+    ])
+
+    expect(result.messages.map(row => row.id)).toEqual(['100', '101', '102', '103'])
+    expect(advanceCursorAfterRows(99, [{ id: 100, role: 'user', content: '' }], [message('100')])).toBe(100)
   })
 })

@@ -52,6 +52,7 @@ import { $reviewOpen, REVIEW_PANE_ID } from '../store/review'
 import {
   $activeSessionId,
   $attentionSessionIds,
+  $busy,
   $currentCwd,
   $freshDraftReady,
   $gatewayState,
@@ -189,6 +190,7 @@ export function DesktopController() {
 
   const gatewayState = useStore($gatewayState)
   const activeSessionId = useStore($activeSessionId)
+  const busy = useStore($busy)
   const currentCwd = useStore($currentCwd)
   const freshDraftReady = useStore($freshDraftReady)
   const messages = useStore($messages)
@@ -583,9 +585,21 @@ export function DesktopController() {
     }
   }, [activeSessionIdRef, busyRef, selectedStoredSessionIdRef, updateSessionState])
 
+  const sessionChanges = useSessionChanges({
+    activeSessionId,
+    busy,
+    currentView,
+    messages,
+    requestGateway,
+    statusSnapshot,
+    updateSessionState
+  })
+
   const { handleGatewayEvent } = useMessageStream({
     activeSessionIdRef,
     hydrateFromStoredSession,
+    onTurnComplete: sessionChanges.markTurnComplete,
+    onTurnFrame: sessionChanges.markFrame,
     queryClient,
     refreshHermesConfig,
     refreshSessions,
@@ -601,15 +615,6 @@ export function DesktopController() {
     requestGateway,
     routedSessionId,
     selectedStoredSessionId
-  })
-
-  useSessionChanges({
-    activeSessionId,
-    currentView,
-    messages,
-    requestGateway,
-    statusSnapshot,
-    updateSessionState
   })
 
   const {
