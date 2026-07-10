@@ -226,6 +226,33 @@ describe('useSessionChanges B2 materialization', () => {
     expect(result.messages.map(row => row.id)).toEqual(['10', '11'])
     expect(result.messages[1]?.parts).toEqual([{ type: 'text', text: 'new assistant' }])
   })
+
+  it('advances the cursor past tool-result rows merged into the preceding assistant message (Greptile #268)', () => {
+    // toChatMessages collapses assistant-with-tool_calls (id=12) + its tool
+    // result row (id=13) into ONE ChatMessage carrying id=12. Row 13 is
+    // consumed, not surfaced — the cursor must still advance past it, or
+    // every subsequent poll re-fetches 13 and appends a duplicate tool card.
+    const result = appendFetchedMessages([], [
+      {
+        id: 12,
+        role: 'assistant',
+        content: '',
+        timestamp: 12,
+        tool_calls: [{ id: 'call_x', function: { name: 'search_files', arguments: '{}' } }]
+      },
+      { id: 13, role: 'tool', content: '{}', tool_call_id: 'call_x', timestamp: 13 }
+    ])
+
+    expect(result.cursor).toBe(13)
+    expect(result.renderedIds.has('13')).toBe(true)
+
+    // Re-poll returning row 13 again (unchanged-cursor path) must be a
+    // no-op, not a duplicate — renderedIds carry consumed row ids forward.
+    const again = appendFetchedMessages(result.messages, [
+      { id: 13, role: 'tool', content: '{}', tool_call_id: 'call_x', timestamp: 13 }
+    ], result.renderedIds)
+    expect(again.messages).toHaveLength(result.messages.length)
+  })
 })
 
 describe('useSessionChanges B3 partial turns', () => {

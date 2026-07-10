@@ -52,24 +52,25 @@ export function sessionChangesSupported(status: StatusResponse | null): boolean 
 }
 
 export function sessionChangesTiming(status: StatusResponse | null): SessionChangesTiming {
-  const config = (status as { config?: Record<string, unknown> } | null)?.config
-  const dashboard = config?.dashboard && typeof config.dashboard === 'object' ? config.dashboard : undefined
-  const sync =
-    dashboard && 'session_sync' in dashboard && typeof dashboard.session_sync === 'object'
-      ? (dashboard.session_sync as Record<string, unknown>)
-      : undefined
+  // /api/status emits timing at TOP-LEVEL `session_sync` (hermes_cli/
+  // web_server.py get_status), not under config.dashboard — Greptile #268 P1.
+  const root = status as { session_sync?: Record<string, unknown> } | null
+  const sync = root?.session_sync && typeof root.session_sync === 'object' ? root.session_sync : undefined
 
-  const numberValue = (key: string, fallback: number) => {
+  // Server values are SECONDS (dashboard.session_sync.* in config.yaml);
+  // the hook consumes MILLISECONDS. Convert here — consuming 2.5 as ms
+  // would be a 2.5ms poll storm.
+  const secondsToMs = (key: string, fallback: number) => {
     const value = sync?.[key]
     const numeric = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN
 
-    return Number.isFinite(numeric) && numeric > 0 ? numeric : fallback
+    return Number.isFinite(numeric) && numeric > 0 ? numeric * 1000 : fallback
   }
 
   return {
-    pollIntervalMs: numberValue('poll_interval', DEFAULT_SESSION_CHANGES_POLL_MS),
-    refocusDebounceMs: numberValue('refocus_debounce', DEFAULT_SESSION_CHANGES_REFOCUS_DEBOUNCE_MS),
-    tSilenceMs: numberValue('t_silence', DEFAULT_SESSION_CHANGES_T_SILENCE_MS)
+    pollIntervalMs: secondsToMs('poll_interval', DEFAULT_SESSION_CHANGES_POLL_MS),
+    refocusDebounceMs: secondsToMs('refocus_debounce', DEFAULT_SESSION_CHANGES_REFOCUS_DEBOUNCE_MS),
+    tSilenceMs: secondsToMs('t_silence', DEFAULT_SESSION_CHANGES_T_SILENCE_MS)
   }
 }
 
@@ -100,20 +101,45 @@ export function createSessionChangesController(messages: readonly ChatMessage[])
 export function isFeatureDisabledError(error: unknown): boolean {
   const text = error instanceof Error ? error.message : String(error)
 
-  return /session changes disabled|feature.?disabled|disabled/i.test(text)
+  // Match ONLY the server-emitted feature-disabled strings (SPEC P1-6).
+  // A bare `disabled` alternative would permanently kill polling on any
+  // unrelated transient error mentioning the word (Greptile #268 P1).
+  return /session changes disabled|feature[\s-]?disabled/i.test(text)
 }
 
 export function appendFetchedMessages(
   current: readonly ChatMessage[],
-  fetchedRows: readonly SessionMessage[]
+  fetchedRows: readonly SessionMessage[],
+  priorRenderedIds?: ReadonlySet<string>
 ): { cursor: number; messages: ChatMessage[]; renderedIds: Set<string> } {
   const renderedIds = new Set(current.map(message => message.id))
+
+  // Carry forward CONSUMED row ids from prior polls (tool-result rows merged
+  // into a preceding assistant ChatMessage never surface as their own id, so
+  // deriving renderedIds from `current` alone forgets them — and an
+  // unchanged-cursor re-poll, e.g. the discard hatch, would then append a
+  // duplicate standalone tool card; Greptile #268 P1).
+  if (priorRenderedIds) {
+    for (const id of priorRenderedIds) {
+      renderedIds.add(id)
+    }
+  }
+
   const newRows = fetchedRows.filter(row => row.id === undefined || !renderedIds.has(String(row.id)))
   const materialized = toChatMessages([...newRows])
   const appendable = materialized.filter(message => !renderedIds.has(message.id))
 
   for (const message of appendable) {
     renderedIds.add(message.id)
+  }
+
+  // Every fetched row was either surfaced or merged (B3 renders dangling
+  // tool_calls as pending cards — no deferral), so mark ALL new rows
+  // consumed: the cursor may advance past merged tool-result ids.
+  for (const row of newRows) {
+    if (row.id !== undefined) {
+      renderedIds.add(String(row.id))
+    }
   }
 
   return {
@@ -295,7 +321,7 @@ export function useSessionChanges({
       const rows = response.messages ?? []
 
       updateSessionState(sessionId, state => {
-        const result = appendFetchedMessages(state.messages, rows)
+        const result = appendFetchedMessages(state.messages, rows, controllerRef.current.renderedIds)
         const cursor = advanceCursorAfterRows(since, rows, result.messages, result.renderedIds)
 
         controllerRef.current.cursor = cursor
