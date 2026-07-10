@@ -34,7 +34,7 @@ export default defineConfig({
         url: 'http://localhost/'
       }
     },
-    include: ['src/**/*.{test,spec}.{ts,tsx}'],
+    include: ['src/**/*.{test,spec}.{ts,tsx}', 'scripts/**/*.{test,spec}.mjs'],
     setupFiles: ['./src/test/setup.ts']
   },
   css: {
