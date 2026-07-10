@@ -30,6 +30,29 @@ Behavioral settings live in `$HERMES_HOME/mem0.json` (set them via `hermes memor
 | `agent_id` | `hermes` | Agent identifier |
 | `rerank` | `true` | Rerank search results for relevance (platform mode only) |
 
+## Capture router and corrections
+
+The optional `mem0_capture_router` block runs two dedicated extraction passes after a turn, then
+partitions candidates deterministically by class:
+
+- `preference` / `ops_state` stay on the mem0 write path.
+- `world_entity` / `event` are deduplicated against the preference pass and written to the configured
+  gbrain inbox. That inbox is staging for `inbox-filer.py`; it is not a flat gbrain import root. The
+  filer is the single door that routes captures into entity pages before those pages are ingested.
+
+**Corrections are highest-value and bypass the salience threshold.** Before `client.add`, the router
+checks two deterministic signals: a configured correction marker (defaults include `no,`, `actually`,
+`wrong`, and explicit correction phrasing), or a conservative contradiction between an extracted
+world fact and a retrieved existing fact with the same subject but a different exact IP, port, or
+enabled/disabled value. When either fires, the drain worker omits the normal salience prompt and stamps
+`capture_correction` plus `capture_correction_signal` metadata; the ordinary class partition still
+decides the destination.
+
+This detector is deliberately conservative. If a marker is missed, existing-fact lookup is disabled or
+fails, or the contradiction is semantic rather than one of the supported exact values, the turn follows
+the normal salience path. That is the documented false-negative mode: degraded to ordinary capture, not
+a second correction-specific drop path.
+
 ## OSS (Self-Hosted) Mode
 
 Run Mem0 locally with your own LLM, embedder, and vector store.
