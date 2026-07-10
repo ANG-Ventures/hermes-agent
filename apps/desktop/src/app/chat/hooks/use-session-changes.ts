@@ -15,6 +15,10 @@ export interface SessionChangesResponse {
   messages?: SessionMessage[]
 }
 
+interface ActiveListResponse {
+  sessions?: Array<{ session_id?: string; id?: string; status?: string }>
+}
+
 export interface SessionChangesTiming {
   pollIntervalMs: number
   refocusDebounceMs: number
@@ -209,6 +213,17 @@ export function stampOptimisticTranscriptRows(messages: readonly ChatMessage[], 
   return { messages: next, stampedIds }
 }
 
+export function discardUnstampedOptimisticTranscriptRows(
+  messages: readonly ChatMessage[],
+  unstampedIds: ReadonlySet<string>
+): ChatMessage[] {
+  if (!unstampedIds.size) {
+    return [...messages]
+  }
+
+  return messages.filter(message => !unstampedIds.has(message.id))
+}
+
 function isWindowFocused(): boolean {
   return typeof document.hasFocus === 'function' ? document.hasFocus() : true
 }
@@ -227,10 +242,13 @@ export function useSessionChanges({
   const controllerRef = useRef<SessionChangesController>(createSessionChangesController(messages))
   const pollTimerRef = useRef<number | null>(null)
   const refocusTimerRef = useRef<number | null>(null)
+  const scheduleWatchdogRef = useRef<() => void>(() => undefined)
+  const watchdogTimerRef = useRef<number | null>(null)
   const focusedRef = useRef(isWindowFocused())
   const inFlightRef = useRef(false)
+  const lastFrameAtRef = useRef(Date.now())
   const sessionIdRef = useRef(activeSessionId)
-  const wasBusyRef = useRef(busy)
+  const wasBusyRef = useRef(false)
 
   const eligible = Boolean(activeSessionId && currentView === 'chat' && supported && focusedRef.current)
 
@@ -249,6 +267,13 @@ export function useSessionChanges({
     if (pollTimerRef.current !== null) {
       window.clearInterval(pollTimerRef.current)
       pollTimerRef.current = null
+    }
+  }, [])
+
+  const clearWatchdogTimer = useCallback(() => {
+    if (watchdogTimerRef.current !== null) {
+      window.clearTimeout(watchdogTimerRef.current)
+      watchdogTimerRef.current = null
     }
   }, [])
 
@@ -299,6 +324,86 @@ export function useSessionChanges({
     pollTimerRef.current = window.setInterval(() => void pollOnce(), timing.pollIntervalMs)
   }, [clearPollTimer, eligible, pollOnce, timing.pollIntervalMs])
 
+  const fireHatch = useCallback(
+    (trigger: 'reconnect' | 'refocus' | 'watchdog') => {
+      const sessionId = sessionIdRef.current
+
+      if (!sessionId || !controllerRef.current.unstampedOptimisticIds.size) {
+        return
+      }
+
+      console.debug('session.changes hatch fired', { trigger })
+      controllerRef.current.suspended = false
+      clearWatchdogTimer()
+
+      updateSessionState(sessionId, state => ({
+        ...state,
+        awaitingResponse: false,
+        busy: false,
+        messages: discardUnstampedOptimisticTranscriptRows(
+          state.messages,
+          controllerRef.current.unstampedOptimisticIds
+        ),
+        streamId: null,
+        turnStartedAt: null
+      }))
+
+      controllerRef.current.unstampedOptimisticIds.clear()
+      schedulePollTimer()
+      void pollOnce()
+    },
+    [clearWatchdogTimer, pollOnce, schedulePollTimer, updateSessionState]
+  )
+
+  const scheduleWatchdog = useCallback(() => {
+    clearWatchdogTimer()
+
+    if (!focusedRef.current || !controllerRef.current.suspended) {
+      return
+    }
+
+    watchdogTimerRef.current = window.setTimeout(async () => {
+      watchdogTimerRef.current = null
+
+      const sessionId = sessionIdRef.current
+
+      if (!sessionId || !focusedRef.current || !controllerRef.current.suspended) {
+        return
+      }
+
+      if (Date.now() - lastFrameAtRef.current < timing.tSilenceMs) {
+        scheduleWatchdogRef.current()
+
+        return
+      }
+
+      console.debug('session.changes watchdog probe', { sessionId })
+
+      try {
+        const active = await requestGateway<ActiveListResponse>('session.active_list', {
+          current_session_id: sessionId
+        })
+        const own = active.sessions?.find(row => row.session_id === sessionId || row.id === sessionId)
+        const status = own?.status
+
+        if (status === 'working') {
+          lastFrameAtRef.current = Date.now()
+          scheduleWatchdogRef.current()
+
+          return
+        }
+
+        if (status === 'idle' || status === 'waiting' || status === undefined) {
+          fireHatch('watchdog')
+        }
+      } catch {
+        scheduleWatchdogRef.current()
+      }
+    }, timing.tSilenceMs)
+  }, [clearWatchdogTimer, fireHatch, requestGateway, timing.tSilenceMs])
+
+  scheduleWatchdogRef.current = scheduleWatchdog
+
   useEffect(() => {
     if (busy === wasBusyRef.current) {
       return
@@ -309,18 +414,21 @@ export function useSessionChanges({
     if (busy) {
       controllerRef.current.suspended = true
       controllerRef.current.unstampedOptimisticIds = new Set(optimisticTranscriptIds(messages))
+      lastFrameAtRef.current = Date.now()
       clearPollTimer()
+      scheduleWatchdog()
 
       return
     }
 
     controllerRef.current.suspended = false
+    clearWatchdogTimer()
     schedulePollTimer()
 
     if (eligible && !controllerRef.current.disabled) {
       void pollOnce()
     }
-  }, [busy, clearPollTimer, eligible, messages, pollOnce, schedulePollTimer])
+  }, [busy, clearPollTimer, clearWatchdogTimer, eligible, messages, pollOnce, schedulePollTimer, scheduleWatchdog])
 
   useEffect(() => {
     schedulePollTimer()
@@ -332,6 +440,7 @@ export function useSessionChanges({
     const onBlur = () => {
       focusedRef.current = false
       clearPollTimer()
+      clearWatchdogTimer()
     }
 
     const onFocus = () => {
@@ -343,6 +452,13 @@ export function useSessionChanges({
 
       refocusTimerRef.current = window.setTimeout(() => {
         refocusTimerRef.current = null
+
+        if (controllerRef.current.unstampedOptimisticIds.size) {
+          fireHatch('refocus')
+
+          return
+        }
+
         schedulePollTimer()
 
         if (sessionIdRef.current && currentView === 'chat' && supported && !controllerRef.current.disabled) {
@@ -358,16 +474,28 @@ export function useSessionChanges({
       window.removeEventListener('blur', onBlur)
       window.removeEventListener('focus', onFocus)
       clearPollTimer()
+      clearWatchdogTimer()
 
       if (refocusTimerRef.current !== null) {
         window.clearTimeout(refocusTimerRef.current)
         refocusTimerRef.current = null
       }
     }
-  }, [clearPollTimer, currentView, pollOnce, schedulePollTimer, supported, timing.refocusDebounceMs])
+  }, [
+    clearPollTimer,
+    clearWatchdogTimer,
+    currentView,
+    fireHatch,
+    pollOnce,
+    schedulePollTimer,
+    supported,
+    timing.refocusDebounceMs
+  ])
 
   return {
-    markFrame: useCallback(() => undefined, []),
+    markFrame: useCallback(() => {
+      lastFrameAtRef.current = Date.now()
+    }, []),
     markTurnComplete: useCallback(
       (sessionId: string, payload: unknown) => {
         if (!sessionId || sessionId !== sessionIdRef.current) {

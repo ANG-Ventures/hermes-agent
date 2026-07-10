@@ -10,6 +10,7 @@ import {
   advanceCursorAfterRows,
   appendFetchedMessages,
   createSessionChangesController,
+  discardUnstampedOptimisticTranscriptRows,
   extractCommittedMessageIds,
   maxCommittedMessageId,
   sessionChangesSupported,
@@ -18,6 +19,7 @@ import {
 } from './use-session-changes'
 
 const SID = 'session-1'
+type TestGatewayRequest = (method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<unknown>
 
 function message(id: string, role: ChatMessage['role'] = 'user'): ChatMessage {
   return {
@@ -54,16 +56,20 @@ function setFocused(focused: boolean) {
 
 interface HarnessProps {
   activeSessionId?: string | null
+  busy?: boolean
   currentView?: string
   initialMessages?: ChatMessage[]
-  requestGateway: ReturnType<typeof vi.fn>
+  onState?: (state: ClientSessionState) => void
+  requestGateway: TestGatewayRequest
   statusSnapshot?: StatusResponse | null
 }
 
 function Harness({
   activeSessionId = SID,
+  busy = false,
   currentView = 'chat',
   initialMessages = [message('4')],
+  onState,
   requestGateway,
   statusSnapshot = status()
 }: HarnessProps) {
@@ -91,11 +97,21 @@ function Harness({
 
   useSessionChanges({
     activeSessionId,
+    busy,
     currentView,
     messages: initialMessages,
-    requestGateway,
+    requestGateway: requestGateway as <T = unknown>(
+      method: string,
+      params?: Record<string, unknown>,
+      timeoutMs?: number
+    ) => Promise<T>,
     statusSnapshot,
-    updateSessionState: (_sessionId, updater) => updater(state)
+    updateSessionState: (_sessionId, updater) => {
+      const next = updater(state)
+      onState?.(next)
+
+      return next
+    }
   })
 
   return null
@@ -303,5 +319,92 @@ describe('useSessionChanges B4 own-turn suspension helpers', () => {
 
     expect(result.messages.map(row => row.id)).toEqual(['100', '101', '102', '103'])
     expect(advanceCursorAfterRows(99, [{ id: 100, role: 'user', content: '' }], [message('100')])).toBe(100)
+  })
+})
+
+describe('useSessionChanges B5 watchdog and hatch', () => {
+  it('does not hatch during a long quiet tool call while active_list still reports working', async () => {
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined)
+    const states: ClientSessionState[] = []
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.active_list') {
+        return { sessions: [{ session_id: SID, status: 'working' }] }
+      }
+
+      return { messages: [], last_id: 0 }
+    })
+
+    render(
+      createElement(Harness, {
+        busy: true,
+        initialMessages: [message('user-temp', 'user'), { ...message('assistant-stream-1', 'assistant'), pending: true }],
+        onState: state => states.push(state),
+        requestGateway
+      })
+    )
+
+    await act(async () => {
+      vi.advanceTimersByTime(90_000)
+      await Promise.resolve()
+    })
+
+    const probes = requestGateway.mock.calls.filter(([method]) => method === 'session.active_list')
+    const polls = requestGateway.mock.calls.filter(([method]) => method === 'session.changes')
+
+    expect(probes.length).toBeLessThanOrEqual(3)
+    expect(polls).toHaveLength(0)
+    expect(states.some(state => state.messages.length === 0)).toBe(false)
+    expect(debug).toHaveBeenCalledWith('session.changes watchdog probe', { sessionId: SID })
+  })
+
+  it('runs the refocus hatch before polling so unstamped optimistic rows cannot dedupe against committed ids', async () => {
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined)
+    const states: ClientSessionState[] = []
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.changes') {
+        return {
+          last_id: 2,
+          messages: [
+            { id: 1, role: 'user', content: 'own user' },
+            { id: 2, role: 'assistant', content: 'own assistant' }
+          ]
+        }
+      }
+
+      return { sessions: [] }
+    })
+
+    render(
+      createElement(Harness, {
+        busy: true,
+        initialMessages: [message('user-temp', 'user'), { ...message('assistant-stream-1', 'assistant'), pending: true }],
+        onState: state => states.push(state),
+        requestGateway
+      })
+    )
+
+    act(() => {
+      window.dispatchEvent(new Event('blur'))
+    })
+
+    await act(async () => {
+      window.dispatchEvent(new Event('focus'))
+      vi.advanceTimersByTime(1_000)
+      await Promise.resolve()
+    })
+
+    expect(debug).toHaveBeenCalledWith('session.changes hatch fired', { trigger: 'refocus' })
+    expect(states[0]?.messages).toEqual([])
+    expect(requestGateway.mock.calls.find(([method]) => method === 'session.changes')).toBeTruthy()
+  })
+
+  it('discards only transcript rows, leaving queued composer entries out of hatch scope', () => {
+    const queuedChip = { id: 'queue-chip-1', role: 'system', parts: [{ type: 'text', text: 'queued' }] } as ChatMessage
+    const remaining = discardUnstampedOptimisticTranscriptRows(
+      [message('user-temp', 'user'), queuedChip],
+      new Set(['user-temp'])
+    )
+
+    expect(remaining).toEqual([queuedChip])
   })
 })
