@@ -167,3 +167,48 @@ def test_decompose_no_board_default_still_scratch(kanban_home):
             t = kb.get_task(conn, child_ids[0])
     assert t.workspace_kind == "scratch"
     assert t.workspace_path is None
+
+
+def test_decompose_explicit_board_beats_ambient_current_board(
+    kanban_home, tmp_path
+):
+    """P1 (Greptile #276): the board used for the default_workdir lookup
+    must be the one the caller's connection is scoped to, NOT whatever
+    get_current_board() ambiently resolves to.
+
+    Reproduce the context leak: the caller operates on board 'proj'
+    (with a default_workdir), but the ambient current board points at a
+    DIFFERENT board 'other'. Passing board='proj' explicitly must upgrade
+    children into proj's dir; the ambient 'other' must not leak in.
+    """
+    proj = tmp_path / "proj_tree"
+    proj.mkdir()
+    other = tmp_path / "other_tree"
+    other.mkdir()
+    kb.create_board("proj", default_workdir=str(proj))
+    kb.create_board("other", default_workdir=str(other))
+
+    # Ambient current board is 'other' — the wrong one for this caller.
+    with kb.scoped_current_board("other"):
+        with kb.connect(board="proj") as conn:
+            tid = kb.create_task(
+                conn, title="scoped root", workspace_kind="scratch",
+                triage=True, board="proj",
+            )
+        with kb.connect(board="proj") as conn:
+            child_ids = kb.decompose_triage_task(
+                conn, tid, root_assignee="orch",
+                children=[{"title": "c1"}, {"title": "c2", "parents": [0]}],
+                author="decomposer",
+                board="proj",  # explicit — must win over ambient 'other'
+            )
+        with kb.connect(board="proj") as conn:
+            for cid in child_ids:
+                t = kb.get_task(conn, cid)
+                assert t.workspace_kind == "dir", (
+                    f"child {cid} not upgraded to dir: {t.workspace_kind}"
+                )
+                assert t.workspace_path == str(proj), (
+                    f"child {cid} leaked to wrong board: {t.workspace_path} "
+                    f"(expected proj tree {proj}, ambient was 'other' -> {other})"
+                )

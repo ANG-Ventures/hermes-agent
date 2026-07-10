@@ -5006,6 +5006,7 @@ def decompose_triage_task(
     children: list[dict],
     author: Optional[str] = None,
     auto_promote: bool = True,
+    board: Optional[str] = None,
 ) -> Optional[list[str]]:
     """Fan a triage task out into child tasks and promote the root to ``todo``.
 
@@ -5113,10 +5114,15 @@ def decompose_triage_task(
         # orchestration run shares the same directory.
         _board_ws_upgraded = False
         if root_ws_kind == "scratch" and not root_ws_path:
-            # Resolve the ACTIVE board, not the hardcoded default — a
-            # named board carries its own default_workdir. Mirrors the
-            # board-resolution create_task() uses for dir/worktree tasks.
-            _board_meta = read_board_metadata(get_current_board())
+            # Resolve the board ONCE and thread it explicitly, matching
+            # every other board-aware function here. Falling back to the
+            # ambient get_current_board() only when no board was passed
+            # would let a concurrent `boards switch` (or an outer
+            # HERMES_KANBAN_BOARD override) point the lookup at a
+            # different board than the caller's connection is scoped to,
+            # silently upgrading children into an unrelated project dir.
+            _resolved_board = board if board is not None else get_current_board()
+            _board_meta = read_board_metadata(_resolved_board)
             _board_default = _board_meta.get("default_workdir")
             if _board_default:
                 root_ws_kind = "dir"
@@ -5451,12 +5457,41 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
 
 
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+    """Materialize ``target`` as a linked git worktree under ``repo_root``.
+
+    When ``target`` already exists as a linked worktree of ``repo_root``,
+    reuse it — but only after confirming it is checked out on
+    ``branch_name``. A previous failed/interrupted dispatch of the same
+    task can leave the canonical ``.worktrees/<id>`` path on a stale or
+    unrelated branch; silently reusing it would run this task's work on
+    the wrong branch. If the branch differs, switch it back (creating the
+    branch if needed) so the reused checkout matches the requested branch.
+    """
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None:
         target_common = _git_common_dir(target)
         if target_common == repo_common:
+            if _git_current_branch(target) == branch_name:
+                return
+            # Reused worktree is on the wrong branch — realign it.
+            if _git_branch_exists(repo_root, branch_name):
+                switch_cmd = ["git", "-C", str(target), "checkout", branch_name]
+            else:
+                switch_cmd = ["git", "-C", str(target), "checkout", "-b", branch_name]
+            switch = subprocess.run(
+                switch_cmd,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            if switch.returncode != 0:
+                stderr = (switch.stderr or switch.stdout or "").strip()
+                raise RuntimeError(
+                    f"git checkout {branch_name} failed for reused worktree "
+                    f"{target}: {stderr}"
+                )
             return
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):

@@ -196,3 +196,44 @@ def test_resolve_worktree_own_path_on_foreign_branch_keeps_legacy_reuse(
     workspace, branch = kb._resolve_worktree_workspace(task)
     assert workspace == own.resolve()
     assert branch == "wt/foreign"
+
+
+def test_ensure_git_worktree_realigns_stale_reused_branch(kanban_home, tmp_path):
+    """P2 (Greptile #276): reusing an existing linked worktree must verify
+    and correct its branch. A previous failed/interrupted dispatch can
+    leave the canonical <repo>/.worktrees/<id> on a stale branch; reusing
+    it as-is would silently run this task on the wrong branch.
+    """
+    repo = _make_repo(tmp_path)
+    target = _add_worktree(repo, repo / ".worktrees" / "t_stale", "wt/OLD-stale")
+    # Sanity: the checkout starts on the stale branch.
+    head = subprocess.run(
+        ["git", "-C", str(target), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert head == "wt/OLD-stale"
+
+    # Ensure the worktree for the task's REAL branch — reuse must realign.
+    kb._ensure_git_worktree(repo, target, "wt/t_stale")
+
+    head = subprocess.run(
+        ["git", "-C", str(target), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert head == "wt/t_stale", (
+        f"reused worktree left on stale branch {head!r}, expected wt/t_stale"
+    )
+
+
+def test_ensure_git_worktree_same_branch_reuse_is_noop(kanban_home, tmp_path):
+    """Non-regression: reusing a worktree already on the right branch does
+    not churn (no checkout, same branch)."""
+    repo = _make_repo(tmp_path)
+    target = _add_worktree(repo, repo / ".worktrees" / "t_same", "wt/t_same")
+    # No raise, stays on branch.
+    kb._ensure_git_worktree(repo, target, "wt/t_same")
+    head = subprocess.run(
+        ["git", "-C", str(target), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert head == "wt/t_same"
