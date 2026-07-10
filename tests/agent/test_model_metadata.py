@@ -1155,6 +1155,108 @@ class TestStripProviderPrefix:
 # fetch_model_metadata — caching, TTL, slugs, failures
 # =========================================================================
 
+class TestClaudeProxyContextLengthContract:
+    """Regression: the Claude api-proxy / bridge (claude-apr/apx/bpr/bpx) serve
+    an OpenAI-compatible /v1/models that MUST carry a per-model context_length,
+    so this harness sizes auto-compaction against the real window instead of
+    the 128K probe-tier fallback.
+
+    History (2026-07-10): the proxy's /v1/models emitted model IDs with NO
+    context_length, so _resolve_endpoint_context_length returned None and the
+    resolver cached 128K for claude-fable-5 (a 1M model) — auto-compacting a
+    voice session at ~96K (0.75 * 128K) far below the real 1M window. Fixed by
+    advertising context_length in the proxy + bridge catalogs. These tests lock
+    the HARNESS side of that contract: given a proxy payload WITH context_length,
+    the endpoint parser must extract it; given one WITHOUT, resolution must fall
+    through to a probe tier (documenting the pre-fix failure so a future
+    regression is unambiguous)."""
+
+    # A realistic post-fix /v1/models body from claude-apx/proxy.js.
+    _PROXY_MODELS_BODY = {
+        "object": "list",
+        "data": [
+            {"id": "claude-fable-5", "object": "model", "created": 1, "owned_by": "anthropic",
+             "context_length": 1000000, "context_window": 1000000, "max_input_tokens": 1000000},
+            {"id": "claude-opus-4-8", "object": "model", "created": 1, "owned_by": "anthropic",
+             "context_length": 1000000, "context_window": 1000000, "max_input_tokens": 1000000},
+            {"id": "claude-sonnet-5", "object": "model", "created": 1, "owned_by": "anthropic",
+             "context_length": 1000000, "context_window": 1000000, "max_input_tokens": 1000000},
+            {"id": "claude-haiku-4-5", "object": "model", "created": 1, "owned_by": "anthropic",
+             "context_length": 200000, "context_window": 200000, "max_input_tokens": 200000},
+        ],
+    }
+
+    def _reset_endpoint_cache(self):
+        import agent.model_metadata as mm
+        mm._endpoint_model_metadata_cache = {}
+        mm._endpoint_model_metadata_cache_time = {}
+
+    def _mock_models_response(self, body):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = body
+        resp.raise_for_status = MagicMock()
+        resp.ok = True
+        return resp
+
+    def test_proxy_payload_context_length_is_extracted_per_model(self):
+        """The proxy advertises context_length; the endpoint parser must read
+        1M for the large models and 200K for haiku — NOT a probe fallback."""
+        import agent.model_metadata as mm
+        self._reset_endpoint_cache()
+        base_url = "http://100.92.54.25:18801/anthropic"  # a real apx tailscale endpoint shape
+
+        with patch("agent.model_metadata.is_local_endpoint", return_value=False), \
+             patch("agent.model_metadata.requests.get",
+                   return_value=self._mock_models_response(self._PROXY_MODELS_BODY)):
+            meta = mm.fetch_endpoint_model_metadata(base_url, api_key="", force_refresh=True)
+
+        assert meta.get("claude-fable-5", {}).get("context_length") == 1_000_000
+        assert meta.get("claude-opus-4-8", {}).get("context_length") == 1_000_000
+        assert meta.get("claude-sonnet-5", {}).get("context_length") == 1_000_000
+        assert meta.get("claude-haiku-4-5", {}).get("context_length") == 200_000
+
+    def test_resolve_endpoint_context_length_returns_real_window_not_probe_fallback(self):
+        """End-to-end: _resolve_endpoint_context_length on a proxy that advertises
+        1M returns 1_000_000 — the exact value that stops the 96K over-compaction."""
+        import agent.model_metadata as mm
+        self._reset_endpoint_cache()
+        base_url = "http://127.0.0.1:18810/anthropic"  # the claude-apr pool passthrough
+
+        with patch("agent.model_metadata.is_local_endpoint", return_value=False), \
+             patch("agent.model_metadata.requests.get",
+                   return_value=self._mock_models_response(self._PROXY_MODELS_BODY)):
+            ctx = mm._resolve_endpoint_context_length("claude-fable-5", base_url, api_key="")
+
+        assert ctx == 1_000_000, (
+            f"claude-fable-5 must resolve to its advertised 1M window, got {ctx} "
+            "(a 128K here is the exact pre-fix bug: 0.75*128K=96K over-compaction)"
+        )
+
+    def test_missing_context_length_falls_through_to_probe_tier_documents_prefix_bug(self):
+        """The PRE-FIX shape (no context_length) must NOT silently resolve to a
+        real window — it returns None so the caller drops to a probe tier. This
+        pins the failure mode: if the proxy ever regresses to an unadvertised
+        catalog, resolution is None (probe fallback), never a wrong confident value."""
+        import agent.model_metadata as mm
+        self._reset_endpoint_cache()
+        base_url = "http://100.92.54.25:18801/anthropic"
+        prefix_bug_body = {
+            "object": "list",
+            "data": [{"id": "claude-fable-5", "object": "model", "created": 1, "owned_by": "anthropic"}],
+        }
+
+        with patch("agent.model_metadata.is_local_endpoint", return_value=False), \
+             patch("agent.model_metadata.requests.get",
+                   return_value=self._mock_models_response(prefix_bug_body)):
+            ctx = mm._resolve_endpoint_context_length("claude-fable-5", base_url, api_key="")
+
+        assert ctx is None, (
+            "An unadvertised catalog must resolve to None (probe fallback), not a "
+            f"confident wrong window; got {ctx}"
+        )
+
+
 class TestFetchModelMetadata:
     def _reset_cache(self):
         import agent.model_metadata as mm
