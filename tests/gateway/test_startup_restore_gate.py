@@ -1,0 +1,116 @@
+"""Tests for the startup-restore queue ACK.
+
+Covers the user-facing half of the "slash command silently queued after a
+restart" bug. The *bounded wait* half (a slow boot-resume turn holding the
+inbound gate) shipped separately in PR #256; this adds the missing feedback:
+when a fresh inbound message is queued during startup restore, the user gets a
+one-time "still starting up" ack per chat instead of silence.
+"""
+
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
+
+from gateway.config import Platform
+from gateway.run import GatewayRunner
+from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+
+
+def _bind(runner):
+    """Bind the ack methods-under-test onto an object.__new__ runner."""
+    for name in (
+        "_queue_startup_restore_event",
+        "_maybe_ack_startup_restore_queue",
+        "_send_startup_restore_ack",
+    ):
+        setattr(runner, name, getattr(GatewayRunner, name).__get__(runner, GatewayRunner))
+    return runner
+
+
+def _make_event(source):
+    ev = MagicMock()
+    ev.source = source
+    ev.internal = False
+    return ev
+
+
+class TestQueueAck:
+    def test_ack_sent_once_per_chat(self):
+        adapter = AsyncMock()
+        runner, _ = make_restart_runner()
+        _bind(runner)
+        runner.adapters = {Platform.TELEGRAM: adapter}
+        runner._startup_restore_in_progress = True
+
+        async def _drive():
+            src = make_restart_source(chat_id="c1")
+            runner._queue_startup_restore_event(_make_event(src))
+            runner._queue_startup_restore_event(_make_event(src))
+            runner._queue_startup_restore_event(_make_event(src))
+            await asyncio.sleep(0.05)  # let fire-and-forget ack tasks run
+
+        asyncio.run(_drive())
+        # Three queued messages, ONE ack; all three still queued for the drain.
+        assert adapter.send.await_count == 1
+        assert len(runner._startup_restore_queue) == 3
+
+    def test_ack_per_distinct_chat(self):
+        adapter = AsyncMock()
+        runner, _ = make_restart_runner()
+        _bind(runner)
+        runner.adapters = {Platform.TELEGRAM: adapter}
+        runner._startup_restore_in_progress = True
+
+        async def _drive():
+            runner._queue_startup_restore_event(_make_event(make_restart_source(chat_id="a")))
+            runner._queue_startup_restore_event(_make_event(make_restart_source(chat_id="b")))
+            await asyncio.sleep(0.05)
+
+        asyncio.run(_drive())
+        assert adapter.send.await_count == 2
+
+    def test_ack_reset_between_restore_cycles(self):
+        adapter = AsyncMock()
+        runner, _ = make_restart_runner()
+        _bind(runner)
+        runner.adapters = {Platform.TELEGRAM: adapter}
+        runner._startup_restore_in_progress = True
+
+        async def _drive():
+            src = make_restart_source(chat_id="c1")
+            runner._queue_startup_restore_event(_make_event(src))
+            await asyncio.sleep(0.02)
+            # Simulate a NEW restart cycle resetting the dedupe set.
+            runner._startup_restore_acked_chats = set()
+            runner._queue_startup_restore_event(_make_event(src))
+            await asyncio.sleep(0.02)
+
+        asyncio.run(_drive())
+        assert adapter.send.await_count == 2
+
+    def test_no_ack_when_adapter_missing(self):
+        runner, _ = make_restart_runner()
+        _bind(runner)
+        runner.adapters = {}  # no adapter for the platform
+        runner._startup_restore_in_progress = True
+
+        async def _drive():
+            runner._queue_startup_restore_event(_make_event(make_restart_source(chat_id="c1")))
+            await asyncio.sleep(0.02)
+
+        asyncio.run(_drive())  # must not raise; simply no ack
+        assert len(runner._startup_restore_queue) == 1
+
+    def test_ack_send_failure_is_swallowed(self):
+        adapter = AsyncMock()
+        adapter.send.side_effect = RuntimeError("boom")
+        runner, _ = make_restart_runner()
+        _bind(runner)
+        runner.adapters = {Platform.TELEGRAM: adapter}
+        runner._startup_restore_in_progress = True
+
+        async def _drive():
+            runner._queue_startup_restore_event(_make_event(make_restart_source(chat_id="c1")))
+            await asyncio.sleep(0.05)
+
+        asyncio.run(_drive())  # a failing ack must not break queuing
+        assert len(runner._startup_restore_queue) == 1

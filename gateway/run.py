@@ -8044,8 +8044,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             queue = []
             self._startup_restore_queue = queue
         queue.append(event)
+        source = getattr(event, "source", None)
         try:
-            source = event.source
             logger.info(
                 "Queued inbound message during gateway startup restore: platform=%s chat=%s",
                 source.platform.value if source and source.platform else "unknown",
@@ -8053,6 +8053,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             pass
+        # Acknowledge ONCE per chat so the user isn't left staring at silence —
+        # a queued message (esp. a slash command) otherwise looks dead until the
+        # gate releases. The gate is already bounded (see _finish_startup_restore),
+        # but even a bounded wait is long enough to look broken; the ack tells the
+        # user their message landed. One ack per (platform, chat) avoids spamming a
+        # burst of queued messages; fire-and-forget so queuing stays non-blocking.
+        self._maybe_ack_startup_restore_queue(source)
+
+    def _maybe_ack_startup_restore_queue(self, source: Any) -> None:
+        """Send a single 'still starting up' ack per chat for queued inbound."""
+        if source is None:
+            return
+        platform = getattr(source, "platform", None)
+        chat_id = getattr(source, "chat_id", None)
+        if platform is None or chat_id is None:
+            return
+        acked = getattr(self, "_startup_restore_acked_chats", None)
+        if acked is None:
+            acked = set()
+            self._startup_restore_acked_chats = acked
+        key = (getattr(platform, "value", platform), str(chat_id))
+        if key in acked:
+            return
+        acked.add(key)
+        adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
+        if adapter is None:
+            return
+        try:
+            task = asyncio.create_task(
+                self._send_startup_restore_ack(adapter, chat_id)
+            )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        except RuntimeError:
+            # No running loop (shouldn't happen on the gateway path); skip the ack.
+            pass
+
+    async def _send_startup_restore_ack(self, adapter: Any, chat_id: Any) -> None:
+        try:
+            await adapter.send(
+                chat_id,
+                "⏳ Still starting up — your message is queued and I'll get to it "
+                "in a moment.",
+            )
+        except Exception as e:
+            logger.debug("startup-restore ack send failed: %s", e)
 
     async def _drain_startup_restore_queue(self) -> int:
         """Replay inbound messages queued while startup auto-resume ran."""
@@ -8711,6 +8757,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._startup_restore_in_progress = True
         self._startup_restore_queue = []
         self._startup_restore_tasks = []
+        # Reset per-restore-cycle ack dedupe so a fresh restart re-acks queued chats.
+        self._startup_restore_acked_chats = set()
 
         connected_count = 0
         enabled_platform_count = 0
