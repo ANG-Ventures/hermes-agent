@@ -1628,6 +1628,27 @@ def _fallback_reason_label(reason: "Any | None") -> "str | None":
     return _FALLBACK_REASON_LABELS.get(val, _GENERIC_FALLBACK_LABEL)
 
 
+def _resolve_failover_reason(agent, reason: "Any | None") -> "Any | None":
+    """Resolve the effective failover reason and clear the pending stamp.
+
+    Invariant (unit-tested in test_fallback_reason_surfacing):
+    - An EXPLICIT reason at the call site always wins — the stamp never
+      overrides it.
+    - A reason-less call (``reason is None``, the loop's stub/empty/invalid
+      failover sites) is backfilled from ``agent._pending_stream_error_reason``,
+      which the streaming helper stamps when it swallows a mid-stream fault into
+      a partial-stream stub.
+    - Consume-once: the stamp is cleared UNCONDITIONALLY so it can never leak
+      into an unrelated later failover.
+    """
+    if reason is None:
+        _pending = getattr(agent, "_pending_stream_error_reason", None)
+        if _pending is not None:
+            reason = _pending
+    agent._pending_stream_error_reason = None
+    return reason
+
+
 def _emit_fallback_announce(
     agent,
     old_model: str,
@@ -1899,13 +1920,10 @@ def try_activate_fallback(
     # helper stamps ``_pending_stream_error_reason`` when it swallows a stream
     # fault into a stub, so pick it up here — this is what makes the route-change
     # announce say WHY (e.g. "(connection dropped)") instead of a bare line for
-    # the peer-closed stream-drop class (2026-07-10). Consume-once: cleared
-    # immediately so it can't leak into an unrelated later failover.
-    if reason is None:
-        _pending = getattr(agent, "_pending_stream_error_reason", None)
-        if _pending is not None:
-            reason = _pending
-    agent._pending_stream_error_reason = None
+    # the peer-closed stream-drop class (2026-07-10). Extracted to a pure helper
+    # so the explicit-wins / backfill / consume-once invariant is unit-testable
+    # without driving the whole provider-resolution path.
+    reason = _resolve_failover_reason(agent, reason)
     # A safety refusal (content_policy_blocked) is deterministic for the
     # unchanged prompt, exactly like a rate-limit is deterministic for its
     # window: restoring the primary next turn just reproduces the refusal and
@@ -3943,9 +3961,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _stub._content_filter_terminated = True
             # Stamp the classified transport/stream reason on the agent so the
             # loop's reason-less failover sites (empty-response, length-stub,
-            # invalid-response) surface it in the route-change announce. Set
-            # only when we actually classified something; a genuine
-            # content-filter uses its own dedicated reason plumbing.
+            # invalid-response) surface it in the route-change announce. This
+            # stamps for EVERY classified reason (content_policy_blocked
+            # included) — it's a fallback only: any explicit reason passed to
+            # try_activate_fallback wins over the stamp, and a content-filter
+            # stream stall already carries its own reason via the
+            # _content_filter_terminated escalation path.
             if _stream_error_reason is not None:
                 agent._pending_stream_error_reason = _stream_error_reason
             # Partial-stream stub: chunks WERE received (deltas fired), so

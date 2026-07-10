@@ -18,6 +18,7 @@ class _StubAgent:
         self._last_fallback_announced = None
         self._last_fallback_event = None
         self.context_compressor = None
+        self._pending_stream_error_reason = None
 
     def _emit_status(self, msg):
         self.emitted.append(msg)
@@ -105,41 +106,44 @@ class TestAnnounceRendersReason:
 
 
 class TestStreamErrorReasonThreading:
-    """End-to-end: a partial-stream stub stamps _pending_stream_error_reason, and
-    a subsequent reason-less try_activate_fallback() call backfills it so the
-    route-change announce names WHY (the 2026-07-10 peer-closed drop that fired a
-    bare line)."""
+    """The reason-resolution invariant behind naming WHY a stream-drop failover
+    changed the route (the 2026-07-10 peer-closed drop that fired a bare line).
+    Tests the pure resolver directly so explicit-wins / backfill / consume-once
+    are asserted on the EFFECTIVE reason, not just a cleared stamp."""
 
-    def _fallback_agent(self, pending):
-        """Minimal agent carrying just what try_activate_fallback's reason-backfill
-        prologue reads before the chain-exhausted early return."""
+    def _agent(self, pending):
         a = _StubAgent()
         a._pending_stream_error_reason = pending
-        a._fallback_index = 0
-        a._fallback_chain = []  # empty → early-return after the backfill+cooldown
-        a._fallback_activated = False
-        a.provider = "claude-app"
-        a._primary_runtime = {"provider": "claude-app"}
-        a._rate_limited_until = 0
         return a
 
-    def test_reasonless_call_consumes_pending_stamp(self):
-        from agent.chat_completion_helpers import try_activate_fallback
-        a = self._fallback_agent(FailoverReason.timeout)
+    def test_reasonless_call_backfills_from_stamp(self):
+        from agent.chat_completion_helpers import _resolve_failover_reason
+        a = self._agent(FailoverReason.timeout)
         # reason=None (the loop's stub failover sites) → backfilled from the stamp
-        try_activate_fallback(a, None)
-        # Consumed-once: cleared so it can't leak into a later unrelated failover.
-        assert a._pending_stream_error_reason is None
+        eff = _resolve_failover_reason(a, None)
+        assert eff == FailoverReason.timeout          # the announce will name it
+        assert a._pending_stream_error_reason is None  # consume-once
 
     def test_explicit_reason_wins_over_stamp(self):
-        from agent.chat_completion_helpers import try_activate_fallback
-        a = self._fallback_agent(FailoverReason.timeout)
-        # An explicit reason at the call site must not be clobbered by the stamp.
-        try_activate_fallback(a, FailoverReason.rate_limit)
+        from agent.chat_completion_helpers import _resolve_failover_reason
+        a = self._agent(FailoverReason.timeout)
+        # An explicit reason at the call site must be the EFFECTIVE reason —
+        # the stamp must not override it (this is the invariant the name promises).
+        eff = _resolve_failover_reason(a, FailoverReason.rate_limit)
+        assert eff == FailoverReason.rate_limit
+        assert a._pending_stream_error_reason is None  # stamp still consumed
+
+    def test_reasonless_call_no_stamp_returns_none(self):
+        from agent.chat_completion_helpers import _resolve_failover_reason
+        a = self._agent(None)
+        eff = _resolve_failover_reason(a, None)
+        assert eff is None                             # → bare line, correctly
         assert a._pending_stream_error_reason is None
 
-    def test_stamp_cleared_even_when_absent(self):
-        from agent.chat_completion_helpers import try_activate_fallback
-        a = self._fallback_agent(None)
-        try_activate_fallback(a, None)
-        assert a._pending_stream_error_reason is None
+    def test_backfilled_reason_renders_rider_end_to_end(self):
+        # The stamped reason, once resolved, must produce a real announce rider.
+        from agent.chat_completion_helpers import _resolve_failover_reason
+        a = self._agent(FailoverReason.timeout)
+        eff = _resolve_failover_reason(a, None)
+        out = _announce(reason=eff)
+        assert "Model fallback (connection dropped):" in out[0]
