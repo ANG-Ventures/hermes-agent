@@ -698,6 +698,12 @@ function withUniqueToolCallIds(messages: ChatMessage[]): ChatMessage[] {
   })
 }
 
+function storedMessageId(message: SessionMessage, fallback: string): string {
+  const id = message.id
+
+  return id === undefined || id === null || id === '' ? fallback : String(id)
+}
+
 export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
   const result: ChatMessage[] = []
   let pendingToolParts: ChatMessagePart[] = []
@@ -834,7 +840,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     }
 
     result.push({
-      id: `${message.timestamp || Date.now()}-${index}-${message.role}`,
+      id: storedMessageId(message, `${message.timestamp || Date.now()}-${index}-${message.role}`),
       role: message.role,
       parts,
       timestamp: message.timestamp
