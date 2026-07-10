@@ -1256,6 +1256,93 @@ class TestClaudeProxyContextLengthContract:
             f"confident wrong window; got {ctx}"
         )
 
+    def test_full_resolution_end_to_end_through_local_proxy_all_three_layers(self, tmp_path, monkeypatch):
+        """INTEGRATION guard for the whole 2026-07-10 three-bug chain.
+
+        Each bug had its own unit test, yet the FULL get_model_context_length()
+        path still returned 128K because the bugs composed: the endpoint is a
+        LOOPBACK Claude proxy, so resolution goes local-server-detection →
+        local ctx probe BEFORE the /v1/models catalog. This test drives the
+        real get_model_context_length() against a faithful proxy mock that
+        reproduces ALL of the proxy's surfaces at once, and asserts the
+        composed result is the real 1M window — the exact thing that was broken
+        while every unit test was green.
+
+        The three layers it exercises in one path:
+          1. detect_local_server_type must NOT classify the proxy as lm-studio
+             (it answers /api/v1/models 200 with an OpenAI list envelope);
+          2. the local ctx probe must read the Anthropic passthrough's
+             max_input_tokens (1M), NOT max_tokens (128K output cap);
+          3. the /v1/models catalog advertises context_length=1M as the backstop.
+        """
+        import agent.model_metadata as mm
+        self._reset_endpoint_cache()
+        mm._endpoint_probe_path_cache = {}
+        mm._LOCAL_CTX_PROBE_CACHE = {}
+        # Isolate the persistent cache so a poisoned disk row can't short-circuit.
+        cache_file = tmp_path / "context_length_cache.yaml"
+        monkeypatch.setattr(mm, "_get_context_cache_path", lambda: cache_file)
+
+        base_url = "http://127.0.0.1:18801/anthropic"  # loopback → the local path
+
+        # Faithful Claude-proxy surface map, keyed by the path suffix each
+        # probe hits. This is what claude-apx actually serves.
+        openai_catalog = {
+            "object": "list",
+            "data": [
+                {"id": "claude-fable-5", "object": "model", "created": 1,
+                 "owned_by": "anthropic", "context_length": 1000000,
+                 "context_window": 1000000, "max_input_tokens": 1000000},
+            ],
+        }
+        ollama_tags = {"models": [{"name": "claude-fable-5", "model": "claude-fable-5",
+                                   "context_length": 1000000, "details": {}}]}
+        # The Anthropic passthrough of GET /v1/models/{id}: BOTH fields present.
+        single_model = {"type": "model", "id": "claude-fable-5",
+                        "max_input_tokens": 1000000, "max_tokens": 128000}
+
+        def _resp(status, body):
+            r = MagicMock(); r.status_code = status; r.ok = status < 400
+            r.json.return_value = body
+            r.raise_for_status = MagicMock()
+            return r
+
+        def httpx_get(url, *a, **k):
+            if url.endswith("/api/v1/models"):
+                return _resp(200, openai_catalog)      # NOT lm-studio shape
+            if url.endswith("/api/tags"):
+                return _resp(200, ollama_tags)          # ollama signature
+            if url.endswith("/v1/models/claude-fable-5"):
+                return _resp(200, single_model)         # the max_tokens trap
+            if url.endswith("/v1/models"):
+                return _resp(200, openai_catalog)
+            return _resp(404, {})
+
+        def requests_get(url, *a, **k):
+            if url.rstrip("/").endswith("/models"):
+                return self._mock_models_response(openai_catalog)
+            return _resp(404, {})
+
+        httpx_client = MagicMock()
+        httpx_client.__enter__ = lambda s: httpx_client
+        httpx_client.__exit__ = MagicMock(return_value=False)
+        httpx_client.get.side_effect = httpx_get
+        httpx_client.post.side_effect = lambda url, *a, **k: _resp(200, {})  # /api/show → {}
+
+        with patch("httpx.Client", return_value=httpx_client), \
+             patch("agent.model_metadata.requests.get", side_effect=requests_get):
+            ctx = mm.get_model_context_length(
+                model="claude-fable-5", base_url=base_url, api_key="",
+                provider="claude-apx-1",
+            )
+
+        assert ctx == 1_000_000, (
+            f"full local-proxy resolution must land on the real 1M window, got {ctx}. "
+            "A 128K here means one of the three layers regressed (lm-studio "
+            "misdetect / max_tokens-as-context / unadvertised catalog) and the "
+            "chain collapsed the window again."
+        )
+
 
 class TestFetchModelMetadata:
     def _reset_cache(self):
