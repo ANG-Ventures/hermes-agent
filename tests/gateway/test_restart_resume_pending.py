@@ -1420,6 +1420,52 @@ async def test_startup_restore_gate_releases_when_a_resume_turn_runs_long(monkey
     slow_task.cancel()
 
 
+@pytest.mark.asyncio
+async def test_background_resume_result_logs_late_failure_not_success_or_cancel():
+    """A boot-resume turn that outlives the startup-restore gate and later FAILS
+    must still be logged, not silently swallowed once it's discarded from
+    ``_background_tasks`` (Greptile P2). Success and cancellation are quiet.
+    """
+    from gateway.run import GatewayRunner
+
+    async def _boom():
+        raise RuntimeError("late resume failure")
+
+    async def _ok():
+        return "fine"
+
+    async def _blocks():
+        await asyncio.Event().wait()
+
+    # Failure => logged.
+    failed = asyncio.create_task(_boom())
+    try:
+        await failed
+    except RuntimeError:
+        pass
+    with patch("gateway.run.logger") as mock_logger:
+        GatewayRunner._log_background_resume_result(failed)
+        assert mock_logger.debug.call_count == 1
+
+    # Success => quiet.
+    ok = asyncio.create_task(_ok())
+    await ok
+    with patch("gateway.run.logger") as mock_logger:
+        GatewayRunner._log_background_resume_result(ok)
+        assert mock_logger.debug.call_count == 0
+
+    # Cancellation (shutdown) => quiet, and must not raise on .exception().
+    cancelled = asyncio.create_task(_blocks())
+    cancelled.cancel()
+    try:
+        await cancelled
+    except asyncio.CancelledError:
+        pass
+    with patch("gateway.run.logger") as mock_logger:
+        GatewayRunner._log_background_resume_result(cancelled)
+        assert mock_logger.debug.call_count == 0
+
+
 # ---------------------------------------------------------------------------
 # Shutdown banner wording
 # ---------------------------------------------------------------------------

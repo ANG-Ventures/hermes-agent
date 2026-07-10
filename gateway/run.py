@@ -7477,6 +7477,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         timeout,
                         len(pending),
                     )
+                    # These tasks keep running after we release the gate. Their
+                    # normal done-callback only discards them from
+                    # _background_tasks, so a LATER failure would be silently
+                    # swallowed. Attach a logging callback so a background
+                    # resume turn that fails after the timeout is still recorded.
+                    for task in pending:
+                        task.add_done_callback(self._log_background_resume_result)
             else:
                 # Non-positive timeout => opt out of the bound (pre-fix
                 # "wait forever" behaviour). gather awaits every task, so they
@@ -7495,6 +7502,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._startup_restore_in_progress = False
         if drained:
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
+
+    @staticmethod
+    def _log_background_resume_result(task: "asyncio.Task") -> None:
+        """Done-callback for a boot-resume turn that outlived the startup-restore
+        gate. Logs a late failure that would otherwise be swallowed once the
+        task is discarded from ``_background_tasks``. Cancellation is expected
+        (shutdown) and not an error."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.debug(
+                "background startup auto-resume task failed after gate release",
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
