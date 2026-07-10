@@ -1271,6 +1271,16 @@ def _dashboard_session_sync_status_config(config: dict | None = None) -> dict[st
     }
 
 
+def _dashboard_state_db_path() -> Path:
+    return (Path(get_hermes_home()) / "state.db").expanduser().resolve()
+
+
+def _log_dashboard_state_db_path() -> Path:
+    path = _dashboard_state_db_path()
+    _log.info("Dashboard state.db path: %s", path)
+    return path
+
+
 # Image MIME types this endpoint will serve. Extension-allowlisted so an
 # authenticated caller can't pull non-image files through it.
 _MEDIA_CONTENT_TYPES = {
@@ -17174,6 +17184,8 @@ def start_server(
     the banner announces the bind rather than a browser URL.
     """
     import uvicorn
+
+    _log_dashboard_state_db_path()
 
     try:
         from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
