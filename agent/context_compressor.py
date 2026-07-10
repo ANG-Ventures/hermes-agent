@@ -781,6 +781,7 @@ class ContextCompressor(ContextEngine):
         # conversation must NOT scale down a fresh session's first preflight before it
         # has its own real usage (Greptile #111). Fresh session → skew 1.0 = raw rough.
         self.reset_skew_calibration()
+        self._clear_persisted_skew_history()
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Clear all per-session compaction state at a real session boundary.
@@ -817,6 +818,29 @@ class ContextCompressor(ContextEngine):
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
         self.awaiting_real_usage_after_compression = False
+        # In-memory skew resets with the rest of the per-session state, but the
+        # PERSISTED row must survive: the gateway calls on_session_end() on
+        # cached agents during SHUTDOWN (shutdown_memory_provider), which is
+        # not a real conversation boundary — the same session resumes right
+        # after, and wiping the row here defeats the restart seed entirely
+        # (found by the 2026-07-10 restart-B live E2E: row gone at boot,
+        # skew back to 1.0). Persisted rows are keyed by session_id, which is
+        # unique per conversation — a stale row can never contaminate a
+        # different session, so leaving it is safe; a genuinely dead session's
+        # row is just inert data on its own sessions row.
+        self.reset_skew_calibration()
+
+    def _clear_persisted_skew_history(self) -> None:
+        """Best-effort: drop the persisted skew history for the bound session."""
+        try:
+            session_db = getattr(self, "_session_db", None)
+            session_id = getattr(self, "_session_id", "")
+            if session_db and session_id:
+                clearer = getattr(session_db, "clear_compression_skew_history", None)
+                if clearer is not None:
+                    clearer(session_id)
+        except Exception:
+            pass
 
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
         """Bind the current session row so durable cooldowns can round-trip."""
@@ -825,6 +849,18 @@ class ContextCompressor(ContextEngine):
         self._summary_failure_cooldown_until = 0.0
         self._last_summary_error = None
         self.get_active_compression_failure_cooldown()
+        # Seed the P2 skew calibration from the persisted per-session history
+        # so a gateway/process restart doesn't revert the first preflight to
+        # skew=1.0 (raw rough) — on a large session whose rough estimate
+        # over-counts, that false-fired compression at ~48% real usage
+        # (2026-07-10 incident). seed only fills an EMPTY in-memory history.
+        try:
+            if session_db and self._session_id:
+                getter = getattr(session_db, "get_compression_skew_history", None)
+                if getter is not None:
+                    self.seed_skew_calibration(getter(self._session_id))
+        except Exception:
+            pass
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         """Bind session-scoped compression state for a new or resumed session."""
