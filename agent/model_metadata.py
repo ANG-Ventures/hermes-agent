@@ -768,11 +768,11 @@ def _is_lmstudio_models_payload(response: Any) -> bool:
     """Return True only if an `/api/v1/models` 200 is genuinely LM Studio.
 
     LM Studio's native listing is `{"data": [{...lm-studio fields...}]}` (its
-    REST API also nests under `data`, but each entry carries LM Studio-native
-    fields the OpenAI envelope never has: `loaded_instances`, a `state`, a
-    `type` like "llm"/"embeddings", `max_context_length`, `arch`, or a
-    publisher-qualified `key`). A generic OpenAI-compatible server (e.g. a
-    loopback Claude/Anthropic proxy that answers `/api/v1/models` for model-name
+    REST API nests under `data`, but each entry carries LM Studio-native fields
+    the OpenAI envelope never has: `loaded_instances`, `max_context_length`,
+    `arch`, a publisher-qualified `key`, or a `type` like "llm"/"embeddings"
+    paired with a `state`). A generic OpenAI-compatible server (e.g. a loopback
+    Claude/Anthropic proxy that answers `/api/v1/models` for model-name
     validation) returns `{"object":"list","data":[{"id","object":"model",...}]}`
     with NONE of those fields. Distinguishing on the entry SHAPE — not a bare
     200 — stops the misdetection that routed such proxies into the LM Studio
@@ -781,13 +781,17 @@ def _is_lmstudio_models_payload(response: Any) -> bool:
     Fails closed: any parse error or unrecognized shape returns False (the
     caller then continues its detection waterfall / OpenAI-compat path).
     """
-    _LMSTUDIO_ENTRY_MARKERS = (
+    # Strong LM Studio-native markers: a single one is decisive. `state`/`type`
+    # are individually too generic (common in arbitrary JSON), so they only
+    # count TOGETHER (an entry that carries both a `type` and a `state`), never
+    # on their own — this avoids classifying a bespoke proxy whose entries
+    # happen to carry a lone `type`/`state` as LM Studio.
+    _LMSTUDIO_STRONG_MARKERS = (
         "loaded_instances",
-        "state",
-        "type",
         "max_context_length",
         "arch",
         "publisher",
+        "key",  # publisher-qualified id, e.g. "qwen/qwen3-4b"
     )
     try:
         data = response.json()
@@ -796,20 +800,31 @@ def _is_lmstudio_models_payload(response: Any) -> bool:
     if not isinstance(data, dict):
         return False
     # An explicit OpenAI list envelope is a strong NEGATIVE signal — LM Studio's
-    # native payload does not stamp object="list".
+    # native payload does not stamp object="list". This rejects every standard
+    # OpenAI-compatible server (vLLM, Ollama's OpenAI-compat layer, our Claude
+    # proxy, …) regardless of what entry fields it carries.
     if data.get("object") == "list":
         return False
-    entries = data.get("models")
+    # LM Studio's native listing keys entries under `data`; some builds use
+    # `models`. Prefer a `models`-keyed list as itself a positive signal (the
+    # OpenAI envelope never uses that key), then fall back to `data`.
+    lmstudio_keyed = isinstance(data.get("models"), list)
+    entries = data.get("models") if lmstudio_keyed else data.get("data")
     if not isinstance(entries, list):
-        # Some LM Studio builds key the native listing under `data`; accept it
-        # only when the entries actually look LM Studio-native (below).
-        entries = data.get("data")
-    if not isinstance(entries, list) or not entries:
         return False
+    if not entries:
+        # An idle LM Studio (started, no model loaded) returns an empty list.
+        # Accept it ONLY on the LM Studio-native `models` key — an empty
+        # `{"data": []}` is too ambiguous (an idle OpenAI server looks identical
+        # once the `object:"list"` envelope is absent), so fail closed there.
+        return lmstudio_keyed
     first = entries[0]
     if not isinstance(first, dict):
         return False
-    return any(marker in first for marker in _LMSTUDIO_ENTRY_MARKERS)
+    if any(marker in first for marker in _LMSTUDIO_STRONG_MARKERS):
+        return True
+    # `type` + `state` together (neither alone) is an acceptable weaker signal.
+    return "type" in first and "state" in first
 
 
 def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:

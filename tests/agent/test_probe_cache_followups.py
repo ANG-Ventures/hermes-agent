@@ -253,13 +253,21 @@ class TestDetectLocalServerTypeCache:
         def _resp(payload):
             r = MagicMock(); r.json.return_value = payload; return r
 
-        # Genuine LM Studio native entries (any one marker suffices).
+        # Genuine LM Studio native entries (any one strong marker suffices).
         assert _is_lmstudio_models_payload(_resp(
-            {"data": [{"id": "m", "type": "llm", "state": "loaded"}]}))
+            {"data": [{"id": "m", "loaded_instances": []}]}))
         assert _is_lmstudio_models_payload(_resp(
-            {"models": [{"key": "pub/m", "loaded_instances": []}]}))
+            {"models": [{"key": "pub/m"}]}))
         assert _is_lmstudio_models_payload(_resp(
             {"data": [{"id": "m", "max_context_length": 32768}]}))
+        # `key` alone is now a decisive marker (docstring↔tuple consistency).
+        assert _is_lmstudio_models_payload(_resp(
+            {"data": [{"key": "publisher/model-a"}]}))
+        # `type`+`state` together is an acceptable weaker signal.
+        assert _is_lmstudio_models_payload(_resp(
+            {"data": [{"id": "m", "type": "llm", "state": "loaded"}]}))
+        # An idle LM Studio (no models) on the native `models` key is accepted.
+        assert _is_lmstudio_models_payload(_resp({"models": []}))
         # OpenAI envelope — must be rejected.
         assert not _is_lmstudio_models_payload(_resp(
             {"object": "list", "data": [{"id": "m", "object": "model", "owned_by": "anthropic"}]}))
@@ -267,9 +275,16 @@ class TestDetectLocalServerTypeCache:
         # markers is rejected (fail-closed).
         assert not _is_lmstudio_models_payload(_resp(
             {"data": [{"id": "m", "object": "model", "created": 1, "owned_by": "x"}]}))
+        # A lone generic `type` or `state` (no strong marker, not both) is NOT
+        # enough — avoids false-positiving a bespoke proxy.
+        assert not _is_lmstudio_models_payload(_resp(
+            {"data": [{"id": "m", "type": "chat"}]}))
+        assert not _is_lmstudio_models_payload(_resp(
+            {"data": [{"id": "m", "state": "ready"}]}))
+        # An ambiguous empty `{"data": []}` (no native `models` key) fails closed.
+        assert not _is_lmstudio_models_payload(_resp({"data": []}))
         # Malformed / empty → False, never raises.
         assert not _is_lmstudio_models_payload(_resp({}))
-        assert not _is_lmstudio_models_payload(_resp({"data": []}))
         bad = MagicMock(); bad.json.side_effect = ValueError("no json")
         assert not _is_lmstudio_models_payload(bad)
 
