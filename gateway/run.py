@@ -8178,6 +8178,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         scheduled at startup is never resumed a second time.
         """
         window = _auto_continue_freshness_window()
+
+        # Resume-request DROPBOX (SGR-6EA95669): external tools (the
+        # safe-restart watcher) ask for a resume via atomic request files in
+        # <HERMES_HOME>/gateway/resume_requests/ instead of editing
+        # sessions.json (two-writers/last-writer-wins clobber race — the old
+        # gateway's final save during a drain overwrote the watcher's flag,
+        # and this method's boot enumeration then never saw the session).
+        # Consuming requests HERE, before the candidate snapshot, means a
+        # request flows through the exact same gates as a gateway-marked
+        # session: mark_resume_pending (suspended wins), _AUTO_RESUME_REASONS,
+        # allowlist auth, loop breaker, freshness window. Fail-open: a broken
+        # dropbox must never block resume of gateway-marked sessions.
+        try:
+            from gateway import resume_requests as _resume_requests
+
+            for _req_key, _req_reason in _resume_requests.sweep_resume_requests(
+                _hermes_home
+            ):
+                try:
+                    if self.session_store.mark_resume_pending(_req_key, _req_reason):
+                        logger.warning(
+                            "PHASE=dropbox_resume key=%s reason=%s (external "
+                            "resume request honored)",
+                            _req_key, _req_reason,
+                        )
+                    else:
+                        logger.warning(
+                            "PHASE=dropbox_resume_skipped key=%s reason=%s "
+                            "(unknown session or suspended)",
+                            _req_key, _req_reason,
+                        )
+                except Exception as _req_exc:
+                    logger.warning(
+                        "dropbox resume request for %s failed: %s",
+                        _req_key, _req_exc,
+                    )
+        except Exception as _sweep_exc:
+            logger.warning("resume-request dropbox sweep failed: %s", _sweep_exc)
+
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
                 self.session_store._ensure_loaded_locked()  # noqa: SLF001
@@ -17164,7 +17203,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns a list of reset tokens; pass them to ``_clear_session_env``
         in a ``finally`` block.
         """
+        return self._set_session_vars_for_source(
+            source=context.source,
+            session_key=context.session_key,
+            session_id=context.session_id,
+            message_id=context.source.message_id,
+        )
+
+    def _set_session_vars_for_source(
+        self,
+        *,
+        source: SessionSource,
+        session_key: Optional[str],
+        session_id: Optional[str],
+        message_id: Optional[str],
+    ) -> list:
+        """Bind one turn's source identity into the current async context."""
         from gateway.session_context import set_session_vars
+
         # Propagate the adapter's async-delivery capability so async tools
         # (terminal notify_on_complete / watch_patterns, delegate_task
         # background=True) know whether this channel can wake a later turn.
@@ -17173,19 +17229,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # bare runners built via object.__new__ (tests) without self.adapters
         # don't blow up — they simply default to supported.
         _adapters = getattr(self, "adapters", None) or {}
-        _adapter = _adapters.get(context.source.platform)
+        _adapter = _adapters.get(source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
         return set_session_vars(
-            platform=context.source.platform.value,
-            chat_id=context.source.chat_id,
-            chat_name=context.source.chat_name or "",
-            thread_id=str(context.source.thread_id) if context.source.thread_id else "",
-            user_id=str(context.source.user_id) if context.source.user_id else "",
-            user_name=str(context.source.user_name) if context.source.user_name else "",
-            session_key=context.session_key,
-            session_id=context.session_id or "",
-            message_id=str(context.source.message_id) if context.source.message_id else "",
-            profile=getattr(context.source, "profile", "") or "",
+            platform=source.platform.value,
+            chat_id=source.chat_id,
+            chat_name=source.chat_name or "",
+            thread_id=str(source.thread_id) if source.thread_id else "",
+            user_id=str(source.user_id) if source.user_id else "",
+            user_name=str(source.user_name) if source.user_name else "",
+            session_key=session_key or "",
+            session_id=session_id or "",
+            message_id=str(message_id) if message_id else "",
+            profile=getattr(source, "profile", "") or "",
             async_delivery=_async_delivery,
         )
 
@@ -19213,35 +19269,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Profile-scoping wrapper around the agent run.
+        """Session-binding and profile-scoping wrapper around the agent run.
 
-        When multiplexing is active, resolve the inbound source's profile and
-        run the whole turn inside ``_profile_runtime_scope`` so config/skills/
-        memory resolve to that profile's home AND credentials resolve from that
-        profile's secret scope (never the process-global ``os.environ``). When
-        multiplexing is off this is a transparent pass-through — zero behavior
-        change for single-profile gateways.
+        Rebind the identity from this call's own arguments before any local or
+        proxy execution. Recursive queued turns bypass the top-level message
+        handler and may otherwise inherit the outer turn's coherent identity.
+
+        When multiplexing is active, also resolve the inbound source's profile
+        and run the whole turn inside ``_profile_runtime_scope`` so config,
+        skills, memory, and credentials resolve from the routed profile.
         """
-        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
+        from gateway.session_context import reset_session_vars, restore_session_vars
+
+        reset_tokens = reset_session_vars()
+        session_tokens = []
+        try:
+            session_tokens = self._set_session_vars_for_source(
+                source=source,
+                session_key=session_key,
+                session_id=session_id,
+                message_id=event_message_id,
             )
 
-        profile_home = self._resolve_profile_home_for_source(source)
-        with _profile_runtime_scope(profile_home):
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-            )
+            if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                return await self._run_agent_inner(
+                    message, context_prompt, history, source, session_id,
+                    session_key=session_key, run_generation=run_generation,
+                    _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                    channel_prompt=channel_prompt, moa_config=moa_config,
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                )
+
+            profile_home = self._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                return await self._run_agent_inner(
+                    message, context_prompt, history, source, session_id,
+                    session_key=session_key, run_generation=run_generation,
+                    _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                    channel_prompt=channel_prompt, moa_config=moa_config,
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                )
+        finally:
+            try:
+                restore_session_vars(session_tokens)
+            finally:
+                restore_session_vars(reset_tokens)
 
     def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
         """Resolve which profile's HERMES_HOME should serve this inbound source.
@@ -19286,6 +19360,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        from gateway.session_context import get_session_env
+
+        try:
+            expected_session_key = self._session_key_for_source(source)
+        except Exception:
+            expected_session_key = session_key
+        bound_session_key = get_session_env("HERMES_SESSION_KEY", "")
+        if expected_session_key and bound_session_key != expected_session_key:
+            logger.warning(
+                "Agent executor context mismatch: bound session %r, executing turn %r",
+                bound_session_key,
+                expected_session_key,
+            )
+
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
@@ -22557,7 +22645,7 @@ def _run_planned_stop_watcher(
         stop_event.wait(poll_interval)
 
 
-def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
+def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60, runner=None):
     """Background thread for gateway-only periodic chores (NOT cron).
 
     Split out of the historical ``_start_cron_ticker`` so the cron *trigger*
@@ -22583,6 +22671,22 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     tick_count = 0
     while not stop_event.is_set():
         tick_count += 1
+
+        # Resume-request dropbox (SGR-6EA95669): honor EXTERNAL resume
+        # requests that arrive AFTER boot (the boot sweep in
+        # _schedule_resume_pending_sessions only runs once). Cheap gate: one
+        # listdir; only when a request file exists do we schedule the full
+        # resume pass — on the event loop thread, because it creates tasks.
+        if runner is not None and loop is not None:
+            try:
+                from gateway import resume_requests as _rr
+                _dropbox = _rr.dropbox_dir(_hermes_home)
+                if any(name.endswith(".json") for name in os.listdir(_dropbox)):
+                    loop.call_soon_threadsafe(runner._schedule_resume_pending_sessions)
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                logger.debug("resume-request dropbox poll error: %s", e)
 
         if tick_count % CHANNEL_DIR_EVERY == 0 and adapters:
             try:
@@ -23176,7 +23280,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     housekeeping_thread = threading.Thread(
         target=_start_gateway_housekeeping,
         args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop(),
+                "runner": runner},
         daemon=True,
         name="gateway-housekeeping",
     )
