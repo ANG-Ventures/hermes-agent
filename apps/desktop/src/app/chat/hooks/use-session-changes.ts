@@ -321,7 +321,7 @@ export function useSessionChanges({
     // error path never advances the cursor).
     const wireId = storedSessionIdRef.current || sessionId
 
-    if (!sessionId || !wireId || controllerRef.current.disabled || controllerRef.current.suspended || inFlightRef.current) {
+    if (!sessionId || controllerRef.current.disabled || controllerRef.current.suspended || inFlightRef.current) {
       return
     }
 
