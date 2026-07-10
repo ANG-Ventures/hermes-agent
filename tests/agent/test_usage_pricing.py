@@ -345,13 +345,24 @@ def test_notional_xai_predicate_matches_only_oauth():
 
 
 def test_xai_oauth_route_resolves_to_xai_billing():
-    """resolve_billing_route rewrites xai-oauth AND the metered xai/x-ai keys to
-    provider 'xai' with the docs-snapshot billing mode."""
-    for provider in ("xai-oauth", "xai", "x-ai"):
+    """resolve_billing_route rewrites xai-oauth AND the metered xai/x-ai/xai-api
+    provider keys to provider 'xai' with the docs-snapshot billing mode."""
+    for provider in ("xai-oauth", "xai", "x-ai", "xai-api"):
         route = resolve_billing_route("grok-build-0.1", provider=provider)
         assert route.provider == "xai", provider
         assert route.billing_mode == "official_docs_snapshot", provider
         assert route.model == "grok-build-0.1", provider
+
+
+def test_xai_metered_route_resolves_via_base_url():
+    """The metered direct API is also reachable by base_url host match
+    (api.x.ai) with no explicit provider — it must still route to 'xai'."""
+    route = resolve_billing_route(
+        "grok-build-0.1", provider="", base_url="https://api.x.ai/v1"
+    )
+    assert route.provider == "xai"
+    assert route.billing_mode == "official_docs_snapshot"
+    assert route.model == "grok-build-0.1"
 
 
 def test_xai_grok_prices_at_official_rates():
