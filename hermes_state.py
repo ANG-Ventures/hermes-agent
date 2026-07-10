@@ -259,6 +259,10 @@ def _trigram_fts_config_enabled() -> bool:
         val = section.get("trigram_fts", True)
         if isinstance(val, bool):
             return val
+        # Tolerate integer 0/1 written in YAML or produced by env-var
+        # substitution; anything else fails open (trigram stays enabled).
+        if isinstance(val, int):
+            return bool(val)
         return True
     except Exception:
         return True
@@ -1928,8 +1932,17 @@ class SessionDB:
                         cursor.execute(
                             "DROP TABLE IF EXISTS messages_fts_trigram"
                         )
-                    except sqlite3.OperationalError:
-                        pass
+                    except sqlite3.OperationalError as exc:
+                        # Triggers are already gone, so writes stay safe; the
+                        # orphaned table just goes stale until the drop is
+                        # retried on the next open. Surface it rather than
+                        # failing the whole schema init.
+                        logger.warning(
+                            "trigram FTS disabled by config but DROP TABLE "
+                            "messages_fts_trigram failed for %s: %s — the "
+                            "stale index remains until the next open.",
+                            self.db_path, exc,
+                        )
                     # Base FTS trigger repair still applies (measure against
                     # the base trigger set — the trigram triggers are
                     # intentionally absent, not degraded).
