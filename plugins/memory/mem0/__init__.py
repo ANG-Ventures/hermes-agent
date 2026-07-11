@@ -15,6 +15,8 @@ Config via environment variables:
 Or via $HERMES_HOME/mem0.json.
 """
 
+# CI scope probe: plugin-only changes intentionally select the memory slice.
+
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
