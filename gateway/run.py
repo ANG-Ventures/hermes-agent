@@ -9437,9 +9437,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._startup_restore_watchdog_task = asyncio.create_task(
             self._startup_restore_gate_watchdog()
         )
-        self._background_tasks.add(self._startup_restore_watchdog_task)
+        # getattr self-heal: harness-constructed runners (and object.__new__
+        # test paths) may not carry _background_tasks — the known CI-only
+        # attr-miss class (cf. safe-gateway-restart skill, fork #72 lesson).
+        background_tasks = getattr(self, "_background_tasks", None)
+        if background_tasks is None:
+            background_tasks = set()
+            self._background_tasks = background_tasks
+        background_tasks.add(self._startup_restore_watchdog_task)
         self._startup_restore_watchdog_task.add_done_callback(
-            self._background_tasks.discard
+            background_tasks.discard
         )
 
         connected_count = 0
