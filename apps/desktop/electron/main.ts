@@ -36,6 +36,7 @@ import { canImportHermesCli, verifyHermesCli } from './backend-probes.ts'
 import { waitForDashboardPortAnnouncement } from './backend-ready.ts'
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform.ts'
 import { runBootstrap } from './bootstrap-runner.ts'
+import { createBootClock } from './boot-clock.ts'
 import {
   authModeFromStatus,
   buildGatewayWsUrl,
@@ -145,6 +146,20 @@ const IS_WSL = isWslEnvironment()
 // build SDK, so gate Tahoe workarounds on Darwin instead.
 const DARWIN_MAJOR = IS_MAC ? Number.parseInt(os.release(), 10) || 0 : 0
 const APP_ROOT = app.getAppPath()
+
+// Boot milestone clock (Phase 0, desktop startup-latency). Anchored T0 as early
+// as the main module evaluates — every boot milestone (window-created,
+// handshake-done, list-loaded, ready) is logged as `[boot:t+<ms>ms] <name>` to
+// desktop.log so cold-launch latency is measurable from the log, never again by
+// external screenshot polling.
+const bootClock = createBootClock()
+function logBootMilestone(milestone: Parameters<typeof bootClock.mark>[0], detail?: string) {
+  try {
+    rememberLog(bootClock.mark(milestone, detail))
+  } catch {
+    // Instrumentation must never break boot.
+  }
+}
 
 // Preload must be plain JS — Electron's sandbox can't run .ts, and tsx's
 // ESM loader is broken on Electron 40's Node (ERR_INVALID_RETURN_PROPERTY_VALUE).
@@ -6763,6 +6778,7 @@ async function startHermes() {
     if (remote) {
       await advanceBootProgress('backend.remote', `Connecting to remote Hermes backend at ${remote.baseUrl}`, 24)
       await waitForHermes(remote.baseUrl, remote.token)
+      logBootMilestone('handshake-done', '(remote)')
       updateBootProgress({
         phase: 'backend.ready',
         message: 'Remote Hermes backend is ready',
@@ -7362,6 +7378,7 @@ function createWindow() {
   }
 
   mainWindow.webContents.once('did-finish-load', () => {
+    logBootMilestone('cache-paint', '(renderer did-finish-load)')
     // Zoom restore is handled by wireCommonWindowHandlers (shared with session
     // windows); no need to reapply it here.
     broadcastBootProgress()
@@ -9007,6 +9024,7 @@ app.on('open-url', (event, url) => {
 })
 
 app.whenReady().then(() => {
+  logBootMilestone('app-ready')
   if (IS_MAC) {
     Menu.setApplicationMenu(buildApplicationMenu())
   } else {
@@ -9021,6 +9039,7 @@ app.whenReady().then(() => {
   configureSpellChecker()
   registerPowerResumeListeners()
   createWindow()
+  logBootMilestone('window-created')
 
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
   const _coldStartLink = _extractDeepLink(process.argv)
