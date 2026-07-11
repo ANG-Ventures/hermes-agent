@@ -1,102 +1,61 @@
-# t_37659d3c progress
+# Auto-continue taxonomy refactor — progress ledger
 
-## Diagnosis (2026-07-10)
+Task: `t_0f2327fc`
+Base: `fork/main` at `55b8a1b002cdc4559df1ab8f604b6ae9da96027e`
+Authoritative spec: `~/.hermes/plans/2026-07-11_auto-continue-taxonomy-refactor-spec.md`
 
-Observed outbound message `1525268439529164851` snowflake-decodes to
-`2026-07-10T15:32:14.101-07:00`.
+## Phase 1 — RC-5 evidence pack (tree-grounded, before code)
 
-The reported send did **not** use cron auto-delivery and did not enter
-`GatewayRunner._run_agent`:
+### 1. Turn-end chokepoint and ordering
 
-- `cron/scheduler.py:3298-3328` constructs `AIAgent(platform="cron")` directly.
-- `cron/scheduler.py:3376-3382` runs it in a copied-context worker thread.
-- `cron/scheduler.py:3031-3039` correctly resolved and bound the stored origin as
-  `HERMES_CRON_AUTO_DELIVER_*` (`discord:1523978409129021484`).
-- The persisted cron transcript (`state.db`, session
-  `cron_73830b66a04e_20260710_151618`) shows the model wrote
-  `~/.hermes/scripts/redispatch-graph-research.sh` with an explicit foreign
-  `--origin discord:1525251294728556615`, then launched it at 15:32:09.
-- `~/.hermes/scripts/dispatch-agent.sh:49-60,88` sends its ACK to that explicit
-  argument. The wrong-thread message timestamp is the ACK timestamp.
-- The scheduler's real final delivery ran later and logged at 15:33:59:
-  `Job '73830b66a04e': delivered to discord:1523978409129021484`.
-- No `Agent executor context mismatch` warning fired because cron correctly
-  bypasses the gateway wrapper; there was no gateway executor binding to compare.
+- Every normal turn completion reaches `GatewayRunner._release_running_agent_state` from the `_run_agent` unwind (`gateway/run.py:14054-14058`, with the containing turn's unconditional release documented at `gateway/run.py:12501-12511`).
+- The chokepoint is `gateway/run.py:18610-18680`. Its actual order is: generation ownership check (`18639-18644`), active-session lease release (`18645-18650`), remove `_running_agents` (`18651`), remove timestamp/task/busy-ack (`18652-18659`), clear boot-resume state (`18660-18674`), then persist the lower active count (`18675-18679`).
+- Divergence from spec hypothesis: there is currently no post-release callback and no delivery barrier in this method. The deferred-restart arm hook must run only after the slot/task removals and active-count persistence, and must schedule (not await) the shutdown work so release remains non-reentrant.
 
-Therefore hypotheses 1 and 4 are false. Hypothesis 2 describes the architecture
-but not the defect. Hypothesis 3 is confirmed only for a nested process launched
-by the cron agent: that process accepted an explicit target invented from task
-context instead of the job's stored origin. Core cron delivery itself routed
-correctly.
+### 2. Adapter `send()` acknowledgement semantics
 
-Root cause in the repo: `_build_job_prompt` at `cron/scheduler.py:2407-2419`
-tells cron agents that final output is auto-delivered, but gives no contract for
-nested subprocesses that emit ACK/heartbeat/status messages. The authoritative
-per-job target exists in worker ContextVars, but the model is never told to use
-`HERMES_CRON_AUTO_DELIVER_PLATFORM/CHAT_ID/THREAD_ID` rather than infer or
-hardcode an ID from referenced work.
+- The common contract is `BasePlatformAdapter.send()` returning `SendResult(success, message_id, error, raw_response)` (`gateway/platforms/base.py:1854-1860`, `gateway/platforms/base.py:2895-2914`). Completion of the coroutine plus `success=True` is therefore the only uniform cross-platform acknowledgement; the API does not promise client display/read acknowledgement.
+- Discord awaits each SDK `channel.send()` before collecting the returned message id (`plugins/platforms/discord/adapter.py:2268-2302`) and returns success only after all chunks are accepted (`2329-2337`). This is Discord API acceptance, not user display/read.
+- Telegram awaits Bot API `send_message()` (`plugins/platforms/telegram/adapter.py:3686-3716`) and treats generic timeouts as UNKNOWN because the request may have reached Telegram (`3794-3808`). A successful return is Bot API acceptance, not user display/read.
+- Streaming delivery is already tracked from real adapter results: `StreamConsumer` sets `final_content_delivered` only after successful send/edit paths (`gateway/stream_consumer.py:178-182`, `680-686`, `757-809`), and the runner consumes those flags before deciding whether to perform the normal final send (`gateway/run.py:22790-22827`).
+- Base adapters already expose generation-aware post-delivery callbacks (`gateway/platforms/base.py:4025-4115`), fired by the actual response-delivery path; this is the correct contract-faithful seam for the SELF delivery barrier, rather than a manually set test flag.
+- All other platform adapters implement the same `BasePlatformAdapter.send -> SendResult` contract. No adapter exposes a stronger uniform durable/read receipt. Per spec RC-2, `send()` success / confirmed stream delivery is the barrier; timeout means UNKNOWN and restart proceeds with the loss warning.
 
-## Planned regression and fix
+### 3. `mark_resume_pending` persistence
 
-1. Add a worker-level regression in `tests/cron/test_scheduler.py` that runs
-   `run_job` with a foreign chat ID in task text and a different stored origin,
-   captures the actual worker prompt plus worker ContextVars, and asserts the
-   prompt identifies the ContextVar-backed target as authoritative and forbids
-   inferring/hardcoding a target from task content.
-2. Observe RED on current `fork/main`.
-3. Bind a scheduler-owned delivery-target instruction into the prompt from the
-   same `delivery_target` object used to populate `HERMES_CRON_AUTO_DELIVER_*`.
-   This preserves the intentional separation between cron execution identity
-   and delivery identity from commit `dbafa083b5`.
-4. Mutation-check by removing the binding and re-running the regression.
-5. Run the targeted cron scheduler and gateway/session-context suites.
+- `SessionStore.mark_resume_pending` holds the store lock, rejects suspended sessions, mutates the entry, and calls `_save()` synchronously before returning (`gateway/session.py:2191-2218`). No extra flush API is required for ordinary marks.
+- `suspend_recently_active` also performs one synchronous `_save()` after its in-memory marking loop (`gateway/session.py:2297-2331`).
+- Divergence/constraint: crash injection after in-memory mark but before `_save()` (T9o) cannot be represented by calling the public method as-is. Boot reconciliation needs an explicit internal two-step test seam (mark mutation, crash hook, synchronous save) while production still preserves the public single-call contract.
 
-No live cron mutation, gateway restart, or push is part of this task.
+### 4. F1/F2 breaker and replay-mark sites
 
-## Implementation and verification
+- F1/programmatic restart records the initiating session before setting global restart state (`gateway/run.py:8060-8073`).
+- C1 recognizes an executed `safe-restart.py` terminal call (not mere mention) and sets the same per-session flag (`gateway/run.py:20006-20032`).
+- Clean-turn F2 consumes the breadcrumb unconditionally, ORs it with the in-memory flag, records a replay mark for restart-initiating turns, otherwise clears marks after genuine work (`gateway/run.py:7576-7661`).
+- Breadcrumb validation/consumption is per-session, same-boot, TTL-bounded, and single-use (`gateway/run.py:7663-7758`). It currently unlinks while validating, so deferred arm requires a dedicated consume-and-return validation result (or equivalent) rather than a second consume.
+- The reusable replay API is `_record_restart_replay_mark(session_key, now=...)` (`gateway/run.py:7523-7564`). It is not request-id-idempotent today. Cross-boot deferred reconciliation therefore needs request-id dedup persisted alongside breaker state before it can satisfy T9e/T9j.
+- Drain-time marking records a replay mark before `mark_resume_pending` (`gateway/run.py:6707-6724`), and the hard timeout marks only genuinely still-running agents before interrupting them (`gateway/run.py:10237-10309`).
 
-- Added `_bind_cron_delivery_target_hint()` in `cron/scheduler.py`. `run_job`
-  invokes it only after resolving the concrete target and binding the same target
-  into `HERMES_CRON_AUTO_DELIVER_*`. Cron execution identity remains blank as
-  required by `dbafa083b5`.
-- The hint JSON-encodes the authoritative target and tells nested status helpers
-  to read the three existing cron delivery variables instead of inferring IDs
-  from task content. Jobs with no resolved target are unchanged.
-- Added a worker regression with `FOREIGN_CHAT` in task text and a distinct stored
-  origin. It asserts both the actual worker ContextVars and the authoritative
-  target instruction.
-- Strengthened the transport regression to contaminate ambient
-  `HERMES_SESSION_*` values and assert `_send_to_platform` receives the stored
-  origin chat ID and thread ID.
+### 5. #269 resume-request dropbox read/write sites
 
-Observed test evidence:
+- External writes are atomic temp+fsync+replace at `gateway/resume_requests.py:51-83`.
+- Current reads enumerate only `*.json`, parse, then unlink *before* returning the request (`gateway/resume_requests.py:86-142`). Malformed files become `*.rejected`; stale files are deleted.
+- Gateway folding is `_sweep_resume_requests` (`gateway/run.py:8389-8419`). It immediately calls synchronous `mark_resume_pending`.
+- Reads occur before tail classification (`gateway/run.py:8211-8218`), again at scheduler entry before candidate enumeration (`gateway/run.py:8446-8457`), and from housekeeping when a `.json` file exists (`gateway/run.py:23016-23030`).
+- Divergence from new lifecycle: the existing sweep's same-pass unlink cannot support submitted→armed→claimed→terminal boot-owned cleanup. Existing plain resume requests must retain current behavior; `deferred_restart` needs a typed lifecycle API that does not flow through the destructive tuple sweep.
 
-- RED before implementation:
-  `scripts/run_tests.sh tests/cron/test_scheduler.py -q` -> `226 passed, 1 failed`;
-  the new worker test failed because the authoritative target was absent.
-- GREEN after implementation:
-  the same command -> `227 passed, 0 failed`.
-- Mutation check: removed the single prompt-binding call and reran the same file
-  -> `226 passed, 1 failed`; restored the call and reran -> `227 passed, 0 failed`.
-- Related gateway/send coverage:
-  `scripts/run_tests.sh tests/gateway/test_session_context_inheritance.py tests/tools/test_send_message_origin.py tests/tools/test_send_message_tool.py -q`
-  -> `172 passed, 0 failed`.
-- Lint: shared-venv `ruff check cron/scheduler.py tests/cron/test_scheduler.py`
-  -> `All checks passed!`; `git diff --check` passed.
-- Deterministic pre-scan ran Bandit, Ruff, and Semgrep. Whole-file mode reported
-  existing repository/test-file findings; none are on the added production lines.
-- Momus review transport could not start because its configured
-  `opus-review-direct.py` path is absent under the Daedalus profile. The task is
-  therefore handed off `review-required` rather than self-approved.
+### 6. Boot startup order
 
-## t_64d6a35f — auto-continue interrupted turns
+- Real startup order after adapters settle is restart notification, `_prepare_auto_resume_decisions`, `_schedule_resume_pending_sessions`, then `_finish_startup_restore` (`gateway/run.py:9315-9345`).
+- `_prepare_auto_resume_decisions` currently sweeps the dropbox before snapshot/classification (`gateway/run.py:8199-8218`). `_schedule_resume_pending_sessions` sweeps again before locked candidate enumeration (`gateway/run.py:8421-8462`).
+- Therefore boot deferred-restart reconciliation belongs at the start of `_prepare_auto_resume_decisions`, before the existing plain-request sweep and before scheduling. T9k must execute this real order, not call reconciliation in isolation.
 
-- Implemented the fail-closed `agent.resume_interrupted_turns` enum, schedule-time
-  persisted-tail mutation classification, and the seven-day durable once-ever
-  attempt store keyed by `(session_key, assistant_rowid)`.
-- Added T1–T8 behavior-contract coverage and parameterized the existing F2
-  cross-cycle breaker test over `prompt` and `auto`.
-- PR #289 merged with CI green; Greptile's durability and surface-scope findings
-  are addressed in the review-hardening follow-up.
+### Grounded design decisions / divergences
 
-NEXT: After the review-hardening PR merges, Apollo updates the safe-restart skill and performs live deployment/restart verification.
+1. Preserve plain #269 request behavior; add typed deferred-request lifecycle APIs beside it.
+2. Reuse the common `SendResult`/post-delivery path as the barrier; do not invent per-platform durable receipts.
+3. Add request-id-bearing SELF metadata to `SessionEntry`; current schema has only `resume_pending`, `resume_reason`, and timestamp (`gateway/session.py:715-720`, serialized at `775-783` and restored at `858-863`).
+4. Extend the replay store with request-id idempotence; the current API is timestamp-only.
+5. The safe-restart script and skill are outside this repository; spec §4 explicitly assigns the skill rewrite to Apollo post-merge. This branch will implement and test the gateway/dropbox contract and list the required external script change in handoff, without mutating the live skill tree.
+
+NEXT: Phase 2 — write RED tests for typed deferred requests, taxonomy logging/notes, release-time arm, and boot reconciliation (T1/T2/T3/T7/T8/T9/T10 IDs), then implement the smallest gateway changes to make them green.
