@@ -158,3 +158,29 @@ Observed test evidence:
   gbrain's focused `bun test test/search/per-call-mode.test.ts` ran **5 passed,
   0 failed**, including the explicit remote-mode-ignored contract.
   `git diff --check` passed. No live gateway was restarted or reconfigured.
+
+## t_4963087b — Item A adjudication and closeout
+
+- `2026-07-11T03:18:26Z` — Ace supplied the missing non-circular property
+  anchor and adjudicated the held-out answer **PASS**: “prompt the user is
+  fine”; preserve-and-prompt conveys the surface-and-ask doctrine. This ruling
+  supersedes the RC-a STOP above. Per Ace's instruction, M1 calibration remains
+  the protocol for future disputes and was not applied retroactively here.
+- `2026-07-11T03:18:26Z` — Reproduced the frozen failure before editing by
+  running `r2_answer_presence.py --check-only` against the original six-case
+  fixture and captured results: **5/6, FAIL**. R2-07 passed
+  `preserve-prompt`, `no-reexecute`, and `no-autocontinue`, but failed
+  `surface-ask`; the other five cases passed.
+- `2026-07-11T03:18:26Z` — Added Ace's property statement verbatim as the
+  R2-07 `intent` field. Rewrote only R2-07's `surface-ask` lexical set to
+  accept preserve-and-prompt and property-level prompt/ask equivalents. The
+  other predicates and all five non-R2-07 cases are unchanged.
+- `2026-07-11T03:18:26Z` — Re-evaluated the same frozen six answer payloads
+  with the updated fixture: **6/6, PASS**. R2-07 `surface-ask` matched
+  `preserve-and-prompt` and `ask whether to resume`; the five other cases'
+  complete verdict/predicate records were byte-identical to the pre-edit
+  check-only report. Mutation proof restored the old narrow phrase list in a
+  temporary fixture and returned the suite to **5/6, FAIL**, proving the
+  rewritten predicate is the load-bearing gate.
+- Item B remains closed unchanged: hit@3 tied, so RC3 correctly ships no
+  detector, flag, logging, or rollback surface.
