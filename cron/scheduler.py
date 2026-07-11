@@ -2520,15 +2520,15 @@ def _bind_cron_delivery_target_hint(prompt: str, target: Optional[dict]) -> str:
     """
     if not target:
         return prompt
+    # thread_id: use "" (never null) so the JSON hint matches the
+    # HERMES_CRON_AUTO_DELIVER_THREAD_ID ContextVar representation exactly —
+    # a worker echoing either form must produce the same value (Greptile P2,
+    # PR #278).
     target_json = json.dumps(
         {
             "platform": str(target.get("platform") or ""),
             "chat_id": str(target.get("chat_id") or ""),
-            "thread_id": (
-                None
-                if target.get("thread_id") is None
-                else str(target.get("thread_id"))
-            ),
+            "thread_id": str(target.get("thread_id") or ""),
         },
         separators=(",", ":"),
     )
