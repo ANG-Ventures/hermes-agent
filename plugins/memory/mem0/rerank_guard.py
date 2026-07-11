@@ -133,8 +133,16 @@ class RerankIncidentManager:
     def _write(self, state: Dict[str, Any]) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(prefix=f".{self._path.name}.", dir=self._path.parent)
+        fd_owned = True
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle = None
+            try:
+                handle = os.fdopen(fd, "w", encoding="utf-8")
+                fd_owned = False  # fdopen owns the descriptor from here
+            finally:
+                if fd_owned:
+                    os.close(fd)
+            with handle:
                 json.dump(state, handle, sort_keys=True)
                 handle.write("\n")
                 handle.flush()
@@ -256,7 +264,12 @@ class RerankIncidentManager:
             attempt["error"] = exc
         finally:
             attempt["done"].set()
-            self._schedule_retry()
+            # Retry is only armed on failure. A successful delivery is settled by
+            # the waiting _deliver_pending (or, after a caller timeout, by the
+            # retry that caller already armed) — an unconditional re-arm here
+            # races _clear_retry_if_clean and leaves a spurious wakeup pending.
+            if attempt.get("error") is not None:
+                self._schedule_retry()
 
     def _clear_retry_if_clean(self) -> None:
         with self._lock:
@@ -427,6 +440,11 @@ class RerankIncidentManager:
             self._latencies = latencies
 
             if status == "success" and latencies and self._latency_budget_ms > 0:
+                # Early-window p95 (small n) degenerates toward max() — intentional:
+                # conservative in the fail-loud direction, and an incident still
+                # requires `failure_threshold` consecutive breaches of a budget
+                # sized in seconds. Recovery from LATENCY-BREACH conversely
+                # requires a FULL ring (see below) — asymmetry is by design.
                 p95 = self._p95(latencies)
                 if p95 > self._latency_budget_ms:
                     status = "failure"
