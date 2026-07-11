@@ -1,0 +1,88 @@
+[
+  {
+    "case_id": "R2-04-answer",
+    "parent_case_id": "R2-04",
+    "query": "Explain the Clanker flight recorder's live-turn safety contract, how files are joined to a turn, and its retention. Use the exact implementation terms and cite the source.",
+    "source_path": "Engineering/HA Voice/Clanker Flight Recorder — Record Everything & Replay.md",
+    "source_sha256": "3e2dc3e866cb51a5cf0384f9822483c77ec4fc4188713c1596b85bb520de27a8",
+    "relevant_slugs": ["engineering/ha-voice/clanker-flight-recorder-record-everything-replay"],
+    "predicates": [
+      {"id": "observe-reforward", "any_phrases": ["observe-and-reforward"]},
+      {"id": "fail-open", "any_phrases": ["fail-open"]},
+      {"id": "turn-token", "any_phrases": ["active_turn token", "active_turn"]},
+      {"id": "retention", "any_phrases": ["audio 14d / 20 gb", "audio 14 days", "14d / 20 gb"]}
+    ]
+  },
+  {
+    "case_id": "R2-05-answer",
+    "parent_case_id": "R2-05",
+    "query": "Explain why the ZSW overlay drives Hue groups for ordinary commands but retains bulb lists for rainbow and eviction. Include the measured latency result and cite the source.",
+    "source_path": "Home/Lighting/ZSW Overlay System.md",
+    "source_sha256": "3f1575943d20efa581f9c378dcb4c52556d03171cd691a83c78b63297e9d1445",
+    "relevant_slugs": ["home/lighting/zsw-overlay-system"],
+    "predicates": [
+      {"id": "group-target", "any_phrases": ["target_group", "hue group"]},
+      {"id": "bulb-target", "any_phrases": ["target_lights", "member-bulb list"]},
+      {"id": "group-count-independent", "any_phrases": ["independent of bulb count", "regardless of count"]},
+      {"id": "shower-improvement", "any_phrases": ["1499ms", "1,499ms", "1,499 ms", "1.499 seconds"]}
+    ]
+  },
+  {
+    "case_id": "R2-06-answer",
+    "parent_case_id": "R2-06",
+    "query": "State the camera-floodlight two-class rule, the authoritative discriminator, and the three defense-in-depth layers. Use the exact implementation terms and cite the source.",
+    "source_path": "Home/Home Assistant/Camera Floodlights vs Ordinary Floodlights — Two-Class Rule.md",
+    "source_sha256": "327417f71caf7379572b81399b65197864c027bbdd3387e87f6c6853960d130e",
+    "relevant_slugs": ["home/home-assistant/camera-floodlights-vs-ordinary-floodlights-two-class-rule"],
+    "predicates": [
+      {"id": "device-class", "any_phrases": ["camera floodlights are devices, not lights", "device_control"]},
+      {"id": "friendly-name", "any_phrases": ["friendly_name"]},
+      {"id": "classifier", "any_phrases": ["_is_reolink_camera_floodlight"]},
+      {"id": "sanitizer", "any_phrases": ["sanitize_floodlights"]}
+    ]
+  },
+  {
+    "case_id": "R2-07-answer",
+    "parent_case_id": "R2-07",
+    "query": "After a gateway restart interrupts a turn, what must preserve-and-prompt do, and what must it never do before the human says go? Use the spec's exact terms and cite the source.",
+    "intent": "An acceptable answer conveys the preserve-and-prompt doctrine: interrupted work is preserved and the user is prompted/asked before continuation; explicit surface-and-ask phrasing is NOT required if preserve-and-prompt (or equivalent) plus the no-reexecute and no-autocontinue negatives are stated.",
+    "source_path": "Plans/2026-06-30_gateway-restart-coalesce-durability-autoresume-SPEC.md",
+    "source_sha256": "55df4a82c245df6cf3cbaa7526f13d0c586689e11a25557945060056d4fce87d",
+    "relevant_slugs": ["plans/2026-06-30_gateway-restart-coalesce-durability-autoresume-spec"],
+    "predicates": [
+      {"id": "preserve-prompt", "any_phrases": ["preserve-and-prompt"]},
+      {"id": "surface-ask", "any_phrases": ["preserve-and-prompt", "preserved and prompted", "prompt the user", "ask the user", "ask whether to resume", "wait for the user", "surface-and-ask", "summarized for the user and offered for resume"]},
+      {"id": "no-reexecute", "any_phrases": ["do not re-execute", "do not re-run", "never re-execute"]},
+      {"id": "no-autocontinue", "any_phrases": ["do not auto-continue", "never auto-continue", "zero forward-progress tool calls"]}
+    ]
+  },
+  {
+    "case_id": "R2-08-11-answer",
+    "parent_case_id": "R2-08/R2-11",
+    "query": "What DNS chain should Mac Studio and LAN clients use, why must CorpDNS remain false, and what AdGuard listener is the critical invariant? Include exact addresses and cite the source.",
+    "source_path": "Engineering/Network & DNS/DNS Resilience After Power Loss — Tailscale and AdGuard Spec.md",
+    "source_sha256": "8ee9dd2b0890183dc034e2ddc600cb18c952972020904e9d3db85c8dbaa6f297",
+    "relevant_slugs": ["engineering/network-dns/dns-resilience-after-power-loss-tailscale-and-adguard-spec"],
+    "predicates": [
+      {"id": "corp-dns", "any_phrases": ["corpdns=false"]},
+      {"id": "agh-primary", "any_phrases": ["192.168.1.208"]},
+      {"id": "nextdns-secondary", "any_phrases": ["45.90.28.215"]},
+      {"id": "listener", "any_phrases": ["192.168.1.208:53", "192.168.1.208 on port 53"]}
+    ]
+  },
+  {
+    "case_id": "R2-10-answer",
+    "parent_case_id": "R2-10",
+    "query": "Summarize the dual-WAN roles, the Starlink failure constraints, and the IPv6 hardening decision. Include interface names and cite the source.",
+    "source_path": "Engineering/Network & DNS/Dual-WAN Failover System — Overview, Gotchas & Hardening.md",
+    "source_sha256": "78ca75f55fa6ec618c6b065cffa42771380a565eae324ef581dbe1c6ed4ca8b4",
+    "relevant_slugs": ["engineering/network-dns/dual-wan-failover-system-overview-gotchas-hardening"],
+    "predicates": [
+      {"id": "primary", "any_phrases": ["spectrum/charter", "spectrum", "charter"]},
+      {"id": "primary-interface", "any_phrases": ["eth8"]},
+      {"id": "failover-interface", "any_phrases": ["eth9"]},
+      {"id": "cgnat", "any_phrases": ["cgnat", "carrier-grade nat"]},
+      {"id": "ula", "any_phrases": ["ula-only"]}
+    ]
+  }
+]
