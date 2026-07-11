@@ -14,10 +14,11 @@ declare global {
       // All fail-open in main — a cache problem never errors into the renderer.
       renderCache?: {
         read: (
-          gatewayUrl: string,
+          gatewayUrl?: string | null,
           activeStoredSessionId?: string | null
         ) => Promise<{
           enabled: boolean
+          gatewayUrl: string | null
           sessions: unknown | null
           status: unknown | null
           transcript: unknown | null
@@ -27,6 +28,7 @@ declare global {
         putTranscript: (gatewayUrl: string, storedSessionId: string, rows: unknown[]) => void
         cullSession: (gatewayUrl: string, storedSessionId: string) => void
         sweep: (gatewayUrl: string, liveSessionIds: string[]) => void
+        reportDivergence: (rows: number) => void
       }
       // Resolve a backend connection. Omit `profile` (or pass the primary) for
       // the window's backend; pass a named profile to lazily spawn/reuse that

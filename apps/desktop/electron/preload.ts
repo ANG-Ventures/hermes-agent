@@ -13,7 +13,8 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
       ipcRenderer.send('hermes:render-cache:put-transcript', gatewayUrl, storedSessionId, rows),
     cullSession: (gatewayUrl, storedSessionId) =>
       ipcRenderer.send('hermes:render-cache:cull-session', gatewayUrl, storedSessionId),
-    sweep: (gatewayUrl, liveSessionIds) => ipcRenderer.send('hermes:render-cache:sweep', gatewayUrl, liveSessionIds)
+    sweep: (gatewayUrl, liveSessionIds) => ipcRenderer.send('hermes:render-cache:sweep', gatewayUrl, liveSessionIds),
+    reportDivergence: rows => ipcRenderer.send('hermes:render-cache:report-divergence', rows)
   },
   revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
   touchBackend: profile => ipcRenderer.invoke('hermes:backend:touch', profile),

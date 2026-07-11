@@ -36,7 +36,7 @@ import { canImportHermesCli, verifyHermesCli } from './backend-probes.ts'
 import { waitForDashboardPortAnnouncement } from './backend-ready.ts'
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform.ts'
 import { runBootstrap } from './bootstrap-runner.ts'
-import { createBootClock } from './boot-clock.ts'
+import { createBootClock, formatCacheDivergence, formatCacheHit } from './boot-clock.ts'
 import { RenderCache } from './render-cache.ts'
 import { readRenderCacheEnabled } from './render-cache-config.ts'
 import {
@@ -7475,20 +7475,47 @@ ipcMain.on('hermes:render-cache:sweep', (_event, gatewayUrl, liveSessionIds) => 
 })
 
 // Boot read: everything the renderer needs to paint from cache, in one hop.
+// gatewayUrl may be null on a cold boot (the renderer doesn't know it before
+// the connection resolves) — resolve it from the stored connection config
+// (remote mode only; local mode has no stable pre-spawn URL, which matches the
+// spec's D4 remote-first scope). Logs the cache hit/miss counter (Phase 0 RC4).
 ipcMain.handle('hermes:render-cache:read', (_event, gatewayUrl, activeStoredSessionId) => {
   try {
-    const cache = getRenderCache(gatewayUrl)
-    if (!cache) {
-      return { enabled: RENDER_CACHE_ENABLED, sessions: null, status: null, transcript: null }
+    let url = String(gatewayUrl || '').trim()
+    if (!url) {
+      const config = readDesktopConnectionConfig()
+      if (config.mode === 'remote' && config.remote?.url) {
+        url = String(config.remote.url).trim()
+      }
     }
+    const cache = getRenderCache(url)
+    if (!cache) {
+      return { enabled: RENDER_CACHE_ENABLED, gatewayUrl: url || null, sessions: null, status: null, transcript: null }
+    }
+    const sessions = cache.readSessions()
+    const rowCount = Array.isArray((sessions as any)?.sessions) ? (sessions as any).sessions.length : 0
+    rememberLog(formatCacheHit(sessions != null, rowCount))
     return {
       enabled: true,
-      sessions: cache.readSessions(),
+      gatewayUrl: url,
+      sessions,
       status: cache.readStatus(),
       transcript: activeStoredSessionId ? cache.readTranscript(activeStoredSessionId) : null
     }
   } catch {
-    return { enabled: false, sessions: null, status: null, transcript: null }
+    return { enabled: false, gatewayUrl: null, sessions: null, status: null, transcript: null }
+  }
+})
+
+// Reconcile observability (Phase 0 RC4): the renderer reports how many rows
+// differed between the cached paint and the first live snapshot. rows=0 means
+// the cache matched live exactly — I1's "reconciles within one cycle" held.
+ipcMain.on('hermes:render-cache:report-divergence', (_event, rows) => {
+  try {
+    logBootMilestone('list-loaded', '(live reconcile)')
+    rememberLog(formatCacheDivergence(Number(rows) || 0))
+  } catch {
+    /* never throw */
   }
 })
 // Reconnect-after-wake recovery. A REMOTE primary backend has no child process,
