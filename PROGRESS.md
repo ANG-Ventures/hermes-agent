@@ -29,6 +29,6 @@ Base: latest `fork/main`
 
 - Aegis gateway only; Apollo/default gateway remains untouched.
 - Instrumented Aegis rig transcript captured at 12:48:47-12:49:07 PT. It proves H3 and the replay await above without restarting Apollo/default.
-- Behavioral fix remains worktree-only. Shared runtime received log-only instrumentation for the rig and was restored clean immediately after capture.
+- Behavioral fix is committed in fork PR #301 (`1916afc`) but is not deployed. Shared runtime received log-only instrumentation for the rig and was restored clean immediately after capture.
 
-NEXT: Minimize/review the worktree diff, rerun the full restart-family regression gates, obtain independent review, then commit/push/open the fork PR; Apollo deployment remains deferred to an Ace-approved combined bounce.
+NEXT: Wait for PR #301 CI to turn fully green, then enable auto-merge; after merge, verify the merged runtime on Aegis first. Apollo deployment remains deferred to an Ace-approved combined bounce.
