@@ -37,6 +37,8 @@ import { waitForDashboardPortAnnouncement } from './backend-ready.ts'
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform.ts'
 import { runBootstrap } from './bootstrap-runner.ts'
 import { createBootClock } from './boot-clock.ts'
+import { RenderCache } from './render-cache.ts'
+import { readRenderCacheEnabled } from './render-cache-config.ts'
 import {
   authModeFromStatus,
   buildGatewayWsUrl,
@@ -7388,6 +7390,107 @@ function createWindow() {
 }
 
 ipcMain.handle('hermes:connection', async (_event, profile) => ensureBackend(profile))
+
+// ---------------------------------------------------------------------------
+// Render cache (Phase 1, startup-latency spec). One writer per gateway URL,
+// lazily created on the first renderer push. All handlers are fail-open: a
+// cache problem must never surface as a renderer error (I3).
+// ---------------------------------------------------------------------------
+const RENDER_CACHE_ENABLED = readRenderCacheEnabled(HERMES_HOME)
+const renderCaches = new Map() // gatewayUrl -> RenderCache
+
+function getRenderCache(gatewayUrl) {
+  if (!RENDER_CACHE_ENABLED) {
+    return null
+  }
+  const url = String(gatewayUrl || '').trim()
+  if (!url) {
+    return null
+  }
+  let cache = renderCaches.get(url)
+  if (!cache) {
+    cache = new RenderCache({
+      dir: path.join(app.getPath('userData'), 'render-cache'),
+      appVersion: app.getVersion(),
+      gatewayUrl: url,
+      log: rememberLog
+    })
+    renderCaches.set(url, cache)
+  }
+  return cache
+}
+
+ipcMain.on('hermes:render-cache:put-sessions', (_event, gatewayUrl, data) => {
+  try {
+    getRenderCache(gatewayUrl)?.putSessions(data)
+  } catch {
+    /* never throw into the renderer */
+  }
+})
+
+ipcMain.on('hermes:render-cache:put-status', (_event, gatewayUrl, data) => {
+  try {
+    getRenderCache(gatewayUrl)?.putStatus(data)
+  } catch {
+    /* never throw */
+  }
+})
+
+ipcMain.on('hermes:render-cache:put-transcript', (_event, gatewayUrl, storedSessionId, rows) => {
+  try {
+    const cache = getRenderCache(gatewayUrl)
+    if (cache) {
+      cache.putTranscript(storedSessionId, rows)
+      cache.enforceTranscriptCap()
+    }
+  } catch {
+    /* never throw */
+  }
+})
+
+// The I4b delete wire: livesync lives in the RENDERER, so main only learns of
+// a session delete via this explicit forward (Opus pass-2 Blocker 1).
+ipcMain.on('hermes:render-cache:cull-session', (_event, gatewayUrl, storedSessionId) => {
+  try {
+    getRenderCache(gatewayUrl)?.cullSession(storedSessionId)
+  } catch {
+    /* never throw */
+  }
+})
+
+// Boot-time sweep (I4b belt-and-suspenders): the renderer calls this once
+// after the first live session-list load, passing every live session id.
+ipcMain.on('hermes:render-cache:sweep', (_event, gatewayUrl, liveSessionIds) => {
+  try {
+    const cache = getRenderCache(gatewayUrl)
+    if (cache && Array.isArray(liveSessionIds)) {
+      const culled = cache.sweepAgainstLiveSessions(liveSessionIds)
+      if (culled > 0) {
+        rememberLog(`[render-cache] boot sweep culled ${culled} orphaned transcript file(s)`)
+      }
+    }
+  } catch {
+    /* never throw */
+  }
+})
+
+// Boot read: everything the renderer needs to paint from cache, in one hop.
+ipcMain.handle('hermes:render-cache:read', (_event, gatewayUrl, activeStoredSessionId) => {
+  try {
+    const cache = getRenderCache(gatewayUrl)
+    if (!cache) {
+      return { enabled: RENDER_CACHE_ENABLED, sessions: null, status: null, transcript: null }
+    }
+    return {
+      enabled: true,
+      sessions: cache.readSessions(),
+      status: cache.readStatus(),
+      transcript: activeStoredSessionId ? cache.readTranscript(activeStoredSessionId) : null
+    }
+  } catch {
+    return { enabled: false, sessions: null, status: null, transcript: null }
+  }
+})
 // Reconnect-after-wake recovery. A REMOTE primary backend has no child process,
 // so the 'exit'/'error' handlers that would clear a dead connectionPromise never
 // fire — once the remote becomes unreachable across a sleep/wake the renderer
@@ -9113,6 +9216,16 @@ app.on('before-quit', () => {
 
   stopBackendChild(hermesProcess)
   stopAllPoolBackends()
+
+  // Flush any pending render-cache writes synchronously (D2/AC8): a clean exit
+  // must never systematically lose the last debounce window of cache state.
+  for (const cache of renderCaches.values()) {
+    try {
+      cache.flush()
+    } catch {
+      /* never block quit */
+    }
+  }
 })
 
 app.on('window-all-closed', () => {
