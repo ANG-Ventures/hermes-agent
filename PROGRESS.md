@@ -18,7 +18,7 @@ Authoritative spec: `~/.hermes/plans/2026-07-11_auto-continue-taxonomy-refactor-
 - Discord awaits each SDK `channel.send()` before collecting the returned message id (`plugins/platforms/discord/adapter.py:2268-2302`) and returns success only after all chunks are accepted (`2329-2337`). This is Discord API acceptance, not user display/read.
 - Telegram awaits Bot API `send_message()` (`plugins/platforms/telegram/adapter.py:3686-3716`) and treats generic timeouts as UNKNOWN because the request may have reached Telegram (`3794-3808`). A successful return is Bot API acceptance, not user display/read.
 - Streaming delivery is already tracked from real adapter results: `StreamConsumer` sets `final_content_delivered` only after successful send/edit paths (`gateway/stream_consumer.py:178-182`, `680-686`, `757-809`), and the runner consumes those flags before deciding whether to perform the normal final send (`gateway/run.py:22790-22827`).
-- Base adapters already expose generation-aware post-delivery callbacks (`gateway/platforms/base.py:4025-4115`), fired by the actual response-delivery path; this is the correct contract-faithful seam for the SELF delivery barrier, rather than a manually set test flag.
+- Base adapters already expose generation-aware post-delivery callbacks (`gateway/platforms/base.py:4025-4115`), but the tree-grounded implementation review found that they fire from the handler `finally` block even after cancellation/failure (`gateway/platforms/base.py:5348-5385`). They are not delivery acknowledgements. The implementation therefore adds a separate generation-owned callback fired only after `SendResult.success`, while confirmed streaming delivery is recorded by the runner.
 - All other platform adapters implement the same `BasePlatformAdapter.send -> SendResult` contract. No adapter exposes a stronger uniform durable/read receipt. Per spec RC-2, `send()` success / confirmed stream delivery is the barrier; timeout means UNKNOWN and restart proceeds with the loss warning.
 
 ### 3. `mark_resume_pending` persistence
@@ -58,4 +58,43 @@ Authoritative spec: `~/.hermes/plans/2026-07-11_auto-continue-taxonomy-refactor-
 4. Extend the replay store with request-id idempotence; the current API is timestamp-only.
 5. The safe-restart script and skill are outside this repository; spec §4 explicitly assigns the skill rewrite to Apollo post-merge. This branch will implement and test the gateway/dropbox contract and list the required external script change in handoff, without mutating the live skill tree.
 
-NEXT: Phase 2 — write RED tests for typed deferred requests, taxonomy logging/notes, release-time arm, and boot reconciliation (T1/T2/T3/T7/T8/T9/T10 IDs), then implement the smallest gateway changes to make them green.
+## Phase 2 — RED/GREEN implementation
+
+- Added explicit taxonomy constants and the authority mapper in `gateway/auto_resume.py`; persisted `resume_kind`, `resume_handoff`, and `resume_request_id` through `SessionEntry` and `SessionStore`.
+- Added the typed deferred lifecycle in `gateway/deferred_restart.py:68-434`: atomic request publication, submitted→armed→claimed→consumed/rejected transitions, same-boot breadcrumb validation, epoch-owned `mkdir` CAS, atomic `meta.json` commit publication, committed-only loser coalescing, and boot-only terminal reconciliation.
+- Added a real delivery-ack seam at `gateway/platforms/base.py:4098-4139`. It is generation-owned and fires only from the successful final-send path; confirmed streamed delivery directly acknowledges the armed callback before normal-send suppression. Handler-finally callbacks are intentionally not accepted as delivery proof, and ordinary streamed turns retain no confirmation cache.
+- Wired boot reconciliation before the prompt/auto branch and candidate snapshot (`gateway/run.py:8254-8311`), release-time arm after running-state persistence (`gateway/run.py:18736-18855`), request-id replay dedupe (`gateway/run.py:7547-7612`), explicit SELF scheduling without SIBLING attempt credit, and `kind=sibling|self` schedule logs.
+- Preserved plain #269 requests by making their sweep ignore `kind=deferred_restart` files.
+- Added G1 tests in `tests/gateway/test_deferred_restart_taxonomy.py:51-900`, including T9a/b/c/d/j/k/m/n1..n6/o/p/q. T9n1..T9n6 correspond to every fallible post-`mkdir`/pre-signal boundary introduced: initial leader publication, claim persistence, replay mark, SELF mark, all-peer delivery completion, and committed-meta publication. Every boundary is exercised both with a concurrent loser and as the normal single-request case.
+
+RED observations:
+
+- Initial collection failed on missing `RESUME_KIND_SELF`.
+- Added delivery/note contracts failed until release-time strong acknowledgement and SELF note wiring existed.
+- Combined regression caught the intentional new taxonomy log and an unintended legacy SIBLING-credit bypass; the bypass was narrowed to explicit persisted `resume_kind=self`, preserving existing behavior for legacy reason-only rows.
+- Tree review caught that existing post-delivery callbacks are finally callbacks, not send acknowledgements; the strong callback registry above replaced that unsafe assumption.
+
+GREEN evidence via the repository virtualenv runner:
+
+- `scripts/run_tests.sh tests/gateway/test_deferred_restart_taxonomy.py tests/gateway/test_auto_continue_interrupted_turns.py tests/gateway/test_restart_cascade.py -q` → 122 passed.
+- `scripts/run_tests.sh tests/gateway/test_resume_requests.py tests/gateway/test_session.py tests/gateway/test_post_delivery_callback_chaining.py tests/gateway/test_restart_cascade.py tests/gateway/test_auto_continue_interrupted_turns.py tests/gateway/test_deferred_restart_taxonomy.py -q` → 249 passed.
+- Final post-rebase command across resume requests, sessions, callback chaining, restart cascade, interrupted-turn behavior, and deferred taxonomy → 270 passed; latest deferred lifecycle file → 54 passed after staggered multi-initiator delivery and T9n6 coverage.
+- `ruff check` on all changed Python files → all checks passed.
+- Static pre-scan: bandit/ruff/semgrep, 0 HIGH/CRITICAL findings; low/medium output is baseline noise from scanning complete large files and pytest assertions.
+
+Mutation evidence (each mutation was restored from the staged implementation immediately after the expected RED):
+
+- Replace strong delivery-ack registration with finally callback → T2/T8 fails because no strong callback is armed.
+- Remove SELF mark → T2/T8 fails (`resume_kind` remains `None`).
+- Bypass `mkdir` CAS → T9c fails with two restart signals.
+- Remove request-id dedupe → T9j trips the breaker one request early.
+- Remove boot reconciliation from preparation → T9k fails in prompt mode.
+
+## Phase 3 — adversarial review corrections
+
+- Momus pass 1 identified generation fail-open and boot-reconcile retry ownership. Both were fixed and regression-tested; disputed signal ordering, legacy log mapping, and cross-boot submitted handling were dismissed by the authoritative spec/source pack.
+- Pass 2 identified orphaning of a sole failed winner and malformed committed metadata. The coordinator now retries non-owning/injected precommit cancellation and fallible precommit exceptions with bounded backoff while propagating real external task cancellation to shutdown/boot ownership. Committed metadata requires a finite positive numeric `commit_ts` before any loser transition.
+- Pass 3 identified an unbounded alternate-order stream-confirmation cache. Tree ordering proves release precedes streaming suppression, so the cache was removed; confirmed stream delivery directly fires an existing strong callback and ordinary delivery retains no state.
+- Pass 4 identified cross-request delivery-barrier bypass. The elected leader now waits until every same-boot armed/claimed request has independently acknowledged delivery or timed out before atomically committing; a staggered two-initiator regression proves no early signal.
+
+NEXT: Obtain final Momus approval on the corrected current diff, push/open the fork PR, wait for green CI, then arm auto-merge and record the CI/merge handoff. External safe-restart writer/skill wiring and the physical T6 rig remain Apollo/Aegis post-merge work per the authoritative sequence.
