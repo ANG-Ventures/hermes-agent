@@ -1,7 +1,7 @@
 # Auto-continue taxonomy refactor — progress ledger
 
 Task: `t_0f2327fc`
-Base: `fork/main` at `55b8a1b002cdc4559df1ab8f604b6ae9da96027e`
+Base: `fork/main` at `b286e8ceca646906fb34bef60749261d63afca1f`
 Authoritative spec: `~/.hermes/plans/2026-07-11_auto-continue-taxonomy-refactor-spec.md`
 
 ## Phase 1 — RC-5 evidence pack (tree-grounded, before code)
@@ -78,7 +78,7 @@ GREEN evidence via the repository virtualenv runner:
 
 - `scripts/run_tests.sh tests/gateway/test_deferred_restart_taxonomy.py tests/gateway/test_auto_continue_interrupted_turns.py tests/gateway/test_restart_cascade.py -q` → 122 passed.
 - `scripts/run_tests.sh tests/gateway/test_resume_requests.py tests/gateway/test_session.py tests/gateway/test_post_delivery_callback_chaining.py tests/gateway/test_restart_cascade.py tests/gateway/test_auto_continue_interrupted_turns.py tests/gateway/test_deferred_restart_taxonomy.py -q` → 249 passed.
-- Final post-rebase command across resume requests, sessions, callback chaining, restart cascade, interrupted-turn behavior, and deferred taxonomy → 270 passed; latest deferred lifecycle file → 54 passed after staggered multi-initiator delivery and T9n6 coverage.
+- Final post-rebase command across resume requests, sessions, callback chaining, restart cascade, interrupted-turn behavior, and deferred taxonomy → 277 passed; latest deferred lifecycle file → 61 passed after staggered multi-initiator delivery, T9n6 coverage, injected arm-to-owner failures, host-reboot clock reset, real startup scheduling, stale-latch deletion failure, and loser backoff.
 - `ruff check` on all changed Python files → all checks passed.
 - Static pre-scan: bandit/ruff/semgrep, 0 HIGH/CRITICAL findings; low/medium output is baseline noise from scanning complete large files and pytest assertions.
 
@@ -96,5 +96,9 @@ Mutation evidence (each mutation was restored from the staged implementation imm
 - Pass 2 identified orphaning of a sole failed winner and malformed committed metadata. The coordinator now retries non-owning/injected precommit cancellation and fallible precommit exceptions with bounded backoff while propagating real external task cancellation to shutdown/boot ownership. Committed metadata requires a finite positive numeric `commit_ts` before any loser transition.
 - Pass 3 identified an unbounded alternate-order stream-confirmation cache. Tree ordering proves release precedes streaming suppression, so the cache was removed; confirmed stream delivery directly fires an existing strong callback and ordinary delivery retains no state.
 - Pass 4 identified cross-request delivery-barrier bypass. The elected leader now waits until every same-boot armed/claimed request has independently acknowledged delivery or timed out before atomically committing; a staggered two-initiator regression proves no early signal.
+- Pass 5 identified an arm-to-task ownership gap when the durable `armed` transition succeeded but a later scan or callback-registration step failed. The coordinator now retains the exact armed/claimed request in memory, schedules its owner immediately after the durable arm, and treats callback-registration failure as UNKNOWN delivery while preserving eventual one-signal progress. Injected post-arm scan and callback failures both prove the request remains owned.
+- Pass 6 found the same fingerprint at the narrower rename→payload-refresh boundary. Lifecycle state is authoritative in the successfully renamed filename, so ownership is now established immediately after rename and a failed redundant payload refresh is logged without abandoning the recoverable request. The exact post-rename failure is injected for both a sole request and a concurrent peer; both cases produce exactly one signal.
+- Pass 7 certified the ownership fingerprint resolved, then found two new classes: persisted monotonic timestamps fail across host reboot, and T9k tested reconciliation/order proxies instead of the startup effect. Deferred intent/commit and boot-start ordering now use wall-clock timestamps, with a simulated monotonic-epoch reset proving the handoff survives. The startup prepare→snapshot→schedule→finish sequence is one binding helper used by `start()` and T9k; the real surviving request is scheduled as SELF in the same boot.
+- Pass 8 certified both pass-7 classes resolved, then identified a non-yielding stale-latch deletion retry and fixed 10 ms loser polling. Failed stale deletion now verifies the directory remains and yields with bounded exponential backoff; all uncommitted/torn loser polling uses the same 10 ms→1 s bounded backoff. Injected regressions prove the event loop yields before deletion retry and the loser never falsely coalesces or signals.
 
-NEXT: Obtain final Momus approval on the corrected current diff, push/open the fork PR, wait for green CI, then arm auto-merge and record the CI/merge handoff. External safe-restart writer/skill wiring and the physical T6 rig remain Apollo/Aegis post-merge work per the authoritative sequence.
+NEXT: Commit, push/open the fork PR, wait for green CI, then arm auto-merge and record the CI/merge handoff. External safe-restart writer/skill wiring and the physical T6 rig remain Apollo/Aegis post-merge work per the authoritative sequence.

@@ -127,6 +127,38 @@ async def test_t2_t8_release_arms_then_waits_for_real_delivery_ack(
     assert durable.resume_handoff == "continue the migration"
 
 
+@pytest.mark.asyncio
+async def test_t8_post_arm_callback_failure_keeps_task_ownership(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, adapter = make_restart_runner()
+    runner.session_store, entry = _store(tmp_path)
+    runner._running_agents[entry.session_key] = object()
+    runner._current_boot_id = lambda: "11:22"
+    runner._consume_restart_initiated_breadcrumb = lambda session_key: bool(session_key)
+    signals: list[int] = []
+    runner.request_restart = lambda **_kwargs: signals.append(1) or True
+
+    def _fail_callback_registration(*_args, **_kwargs) -> None:
+        raise OSError("injected callback failure")
+
+    monkeypatch.setattr(
+        adapter,
+        "register_delivery_ack_callback",
+        _fail_callback_registration,
+    )
+    _submit(tmp_path, entry.session_key)
+
+    assert runner._release_running_agent_state(entry.session_key) is True
+    await asyncio.gather(*runner._background_tasks)
+
+    assert signals == [1]
+    assert "delivery state is UNKNOWN" in caplog.text
+    durable = runner.session_store._entries[entry.session_key]
+    assert durable.resume_kind == RESUME_KIND_SELF
+
+
 def test_t2_delivery_ack_is_generation_owned_and_not_a_finally_callback() -> None:
     _runner, adapter = make_restart_runner()
     observed: list[str] = []
@@ -206,30 +238,64 @@ def test_t9d_request_during_existing_drain_stays_submitted_for_next_boot(
     assert getattr(runner, "_background_tasks", set()) == set()
 
 
-def test_t9k_real_boot_reconciliation_precedes_candidate_snapshot(
+@pytest.mark.asyncio
+async def test_t9k_real_startup_sequence_reconciles_before_same_boot_schedule(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setenv("HERMES_RESUME_INTERRUPTED_TURNS", "auto")
     runner, _adapter = make_restart_runner()
     runner.session_store, entry = _store(tmp_path)
+    runner._session_db = None
     runner._current_boot_id = lambda: "new:boot"
-    runner._boot_started_monotonic = 20.0
+    runner._boot_started_at = 20.0
+    runner._startup_restore_in_progress = True
     request = _submit(tmp_path, entry.session_key, boot_id="old:boot")
     DeferredRestartCoordinator(tmp_path, boot_id="old:boot").transition(
         request, "claimed"
     )
 
-    assert runner._reconcile_deferred_restarts_at_boot() == 1
-    assert runner._reconcile_deferred_restarts_at_boot() == 0
+    assert await runner._restore_resume_pending_sessions_at_startup() == 1
     durable = runner.session_store._entries[entry.session_key]
     assert durable.resume_pending is True
     assert durable.resume_kind == RESUME_KIND_SELF
     assert durable.resume_request_id == "req-1"
+    assert runner._startup_resume_modes[entry.session_key]["mode"] == "auto"
+    assert entry.session_key in runner._resumed_this_boot
     assert not any((tmp_path / "gateway" / "resume_requests").iterdir())
 
     counts = json.loads((tmp_path / runner._STUCK_LOOP_FILE).read_text())
     assert counts[entry.session_key]["replay_request_ids"] == ["req-1"]
     assert len(counts[entry.session_key]["replay_marks"]) == 1
+
+
+def test_t9_cross_host_reboot_uses_stable_wall_clock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _store_obj, entry = _store(tmp_path)
+    monkeypatch.setattr(deferred_restart_module.time, "time", lambda: 1_700_000_000.0)
+    monkeypatch.setattr(deferred_restart_module.time, "monotonic", lambda: 50_000.0)
+    request = submit_deferred_restart(
+        tmp_path,
+        session_key=entry.session_key,
+        handoff="survive host reboot",
+        boot_id="old:boot",
+        request_id="req-host-reboot",
+    )
+    assert request.intent_ts == 1_700_000_000.0
+
+    marked: list[str] = []
+    assert reconcile_deferred_restarts_at_boot(
+        tmp_path,
+        current_boot_id="new:boot",
+        boot_started_at=1_700_000_010.0,
+        has_durable_mark=lambda req: False,
+        record_replay=lambda req: None,
+        mark_in_memory=lambda req: marked.append(req.request_id),
+        flush_sessions=lambda: None,
+        signal_restart=lambda: pytest.fail("cross-boot reconciliation signaled"),
+    ) == 1
+    assert marked == ["req-host-reboot"]
 
 
 @pytest.mark.asyncio
@@ -365,6 +431,93 @@ async def test_t8_delivery_barrier_and_repeated_schedule_are_one_shot(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_t8_post_arm_scan_failure_keeps_task_ownership(tmp_path: Path) -> None:
+    _store_obj, entry = _store(tmp_path)
+    _submit(tmp_path, entry.session_key)
+    coordinator = DeferredRestartCoordinator(tmp_path, boot_id="11:22")
+    assert coordinator.arm_for_session(
+        entry.session_key, consume_breadcrumb=lambda _k: True
+    ) == "armed"
+    coordinator.scan = lambda: []
+    delivered = asyncio.Event()
+    delivered.set()
+    signals: list[int] = []
+
+    outcome = await coordinator.schedule_armed(
+        entry.session_key,
+        delivery_event=delivered,
+        delivery_timeout=1.0,
+        record_replay=lambda req: None,
+        mark_self=lambda req: None,
+        signal_restart=lambda: signals.append(1),
+    )
+    assert outcome == "signaled"
+    assert signals == [1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("peer_count", [0, 1])
+async def test_t8_post_rename_refresh_failure_keeps_exactly_one_signal(
+    tmp_path: Path, monkeypatch, peer_count: int
+) -> None:
+    session_keys = ["agent:main:telegram:dm:123"]
+    if peer_count:
+        session_keys.append("agent:main:telegram:dm:456")
+    for index, session_key in enumerate(session_keys, start=1):
+        submit_deferred_restart(
+            tmp_path,
+            session_key=session_key,
+            handoff=f"handoff-{index}",
+            boot_id="11:22",
+            intent_ts=10.0,
+            request_id=f"req-{index}",
+        )
+
+    original_atomic_write = deferred_restart_module._atomic_write_json
+    injected = False
+
+    def _fail_first_armed_refresh(path: Path, payload: dict) -> None:
+        nonlocal injected
+        if not injected and path.name.endswith(".armed.json"):
+            injected = True
+            raise OSError("injected post-rename refresh failure")
+        original_atomic_write(path, payload)
+
+    monkeypatch.setattr(
+        deferred_restart_module,
+        "_atomic_write_json",
+        _fail_first_armed_refresh,
+    )
+    coordinator = DeferredRestartCoordinator(tmp_path, boot_id="11:22")
+    for session_key in session_keys:
+        assert coordinator.arm_for_session(
+            session_key, consume_breadcrumb=lambda _key: True
+        ) == "armed"
+
+    signals: list[int] = []
+    tasks = []
+    for session_key in session_keys:
+        delivered = asyncio.Event()
+        delivered.set()
+        tasks.append(
+            coordinator.schedule_armed(
+                session_key,
+                delivery_event=delivered,
+                delivery_timeout=1.0,
+                record_replay=lambda req: None,
+                mark_self=lambda req: None,
+                signal_restart=lambda: signals.append(1),
+            )
+        )
+
+    outcomes = await asyncio.gather(*tasks)
+    assert injected is True
+    assert signals == [1]
+    assert outcomes.count("signaled") == 1
+    assert outcomes.count("coalesced") == peer_count
+
+
+@pytest.mark.asyncio
 async def test_stale_prior_boot_leader_is_recovered_by_epoch_not_pid(
     tmp_path: Path,
 ) -> None:
@@ -387,6 +540,48 @@ async def test_stale_prior_boot_leader_is_recovered_by_epoch_not_pid(
         mark_self=lambda req: None,
         signal_restart=lambda: signals.append(1),
     )
+    assert signals == [1]
+
+
+@pytest.mark.asyncio
+async def test_stale_latch_delete_failure_yields_before_retry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _store_obj, entry = _store(tmp_path)
+    _submit(tmp_path, entry.session_key, boot_id="new:boot")
+    coordinator = DeferredRestartCoordinator(tmp_path, boot_id="new:boot")
+    coordinator.arm_for_session(entry.session_key, consume_breadcrumb=lambda _k: True)
+    coordinator.leader_dir.mkdir()
+    (coordinator.leader_dir / "meta.json").write_text(
+        json.dumps({"boot_id": "old:boot", "committed": False})
+    )
+    delivered = asyncio.Event()
+    delivered.set()
+    attempts = 0
+    observed_attempts: list[int] = []
+    original_rmtree = deferred_restart_module.shutil.rmtree
+    loop = asyncio.get_running_loop()
+
+    def _sticky_rmtree(path, *args, **kwargs) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            loop.call_soon(lambda: observed_attempts.append(attempts))
+        if attempts < 3:
+            return
+        original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(deferred_restart_module.shutil, "rmtree", _sticky_rmtree)
+    signals: list[int] = []
+    assert await coordinator.schedule_armed(
+        entry.session_key,
+        delivery_event=delivered,
+        delivery_timeout=1.0,
+        record_replay=lambda req: None,
+        mark_self=lambda req: None,
+        signal_restart=lambda: signals.append(1),
+    ) == "signaled"
+    assert observed_attempts == [1]
     assert signals == [1]
 
 
@@ -429,6 +624,44 @@ async def test_unreadable_meta_never_false_coalesces(
         await task
     [request] = coordinator.scan()
     assert request.state == "armed"
+
+
+@pytest.mark.asyncio
+async def test_uncommitted_loser_uses_bounded_exponential_backoff(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _store_obj, entry = _store(tmp_path)
+    _submit(tmp_path, entry.session_key)
+    coordinator = DeferredRestartCoordinator(tmp_path, boot_id="11:22")
+    coordinator.arm_for_session(entry.session_key, consume_breadcrumb=lambda _k: True)
+    coordinator.leader_dir.mkdir()
+    (coordinator.leader_dir / "meta.json").write_text(
+        json.dumps({"boot_id": "11:22", "committed": False})
+    )
+    delivered = asyncio.Event()
+    delivered.set()
+    delays: list[float] = []
+
+    class _StopPolling(Exception):
+        pass
+
+    async def _capture_sleep(delay: float) -> None:
+        delays.append(delay)
+        if len(delays) == 4:
+            raise _StopPolling
+
+    monkeypatch.setattr(deferred_restart_module.asyncio, "sleep", _capture_sleep)
+    task = coordinator.schedule_armed(
+        entry.session_key,
+        delivery_event=delivered,
+        delivery_timeout=1.0,
+        record_replay=lambda req: None,
+        mark_self=lambda req: pytest.fail("uncommitted loser coalesced"),
+        signal_restart=lambda: pytest.fail("uncommitted loser signaled"),
+    )
+    with pytest.raises(_StopPolling):
+        await task
+    assert delays == [0.01, 0.02, 0.04, 0.08]
 
 
 @pytest.mark.asyncio

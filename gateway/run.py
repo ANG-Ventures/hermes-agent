@@ -8307,7 +8307,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         reconciled = reconcile_deferred_restarts_at_boot(
             _hermes_home,
             current_boot_id=self._current_boot_id(),
-            boot_started_at=getattr(self, "_boot_started_monotonic", time.monotonic()),
+            boot_started_at=getattr(self, "_boot_started_at", time.time()),
             session_exists=lambda request: _entry(request) is not None,
             has_durable_mark=_has_durable_mark,
             record_replay=lambda request: self._record_restart_replay_mark(
@@ -8507,6 +8507,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._startup_restore_in_progress = False
         if drained:
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
+
+    async def _restore_resume_pending_sessions_at_startup(self) -> int:
+        """Run the binding prepare→snapshot→schedule startup sequence."""
+        await self._prepare_auto_resume_decisions()
+        scheduled = self._schedule_resume_pending_sessions()
+        await self._finish_startup_restore()
+        return scheduled
 
     @staticmethod
     def _log_background_resume_result(task: "asyncio.Task") -> None:
@@ -8869,7 +8876,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns True if at least one adapter connected successfully.
         """
         logger.info("Starting Hermes Gateway...")
-        self._boot_started_monotonic = time.monotonic()
+        # Persisted deferred requests can span an OS reboot, so their ordering
+        # must use the same stable wall-clock epoch as request intent_ts.
+        self._boot_started_at = time.time()
         try:
             self._gateway_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -9490,9 +9499,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # previous gateway restart/shutdown.  The resume_pending flag is cleared
         # by the normal successful-turn path, so a failed auto-resume remains
         # visible for manual recovery on the next user message.
-        await self._prepare_auto_resume_decisions()
-        self._schedule_resume_pending_sessions()
-        await self._finish_startup_restore()
+        await self._restore_resume_pending_sessions_at_startup()
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
         try:
@@ -18775,28 +18782,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> None:
         """Arm one SELF request after ownership teardown, then await delivery."""
         coordinator = self._get_deferred_restart_coordinator()
-        state = coordinator.arm_for_session(
-            session_key,
-            consume_breadcrumb=self._consume_restart_initiated_breadcrumb,
-        )
-        if state != "armed":
-            return
-
         entry = self.session_store._entries.get(session_key)
         source = getattr(entry, "origin", None)
         adapter = self._adapter_for_source(source) if source is not None else None
         delivered = asyncio.Event()
-        if adapter is not None:
-            adapter.register_delivery_ack_callback(
-                session_key,
-                delivered.set,
-                generation=generation,
-            )
-        else:
-            logger.warning(
-                "SELF restart has no adapter delivery barrier for %s; delivery state is UNKNOWN",
-                session_key,
-            )
 
         def _mark_self(request) -> bool:
             return self.session_store.mark_resume_pending(
@@ -18807,6 +18796,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 resume_request_id=request.request_id,
             )
 
+        state = coordinator.arm_for_session(
+            session_key,
+            consume_breadcrumb=self._consume_restart_initiated_breadcrumb,
+        )
+        if state != "armed":
+            return
+
+        # Establish task ownership immediately after the durable arm. Callback
+        # registration is fallible; if it fails, the owned task proceeds with
+        # UNKNOWN delivery instead of leaving an orphaned armed request.
         task = coordinator.schedule_armed(
             session_key,
             delivery_event=delivered,
@@ -18824,6 +18823,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._background_tasks = background
         background.add(task)
         task.add_done_callback(background.discard)
+        if adapter is not None:
+            try:
+                adapter.register_delivery_ack_callback(
+                    session_key,
+                    delivered.set,
+                    generation=generation,
+                )
+            except Exception:
+                logger.warning(
+                    "SELF restart delivery callback registration failed for %s; "
+                    "delivery state is UNKNOWN",
+                    session_key,
+                    exc_info=True,
+                )
+                delivered.set()
+        else:
+            logger.warning(
+                "SELF restart has no adapter delivery barrier for %s; delivery state is UNKNOWN",
+                session_key,
+            )
 
     def _release_running_agent_state(
         self,

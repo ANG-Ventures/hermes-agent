@@ -127,7 +127,9 @@ def submit_deferred_restart(
         session_key=str(session_key),
         handoff=str(handoff or ""),
         boot_id=str(boot_id),
-        intent_ts=float(time.monotonic() if intent_ts is None else intent_ts),
+        # Persist wall time: monotonic epochs reset across host reboots, while
+        # deferred requests intentionally survive both process and host boots.
+        intent_ts=float(time.time() if intent_ts is None else intent_ts),
         state="submitted",
         path=path,
     )
@@ -148,6 +150,7 @@ class DeferredRestartCoordinator:
         self.requests_dir = dropbox_dir(self.hermes_home)
         self.leader_dir = self.hermes_home / "gateway" / ".restart-leader.d"
         self._scheduled: dict[str, asyncio.Task] = {}
+        self._owned_requests: dict[str, DeferredRestartRequest] = {}
         self._delivery_ready: set[str] = set()
 
     def scan(self) -> list[DeferredRestartRequest]:
@@ -174,7 +177,23 @@ class DeferredRestartCoordinator:
         destination = request.path.with_name(f"{request.request_id}.{state}.json")
         os.replace(request.path, destination)
         updated = replace(request, state=state, path=destination)
-        _atomic_write_json(destination, updated.payload())
+        if state in {"armed", "claimed", "coalesce_pending"}:
+            self._owned_requests[updated.session_key] = updated
+        else:
+            self._owned_requests.pop(updated.session_key, None)
+        try:
+            _atomic_write_json(destination, updated.payload())
+        except OSError:
+            # The filename is the authoritative lifecycle state. Once the CAS
+            # rename succeeds, a redundant payload refresh must not orphan the
+            # durable request before its in-memory owner can be scheduled.
+            logger.warning(
+                "Deferred restart payload refresh failed after transition to %s; "
+                "filename state remains authoritative for %s",
+                state,
+                request.request_id,
+                exc_info=True,
+            )
         return updated
 
     def reject(self, request: DeferredRestartRequest, reason: str) -> DeferredRestartRequest:
@@ -213,9 +232,10 @@ class DeferredRestartCoordinator:
             self.reject(request, "missing, mismatched, or replayed breadcrumb")
             return "rejected"
         try:
-            self.transition(request, "armed")
+            armed = self.transition(request, "armed")
         except FileNotFoundError:
             return "lost"
+        self._owned_requests[session_key] = armed
         return "armed"
 
     def schedule_armed(
@@ -232,16 +252,20 @@ class DeferredRestartCoordinator:
         existing = self._scheduled.get(session_key)
         if existing is not None and not existing.done():
             return existing
-        request = next(
-            (
-                item
-                for item in self.scan()
-                if item.session_key == session_key and item.state == "armed"
-            ),
-            None,
-        )
+        request = self._owned_requests.get(session_key)
+        if request is None or request.state not in {"armed", "claimed"}:
+            request = next(
+                (
+                    item
+                    for item in self.scan()
+                    if item.session_key == session_key
+                    and item.state in {"armed", "claimed"}
+                ),
+                None,
+            )
         if request is None:
             raise LookupError(f"no armed deferred restart for {session_key}")
+        self._owned_requests[session_key] = request
         task = asyncio.create_task(
             self._run_armed(
                 request,
@@ -338,15 +362,17 @@ class DeferredRestartCoordinator:
                     raise RuntimeError(
                         "deferred restart signal failed after actuation commit"
                     )
-                retryable = next(
-                    (
-                        candidate
-                        for candidate in self.scan()
-                        if candidate.session_key == request.session_key
-                        and candidate.state in {"armed", "claimed"}
-                    ),
-                    None,
-                )
+                retryable = self._owned_requests.get(request.session_key)
+                if retryable is None or retryable.state not in {"armed", "claimed"}:
+                    retryable = next(
+                        (
+                            candidate
+                            for candidate in self.scan()
+                            if candidate.session_key == request.session_key
+                            and candidate.state in {"armed", "claimed"}
+                        ),
+                        None,
+                    )
                 if retryable is None:
                     raise LookupError(
                         "deferred restart request disappeared during retry: "
@@ -366,6 +392,11 @@ class DeferredRestartCoordinator:
             ):
                 # Epoch ownership, never PID liveness, proves this latch stale.
                 shutil.rmtree(self.leader_dir, ignore_errors=True)
+                if self.leader_dir.exists():
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(1.0, retry_delay * 2.0)
+                else:
+                    retry_delay = 0.01
                 continue
             commit_ts: float | None = None
             if meta and meta.get("committed") is True:
@@ -388,7 +419,8 @@ class DeferredRestartCoordinator:
 
             # committed:false, missing, or torn metadata is never a coalescence
             # trigger. Stay armed and retry after the winner releases the latch.
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(1.0, retry_delay * 2.0)
 
     async def _run_as_leader(
         self,
@@ -421,7 +453,10 @@ class DeferredRestartCoordinator:
             while True:
                 pending_delivery_ids = {
                     candidate.request_id
-                    for candidate in self.scan()
+                    for candidate in [
+                        *self._owned_requests.values(),
+                        *self.scan(),
+                    ]
                     if candidate.boot_id == self.boot_id
                     and candidate.state in {"armed", "claimed"}
                 } - self._delivery_ready
@@ -433,7 +468,7 @@ class DeferredRestartCoordinator:
 
             if checkpoint:
                 checkpoint("before_commit_publish", current)
-            commit_ts = time.monotonic()
+            commit_ts = time.time()
             self._publish_leader_meta(current, committed=True, commit_ts=commit_ts)
             committed = True
             signal_restart()
