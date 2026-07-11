@@ -1626,6 +1626,10 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Per-task skill promotion: names re-promoted to full descriptions in the
+    # child's compact skills index (see agent/system_prompt.py). None/empty =
+    # pure names-only index.
+    skills: Optional[List[str]] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -2027,6 +2031,12 @@ def _build_child_agent(
     # close it out from under a background child (#81267).
     if child_session_db is not None:
         child._owns_session_db = True
+    # Per-task skill promotion (see agent/system_prompt.py): names the brief
+    # wants re-promoted to full descriptions in the child's compact index.
+    # Set BEFORE the first request — the system prompt is built lazily.
+    child._delegate_skills = tuple(
+        s.strip() for s in (skills or []) if isinstance(s, str) and s.strip()
+    )
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
@@ -3642,6 +3652,7 @@ def delegate_task(
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
+    skills: Optional[List[str]] = None,
     parent_agent=None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
 ) -> str:
@@ -3776,7 +3787,12 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
+        single_task: Dict[str, Any] = {
+            "goal": goal,
+            "context": context,
+            "role": top_role,
+            "skills": skills,
+        }
         if output_schema is not None:
             single_task["output_schema"] = output_schema
         task_list = [single_task]
@@ -3908,6 +3924,7 @@ def delegate_task(
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
                 role=effective_role,
+                skills=(t.get("skills") if "skills" in t else skills),
             )
         except ValueError as exc:
             # Explicit-pin preflight failures (e.g. pinned delegation.command
@@ -4956,6 +4973,11 @@ DELEGATE_TASK_SCHEMA = {
                                 "fields you will read."
                             ),
                         },
+                        "skills": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Per-task skill promotion override. See top-level 'skills'.",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -4997,6 +5019,18 @@ DELEGATE_TASK_SCHEMA = {
                     "For action='steer': the course correction, appended to "
                     "the child's next tool result mid-run. Be directive and "
                     "specific."
+                ),
+            },
+            "skills": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Skill names to promote in the subagent's skill index. "
+                    "Subagents get a compact names-only index by default; "
+                    "skills named here keep their full descriptions so the "
+                    "child loads them reliably. Pass the skills the task's "
+                    "domain needs (e.g. ['systematic-debugging']). The child "
+                    "can still browse/load ANY skill via skills_list/skill_view."
                 ),
             },
         },
@@ -5063,6 +5097,7 @@ registry.register(
         action=args.get("action"),
         subagent_id=args.get("subagent_id"),
         message=args.get("message"),
+        skills=args.get("skills"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
