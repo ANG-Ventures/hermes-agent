@@ -9765,9 +9765,8 @@ async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
             status_code=400,
             detail="ids must contain at most 500 entries",
         )
-    db = _open_session_db_for_profile(body.profile)
-
     def _do() -> int:
+        db = _open_session_db_for_profile(body.profile)
         try:
             return db.delete_sessions(body.ids)
         finally:
@@ -9785,9 +9784,8 @@ async def count_empty_sessions_endpoint(profile: Optional[str] = None):
     UI hides the affordance so users aren't presented with a button
     that does nothing. Cheap, single-COUNT query.
     """
-    db = _open_session_db_for_profile(profile)
-
     def _do() -> int:
+        db = _open_session_db_for_profile(profile)
         try:
             return db.count_empty_sessions()
         finally:
@@ -9816,9 +9814,8 @@ async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
     prune-on-startup pass. Matching that pre-existing trade-off keeps
     the two delete endpoints' DB-vs-disk behaviour consistent.
     """
-    db = _open_session_db_for_profile(profile)
-
     def _do() -> int:
+        db = _open_session_db_for_profile(profile)
         try:
             return db.delete_empty_sessions()
         finally:
@@ -9904,9 +9901,8 @@ async def get_session_latest_descendant(
     session_id: str,
     profile: Optional[str] = None,
 ):
-    db = _open_session_db_for_profile(profile)
-
     def _do():
+        db = _open_session_db_for_profile(profile)
         try:
             return _session_latest_descendant(session_id, db)
         finally:
@@ -9929,9 +9925,8 @@ async def get_session_messages(
     limit: Optional[int] = None,
     offset: int = 0,
 ):
-    db = _open_session_db_for_profile(profile)
-
     def _do():
+        db = _open_session_db_for_profile(profile)
         try:
             sid = db.resolve_session_id(session_id)
             if not sid:
@@ -9964,9 +9959,8 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
     # ``profile`` deletes a session belonging to another (local) profile by
     # opening its state.db directly. Remote profiles never reach here — the
     # desktop routes their DELETE to the remote backend. Omit for current/default.
-    db = _open_session_db_for_profile(profile)
-
     def _do():
+        db = _open_session_db_for_profile(profile)
         try:
             # Resolve exact ids / unique prefixes like every other session endpoint
             # (detail, messages, rename, export all do). A session that no longer
@@ -10057,9 +10051,8 @@ def _rename_session_record(
 @app.get("/api/sessions/{session_id}/export")
 async def export_session_endpoint(session_id: str, profile: Optional[str] = None):
     """Export a single session (metadata + messages) as JSON."""
-    db = _open_session_db_for_profile(profile)
-
     def _do():
+        db = _open_session_db_for_profile(profile)
         try:
             sid = db.resolve_session_id(session_id)
             if not sid:
@@ -10128,9 +10121,8 @@ async def prune_sessions_endpoint(body: SessionPrune):
     if has_window or (_attr_filters_set and not _older_than_explicit):
         _effective_older_than = None
     profile_home = _cron_profile_home(body.profile)[1] if body.profile else get_hermes_home()
-    db = _open_session_db_for_profile(body.profile)
-
     def _do():
+        db = _open_session_db_for_profile(body.profile)
         try:
             filters = dict(
                 older_than_days=_effective_older_than,
@@ -14174,9 +14166,8 @@ async def update_config_raw(body: RawConfigUpdate, profile: Optional[str] = None
 async def get_usage_analytics(days: int = 30, profile: Optional[str] = None):
     from agent.insights import InsightsEngine
 
-    db = _open_session_db_for_profile(profile)
-
     def _do():
+        db = _open_session_db_for_profile(profile)
         try:
             cutoff = time.time() - (days * 86400)
             cur = db._conn.execute("""
@@ -14252,9 +14243,8 @@ async def get_models_analytics(days: int = 30, profile: Optional[str] = None):
     Returns token/cost/session breakdown per model plus capability metadata
     from models.dev (context window, vision, tools, reasoning, etc.).
     """
-    db = _open_session_db_for_profile(profile)
-
     def _do():
+        db = _open_session_db_for_profile(profile)
         try:
             cutoff = time.time() - (days * 86400)
 
