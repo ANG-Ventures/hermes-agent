@@ -10,7 +10,7 @@ import pytest
 import yaml
 
 import gateway.run as gateway_run
-from gateway.config import Platform
+from gateway.config import ChannelOverride, GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
 
@@ -109,6 +109,26 @@ def test_turn_route_injects_priority_processing_without_changing_runtime():
     runner._service_tier = "priority"
     runtime_kwargs = {
         "api_key": "***",
+        "base_url": "https://api.openai.com/v1",
+        "provider": "openai-api",
+        "api_mode": "codex_responses",
+        "command": None,
+        "args": [],
+        "credential_pool": None,
+    }
+
+    route = gateway_run.GatewayRunner._resolve_turn_agent_config(runner, "hi", "gpt-5.4", runtime_kwargs)
+
+    assert route["runtime"]["provider"] == "openai-api"
+    assert route["runtime"]["api_mode"] == "codex_responses"
+    assert route["request_overrides"] == {"service_tier": "priority"}
+
+
+def test_turn_route_fails_closed_for_proxy_gpt_model():
+    runner = _make_runner()
+    runner._service_tier = "priority"
+    runtime_kwargs = {
+        "api_key": "***",
         "base_url": "https://openrouter.ai/api/v1",
         "provider": "openrouter",
         "api_mode": "chat_completions",
@@ -117,11 +137,50 @@ def test_turn_route_injects_priority_processing_without_changing_runtime():
         "credential_pool": None,
     }
 
-    route = gateway_run.GatewayRunner._resolve_turn_agent_config(runner, "hi", "gpt-5.4", runtime_kwargs)
+    route = gateway_run.GatewayRunner._resolve_turn_agent_config(
+        runner, "hi", "gpt-5.6-sol", runtime_kwargs
+    )
 
-    assert route["runtime"]["provider"] == "openrouter"
-    assert route["runtime"]["api_mode"] == "chat_completions"
-    assert route["request_overrides"] == {"service_tier": "priority"}
+    assert route["request_overrides"] == {}
+
+
+@pytest.mark.parametrize(
+    ("provider", "api_mode", "model", "expected"),
+    [
+        (
+            "openai-codex",
+            "codex_responses",
+            "gpt-5.5",
+            {"service_tier": "fast"},
+        ),
+        (
+            "anthropic",
+            "anthropic_messages",
+            "claude-opus-4-6",
+            {"speed": "fast"},
+        ),
+    ],
+)
+def test_turn_route_serializes_provider_specific_fast_override(
+    provider, api_mode, model, expected
+):
+    runner = _make_runner()
+    runner._service_tier = "priority"
+    runtime_kwargs = {
+        "api_key": "runtime-secret",
+        "base_url": "https://example.invalid",
+        "provider": provider,
+        "api_mode": api_mode,
+        "command": None,
+        "args": [],
+        "credential_pool": None,
+    }
+
+    route = gateway_run.GatewayRunner._resolve_turn_agent_config(
+        runner, "hi", model, runtime_kwargs
+    )
+
+    assert route["request_overrides"] == expected
 
 
 def test_turn_route_skips_priority_processing_for_unsupported_models():
@@ -148,7 +207,9 @@ async def test_handle_fast_command_persists_config(monkeypatch, tmp_path):
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
-    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    runner._resolve_effective_session_route_identity = MagicMock(
+        return_value=("gpt-5.4", "openai-api", "codex_responses")
+    )
 
     response = await runner._handle_fast_command(_make_event("/fast fast"))
 
@@ -157,6 +218,230 @@ async def test_handle_fast_command_persists_config(monkeypatch, tmp_path):
 
     saved = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
     assert saved["agent"]["service_tier"] == "fast"
+
+
+@pytest.mark.asyncio
+async def test_fast_status_uses_persisted_session_route_without_credentials(
+    monkeypatch, tmp_path
+):
+    runner = _make_runner()
+    source = _make_source()
+    session_key = runner._session_key_for_source(source)
+    persisted = {
+        "model": "gpt-5.6-sol",
+        "provider": "openai-codex",
+        "api_mode": "codex_responses",
+    }
+    runner.session_store = SimpleNamespace(
+        entry_for=lambda key: SimpleNamespace(model_override_identity=persisted)
+        if key == session_key
+        else None,
+    )
+    runner._session_model_overrides[session_key] = {
+        **persisted,
+        "api_key": "must-not-be-read",
+    }
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {
+            "model": {
+                "default": "claude-opus-4-8",
+                "provider": "anthropic",
+                "api_mode": "anthropic_messages",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        MagicMock(side_effect=AssertionError("credential checkout during /fast status")),
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs_for_provider",
+        MagicMock(side_effect=AssertionError("provider checkout during /fast status")),
+    )
+
+    response = await runner._handle_fast_command(_make_event("/fast status"))
+
+    assert "openai-codex/gpt-5.6-sol" in response
+    assert "Codex Fast" in response
+    assert "GPT-5.5" in response
+    assert "claude" not in response.lower()
+
+
+@pytest.mark.asyncio
+async def test_fast_status_opus_48_proxy_points_to_separate_fast_model(
+    monkeypatch, tmp_path
+):
+    runner = _make_runner()
+    runner._resolve_effective_session_route_identity = MagicMock(
+        return_value=(
+            "claude-opus-4-8",
+            "claude-apr",
+            "anthropic_messages",
+        )
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+
+    response = await runner._handle_fast_command(_make_event("/fast status"))
+
+    assert "claude-apr/claude-opus-4-8" in response
+    assert "speed=fast" in response
+    assert "claude-opus-4-8-fast" in response
+
+
+def test_pure_route_identity_matches_runtime_precedence(monkeypatch):
+    source = _make_source()
+    session_key = "agent:main:telegram:dm:12345"
+    config = {
+        "model": {
+            "default": "gpt-5.4",
+            "provider": "openai-api",
+            "api_mode": "codex_responses",
+        }
+    }
+
+    runner = _make_runner()
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                channel_overrides={
+                    "12345": ChannelOverride(
+                        model="gpt-5.5",
+                        provider="openai-codex",
+                    )
+                }
+            )
+        }
+    )
+    runner.session_store = SimpleNamespace(entry_for=lambda _key: None)
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openai-api",
+            "api_mode": "codex_responses",
+            "api_key": "global-key",
+        },
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs_for_provider",
+        lambda provider: {
+            "provider": provider,
+            "api_mode": "codex_responses",
+            "api_key": "channel-key",
+        },
+    )
+
+    pure = runner._resolve_effective_session_route_identity(
+        source=source,
+        session_key=session_key,
+        user_config=config,
+    )
+    model, runtime = runner._resolve_session_agent_runtime(
+        source=source,
+        session_key=session_key,
+        user_config=config,
+    )
+
+    assert pure == (model, runtime["provider"], runtime["api_mode"])
+    assert pure == ("gpt-5.5", "openai-codex", "codex_responses")
+
+
+def test_pure_route_identity_matches_runtime_for_session_override(monkeypatch):
+    source = _make_source()
+    runner = _make_runner()
+    session_key = runner._session_key_for_source(source)
+    identity = {
+        "model": "gpt-5.6-sol",
+        "provider": "openai-codex",
+        "api_mode": "codex_responses",
+    }
+    runner.session_store = SimpleNamespace(
+        entry_for=lambda _key: SimpleNamespace(model_override_identity=identity)
+    )
+    runner._session_model_overrides[session_key] = {
+        **identity,
+        "api_key": "session-secret",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "credential_pool": object(),
+    }
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        MagicMock(side_effect=AssertionError("session override must win")),
+    )
+    config = {
+        "model": {
+            "default": "claude-opus-4-8",
+            "provider": "anthropic",
+            "api_mode": "anthropic_messages",
+        }
+    }
+
+    pure = runner._resolve_effective_session_route_identity(
+        source=source, session_key=session_key, user_config=config
+    )
+    model, runtime = runner._resolve_session_agent_runtime(
+        source=source, session_key=session_key, user_config=config
+    )
+
+    assert pure == (model, runtime["provider"], runtime["api_mode"])
+    assert pure == ("gpt-5.6-sol", "openai-codex", "codex_responses")
+
+
+def test_pure_route_identity_matches_runtime_for_global_route(monkeypatch):
+    runner = _make_runner()
+    runner.config = GatewayConfig()
+    runner.session_store = SimpleNamespace(entry_for=lambda _key: None)
+    config = {
+        "model": {
+            "default": "claude-opus-4-6",
+            "provider": "anthropic",
+            "api_mode": "anthropic_messages",
+        }
+    }
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "anthropic",
+            "api_mode": "anthropic_messages",
+            "api_key": "global-secret",
+        },
+    )
+
+    pure = runner._resolve_effective_session_route_identity(
+        source=_make_source(), session_key="global-key", user_config=config
+    )
+    model, runtime = runner._resolve_session_agent_runtime(
+        source=_make_source(), session_key="global-key", user_config=config
+    )
+
+    assert pure == (model, runtime["provider"], runtime["api_mode"])
+
+
+def test_model_switch_note_reports_enabled_fast_becoming_unavailable():
+    runner = _make_runner()
+    runner._service_tier = "priority"
+    result = SimpleNamespace(
+        new_model="gpt-5.6-sol",
+        target_provider="openai-codex",
+        api_mode="codex_responses",
+    )
+
+    note = runner._fast_unavailable_model_switch_row(result)
+
+    assert "Fast: unavailable" in note
+    assert "openai-codex/gpt-5.6-sol" in note
+    assert "normal speed" in note
 
 
 @pytest.mark.asyncio
@@ -183,9 +468,9 @@ async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch
         gateway_run,
         "_resolve_runtime_agent_kwargs",
         lambda: {
-            "provider": "openrouter",
-            "api_mode": "chat_completions",
-            "base_url": "https://openrouter.ai/api/v1",
+            "provider": "openai-api",
+            "api_mode": "codex_responses",
+            "base_url": "https://api.openai.com/v1",
             "api_key": "***",
         },
     )

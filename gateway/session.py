@@ -639,6 +639,25 @@ def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict
     return cleaned or None
 
 
+PERSISTABLE_MODEL_IDENTITY_KEYS = ("model", "provider", "api_mode")
+
+
+def sanitize_model_override_identity(
+    identity: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, str]]:
+    """Keep only the credential-free identity used for sticky routing."""
+    if not isinstance(identity, dict):
+        return None
+    cleaned = {
+        key: str(identity[key])
+        for key in PERSISTABLE_MODEL_IDENTITY_KEYS
+        if identity.get(key) not in (None, "")
+    }
+    if not cleaned.get("model") or not cleaned.get("provider"):
+        return None
+    return cleaned
+
+
 @dataclass
 class SessionEntry:
     """
@@ -726,8 +745,9 @@ class SessionEntry:
     # restart (the harness event the user didn't cause) — the in-memory
     # GatewayRunner._session_reasoning_overrides dict is otherwise lost on
     # restart, silently reverting /reasoning high back to the config default.
-    # Still CLEARED by /new, /reset, auto-reset, and finalization (durability,
-    # not scope). Shape: {"enabled": bool, "effort": str} or None.
+    # Preserved by manual /new and /reset by default, but still cleared by
+    # automatic reset/finalization. Shape: {"enabled": bool, "effort": str}
+    # or None; {"enabled": False, "effort": "none"} is an explicit override.
     reasoning_override: Optional[Dict[str, Any]] = None
 
     # Session-scoped /model override IDENTITY (never the secret): only
@@ -793,7 +813,9 @@ class SessionEntry:
             "auto_reset_reason": self.auto_reset_reason,
             "reset_had_activity": self.reset_had_activity,
             "reasoning_override": self.reasoning_override,
-            "model_override_identity": self.model_override_identity,
+            "model_override_identity": sanitize_model_override_identity(
+                self.model_override_identity
+            ),
             "last_served_identity": self.last_served_identity,
         }
         if self.model_override:
@@ -879,10 +901,8 @@ class SessionEntry:
                 if isinstance(data.get("reasoning_override"), dict)
                 else None
             ),
-            model_override_identity=(
+            model_override_identity=sanitize_model_override_identity(
                 data.get("model_override_identity")
-                if isinstance(data.get("model_override_identity"), dict)
-                else None
             ),
             last_served_identity=(
                 data.get("last_served_identity")
@@ -2437,8 +2457,19 @@ class SessionStore:
                 self._save()
         return count
 
-    def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
-        """Force reset a session, creating a new session ID."""
+    def reset_session(
+        self,
+        session_key: str,
+        display_name: Optional[str] = None,
+        *,
+        preserve_route_preferences: bool = False,
+    ) -> Optional[SessionEntry]:
+        """Force reset a session, creating a new session ID.
+
+        Automatic callers retain the legacy full-reset default. The manual
+        /new and /reset handler explicitly opts in to carrying only the two
+        persisted, non-secret route preference fields.
+        """
         db_end_session_id = None
         db_create_kwargs = None
         new_entry = None
@@ -2465,6 +2496,20 @@ class SessionStore:
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
                 is_fresh_reset=True,
+                model_override_identity=(
+                    sanitize_model_override_identity(
+                        old_entry.model_override_identity
+                    )
+                    if preserve_route_preferences
+                    and isinstance(old_entry.model_override_identity, dict)
+                    else None
+                ),
+                reasoning_override=(
+                    dict(old_entry.reasoning_override)
+                    if preserve_route_preferences
+                    and isinstance(old_entry.reasoning_override, dict)
+                    else None
+                ),
             )
 
             self._entries[session_key] = new_entry

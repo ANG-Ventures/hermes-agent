@@ -11382,7 +11382,7 @@ def _(rid, params: dict) -> dict:
 
         overrides = None
         if nv == "fast":
-            from hermes_cli.models import resolve_fast_mode_overrides
+            from hermes_cli.models import resolve_fast_mode_capability
 
             target_model = (
                 getattr(agent, "model", None) if agent is not None else _resolve_model()
@@ -11393,12 +11393,37 @@ def _(rid, params: dict) -> dict:
                     4002,
                     "fast mode is not available without a selected model",
                 )
-            overrides = resolve_fast_mode_overrides(target_model)
-            if overrides is None:
+            model_cfg = _load_cfg().get("model") or {}
+            if not isinstance(model_cfg, dict):
+                model_cfg = {}
+            target_provider = (
+                getattr(agent, "provider", None)
+                if agent is not None
+                else model_cfg.get("provider")
+            )
+            target_api_mode = (
+                getattr(agent, "api_mode", None)
+                if agent is not None
+                else model_cfg.get("api_mode")
+            )
+            if not target_api_mode:
+                if target_provider == "openai-codex":
+                    target_api_mode = "codex_responses"
+                elif target_provider == "anthropic":
+                    target_api_mode = "anthropic_messages"
+                elif target_provider in {"openai", "openai-api"}:
+                    target_api_mode = "codex_responses"
+            capability = resolve_fast_mode_capability(
+                model=target_model,
+                provider=target_provider,
+                api_mode=target_api_mode,
+            )
+            overrides = capability.request_overrides
+            if not capability.supported:
                 return _err(
                     rid,
                     4002,
-                    "fast mode is not available for this model",
+                    capability.reason or "fast mode is not available for this route",
                 )
 
         _write_config_key("agent.service_tier", nv)

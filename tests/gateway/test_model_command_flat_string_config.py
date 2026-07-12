@@ -202,6 +202,34 @@ async def test_model_session_flag_does_not_persist(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_model_reset_clears_session_override_without_switching_global(
+    tmp_path, monkeypatch
+):
+    cfg_path = _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "global-model", "provider": "openai-api"},
+    )
+    runner = _make_runner()
+    event = _make_event("/model reset")
+    session_key = runner._session_key_for_source(event.source)
+    runner._session_model_overrides[session_key] = {
+        "model": "session-model",
+        "provider": "openai-codex",
+        "api_mode": "codex_responses",
+        "api_key": "runtime-only",
+    }
+
+    result = await runner._handle_model_command(event)
+
+    assert session_key not in runner._session_model_overrides
+    assert "cleared" in result.lower()
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert written["model"]["default"] == "global-model"
+    assert written["model"]["provider"] == "openai-api"
+
+
+@pytest.mark.asyncio
 async def test_model_switch_confirmation_shows_reasoning_from_config(tmp_path, monkeypatch):
     """The /model confirmation surfaces the effective reasoning effort, read
     from config.yaml (agent.reasoning_effort) when no session override is set.

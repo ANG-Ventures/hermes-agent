@@ -6631,12 +6631,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
     
     def _fast_command_available(self) -> bool:
         try:
-            from hermes_cli.models import model_supports_fast_mode
+            from hermes_cli.models import resolve_fast_mode_capability
         except Exception:
             return False
         agent = getattr(self, "agent", None)
         model = getattr(agent, "model", None) or getattr(self, "model", None)
-        return model_supports_fast_mode(model)
+        provider = getattr(agent, "provider", None) or getattr(self, "provider", None)
+        api_mode = getattr(agent, "api_mode", None) or getattr(self, "api_mode", None)
+        if not api_mode:
+            if provider == "openai-codex":
+                api_mode = "codex_responses"
+            elif provider == "anthropic":
+                api_mode = "anthropic_messages"
+            elif provider in {"openai", "openai-api"}:
+                api_mode = "codex_responses"
+        return resolve_fast_mode_capability(
+            model=model,
+            provider=provider,
+            api_mode=api_mode,
+        ).supported
 
     def _command_available(self, slash_command: str) -> bool:
         if slash_command == "/fast":

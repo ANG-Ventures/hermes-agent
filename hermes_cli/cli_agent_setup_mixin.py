@@ -179,7 +179,7 @@ class CLIAgentSetupMixin:
         Processing / Anthropic fast mode, attach `request_overrides` so the
         API call is marked accordingly.
         """
-        from hermes_cli.models import resolve_fast_mode_overrides
+        from hermes_cli.models import resolve_fast_mode_capability
 
         runtime = {
             "api_key": self.api_key,
@@ -209,7 +209,12 @@ class CLIAgentSetupMixin:
             return route
 
         try:
-            overrides = resolve_fast_mode_overrides(route["model"])
+            capability = resolve_fast_mode_capability(
+                model=route["model"],
+                provider=runtime["provider"],
+                api_mode=runtime["api_mode"],
+            )
+            overrides = capability.request_overrides
         except Exception:
             overrides = None
         route["request_overrides"] = overrides

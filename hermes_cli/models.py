@@ -13,9 +13,10 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import time
+from dataclasses import dataclass
 from difflib import get_close_matches
 from pathlib import Path
-from typing import Any, NamedTuple, Optional
+from typing import Any, Literal, NamedTuple, Optional
 
 from hermes_cli import __version__ as _HERMES_VERSION
 
@@ -2076,15 +2077,56 @@ def provider_label(provider: Optional[str]) -> str:
     return _PROVIDER_LABELS.get(normalized, original or "OpenRouter")
 
 
-# Models that support OpenAI Priority Processing (service_tier="priority").
-# See https://openai.com/api-priority-processing/ for the canonical list.
-#
-# Pattern-based matching — any OpenAI flagship model (gpt-*, o1*, o3*, o4*)
-# is assumed to support Priority Processing. service_tier=priority is silently
-# ignored by non-OpenAI endpoints (OpenRouter/Copilot/opencode-zen proxies
-# strip the field), so false positives are harmless. Codex-series models
-# (gpt-5-codex, gpt-5.3-codex, etc.) are excluded — they don't expose the
-# service_tier parameter through the Codex Responses API.
+# Route-specific Fast/Priority contracts. Keep the dated model entries aligned
+# with the provider catalogs above whenever those catalogs change.
+FAST_MODE_CAPABILITY_CATALOG: dict[str, dict[str, Any]] = {
+    "openai_priority": {
+        "source_url": "https://openai.com/api-priority-processing/",
+        "checked_date": "2026-07-12",
+        "providers": ("openai-api",),
+        "models": (
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.5-pro",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.4-nano",
+            "gpt-5-mini",
+            "gpt-4.1",
+            "gpt-4o",
+            "gpt-4o-mini",
+        ),
+    },
+    "codex_fast": {
+        "source_url": "https://developers.openai.com/codex/speed",
+        "checked_date": "2026-07-12",
+        "providers": ("openai-codex",),
+        "models": ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini"),
+    },
+    "anthropic_fast": {
+        "source_url": "https://platform.claude.com/docs/en/build-with-claude/fast-mode",
+        "checked_date": "2026-07-12",
+        "providers": ("anthropic",),
+        "models": ("claude-opus-4-6",),
+    },
+}
+
+
+@dataclass(frozen=True)
+class FastModeCapability:
+    supported: bool
+    family: Literal[
+        "openai_priority", "codex_fast", "anthropic_fast", "unsupported"
+    ]
+    request_overrides: dict[str, Any]
+    reason: Optional[str] = None
+
+
+# Legacy model-only compatibility helpers retain the old broad direct-OpenAI
+# behavior for third-party imports and inventory display. Request enforcement
+# must use resolve_fast_mode_capability() with the complete route identity.
 _OPENAI_FAST_MODE_PREFIXES: tuple[str, ...] = (
     "gpt-",
     "o1",
@@ -2121,6 +2163,106 @@ def _strip_vendor_prefix(model_id: str) -> str:
     if "/" in raw:
         raw = raw.split("/", 1)[1]
     return raw
+
+
+def _fast_model_base(model_id: Optional[str]) -> str:
+    return _strip_vendor_prefix(str(model_id or "")).split(":", 1)[0]
+
+
+def resolve_fast_mode_capability(
+    *,
+    model: Optional[str],
+    provider: Optional[str],
+    api_mode: Optional[str],
+) -> FastModeCapability:
+    """Resolve Fast support from the complete transport contract.
+
+    Unknown providers and proxies fail closed even when they carry a GPT or
+    Claude model name. This result is shared by command UX and request
+    construction so support, explanation, and serialized overrides cannot
+    drift apart.
+    """
+    normalized_provider = normalize_provider(provider)
+    normalized_mode = str(api_mode or "").strip().lower()
+    base = _fast_model_base(model)
+    route = f"{normalized_provider}/{base or '<unset>'}"
+
+    if normalized_provider in {"openai", "openai-api"} and normalized_mode in {
+        "chat_completions",
+        "codex_responses",
+    }:
+        models = FAST_MODE_CAPABILITY_CATALOG["openai_priority"]["models"]
+        supported = base in models
+        return FastModeCapability(
+            supported=supported,
+            family="openai_priority",
+            request_overrides={"service_tier": "priority"} if supported else {},
+            reason=None
+            if supported
+            else f"OpenAI API Priority Processing is not documented for `{route}`.",
+        )
+
+    if normalized_provider == "openai-codex" and normalized_mode == "codex_responses":
+        supported = any(
+            base == family or base.startswith(f"{family}-")
+            for family in ("gpt-5.5", "gpt-5.4")
+        )
+        return FastModeCapability(
+            supported=supported,
+            family="codex_fast",
+            request_overrides={"service_tier": "fast"} if supported else {},
+            reason=None
+            if supported
+            else (
+                f"Codex Fast is not currently available for `{route}` "
+                "(OpenAI currently lists GPT-5.5 and GPT-5.4)."
+            ),
+        )
+
+    if normalized_provider == "anthropic" and normalized_mode == "anthropic_messages":
+        supported = _is_anthropic_fast_model(base)
+        if supported:
+            reason = None
+        elif "opus-4-8" in base or "opus-4.8" in base:
+            reason = (
+                f"Anthropic's `speed=fast` parameter is unavailable for `{route}`; "
+                "select the separate `claude-opus-4-8-fast` model instead."
+            )
+        else:
+            reason = (
+                f"Anthropic Fast (`speed=fast`) is not available for `{route}` "
+                "under the current native Messages contract."
+            )
+        return FastModeCapability(
+            supported=supported,
+            family="anthropic_fast",
+            request_overrides={"speed": "fast"} if supported else {},
+            reason=reason,
+        )
+
+    if normalized_mode == "anthropic_messages" and (
+        "opus-4-8" in base or "opus-4.8" in base
+    ):
+        return FastModeCapability(
+            supported=False,
+            family="unsupported",
+            request_overrides={},
+            reason=(
+                f"`{route}` is a proxy route and cannot receive Hermes' "
+                "`speed=fast` override; select the separate "
+                "`claude-opus-4-8-fast` model instead."
+            ),
+        )
+
+    return FastModeCapability(
+        supported=False,
+        family="unsupported",
+        request_overrides={},
+        reason=(
+            f"`{route}` with API mode `{normalized_mode or '<unset>'}` does not "
+            "declare a supported Fast contract; requests will use normal speed."
+        ),
+    )
 
 
 def model_supports_fast_mode(model_id: Optional[str]) -> bool:

@@ -202,19 +202,19 @@ class TestPriorityProcessingModels(unittest.TestCase):
 
 
 class TestFastModeRouting(unittest.TestCase):
-    def test_fast_command_exposed_for_model_even_when_provider_is_auto(self):
+    def test_fast_command_fails_closed_when_provider_is_auto(self):
         cli_mod = _import_cli()
         stub = SimpleNamespace(provider="auto", requested_provider="auto", model="gpt-5.4", agent=None)
 
-        assert cli_mod.HermesCLI._fast_command_available(stub) is True
+        assert cli_mod.HermesCLI._fast_command_available(stub) is False
 
-    def test_fast_command_exposed_for_non_codex_models(self):
+    def test_fast_command_exposed_only_for_declared_direct_contract(self):
         cli_mod = _import_cli()
         stub = SimpleNamespace(provider="openai", requested_provider="openai", model="gpt-4.1", agent=None)
         assert cli_mod.HermesCLI._fast_command_available(stub) is True
 
         stub = SimpleNamespace(provider="openrouter", requested_provider="openrouter", model="o3", agent=None)
-        assert cli_mod.HermesCLI._fast_command_available(stub) is True
+        assert cli_mod.HermesCLI._fast_command_available(stub) is False
 
     def test_turn_route_injects_overrides_without_provider_switch(self):
         """Fast mode should add request_overrides but NOT change the provider/runtime."""
@@ -236,8 +236,8 @@ class TestFastModeRouting(unittest.TestCase):
         # Provider should NOT have changed
         assert route["runtime"]["provider"] == "openrouter"
         assert route["runtime"]["api_mode"] == "chat_completions"
-        # But request_overrides should be set
-        assert route["request_overrides"] == {"service_tier": "priority"}
+        # Proxy routes fail closed even when they carry a GPT model id.
+        assert route["request_overrides"] == {}
 
     def test_turn_route_keeps_primary_runtime_when_model_has_no_fast_backend(self):
         cli_mod = _import_cli()
@@ -256,7 +256,7 @@ class TestFastModeRouting(unittest.TestCase):
         route = cli_mod.HermesCLI._resolve_turn_agent_config(stub, "hi")
 
         assert route["runtime"]["provider"] == "openrouter"
-        assert route.get("request_overrides") is None
+        assert route.get("request_overrides") == {}
 
 
 class TestAnthropicFastMode(unittest.TestCase):

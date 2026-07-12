@@ -10,8 +10,7 @@ the normal runtime provider resolution.
 Covers:
   - the override survives a simulated restart (a second SessionStore instance
     reading the same sessions dir, and a fresh runner rehydrating from it)
-  - /new (SessionStore.reset_session) clears the persisted override so a
-    restart cannot resurrect it
+  - the default/automatic reset path clears the legacy persisted mirror
   - api_key is NEVER serialized to sessions.json
 """
 import json
@@ -120,8 +119,8 @@ def test_from_dict_strips_api_key_from_tampered_json():
     assert store_entry.model_override == {"model": "m1", "provider": "p1"}
 
 
-def test_new_clears_persisted_override(store_factory, tmp_path):
-    """/new resets the session; the persisted override must not survive it."""
+def test_default_reset_clears_legacy_persisted_override(store_factory, tmp_path):
+    """The automatic/default reset path must not preserve route preferences."""
     store = store_factory()
     entry = store.get_or_create_session(_make_source())
     session_key = entry.session_key
@@ -129,12 +128,12 @@ def test_new_clears_persisted_override(store_factory, tmp_path):
     store.set_model_override(session_key, OVERRIDE)
     assert store.get_model_override(session_key) is not None
 
-    # /new path -> SessionStore.reset_session creates a fresh entry.
+    # Automatic path -> SessionStore.reset_session creates a fresh entry.
     new_entry = store.reset_session(session_key)
     assert new_entry is not None
     assert store.get_model_override(session_key) is None
 
-    # Restart after /new must NOT resurrect the override.
+    # Restart after automatic reset must NOT resurrect the override.
     store2 = store_factory()
     assert store2.get_model_override(session_key) is None
     assert "gpt-5o" not in _sessions_json(tmp_path)
