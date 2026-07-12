@@ -833,11 +833,21 @@ Instead, when the budget is actually exhausted (90/90), Hermes injects one messa
 agent:
   max_turns: 90                # Max iterations per conversation turn (default: 90)
   api_max_retries: 3           # Retries per provider before fallback engages (default: 3)
+  resume_interrupted_turns: prompt  # prompt (default) or safe once-ever auto continuation
 ```
 
 When the iteration budget is fully exhausted, the CLI shows a notification to the user: `⚠ Iteration budget reached (90/90) — response may be incomplete`.
 
 `agent.api_max_retries` controls how many times Hermes retries a provider API call on transient errors (rate limits, connection drops, 5xx) **before** fallback-provider switching engages. The default is `3` — four attempts total. If you have [fallback providers](/user-guide/features/fallback-providers) configured and want to fail over faster, drop this to `0` so the first transient error on your primary immediately hands off to the fallback instead of churning retries against the flaky endpoint.
+
+`agent.resume_interrupted_turns` controls messaging-gateway recovery after a restart interrupts an active turn. The default, `prompt`, preserves the user-facing prompt-and-wait semantics: Hermes surfaces the interruption and waits for the user. Schedule logs now add the log-only `kind=sibling|self` taxonomy token described below. Opt-in `auto` continues the interrupted turn once only when the persisted tail is mechanically safe. Incomplete mutating calls, unknown tools or surfaces, invalid values, corrupt attempt state, and repeated attempts all fail closed to `prompt`. Completed mutating calls may continue forward, but returned tool calls are never re-executed. The once-ever key is the gateway `session_key` plus the persisted interrupted assistant-row ID, and attempt credit expires after seven days. This setting is read when the gateway starts, so restart the gateway after changing it.
+
+### The two kinds of auto-continue
+
+- **SIBLING** (`kind=sibling`) restores a different session whose running turn was cut off by a gateway drain timeout. In `auto` mode it continues forward only when the persisted tail passes the safety checks above, and it consumes the once-ever credit. In `prompt` mode it reports the interruption and waits.
+- **SELF** (`kind=self`) is a fresh synthesized turn for the session that intentionally requested the restart. It carries that session's handoff note after the initiating turn has delivered its final response. SELF does not replay an amputated assistant row and never consumes the SIBLING once-ever credit. Its per-session release gate is independent of unrelated busy sessions on the same gateway.
+
+Both kinds remain subject to the restart-loop breaker. `PHASE=boot_resume_scheduled` logs the authoritative `kind` token without message content.
 
 ## Standing Goals (`/goal`)
 
