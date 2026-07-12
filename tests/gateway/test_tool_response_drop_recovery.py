@@ -379,6 +379,10 @@ class TestPostStopInterruptSwallow:
         assert agent.interrupt_reasons == [_INTERRUPT_REASON_STOP]
         assert cancelled == [{
             "session_key": session_key,
+            # /new-scope fix 2026-07-11: the call site now also passes the
+            # current session id (empty here — harness runner has no
+            # session_store entry), scoping durable cancels to THIS session.
+            "parent_session_id": "",
             "reason": _INTERRUPT_REASON_STOP,
         }]
         assert released == [session_key]

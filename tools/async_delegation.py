@@ -1033,8 +1033,7 @@ def interrupt_for_session(
                     str(r.get("parent_session_id") or ""),
                 )
                 or (
-                    not scoped
-                    and parent_session_id
+                    parent_session_id
                     and str(r.get("parent_session_id") or "") == parent_session_id
                 )
             )
