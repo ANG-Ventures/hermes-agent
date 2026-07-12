@@ -1955,3 +1955,51 @@ class TestAggregatorCrossProviderContext:
                 "zzq-only-on-othervendor-1", base_url="https://yunwu.ai/v1", provider="yunwu"
             )
             assert ctx == 333333
+
+
+class TestAggregatorGreptileFixes:
+    """Regression tests for the two Greptile findings on the aggregator
+    cross-provider context path (PR #310)."""
+
+    def test_minimax_m3_underreport_corrected_on_aggregator(self):
+        """P1: models.dev reports 512K for minimax-m3 but the real window is 1M.
+        The step-5g guard only fires for MAPPED providers; the aggregator step
+        7b must apply the SAME correction, else a yunwu-routed minimax-m3 gets
+        the stale 512K instead of the catalog 1M."""
+        import agent.model_metadata as mm
+        from agent import models_dev
+        # models.dev sample with the KNOWN-WRONG 512K minimax-m3 window.
+        sample = {
+            "minimax": {"models": {"minimax-m3": {"limit": {"context": 512000}}}},
+        }
+        catalog = mm.DEFAULT_CONTEXT_LENGTHS.get("minimax-m3")
+        assert catalog and catalog > 512000, "catalog must carry the correct 1M"
+        with patch.object(models_dev, "fetch_models_dev", return_value=sample), \
+             patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata._is_known_provider_base_url", return_value=True), \
+             patch("agent.model_metadata.fetch_model_metadata", return_value={}):
+            ctx = mm.get_model_context_length(
+                "minimax-m3", base_url="https://yunwu.ai/v1", provider="yunwu"
+            )
+            # Must be corrected UP to the catalog value, not the 512K underreport.
+            assert ctx == catalog, f"got {ctx}, want catalog {catalog} (underreport guard)"
+
+    def test_cross_provider_suffix_cloud_fallback(self):
+        """P2: some providers store suffixed ids (model:cloud / model-cloud) in
+        models.dev while the live API returns the bare name. The cross-provider
+        lookup must try the suffix fallback, matching lookup_models_dev_context."""
+        from agent import models_dev
+        sample = {
+            "someprov": {"models": {"kimi-fake-x:cloud": {"limit": {"context": 262144}}}},
+        }
+        with patch.object(models_dev, "fetch_models_dev", return_value=sample):
+            # bare id misses exact+case-insensitive, hits the :cloud suffix pass.
+            assert models_dev.lookup_models_dev_context_any_provider("kimi-fake-x") == 262144
+
+    def test_cross_provider_suffix_dash_cloud_fallback(self):
+        from agent import models_dev
+        sample = {
+            "someprov": {"models": {"kimi-fake-y-cloud": {"limit": {"context": 131072}}}},
+        }
+        with patch.object(models_dev, "fetch_models_dev", return_value=sample):
+            assert models_dev.lookup_models_dev_context_any_provider("kimi-fake-y") == 131072

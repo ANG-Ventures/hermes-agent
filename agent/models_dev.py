@@ -433,6 +433,31 @@ def lookup_models_dev_context_any_provider(model: str) -> Optional[int]:
                 if ctx:
                     return ctx
 
+    # Pass 3: suffix-aware fallback across all providers. Some providers store
+    # model IDs with :cloud / -cloud suffixes in models.dev while the live API
+    # returns bare names (e.g. kimi-k2.6 vs kimi-k2.6:cloud). Mirrors the same
+    # third pass in the per-provider lookup_models_dev_context so an aggregator
+    # route resolves suffixed entries identically.
+    for suffix in (":cloud", "-cloud"):
+        suffixed = model + suffix
+        suffixed_lower = model_lower + suffix
+        for provider_data in data.values():
+            if not isinstance(provider_data, dict):
+                continue
+            models = provider_data.get("models", {})
+            if not isinstance(models, dict):
+                continue
+            entry = models.get(suffixed)
+            if isinstance(entry, dict):
+                ctx = _extract_context(entry)
+                if ctx:
+                    return ctx
+            for mid, mdata in models.items():
+                if mid.lower() == suffixed_lower and isinstance(mdata, dict):
+                    ctx = _extract_context(mdata)
+                    if ctx:
+                        return ctx
+
     return None
 
 

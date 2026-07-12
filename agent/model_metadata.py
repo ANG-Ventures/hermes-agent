@@ -2623,6 +2623,19 @@ def get_model_context_length(
     if effective_provider and effective_provider not in PROVIDER_TO_MODELS_DEV:
         agg_ctx = lookup_models_dev_context_any_provider(model)
         if agg_ctx:
+            # MiniMax M3: models.dev reports 512K but actual context is 1M.
+            # Mirror the step-5g guard — otherwise an aggregator route (yunwu)
+            # would get the stale 512K here and short-circuit before the step-8
+            # catalog ("minimax-m3": 1M) could correct it.
+            if _model_name_suggests_minimax_m3(model):
+                catalog = DEFAULT_CONTEXT_LENGTHS.get("minimax-m3")
+                if catalog and agg_ctx < catalog:
+                    logger.info(
+                        "Rejecting cross-provider models.dev context=%s for %r "
+                        "(MiniMax-M3 underreport); using hardcoded default %s",
+                        agg_ctx, model, f"{catalog:,}",
+                    )
+                    agg_ctx = catalog
             logger.info(
                 "Resolved context length %s for %r via cross-provider "
                 "models.dev lookup (aggregator provider %r not in "
