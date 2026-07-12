@@ -172,7 +172,9 @@ jobs:
               # but zero readable slices should fail loudly.
               bad += 1
               print(f'WARNING: skipping unreadable {f}: {e}', file=sys.stderr)
-          if files and bad == len(files):
+          if not files:
+            sys.exit('no slice duration files found — artifact pattern matched nothing')
+          if bad == len(files):
             sys.exit(f'all {bad} slice duration files unreadable')
           with open('test_durations.json', 'w') as fh:
             json.dump(merged, fh, indent=2, sort_keys=True)
