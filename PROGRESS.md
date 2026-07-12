@@ -1,27 +1,35 @@
-# Auto-continue taxonomy refactor — progress ledger
+# Startup-restore fail-open — progress ledger
 
-Task: `t_0f2327fc`
-Base: `fork/main` at `b286e8ceca646906fb34bef60749261d63afca1f`
-Authoritative spec: `~/.hermes/plans/2026-07-11_auto-continue-taxonomy-refactor-spec.md`
+Task: `t_0861a67d`
+Branch: `fix/startup-restore-fail-open-t-0861a67d`
+Base: latest `fork/main`
 
-## Phase 1 — RC-5 evidence pack (tree-grounded, before code)
+## Diagnosis
 
-### 1. Turn-end chokepoint and ordering
+- Default-gateway incident window grounded from `~/.hermes/logs/agent.log`: first queued inbound at 11:55:43; additional inbound remained gated through 12:11:06; the longest boot-resume turn finished at 12:15:39; queue drain completed at 12:15:42.
+- PR #256's timeout warning was absent. Default timeout was 30s and had no config/env override.
+- Aegis telemetry proved H3 (task-set race / detached wrapper): at 12:48:53.670 `_finish_startup_restore` entered with one tracked task; at 12:48:54.784 the wait returned `done=1, pending=0`; the actual internal resume event entered the runner only at 12:48:54.797 and its turn completed at 12:49:07.955. The #256 timeout watched the dispatch wrapper, not the actual turn.
+- The same Aegis cycle proved the remaining gate-critical await: a startup-window poke queued at 12:48:53.915; replay entered `gateway/run.py::_drain_startup_restore_queue -> await adapter.handle_message(event)` at 12:48:54.784 and exited 1.007s later; only then did the gate release at 12:48:55.791. That await was unbounded in the 20-minute incident.
+- Apollo added log-only `PHASE=startup_restore_*` instrumentation to the shared runtime tree. It records gate flips, `_finish_startup_restore` entry/task count/timeout, wait exit, and each queued replay enter/exit.
+- Re-wedge risk checked before the rig cycle: default session `agent:main:discord:thread:1524057034696425765:1524057034696425765` still has `resume_pending=true`; Apollo's default gateway is not being restarted.
 
-- Every normal turn completion reaches `GatewayRunner._release_running_agent_state` from the `_run_agent` unwind (`gateway/run.py:14054-14058`, with the containing turn's unconditional release documented at `gateway/run.py:12501-12511`).
-- The chokepoint is `gateway/run.py:18610-18680`. Its actual order is: generation ownership check (`18639-18644`), active-session lease release (`18645-18650`), remove `_running_agents` (`18651`), remove timestamp/task/busy-ack (`18652-18659`), clear boot-resume state (`18660-18674`), then persist the lower active count (`18675-18679`).
-- Divergence from spec hypothesis: there is currently no post-release callback and no delivery barrier in this method. The deferred-restart arm hook must run only after the slot/task removals and active-count persistence, and must schedule (not await) the shutdown work so release remains non-reentrant.
+## RED/GREEN worktree tests
 
-### 2. Adapter `send()` acknowledgement semantics
+- RED on unmodified `fork/main`: 3/3 targeted regressions failed — blocked replay retained the gate, no absolute watchdog existed, and a wait exception escaped without releasing the gate.
+- GREEN candidate fix in the worktree only: release the gate before queued replay, arm an absolute timeout watchdog when the gate is first raised, and transfer queued events to one background replay owner that retains/retries unaccepted events.
+- Updated RED on unmodified `fork/main`: all 14 targeted fail-open, ownership, ordering, scheduler-yield, retry-noise, adapter-contract, wiring, and fallback-observability regressions failed.
+- Momus pass 1 blocked on pop-before-await ownership and pre-registration adapter loss. The worker now peeks instead of popping, retries failures/unavailable adapters with backoff, and serializes watchdog/finisher replay through one task.
+- Momus pass 2 relocated the remaining ownership blocker to cancellation and required same-session FIFO, an explicit adapter acceptance contract, bounded retry noise, and corrected timeout docs. The live-gateway cancellation path now transfers the retained queue to a successor owner; unrelated sessions may pass a blocked one without overtaking within that session; `BasePlatformAdapter.handle_message` documents exception-before-acceptance; retry warnings include queue age/depth and are rate-limited to one per event per minute.
+- Ace's follow-up observability directive is included: default prompt-mode `PHASE=boot_resume_scheduled` bytes remain frozen, while an auto-mode fallback logs `mode=prompt fallback_reason=...`; auto scheduling already logs `mode=auto`.
+- Momus pass 3 caught a cross-session no-yield retry loop and WARNING-level replay-enter spam. Every failed attempt now yields through exponential backoff even when another session is promoted, and replay-enter warnings are rate-limited per event; regressions prove two permanently blocked sessions cannot starve an unrelated coroutine and repeated dispatch failures emit bounded warnings.
+- Momus pass 4 had no blockers and requested the missing keeper arm event; pass 5 APPROVED with no required changes after the WARNING-level `gate_flip state=armed` event and production ordering contract were added.
+- Final full restart-family regression gate: 185 passed across `test_restart_resume_pending.py`, `test_restart_cascade.py`, and `test_auto_continue_interrupted_turns.py`; `py_compile` and `git diff --check` also passed.
 
-- The common contract is `BasePlatformAdapter.send()` returning `SendResult(success, message_id, error, raw_response)` (`gateway/platforms/base.py:1854-1860`, `gateway/platforms/base.py:2895-2914`). Completion of the coroutine plus `success=True` is therefore the only uniform cross-platform acknowledgement; the API does not promise client display/read acknowledgement.
-- Discord awaits each SDK `channel.send()` before collecting the returned message id (`plugins/platforms/discord/adapter.py:2268-2302`) and returns success only after all chunks are accepted (`2329-2337`). This is Discord API acceptance, not user display/read.
-- Telegram awaits Bot API `send_message()` (`plugins/platforms/telegram/adapter.py:3686-3716`) and treats generic timeouts as UNKNOWN because the request may have reached Telegram (`3794-3808`). A successful return is Bot API acceptance, not user display/read.
-- Streaming delivery is already tracked from real adapter results: `StreamConsumer` sets `final_content_delivered` only after successful send/edit paths (`gateway/stream_consumer.py:178-182`, `680-686`, `757-809`), and the runner consumes those flags before deciding whether to perform the normal final send (`gateway/run.py:22790-22827`).
-- Base adapters already expose generation-aware post-delivery callbacks (`gateway/platforms/base.py:4025-4115`), but the tree-grounded implementation review found that they fire from the handler `finally` block even after cancellation/failure (`gateway/platforms/base.py:5348-5385`). They are not delivery acknowledgements. The implementation therefore adds a separate generation-owned callback fired only after `SendResult.success`, while confirmed streaming delivery is recorded by the runner.
-- All other platform adapters implement the same `BasePlatformAdapter.send -> SendResult` contract. No adapter exposes a stronger uniform durable/read receipt. Per spec RC-2, `send()` success / confirmed stream delivery is the barrier; timeout means UNKNOWN and restart proceeds with the loss warning.
+## Live test venue
 
-### 3. `mark_resume_pending` persistence
+- Aegis gateway only; Apollo/default gateway remains untouched.
+- Instrumented Aegis rig transcript captured at 12:48:47-12:49:07 PT. It proves H3 and the replay await above without restarting Apollo/default.
+- Behavioral fix is committed in fork PR #301 (`1916afc`) but is not deployed. Shared runtime received log-only instrumentation for the rig and was restored clean immediately after capture.
 
 - `SessionStore.mark_resume_pending` holds the store lock, rejects suspended sessions, mutates the entry, and calls `_save()` synchronously before returning (`gateway/session.py:2191-2218`). No extra flush API is required for ordinary marks.
 - `suspend_recently_active` also performs one synchronous `_save()` after its in-memory marking loop (`gateway/session.py:2297-2331`).
@@ -193,3 +201,4 @@ Mutation evidence (each mutation was restored from the staged implementation imm
 - Pass 8 certified both pass-7 classes resolved, then identified a non-yielding stale-latch deletion retry and fixed 10 ms loser polling. Failed stale deletion now verifies the directory remains and yields with bounded exponential backoff; all uncommitted/torn loser polling uses the same 10 ms→1 s bounded backoff. Injected regressions prove the event loop yields before deletion retry and the loser never falsely coalesces or signals.
 
 NEXT: Commit, push/open the fork PR, wait for green CI, then arm auto-merge and record the CI/merge handoff. External safe-restart writer/skill wiring and the physical T6 rig remain Apollo/Aegis post-merge work per the authoritative sequence.
+NEXT: Wait for PR #301 CI to turn fully green, then enable auto-merge; after merge, verify the merged runtime on Aegis first. Apollo deployment remains deferred to an Ace-approved combined bounce.
