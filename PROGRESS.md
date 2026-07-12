@@ -24,6 +24,7 @@
 - 2026-07-12 — Resolved and refreshed formerly conflicting #34294 at `08de1dd040` and #23331 at `d8c98f48fc`. #34294 preserves upstream's dynamically-derived blocklist while allowing `execute_code`; focused feature tests and the CI-failing MCP seam pass locally. Its previous CI failure was a profile-local MCP discovery flake that passes on both current main and the PR branch; a fresh CI run is active. #23331 carries current dynamic context-file truncation through HERMES_HOME AGENTS.md; 165 passed / 1 skipped.
 - 2026-07-12 — Rebased/re-authored #62925 (`5086604fa9`), #37513 (`e3b85403cd`), #37418 (`9c364e77f5`), and #37381 (`75d891978a`) to repair contributor-check failures. Focused results: 5, 76, 5, and 15 passed respectively. #62925's broader delegate file reproduced the same heartbeat timing failure on clean current main; feature-specific tests passed.
 - 2026-07-12 — Final inventory remains 42 open Kyzcreig PRs. Fresh local `merge-tree` assessment against `origin/main` is 36 clean / 6 conflicting. All six conflicts are report-only rather than safe mechanical rebases: #38976 violates current config.yaml-over-env policy; #34295 and #34146 are implemented on main; #25397/#25396/#24586 are superseded by newer clean/refreshed PRs. No upstream PR was closed or merged.
+- 2026-07-12 — Final bounded CI repair completed. #47017 slice 3 exposed two synchronous SessionStore calls in async `/redo`; moved both through the awaited async facade and pushed `066d678e3ab`. Rebuilt #60253 on that corrected base, added all seven tail-preview i18n keys to every non-English catalog, and moved preview rendering off the event loop; pushed `6e5a67ed96`. Local verification: #47017 387 focused pass; #60253 441 focused + 216 Slack pass; Ruff/diff pass. Fresh GitHub CI: both PRs MERGEABLE/CLEAN with 23 success / 0 fail / 0 pending (plus 7 skipped / 1 neutral). Neither PR was merged.
 
 ## Final 42-PR sweep table
 
@@ -39,12 +40,12 @@ Check cells are `passing / failing / pending` at the final query; newly pushed b
 | #62699 | CLEAN | 31 / 0 / 0 | attribution refreshed; clean |
 | #62399 | CLEAN | 36 / 0 / 0 | no mutation; clean |
 | #62398 | CLEAN | 22 / 0 / 0 | rebased/pushed; desktop suites + typecheck pass |
-| #60253 | CLEAN | 17 / 0 / 10 | rebased/pushed `37bcf6d350`; Slack-cap drift fixed in base; 561 focused pass |
+| #60253 | CLEAN | 23 / 0 / 0 | rebuilt on corrected #47017; pushed `6e5a67ed96`; 441 focused + 216 Slack pass; CI green |
 | #60146 | CLEAN | 31 / 0 / 0 | rebased/pushed `d44f92c800`; 20 pass |
 | #59463 | CLEAN | 31 / 0 / 0 | rebuilt on refreshed #58144; pushed `f7af41628b`; 186 pass |
 | #58144 | CLEAN | 31 / 0 / 0 | rebased/re-authored/pushed `b87e3d4485`; 30 pass + subprocess guard |
 | #47600 | CLEAN | 35 / 0 / 0 | no mutation; clean |
-| #47017 | CLEAN | 17 / 0 / 10 | rebased/pushed `948aaf2101`; current Slack cap curated; 382 + 173 pass |
+| #47017 | CLEAN | 23 / 0 / 0 | async `/redo` SessionStore calls fixed; pushed `066d678e3ab`; 387 focused pass; CI green |
 | #46453 | CLEAN | 30 / 0 / 0 | no mutation; clean |
 | #42447 | CLEAN | 31 / 0 / 0 | rebased/pushed `e315dac093`; 41 pass |
 | #41653 | CLEAN | 20 / 0 / 0 | no mutation; clean |
@@ -74,4 +75,4 @@ Check cells are `passing / failing / pending` at the final query; newly pushed b
 | #24586 | CONFLICT | no rollup | report only: superseded by clean newer #34299 |
 | #23331 | CLEAN | 31 / 0 / 0 | rebased/resolved/pushed `d8c98f48fc`; 165 pass / 1 skip |
 
-NEXT: Apollo senior review of the final sweep mutations. Watch only the fresh pending CI on #62925, #60253, #47017, #37513, #37418, #37381, and #34294; do not merge upstream. #63082/#63096 are green and remain upstream-maintainer decisions.
+NEXT: Task complete. #47017 and #60253 are MERGEABLE/CLEAN with fresh CI green; do not merge upstream. #63082/#63096 remain upstream-maintainer decisions.
