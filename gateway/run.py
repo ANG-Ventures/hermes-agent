@@ -3455,6 +3455,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._startup_restore_tasks: List[asyncio.Task] = []
         self._startup_restore_watchdog_task: Optional[asyncio.Task] = None
         self._startup_restore_replay_task: Optional[asyncio.Task] = None
+        # Bounded successor respawns for a crashing replay owner (Greptile P1).
+        self._startup_restore_replay_failures: int = 0
         # Schedule-time disposition for synthetic startup resume turns. The
         # persisted transcript classification is prepared off-loop immediately
         # before scheduling; the selected mode remains attached only for that
@@ -8583,10 +8585,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             exc = done_task.exception()
             if exc is not None:
-                logger.warning(
-                    "Startup-restore replay worker failed with queued messages retained",
-                    exc_info=(type(exc), exc, exc.__traceback__),
+                # Greptile P1 (2026-07-11): mirror the cancellation path — an
+                # exception with the gate already open leaves no drain trigger,
+                # so a successor MUST be scheduled or retained messages are
+                # permanently unprocessed. Bounded (3) so a deterministically
+                # crashing drain cannot respawn forever; the final failure logs
+                # the retained count honestly.
+                failures = getattr(self, "_startup_restore_replay_failures", 0) + 1
+                self._startup_restore_replay_failures = failures
+                shutdown_event = getattr(self, "_shutdown_event", None)
+                aborting = (
+                    bool(getattr(self, "_restart_requested", False))
+                    or bool(getattr(self, "_draining", False))
+                    or bool(shutdown_event is not None and shutdown_event.is_set())
                 )
+                if (
+                    getattr(self, "_startup_restore_queue", None)
+                    and not aborting
+                    and failures <= 3
+                ):
+                    logger.warning(
+                        "Startup-restore replay worker failed (attempt %d/3); "
+                        "scheduling successor for %d queued message(s)",
+                        failures,
+                        len(self._startup_restore_queue),
+                        exc_info=(type(exc), exc, exc.__traceback__),
+                    )
+                    self._schedule_startup_restore_queue_drain()
+                else:
+                    logger.warning(
+                        "Startup-restore replay worker failed with %d queued "
+                        "message(s) retained (no successor: %s)",
+                        len(getattr(self, "_startup_restore_queue", None) or []),
+                        "aborting" if aborting else (
+                            "failure cap reached" if failures > 3 else "queue empty"
+                        ),
+                        exc_info=(type(exc), exc, exc.__traceback__),
+                    )
                 return
             drained = done_task.result()
             if drained:
