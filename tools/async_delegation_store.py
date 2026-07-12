@@ -558,11 +558,22 @@ def cancel_matching(
             if record.get("state") not in {"running", "recoverable"}:
                 continue
             route = record.get("route") or {}
+            # Scoped-pair semantics mirror interrupt_for_session (Greptile P1
+            # 2026-07-11): key+parent supplied together => a record recorded
+            # under a DIFFERENT parent_session_id is a prior /new-reset
+            # session's job and must not be durably cancelled by key alone.
+            _scoped = bool(session_key and parent_session_id)
+            _rec_parent = str(route.get("parent_session_id") or "")
+            _key_ok = bool(
+                session_key
+                and str(route.get("session_key") or "") == session_key
+                and not (_scoped and _rec_parent and _rec_parent != parent_session_id)
+            )
             matches = all_active or (
-                (session_key and str(route.get("session_key") or "") == session_key)
+                _key_ok
                 or (
                     parent_session_id
-                    and str(route.get("parent_session_id") or "") == parent_session_id
+                    and _rec_parent == parent_session_id
                 )
                 or (
                     origin_ui_session_id

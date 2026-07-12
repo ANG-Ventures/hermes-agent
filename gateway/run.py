@@ -18550,7 +18550,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         elif outcome == "temporary":
                             # Retry in this boot while an adapter/session store
                             # reconnects; the outbox remains crash-safe.
-                            _pr.completion_queue.put(evt)
+                            # Greptile P1 2026-07-11: BOUNDED — a permanently
+                            # unroutable event otherwise ping-pongs the queue
+                            # every watcher cycle forever. ~30 min of retries
+                            # (at the watcher interval), then park it: the
+                            # durable outbox re-delivers on next boot.
+                            retries = int(evt.get("_temporary_retries", 0)) + 1
+                            evt["_temporary_retries"] = retries
+                            if retries <= 900:
+                                _pr.completion_queue.put(evt)
+                            else:
+                                logger.warning(
+                                    "Async delegation event %s undeliverable after "
+                                    "%d temporary-failure retries; parking until "
+                                    "next boot (outbox remains durable)",
+                                    evt.get("event_id") or evt.get("delegation_id"),
+                                    retries,
+                                )
                     except Exception as e:
                         logger.error("Async delegation injection error: %s", e)
             except Exception as e:
@@ -19308,8 +19324,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from tools.async_delegation import interrupt_for_session
 
+            # Greptile P1 2026-07-11: pass the CURRENT session id alongside the
+            # platform key. session_key survives /new resets, so key-only
+            # matching could cancel a delegation spawned by a PRIOR session in
+            # the same chat. With both selectors the registry can prefer the
+            # precise id-match; key-only records (legacy) still match by key.
+            current_session_id = ""
+            try:
+                entry = self.session_store._entries.get(session_key)  # noqa: SLF001
+                current_session_id = str(getattr(entry, "session_id", "") or "")
+            except Exception:
+                current_session_id = ""
             interrupt_for_session(
                 session_key=session_key,
+                parent_session_id=current_session_id,
                 reason=interrupt_reason,
             )
         except Exception:

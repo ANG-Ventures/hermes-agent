@@ -358,7 +358,13 @@ def _finalize(
         event_record = dict(record)
         _prune_completed_locked()
 
-    if event_record.get("recover_on_shutdown"):
+    if event_record.get("recover_on_shutdown") and status != "completed":
+        # Interrupted mid-shutdown: the boot-scan re-dispatches. But a job whose
+        # runner FINISHED inside the shutdown window has a real result — dropping
+        # it and re-running the whole delegation discards completed work (and
+        # re-executes side effects). Greptile P1 2026-07-11: completed results
+        # always flow to the terminal store; only genuinely-interrupted jobs
+        # take the recovery path.
         return
     if expected_attempt:
         profile_home = (
@@ -631,7 +637,10 @@ def _finalize_batch(
         event_record = dict(record)
         _prune_completed_locked()
 
-    if event_record.get("recover_on_shutdown"):
+    if event_record.get("recover_on_shutdown") and status != "completed":
+        # Same contract as _finalize: a batch that COMPLETED during the
+        # shutdown window keeps its combined result; only interrupted
+        # batches take the boot-scan recovery path (Greptile P1 2026-07-11).
         return
     if event_record.get("attempt_id"):
         payload = _store.append_terminal(
@@ -998,6 +1007,20 @@ def interrupt_for_session(
     """
     if not session_key and not origin_ui_session_id and not parent_session_id:
         return 0
+    # Greptile P1 2026-07-11: when BOTH session_key and parent_session_id are
+    # supplied, the pair is a SCOPED selector — session_key alone must not
+    # claim records spawned by a PRIOR session in the same chat (the platform
+    # key survives /new resets). A record with no recorded parent_session_id
+    # (legacy) still matches by key; a record WITH one must agree.
+    scoped = bool(session_key and parent_session_id)
+
+    def _key_match(rec_key: str, rec_parent: str) -> bool:
+        if not session_key or rec_key != session_key:
+            return False
+        if scoped and rec_parent and rec_parent != parent_session_id:
+            return False
+        return True
+
     count = 0
     with _records_lock:
         targets = [
@@ -1005,8 +1028,15 @@ def interrupt_for_session(
             if r.get("status") == "running"
             and (
                 (origin_ui_session_id and str(r.get("origin_ui_session_id") or "") == origin_ui_session_id)
-                or (session_key and str(r.get("session_key") or "") == session_key)
-                or (parent_session_id and str(r.get("parent_session_id") or "") == parent_session_id)
+                or _key_match(
+                    str(r.get("session_key") or ""),
+                    str(r.get("parent_session_id") or ""),
+                )
+                or (
+                    not scoped
+                    and parent_session_id
+                    and str(r.get("parent_session_id") or "") == parent_session_id
+                )
             )
         ]
     # Explicit cancellation is durable before the signal, including records
