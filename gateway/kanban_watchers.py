@@ -122,12 +122,15 @@ _BENIGN_DECLINE_FIELDS = (
     "respawn_guarded",
     "skipped_locked",
 )
-# Genuine-fault buckets: the dispatcher TRIED to spawn and the attempt failed
-# hard enough to trip the circuit breaker (broken venv / PATH / credential loss
-# → repeated spawn_failed → auto_block). These are exactly the states the stuck
-# warning exists to surface, so they force the tick to count even if a benign
-# decline is also present on some other board this tick.
+# Genuine-fault buckets: the dispatcher TRIED to spawn and the attempt failed.
+# ``spawn_failed`` is populated on EVERY spawn failure this tick (workspace
+# resolution or worker launch), so an early, pre-circuit-breaker failure on one
+# board is a fault immediately — it can't be masked by a benign decline on a
+# different board and silently reset the streak. ``auto_blocked`` is the subset
+# that additionally tripped the circuit breaker (broken venv / PATH / credential
+# loss → repeated spawn_failed). Either forces the tick to count.
 _FAULT_FIELDS = (
+    "spawn_failed",
     "auto_blocked",
 )
 

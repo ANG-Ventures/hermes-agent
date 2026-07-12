@@ -94,6 +94,7 @@ class _FakeResult:
     rate_limited: list = field(default_factory=list)
     respawn_guarded: list = field(default_factory=list)
     skipped_locked: bool = False
+    spawn_failed: list = field(default_factory=list)
     auto_blocked: list = field(default_factory=list)
 
 
@@ -143,6 +144,17 @@ def test_stall_auto_blocked_fault_IS_bad_even_with_benign_sibling():
     faulted = _FakeResult(auto_blocked=["t1"])
     capped = _FakeResult(skipped_per_profile_capped=[("t2", "athena", 2)])
     assert _stall_streak_is_bad(True, False, [("b1", faulted), ("b2", capped)]) is True
+
+
+def test_stall_early_spawn_failure_IS_bad_even_with_benign_sibling():
+    # Cross-board masking regression (Greptile #304 P2): board A has an EARLY,
+    # pre-circuit-breaker spawn failure (spawn_failed populated, but not yet
+    # auto_blocked), while board B is benignly rate-limited the same tick. The
+    # benign decline on B must NOT mask the genuine fault on A — spawn_failed is
+    # a fault immediately (failure #1), so the tick counts.
+    early_fail = _FakeResult(spawn_failed=["t1"])  # not yet auto_blocked
+    rate_limited = _FakeResult(rate_limited=["t2"])
+    assert _stall_streak_is_bad(True, False, [("A", early_fail), ("B", rate_limited)]) is True
 
 
 def test_stall_none_results_bare_stall_is_bad():
