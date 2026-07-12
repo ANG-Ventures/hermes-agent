@@ -1903,11 +1903,21 @@ class TestAggregatorCrossProviderContext:
     def test_aggregator_provider_resolves_cross_vendor_model(self):
         """INVARIANT: an aggregator provider (not in PROVIDER_TO_MODELS_DEV)
         resolves a cross-vendor model to the SAME window models.dev lists for it.
+
+        Hermetic: the yunwu base_url is only recognized as a KNOWN provider when
+        the yunwu plugin is installed (it registers yunwu.ai into _URL_TO_PROVIDER
+        at import). That plugin lives outside the repo, so in a clean CI checkout
+        the custom-endpoint probe (step 2) would fire against an unreachable
+        yunwu.ai and return a probe-tier default BEFORE the aggregator branch.
+        Patch _is_known_provider_base_url -> True (exactly what the installed
+        plugin makes true at runtime) so step 2 is skipped, and neutralize the
+        endpoint probe, making the test independent of plugin-provided state.
         """
         from agent import models_dev
         assert "yunwu" not in models_dev.PROVIDER_TO_MODELS_DEV
         with patch.object(models_dev, "fetch_models_dev", return_value=_AGG_MODELS_DEV_SAMPLE), \
              patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata._is_known_provider_base_url", return_value=True), \
              patch("agent.model_metadata.fetch_model_metadata", return_value={}):
             for model, expected in (("gpt-5.6-sol", 1050000), ("gemini-3-pro", 1048576), ("deepseek-v3", 128000)):
                 ctx = get_model_context_length(model, base_url="https://yunwu.ai/v1", provider="yunwu")
@@ -1939,6 +1949,7 @@ class TestAggregatorCrossProviderContext:
         from agent import models_dev
         with patch.object(models_dev, "fetch_models_dev", return_value=_AGG_MODELS_DEV_SAMPLE), \
              patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata._is_known_provider_base_url", return_value=True), \
              patch("agent.model_metadata.fetch_model_metadata", return_value={}):
             ctx = get_model_context_length(
                 "zzq-only-on-othervendor-1", base_url="https://yunwu.ai/v1", provider="yunwu"
