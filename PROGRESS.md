@@ -1,186 +1,77 @@
-# t_37659d3c progress
+# t_a27dd0c4 progress
 
-## Diagnosis (2026-07-10)
+## Scope
 
-Observed outbound message `1525268439529164851` snowflake-decodes to
-`2026-07-10T15:32:14.101-07:00`.
+1. Refresh all open NousResearch/hermes-agent PRs authored by Kyzcreig, desktop-first.
+2. Port fork PR #308 (SessionDB executor offload) to upstream.
+3. Port fork PR #307 (dashboard turn isolation) to upstream and run AC-4 in an isolated scratch dashboard.
+4. Open upstream PRs only; never merge upstream.
 
-The reported send did **not** use cron auto-delivery and did not enter
-`GatewayRunner._run_agent`:
+## Ledger
 
-- `cron/scheduler.py:3298-3328` constructs `AIAgent(platform="cron")` directly.
-- `cron/scheduler.py:3376-3382` runs it in a copied-context worker thread.
-- `cron/scheduler.py:3031-3039` correctly resolved and bound the stored origin as
-  `HERMES_CRON_AUTO_DELIVER_*` (`discord:1523978409129021484`).
-- The persisted cron transcript (`state.db`, session
-  `cron_73830b66a04e_20260710_151618`) shows the model wrote
-  `~/.hermes/scripts/redispatch-graph-research.sh` with an explicit foreign
-  `--origin discord:1525251294728556615`, then launched it at 15:32:09.
-- `~/.hermes/scripts/dispatch-agent.sh:49-60,88` sends its ACK to that explicit
-  argument. The wrong-thread message timestamp is the ACK timestamp.
-- The scheduler's real final delivery ran later and logged at 15:33:59:
-  `Job '73830b66a04e': delivered to discord:1523978409129021484`.
-- No `Agent executor context mismatch` warning fired because cron correctly
-  bypasses the gateway wrapper; there was no gateway executor binding to compare.
+- 2026-07-12 01:28 PDT — Run 41 resumed. Confirmed this worker owns the board claim and assigned worktree. Recovered prior run's uncommitted #308 port from the old task workspace; focused suite had previously reached 375 green tests, but no commit or PR exists yet.
+- 2026-07-12 01:30 PDT — Fresh upstream query found 42 open PRs authored by Kyzcreig, not 13 or 30. Desktop priority state: #62398, #56827, and #40174 are CONFLICTING/DIRTY; #62716 and #62399 CLEAN; #62703 and #62699 BLOCKED with green-or-mostly-green checks. Starting the three dirty desktop rebases first.
+- 2026-07-12 01:34 PDT — Rebased #62398 onto upstream `095b9eed3`, preserved current-main `use-prompt-actions` coverage during its sole conflict, fixed two touched-file lint errors, and force-pushed verified head `0a02a4ce3`. Fresh local evidence: Electron platform tests 320 pass / 1 skip / 0 fail; Vitest excluding one upstream-red panes test 1,229 pass / 0 fail; typecheck green. The panes failure reproduces unchanged on clean upstream.
+- 2026-07-12 01:35 PDT — #56827 is obsolete on current upstream: `fe82b3a77 fix(desktop): read attachment previews local-first in remote mode` implements the same local-first/fallback behavior and current `use-composer-actions.test.ts` carries the same regression cases. Aborted the rebase; did not mutate or close the PR. #40174 is likewise obsolete: current upstream has `oauth-net-request.ts` plus `oauth-session-request.test.ts`, and the OAuth Electron request path no longer sets restricted Content-Length.
+- 2026-07-12 01:49 PDT — Repaired #62699 attribution by amending author/committer to `9063726+Kyzcreig@users.noreply.github.com`; force-with-lease pushed verified head `2b8dbc3c5`.
+- 2026-07-12 01:56 PDT — Ported fork #308 to upstream PR #63082 (`44918ccf9`): SessionDB open/use/close moved off the dashboard event loop. Base proof: 2/2 focused tests fail on clean upstream. Fixed branch: 2/2 focused tests pass; 557 web-server tests pass; Ruff and diff checks pass. Broad `tests/hermes_cli` remains ambient-red outside this patch.
+- 2026-07-12 02:38 PDT — Ported the full fork #307 mechanism to current upstream PR #63096, head `8d08fecc1`: default-off compute-host supervisor, streamed delta/control protocol, metadata mirror, PPID orphan guard, PID-reuse-safe reconciliation, inline dispatch fail-open, synthetic heavy-turn seam, and scratch AC-4 harness. Clean-current-base focused suite: 343 passed; Ruff/diff checks passed. Exact 360s/six-lane AC-4 PASS runs observed at 7.08ms, 6.92ms, and final-current-base 6.11ms serving p99, all with zero serving stalls and valid load. One additional current-base run correctly reported INCONCLUSIVE after a stale terminal event; harness now requires the new turn's `message.start` before scoring and the full rerun passed.
 
-Therefore hypotheses 1 and 4 are false. Hypothesis 2 describes the architecture
-but not the defect. Hypothesis 3 is confirmed only for a nested process launched
-by the cron agent: that process accepted an explicit target invented from task
-context instead of the job's stored origin. Core cron delivery itself routed
-correctly.
+- 2026-07-12 — Senior review independently accepted both dashboard ports. Fresh GitHub rollups now show #63082 and #63096 at 31 passing / 0 failing / 0 pending checks. Neither upstream PR was merged.
+- 2026-07-12 — Rebased and force-with-lease pushed #62716 at `c9c6a67e56`; resolved the current-main workspace-target conflict while preserving server-owned pins. Verification: 673 Python tests, 29 desktop tests, and both desktop typechecks passed.
+- 2026-07-12 — Rebased and verified #60253, #60146, #47017, #42447, #40157, #34537, and #34298. After fresh CI exposed Slack's 50-command cap on the stacked undo/redo family, rebased #47017 again on current main, explicitly routed low-frequency `/version` through `/hermes version`, and rebuilt #60253 on that corrected base. Final local evidence: #47017 382 undo/redo tests + 173 command-registry tests passed; #60253 561 focused tests passed.
+- 2026-07-12 — Rebuilt contaminated-history #59463 rather than rebasing its ~300 unrelated fork commits. First rebased/re-authored prerequisite #58144 at `b87e3d4485` (30 tests + subprocess guard pass), then replayed the single SSRF-proxy commit on top and pushed #59463 at `f7af41628b` (186 tests + subprocess guard pass). Added a PR comment documenting the stack and verification.
+- 2026-07-12 — Resolved and refreshed formerly conflicting #34294 at `08de1dd040` and #23331 at `d8c98f48fc`. #34294 preserves upstream's dynamically-derived blocklist while allowing `execute_code`; focused feature tests and the CI-failing MCP seam pass locally. Its previous CI failure was a profile-local MCP discovery flake that passes on both current main and the PR branch; a fresh CI run is active. #23331 carries current dynamic context-file truncation through HERMES_HOME AGENTS.md; 165 passed / 1 skipped.
+- 2026-07-12 — Rebased/re-authored #62925 (`5086604fa9`), #37513 (`e3b85403cd`), #37418 (`9c364e77f5`), and #37381 (`75d891978a`) to repair contributor-check failures. Focused results: 5, 76, 5, and 15 passed respectively. #62925's broader delegate file reproduced the same heartbeat timing failure on clean current main; feature-specific tests passed.
+- 2026-07-12 — Final inventory remains 42 open Kyzcreig PRs. Fresh local `merge-tree` assessment against `origin/main` is 36 clean / 6 conflicting. All six conflicts are report-only rather than safe mechanical rebases: #38976 violates current config.yaml-over-env policy; #34295 and #34146 are implemented on main; #25397/#25396/#24586 are superseded by newer clean/refreshed PRs. No upstream PR was closed or merged.
 
-Root cause in the repo: `_build_job_prompt` at `cron/scheduler.py:2407-2419`
-tells cron agents that final output is auto-delivered, but gives no contract for
-nested subprocesses that emit ACK/heartbeat/status messages. The authoritative
-per-job target exists in worker ContextVars, but the model is never told to use
-`HERMES_CRON_AUTO_DELIVER_PLATFORM/CHAT_ID/THREAD_ID` rather than infer or
-hardcode an ID from referenced work.
+## Final 42-PR sweep table
 
-## Planned regression and fix
+Check cells are `passing / failing / pending` at the final query; newly pushed branches may still be running.
 
-1. Add a worker-level regression in `tests/cron/test_scheduler.py` that runs
-   `run_job` with a foreign chat ID in task text and a different stored origin,
-   captures the actual worker prompt plus worker ContextVars, and asserts the
-   prompt identifies the ContextVar-backed target as authoritative and forbids
-   inferring/hardcoding a target from task content.
-2. Observe RED on current `fork/main`.
-3. Bind a scheduler-owned delivery-target instruction into the prompt from the
-   same `delivery_target` object used to populate `HERMES_CRON_AUTO_DELIVER_*`.
-   This preserves the intentional separation between cron execution identity
-   and delivery identity from commit `dbafa083b5`.
-4. Mutation-check by removing the binding and re-running the regression.
-5. Run the targeted cron scheduler and gateway/session-context suites.
+| PR | Local apply | Checks | Action |
+|---:|:---:|:---:|---|
+| #63096 | CLEAN | 31 / 0 / 0 | ported full #307 mechanism; CI green; senior review accepted |
+| #63082 | CLEAN | 31 / 0 / 0 | ported #308 SessionDB offload; CI green; senior review accepted |
+| #62925 | CLEAN | 17 / 0 / 10 | rebased, attribution repaired, pushed `5086604fa9`; 5 focused pass |
+| #62716 | CLEAN | 36 / 0 / 0 | rebased/pushed `c9c6a67e56`; 673 Python + 29 desktop pass; typechecks pass |
+| #62703 | CLEAN | 22 / 0 / 0 | no branch mutation; policy/review blocked |
+| #62699 | CLEAN | 31 / 0 / 0 | attribution refreshed; clean |
+| #62399 | CLEAN | 36 / 0 / 0 | no mutation; clean |
+| #62398 | CLEAN | 22 / 0 / 0 | rebased/pushed; desktop suites + typecheck pass |
+| #60253 | CLEAN | 17 / 0 / 10 | rebased/pushed `37bcf6d350`; Slack-cap drift fixed in base; 561 focused pass |
+| #60146 | CLEAN | 31 / 0 / 0 | rebased/pushed `d44f92c800`; 20 pass |
+| #59463 | CLEAN | 31 / 0 / 0 | rebuilt on refreshed #58144; pushed `f7af41628b`; 186 pass |
+| #58144 | CLEAN | 31 / 0 / 0 | rebased/re-authored/pushed `b87e3d4485`; 30 pass + subprocess guard |
+| #47600 | CLEAN | 35 / 0 / 0 | no mutation; clean |
+| #47017 | CLEAN | 17 / 0 / 10 | rebased/pushed `948aaf2101`; current Slack cap curated; 382 + 173 pass |
+| #46453 | CLEAN | 30 / 0 / 0 | no mutation; clean |
+| #42447 | CLEAN | 31 / 0 / 0 | rebased/pushed `e315dac093`; 41 pass |
+| #41653 | CLEAN | 20 / 0 / 0 | no mutation; clean |
+| #40237 | CLEAN | 23 / 0 / 0 | no mutation; clean |
+| #40157 | CLEAN | 31 / 0 / 0 | rebased/pushed `0a526ace0c`; 15 pass |
+| #39587 | CLEAN | 23 / 0 / 0 | no mutation; clean |
+| #39584 | CLEAN | 23 / 0 / 0 | no mutation; clean |
+| #39520 | CLEAN | 23 / 0 / 0 | no mutation; clean |
+| #38976 | CONFLICT | 23 / 0 / 0 | report only: env-gated behavioral config violates current config.yaml policy |
+| #37513 | CLEAN | 15 / 0 / 12 | rebased/re-authored/pushed `e3b85403cd`; 76 pass |
+| #37418 | CLEAN | 15 / 0 / 12 | rebased/re-authored/pushed `9c364e77f5`; 5 pass |
+| #37381 | CLEAN | 10 / 0 / 17 | rebased/re-authored/pushed `75d891978a`; 15 pass |
+| #34537 | CLEAN | 31 / 0 / 0 | rebased/pushed `e6a736f7c1`; 28 pass |
+| #34368 | CLEAN | no rollup | no mutation; clean |
+| #34299 | CLEAN | no rollup | no mutation; clean newer resolver variant |
+| #34298 | CLEAN | 31 / 0 / 0 | rebased/pushed `e1c9a7d010`; 2 pass |
+| #34297 | CLEAN | no rollup | no mutation; clean newer cached-client variant |
+| #34295 | CONFLICT | no rollup | report only: behavior implemented on main (`stop_typing` before stale return) |
+| #34294 | CLEAN | rerunning, 0 failing | rebased/re-authored/pushed `08de1dd040`; 5 feature + MCP seam pass |
+| #34293 | CLEAN | no rollup | no mutation; clean newer inline-provider variant |
+| #34292 | CLEAN | no rollup | no mutation; clean newer Codex slash parser variant |
+| #34146 | CONFLICT | no rollup | report only: dirty lineage; stale-result typing fix implemented on main |
+| #25403 | CLEAN | no rollup | no mutation; superseded by newer #34293 |
+| #25397 | CONFLICT | no rollup | report only: superseded by refreshed #34298 |
+| #25396 | CONFLICT | no rollup | report only: superseded by clean newer #34292 |
+| #24599 | CLEAN | no rollup | no mutation; superseded by newer #34297 |
+| #24586 | CONFLICT | no rollup | report only: superseded by clean newer #34299 |
+| #23331 | CLEAN | 31 / 0 / 0 | rebased/resolved/pushed `d8c98f48fc`; 165 pass / 1 skip |
 
-No live cron mutation, gateway restart, or push is part of this task.
-
-## Implementation and verification
-
-- Added `_bind_cron_delivery_target_hint()` in `cron/scheduler.py`. `run_job`
-  invokes it only after resolving the concrete target and binding the same target
-  into `HERMES_CRON_AUTO_DELIVER_*`. Cron execution identity remains blank as
-  required by `dbafa083b5`.
-- The hint JSON-encodes the authoritative target and tells nested status helpers
-  to read the three existing cron delivery variables instead of inferring IDs
-  from task content. Jobs with no resolved target are unchanged.
-- Added a worker regression with `FOREIGN_CHAT` in task text and a distinct stored
-  origin. It asserts both the actual worker ContextVars and the authoritative
-  target instruction.
-- Strengthened the transport regression to contaminate ambient
-  `HERMES_SESSION_*` values and assert `_send_to_platform` receives the stored
-  origin chat ID and thread ID.
-
-Observed test evidence:
-
-- RED before implementation:
-  `scripts/run_tests.sh tests/cron/test_scheduler.py -q` -> `226 passed, 1 failed`;
-  the new worker test failed because the authoritative target was absent.
-- GREEN after implementation:
-  the same command -> `227 passed, 0 failed`.
-- Mutation check: removed the single prompt-binding call and reran the same file
-  -> `226 passed, 1 failed`; restored the call and reran -> `227 passed, 0 failed`.
-- Related gateway/send coverage:
-  `scripts/run_tests.sh tests/gateway/test_session_context_inheritance.py tests/tools/test_send_message_origin.py tests/tools/test_send_message_tool.py -q`
-  -> `172 passed, 0 failed`.
-- Lint: shared-venv `ruff check cron/scheduler.py tests/cron/test_scheduler.py`
-  -> `All checks passed!`; `git diff --check` passed.
-- Deterministic pre-scan ran Bandit, Ruff, and Semgrep. Whole-file mode reported
-  existing repository/test-file findings; none are on the added production lines.
-- Momus review transport could not start because its configured
-  `opus-review-direct.py` path is absent under the Daedalus profile. The task is
-  therefore handed off `review-required` rather than self-approved.
-
-## t_4963087b — R2 closeout M1 ledger
-
-- `2026-07-11T02:23:15Z` — Read the full closeout contract before inspecting the
-  suite or R2-07 evidence. Confirmed the Hermes worktree was clean.
-- `2026-07-11T02:26:17Z` — Completed the required pre-answer anchor check without
-  opening any `R2-07-answer.json` result. `git log --follow` shows the R2 suite
-  specification was first introduced at
-  `1d987517bf363fdf16abde44a386f8cfcdc5f3ed` on
-  `2026-07-10T03:47:20-07:00`; `git cat-file` confirms the file does not exist in
-  that commit's parent. The two later pre-answer blobs (`698e0e1`, `d90d73e`)
-  carry the same sole R2-07 description verbatim:
-  `Gateway restart interrupted turn`. The complete row labels it only
-  `answer-presence for cited docs`; it does not define the required behavior.
-- `2026-07-11T02:26:17Z` — RC-a quality verdict: **STOP Item A**. The only
-  git-anchored R2-07 intent is a topic label, not an independent property-level
-  statement such as "surface a clarifying question and wait for the user."
-  The later uncommitted frozen fixture (created `2026-07-10T09:53:53-0700`)
-  contains a query plus lexical predicate ids, but no `intent` or `description`
-  field and therefore cannot supply the contract's required independent
-  pre-incident anchor. Per M1, no calibration set was authored and the held-out
-  R2-07 answer remains unread. Apollo's GO adjudication must be re-examined; the
-  `surface-ask` predicate must not be rewritten on this evidence.
-
-## t_4963087b — Item B routing gate
-
-- `2026-07-11T02:32:39Z` — RC4 read timing pinned before implementation.
-  `Mem0MemoryProvider.initialize()` calls `_load_config()` once and snapshots
-  `mem0_gbrain` into `self._gbrain_cfg` (`plugins/memory/mem0/__init__.py:1098,
-  1160-1168`). Query-time code reads that snapshot (`:1459`, `:1642-1658`), not
-  `mem0.json`. Therefore a future `audit_mode_for_ids` flip would take effect on
-  provider reinitialization / the next gateway restart, not live in the resident
-  provider. No instant-rollback claim is valid.
-- `2026-07-11T02:32:39Z` — RC-c metric pinned to **hit@3**. The production
-  prefetch path passes `mem0_gbrain.prefetch_limit` (default `3`) directly to
-  `_gbrain_pointers`, then renders every returned pointer into `## Local Docs
-  (gbrain)` (`plugins/memory/mem0/gbrain_recall.py:58`,
-  `plugins/memory/mem0/__init__.py:1655-1664`). The explicit `mem0_search` lane's
-  limit 5 is not the prefetch injection budget and is not the acceptance metric.
-- `2026-07-11T02:32:39Z` — Per-call mode is **not selectable through the actual
-  prefetch path**. Hermes sends `tools/call search` over OAuth HTTP
-  (`gbrain_recall.py:314-325`). The live gbrain operation explicitly ignores
-  `mode` whenever `ctx.remote is not false` (`src/core/operations.ts:538-546`),
-  and the HTTP transport dispatches with `remote: true`. A live request with the
-  invalid mode `definitely-not-a-mode` succeeded and returned the same top-3 as
-  an omitted mode, proving the server used its configured mode (`tokenmax`).
-- `2026-07-11T02:32:39Z` — Three-arm live prefetch A/B completed; full rows are
-  saved at `/tmp/t_4963087b-routing-ab.json`.
-
-  | arm | rows | baseline | requested audit | byte-identical |
-  |---|---:|---:|---:|---:|
-  | real ids (`SGR-*`, `proc_*`, `t_*`) | 5 | hit@3 5/5 | hit@3 5/5 | 5/5 |
-  | ordinary prose | 5 | — | — | 5/5 |
-  | adversarial near-misses | 5 | — | — | 5/5 |
-
-  The five real identifiers were `SGR-EA6EE271`, `SGR-B8AB643D`,
-  `proc_c06b8584afe`, `t_70e0d5a1`, and `t_1e5baf38`, each with a corpus-backed
-  expected slug. A second local/trusted CLI comparison (where per-call mode is
-  genuinely honored) also scored tokenmax 5/5 vs audit 5/5 at hit@3. The id arm
-  is a strict tie, so RC3 forbids default-true and the spec's no-op-complexity
-  rule says not to ship the detector. No detector or config flag was added;
-  consequently there are no detector-fire log lines or rollback surface to
-  certify. This is the contract-prescribed no-ship finding, not an implementation
-  omission.
-
-- `2026-07-11T02:34:00Z` — Verification: Hermes' canonical wrapper ran
-  `plugins/memory/mem0/test_gbrain_recall.py` with **22 passed, 0 failed**.
-  gbrain's focused `bun test test/search/per-call-mode.test.ts` ran **5 passed,
-  0 failed**, including the explicit remote-mode-ignored contract.
-  `git diff --check` passed. No live gateway was restarted or reconfigured.
-
-## t_4963087b — Item A adjudication and closeout
-
-- `2026-07-11T03:18:26Z` — Ace supplied the missing non-circular property
-  anchor and adjudicated the held-out answer **PASS**: “prompt the user is
-  fine”; preserve-and-prompt conveys the surface-and-ask doctrine. This ruling
-  supersedes the RC-a STOP above. Per Ace's instruction, M1 calibration remains
-  the protocol for future disputes and was not applied retroactively here.
-- `2026-07-11T03:18:26Z` — Reproduced the frozen failure before editing by
-  running `r2_answer_presence.py --check-only` against the original six-case
-  fixture and captured results: **5/6, FAIL**. R2-07 passed
-  `preserve-prompt`, `no-reexecute`, and `no-autocontinue`, but failed
-  `surface-ask`; the other five cases passed.
-- `2026-07-11T03:18:26Z` — Added Ace's property statement verbatim as the
-  R2-07 `intent` field. Rewrote only R2-07's `surface-ask` lexical set to
-  accept preserve-and-prompt and property-level prompt/ask equivalents. The
-  other predicates and all five non-R2-07 cases are unchanged.
-- `2026-07-11T03:18:26Z` — Re-evaluated the same frozen six answer payloads
-  with the updated fixture: **6/6, PASS**. R2-07 `surface-ask` matched
-  `preserve-and-prompt` and `ask whether to resume`; the five other cases'
-  complete verdict/predicate records were byte-identical to the pre-edit
-  check-only report. Mutation proof restored the old narrow phrase list in a
-  temporary fixture and returned the suite to **5/6, FAIL**, proving the
-  rewritten predicate is the load-bearing gate.
-- Item B remains closed unchanged: hit@3 tied, so RC3 correctly ships no
-  detector, flag, logging, or rollback surface.
+NEXT: Apollo senior review of the final sweep mutations. Watch only the fresh pending CI on #62925, #60253, #47017, #37513, #37418, #37381, and #34294; do not merge upstream. #63082/#63096 are green and remain upstream-maintainer decisions.
