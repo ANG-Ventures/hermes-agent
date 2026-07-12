@@ -407,16 +407,15 @@ def test_xai_has_known_pricing():
 
 
 # --- gemini-bridge (Google AI Ultra sub via agy) notional pricing ---------------
-# The bridge is POLY-VENDOR: one endpoint fronts Gemini 3.x + Claude 4.6 + GPT-OSS.
-# Each alias must normalize to a canonical priced model and route to the inferred
-# vendor at official-docs rates (status "estimated", never "unknown"/$0).
+# The bridge is Gemini-ONLY: it fronts the Gemini surface of the Ultra sub. (agy
+# also advertises Claude/GPT-OSS tiers, but the bridge deliberately excludes them —
+# the claude-*/gpt-oss aliases were removed 2026-07-12; zero non-Gemini spend.)
+# Each alias must normalize to a canonical priced Gemini model and route to google
+# at official-docs rates (status "estimated", never "unknown"/$0).
 _GEMINI_BRIDGE_CASES = [
     # (model_arg, expected_vendor, expected_canonical, in$/Mtok, out$/Mtok)
     ("gemini-flash", "google", "gemini-3.5-flash", 1.50, 9.00),
     ("gemini-pro", "google", "gemini-3.1-pro", 2.00, 12.00),
-    ("claude-opus", "anthropic", "claude-opus-4-6", None, None),
-    ("claude-sonnet", "anthropic", "claude-sonnet-4-6", None, None),
-    ("gpt-oss", "openai", "gpt-oss-120b", 0.03, 0.15),
     # the store records the provider-prefixed form too
     ("gemini-bridge/gemini-flash", "google", "gemini-3.5-flash", 1.50, 9.00),
 ]
@@ -470,6 +469,9 @@ def test_gemini_bridge_unknown_alias_routes_unknown_not_google():
     bogus = (
         "mistral-large", "totally-made-up", "flash", "opus",  # no vendor prefix
         "gemini-2.0-flash", "gemini-2.5-flash", "claude-opus-4-8", "gpt-5.5",  # prefix-valid, not fronted
+        # Gemini-only bridge: the former claude-*/gpt-oss short aliases are no
+        # longer fronted and must now route unknown (removed 2026-07-12).
+        "claude-opus", "claude-sonnet", "gpt-oss",
     )
     for model in bogus:
         route = resolve_billing_route(model, provider="gemini-bridge")
@@ -579,6 +581,12 @@ def test_openai_codex_route_resolves_to_notional_openrouter():
 def test_openai_codex_priced_from_openrouter_catalog(monkeypatch):
     """A codex turn is priced at the underlying OpenAI model's live OpenRouter
     rate and labelled 'estimated'."""
+    # Pin the external source to OpenRouter so this test exercises the OpenRouter
+    # catalog path it names (the default is now models.dev, which would answer
+    # gpt-5.5 first and ignore the stub).
+    monkeypatch.setattr(
+        "agent.usage_pricing._pricing_source_order", lambda: ("openrouter",)
+    )
     monkeypatch.setattr(
         "agent.usage_pricing.fetch_model_metadata", lambda: _CODEX_STUB_METADATA
     )
@@ -594,6 +602,9 @@ def test_openai_codex_minus_codex_suffix_falls_back_to_base_model(monkeypatch):
     """gpt-5.5-codex is absent from the OpenRouter catalog while gpt-5.5 is
     present; the '-codex' fallback must price it as the base model."""
     monkeypatch.setattr(
+        "agent.usage_pricing._pricing_source_order", lambda: ("openrouter",)
+    )
+    monkeypatch.setattr(
         "agent.usage_pricing.fetch_model_metadata", lambda: _CODEX_STUB_METADATA
     )
     usage = CanonicalUsage(input_tokens=120_000, output_tokens=8_000)
@@ -604,6 +615,9 @@ def test_openai_codex_minus_codex_suffix_falls_back_to_base_model(monkeypatch):
 
 def test_openai_codex_exact_codex_id_preferred_over_fallback(monkeypatch):
     """When the exact '-codex' id IS in the catalog, use it directly (no strip)."""
+    monkeypatch.setattr(
+        "agent.usage_pricing._pricing_source_order", lambda: ("openrouter",)
+    )
     monkeypatch.setattr(
         "agent.usage_pricing.fetch_model_metadata", lambda: _CODEX_STUB_METADATA
     )
@@ -616,6 +630,11 @@ def test_openai_codex_exact_codex_id_preferred_over_fallback(monkeypatch):
 def test_openai_codex_unknown_model_stays_unknown(monkeypatch):
     """A codex model absent from the catalog with no base fallback must degrade
     to 'unknown' (NOT fabricate a price)."""
+    # Pin to OpenRouter AND ensure models.dev can't answer the imaginary id
+    # either (it can't — but pinning keeps the test source-explicit).
+    monkeypatch.setattr(
+        "agent.usage_pricing._pricing_source_order", lambda: ("openrouter",)
+    )
     monkeypatch.setattr(
         "agent.usage_pricing.fetch_model_metadata", lambda: _CODEX_STUB_METADATA
     )
@@ -626,6 +645,14 @@ def test_openai_codex_unknown_model_stays_unknown(monkeypatch):
 
 
 def test_estimate_usage_cost_refuses_cache_pricing_without_official_cache_rate(monkeypatch):
+    # This exercises the OpenRouter path's refuse-cache-without-official-rate
+    # contract: a route with input/output but NO cache rate must NOT fabricate
+    # a cache cost. Pin the external source to OpenRouter only — otherwise the
+    # default models.dev source supplies a real cache_read rate for
+    # gemini-2.5-pro and the turn prices honestly (a different, valid path).
+    monkeypatch.setattr(
+        "agent.usage_pricing._pricing_source_order", lambda: ("openrouter",)
+    )
     monkeypatch.setattr(
         "agent.usage_pricing.fetch_model_metadata",
         lambda: {
@@ -975,3 +1002,108 @@ def test_fable_5_prices_at_premium_tier_across_notional_providers():
             f"{provider}: {result.amount_usd}"
         )
         assert has_known_pricing("claude-fable-5", provider=provider), provider
+
+
+# =========================================================================
+# Pluggable external pricing source (models.dev default, OpenRouter fallback)
+# =========================================================================
+# The external catalog that prices models NOT in the curated snapshot is now
+# configurable (config.yaml `pricing.external_source`), defaulting to
+# models.dev. These are behavior-contract tests: they assert the INVARIANTS
+# (snapshot precedence, source dispatch, fallback ordering, honest cost
+# extraction), not frozen provider/model lists.
+
+import agent.usage_pricing as _up  # noqa: E402
+import agent.models_dev as _mdev  # noqa: E402
+
+
+_FAKE_MDEV = {
+    "openai": {"models": {"gpt-fake-1": {"cost": {"input": 5, "output": 30, "cache_read": 0.5}}}},
+    "google": {"models": {"gemini-fake-1": {"cost": {"input": 2, "output": 12}}}},
+    "anthropic": {"models": {"claude-fake-1": {"cost": {"input": 10, "output": 50, "cache_read": 1, "cache_write": 12.5}}}},
+}
+
+
+class TestExternalPricingSource:
+    def test_config_can_select_openrouter_primary(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"pricing": {"external_source": "openrouter"}},
+        )
+        order = _up._pricing_source_order()
+        assert order[0] == "openrouter"
+        assert "models_dev" in order  # still present as fallback
+
+    def test_default_source_is_models_dev(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+        assert _up._pricing_source_order()[0] == "models_dev"
+
+    def test_unknown_source_degrades_to_default(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"pricing": {"external_source": "nonsense"}},
+        )
+        assert _up._pricing_source_order()[0] == "models_dev"
+
+    def test_models_dev_entry_builder_extracts_cost_and_cache(self, monkeypatch):
+        monkeypatch.setattr(_mdev, "fetch_models_dev", lambda: _FAKE_MDEV)
+        route = _up.BillingRoute(
+            provider="openai", model="gpt-fake-1", base_url="", billing_mode="official_models_api"
+        )
+        entry = _up._models_dev_pricing_entry(route)
+        assert entry is not None
+        assert float(entry.input_cost_per_million) == 5.0
+        assert float(entry.output_cost_per_million) == 30.0
+        assert float(entry.cache_read_cost_per_million) == 0.5
+        assert entry.cache_write_cost_per_million is None  # absent in fixture
+        assert entry.pricing_version == "models-dev-api"
+
+    def test_models_dev_entry_none_for_absent_model(self, monkeypatch):
+        monkeypatch.setattr(_mdev, "fetch_models_dev", lambda: _FAKE_MDEV)
+        route = _up.BillingRoute(
+            provider="openai", model="no-such-id", base_url="", billing_mode="official_models_api"
+        )
+        assert _up._models_dev_pricing_entry(route) is None
+
+    def test_external_entry_falls_back_to_openrouter_when_models_dev_misses(self, monkeypatch):
+        # models.dev returns nothing for this id; OpenRouter fallback answers.
+        monkeypatch.setattr(_mdev, "fetch_models_dev", lambda: {})
+        monkeypatch.setattr(
+            "agent.usage_pricing.fetch_model_metadata",
+            lambda: {"or-only-model": {"pricing": {"prompt": "0.000004", "completion": "0.00002"}}},
+        )
+        route = _up.BillingRoute(
+            provider="openrouter", model="or-only-model", base_url="", billing_mode="official_models_api"
+        )
+        entry = _up._external_pricing_entry(route)
+        assert entry is not None
+        assert float(entry.input_cost_per_million) == 4.0
+        assert float(entry.output_cost_per_million) == 20.0
+        assert entry.pricing_version == "openrouter-models-api"
+
+    def test_snapshot_precedence_over_models_dev_intro_price(self, monkeypatch):
+        # INVARIANT: the curated snapshot wins over the external catalog. Model
+        # a models.dev "intro" rate cheaper than the snapshot list rate; the
+        # snapshot's list rate must still be returned for a snapshot-covered
+        # model. (Mirrors real Sonnet-5 $3/$15 list vs models.dev $2/$10 intro.)
+        monkeypatch.setattr(
+            _mdev,
+            "fetch_models_dev",
+            lambda: {"anthropic": {"models": {"claude-sonnet-5": {"cost": {"input": 2, "output": 10}}}}},
+        )
+        entry = get_pricing_entry("claude-sonnet-5", provider="anthropic")
+        assert entry is not None
+        assert entry.source == "official_docs_snapshot"
+        assert float(entry.input_cost_per_million) == 3.0  # list, NOT the 2.0 intro
+        assert float(entry.output_cost_per_million) == 15.0
+
+    def test_models_dev_prices_openrouter_relay_model(self, monkeypatch):
+        # A notional-OpenRouter relay model (openai-codex -> openrouter route)
+        # absent from the snapshot prices from models.dev (the new default).
+        monkeypatch.setattr(_mdev, "fetch_models_dev", lambda: _FAKE_MDEV)
+        entry = get_pricing_entry("gpt-fake-1", provider="openai-codex")
+        assert entry is not None
+        assert float(entry.input_cost_per_million) == 5.0
+        assert float(entry.output_cost_per_million) == 30.0
+        assert entry.source == "provider_models_api"
+        assert entry.pricing_version == "models-dev-api"
