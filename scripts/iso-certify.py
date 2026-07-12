@@ -534,11 +534,11 @@ def run_certify(args: argparse.Namespace) -> dict[str, Any]:
                 result["verdict"] = "SMOKE-OK" if (total_turns > 0 and not lane_errors) else "SMOKE-FAIL"
                 result["is_verdict"] = False
             else:
+                probes_adequate = probe_thread_samples_ok(ws_samples, rest_samples)
                 serving_ok = (
                     serving_p99 < threshold_ms
                     and serving_stalls == 0
                     and log_stalls == 0
-                    and probe_thread_samples_ok(ws_samples, rest_samples)
                 )
                 if not load_valid:
                     # Cannot certify: the offered load was not the incident
@@ -548,6 +548,17 @@ def run_certify(args: argparse.Namespace) -> dict[str, Any]:
                     result.setdefault("notes", []).append(
                         "load invalid: lanes/turn-duration/deltas below the sustained-heavy-load floor — "
                         "not the AC-4 incident regime, verdict cannot certify"
+                    )
+                elif not probes_adequate:
+                    # Probe infrastructure failure is its own INCONCLUSIVE leg,
+                    # parallel to load validity: with no (or too few) probe
+                    # samples the run saw nothing about serving latency, so a
+                    # FAIL here would misread "probe client broke" as
+                    # "isolation didn't prevent stalls". Never PASS, never FAIL.
+                    result["verdict"] = "INCONCLUSIVE"
+                    result.setdefault("notes", []).append(
+                        f"probe samples inadequate (ws={len(ws_samples)}, rest={len(rest_samples)}, "
+                        "min 3 each): probe client failed to sample serving — verdict cannot certify"
                     )
                 else:
                     result["verdict"] = "PASS" if serving_ok else "FAIL"
