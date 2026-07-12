@@ -272,6 +272,19 @@ class TestGatewayConfigSerialization:
         restored = GatewayConfig.from_dict({"session_store_max_age_days": "nope"})
         assert restored.session_store_max_age_days == 90
 
+    def test_session_store_max_age_days_loads_from_config_yaml(
+        self, tmp_path, monkeypatch
+    ):
+        from gateway.config import load_gateway_config
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "session_store_max_age_days: 30\n",
+            encoding="utf-8",
+        )
+
+        assert load_gateway_config().session_store_max_age_days == 30
+
 
 class TestGatewayWatcherCallsPrune:
     """The session_expiry_watcher should call prune_old_entries once per hour."""

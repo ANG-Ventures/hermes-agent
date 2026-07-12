@@ -866,6 +866,24 @@ def _auto_continue_freshness_window() -> float:
     return auto_continue_freshness_window()
 
 
+def _resume_flag_stale_clear_enabled() -> bool:
+    """Return whether hourly stale ``resume_pending`` cleanup is enabled."""
+    raw = os.environ.get("HERMES_RESUME_FLAG_STALE_CLEAR")
+    if raw is None or raw == "":
+        return True
+    normalized = str(raw).strip().lower()
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    return True
+
+
+def _resume_flag_stale_ttl_secs() -> float:
+    """Generous resume-flag TTL: at least one day or six freshness windows."""
+    return max(24 * 60 * 60, 6 * _auto_continue_freshness_window())
+
+
 def _resume_interrupted_turns_mode() -> str:
     """Resolve the startup-captured enum, failing closed to prompt."""
     raw = os.environ.get("HERMES_RESUME_INTERRUPTED_TURNS", "prompt")
@@ -985,6 +1003,7 @@ _AGENT_CONFIG_ENV_BRIDGE: dict[str, str] = {
     "gateway_notify_interval": "HERMES_AGENT_NOTIFY_INTERVAL",
     "restart_drain_timeout": "HERMES_RESTART_DRAIN_TIMEOUT",
     "gateway_auto_continue_freshness": "HERMES_AUTO_CONTINUE_FRESHNESS",
+    "resume_flag_stale_clear": "HERMES_RESUME_FLAG_STALE_CLEAR",
     "resume_interrupted_turns": "HERMES_RESUME_INTERRUPTED_TURNS",
     "gateway_startup_restore_drain_timeout": "HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT",
     "restart_loop_threshold": "HERMES_RESTART_LOOP_THRESHOLD",
@@ -10109,6 +10128,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             err = getattr(result, "error", "send returned success=False")
             raise RuntimeError(f"adapter.send failed: {err}")
 
+    async def _clear_stale_resume_pending_flags(self) -> int:
+        """Clear dead resume flags without deleting their routing entries."""
+        if not _resume_flag_stale_clear_enabled():
+            return 0
+        ttl_seconds = _resume_flag_stale_ttl_secs()
+        cleared = await self.async_session_store.clear_stale_resume_pending(
+            ttl_seconds
+        )
+        for session_key, age_seconds in cleared:
+            logger.info(
+                "Cleared stale resume_pending for %s (age %.0fs, TTL %.0fs)",
+                session_key,
+                age_seconds,
+                ttl_seconds,
+            )
+        return len(cleared)
+
     async def _session_expiry_watcher(self, interval: int = 300):
         """Background task that finalizes expired sessions.
 
@@ -10276,6 +10312,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _last_prune_ts = getattr(self, "_last_session_store_prune_ts", 0.0)
                 _prune_interval = 3600.0  # once per hour
                 if time.time() - _last_prune_ts > _prune_interval:
+                    try:
+                        await self._clear_stale_resume_pending_flags()
+                    except Exception as _e:
+                        logger.debug("Stale resume flag cleanup failed: %s", _e)
                     try:
                         _max_age = int(
                             getattr(self.config, "session_store_max_age_days", 0) or 0

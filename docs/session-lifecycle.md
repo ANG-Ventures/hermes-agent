@@ -614,8 +614,9 @@ When a session expires:
 |---|---|---|---|
 | `group_sessions_per_user` | `bool` | `true` | Isolate group/channel sessions per user |
 | `thread_sessions_per_user` | `bool` | `false` | Isolate thread sessions per user |
-| `session_store_max_age_days` | `int` | `0` | Prune sessions older than N days (0=disabled) |
+| `session_store_max_age_days` | `int` | `90` | Prune sessions older than N days; suspended sessions are preserved (0=disabled) |
 | `agent.gateway_auto_continue_freshness` | `int` | `3600` | Seconds for resume freshness window |
+| `agent.resume_flag_stale_clear` | `bool` | `true` | Hourly clear of abandoned resume flags after max(24h, 6× freshness) |
 | `agent.gateway_timeout` | `int` | `1800` | Agent turn timeout (30 min default) |
 
 ### Reset Policy (per-platform/type, in config.yaml)

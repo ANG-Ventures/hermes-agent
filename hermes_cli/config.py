@@ -1172,6 +1172,10 @@ DEFAULT_CONFIG = {
         # default is 1800s) plus runtime slack.  Set to 0 to disable the
         # gate and restore pre-fix behaviour (always inject).
         "gateway_auto_continue_freshness": 3600,
+        # Clear abandoned resume_pending markers during hourly gateway
+        # maintenance after max(24h, 6x the freshness window). This only clears
+        # the recovery flag; it does not delete the session routing entry.
+        "resume_flag_stale_clear": True,
         # What a messaging-gateway boot does with a restart-interrupted turn.
         # "prompt" preserves the transcript and asks before continuing (safe
         # default). "auto" continues once when the persisted tail is mechanically

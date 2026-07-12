@@ -1047,6 +1047,11 @@ def load_gateway_config() -> GatewayConfig:
             if "thread_sessions_per_user" in yaml_cfg:
                 gw_data["thread_sessions_per_user"] = yaml_cfg["thread_sessions_per_user"]
 
+            if "session_store_max_age_days" in yaml_cfg:
+                gw_data["session_store_max_age_days"] = yaml_cfg[
+                    "session_store_max_age_days"
+                ]
+
             # Multiplexing flag: accept both the top-level key and the nested
             # gateway.multiplex_profiles form (written by
             # ``hermes config set gateway.multiplex_profiles true``).

@@ -2290,14 +2290,51 @@ class SessionStore:
             entry = self._entries.get(session_key)
             if entry is None or not entry.resume_pending:
                 return False
-            entry.resume_pending = False
-            entry.resume_reason = None
-            entry.resume_kind = None
-            entry.resume_handoff = None
-            entry.resume_request_id = None
-            entry.last_resume_marked_at = None
+            self._clear_resume_pending_fields(entry)
             self._save()
             return True
+
+    @staticmethod
+    def _clear_resume_pending_fields(entry: SessionEntry) -> None:
+        """Clear all persisted resume metadata on an entry."""
+        entry.resume_pending = False
+        entry.resume_reason = None
+        entry.resume_kind = None
+        entry.resume_handoff = None
+        entry.resume_request_id = None
+        entry.last_resume_marked_at = None
+
+    def clear_stale_resume_pending(
+        self, max_age_seconds: float
+    ) -> List[tuple[str, float]]:
+        """Clear stale resume flags while preserving their session entries.
+
+        ``last_resume_marked_at`` is authoritative when present; ``updated_at``
+        is the fallback for routing rows written before the resume timestamp was
+        added. Explicitly suspended sessions are user-held and never changed.
+
+        Returns ``(session_key, age_seconds)`` for each cleared flag so the
+        gateway can emit one observable INFO record per cleanup.
+        """
+        if max_age_seconds is None or max_age_seconds <= 0:
+            return []
+
+        now = _now()
+        cleared: List[tuple[str, float]] = []
+        with self._lock:
+            self._ensure_loaded_locked()
+            for entry in self._entries.values():
+                if not entry.resume_pending or entry.suspended:
+                    continue
+                marker = entry.last_resume_marked_at or entry.updated_at
+                age_seconds = (now - marker).total_seconds()
+                if age_seconds <= max_age_seconds:
+                    continue
+                self._clear_resume_pending_fields(entry)
+                cleared.append((entry.session_key, age_seconds))
+            if cleared:
+                self._save()
+        return cleared
 
     def prune_old_entries(self, max_age_days: int) -> int:
         """Drop SessionEntry records older than max_age_days.

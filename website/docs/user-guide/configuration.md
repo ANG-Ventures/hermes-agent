@@ -833,12 +833,16 @@ Instead, when the budget is actually exhausted (90/90), Hermes injects one messa
 agent:
   max_turns: 90                # Max iterations per conversation turn (default: 90)
   api_max_retries: 3           # Retries per provider before fallback engages (default: 3)
+  gateway_auto_continue_freshness: 3600  # Fresh resume window in seconds
+  resume_flag_stale_clear: true  # Clear abandoned resume flags after at least 24h
   resume_interrupted_turns: prompt  # prompt (default) or safe once-ever auto continuation
 ```
 
 When the iteration budget is fully exhausted, the CLI shows a notification to the user: `⚠ Iteration budget reached (90/90) — response may be incomplete`.
 
 `agent.api_max_retries` controls how many times Hermes retries a provider API call on transient errors (rate limits, connection drops, 5xx) **before** fallback-provider switching engages. The default is `3` — four attempts total. If you have [fallback providers](/user-guide/features/fallback-providers) configured and want to fail over faster, drop this to `0` so the first transient error on your primary immediately hands off to the fallback instead of churning retries against the flaky endpoint.
+
+`agent.resume_flag_stale_clear` defaults to `true`. Once per hour, the gateway clears `resume_pending` from abandoned recovery records older than `max(24 hours, 6 × agent.gateway_auto_continue_freshness)`. This preserves the session entry and transcript; it only prevents a dead recovery marker from being re-persisted forever. Fresh flags and explicitly suspended sessions are left untouched. Set this to `false` only to disable that cleanup for testing.
 
 `agent.resume_interrupted_turns` controls messaging-gateway recovery after a restart interrupts an active turn. The default, `prompt`, preserves the user-facing prompt-and-wait semantics: Hermes surfaces the interruption and waits for the user. Schedule logs now add the log-only `kind=sibling|self` taxonomy token described below. Opt-in `auto` continues the interrupted turn once only when the persisted tail is mechanically safe. Incomplete mutating calls, unknown tools or surfaces, invalid values, corrupt attempt state, and repeated attempts all fail closed to `prompt`. Completed mutating calls may continue forward, but returned tool calls are never re-executed. The once-ever key is the gateway `session_key` plus the persisted interrupted assistant-row ID, and attempt credit expires after seven days. This setting is read when the gateway starts, so restart the gateway after changing it.
 
