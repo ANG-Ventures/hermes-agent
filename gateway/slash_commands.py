@@ -405,8 +405,11 @@ class GatewaySlashCommandsMixin:
         preserved_preferences = []
         unavailable_model_preference = False
         if preserve_route_preferences and new_entry:
-            if new_entry.model_override_identity:
-                unavailable_model_preference = session_key in getattr(
+            invalid_model_preference = bool(
+                getattr(new_entry, "_model_override_identity_invalid", False)
+            )
+            if new_entry.model_override_identity or invalid_model_preference:
+                unavailable_model_preference = invalid_model_preference or session_key in getattr(
                     self, "_session_model_override_unavailable", set()
                 )
                 if not unavailable_model_preference:

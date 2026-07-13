@@ -373,6 +373,30 @@ async def test_manual_reset_preserves_but_marks_unavailable_model_preference(
 
 
 @pytest.mark.asyncio
+async def test_manual_reset_surfaces_invalid_persisted_model_preference(
+    store, monkeypatch
+):
+    old = store.get_or_create_session(_source())
+    with store._lock:
+        old.model_override_identity = None
+        old._model_override_identity_invalid = True
+        store._save()
+    runner = _runner_for_manual_reset(store)
+    home = store.sessions_dir.parent
+    _write_reset_policy(home, True)
+    monkeypatch.setattr(gateway_run, "_gateway_config_home", lambda: home)
+
+    reply = await runner._handle_reset_command(
+        MessageEvent(text="/new", source=_source(), message_id="m-invalid")
+    )
+
+    new = store.entry_for(old.session_key)
+    assert new._model_override_identity_invalid is True
+    assert "model preference" in str(reply)
+    assert "currently unavailable" in str(reply)
+
+
+@pytest.mark.asyncio
 async def test_runtime_kill_switch_false_restores_legacy_clear(store, monkeypatch):
     old = _seed_preferences(store)
     runner = _runner_for_manual_reset(store)
