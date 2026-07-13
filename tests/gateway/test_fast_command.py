@@ -3,6 +3,7 @@
 import sys
 import threading
 import types
+from itertools import product
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -218,6 +219,50 @@ async def test_handle_fast_command_persists_config(monkeypatch, tmp_path):
 
     saved = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
     assert saved["agent"]["service_tier"] == "fast"
+
+
+@pytest.mark.asyncio
+async def test_fast_status_and_toggle_replies_use_i18n(monkeypatch, tmp_path):
+    runner = _make_runner()
+    translator = MagicMock(side_effect=lambda key, **_kwargs: key)
+    monkeypatch.setattr("gateway.slash_commands.t", translator)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    runner._resolve_effective_session_route_identity = MagicMock(
+        return_value=("gpt-5.5", "openai-codex", "codex_responses")
+    )
+
+    assert await runner._handle_fast_command(
+        _make_event("/fast status")
+    ) == "gateway.fast.route_status"
+    assert await runner._handle_fast_command(
+        _make_event("/fast fast")
+    ) == "gateway.fast.route_saved"
+
+    runner._resolve_effective_session_route_identity.return_value = (
+        "gpt-5.6-sol",
+        "openai-codex",
+        "codex_responses",
+    )
+    assert await runner._handle_fast_command(
+        _make_event("/fast status")
+    ) == "gateway.fast.route_off"
+    assert await runner._handle_fast_command(
+        _make_event("/fast fast")
+    ) == "gateway.fast.route_unavailable"
+
+    def _fail_write(*_args, **_kwargs):
+        raise OSError("read-only test config")
+
+    monkeypatch.setattr("gateway.slash_commands.atomic_config_write", _fail_write)
+    runner._resolve_effective_session_route_identity.return_value = (
+        "gpt-5.5",
+        "openai-codex",
+        "codex_responses",
+    )
+    assert await runner._handle_fast_command(
+        _make_event("/fast normal")
+    ) == "gateway.fast.route_session_only"
 
 
 @pytest.mark.asyncio
@@ -515,6 +560,85 @@ def test_pure_route_identity_matches_runtime_for_global_route(monkeypatch):
     assert pure == (model, runtime["provider"], runtime["api_mode"])
 
 
+@pytest.mark.parametrize(
+    ("channel_model", "channel_provider", "session_override"),
+    product((False, True), repeat=3),
+)
+def test_pure_route_identity_matches_runtime_exhaustive_precedence_matrix(
+    monkeypatch, channel_model, channel_provider, session_override
+):
+    """Guard pure /fast identity selection against full runtime precedence."""
+    source = _make_source()
+    runner = _make_runner()
+    session_key = runner._session_key_for_source(source)
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                channel_overrides={
+                    "12345": ChannelOverride(
+                        model="claude-opus-4-6" if channel_model else None,
+                        provider="anthropic" if channel_provider else None,
+                    )
+                }
+            )
+        }
+    )
+    identity = (
+        {
+            "model": "gpt-5.5",
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+        }
+        if session_override
+        else None
+    )
+    runner.session_store = SimpleNamespace(
+        entry_for=lambda _key: SimpleNamespace(model_override_identity=identity)
+        if identity
+        else None
+    )
+    if identity:
+        runner._session_model_overrides[session_key] = {
+            **identity,
+            "api_key": "session-secret",
+        }
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openai-api",
+            "api_mode": "codex_responses",
+            "api_key": "global-secret",
+        },
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs_for_provider",
+        lambda provider: {
+            "provider": provider,
+            "api_mode": "anthropic_messages",
+            "api_key": "channel-secret",
+        },
+    )
+    config = {
+        "model": {
+            "default": "gpt-5.4",
+            "provider": "openai-api",
+            "api_mode": "codex_responses",
+        }
+    }
+
+    pure = runner._resolve_effective_session_route_identity(
+        source=source, session_key=session_key, user_config=config
+    )
+    model, runtime = runner._resolve_session_agent_runtime(
+        source=source, session_key=session_key, user_config=config
+    )
+
+    assert pure == (model, runtime["provider"], runtime["api_mode"])
+
+
 def test_model_switch_note_reports_enabled_fast_becoming_unavailable():
     runner = _make_runner()
     runner._service_tier = "priority"
@@ -540,6 +664,44 @@ def test_model_switch_note_derives_api_mode_when_result_omits_it():
     )
 
     assert runner._fast_unavailable_model_switch_row(result) is None
+
+
+def test_model_switch_unavailable_note_uses_i18n(monkeypatch):
+    runner = _make_runner()
+    runner._service_tier = "priority"
+    translator = MagicMock(return_value="localized model-switch note")
+    monkeypatch.setattr("gateway.slash_commands.t", translator)
+
+    note = runner._fast_unavailable_model_switch_row(
+        SimpleNamespace(
+            new_model="gpt-5.6-sol",
+            target_provider="openai-codex",
+            api_mode="codex_responses",
+        )
+    )
+
+    assert note == "localized model-switch note"
+    translator.assert_called_once_with(
+        "gateway.fast.model_switch_unavailable",
+        route="openai-codex/gpt-5.6-sol",
+    )
+
+
+def test_new_fast_gateway_messages_have_english_i18n_fallbacks():
+    from agent.i18n import t
+
+    assert t(
+        "gateway.fast.route_status",
+        lang="es",
+        state="on",
+        family="Codex Fast",
+        route="openai-codex/gpt-5.5",
+    ) == "⚡ Fast: on — Codex Fast on `openai-codex/gpt-5.5`"
+    assert t(
+        "gateway.fast.model_switch_unavailable",
+        lang="es",
+        route="openai-codex/gpt-5.6-sol",
+    ).endswith("requests will use normal speed.")
 
 
 @pytest.mark.asyncio

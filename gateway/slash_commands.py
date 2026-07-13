@@ -1591,8 +1591,9 @@ class GatewaySlashCommandsMixin:
                 f"{getattr(result, 'target_provider', None) or '<unknown>'}/"
                 f"{getattr(result, 'new_model', None) or '<unset>'}"
             )
-            return (
-                f"⚡ Fast: unavailable on `{route}`; requests will use normal speed."
+            return t(
+                "gateway.fast.model_switch_unavailable",
+                route=route,
             )
         except Exception:
             return None
@@ -3350,18 +3351,23 @@ class GatewaySlashCommandsMixin:
 
         if not args or args == "status":
             if not capability.supported:
-                return f"⚡ Fast: off — {capability.reason}"
-            state = "on" if self._service_tier == "priority" else "off"
-            label = {
-                "openai_priority": "OpenAI API Priority Processing",
-                "codex_fast": "Codex Fast",
-                "anthropic_fast": "Anthropic Fast",
-            }.get(capability.family, "Fast")
-            return f"⚡ Fast: {state} — {label} on `{route}`"
+                return t("gateway.fast.route_off", reason=capability.reason)
+            state = t(
+                "gateway.fast.state_on"
+                if self._service_tier == "priority"
+                else "gateway.fast.state_off"
+            )
+            family_label = t(f"gateway.fast.family_{capability.family}")
+            return t(
+                "gateway.fast.route_status",
+                state=state,
+                family=family_label,
+                route=route,
+            )
 
         if args in {"fast", "on"}:
             if not capability.supported:
-                return f"⚡ Fast unavailable — {capability.reason}"
+                return t("gateway.fast.route_unavailable", reason=capability.reason)
             self._service_tier = "priority"
             saved_value = "fast"
             label = t("gateway.fast.label_fast")
@@ -3372,14 +3378,12 @@ class GatewaySlashCommandsMixin:
         else:
             return t("gateway.fast.unknown_arg", arg=args)
 
-        family_label = {
-            "openai_priority": "OpenAI API Priority Processing",
-            "codex_fast": "Codex Fast",
-            "anthropic_fast": "Anthropic Fast",
-        }.get(capability.family, "Fast")
+        family_label = t(f"gateway.fast.family_{capability.family}")
         if _save_config_key("agent.service_tier", saved_value):
-            return f"⚡ ✓ {family_label}: **{label}** (saved to config)"
-        return f"⚡ ✓ {family_label}: **{label}** (this session only)"
+            return t("gateway.fast.route_saved", family=family_label, label=label)
+        return t(
+            "gateway.fast.route_session_only", family=family_label, label=label
+        )
 
     async def _handle_yolo_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /yolo — toggle dangerous command approval bypass for this session only."""

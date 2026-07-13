@@ -2083,7 +2083,6 @@ FAST_MODE_CAPABILITY_CATALOG: dict[str, dict[str, Any]] = {
     "openai_priority": {
         "source_url": "https://openai.com/api-priority-processing/",
         "checked_date": "2026-07-12",
-        "providers": ("openai-api",),
         "models": (
             "gpt-5.6-sol",
             "gpt-5.6-terra",
@@ -2102,13 +2101,11 @@ FAST_MODE_CAPABILITY_CATALOG: dict[str, dict[str, Any]] = {
     "codex_fast": {
         "source_url": "https://developers.openai.com/codex/speed",
         "checked_date": "2026-07-12",
-        "providers": ("openai-codex",),
         "models": ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini"),
     },
     "anthropic_fast": {
         "source_url": "https://platform.claude.com/docs/en/build-with-claude/fast-mode",
         "checked_date": "2026-07-12",
-        "providers": ("anthropic",),
         "models": ("claude-opus-4-6",),
     },
 }
@@ -2141,8 +2138,10 @@ def _is_openai_fast_model(model_id: Optional[str]) -> bool:
     base = raw.split(":")[0]
     if not base:
         return False
-    # Exclude Codex-series — they route through the Codex Responses API
-    # which doesn't accept service_tier.
+    # Exclude Codex-series from this legacy model-only helper: it cannot tell
+    # direct OpenAI Priority Processing from ChatGPT-authenticated Codex Fast.
+    # The latter does accept service_tier="fast" plus features.fast_mode=true;
+    # resolve_fast_mode_capability() handles that documented route contract.
     if "codex" in base:
         return False
     return any(base.startswith(prefix) for prefix in _OPENAI_FAST_MODE_PREFIXES)
@@ -2187,11 +2186,12 @@ def resolve_fast_mode_capability(
     base = _fast_model_base(model)
     route = f"{normalized_provider}/{base or '<unset>'}"
 
+    openai_contract = FAST_MODE_CAPABILITY_CATALOG["openai_priority"]
     if normalized_provider in {"openai", "openai-api"} and normalized_mode in {
         "chat_completions",
         "codex_responses",
     }:
-        models = FAST_MODE_CAPABILITY_CATALOG["openai_priority"]["models"]
+        models = openai_contract["models"]
         supported = base in models
         return FastModeCapability(
             supported=supported,
@@ -2202,8 +2202,12 @@ def resolve_fast_mode_capability(
             else f"OpenAI API Priority Processing is not documented for `{route}`.",
         )
 
-    if normalized_provider == "openai-codex" and normalized_mode == "codex_responses":
-        models = FAST_MODE_CAPABILITY_CATALOG["codex_fast"]["models"]
+    codex_contract = FAST_MODE_CAPABILITY_CATALOG["codex_fast"]
+    if (
+        normalized_provider == "openai-codex"
+        and normalized_mode == "codex_responses"
+    ):
+        models = codex_contract["models"]
         supported = base in models
         return FastModeCapability(
             supported=supported,
@@ -2218,8 +2222,12 @@ def resolve_fast_mode_capability(
             ),
         )
 
-    if normalized_provider == "anthropic" and normalized_mode == "anthropic_messages":
-        models = FAST_MODE_CAPABILITY_CATALOG["anthropic_fast"]["models"]
+    anthropic_contract = FAST_MODE_CAPABILITY_CATALOG["anthropic_fast"]
+    if (
+        normalized_provider == "anthropic"
+        and normalized_mode == "anthropic_messages"
+    ):
+        models = anthropic_contract["models"]
         # Anthropic model ids appear with both ``4-6`` and ``4.6`` version
         # separators. The catalog stores the canonical provider spelling.
         catalog_base = base.replace("opus-4.", "opus-4-")

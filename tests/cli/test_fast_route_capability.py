@@ -109,12 +109,32 @@ def test_opus_48_proxy_route_stays_unsupported_but_keeps_separate_model_guidance
 def test_fast_capability_catalog_entries_exist_in_provider_catalogs():
     from hermes_cli.models import FAST_MODE_CAPABILITY_CATALOG, provider_model_ids
 
-    for contract in FAST_MODE_CAPABILITY_CATALOG.values():
+    catalog_provider = {
+        "openai_priority": "openai-api",
+        "codex_fast": "openai-codex",
+        "anthropic_fast": "anthropic",
+    }
+    for family, contract in FAST_MODE_CAPABILITY_CATALOG.items():
         assert contract["source_url"].startswith("https://")
         assert contract["checked_date"] == "2026-07-12"
-        for provider in contract["providers"]:
-            catalog = set(provider_model_ids(provider))
-            assert set(contract["models"]) <= catalog
+        assert "providers" not in contract
+        catalog = set(provider_model_ids(catalog_provider[family]))
+        assert set(contract["models"]) <= catalog
+
+
+def test_codex_fast_contract_retains_documented_request_field():
+    from hermes_cli.models import (
+        FAST_MODE_CAPABILITY_CATALOG,
+        resolve_fast_mode_capability,
+    )
+
+    contract = FAST_MODE_CAPABILITY_CATALOG["codex_fast"]
+    assert contract["source_url"] == "https://developers.openai.com/codex/speed"
+    assert resolve_fast_mode_capability(
+        model="gpt-5.5",
+        provider="openai-codex",
+        api_mode="codex_responses",
+    ).request_overrides == {"service_tier": "fast"}
 
 
 @pytest.mark.parametrize(
@@ -167,3 +187,4 @@ def test_request_enforcement_call_sites_do_not_use_model_only_wrapper():
     for path in production_files:
         source = path.read_text(encoding="utf-8")
         assert "resolve_fast_mode_overrides(" not in source, path
+        assert "model_supports_fast_mode(" not in source, path
