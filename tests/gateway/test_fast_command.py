@@ -157,7 +157,7 @@ def test_turn_route_fails_closed_for_proxy_gpt_model():
         (
             "anthropic",
             "anthropic_messages",
-            "claude-opus-4-6",
+            "claude-opus-4-8",
             {"speed": "fast"},
         ),
     ],
@@ -202,13 +202,27 @@ def test_turn_route_skips_priority_processing_for_unsupported_models():
     assert route["request_overrides"] == {}
 
 
+def test_gateway_configured_identity_uses_shared_api_mode_inference(monkeypatch):
+    infer = MagicMock(return_value="shared-mode")
+    monkeypatch.setattr(
+        "hermes_cli.providers.infer_api_mode_from_provider", infer
+    )
+
+    identity = gateway_run.GatewayRunner._configured_route_identity(
+        {"model": {"default": "m", "provider": "openai-codex"}}
+    )
+
+    assert identity == ("m", "openai-codex", "shared-mode")
+    infer.assert_called_once_with("openai-codex")
+
+
 @pytest.mark.asyncio
 async def test_handle_fast_command_persists_config(monkeypatch, tmp_path):
     runner = _make_runner()
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
-    runner._resolve_effective_session_route_identity = MagicMock(
+    runner._resolve_configured_session_route_identity = MagicMock(
         return_value=("gpt-5.4", "openai-api", "codex_responses")
     )
 
@@ -228,7 +242,7 @@ async def test_fast_status_and_toggle_replies_use_i18n(monkeypatch, tmp_path):
     monkeypatch.setattr("gateway.slash_commands.t", translator)
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
-    runner._resolve_effective_session_route_identity = MagicMock(
+    runner._resolve_configured_session_route_identity = MagicMock(
         return_value=("gpt-5.5", "openai-codex", "codex_responses")
     )
 
@@ -239,7 +253,7 @@ async def test_fast_status_and_toggle_replies_use_i18n(monkeypatch, tmp_path):
         _make_event("/fast fast")
     ) == "gateway.fast.route_saved"
 
-    runner._resolve_effective_session_route_identity.return_value = (
+    runner._resolve_configured_session_route_identity.return_value = (
         "gpt-5.6-sol",
         "openai-codex",
         "codex_responses",
@@ -255,7 +269,7 @@ async def test_fast_status_and_toggle_replies_use_i18n(monkeypatch, tmp_path):
         raise OSError("read-only test config")
 
     monkeypatch.setattr("gateway.slash_commands.atomic_config_write", _fail_write)
-    runner._resolve_effective_session_route_identity.return_value = (
+    runner._resolve_configured_session_route_identity.return_value = (
         "gpt-5.5",
         "openai-codex",
         "codex_responses",
@@ -319,11 +333,42 @@ async def test_fast_status_uses_persisted_session_route_without_credentials(
 
 
 @pytest.mark.asyncio
+async def test_fast_status_reports_persisted_preference_as_unavailable_without_checkout(
+    monkeypatch, tmp_path
+):
+    runner = _make_runner()
+    source = _make_source()
+    session_key = runner._session_key_for_source(source)
+    persisted = {
+        "model": "gpt-5.5",
+        "provider": "openai-codex",
+        "api_mode": "codex_responses",
+    }
+    runner.session_store = SimpleNamespace(
+        entry_for=lambda _key: SimpleNamespace(model_override_identity=persisted)
+    )
+    runner._session_model_override_unavailable = {session_key}
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    checkout = MagicMock(side_effect=AssertionError("status checked credentials"))
+    monkeypatch.setattr(runner, "_reresolve_model_override_credentials", checkout)
+
+    response = await runner._handle_fast_command(_make_event("/fast status"))
+    toggle_response = await runner._handle_fast_command(_make_event("/fast fast"))
+
+    assert "Configured session preference" in response
+    assert "currently unavailable" in response
+    assert "openai-codex/gpt-5.5" in response
+    assert toggle_response == response
+    checkout.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_fast_status_opus_48_proxy_points_to_separate_fast_model(
     monkeypatch, tmp_path
 ):
     runner = _make_runner()
-    runner._resolve_effective_session_route_identity = MagicMock(
+    runner._resolve_configured_session_route_identity = MagicMock(
         return_value=(
             "claude-opus-4-8",
             "claude-apr",
@@ -385,7 +430,7 @@ def test_pure_route_identity_matches_runtime_precedence(monkeypatch):
         },
     )
 
-    pure = runner._resolve_effective_session_route_identity(
+    pure = runner._resolve_configured_session_route_identity(
         source=source,
         session_key=session_key,
         user_config=config,
@@ -431,7 +476,7 @@ def test_pure_route_identity_matches_runtime_for_session_override(monkeypatch):
         }
     }
 
-    pure = runner._resolve_effective_session_route_identity(
+    pure = runner._resolve_configured_session_route_identity(
         source=source, session_key=session_key, user_config=config
     )
     model, runtime = runner._resolve_session_agent_runtime(
@@ -485,7 +530,7 @@ def test_pure_route_identity_matches_runtime_for_channel_and_session_override(
         }
     }
 
-    pure = runner._resolve_effective_session_route_identity(
+    pure = runner._resolve_configured_session_route_identity(
         source=source, session_key=session_key, user_config=config
     )
     model, runtime = runner._resolve_session_agent_runtime(
@@ -550,7 +595,7 @@ def test_pure_route_identity_matches_runtime_for_global_route(monkeypatch):
         },
     )
 
-    pure = runner._resolve_effective_session_route_identity(
+    pure = runner._resolve_configured_session_route_identity(
         source=_make_source(), session_key="global-key", user_config=config
     )
     model, runtime = runner._resolve_session_agent_runtime(
@@ -629,7 +674,7 @@ def test_pure_route_identity_matches_runtime_exhaustive_precedence_matrix(
         }
     }
 
-    pure = runner._resolve_effective_session_route_identity(
+    pure = runner._resolve_configured_session_route_identity(
         source=source, session_key=session_key, user_config=config
     )
     model, runtime = runner._resolve_session_agent_runtime(
@@ -751,6 +796,61 @@ async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch
     assert result["final_response"] == "ok"
     assert _CapturingAgent.last_init["service_tier"] == "priority"
     assert _CapturingAgent.last_init["request_overrides"] == {"service_tier": "priority"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resolution_failure", [None, RuntimeError("keychain unavailable")])
+async def test_run_agent_fails_closed_when_persisted_route_credentials_unavailable(
+    monkeypatch, tmp_path, resolution_failure
+):
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+    session_key = "agent:main:telegram:dm:12345"
+    identity = {
+        "model": "gpt-5.5",
+        "provider": "openai-codex",
+        "api_mode": "codex_responses",
+    }
+    runner.session_store.entry_for = lambda key: (
+        SimpleNamespace(model_override_identity=identity)
+        if key == session_key
+        else None
+    )
+    resolver = MagicMock()
+    if resolution_failure is None:
+        resolver.return_value = None
+    else:
+        resolver.side_effect = resolution_failure
+    monkeypatch.setattr(runner, "_reresolve_model_override_credentials", resolver)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(
+        gateway_run, "_resolve_gateway_model", lambda config=None: "global-fallback"
+    )
+    configured_provider = MagicMock(
+        side_effect=AssertionError("configured provider must not be resolved")
+    )
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", configured_provider
+    )
+
+    _CapturingAgent.last_init = None
+    result = await runner._run_agent(
+        message="do not reroute this prompt",
+        context_prompt="",
+        history=[],
+        source=_make_source(),
+        session_id="session-1",
+        session_key=session_key,
+    )
+
+    assert "currently unavailable" in result["final_response"]
+    assert "preference was preserved" in result["final_response"]
+    assert result["api_calls"] == 0
+    configured_provider.assert_not_called()
+    assert _CapturingAgent.last_init is None
 
 
 @pytest.mark.asyncio

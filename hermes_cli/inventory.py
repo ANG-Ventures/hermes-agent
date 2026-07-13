@@ -261,6 +261,7 @@ def _apply_capabilities(rows: list[dict]) -> None:
     uncatalogued model is the worse failure.
     """
     from hermes_cli.models import resolve_fast_mode_capability
+    from hermes_cli.providers import infer_api_mode_from_provider
 
     try:
         from agent.models_dev import get_model_capabilities
@@ -269,14 +270,7 @@ def _apply_capabilities(rows: list[dict]) -> None:
 
     for row in rows:
         slug = row.get("slug") or ""
-        if slug == "openai-codex":
-            api_mode = "codex_responses"
-        elif slug == "anthropic":
-            api_mode = "anthropic_messages"
-        elif slug in {"openai", "openai-api"}:
-            api_mode = "codex_responses"
-        else:
-            api_mode = "chat_completions"
+        api_mode = infer_api_mode_from_provider(slug)
         caps: dict[str, dict[str, bool]] = {}
 
         for model in row.get("models") or []:

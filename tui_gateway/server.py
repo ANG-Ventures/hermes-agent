@@ -11383,6 +11383,7 @@ def _(rid, params: dict) -> dict:
         overrides = None
         if nv == "fast":
             from hermes_cli.models import resolve_fast_mode_capability
+            from hermes_cli.providers import infer_api_mode_from_provider
 
             target_model = (
                 getattr(agent, "model", None) if agent is not None else _resolve_model()
@@ -11407,12 +11408,7 @@ def _(rid, params: dict) -> dict:
                 else model_cfg.get("api_mode")
             )
             if not target_api_mode:
-                if target_provider == "openai-codex":
-                    target_api_mode = "codex_responses"
-                elif target_provider == "anthropic":
-                    target_api_mode = "anthropic_messages"
-                elif target_provider in {"openai", "openai-api"}:
-                    target_api_mode = "codex_responses"
+                target_api_mode = infer_api_mode_from_provider(target_provider)
             capability = resolve_fast_mode_capability(
                 model=target_model,
                 provider=target_provider,

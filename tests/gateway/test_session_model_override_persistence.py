@@ -157,9 +157,11 @@ def test_runner_rehydrates_override_after_restart(store_factory):
     # Simulated restart: fresh store + fresh runner with an empty in-memory
     # override map, credentials re-resolved via runtime provider resolution.
     runner = _make_runner(store_factory())
-    with patch(
-        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+    with patch.object(
+        runner,
+        "_reresolve_model_override_credentials",
         return_value={
+            "model": "gpt-5o",
             "api_key": "sk-fresh-from-keychain",
             "api_mode": "responses",
             "base_url": "https://api.openai.example/v1",
@@ -203,23 +205,22 @@ def test_runner_rehydrate_noop_without_persisted_override(store_factory):
     assert runner._session_model_overrides == {}
 
 
-def test_runner_rehydrate_survives_credential_resolution_failure(store_factory):
-    """Missing credentials degrade to a credential-less override, not a crash."""
+def test_runner_rehydrate_marks_credential_resolution_failure_unavailable(store_factory):
     store = store_factory()
     entry = store.get_or_create_session(_make_source())
     session_key = entry.session_key
     store.set_model_override(session_key, OVERRIDE)
 
     runner = _make_runner(store)
-    with patch(
-        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+    with patch.object(
+        runner,
+        "_reresolve_model_override_credentials",
         side_effect=RuntimeError("no credentials"),
     ):
         runner._rehydrate_session_model_override(session_key)
 
-    override = runner._session_model_overrides[session_key]
-    assert override["model"] == "gpt-5o"
-    assert override.get("api_key") is None
+    assert session_key not in runner._session_model_overrides
+    assert session_key in runner._session_model_override_unavailable
 
 
 def test_sanitize_model_override():

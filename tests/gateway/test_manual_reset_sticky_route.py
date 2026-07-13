@@ -272,6 +272,29 @@ async def test_manual_reset_persisted_entry_wins_map_divergence(store, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_manual_reset_preserves_but_marks_unavailable_model_preference(
+    store, monkeypatch
+):
+    old = _seed_preferences(store)
+    runner = _runner_for_manual_reset(store)
+    runner._reresolve_model_override_credentials.return_value = None
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_runtime_config",
+        lambda: {"session_reset": {"preserve_route_preferences_on_manual_reset": True}},
+    )
+
+    reply = await runner._handle_reset_command(
+        MessageEvent(text="/new", source=_source(), message_id="m-unavailable")
+    )
+
+    assert store.entry_for(old.session_key).model_override_identity == MODEL_IDENTITY
+    assert old.session_key in runner._session_model_override_unavailable
+    assert "model preference" in str(reply)
+    assert "currently unavailable" in str(reply)
+
+
+@pytest.mark.asyncio
 async def test_runtime_kill_switch_false_restores_legacy_clear(store, monkeypatch):
     old = _seed_preferences(store)
     runner = _runner_for_manual_reset(store)
@@ -298,7 +321,7 @@ async def test_runtime_kill_switch_false_restores_legacy_clear(store, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_unreadable_kill_switch_cannot_wedge_reset_and_defaults_true(
+async def test_unreadable_kill_switch_fails_to_legacy_clear(
     store, monkeypatch
 ):
     old = _seed_preferences(store)
@@ -315,8 +338,8 @@ async def test_unreadable_kill_switch_cannot_wedge_reset_and_defaults_true(
 
     new = store.entry_for(old.session_key)
     assert new.session_id != old.session_id
-    assert new.model_override_identity == MODEL_IDENTITY
-    assert new.reasoning_override == REASONING_NONE
+    assert new.model_override_identity is None
+    assert new.reasoning_override is None
 
 
 def test_default_config_enables_manual_reset_route_preference_carryover():
@@ -330,13 +353,35 @@ def test_default_config_enables_manual_reset_route_preference_carryover():
     )
 
 
-def test_malformed_yaml_defaults_true_and_logs_warning(tmp_path, monkeypatch, caplog):
+def test_missing_session_reset_section_uses_new_default(monkeypatch):
+    monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: {})
+
+    assert gateway_run.GatewayRunner._preserve_route_preferences_on_manual_reset()
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        [],
+        {"session_reset": []},
+        {"session_reset": {"preserve_route_preferences_on_manual_reset": 7}},
+    ],
+)
+def test_malformed_runtime_config_fails_to_legacy_false(config, monkeypatch):
+    monkeypatch.setattr(
+        gateway_run, "_load_gateway_runtime_config", lambda: config
+    )
+
+    assert not gateway_run.GatewayRunner._preserve_route_preferences_on_manual_reset()
+
+
+def test_malformed_yaml_defaults_false_and_logs_warning(tmp_path, monkeypatch, caplog):
     (tmp_path / "config.yaml").write_text("session_reset: [unterminated", encoding="utf-8")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
     with caplog.at_level(logging.WARNING, logger="gateway.run"):
         preserved = gateway_run.GatewayRunner._preserve_route_preferences_on_manual_reset()
 
-    assert preserved is True
+    assert preserved is False
     assert "config" in caplog.text.lower()
     assert "warning" in caplog.text.lower() or "could not" in caplog.text.lower()

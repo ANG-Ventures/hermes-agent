@@ -3031,6 +3031,42 @@ def test_config_set_fast_updates_live_agent_and_config(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_config_set_fast_uses_shared_provider_api_mode_inference(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(server, "_resolve_model", lambda: "gpt-5.5")
+    monkeypatch.setattr(
+        server, "_load_cfg", lambda: {"model": {"provider": "openai-codex"}}
+    )
+    monkeypatch.setattr(server, "_write_config_key", lambda *_args: None)
+    def _infer(provider):
+        captured["provider"] = provider
+        return "shared-mode"
+
+    monkeypatch.setattr(
+        "hermes_cli.providers.infer_api_mode_from_provider", _infer
+    )
+
+    def _resolve(**kwargs):
+        captured.update(kwargs)
+        return types.SimpleNamespace(
+            supported=True, request_overrides={"service_tier": "fast"}
+        )
+
+    monkeypatch.setattr("hermes_cli.models.resolve_fast_mode_capability", _resolve)
+
+    response = server.handle_request(
+        {
+            "id": "shared-inference",
+            "method": "config.set",
+            "params": {"key": "fast", "value": "fast"},
+        }
+    )
+
+    assert response["result"]["value"] == "fast"
+    assert captured["provider"] == "openai-codex"
+    assert captured["api_mode"] == "shared-mode"
+
+
 def test_config_set_fast_status_is_non_mutating(monkeypatch):
     writes = []
     emits = []

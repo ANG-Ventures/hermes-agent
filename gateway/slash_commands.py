@@ -91,33 +91,51 @@ class GatewaySlashCommandsMixin:
 
     @staticmethod
     def _preserve_route_preferences_on_manual_reset() -> bool:
-        """Runtime-read, default-true kill switch for manual reset carry-over."""
+        """Runtime-read kill switch for manual reset carry-over.
+
+        A missing section uses the new default. Read or shape failures use the
+        legacy false behavior so an operator's rollback remains dependable.
+        """
         try:
-            from gateway.run import _load_gateway_runtime_config
+            from gateway.run import _gateway_config_home, _load_gateway_runtime_config
+
+            # The ordinary gateway loader is intentionally fail-open and
+            # collapses YAML/read errors to {}. This rollback switch must
+            # distinguish those failures from a genuinely missing section, so
+            # validate an existing file strictly before using the expanded
+            # runtime view.
+            config_path = _gateway_config_home() / "config.yaml"
+            if config_path.exists():
+                import yaml
+
+                with open(config_path, encoding="utf-8") as handle:
+                    raw = yaml.safe_load(handle)
+                if raw is not None and not isinstance(raw, dict):
+                    raise ValueError("config root must be a mapping")
 
             cfg = _load_gateway_runtime_config()
         except Exception as exc:
             logger.warning(
                 "Could not read session_reset manual preference policy; "
-                "defaulting preserve_route_preferences_on_manual_reset=true: %s",
+                "using legacy preserve_route_preferences_on_manual_reset=false: %s",
                 exc,
             )
-            return True
+            return False
         if not isinstance(cfg, dict):
             logger.warning(
                 "Malformed gateway config while reading manual reset policy; "
-                "defaulting preserve_route_preferences_on_manual_reset=true"
+                "using legacy preserve_route_preferences_on_manual_reset=false"
             )
-            return True
+            return False
         section = cfg.get("session_reset")
         if section is None:
             return True
         if not isinstance(section, dict):
             logger.warning(
                 "Malformed session_reset config (expected mapping); defaulting "
-                "preserve_route_preferences_on_manual_reset=true"
+                "preserve_route_preferences_on_manual_reset=false"
             )
-            return True
+            return False
         value = section.get("preserve_route_preferences_on_manual_reset", True)
         if isinstance(value, bool):
             return value
@@ -129,10 +147,10 @@ class GatewaySlashCommandsMixin:
                 return False
         logger.warning(
             "Malformed session_reset.preserve_route_preferences_on_manual_reset=%r; "
-            "defaulting to true",
+            "defaulting to false",
             value,
         )
-        return True
+        return False
 
     def _rehydrate_manual_reset_route_preferences(
         self, session_key: str, entry: Any
@@ -142,10 +160,13 @@ class GatewaySlashCommandsMixin:
             self._session_model_overrides = {}
         if not hasattr(self, "_session_reasoning_overrides"):
             self._session_reasoning_overrides = {}
+        if not hasattr(self, "_session_model_override_unavailable"):
+            self._session_model_override_unavailable = set()
         # NOTE(P3b/RC-2): cache reconciliation, not a preference clear. The
         # newly rotated persisted entry is authoritative and is applied below.
         self._session_model_overrides.pop(session_key, None)
         self._session_reasoning_overrides.pop(session_key, None)
+        self._session_model_override_unavailable.discard(session_key)
 
         reasoning = getattr(entry, "reasoning_override", None) if entry else None
         if isinstance(reasoning, dict):
@@ -167,6 +188,9 @@ class GatewaySlashCommandsMixin:
                 resolved = None
             if resolved is not None:
                 self._session_model_overrides[session_key] = resolved
+                self._session_model_override_unavailable.discard(session_key)
+            else:
+                self._session_model_override_unavailable.add(session_key)
         getattr(self, "_override_target_just_changed", {}).pop(session_key, None)
 
     def _typed_command_prefix_for(self, platform) -> str:
@@ -382,9 +406,14 @@ class GatewaySlashCommandsMixin:
         header = header + _title_note
 
         preserved_preferences = []
+        unavailable_model_preference = False
         if preserve_route_preferences and new_entry:
             if new_entry.model_override_identity:
-                preserved_preferences.append("model")
+                unavailable_model_preference = session_key in getattr(
+                    self, "_session_model_override_unavailable", set()
+                )
+                if not unavailable_model_preference:
+                    preserved_preferences.append("model")
             if new_entry.reasoning_override is not None:
                 preserved_preferences.append("reasoning")
         if preserved_preferences:
@@ -392,6 +421,8 @@ class GatewaySlashCommandsMixin:
                 "gateway.reset.preferences_preserved",
                 preferences=" and ".join(preserved_preferences),
             )
+        if unavailable_model_preference:
+            header += t("gateway.reset.model_preference_unavailable")
 
         # When /new runs inside a Telegram DM topic lane, rewrite the
         # (chat_id, thread_id) → session_id binding so the next message
@@ -3322,7 +3353,7 @@ class GatewaySlashCommandsMixin:
 
         user_config = _load_gateway_config()
         session_key = self._session_key_for_source(event.source)
-        model, provider, api_mode = self._resolve_effective_session_route_identity(
+        model, provider, api_mode = self._resolve_configured_session_route_identity(
             source=event.source,
             session_key=session_key,
             user_config=user_config,
@@ -3333,6 +3364,10 @@ class GatewaySlashCommandsMixin:
             api_mode=api_mode,
         )
         route = f"{provider or '<unknown>'}/{model or '<unset>'}"
+        persisted_preference = self._persisted_session_route_identity(session_key)
+        preference_unavailable = session_key in getattr(
+            self, "_session_model_override_unavailable", set()
+        )
         logger.debug(
             "Fast capability route=%s api_mode=%s family=%s supported=%s",
             route,
@@ -3362,8 +3397,18 @@ class GatewaySlashCommandsMixin:
                 return False
 
         if not args or args == "status":
+            if persisted_preference and preference_unavailable:
+                return t(
+                    "gateway.fast.preference_unavailable",
+                    route=route,
+                )
             if not capability.supported:
-                return t("gateway.fast.route_off", reason=capability.reason)
+                key = (
+                    "gateway.fast.preference_off"
+                    if persisted_preference
+                    else "gateway.fast.route_off"
+                )
+                return t(key, reason=capability.reason)
             state = t(
                 "gateway.fast.state_on"
                 if self._service_tier == "priority"
@@ -3371,13 +3416,20 @@ class GatewaySlashCommandsMixin:
             )
             family_label = t(f"gateway.fast.family_{capability.family}")
             return t(
-                "gateway.fast.route_status",
+                "gateway.fast.preference_status"
+                if persisted_preference
+                else "gateway.fast.route_status",
                 state=state,
                 family=family_label,
                 route=route,
             )
 
         if args in {"fast", "on"}:
+            if persisted_preference and preference_unavailable:
+                return t(
+                    "gateway.fast.preference_unavailable",
+                    route=route,
+                )
             if not capability.supported:
                 return t("gateway.fast.route_unavailable", reason=capability.reason)
             self._service_tier = "priority"

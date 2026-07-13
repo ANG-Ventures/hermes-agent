@@ -117,7 +117,9 @@ def _is_claude_model(model: str | None) -> bool:
     return "claude" in (model or "").lower()
 
 
-_FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-6", "opus-4.6")
+_FAST_MODE_SUPPORTED_SUBSTRINGS = (
+    "opus-4-8", "opus-4.8", "opus-4-7", "opus-4.7",
+)
 
 # ── Max output token limits per Anthropic model ───────────────────────
 # Source: Anthropic docs + Cline model catalog.  Anthropic's API requires
@@ -292,12 +294,13 @@ def _forbids_sampling_params(model: str) -> bool:
 def _supports_fast_mode(model: str) -> bool:
     """Return True for models that support Anthropic Fast Mode (speed=fast).
 
-    Per Anthropic docs, fast mode is currently supported on Opus 4.6 only.
-    Sending ``speed: "fast"`` to any other Claude model (including Opus 4.7)
-    returns HTTP 400. This guard prevents silently 400'ing when stale config
-    or older callers leave fast mode enabled across a model upgrade.
+    Per Anthropic's native Fast Mode contract, Opus 4.8 and 4.7 accept the
+    parameter. Opus 4.6 does not support Fast and runs at standard speed.
+    This allowlist prevents stale config from sending the beta contract to
+    unsupported models.
     """
-    return any(v in model for v in _FAST_MODE_SUPPORTED_SUBSTRINGS)
+    normalized = (model or "").lower()
+    return any(v in normalized for v in _FAST_MODE_SUPPORTED_SUBSTRINGS)
 
 
 # Beta headers for enhanced features that are safe on ordinary/native Anthropic
@@ -327,7 +330,7 @@ _TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14"
 _CONTEXT_1M_BETA = "context-1m-2025-08-07"
 
 # Fast mode beta — enables the ``speed: "fast"`` request parameter for
-# significantly higher output token throughput on Opus 4.6 (~2.5x).
+# significantly higher output token throughput on supported Opus models.
 # See https://platform.claude.com/docs/en/build-with-claude/fast-mode
 _FAST_MODE_BETA = "fast-mode-2026-02-01"
 
@@ -2500,7 +2503,7 @@ def build_anthropic_kwargs(
     thinking block signatures are stripped (they are Anthropic-proprietary).
 
     When *fast_mode* is True, adds ``extra_body["speed"] = "fast"`` and the
-    fast-mode beta header for ~2.5x faster output throughput on Opus 4.6.
+    fast-mode beta header for higher output throughput on supported Opus models.
     Currently only supported on native Anthropic endpoints (not third-party
     compatible ones).
     """
@@ -2670,10 +2673,9 @@ def build_anthropic_kwargs(
         for _sampling_key in ("temperature", "top_p", "top_k"):
             kwargs.pop(_sampling_key, None)
 
-    # ── Fast mode (Opus 4.6 only) ────────────────────────────────────
-    # Adds extra_body.speed="fast" + the fast-mode beta header for ~2.5x
-    # output speed. Per Anthropic docs, fast mode is only supported on
-    # Opus 4.6 — Opus 4.7 and other models 400 on the speed parameter.
+    # ── Fast mode (native Opus 4.8 / 4.7) ────────────────────────────
+    # Adds extra_body.speed="fast" plus the required fast-mode beta header.
+    # Opus 4.6 is unavailable in Fast and remains at standard speed.
     # Only for native Anthropic endpoints — third-party providers would
     # reject the unknown beta header and speed parameter.
     if (

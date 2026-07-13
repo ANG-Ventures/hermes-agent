@@ -6,6 +6,23 @@ import pytest
 
 
 @pytest.mark.parametrize(
+    ("provider", "expected"),
+    [
+        ("openai-codex", "codex_responses"),
+        ("anthropic", "anthropic_messages"),
+        ("openai", "codex_responses"),
+        ("openai-api", "codex_responses"),
+        ("openrouter", "chat_completions"),
+        (None, "chat_completions"),
+    ],
+)
+def test_provider_only_api_mode_inference_contract(provider, expected):
+    from hermes_cli.providers import infer_api_mode_from_provider
+
+    assert infer_api_mode_from_provider(provider) == expected
+
+
+@pytest.mark.parametrize(
     ("provider", "api_mode", "model", "supported", "family", "overrides"),
     [
         (
@@ -36,25 +53,25 @@ import pytest
             "openai-codex",
             "codex_responses",
             "gpt-5.4-mini",
-            True,
+            False,
             "codex_fast",
-            {"service_tier": "fast"},
+            {},
         ),
         (
             "anthropic",
             "anthropic_messages",
             "claude-opus-4-6",
-            True,
+            False,
             "anthropic_fast",
-            {"speed": "fast"},
+            {},
         ),
         (
             "anthropic",
             "anthropic_messages",
             "claude-opus-4-8",
-            False,
+            True,
             "anthropic_fast",
-            {},
+            {"speed": "fast"},
         ),
         ("openrouter", "chat_completions", "gpt-5.6-sol", False, "unsupported", {}),
         ("custom:proxy", "codex_responses", "gpt-5.5", False, "unsupported", {}),
@@ -76,18 +93,18 @@ def test_fast_capability_is_route_specific(
     assert capability.request_overrides == overrides
 
 
-def test_opus_48_guidance_names_separate_fast_model():
+def test_opus_46_native_route_is_standard_speed_only():
     from hermes_cli.models import resolve_fast_mode_capability
 
     capability = resolve_fast_mode_capability(
-        model="claude-opus-4-8",
+        model="claude-opus-4-6",
         provider="anthropic",
         api_mode="anthropic_messages",
     )
 
     assert capability.supported is False
-    assert "claude-opus-4-8-fast" in capability.reason
-    assert "speed" in capability.reason
+    assert capability.supported is False
+    assert "not available" in capability.reason
 
 
 def test_opus_48_proxy_route_stays_unsupported_but_keeps_separate_model_guidance():

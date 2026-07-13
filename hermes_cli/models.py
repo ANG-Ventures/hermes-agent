@@ -2101,12 +2101,12 @@ FAST_MODE_CAPABILITY_CATALOG: dict[str, dict[str, Any]] = {
     "codex_fast": {
         "source_url": "https://developers.openai.com/codex/speed",
         "checked_date": "2026-07-12",
-        "models": ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini"),
+        "models": ("gpt-5.5", "gpt-5.4"),
     },
     "anthropic_fast": {
         "source_url": "https://platform.claude.com/docs/en/build-with-claude/fast-mode",
         "checked_date": "2026-07-12",
-        "models": ("claude-opus-4-6",),
+        "models": ("claude-opus-4-8", "claude-opus-4-7"),
     },
 }
 
@@ -2150,8 +2150,8 @@ def _is_openai_fast_model(model_id: Optional[str]) -> bool:
 # Models that support Anthropic Fast Mode (speed="fast").
 # See https://platform.claude.com/docs/en/build-with-claude/fast-mode
 #
-# Pattern-based matching — any claude-* model is eligible. The anthropic
-# adapter gates speed=fast on native Anthropic endpoints only (see
+# The documented Opus versions are allowlisted. The Anthropic adapter also
+# gates speed=fast on native Anthropic endpoints only (see
 # _is_third_party_anthropic_endpoint in agent/anthropic_adapter.py), so
 # third-party proxies that would reject the beta header are protected.
 
@@ -2234,11 +2234,6 @@ def resolve_fast_mode_capability(
         supported = catalog_base in models
         if supported:
             reason = None
-        elif "opus-4-8" in base or "opus-4.8" in base:
-            reason = (
-                f"Anthropic's `speed=fast` parameter is unavailable for `{route}`; "
-                "select the separate `claude-opus-4-8-fast` model instead."
-            )
         else:
             reason = (
                 f"Anthropic Fast (`speed=fast`) is not available for `{route}` "
@@ -2284,20 +2279,18 @@ def model_supports_fast_mode(model_id: Optional[str]) -> bool:
 def _is_anthropic_fast_model(model_id: Optional[str]) -> bool:
     """Return True if the model accepts the Anthropic Fast Mode ``speed`` param.
 
-    This gates the *speed=fast request parameter*, which Anthropic supports on
-    Opus 4.6 only (Opus 4.7 explicitly 400s). It is deliberately NOT a general
-    "is this a fast model" check: for Opus 4.8 the fast offering is a SEPARATE
-    model id (``…-opus-4.8-fast``) selected via the model field, not the speed
-    parameter — see ``agent.anthropic_adapter._supports_fast_mode`` and its
-    test. Keep this in lock-step with that adapter gate so the UI never shows a
-    Fast toggle that the runtime would silently drop.
+    This gates the *speed=fast request parameter*, which Anthropic documents
+    for Opus 4.8 and 4.7. Opus 4.6 is deliberately excluded because Anthropic
+    serves it at standard speed even when the parameter is requested. Keep
+    this in lock-step with ``agent.anthropic_adapter._supports_fast_mode``.
     """
     raw = _strip_vendor_prefix(str(model_id or ""))
     base = raw.split(":")[0]
     if not base.startswith("claude-"):
         return False
-    # Only Opus 4.6 supports the speed=fast parameter at present.
-    return "opus-4-6" in base or "opus-4.6" in base
+    return any(version in base for version in (
+        "opus-4-8", "opus-4.8", "opus-4-7", "opus-4.7"
+    ))
 
 
 def resolve_fast_mode_overrides(model_id: Optional[str]) -> dict[str, Any] | None:
