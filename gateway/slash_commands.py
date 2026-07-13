@@ -381,6 +381,18 @@ class GatewaySlashCommandsMixin:
                 _title_note = t("gateway.reset.title_empty_untitled")
         header = header + _title_note
 
+        preserved_preferences = []
+        if preserve_route_preferences and new_entry:
+            if new_entry.model_override_identity:
+                preserved_preferences.append("model")
+            if new_entry.reasoning_override is not None:
+                preserved_preferences.append("reasoning")
+        if preserved_preferences:
+            header += t(
+                "gateway.reset.preferences_preserved",
+                preferences=" and ".join(preserved_preferences),
+            )
+
         # When /new runs inside a Telegram DM topic lane, rewrite the
         # (chat_id, thread_id) → session_id binding so the next message
         # uses the freshly-created session. Without this, the binding
@@ -1963,7 +1975,7 @@ class GatewaySlashCommandsMixin:
                         # Build confirmation text
                         plabel = result.provider_label or result.target_provider
                         lines = [t("gateway.model.switched", model=result.new_model)]
-                        _fast_row = _self._fast_unavailable_model_switch_row(result)
+                        _fast_row = self._fast_unavailable_model_switch_row(result)
                         if _fast_row:
                             lines.append(_fast_row)
                         lines.append(t("gateway.model.provider_label", provider=plabel))

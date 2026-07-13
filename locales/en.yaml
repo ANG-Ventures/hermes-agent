@@ -291,6 +291,7 @@ gateway:
     title_rejected:        "\n⚠️ Title rejected: {error}"
     title_error_untitled:  "\n⚠️ {error} — session started untitled."
     title_empty_untitled:  "\n⚠️ Title is empty after cleanup — session started untitled."
+    preferences_preserved: "\n↪ Preserved explicit {preferences} preferences. Use `/model reset` and `/reasoning reset` to return to configured defaults."
     tip:                   "\n✦ Tip: {tip}"
 
   restart:

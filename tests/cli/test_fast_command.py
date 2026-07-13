@@ -258,6 +258,28 @@ class TestFastModeRouting(unittest.TestCase):
         assert route["runtime"]["provider"] == "openrouter"
         assert route.get("request_overrides") == {}
 
+    def test_turn_route_normalizes_fast_resolution_exception_to_dict(self):
+        cli_mod = _import_cli()
+        stub = SimpleNamespace(
+            model="gpt-5.4",
+            api_key="primary-key",
+            base_url="https://api.openai.com/v1",
+            provider="openai",
+            api_mode="chat_completions",
+            acp_command=None,
+            acp_args=[],
+            _credential_pool=None,
+            service_tier="priority",
+        )
+
+        with patch(
+            "hermes_cli.models.resolve_fast_mode_capability",
+            side_effect=RuntimeError("catalog unavailable"),
+        ):
+            route = cli_mod.HermesCLI._resolve_turn_agent_config(stub, "hi")
+
+        assert route["request_overrides"] == {}
+
 
 class TestAnthropicFastMode(unittest.TestCase):
     """Verify Anthropic Fast Mode model support and override resolution."""
