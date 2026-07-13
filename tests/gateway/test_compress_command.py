@@ -760,6 +760,10 @@ async def test_compress_command_lcm_engine_wire_first_context_line():
     assert "Full request size: 303,201" not in result
     # LCM recovery pointer.
     assert "lcm.db" in result
+    # LCM compacts in place (_rewritten=True) → CASE D cannot fire; guard against
+    # a future regression where the in-place path falls through to the CASE C
+    # no-op message.
+    assert "No changes" not in result
 
 
 # ---------------------------------------------------------------------------
