@@ -25,6 +25,7 @@ except ModuleNotFoundError:
     pass
 
 import asyncio
+import ipaddress
 import concurrent.futures
 import dataclasses
 import inspect
@@ -45,6 +46,7 @@ from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
 from typing import Callable, Dict, Optional, Any, List, Union
+from urllib.parse import urlsplit, urlunsplit
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
 # /usage; we still import it at module top in the gateway because test
@@ -80,6 +82,37 @@ _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 # atexit-join would otherwise block interpreter finalization). Overridable via
 # HERMES_GATEWAY_EXECUTOR_DRAIN_TIMEOUT for ops tuning.
 _EXECUTOR_DRAIN_TIMEOUT_SECS_DEFAULT = 8.0
+
+
+class SessionRouteUnavailableError(RuntimeError):
+    """A persisted explicit route cannot currently resolve credentials."""
+
+
+def _endpoint_url_for_display(value: object) -> str:
+    """Return a safe origin for an exact local, loopback, or unspecified host."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+        hostname = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError):
+        return ""
+    if not parsed.scheme or not hostname:
+        return ""
+    is_local_host = hostname == "localhost"
+    try:
+        address = ipaddress.ip_address(hostname)
+        is_local_host = address.is_loopback or address.is_unspecified
+    except ValueError:
+        pass
+    if not is_local_host:
+        return ""
+    display_host = f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None:
+        display_host = f"{display_host}:{port}"
+    return urlunsplit((parsed.scheme, display_host, "", "", ""))
 
 
 def _executor_drain_timeout() -> float:
@@ -2208,6 +2241,7 @@ from gateway.config import (
 )
 from gateway.session import (
     AsyncSessionStore,
+    PersistedSessionRouteLookup,
     SessionStore,
     SessionSource,
     SessionContext,
@@ -2808,8 +2842,13 @@ def _load_gateway_config() -> dict:
                 import yaml
                 with open(config_path, 'r', encoding='utf-8') as f:
                     raw = yaml.safe_load(f) or {}
-        except Exception:
-            logger.debug("Could not load gateway config from %s", config_path)
+        except Exception as exc:
+            logger.warning(
+                "Could not load gateway config from %s; runtime defaults will apply "
+                "(error=%s)",
+                config_path,
+                type(exc).__name__,
+            )
             raw = {}
 
     # Overlay managed scope. read_raw_config() returns the user's raw YAML
@@ -3508,6 +3547,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Per-session model overrides from /model command.
         # Key: session_key, Value: dict with model/provider/api_key/base_url/api_mode
         self._session_model_overrides: Dict[str, Dict[str, str]] = {}
+        self._session_model_override_unavailable: set[str] = set()
         # Per-session reasoning effort overrides from /reasoning.
         # Key: session_key, Value: parsed reasoning config dict.
         self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
@@ -3679,12 +3719,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Reasoning overrides carry no secret and rehydrate directly. Model overrides
         persist only their identity ({model, provider, api_mode}); their api_key and
         base_url are re-resolved from provider config here (never read from disk),
-        and an entry whose provider is no longer configured is skipped (fail-open to
-        the config default rather than booting a broken client).
+        and an entry whose provider is no longer configured is marked unavailable.
+        The turn resolver then fails closed before consulting the global provider.
         """
         store = getattr(self, "session_store", None)
         if store is None:
             return
+        if not hasattr(self, "_session_model_override_unavailable"):
+            self._session_model_override_unavailable = set()
         try:
             store._ensure_loaded()  # noqa: SLF001 — populate _entries before we read
         except Exception:
@@ -3710,7 +3752,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     resolved = None
                 if resolved is not None:
                     self._session_model_overrides[key] = resolved
+                    self._session_model_override_unavailable.discard(key)
                 else:
+                    self._session_model_override_unavailable.add(key)
                     logger.debug(
                         "model override rehydrate skipped for %s (provider %r unresolvable)",
                         key, mo.get("provider"),
@@ -4338,6 +4382,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
+        persisted_route_lookup: Optional[PersistedSessionRouteLookup] = None,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session.
 
@@ -4352,10 +4397,69 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 resolved_session_key = None
 
+        # Persisted identity is durability truth. If a stale credential-resolved
+        # map entry diverges, discard it so lazy rehydration below rebuilds the
+        # cache from the entry rather than routing on stale process state.
+        persisted_identity = None
+        if resolved_session_key:
+            route_lookup = (
+                persisted_route_lookup
+                if persisted_route_lookup is not None
+                else self._persisted_session_route_identity(resolved_session_key)
+            )
+            if route_lookup.state == "unavailable":
+                raise SessionRouteUnavailableError(
+                    "The persisted session model preference could not be read or "
+                    "validated. No provider request was made; repair the session "
+                    "store or use `/model reset`."
+                )
+            persisted_identity = route_lookup.identity
+            cached_override = self._session_model_overrides.get(resolved_session_key)
+            if persisted_identity and cached_override:
+                cached_identity = self._configured_route_identity(
+                    {
+                        "model": {
+                            "default": cached_override.get("model"),
+                            "provider": cached_override.get("provider"),
+                            "api_mode": cached_override.get("api_mode"),
+                        }
+                    }
+                )
+                normalized_persisted_identity = self._configured_route_identity(
+                    {
+                        "model": {
+                            "default": persisted_identity.get("model"),
+                            "provider": persisted_identity.get("provider"),
+                            "api_mode": persisted_identity.get("api_mode"),
+                        }
+                    }
+                )
+                if cached_identity != normalized_persisted_identity:
+                    # NOTE(P3b/RC-2): cache reconciliation, not a preference
+                    # clear. Persisted identity remains authoritative and is
+                    # immediately rehydrated below without a user-action stamp.
+                    self._session_model_overrides.pop(resolved_session_key, None)
+
         model = _resolve_gateway_model(user_config)
         if resolved_session_key:
-            self._rehydrate_session_model_override(resolved_session_key)
+            self._rehydrate_session_model_override(
+                resolved_session_key,
+                persisted_route_lookup=route_lookup,
+            )
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
+        if persisted_identity and (not override or not override.get("api_key")):
+            unavailable = getattr(self, "_session_model_override_unavailable", None)
+            if unavailable is None:
+                unavailable = self._session_model_override_unavailable = set()
+            unavailable.add(resolved_session_key)
+            provider = str(persisted_identity.get("provider") or "<unknown>")
+            preferred_model = str(persisted_identity.get("model") or "<unset>")
+            raise SessionRouteUnavailableError(
+                "Session model preference "
+                f"`{provider}/{preferred_model}` is currently unavailable because "
+                "its credentials could not be resolved. The preference was "
+                "preserved; restore that provider's credentials or use `/model reset`."
+            )
         if override:
             override_model = override.get("model", model)
             override_runtime = {
@@ -4480,6 +4584,117 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return model, runtime_kwargs
 
+    @staticmethod
+    def _configured_route_identity(user_config: Optional[dict]) -> tuple[str, str, str]:
+        """Read model/provider/API mode from config without resolving credentials."""
+        from hermes_cli.providers import infer_api_mode_from_provider
+
+        cfg = user_config if isinstance(user_config, dict) else {}
+        model_cfg = cfg.get("model", {})
+        if isinstance(model_cfg, str):
+            return model_cfg, "", ""
+        if not isinstance(model_cfg, dict):
+            model_cfg = {}
+        model = str(model_cfg.get("default") or model_cfg.get("model") or "")
+        provider = str(model_cfg.get("provider") or "").strip().lower()
+        api_mode = str(model_cfg.get("api_mode") or "").strip().lower()
+        if not api_mode:
+            api_mode = infer_api_mode_from_provider(provider) if provider else ""
+        return model, provider, api_mode
+
+    def _persisted_session_route_identity(
+        self, session_key: str
+    ) -> PersistedSessionRouteLookup:
+        """Return authoritative ABSENT/VALID/UNAVAILABLE persisted route state.
+
+        Read failures and malformed explicit identities are never equivalent to
+        absence: callers must fail closed before enrichment, global-provider
+        resolution, or agent construction.
+        """
+        store = getattr(self, "session_store", None)
+        if store is None or not session_key:
+            return PersistedSessionRouteLookup("absent")
+
+        # Inspect the class, not the instance: Mock/MagicMock and lightweight
+        # fixture stores synthesize arbitrary attributes on demand and must not
+        # accidentally claim authority over persisted routing state.
+        lookup = getattr(type(store), "lookup_persisted_route_identity", None)
+        if not callable(lookup):
+            return PersistedSessionRouteLookup("absent")
+        try:
+            result = lookup(store, session_key)
+        except Exception:
+            return PersistedSessionRouteLookup("unavailable")
+        if not isinstance(result, PersistedSessionRouteLookup):
+            return PersistedSessionRouteLookup("unavailable")
+        return result
+
+    def _resolve_configured_session_route_identity(
+        self,
+        *,
+        source: Optional[SessionSource] = None,
+        session_key: Optional[str] = None,
+        user_config: Optional[dict] = None,
+        persisted_route_lookup: Optional[PersistedSessionRouteLookup] = None,
+    ) -> tuple[str, str, str]:
+        """Select the configured route preference without checking availability.
+
+        This mirrors identity precedence but deliberately performs no credential
+        checkout, agent construction, or cache mutation. A persisted preference
+        may be unavailable at runtime; callers must not describe it as effective.
+        """
+        resolved_key = session_key
+        if not resolved_key and source is not None:
+            try:
+                resolved_key = self._session_key_for_source(source)
+            except Exception:
+                resolved_key = None
+
+        model, provider, api_mode = self._configured_route_identity(user_config)
+
+        cfg = getattr(self, "config", None)
+        if cfg and source is not None:
+            ch = _get_channel_override(
+                cfg,
+                source.platform,
+                str(source.chat_id or ""),
+                thread_id=str(source.thread_id) if source.thread_id else None,
+                parent_id=str(source.parent_chat_id) if source.parent_chat_id else None,
+            )
+            if ch:
+                if ch.model:
+                    model = ch.model
+                if ch.provider:
+                    provider = str(ch.provider).strip().lower()
+                    _, _, api_mode = self._configured_route_identity(
+                        {"model": {"provider": provider}}
+                    )
+
+        lookup = persisted_route_lookup or (
+            self._persisted_session_route_identity(resolved_key)
+            if resolved_key
+            else PersistedSessionRouteLookup("absent")
+        )
+        if lookup.state == "unavailable":
+            raise SessionRouteUnavailableError(
+                "The persisted session model preference could not be read or validated."
+            )
+        identity = lookup.identity
+        if identity is None and resolved_key:
+            cached = getattr(self, "_session_model_overrides", {}).get(resolved_key)
+            if isinstance(cached, dict) and cached.get("model") and cached.get("provider"):
+                identity = cached
+        if identity:
+            model = str(identity.get("model") or model)
+            provider = str(identity.get("provider") or provider).strip().lower()
+            api_mode = str(identity.get("api_mode") or "").strip().lower()
+            if not api_mode:
+                _, _, api_mode = self._configured_route_identity(
+                    {"model": {"provider": provider}}
+                )
+
+        return model, provider, api_mode
+
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         """Build the effective model/runtime config for a single turn.
 
@@ -4488,7 +4703,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         mode, attach `request_overrides` so the API call is marked
         accordingly.
         """
-        from hermes_cli.models import resolve_fast_mode_overrides
+        from hermes_cli.models import resolve_fast_mode_capability
 
         runtime = {
             "api_key": runtime_kwargs.get("api_key"),
@@ -4519,7 +4734,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return route
 
         try:
-            overrides = resolve_fast_mode_overrides(route["model"])
+            capability = resolve_fast_mode_capability(
+                model=route["model"],
+                provider=runtime["provider"],
+                api_mode=runtime["api_mode"],
+            )
+            overrides = capability.request_overrides
         except Exception:
             overrides = None
         route["request_overrides"] = overrides or {}
@@ -5690,11 +5910,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         Write-through: the override is ALSO persisted onto the SessionEntry so it
         survives a gateway restart (P3a) — the in-memory dict alone is lost on
-        restart, silently reverting /reasoning high to the config default. Because
-        this setter is the single door every clear-point already calls
-        (/new, /reset, /reasoning reset, auto-reset, finalization), clearing the
-        override (reasoning_config=None) also nulls the persisted field, so a
-        conversation boundary still clears it (durability, not scope).
+        restart, silently reverting /reasoning high to the config default. Manual
+        /new and /reset preserve the entry without calling this user-action setter;
+        explicit clears and automatic lifecycle cleanup still call it.
         """
         if not session_key:
             return
@@ -5724,8 +5942,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         ``identity`` carries only {model, provider, api_mode}. Returns a full runtime
         override dict (with re-resolved api_key/base_url) or None when the provider is
-        no longer configured / resolution yields no usable credential (fail-open to
-        the config default rather than booting a broken client).
+        no longer configured or resolution yields no usable credential. Callers keep
+        the preference persisted and fail the turn closed rather than changing route.
         """
         model = (identity or {}).get("model")
         provider = (identity or {}).get("provider")
@@ -5792,18 +6010,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         session_key: str,
         override: Optional[dict],
+        *,
+        require_persistence: bool = False,
     ) -> None:
         """Single door for setting/clearing a session-scoped /model override (P3b/RC-2).
 
         Sets or pops the in-memory dict AND writes/nulls the persisted identity on the
-        SessionEntry (config-backed-only per RC-4) AND saves. Routing every clear-site
-        through this door means a missed/future ``.pop`` can't leave a persisted
-        override that wrongly outlives a /new (the dual-maintenance anti-pattern).
+        SessionEntry (config-backed-only per RC-4) AND saves. Manual /new and
+        /reset copy persisted identity directly; /model reset and automatic cleanup
+        use this user-action door.
         """
         if not session_key:
             return
         if not hasattr(self, "_session_model_overrides"):
             self._session_model_overrides = {}
+        if override is None:
+            try:
+                store = getattr(self, "session_store", None)
+                if store is not None:
+                    store.clear_model_route_override(session_key)
+            except Exception:
+                if require_persistence:
+                    raise
+                logger.debug("model-route clear persist skipped", exc_info=True)
         # Stamp "the user changed the override target this turn" for the NEXT
         # turn's pre-run recovery announce: the shared recovery_should_announce
         # predicate suppresses the manual /model re-target (or clear) transition
@@ -5818,13 +6047,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._session_model_overrides.pop(session_key, None)
         else:
             self._session_model_overrides[session_key] = dict(override)
+        unavailable = getattr(self, "_session_model_override_unavailable", None)
+        if unavailable is not None:
+            unavailable.discard(session_key)
         try:
             store = getattr(self, "session_store", None)
             entry = store.entry_for(session_key) if store is not None else None
-            if entry is not None:
+            if entry is not None and override is not None:
                 entry.model_override_identity = (
-                    self._model_override_is_persistable(override) if override is not None else None
+                    self._model_override_is_persistable(override)
                 )
+                entry._model_override_identity_invalid = False
                 store.persist()
         except Exception:
             logger.debug("model-override persist skipped (non-fatal)", exc_info=True)
@@ -13538,6 +13771,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+
+        # Persisted route identity is a security/billing boundary. Resolve its
+        # tri-state immediately after session lookup, before any session
+        # hygiene, onboarding, media enrichment, global provider resolution,
+        # or agent construction can run.
+        route_lookup = self._persisted_session_route_identity(session_key)
+        if route_lookup.state == "unavailable":
+            return (
+                "⚠️ Provider authentication failed: The persisted session model "
+                "preference could not be read or validated. No provider request "
+                "was made; repair the session store or use `/model reset`."
+            )
+        if route_lookup.state == "valid":
+            try:
+                self._resolve_session_agent_runtime(
+                    source=source,
+                    session_key=session_key,
+                    user_config=_load_gateway_config(),
+                    persisted_route_lookup=route_lookup,
+                )
+            except SessionRouteUnavailableError as exc:
+                return f"⚠️ Provider authentication failed: {exc}"
+
         pinned_session_id = str(
             (getattr(event, "metadata", None) or {}).get("gateway_session_id") or ""
         ).strip()
@@ -15144,7 +15400,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
-    def _reset_notice_session_info(self, source: SessionSource) -> str:
+    def _reset_notice_session_info(
+        self,
+        source: SessionSource,
+        *,
+        session_key: Optional[str] = None,
+        session_entry: Optional[Any] = None,
+    ) -> str:
         """Session-info block for the auto-reset notice, profile-scoped.
 
         When multiplexing, resolve model/provider/context inside the profile
@@ -15161,10 +15423,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
-                return self._format_session_info()
-        return self._format_session_info()
+                return self._format_session_info(
+                    source=source,
+                    session_key=session_key,
+                    session_entry=session_entry,
+                )
+        return self._format_session_info(
+            source=source,
+            session_key=session_key,
+            session_entry=session_entry,
+        )
 
-    def _format_session_info(self) -> str:
+    def _format_session_info(
+        self,
+        *,
+        source: Optional[SessionSource] = None,
+        session_key: Optional[str] = None,
+        session_entry: Optional[Any] = None,
+    ) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
@@ -15173,7 +15449,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         from agent.model_metadata import get_model_context_length, DEFAULT_FALLBACK_CONTEXT
 
-        model = _resolve_gateway_model()
+        model = ""
         config_context_length = None
         provider = None
         base_url = None
@@ -15201,6 +15477,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     custom_provs = data.get("custom_providers")
         except Exception:
             pass
+
+        if session_key:
+            persisted_route_lookup = None
+            if session_entry is not None:
+                if getattr(session_entry, "_model_override_identity_invalid", False):
+                    persisted_route_lookup = PersistedSessionRouteLookup("unavailable")
+                else:
+                    identity = getattr(session_entry, "model_override_identity", None)
+                    persisted_route_lookup = PersistedSessionRouteLookup(
+                        "valid" if identity else "absent",
+                        identity if identity else None,
+                    )
+            model, runtime = self._resolve_session_agent_runtime(
+                source=source,
+                session_key=session_key,
+                user_config=data,
+                persisted_route_lookup=persisted_route_lookup,
+            )
+            provider = runtime.get("provider")
+            base_url = runtime.get("base_url")
+            api_key = runtime.get("api_key")
+
+            configured_model, configured_provider, _ = self._configured_route_identity(data)
+            if model != configured_model or (
+                configured_provider and provider != configured_provider
+            ):
+                config_context_length = None
+        else:
+            model = _resolve_gateway_model()
 
         # Also check custom_providers for context_length when top-level model.context_length is not set
         if config_context_length is None and data:
@@ -15238,13 +15543,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
 
         # Resolve runtime credentials for probing
-        try:
-            runtime = _resolve_runtime_agent_kwargs()
-            provider = provider or runtime.get("provider")
-            base_url = base_url or runtime.get("base_url")
-            api_key = runtime.get("api_key")
-        except Exception:
-            pass
+        if not session_key:
+            try:
+                runtime = _resolve_runtime_agent_kwargs()
+                provider = provider or runtime.get("provider")
+                base_url = base_url or runtime.get("base_url")
+                api_key = runtime.get("api_key")
+            except Exception:
+                pass
 
         context_length = get_model_context_length(
             model,
@@ -15271,13 +15577,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             ctx_display = str(context_length)
 
-        # Resolve the effective reasoning effort for the fresh session.
-        # Uses the global config (not a per-session override): this banner
-        # renders on /reset and /new, which clear any /reasoning session
-        # override, so config.yaml is the effective level at reset time.
+        # Resolve the effective reasoning effort for this fresh session.
+        # Manual resets may preserve a deliberate per-session override.
         reasoning_label = None
         try:
-            reasoning_label = self._reasoning_effort_label(self._load_reasoning_config())
+            reasoning_label = self._reasoning_effort_label(
+                self._resolve_session_reasoning_config(
+                    source=source,
+                    session_key=session_key,
+                )
+                if session_key
+                else self._load_reasoning_config()
+            )
         except Exception:
             reasoning_label = None
 
@@ -15290,8 +15601,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         lines.append(f"◆ Context: {ctx_display} tokens ({ctx_source})")
 
         # Show endpoint for local/custom setups
-        if base_url and ("localhost" in base_url or "127.0.0.1" in base_url or "0.0.0.0" in base_url):
-            lines.append(f"◆ Endpoint: {base_url}")
+        if base_url:
+            display_endpoint = _endpoint_url_for_display(base_url)
+            if display_endpoint:
+                lines.append(f"◆ Endpoint: {display_endpoint}")
 
         return "\n".join(lines)
 
@@ -19245,22 +19558,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
-    def _rehydrate_session_model_override(self, session_key: str) -> None:
+    def _rehydrate_session_model_override(
+        self,
+        session_key: str,
+        *,
+        persisted_route_lookup: Optional[PersistedSessionRouteLookup] = None,
+    ) -> None:
         """Lazily restore a persisted /model override after a gateway restart.
 
         ``_session_model_overrides`` is in-memory only, so before persistence
         a restart silently reverted every session to the global default model.
-        The non-secret parts (model/provider/base_url) are written through to
-        the session store when /model runs (and cleared on /new); here we read
-        them back on first use and re-resolve credentials via the normal
-        runtime provider resolution — api_key is never persisted to disk.
+        The non-secret parts are written through when /model runs; here we read
+        them back on first use and re-resolve credentials via the normal runtime
+        provider resolution — api_key is never persisted to disk.
 
         No-op when an in-memory override already exists (live state wins) or
-        when the store has nothing persisted (e.g. the user ran /new, which
-        clears both the in-memory dict and the persisted field).
+        when the store has nothing persisted (e.g. /model reset or automatic
+        lifecycle cleanup cleared the preference).
         """
         if session_key in self._session_model_overrides:
             return
+        unavailable = getattr(self, "_session_model_override_unavailable", None)
+        if unavailable is None:
+            unavailable = self._session_model_override_unavailable = set()
+        lookup = (
+            persisted_route_lookup
+            if persisted_route_lookup is not None
+            else self._persisted_session_route_identity(session_key)
+        )
+        if lookup.state == "unavailable":
+            raise SessionRouteUnavailableError(
+                "The persisted session model preference could not be read or validated."
+            )
+        identity = lookup.identity
+        if identity:
+            try:
+                resolved = self._reresolve_model_override_credentials(identity)
+            except Exception:
+                resolved = None
+            if resolved is not None:
+                self._session_model_overrides[session_key] = resolved
+                unavailable.discard(session_key)
+                logger.info(
+                    "Rehydrated persisted /model identity for session=%s: model=%s provider=%s",
+                    session_key,
+                    identity.get("model"),
+                    identity.get("provider"),
+                )
+            else:
+                unavailable.add(session_key)
+                logger.debug(
+                    "Persisted /model identity is not currently credential-resolvable "
+                    "for session=%s provider=%s",
+                    session_key,
+                    identity.get("provider"),
+                )
+            return
+        unavailable.discard(session_key)
         store = getattr(self, "session_store", None)
         if store is None:
             return
@@ -19273,34 +19627,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         if not persisted:
             return
-        override: Dict[str, Any] = {
+        identity = {
             "model": persisted.get("model"),
             "provider": persisted.get("provider"),
-            "base_url": persisted.get("base_url"),
         }
-        provider = persisted.get("provider")
-        if provider:
-            # Re-resolve credentials for the persisted provider. On failure
-            # (e.g. credentials were removed since the switch) keep the
-            # credential-less override — _resolve_session_agent_runtime falls
-            # back to env-based resolution and applies model/provider on top.
-            try:
-                runtime = _resolve_runtime_agent_kwargs_for_provider(provider)
-                override["api_key"] = runtime.get("api_key")
-                override["api_mode"] = runtime.get("api_mode")
-                override["credential_pool"] = runtime.get("credential_pool")
-                if not override.get("base_url"):
-                    override["base_url"] = runtime.get("base_url")
-            except Exception:
-                logger.debug(
-                    "Credential re-resolution failed for persisted override "
-                    "(provider=%s); using credential-less override",
-                    provider, exc_info=True,
-                )
-        self._session_model_overrides[session_key] = override
+        try:
+            resolved = self._reresolve_model_override_credentials(identity)
+        except Exception:
+            resolved = None
+        if resolved is None:
+            unavailable.add(session_key)
+            logger.debug(
+                "Legacy persisted /model preference is not currently "
+                "credential-resolvable for session=%s provider=%s",
+                session_key,
+                identity.get("provider"),
+            )
+            return
+        self._session_model_overrides[session_key] = resolved
+        unavailable.discard(session_key)
         logger.info(
-            "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
-            session_key, override.get("model"), provider or "",
+            "Rehydrated legacy persisted /model preference for session=%s: "
+            "model=%s provider=%s",
+            session_key,
+            resolved.get("model"),
+            resolved.get("provider") or "",
         )
 
     def _apply_session_model_override(
