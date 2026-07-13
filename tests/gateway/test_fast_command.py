@@ -397,6 +397,93 @@ def test_pure_route_identity_matches_runtime_for_session_override(monkeypatch):
     assert pure == ("gpt-5.6-sol", "openai-codex", "codex_responses")
 
 
+def test_pure_route_identity_matches_runtime_for_channel_and_session_override(
+    monkeypatch,
+):
+    source = _make_source()
+    runner = _make_runner()
+    session_key = runner._session_key_for_source(source)
+    identity = {
+        "model": "claude-opus-4-6",
+        "provider": "anthropic",
+        "api_mode": "anthropic_messages",
+    }
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                channel_overrides={
+                    "12345": ChannelOverride(
+                        model="gpt-5.5",
+                        provider="openai-codex",
+                    )
+                }
+            )
+        }
+    )
+    runner.session_store = SimpleNamespace(
+        entry_for=lambda _key: SimpleNamespace(model_override_identity=identity)
+    )
+    runner._session_model_overrides[session_key] = {
+        **identity,
+        "api_key": "session-secret",
+    }
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        MagicMock(side_effect=AssertionError("session override must win")),
+    )
+    config = {
+        "model": {
+            "default": "gpt-5.4",
+            "provider": "openai-api",
+            "api_mode": "codex_responses",
+        }
+    }
+
+    pure = runner._resolve_effective_session_route_identity(
+        source=source, session_key=session_key, user_config=config
+    )
+    model, runtime = runner._resolve_session_agent_runtime(
+        source=source, session_key=session_key, user_config=config
+    )
+
+    assert pure == (model, runtime["provider"], runtime["api_mode"])
+    assert pure == ("claude-opus-4-6", "anthropic", "anthropic_messages")
+
+
+def test_missing_persisted_api_mode_does_not_rehydrate_matching_cached_route(
+    monkeypatch,
+):
+    source = _make_source()
+    runner = _make_runner()
+    session_key = runner._session_key_for_source(source)
+    persisted = {"model": "gpt-5.5", "provider": "openai-codex"}
+    cached = {
+        **persisted,
+        "api_mode": "codex_responses",
+        "api_key": "cached-secret",
+    }
+    runner.session_store = SimpleNamespace(
+        entry_for=lambda _key: SimpleNamespace(model_override_identity=persisted)
+    )
+    runner._session_model_overrides[session_key] = cached
+    reresolve = MagicMock(
+        side_effect=AssertionError("matching route must not rehydrate credentials")
+    )
+    monkeypatch.setattr(runner, "_reresolve_model_override_credentials", reresolve)
+
+    model, runtime = runner._resolve_session_agent_runtime(
+        source=source,
+        session_key=session_key,
+        user_config={"model": {"default": "global-model"}},
+    )
+
+    assert model == "gpt-5.5"
+    assert runtime["api_mode"] == "codex_responses"
+    assert runner._session_model_overrides[session_key] is cached
+    reresolve.assert_not_called()
+
+
 def test_pure_route_identity_matches_runtime_for_global_route(monkeypatch):
     runner = _make_runner()
     runner.config = GatewayConfig()
@@ -442,6 +529,17 @@ def test_model_switch_note_reports_enabled_fast_becoming_unavailable():
     assert "Fast: unavailable" in note
     assert "openai-codex/gpt-5.6-sol" in note
     assert "normal speed" in note
+
+
+def test_model_switch_note_derives_api_mode_when_result_omits_it():
+    runner = _make_runner()
+    runner._service_tier = "priority"
+    result = SimpleNamespace(
+        new_model="gpt-5.5",
+        target_provider="openai-codex",
+    )
+
+    assert runner._fast_unavailable_model_switch_row(result) is None
 
 
 @pytest.mark.asyncio

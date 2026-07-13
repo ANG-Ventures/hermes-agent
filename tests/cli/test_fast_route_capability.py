@@ -117,14 +117,53 @@ def test_fast_capability_catalog_entries_exist_in_provider_catalogs():
             assert set(contract["models"]) <= catalog
 
 
-def test_request_enforcement_call_sites_do_not_use_model_only_wrapper():
-    root = Path(__file__).resolve().parents[2]
-    enforcement_files = (
-        root / "gateway" / "run.py",
-        root / "hermes_cli" / "cli_agent_setup_mixin.py",
-        root / "tui_gateway" / "server.py",
+@pytest.mark.parametrize(
+    ("family", "provider", "api_mode", "added_model"),
+    [
+        ("codex_fast", "openai-codex", "codex_responses", "gpt-catalog-only"),
+        (
+            "anthropic_fast",
+            "anthropic",
+            "anthropic_messages",
+            "claude-catalog-only",
+        ),
+    ],
+)
+def test_route_capability_support_is_driven_by_catalog(
+    monkeypatch, family, provider, api_mode, added_model
+):
+    from hermes_cli.models import (
+        FAST_MODE_CAPABILITY_CATALOG,
+        resolve_fast_mode_capability,
     )
 
-    for path in enforcement_files:
+    contract = FAST_MODE_CAPABILITY_CATALOG[family]
+    original_models = contract["models"]
+    removed_model = original_models[0]
+    monkeypatch.setitem(contract, "models", (added_model,))
+
+    assert resolve_fast_mode_capability(
+        model=added_model, provider=provider, api_mode=api_mode
+    ).supported
+    assert not resolve_fast_mode_capability(
+        model=removed_model, provider=provider, api_mode=api_mode
+    ).supported
+
+
+def test_request_enforcement_call_sites_do_not_use_model_only_wrapper():
+    root = Path(__file__).resolve().parents[2]
+    compatibility_definition = root / "hermes_cli" / "models.py"
+    production_files = (
+        path
+        for path in root.rglob("*.py")
+        if compatibility_definition != path
+        and "tests" not in path.relative_to(root).parts
+        and not any(
+            part.startswith(".") or part in {"venv", "node_modules"}
+            for part in path.relative_to(root).parts
+        )
+    )
+
+    for path in production_files:
         source = path.read_text(encoding="utf-8")
         assert "resolve_fast_mode_overrides(" not in source, path

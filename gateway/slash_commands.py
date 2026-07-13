@@ -1574,10 +1574,16 @@ class GatewaySlashCommandsMixin:
         try:
             from hermes_cli.models import resolve_fast_mode_capability
 
+            provider = getattr(result, "target_provider", None)
+            api_mode = getattr(result, "api_mode", None)
+            if not api_mode:
+                _, _, api_mode = self._configured_route_identity(
+                    {"model": {"provider": provider}}
+                )
             capability = resolve_fast_mode_capability(
                 model=getattr(result, "new_model", None),
-                provider=getattr(result, "target_provider", None),
-                api_mode=getattr(result, "api_mode", None),
+                provider=provider,
+                api_mode=api_mode,
             )
             if capability.supported:
                 return None

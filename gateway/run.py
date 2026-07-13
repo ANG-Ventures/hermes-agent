@@ -4365,12 +4365,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             cached_override = self._session_model_overrides.get(resolved_session_key)
             if persisted_identity and cached_override:
-                cached_identity = {
-                    "model": cached_override.get("model"),
-                    "provider": cached_override.get("provider"),
-                    "api_mode": cached_override.get("api_mode"),
-                }
-                if cached_identity != persisted_identity:
+                cached_identity = self._configured_route_identity(
+                    {
+                        "model": {
+                            "default": cached_override.get("model"),
+                            "provider": cached_override.get("provider"),
+                            "api_mode": cached_override.get("api_mode"),
+                        }
+                    }
+                )
+                normalized_persisted_identity = self._configured_route_identity(
+                    {
+                        "model": {
+                            "default": persisted_identity.get("model"),
+                            "provider": persisted_identity.get("provider"),
+                            "api_mode": persisted_identity.get("api_mode"),
+                        }
+                    }
+                )
+                if cached_identity != normalized_persisted_identity:
                     # NOTE(P3b/RC-2): cache reconciliation, not a preference
                     # clear. Persisted identity remains authoritative and is
                     # immediately rehydrated below without a user-action stamp.

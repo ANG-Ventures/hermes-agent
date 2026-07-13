@@ -2203,10 +2203,8 @@ def resolve_fast_mode_capability(
         )
 
     if normalized_provider == "openai-codex" and normalized_mode == "codex_responses":
-        supported = any(
-            base == family or base.startswith(f"{family}-")
-            for family in ("gpt-5.5", "gpt-5.4")
-        )
+        models = FAST_MODE_CAPABILITY_CATALOG["codex_fast"]["models"]
+        supported = base in models
         return FastModeCapability(
             supported=supported,
             family="codex_fast",
@@ -2215,12 +2213,17 @@ def resolve_fast_mode_capability(
             if supported
             else (
                 f"Codex Fast is not currently available for `{route}` "
-                "(OpenAI currently lists GPT-5.5 and GPT-5.4)."
+                "(OpenAI currently lists "
+                f"{', '.join(model.upper() for model in models)})."
             ),
         )
 
     if normalized_provider == "anthropic" and normalized_mode == "anthropic_messages":
-        supported = _is_anthropic_fast_model(base)
+        models = FAST_MODE_CAPABILITY_CATALOG["anthropic_fast"]["models"]
+        # Anthropic model ids appear with both ``4-6`` and ``4.6`` version
+        # separators. The catalog stores the canonical provider spelling.
+        catalog_base = base.replace("opus-4.", "opus-4-")
+        supported = catalog_base in models
         if supported:
             reason = None
         elif "opus-4-8" in base or "opus-4.8" in base:
