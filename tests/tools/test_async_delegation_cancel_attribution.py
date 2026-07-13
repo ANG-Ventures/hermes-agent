@@ -345,3 +345,27 @@ def test_attribution_stamp_never_breaks_cancel_on_weird_record():
     stored = _load()["records"][record["delegation_id"]]
     assert stored["state"] == "cancelled"
     assert stored["cancel_attribution"]["reason"] == "/stop"
+
+
+def test_attribution_visible_while_in_memory_handle_still_running():
+    # Greptile P2: a durably-cancelled record whose runner thread is still
+    # alive appears in the in-memory snapshot; attribution must not be hidden
+    # during that window.
+    result, gate = _dispatch()
+    ad.interrupt_for_session(parent_session_id="parent-1", reason="session_end")
+    rows = ad.list_async_delegations()
+    row = next(r for r in rows if r["delegation_id"] == result["delegation_id"])
+    assert row["cancel_attribution"]["reason"] == "session_end"
+    gate.set()
+
+
+def test_transition_owned_cancel_records_delegation_ids_selector():
+    record = _legacy_record()
+    _write_record(record)
+    assert store.transition_owned(
+        [record["delegation_id"]], "cancelled", reason="forced", caller="t"
+    )
+    stored = _load()["records"][record["delegation_id"]]
+    attribution = stored["cancel_attribution"]
+    assert attribution["via"] == "transition_owned"
+    assert attribution["selector"] == {"delegation_ids": [record["delegation_id"]]}

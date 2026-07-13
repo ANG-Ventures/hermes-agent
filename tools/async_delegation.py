@@ -905,7 +905,19 @@ def list_async_delegations() -> List[Dict[str, Any]]:
     except _store.RegistryError:
         durable_records = {}
     for delegation_id, record in durable_records.items():
-        if delegation_id in live or not isinstance(record, dict):
+        if not isinstance(record, dict):
+            continue
+        if delegation_id in live:
+            # The runner thread can outlive a durable cancel by many seconds;
+            # surface the durable attribution even while the in-memory handle
+            # still reports the delegation as running (Phase-0 forensics).
+            cancel_attribution = record.get("cancel_attribution")
+            if isinstance(cancel_attribution, dict) and "cancel_attribution" not in live[delegation_id]:
+                live[delegation_id]["cancel_attribution"] = {
+                    "reason": cancel_attribution.get("reason"),
+                    "caller": cancel_attribution.get("caller"),
+                    "cancelled_at": cancel_attribution.get("cancelled_at"),
+                }
             continue
         source = record.get("source") or {}
         execution = record.get("execution") or {}

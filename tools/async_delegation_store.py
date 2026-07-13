@@ -37,12 +37,13 @@ class RegistryError(RuntimeError):
     """Registry cannot be safely read or mutated."""
 
 
-def _capture_caller_stack(*, skip_frames: int = 2) -> list[str]:
+def _capture_caller_stack(*, skip_frames: int = 3) -> list[str]:
     """Innermost caller frames as compact ``file:line:func`` strings.
 
-    ``skip_frames`` drops this helper (and its immediate store-internal
-    caller) so the trail starts at the runtime code that requested the
-    cancellation — the WHO for Phase-0 cancel forensics.
+    ``skip_frames`` drops this helper, ``_stamp_cancel_attribution``, and
+    the store-internal cancel writer (``cancel_matching`` /
+    ``transition_owned``) so the trail starts at the runtime code that
+    requested the cancellation — the WHO for Phase-0 cancel forensics.
     """
     try:
         frames = traceback.extract_stack()
@@ -637,6 +638,7 @@ def transition_owned(
                             reason=reason,
                             caller=caller,
                             via="transition_owned",
+                            selector={"delegation_ids": list(delegation_ids)},
                         )
                     else:
                         append_lifecycle_event(
