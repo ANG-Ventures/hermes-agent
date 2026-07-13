@@ -1,6 +1,7 @@
 """Tests for gateway /fast support and Priority Processing routing."""
 
 import sys
+import json
 import threading
 import types
 from itertools import product
@@ -13,8 +14,7 @@ import yaml
 import gateway.run as gateway_run
 from gateway.config import ChannelOverride, GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
-from gateway.session import SessionSource
-from gateway.session import AsyncSessionStore
+from gateway.session import AsyncSessionStore, SessionSource, SessionStore
 
 
 class _CapturingAgent:
@@ -944,6 +944,64 @@ async def test_persisted_route_lookup_failures_abort_before_enrichment_or_provid
         side_effect=AssertionError("global provider must not run")
     )
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", global_provider)
+
+    _CapturingAgent.last_init = None
+    response = await runner._handle_message_with_agent(
+        _make_event("route safely"), source, "quick", 1
+    )
+
+    assert "could not be read or validated" in response
+    runner._prepare_inbound_message_text.assert_not_awaited()
+    global_provider.assert_not_called()
+    assert _CapturingAgent.last_init is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "malformed_identity",
+    [
+        "not-a-mapping",
+        {"model": "gpt-5.5"},
+        {"provider": "openai-codex"},
+    ],
+)
+async def test_malformed_persisted_identity_roundtrip_fails_closed_before_enrichment(
+    monkeypatch, tmp_path, malformed_identity
+):
+    """Exercise SessionEntry.from_dict via the real sessions.json load path."""
+    import hermes_state
+
+    monkeypatch.setattr(
+        hermes_state,
+        "SessionDB",
+        MagicMock(side_effect=RuntimeError("JSON-only persistence fixture")),
+    )
+    source = _make_source()
+    sessions_dir = tmp_path / "sessions"
+    seed = SessionStore(sessions_dir, GatewayConfig())
+    entry = seed.get_or_create_session(source)
+    payload = json.loads((sessions_dir / "sessions.json").read_text())
+    payload[entry.session_key]["model_override_identity"] = malformed_identity
+    (sessions_dir / "sessions.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = SessionStore(sessions_dir, GatewayConfig())
+    loaded._ensure_loaded()
+    loaded_entry = loaded.entry_for(entry.session_key)
+    assert loaded_entry.model_override_identity is None
+    assert loaded_entry._model_override_identity_invalid is True
+
+    runner = _make_runner()
+    runner.session_store = loaded
+    runner._async_session_store = AsyncSessionStore(loaded)
+    runner._recover_telegram_topic_thread_id = MagicMock(return_value=None)
+    runner._prepare_inbound_message_text = AsyncMock(
+        side_effect=AssertionError("enrichment must not run")
+    )
+    global_provider = MagicMock(
+        side_effect=AssertionError("global provider must not run")
+    )
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", global_provider)
+    _install_fake_agent(monkeypatch)
 
     _CapturingAgent.last_init = None
     response = await runner._handle_message_with_agent(

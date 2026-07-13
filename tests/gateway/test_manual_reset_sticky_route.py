@@ -212,6 +212,77 @@ def test_manual_reset_strips_tampered_secrets_from_model_identity(store):
     assert "user:pass" not in raw
 
 
+def test_manual_reset_preserves_malformed_identity_fail_closed_across_restart(store):
+    old = store.get_or_create_session(_source())
+    payload = json.loads((store.sessions_dir / "sessions.json").read_text())
+    payload[old.session_key]["model_override_identity"] = {"model": "missing-provider"}
+    (store.sessions_dir / "sessions.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+    reloaded = SessionStore(store.sessions_dir, GatewayConfig())
+    reloaded._ensure_loaded()
+    malformed = reloaded.entry_for(old.session_key)
+    assert malformed._model_override_identity_invalid is True
+
+    reset = reloaded.reset_session(
+        old.session_key, preserve_route_preferences=True
+    )
+    assert reset._model_override_identity_invalid is True
+    persisted = json.loads((store.sessions_dir / "sessions.json").read_text())
+    assert persisted[old.session_key]["model_override_identity"] == {}
+
+    restarted = SessionStore(store.sessions_dir, GatewayConfig())
+    restarted._ensure_loaded()
+    lookup_runner = object.__new__(gateway_run.GatewayRunner)
+    lookup_runner.session_store = restarted
+    lookup = lookup_runner._persisted_session_route_identity(old.session_key)
+    assert lookup.state == "unavailable"
+
+
+def test_manual_reset_migrates_legacy_only_identity_without_secrets(store):
+    old = store.get_or_create_session(_source())
+    payload = json.loads((store.sessions_dir / "sessions.json").read_text())
+    route = payload[old.session_key]
+    route.pop("model_override_identity", None)
+    route["model_override"] = {
+        "model": "legacy-model",
+        "provider": "legacy-provider",
+        "api_mode": "chat_completions",
+        "base_url": "https://user:password@example.invalid/v1",
+        "api_key": "sk-must-not-survive",
+        "access_token": "oauth-must-not-survive",
+    }
+    (store.sessions_dir / "sessions.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+    reloaded = SessionStore(store.sessions_dir, GatewayConfig())
+    reloaded._ensure_loaded()
+    reset = reloaded.reset_session(
+        old.session_key, preserve_route_preferences=True
+    )
+
+    expected = {
+        "model": "legacy-model",
+        "provider": "legacy-provider",
+        "api_mode": "chat_completions",
+    }
+    assert reset.model_override_identity == expected
+    assert reset.model_override is None
+    raw = (store.sessions_dir / "sessions.json").read_text(encoding="utf-8")
+    assert "model_override\"" not in raw
+    assert "sk-must-not-survive" not in raw
+    assert "oauth-must-not-survive" not in raw
+    assert "user:password" not in raw
+
+    restarted = SessionStore(store.sessions_dir, GatewayConfig())
+    restarted._ensure_loaded()
+    durable = restarted.entry_for(old.session_key)
+    assert durable.model_override_identity == expected
+    assert durable.model_override is None
+
+
 def _runner_for_manual_reset(store):
     runner = object.__new__(gateway_run.GatewayRunner)
     runner.config = GatewayConfig()

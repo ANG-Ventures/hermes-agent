@@ -4602,6 +4602,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 entry = getattr(store, "_entries", {}).get(session_key)
             if entry is None:
                 return PersistedSessionRouteLookup("absent")
+            if getattr(entry, "_model_override_identity_invalid", False):
+                return PersistedSessionRouteLookup("unavailable")
             explicit_identity = getattr(entry, "model_override_identity", None)
             if explicit_identity is None:
                 # Backward-compatible persisted preference from before the
@@ -6056,6 +6058,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 entry.model_override_identity = (
                     self._model_override_is_persistable(override)
                 )
+                entry._model_override_identity_invalid = False
                 store.persist()
         except Exception:
             logger.debug("model-override persist skipped (non-fatal)", exc_info=True)
