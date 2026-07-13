@@ -1286,7 +1286,9 @@ class Mem0MemoryProvider(MemoryProvider):
         # an idle gateway (no new turns) the orphans can sit until traffic happens to wake the worker.
         # Warm the pipeline HERE at session init when capture is on, so a fresh gateway starts the
         # worker+reaper immediately and recovers orphaned leases without waiting for a turn.
-        # Best-effort + degrade-safe (INV-3): never let capture setup break session initialization.
+        # Degrade-safe (INV-3): _get_capture_pipeline() already swallows all construction/start
+        # errors internally (returns None), so this guard exists ONLY to keep a raise from
+        # capture_is_on() (a cheap flag read) from ever breaking session initialization.
         try:
             if capture_is_on(self._capture):
                 self._get_capture_pipeline()
