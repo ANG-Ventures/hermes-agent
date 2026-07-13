@@ -1359,11 +1359,14 @@ class TestBuildAnthropicKwargs:
         assert _forbids_sampling_params("claude-sonnet-4-5") is False
 
     def test_supports_fast_mode_predicate(self):
-        """Native Fast supports Opus 4.8/4.7 and excludes Opus 4.6."""
+        """Shipped native Fast supports exact Opus 4.8 only."""
         from agent.anthropic_adapter import _supports_fast_mode
         assert _supports_fast_mode("claude-opus-4-8") is True
         assert _supports_fast_mode("anthropic/claude-opus-4-8") is True
-        assert _supports_fast_mode("claude-opus-4-7") is True
+        assert _supports_fast_mode("claude-opus-4-7") is False
+        assert _supports_fast_mode("claude-opus-4-80") is False
+        assert _supports_fast_mode("claude-opus-4-8:suffix") is False
+        assert _supports_fast_mode("impostor/claude-opus-4-8") is False
         assert _supports_fast_mode("claude-opus-4-6") is False
         assert _supports_fast_mode("claude-sonnet-4-6") is False
         assert _supports_fast_mode("claude-haiku-4-5") is False
@@ -1452,10 +1455,9 @@ class TestBuildAnthropicKwargs:
         beta_header = (kwargs.get("extra_headers") or {}).get("anthropic-beta", "")
         assert "fast-mode-2026-02-01" not in beta_header
 
-    @pytest.mark.parametrize("model", ["claude-opus-4-8", "claude-opus-4-7"])
-    def test_fast_mode_serializes_speed_and_required_beta(self, model):
+    def test_fast_mode_serializes_speed_and_required_beta(self):
         kwargs = build_anthropic_kwargs(
-            model=model,
+            model="claude-opus-4-8",
             messages=[{"role": "user", "content": "hi"}],
             tools=None,
             max_tokens=1024,

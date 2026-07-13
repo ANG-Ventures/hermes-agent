@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import yaml
 
 import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform
@@ -52,6 +53,16 @@ def _seed_preferences(store, source=None):
         }
         store._save()
     return entry
+
+
+def _write_reset_policy(home, value):
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {"session_reset": {"preserve_route_preferences_on_manual_reset": value}}
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_session_store_manual_reset_rotates_transcript_and_preserves_exact_preferences(store):
@@ -249,11 +260,9 @@ async def test_manual_reset_persisted_entry_wins_map_divergence(store, monkeypat
         "enabled": True,
         "effort": "low",
     }
-    monkeypatch.setattr(
-        gateway_run,
-        "_load_gateway_runtime_config",
-        lambda: {"session_reset": {"preserve_route_preferences_on_manual_reset": True}},
-    )
+    home = store.sessions_dir.parent
+    _write_reset_policy(home, True)
+    monkeypatch.setattr(gateway_run, "_gateway_config_home", lambda: home)
 
     event = MessageEvent(text="/new", source=_source(), message_id="m1")
     reply = await runner._handle_reset_command(event)
@@ -278,11 +287,9 @@ async def test_manual_reset_preserves_but_marks_unavailable_model_preference(
     old = _seed_preferences(store)
     runner = _runner_for_manual_reset(store)
     runner._reresolve_model_override_credentials.return_value = None
-    monkeypatch.setattr(
-        gateway_run,
-        "_load_gateway_runtime_config",
-        lambda: {"session_reset": {"preserve_route_preferences_on_manual_reset": True}},
-    )
+    home = store.sessions_dir.parent
+    _write_reset_policy(home, True)
+    monkeypatch.setattr(gateway_run, "_gateway_config_home", lambda: home)
 
     reply = await runner._handle_reset_command(
         MessageEvent(text="/new", source=_source(), message_id="m-unavailable")
@@ -303,11 +310,9 @@ async def test_runtime_kill_switch_false_restores_legacy_clear(store, monkeypatc
         "api_key": "runtime-only",
     }
     runner._session_reasoning_overrides[old.session_key] = dict(REASONING_NONE)
-    monkeypatch.setattr(
-        gateway_run,
-        "_load_gateway_runtime_config",
-        lambda: {"session_reset": {"preserve_route_preferences_on_manual_reset": False}},
-    )
+    home = store.sessions_dir.parent
+    _write_reset_policy(home, False)
+    monkeypatch.setattr(gateway_run, "_gateway_config_home", lambda: home)
 
     await runner._handle_reset_command(
         MessageEvent(text="/reset", source=_source(), message_id="m2")
@@ -322,15 +327,14 @@ async def test_runtime_kill_switch_false_restores_legacy_clear(store, monkeypatc
 
 @pytest.mark.asyncio
 async def test_unreadable_kill_switch_fails_to_legacy_clear(
-    store, monkeypatch
+    store, monkeypatch, tmp_path
 ):
     old = _seed_preferences(store)
     runner = _runner_for_manual_reset(store)
-    monkeypatch.setattr(
-        gateway_run,
-        "_load_gateway_runtime_config",
-        MagicMock(side_effect=OSError("unreadable config")),
-    )
+    home = tmp_path / "unreadable"
+    home.mkdir()
+    (home / "config.yaml").mkdir()
+    monkeypatch.setattr(gateway_run, "_gateway_config_home", lambda: home)
 
     await runner._handle_reset_command(
         MessageEvent(text="/new", source=_source(), message_id="m3")
@@ -353,8 +357,9 @@ def test_default_config_enables_manual_reset_route_preference_carryover():
     )
 
 
-def test_missing_session_reset_section_uses_new_default(monkeypatch):
-    monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: {})
+def test_missing_session_reset_section_uses_new_default(tmp_path, monkeypatch):
+    (tmp_path / "config.yaml").write_text("agent: {}\n", encoding="utf-8")
+    monkeypatch.setattr(gateway_run, "_gateway_config_home", lambda: tmp_path)
 
     assert gateway_run.GatewayRunner._preserve_route_preferences_on_manual_reset()
 
@@ -367,17 +372,21 @@ def test_missing_session_reset_section_uses_new_default(monkeypatch):
         {"session_reset": {"preserve_route_preferences_on_manual_reset": 7}},
     ],
 )
-def test_malformed_runtime_config_fails_to_legacy_false(config, monkeypatch):
-    monkeypatch.setattr(
-        gateway_run, "_load_gateway_runtime_config", lambda: config
-    )
+def test_malformed_runtime_config_fails_to_legacy_false(
+    config, tmp_path, monkeypatch
+):
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    monkeypatch.setattr(gateway_run, "_gateway_config_home", lambda: tmp_path)
 
     assert not gateway_run.GatewayRunner._preserve_route_preferences_on_manual_reset()
 
 
 def test_malformed_yaml_defaults_false_and_logs_warning(tmp_path, monkeypatch, caplog):
-    (tmp_path / "config.yaml").write_text("session_reset: [unterminated", encoding="utf-8")
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    sentinel = "TOP_SECRET_SENTINEL"
+    (tmp_path / "config.yaml").write_text(
+        f"session_reset: [unterminated-{sentinel}", encoding="utf-8"
+    )
+    monkeypatch.setattr(gateway_run, "_gateway_config_home", lambda: tmp_path)
 
     with caplog.at_level(logging.WARNING, logger="gateway.run"):
         preserved = gateway_run.GatewayRunner._preserve_route_preferences_on_manual_reset()
@@ -385,3 +394,44 @@ def test_malformed_yaml_defaults_false_and_logs_warning(tmp_path, monkeypatch, c
     assert preserved is False
     assert "config" in caplog.text.lower()
     assert "warning" in caplog.text.lower() or "could not" in caplog.text.lower()
+    assert sentinel not in caplog.text
+
+
+def test_reset_policy_reads_and_parses_one_snapshot(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "session_reset:\n  preserve_route_preferences_on_manual_reset: false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gateway_run, "_gateway_config_home", lambda: tmp_path)
+    original = type(config_path).read_text
+    reads = 0
+
+    def counted_read(path, *args, **kwargs):
+        nonlocal reads
+        reads += 1
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(config_path), "read_text", counted_read)
+
+    assert not gateway_run.GatewayRunner._preserve_route_preferences_on_manual_reset()
+    assert reads == 1
+
+
+def test_gateway_config_parse_warning_does_not_log_source_snippet(
+    tmp_path, monkeypatch, caplog
+):
+    sentinel = "CONFIG_SECRET_SENTINEL"
+    (tmp_path / "config.yaml").write_text(
+        f"providers: [broken-{sentinel}", encoding="utf-8"
+    )
+    monkeypatch.setattr(gateway_run, "_gateway_config_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "hermes_cli.config.get_config_path", lambda: tmp_path / "different.yaml"
+    )
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        assert gateway_run._load_gateway_config() == {}
+
+    assert "error=ParserError" in caplog.text
+    assert sentinel not in caplog.text

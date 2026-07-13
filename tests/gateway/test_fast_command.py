@@ -14,6 +14,7 @@ import gateway.run as gateway_run
 from gateway.config import ChannelOverride, GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
+from gateway.session import AsyncSessionStore
 
 
 class _CapturingAgent:
@@ -277,6 +278,40 @@ async def test_fast_status_and_toggle_replies_use_i18n(monkeypatch, tmp_path):
     assert await runner._handle_fast_command(
         _make_event("/fast normal")
     ) == "gateway.fast.route_session_only"
+
+
+@pytest.mark.asyncio
+async def test_fast_persistence_failure_is_honestly_process_wide(
+    monkeypatch, tmp_path
+):
+    runner = _make_runner()
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    runner._resolve_configured_session_route_identity = MagicMock(
+        return_value=("gpt-5.5", "openai-codex", "codex_responses")
+    )
+    monkeypatch.setattr(
+        "gateway.slash_commands.atomic_config_write",
+        MagicMock(side_effect=OSError("read only")),
+    )
+
+    response = await runner._handle_fast_command(_make_event("/fast fast"))
+
+    assert "gateway-process-wide" in response
+    assert "this session only" not in response
+    assert runner._service_tier == "priority"
+    runtime = {
+        "provider": "openai-codex",
+        "api_mode": "codex_responses",
+        "api_key": "token",
+    }
+    # _service_tier belongs to the runner, so two distinct response scopes see
+    # the same fallback state until restart.
+    first = runner._resolve_turn_agent_config("s1", "gpt-5.5", runtime)
+    second = runner._resolve_turn_agent_config("s2", "gpt-5.5", runtime)
+    assert first["request_overrides"] == second["request_overrides"] == {
+        "service_tier": "fast"
+    }
 
 
 @pytest.mark.asyncio
@@ -850,6 +885,74 @@ async def test_run_agent_fails_closed_when_persisted_route_credentials_unavailab
     assert "preference was preserved" in result["final_response"]
     assert result["api_calls"] == 0
     configured_provider.assert_not_called()
+    assert _CapturingAgent.last_init is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "ensure_loaded",
+        "entry_for",
+        "identity_read",
+        "malformed_string",
+        "malformed_missing_provider",
+    ],
+)
+async def test_persisted_route_lookup_failures_abort_before_enrichment_or_provider(
+    monkeypatch, failure
+):
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+    source = _make_source()
+    session_key = "agent:main:telegram:dm:12345"
+    entry = SimpleNamespace(session_key=session_key, session_id="session-1")
+
+    def ensure_loaded():
+        if failure == "ensure_loaded":
+            raise OSError("routing store unavailable")
+
+    def entry_for(_key):
+        if failure == "entry_for":
+            raise OSError("routing entry unavailable")
+        if failure == "identity_read":
+            class UnreadableEntry:
+                @property
+                def model_override_identity(self):
+                    raise OSError("identity read unavailable")
+
+            return UnreadableEntry()
+        identity = (
+            "not-a-mapping"
+            if failure == "malformed_string"
+            else {"model": "gpt-5.5"}
+        )
+        return SimpleNamespace(model_override_identity=identity)
+
+    store = SimpleNamespace(
+        _ensure_loaded=ensure_loaded,
+        entry_for=entry_for,
+        get_or_create_session=lambda _source: entry,
+    )
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._recover_telegram_topic_thread_id = MagicMock(return_value=None)
+    runner._prepare_inbound_message_text = AsyncMock(
+        side_effect=AssertionError("enrichment must not run")
+    )
+    global_provider = MagicMock(
+        side_effect=AssertionError("global provider must not run")
+    )
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", global_provider)
+
+    _CapturingAgent.last_init = None
+    response = await runner._handle_message_with_agent(
+        _make_event("route safely"), source, "quick", 1
+    )
+
+    assert "could not be read or validated" in response
+    runner._prepare_inbound_message_text.assert_not_awaited()
+    global_provider.assert_not_called()
     assert _CapturingAgent.last_init is None
 
 

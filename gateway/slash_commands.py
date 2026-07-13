@@ -97,28 +97,26 @@ class GatewaySlashCommandsMixin:
         legacy false behavior so an operator's rollback remains dependable.
         """
         try:
-            from gateway.run import _gateway_config_home, _load_gateway_runtime_config
+            from gateway.run import _gateway_config_home
 
-            # The ordinary gateway loader is intentionally fail-open and
-            # collapses YAML/read errors to {}. This rollback switch must
-            # distinguish those failures from a genuinely missing section, so
-            # validate an existing file strictly before using the expanded
-            # runtime view.
             config_path = _gateway_config_home() / "config.yaml"
-            if config_path.exists():
-                import yaml
+            if not config_path.exists():
+                return True
+            import yaml
 
-                with open(config_path, encoding="utf-8") as handle:
-                    raw = yaml.safe_load(handle)
-                if raw is not None and not isinstance(raw, dict):
-                    raise ValueError("config root must be a mapping")
-
-            cfg = _load_gateway_runtime_config()
+            # One immutable byte snapshot, parsed once. Do not validate one
+            # read and obtain policy from a second loader: that creates a
+            # rollback-policy TOCTOU when the second read fails or changes.
+            snapshot = config_path.read_text(encoding="utf-8")
+            cfg = yaml.safe_load(snapshot)
+            if cfg is None:
+                cfg = {}
         except Exception as exc:
             logger.warning(
-                "Could not read session_reset manual preference policy; "
-                "using legacy preserve_route_preferences_on_manual_reset=false: %s",
-                exc,
+                "Could not read config session_reset manual preference policy; "
+                "using legacy preserve_route_preferences_on_manual_reset=false "
+                "(error=%s)",
+                type(exc).__name__,
             )
             return False
         if not isinstance(cfg, dict):
@@ -146,9 +144,8 @@ class GatewaySlashCommandsMixin:
             if normalized in {"false", "0", "no", "off"}:
                 return False
         logger.warning(
-            "Malformed session_reset.preserve_route_preferences_on_manual_reset=%r; "
-            "defaulting to false",
-            value,
+            "Malformed session_reset.preserve_route_preferences_on_manual_reset; "
+            "defaulting to false"
         )
         return False
 
@@ -1728,16 +1725,18 @@ class GatewaySlashCommandsMixin:
         # identity field and the legacy sanitized mirror so a later /new or
         # restart cannot resurrect the prior pin.
         if model_input.strip().lower() == "reset" and not explicit_provider:
-            self._set_session_model_override(session_key, None)
             try:
-                if getattr(self, "session_store", None) is not None:
-                    await self.async_session_store.set_model_override(
-                        session_key, None
-                    )
+                await asyncio.to_thread(
+                    self._set_session_model_override,
+                    session_key,
+                    None,
+                    require_persistence=True,
+                )
             except Exception:
-                logger.debug(
-                    "Failed to clear legacy session model override",
-                    exc_info=True,
+                logger.warning("Model route reset persistence failed")
+                return (
+                    "Model session override was not cleared because the session "
+                    "store could not persist the reset. No route change was made."
                 )
             getattr(self, "_pending_model_notes", {}).pop(session_key, None)
             getattr(self, "_last_resolved_model", {}).pop(session_key, None)
@@ -3139,8 +3138,12 @@ class GatewaySlashCommandsMixin:
                 current[keys[-1]] = value
                 atomic_config_write(config_path, user_config)
                 return True
-            except Exception as e:
-                logger.error("Failed to save config key %s: %s", key_path, e)
+            except Exception as exc:
+                logger.error(
+                    "Failed to save config key %s (error=%s)",
+                    key_path,
+                    type(exc).__name__,
+                )
                 return False
 
         if not raw_args:
@@ -3353,10 +3356,14 @@ class GatewaySlashCommandsMixin:
 
         user_config = _load_gateway_config()
         session_key = self._session_key_for_source(event.source)
+        persisted_lookup = self._persisted_session_route_identity(session_key)
+        if persisted_lookup.state == "unavailable":
+            return t("gateway.fast.preference_unavailable", route="<unreadable>")
         model, provider, api_mode = self._resolve_configured_session_route_identity(
             source=event.source,
             session_key=session_key,
             user_config=user_config,
+            persisted_route_lookup=persisted_lookup,
         )
         capability = resolve_fast_mode_capability(
             model=model,
@@ -3364,7 +3371,7 @@ class GatewaySlashCommandsMixin:
             api_mode=api_mode,
         )
         route = f"{provider or '<unknown>'}/{model or '<unset>'}"
-        persisted_preference = self._persisted_session_route_identity(session_key)
+        persisted_preference = persisted_lookup.identity
         preference_unavailable = session_key in getattr(
             self, "_session_model_override_unavailable", set()
         )
@@ -3392,8 +3399,12 @@ class GatewaySlashCommandsMixin:
                 current[keys[-1]] = value
                 atomic_config_write(config_path, user_config)
                 return True
-            except Exception as e:
-                logger.error("Failed to save config key %s: %s", key_path, e)
+            except Exception as exc:
+                logger.error(
+                    "Failed to save config key %s (error=%s)",
+                    key_path,
+                    type(exc).__name__,
+                )
                 return False
 
         if not args or args == "status":

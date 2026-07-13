@@ -1316,10 +1316,14 @@ class SessionStore:
         """Public trigger for a durable save of the session index."""
         self._save()
 
-    def _save(self) -> None:
+    def _save(self, *, require_primary: bool = False) -> None:
         """Persist the routing index while the caller holds ``_lock``."""
         data, generation = self._snapshot_routing_locked()
-        self._persist_routing_data(data, generation)
+        self._persist_routing_data(
+            data,
+            generation,
+            require_primary=require_primary,
+        )
 
     def _snapshot_routing_locked(self) -> tuple[Dict[str, Any], int]:
         """Capture immutable routing data and a monotonic generation."""
@@ -1329,7 +1333,13 @@ class SessionStore:
             self._routing_generation,
         )
 
-    def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> None:
+    def _persist_routing_data(
+        self,
+        data: Dict[str, Any],
+        generation: int,
+        *,
+        require_primary: bool = False,
+    ) -> None:
         """Serialize all whole-index writers through one durable write lock."""
         save_lock = getattr(self, "_save_lock", None)
         if save_lock is None:
@@ -1353,6 +1363,8 @@ class SessionStore:
                         logger.warning(
                             "gateway.session: state.db routing save failed: %s", exc
                         )
+                        if require_primary:
+                            raise
             if getattr(self, "_write_sessions_json", True) or not db_saved:
                 self._save_sessions_json(data)
             self._persisted_routing_generation = generation
@@ -2192,6 +2204,35 @@ class SessionStore:
                 return
             entry.model_override = cleaned
             self._save()
+
+    def clear_model_route_override(self, session_key: str) -> bool:
+        """Atomically clear authoritative identity and its legacy mirror.
+
+        Both fields are mutated under the store lock and persisted from one
+        routing snapshot. If persistence fails, the in-memory entry is rolled
+        back and the exception is propagated so callers cannot claim success.
+        The primary state.db routing table is written before the optional JSON
+        mirror, so a mirror-write failure also cannot resurrect a cleared route
+        after restart.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return False
+            old_identity = entry.model_override_identity
+            old_legacy = entry.model_override
+            if old_identity is None and old_legacy is None:
+                return True
+            entry.model_override_identity = None
+            entry.model_override = None
+            try:
+                self._save(require_primary=True)
+            except BaseException:
+                entry.model_override_identity = old_identity
+                entry.model_override = old_legacy
+                raise
+            return True
 
     def get_model_override(self, session_key: str) -> Optional[Dict[str, str]]:
         """Return the persisted /model override for *session_key*, if any."""

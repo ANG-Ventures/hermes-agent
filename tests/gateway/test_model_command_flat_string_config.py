@@ -13,6 +13,8 @@ the proper ``model: {default: ..., provider: ...}`` form.
 
 import yaml
 import pytest
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
@@ -227,6 +229,39 @@ async def test_model_reset_clears_session_override_without_switching_global(
     written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     assert written["model"]["default"] == "global-model"
     assert written["model"]["provider"] == "openai-api"
+
+
+@pytest.mark.asyncio
+async def test_model_reset_persistence_failure_never_claims_success(
+    tmp_path, monkeypatch
+):
+    _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "global-model", "provider": "openai-api"},
+    )
+    runner = _make_runner()
+    event = _make_event("/model reset")
+    session_key = runner._session_key_for_source(event.source)
+    original = {
+        "model": "session-model",
+        "provider": "openai-codex",
+        "api_mode": "codex_responses",
+        "api_key": "runtime-only",
+    }
+    runner._session_model_overrides[session_key] = dict(original)
+    runner.session_store = SimpleNamespace(
+        clear_model_route_override=MagicMock(
+            side_effect=OSError("atomic route save failed")
+        )
+    )
+
+    result = await runner._handle_model_command(event)
+
+    assert "was not cleared" in result
+    assert "No route change was made" in result
+    assert "cleared; using" not in result
+    assert runner._session_model_overrides[session_key] == original
 
 
 @pytest.mark.asyncio

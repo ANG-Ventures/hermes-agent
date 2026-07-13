@@ -117,10 +117,6 @@ def _is_claude_model(model: str | None) -> bool:
     return "claude" in (model or "").lower()
 
 
-_FAST_MODE_SUPPORTED_SUBSTRINGS = (
-    "opus-4-8", "opus-4.8", "opus-4-7", "opus-4.7",
-)
-
 # ── Max output token limits per Anthropic model ───────────────────────
 # Source: Anthropic docs + Cline model catalog.  Anthropic's API requires
 # max_tokens as a mandatory field.  Previously we hardcoded 16384, which
@@ -294,13 +290,11 @@ def _forbids_sampling_params(model: str) -> bool:
 def _supports_fast_mode(model: str) -> bool:
     """Return True for models that support Anthropic Fast Mode (speed=fast).
 
-    Per Anthropic's native Fast Mode contract, Opus 4.8 and 4.7 accept the
-    parameter. Opus 4.6 does not support Fast and runs at standard speed.
-    This allowlist prevents stale config from sending the beta contract to
-    unsupported models.
+    Uses the same exact normalized contract as command capability resolution.
     """
-    normalized = (model or "").lower()
-    return any(v in normalized for v in _FAST_MODE_SUPPORTED_SUBSTRINGS)
+    from hermes_cli.fast_mode_contracts import anthropic_fast_contract_accepts
+
+    return anthropic_fast_contract_accepts(model)
 
 
 # Beta headers for enhanced features that are safe on ordinary/native Anthropic
@@ -2673,7 +2667,7 @@ def build_anthropic_kwargs(
         for _sampling_key in ("temperature", "top_p", "top_k"):
             kwargs.pop(_sampling_key, None)
 
-    # ── Fast mode (native Opus 4.8 / 4.7) ────────────────────────────
+    # ── Fast mode (native Opus 4.8) ──────────────────────────────────
     # Adds extra_body.speed="fast" plus the required fast-mode beta header.
     # Opus 4.6 is unavailable in Fast and remains at standard speed.
     # Only for native Anthropic endpoints — third-party providers would

@@ -114,28 +114,24 @@ class TestPriorityProcessingModels(unittest.TestCase):
     def test_all_documented_models_supported(self):
         from hermes_cli.models import model_supports_fast_mode
 
-        # All OpenAI flagship models support Priority Processing — including
-        # future releases (gpt-5.5, 5.6...) via pattern matching.
+        # Exact intersection of the 2026-07-12 official snapshot and Hermes'
+        # direct OpenAI provider inventory.
         supported = [
-            "gpt-5.5", "gpt-5.5-mini",
-            "gpt-5.4", "gpt-5.4-mini", "gpt-5.2",
-            "gpt-5.1", "gpt-5", "gpt-5-mini",
-            "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano",
+            "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
+            "gpt-5.4", "gpt-5.4-mini", "gpt-5-mini", "gpt-4.1",
             "gpt-4o", "gpt-4o-mini",
-            "o1", "o1-mini", "o3", "o3-mini", "o4-mini",
         ]
         for model in supported:
             assert model_supports_fast_mode(model), f"{model} should support fast mode"
 
     def test_all_anthropic_models_supported(self):
-        """The speed=fast parameter is gated to Opus 4.8 and 4.7."""
+        """The shipped speed=fast parameter is gated to exact Opus 4.8."""
         from hermes_cli.models import model_supports_fast_mode
 
-        # Supported: Opus 4.8 and 4.7 in either version spelling.
+        # Supported: Opus 4.8 in either documented version spelling.
         supported = [
             "claude-opus-4-8", "claude-opus-4.8",
             "anthropic/claude-opus-4-8", "anthropic/claude-opus-4.8",
-            "claude-opus-4-7", "claude-opus-4.7",
         ]
         for model in supported:
             assert model_supports_fast_mode(model), f"{model} should support fast mode"
@@ -143,6 +139,7 @@ class TestPriorityProcessingModels(unittest.TestCase):
         # Unsupported per Anthropic API: Opus 4.6, Sonnet, Haiku.
         unsupported = [
             "claude-opus-4-6", "claude-opus-4.6",
+            "claude-opus-4-7", "claude-opus-4.7",
             "claude-sonnet-4-6", "claude-sonnet-4.6", "claude-sonnet-4",
             "claude-haiku-4-5", "claude-3-5-haiku",
         ]
@@ -163,7 +160,7 @@ class TestPriorityProcessingModels(unittest.TestCase):
 
         assert model_supports_fast_mode("openai/gpt-5.4") is True
         assert model_supports_fast_mode("openai/gpt-4.1") is True
-        assert model_supports_fast_mode("openai/o3") is True
+        assert model_supports_fast_mode("openai/o3") is False
 
     def test_non_priority_models_rejected(self):
         from hermes_cli.models import model_supports_fast_mode
@@ -309,9 +306,9 @@ class TestAnthropicFastMode(unittest.TestCase):
         assert model_supports_fast_mode("claude-opus-4-8") is True
         # OpenRouter format (dots)
         assert model_supports_fast_mode("claude-opus-4.8") is True
-        # With vendor prefix
-        assert model_supports_fast_mode("anthropic/claude-opus-4-7") is True
-        assert model_supports_fast_mode("anthropic/claude-opus-4.7") is True
+        # Deprecated 4.7 is deliberately not shipped.
+        assert model_supports_fast_mode("anthropic/claude-opus-4-7") is False
+        assert model_supports_fast_mode("anthropic/claude-opus-4.7") is False
 
     def test_anthropic_non_fast_models_excluded(self):
         """The speed=fast parameter excludes Opus 4.6, Sonnet, and Haiku."""
@@ -332,12 +329,12 @@ class TestAnthropicFastMode(unittest.TestCase):
         assert _is_anthropic_fast_model("gemini-3-pro") is False
         assert _is_anthropic_fast_model("kimi-k2-thinking") is False
 
-    def test_anthropic_variant_tags_stripped(self):
+    def test_anthropic_suffix_impostors_rejected(self):
         from hermes_cli.models import model_supports_fast_mode
 
-        # OpenRouter variant tags after colon should be stripped
-        assert model_supports_fast_mode("claude-opus-4.8:fast") is True
-        assert model_supports_fast_mode("claude-opus-4.7:beta") is True
+        assert model_supports_fast_mode("claude-opus-4.8:fast") is False
+        assert model_supports_fast_mode("claude-opus-4-80") is False
+        assert model_supports_fast_mode("claude-opus-4-8-suffix") is False
 
     def test_resolve_overrides_returns_speed_for_anthropic(self):
         from hermes_cli.models import resolve_fast_mode_overrides
@@ -345,8 +342,7 @@ class TestAnthropicFastMode(unittest.TestCase):
         result = resolve_fast_mode_overrides("claude-opus-4-8")
         assert result == {"speed": "fast"}
 
-        result = resolve_fast_mode_overrides("anthropic/claude-opus-4.7")
-        assert result == {"speed": "fast"}
+        assert resolve_fast_mode_overrides("anthropic/claude-opus-4.7") is None
 
     def test_resolve_overrides_returns_none_for_unsupported_claude(self):
         """Opus 4.6 and non-Opus Claude models don't take the speed param."""
@@ -364,13 +360,14 @@ class TestAnthropicFastMode(unittest.TestCase):
         assert result == {"service_tier": "priority"}
 
     def test_is_anthropic_fast_model(self):
-        """The speed=fast parameter is limited to Opus 4.8 and 4.7."""
+        """The speed=fast parameter is limited to exact Opus 4.8."""
         from hermes_cli.models import _is_anthropic_fast_model
 
         assert _is_anthropic_fast_model("claude-opus-4-8") is True
         assert _is_anthropic_fast_model("claude-opus-4.8") is True
-        assert _is_anthropic_fast_model("anthropic/claude-opus-4-7") is True
-        assert _is_anthropic_fast_model("claude-opus-4.7:fast") is True
+        assert _is_anthropic_fast_model("anthropic/claude-opus-4-7") is False
+        assert _is_anthropic_fast_model("claude-opus-4.8:fast") is False
+        assert _is_anthropic_fast_model("claude-opus-4-80") is False
 
         assert _is_anthropic_fast_model("claude-opus-4-6") is False
         assert _is_anthropic_fast_model("claude-sonnet-4-6") is False
@@ -397,13 +394,13 @@ class TestAnthropicFastMode(unittest.TestCase):
         )
         assert cli_mod.HermesCLI._fast_command_available(stub) is False
 
-    def test_fast_command_exposed_for_anthropic_opus_47(self):
+    def test_fast_command_hidden_for_deprecated_anthropic_opus_47(self):
         cli_mod = _import_cli()
         stub = SimpleNamespace(
             provider="anthropic", requested_provider="anthropic",
             model="claude-opus-4-7", agent=None,
         )
-        assert cli_mod.HermesCLI._fast_command_available(stub) is True
+        assert cli_mod.HermesCLI._fast_command_available(stub) is False
 
     def test_fast_command_hidden_for_non_claude_non_openai(self):
         """Non-Claude, non-OpenAI models should not expose /fast."""
@@ -490,7 +487,7 @@ class TestAnthropicFastModeAdapter(unittest.TestCase):
         from agent.anthropic_adapter import build_anthropic_kwargs
 
         kwargs = build_anthropic_kwargs(
-            model="claude-opus-4-7",
+            model="claude-opus-4-8",
             messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
             tools=None,
             max_tokens=None,
