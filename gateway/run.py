@@ -44,7 +44,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Callable, Dict, Optional, Any, List, Literal, NamedTuple, Union
+from typing import Callable, Dict, Optional, Any, List, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
 # /usage; we still import it at module top in the gateway because test
@@ -84,13 +84,6 @@ _EXECUTOR_DRAIN_TIMEOUT_SECS_DEFAULT = 8.0
 
 class SessionRouteUnavailableError(RuntimeError):
     """A persisted explicit route cannot currently resolve credentials."""
-
-
-class PersistedSessionRouteLookup(NamedTuple):
-    """Authoritative tri-state result for persisted session-route identity."""
-
-    state: Literal["absent", "valid", "unavailable"]
-    identity: Optional[dict] = None
 
 
 def _executor_drain_timeout() -> float:
@@ -2219,6 +2212,7 @@ from gateway.config import (
 )
 from gateway.session import (
     AsyncSessionStore,
+    PersistedSessionRouteLookup,
     SessionStore,
     SessionSource,
     SessionContext,
@@ -4591,44 +4585,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         store = getattr(self, "session_store", None)
         if store is None or not session_key:
             return PersistedSessionRouteLookup("absent")
+
+        # Inspect the class, not the instance: Mock/MagicMock and lightweight
+        # fixture stores synthesize arbitrary attributes on demand and must not
+        # accidentally claim authority over persisted routing state.
+        lookup = getattr(type(store), "lookup_persisted_route_identity", None)
+        if not callable(lookup):
+            return PersistedSessionRouteLookup("absent")
         try:
-            ensure_loaded = getattr(store, "_ensure_loaded", None)
-            if callable(ensure_loaded):
-                ensure_loaded()
-            entry_for = getattr(store, "entry_for", None)
-            if callable(entry_for):
-                entry = entry_for(session_key)
-            else:
-                entry = getattr(store, "_entries", {}).get(session_key)
-            if entry is None:
-                return PersistedSessionRouteLookup("absent")
-            if getattr(entry, "_model_override_identity_invalid", False):
-                return PersistedSessionRouteLookup("unavailable")
-            explicit_identity = getattr(entry, "model_override_identity", None)
-            if explicit_identity is None:
-                # Backward-compatible persisted preference from before the
-                # credential-free identity field was introduced.
-                identity = getattr(entry, "model_override", None)
-            else:
-                identity = explicit_identity
+            result = lookup(store, session_key)
         except Exception:
             return PersistedSessionRouteLookup("unavailable")
-        if identity is None:
-            return PersistedSessionRouteLookup("absent")
-        if not isinstance(identity, dict):
+        if not isinstance(result, PersistedSessionRouteLookup):
             return PersistedSessionRouteLookup("unavailable")
-        model = identity.get("model")
-        provider = identity.get("provider")
-        if not model or not provider:
-            return PersistedSessionRouteLookup("unavailable")
-        return PersistedSessionRouteLookup(
-            "valid",
-            {
-                "model": str(model),
-                "provider": str(provider),
-                "api_mode": identity.get("api_mode"),
-            },
-        )
+        return result
 
     def _resolve_configured_session_route_identity(
         self,

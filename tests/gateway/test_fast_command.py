@@ -80,6 +80,22 @@ def _make_runner():
     return runner
 
 
+def _authoritative_route_store(*, ensure_loaded, entry_for):
+    """Build a minimal real SessionStore capability without disk setup."""
+    store = object.__new__(SessionStore)
+    store._ensure_loaded = ensure_loaded
+    store.entry_for = entry_for
+    return store
+
+
+def _route_entry(identity):
+    return SimpleNamespace(
+        model_override_identity=identity,
+        model_override=None,
+        _model_override_identity_invalid=False,
+    )
+
+
 def _make_source() -> SessionSource:
     return SessionSource(
         platform=Platform.TELEGRAM,
@@ -326,8 +342,9 @@ async def test_fast_status_uses_persisted_session_route_without_credentials(
         "provider": "openai-codex",
         "api_mode": "codex_responses",
     }
-    runner.session_store = SimpleNamespace(
-        entry_for=lambda key: SimpleNamespace(model_override_identity=persisted)
+    runner.session_store = _authoritative_route_store(
+        ensure_loaded=lambda: None,
+        entry_for=lambda key: _route_entry(persisted)
         if key == session_key
         else None,
     )
@@ -379,8 +396,9 @@ async def test_fast_status_reports_persisted_preference_as_unavailable_without_c
         "provider": "openai-codex",
         "api_mode": "codex_responses",
     }
-    runner.session_store = SimpleNamespace(
-        entry_for=lambda _key: SimpleNamespace(model_override_identity=persisted)
+    runner.session_store = _authoritative_route_store(
+        ensure_loaded=lambda: None,
+        entry_for=lambda _key: _route_entry(persisted),
     )
     runner._session_model_override_unavailable = {session_key}
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
@@ -444,7 +462,9 @@ def test_pure_route_identity_matches_runtime_precedence(monkeypatch):
             )
         }
     )
-    runner.session_store = SimpleNamespace(entry_for=lambda _key: None)
+    runner.session_store = _authoritative_route_store(
+        ensure_loaded=lambda: None, entry_for=lambda _key: None
+    )
 
     monkeypatch.setattr(
         gateway_run,
@@ -489,8 +509,9 @@ def test_pure_route_identity_matches_runtime_for_session_override(monkeypatch):
         "provider": "openai-codex",
         "api_mode": "codex_responses",
     }
-    runner.session_store = SimpleNamespace(
-        entry_for=lambda _key: SimpleNamespace(model_override_identity=identity)
+    runner.session_store = _authoritative_route_store(
+        ensure_loaded=lambda: None,
+        entry_for=lambda _key: _route_entry(identity),
     )
     runner._session_model_overrides[session_key] = {
         **identity,
@@ -545,8 +566,9 @@ def test_pure_route_identity_matches_runtime_for_channel_and_session_override(
             )
         }
     )
-    runner.session_store = SimpleNamespace(
-        entry_for=lambda _key: SimpleNamespace(model_override_identity=identity)
+    runner.session_store = _authoritative_route_store(
+        ensure_loaded=lambda: None,
+        entry_for=lambda _key: _route_entry(identity),
     )
     runner._session_model_overrides[session_key] = {
         **identity,
@@ -588,8 +610,9 @@ def test_missing_persisted_api_mode_does_not_rehydrate_matching_cached_route(
         "api_mode": "codex_responses",
         "api_key": "cached-secret",
     }
-    runner.session_store = SimpleNamespace(
-        entry_for=lambda _key: SimpleNamespace(model_override_identity=persisted)
+    runner.session_store = _authoritative_route_store(
+        ensure_loaded=lambda: None,
+        entry_for=lambda _key: _route_entry(persisted),
     )
     runner._session_model_overrides[session_key] = cached
     reresolve = MagicMock(
@@ -612,7 +635,9 @@ def test_missing_persisted_api_mode_does_not_rehydrate_matching_cached_route(
 def test_pure_route_identity_matches_runtime_for_global_route(monkeypatch):
     runner = _make_runner()
     runner.config = GatewayConfig()
-    runner.session_store = SimpleNamespace(entry_for=lambda _key: None)
+    runner.session_store = _authoritative_route_store(
+        ensure_loaded=lambda: None, entry_for=lambda _key: None
+    )
     config = {
         "model": {
             "default": "claude-opus-4-6",
@@ -672,10 +697,9 @@ def test_pure_route_identity_matches_runtime_exhaustive_precedence_matrix(
         if session_override
         else None
     )
-    runner.session_store = SimpleNamespace(
-        entry_for=lambda _key: SimpleNamespace(model_override_identity=identity)
-        if identity
-        else None
+    runner.session_store = _authoritative_route_store(
+        ensure_loaded=lambda: None,
+        entry_for=lambda _key: _route_entry(identity) if identity else None,
     )
     if identity:
         runner._session_model_overrides[session_key] = {
@@ -846,10 +870,17 @@ async def test_run_agent_fails_closed_when_persisted_route_credentials_unavailab
         "provider": "openai-codex",
         "api_mode": "codex_responses",
     }
-    runner.session_store.entry_for = lambda key: (
-        SimpleNamespace(model_override_identity=identity)
-        if key == session_key
-        else None
+    runner.session_store = _authoritative_route_store(
+        ensure_loaded=lambda: None,
+        entry_for=lambda key: (
+            SimpleNamespace(
+                model_override_identity=identity,
+                model_override=None,
+                _model_override_identity_invalid=False,
+            )
+            if key == session_key
+            else None
+        ),
     )
     resolver = MagicMock()
     if resolution_failure is None:
@@ -917,6 +948,8 @@ async def test_persisted_route_lookup_failures_abort_before_enrichment_or_provid
             raise OSError("routing entry unavailable")
         if failure == "identity_read":
             class UnreadableEntry:
+                _model_override_identity_invalid = False
+
                 @property
                 def model_override_identity(self):
                     raise OSError("identity read unavailable")
@@ -927,13 +960,17 @@ async def test_persisted_route_lookup_failures_abort_before_enrichment_or_provid
             if failure == "malformed_string"
             else {"model": "gpt-5.5"}
         )
-        return SimpleNamespace(model_override_identity=identity)
+        return SimpleNamespace(
+            model_override_identity=identity,
+            model_override=None,
+            _model_override_identity_invalid=False,
+        )
 
-    store = SimpleNamespace(
-        _ensure_loaded=ensure_loaded,
+    store = _authoritative_route_store(
+        ensure_loaded=ensure_loaded,
         entry_for=entry_for,
-        get_or_create_session=lambda _source: entry,
     )
+    store.get_or_create_session = lambda _source: entry
     runner.session_store = store
     runner._async_session_store = AsyncSessionStore(store)
     runner._recover_telegram_topic_thread_id = MagicMock(return_value=None)
@@ -954,6 +991,16 @@ async def test_persisted_route_lookup_failures_abort_before_enrichment_or_provid
     runner._prepare_inbound_message_text.assert_not_awaited()
     global_provider.assert_not_called()
     assert _CapturingAgent.last_init is None
+
+
+@pytest.mark.parametrize("store", [MagicMock(), SimpleNamespace(_entries={})])
+def test_non_persistent_fixture_stores_have_no_persisted_route_authority(store):
+    runner = _make_runner()
+    runner.session_store = store
+
+    lookup = runner._persisted_session_route_identity("fixture-session")
+
+    assert lookup.state == "absent"
 
 
 @pytest.mark.asyncio

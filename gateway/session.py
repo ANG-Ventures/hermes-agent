@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Literal, NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -640,6 +640,13 @@ def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict
 
 
 PERSISTABLE_MODEL_IDENTITY_KEYS = ("model", "provider", "api_mode")
+
+
+class PersistedSessionRouteLookup(NamedTuple):
+    """Authoritative tri-state result for persisted session-route identity."""
+
+    state: Literal["absent", "valid", "unavailable"]
+    identity: Optional[dict] = None
 
 
 def sanitize_model_override_identity(
@@ -1336,6 +1343,50 @@ class SessionStore:
     def entry_for(self, session_key: str) -> Optional["SessionEntry"]:
         """Public read accessor for a single entry by session key."""
         return self._entries.get(session_key)
+
+    def lookup_persisted_route_identity(
+        self, session_key: str
+    ) -> PersistedSessionRouteLookup:
+        """Read the persisted model route without collapsing failures to absence.
+
+        This explicit capability is the authority used by the gateway's
+        fail-closed route precheck. Lightweight fixture stores that do not
+        implement it have no persisted-route authority and are treated as
+        absent by the caller.
+        """
+        if not session_key:
+            return PersistedSessionRouteLookup("absent")
+        try:
+            self._ensure_loaded()
+            entry = self.entry_for(session_key)
+            if entry is None:
+                return PersistedSessionRouteLookup("absent")
+            if entry._model_override_identity_invalid:
+                return PersistedSessionRouteLookup("unavailable")
+            identity = (
+                entry.model_override
+                if entry.model_override_identity is None
+                else entry.model_override_identity
+            )
+        except Exception:
+            return PersistedSessionRouteLookup("unavailable")
+
+        if identity is None:
+            return PersistedSessionRouteLookup("absent")
+        if not isinstance(identity, dict):
+            return PersistedSessionRouteLookup("unavailable")
+        model = identity.get("model")
+        provider = identity.get("provider")
+        if not model or not provider:
+            return PersistedSessionRouteLookup("unavailable")
+        return PersistedSessionRouteLookup(
+            "valid",
+            {
+                "model": str(model),
+                "provider": str(provider),
+                "api_mode": identity.get("api_mode"),
+            },
+        )
 
     def persist(self) -> None:
         """Public trigger for a durable save of the session index."""
