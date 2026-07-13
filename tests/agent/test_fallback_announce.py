@@ -216,16 +216,26 @@ def test_fallback_reannounces_on_new_turn_after_cooldown_pin(monkeypatch):
 
 
 def test_dedupe_reset_is_wired_into_turn_context():
-    """Guard the wiring: build_turn_context must clear _last_fallback_announced.
+    """Guard the wiring: build_turn_context must clear _last_fallback_announced
+    BEFORE calling _restore_primary_runtime.
 
-    The fix lives in turn_context, not the restore path — assert the source
-    actually resets the dedupe there so a future refactor can't silently move
-    the clear back behind restore_primary_runtime's early-returns.
+    The fix lives in turn_context, not the restore path — and ORDER matters: the
+    restore path early-returns on cooldown/auto_recovery without clearing the
+    dedupe, so a reset placed after the restore call re-introduces the bug.
+    Assert both presence AND ordering so a refactor can't silently move the
+    clear back behind restore_primary_runtime's early-returns.
     """
     import inspect
     from agent import turn_context as tc
     src = inspect.getsource(tc)
-    assert "_last_fallback_announced = None" in src, (
+    reset_tok = "_last_fallback_announced = None"
+    restore_tok = "_restore_primary_runtime()"
+    assert reset_tok in src, (
         "turn_context must unconditionally clear _last_fallback_announced at "
         "turn start so a new failover episode re-announces"
+    )
+    assert restore_tok in src, "turn_context no longer calls _restore_primary_runtime?"
+    assert src.index(reset_tok) < src.index(restore_tok), (
+        "the dedupe reset must run BEFORE _restore_primary_runtime() — the "
+        "restore path early-returns on cooldown without clearing it"
     )
