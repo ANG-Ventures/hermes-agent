@@ -405,9 +405,40 @@ def join_split_skill(skill_dir: Path) -> bool:
     text = skill_md.read_text(encoding="utf-8")
     fm, body = split_frontmatter(text)
 
+    # P0 FIX: Validate every carve path stays inside skill_dir (path traversal protection)
+    skill_dir_resolved = skill_dir.resolve()
     contents: List[Dict[str, str]] = []
     for c in carves:
-        src = skill_dir / c["file"]
+        carve_path_str = c["file"]
+        # Reject absolute paths
+        if Path(carve_path_str).is_absolute():
+            raise RuntimeError(
+                f"join_split_skill: absolute path in manifest rejected: {carve_path_str}"
+            )
+        src = skill_dir / carve_path_str
+        # Check for symlinks BEFORE resolving (lstat doesn't follow symlinks)
+        try:
+            if src.lstat().st_mode & 0o170000 == 0o120000:  # S_IFLNK
+                # It's a symlink; resolve and verify containment
+                resolved = src.resolve(strict=True)
+                try:
+                    resolved.relative_to(skill_dir_resolved)
+                except ValueError:
+                    raise RuntimeError(
+                        f"join_split_skill: symlink escape rejected: {carve_path_str} -> {resolved}"
+                    )
+        except (OSError, ValueError):
+            pass  # File doesn't exist yet or resolve failed; containment check below will catch it
+        
+        # Require the resolved path to be contained within skill_dir
+        try:
+            src_resolved = src.resolve(strict=False)
+            src_resolved.relative_to(skill_dir_resolved)
+        except ValueError:
+            raise RuntimeError(
+                f"join_split_skill: path traversal rejected: {carve_path_str} escapes skill_dir"
+            )
+        
         contents.append({
             **c,
             "content": src.read_text(encoding="utf-8"),
@@ -431,8 +462,12 @@ def join_split_skill(skill_dir: Path) -> bool:
     skill_md.write_text(fm + joined, encoding="utf-8")
     for c in contents:
         try:
-            (skill_dir / c["file"]).unlink()
-        except OSError:
+            # Re-validate before unlink (defense in depth)
+            carve_path = skill_dir / c["file"]
+            carve_resolved = carve_path.resolve(strict=False)
+            carve_resolved.relative_to(skill_dir_resolved)
+            carve_path.unlink()
+        except (OSError, ValueError):
             pass
     try:
         manifest_path.unlink()

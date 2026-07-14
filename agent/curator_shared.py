@@ -117,11 +117,19 @@ def shared_pass_lock(shared_root: Optional[Path] = None):
     Yields True when acquired, False on contention (another curator holds
     it — the shared pass must be skipped, never blocked behind it). Records
     owner PID + start time in the lockfile (diagnostic only).
+    
+    P2 FIX: Fail CLOSED when fcntl unavailable (Windows, some BSD). Shared-tree
+    curation requires advisory locking to serialize curator-vs-curator; platforms
+    without fcntl simply skip the shared pass.
     """
     root = shared_root or _shared_root()
     lock_path = root / LOCK_NAME
     if fcntl is None:
-        yield True
+        logger.warning(
+            "fcntl unavailable (platform does not support advisory locking); "
+            "shared-tree curation skipped — cannot serialize curator-vs-curator"
+        )
+        yield False
         return
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -316,6 +324,9 @@ def attempt_crash_recovery(
     a dirty tree IS the staleness signal — fcntl auto-releases on holder
     death, so a live holder would have made acquisition fail).
 
+    P1 FIX: Manifest paths are validated for traversal and cross-checked against
+    the baseline commit to prevent arbitrary file deletion via planted manifests.
+
     Returns (recovered, reason).
     """
     root = shared_root or _shared_root()
@@ -336,7 +347,52 @@ def attempt_crash_recovery(
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False, "unreadable snapshot manifest"
-    intended = set(manifest.get("intended_writes") or [])
+    
+    # P1 FIX: Validate manifest paths before trusting them for deletion
+    intended_raw = manifest.get("intended_writes") or []
+    intended = set()
+    repo_resolved = repo.resolve()
+    root_resolved = root.resolve()
+    
+    for path_str in intended_raw:
+        # Reject absolute paths
+        p = Path(path_str)
+        if p.is_absolute():
+            return False, f"manifest contains absolute path (rejected): {path_str}"
+        
+        # Require the path to resolve inside the shared tree
+        try:
+            full_path = (repo / path_str).resolve(strict=False)
+            full_path.relative_to(root_resolved)
+        except ValueError:
+            return False, f"manifest path escapes shared tree (rejected): {path_str}"
+        
+        intended.add(path_str)
+    
+    # P1 FIX: Cross-check intended deletions against baseline commit
+    # Only delete files that existed in the baseline (curator couldn't have created
+    # a file that never existed in git)
+    baseline_rev = manifest.get("baseline_rev")
+    if baseline_rev:
+        for path_str in intended:
+            # Check if this path existed in the baseline commit
+            code, _, _ = _git(repo, "cat-file", "-e", f"{baseline_rev}:{path_str}")
+            if code != 0:
+                # Path didn't exist in baseline — curator couldn't have written it
+                # during this run, so it's either a new sibling file or a manifest lie
+                logger.debug(
+                    "recovery: path in manifest but not in baseline %s: %s",
+                    baseline_rev, path_str
+                )
+                # Don't fail recovery for untracked new files (carves), but DO
+                # fail if a tracked file in dirty set wasn't in baseline
+                if path_str in dirty:
+                    code2, _, _ = _git(repo, "ls-files", "--", path_str)
+                    if code2 == 0:  # It's tracked now but wasn't in baseline
+                        return False, (
+                            f"manifest claims path not in baseline (rejected): {path_str}"
+                        )
+    
     unmanifested = [p for p in dirty if p not in intended]
     if unmanifested:
         return False, (
@@ -352,12 +408,17 @@ def attempt_crash_recovery(
         # curator-written per the manifest.
         removed = []
         for p in dirty:
+            if p not in intended:
+                continue  # Defense in depth: only delete validated manifest paths
             fp = repo / p
             try:
                 if fp.exists() and not fp.is_dir():
+                    # Re-validate containment before unlink
+                    fp_resolved = fp.resolve()
+                    fp_resolved.relative_to(root_resolved)
                     fp.unlink()
                     removed.append(p)
-            except OSError:
+            except (OSError, ValueError):
                 pass
         still = _porcelain_shared(repo, root)
         if still:
@@ -371,8 +432,11 @@ def attempt_crash_recovery(
                 fp = repo / p
                 try:
                     if fp.exists() and not fp.is_dir():
+                        # Re-validate containment before unlink
+                        fp_resolved = fp.resolve()
+                        fp_resolved.relative_to(root_resolved)
                         fp.unlink()
-                except OSError:
+                except (OSError, ValueError):
                     pass
         still = _porcelain_shared(repo, root)
         if still:
@@ -392,6 +456,125 @@ def archive_shared_skill(
     ``git revert`` of the run-commit restores the skill for the whole fleet.
     Never moves the skill to the local ``skills/.archive/`` (other agents
     would lose it). Returns (ok, message, touched_paths).
+    
+    P1 FIX: This function now goes through the FULL safety contract (lock,
+    precheck, snapshot, commit) to prevent dirty-tree corruption. The raw
+    rename logic is now in _archive_shared_skill_impl; this wrapper enforces
+    the git safety gates.
+    """
+    root = shared_root or _shared_root()
+    skill_dir = Path(skill_dir)
+    try:
+        rel = skill_dir.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False, f"{skill_dir} is not under the shared tree", []
+    if not rel.parts or len(rel.parts) < 2:
+        return False, f"{skill_dir} is not a <group>/<skill> dir", []
+    
+    # P1 FIX: Acquire lock, precheck, snapshot, commit
+    with shared_pass_lock(root) as acquired:
+        if not acquired:
+            return False, "lock contention (another curator holds shared lock)", []
+        
+        ok, reason, dirty = git_precheck_shared(root)
+        if not ok and reason == "dirty working tree":
+            recovered, why = attempt_crash_recovery(root)
+            if recovered:
+                ok, reason, dirty = git_precheck_shared(root)
+        if not ok:
+            return False, f"precheck failed ({reason})", []
+        
+        # Compute intended paths BEFORE the rename (for drift detection)
+        repo = _git_toplevel(root)
+        if repo is None:
+            return False, "no git repo", []
+        
+        repo_resolved = repo.resolve()
+        group = rel.parts[0]
+        archive_root_path = root / group / ".archive"
+        dest_name = skill_dir.name
+        # Check if dest already exists and would get timestamped
+        dest_path = archive_root_path / dest_name
+        if dest_path.exists():
+            from datetime import datetime, timezone
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+            dest_path = archive_root_path / f"{dest_name}-{stamp}"
+        
+        # Pre-compute ALL files that will be dirty after rename (recursively)
+        intended_pre = []
+        # All files in source dir
+        for item in skill_dir.rglob("*"):
+            if item.is_file():
+                try:
+                    intended_pre.append(str(item.resolve().relative_to(repo_resolved)))
+                except ValueError:
+                    pass
+        # All files in dest dir (mirror structure)
+        for item in skill_dir.rglob("*"):
+            if item.is_file():
+                try:
+                    rel_in_skill = item.relative_to(skill_dir)
+                    dest_file = dest_path / rel_in_skill
+                    intended_pre.append(str(dest_file.resolve(strict=False).relative_to(repo_resolved)))
+                except ValueError:
+                    pass
+        
+        precheck_dirty = (dirty or []) + intended_pre
+        
+        # Perform the rename
+        ok_rename, msg_rename, touched = _archive_shared_skill_impl(
+            skill_dir, shared_root=root
+        )
+        if not ok_rename:
+            return False, msg_rename, []
+        
+        # Build intended list from actual touched paths
+        intended = []
+        for p in touched:
+            try:
+                intended.append(str(p.resolve().relative_to(repo_resolved)))
+            except ValueError:
+                pass
+        
+        snap = snapshot_shared([skill_dir.parent], intended, shared_root=root)
+        if snap is None:
+            # Rollback the rename
+            try:
+                dest = touched[1] if len(touched) > 1 else None
+                if dest and dest.exists():
+                    dest.rename(skill_dir)
+            except OSError:
+                pass
+            return False, "shared snapshot failed (hard gate)", []
+        
+        # Commit the archive operation (pass precheck_dirty for drift detection)
+        ok_commit, msg_commit = commit_shared(
+            f"archive shared skill {skill_dir.name}",
+            touched,
+            precheck_dirty=precheck_dirty,
+            shared_root=root,
+        )
+        if not ok_commit:
+            # Rollback
+            try:
+                dest = touched[1] if len(touched) > 1 else None
+                if dest and dest.exists():
+                    dest.rename(skill_dir)
+            except OSError:
+                pass
+            return False, f"commit failed: {msg_commit}", []
+        
+        return True, f"archived to {touched[1] if len(touched) > 1 else '?'}", touched
+
+
+def _archive_shared_skill_impl(
+    skill_dir: Path,
+    *,
+    shared_root: Optional[Path] = None,
+) -> Tuple[bool, str, List[Path]]:
+    """Implementation of shared skill archival (rename only, no git ops).
+    
+    Used internally by archive_shared_skill after the safety contract is acquired.
     """
     root = shared_root or _shared_root()
     skill_dir = Path(skill_dir)

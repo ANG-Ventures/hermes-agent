@@ -368,6 +368,7 @@ class TestCrashRecovery:
 
 
 class TestSharedArchive:
+    @pytest.mark.live_system_guard_bypass
     def test_archive_moves_in_tree(self, git_env):
         cs = git_env["cs"]
         ok, msg, touched = cs.archive_shared_skill(
@@ -388,6 +389,7 @@ class TestSharedArchive:
         )
         assert not ok
 
+    @pytest.mark.live_system_guard_bypass
     def test_archive_skill_routes_shared_to_in_tree(self, git_env, monkeypatch):
         """tools.skill_usage.archive_skill routes an in-scope shared skill to
         the IN-TREE archive, not the local skills/.archive/."""
