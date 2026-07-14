@@ -248,6 +248,14 @@ def test_completed_record_has_no_attribution_and_terminal_breadcrumb():
 
 def test_lifecycle_trail_orders_spawned_running_cancelled():
     result, gate = _dispatch()
+    # mark_submitted (the "running" breadcrumb) runs on the worker thread;
+    # wait for it so the cancel deterministically lands third in the trail.
+    deadline = time.time() + 5
+    record = _load()["records"][result["delegation_id"]]
+    while time.time() < deadline and not record["attempt"].get("submitted_at"):
+        time.sleep(0.02)
+        record = _load()["records"][result["delegation_id"]]
+    assert record["attempt"].get("submitted_at"), "worker never marked submitted"
     ad.interrupt_for_session(parent_session_id="parent-1", reason="session_end")
     record = _load()["records"][result["delegation_id"]]
     events = [e["event"] for e in record["lifecycle"]]
