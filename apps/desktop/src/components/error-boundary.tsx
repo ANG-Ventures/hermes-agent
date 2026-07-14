@@ -79,8 +79,24 @@ function RootErrorFallback({ error, reset }: ErrorBoundaryFallbackProps) {
   const resetAndRecover = () => {
     const done = () => window.location.reload()
     try {
+      // Preserve the crash record across the flush — clearing localStorage would
+      // otherwise delete the very diagnostic hermes:lastCrash that Reset & recover
+      // is meant to survive (a dev opening devtools afterward would find it gone).
+      let lastCrash: string | null = null
+      try {
+        lastCrash = window.localStorage?.getItem('hermes:lastCrash') ?? null
+      } catch {
+        lastCrash = null
+      }
       window.localStorage?.clear()
       window.sessionStorage?.clear()
+      if (lastCrash !== null) {
+        try {
+          window.localStorage?.setItem('hermes:lastCrash', lastCrash)
+        } catch {
+          // storage unavailable post-clear — best effort
+        }
+      }
       window.indexedDB?.databases?.().then(dbs => {
         for (const db of dbs) {
           if (db.name) window.indexedDB.deleteDatabase(db.name)
