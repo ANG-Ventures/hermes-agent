@@ -80,3 +80,16 @@ class TestFooterConfigKey:
 
         res = set_fn(4, {"key": "footer", "value": "bogus"})
         assert "error" in res
+
+    def test_get_honors_desktop_platform_override(self, monkeypatch):
+        # Global off + desktop override on → status must say "on" (what turns
+        # actually render), not the bare global flag. Greptile P2 on #333.
+        cfg = {
+            "display": {
+                "runtime_footer": {"enabled": False},
+                "platforms": {"desktop": {"runtime_footer": {"enabled": True}}},
+            }
+        }
+        monkeypatch.setattr(server, "_load_cfg", lambda: cfg)
+        res = self._dispatch("config.get")(1, {"key": "footer"})
+        assert res["result"]["value"] == "on"

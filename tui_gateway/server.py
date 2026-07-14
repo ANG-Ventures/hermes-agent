@@ -12416,9 +12416,13 @@ def _(rid, params: dict) -> dict:
         )
         return _ok(rid, {"value": effort, "display": display})
     if key == "footer":
-        cfg = _load_cfg()
-        rf = ((cfg.get("display") or {}).get("runtime_footer") or {})
-        return _ok(rid, {"value": "on" if rf.get("enabled") else "off"})
+        # Resolve through the same merge (global + desktop platform override)
+        # the footer builder uses, so /footer status never disagrees with
+        # what turns actually render (Greptile P2 on #333).
+        from gateway.runtime_footer import resolve_footer_config
+
+        resolved = resolve_footer_config(_load_cfg(), platform_key="desktop")
+        return _ok(rid, {"value": "on" if resolved.get("enabled") else "off"})
     if key == "fast":
         return _ok(
             rid,
