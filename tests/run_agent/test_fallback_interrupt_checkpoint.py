@@ -198,3 +198,55 @@ class TestStopHaltsFallbackLoopingTurn:
             "the stopped turn must not issue further model calls that would "
             f"append more rows; got {len(calls)} calls"
         )
+        # The truncated transcript IS persisted once on the interrupt unwind
+        # (so the halt is durable), but no further per-call persists happen.
+        assert len(persist_calls) >= 1, (
+            "the interrupt unwind must persist the truncated transcript"
+        )
+
+    def test_stop_cleans_up_task_resources(self):
+        """Greptile P1: an early interrupt return bypasses finalize_turn, so the
+        shared unwind must tear down task-scoped resources (open VMs / browser
+        sessions / remote agents) itself — otherwise a /stop mid-turn leaks them.
+        Assert _cleanup_task_resources is called on the checkpoint path."""
+        agent = _make_agent_with_fallback(_FB_CHAIN)
+        agent._api_max_retries = 5
+        cleanup_calls = []
+
+        def fake_api_call(api_kwargs):
+            agent._interrupt_requested = True
+            return _mock_response("", finish_reason="content_filter")
+
+        mock_fb_client = MagicMock()
+        mock_fb_client.api_key = "primary-key-abcdef12"
+        mock_fb_client.base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+        mock_fb_client._custom_headers = None
+        mock_fb_client.default_headers = None
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=fake_api_call),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(
+                agent,
+                "_cleanup_task_resources",
+                side_effect=lambda tid: cleanup_calls.append(tid),
+            ),
+            patch("run_agent.OpenAI", return_value=MagicMock()),
+            patch("agent.agent_runtime_helpers.time.sleep"),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(mock_fb_client, "glm-4.7"),
+            ),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda m, p: m,
+            ),
+            patch("agent.model_metadata.get_model_context_length", return_value=200000),
+        ):
+            agent.run_conversation("hello")
+
+        assert cleanup_calls, (
+            "the interrupt checkpoint must tear down task-scoped resources "
+            "(it bypasses finalize_turn, which normally does this)"
+        )

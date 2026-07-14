@@ -596,24 +596,39 @@ def _return_interrupted(
     api_call_count: int,
     interrupt_text: str,
     *,
+    effective_task_id=None,
     close_tail: bool = True,
 ):
     """Shared interrupt-unwind for the conversation loop.
 
-    Closes any dangling tool tail into an API-valid turn, persists the
-    truncated transcript, clears the cooperative interrupt flag, and returns
-    the standard interrupted result dict. Used by BOTH the top-of-fallback-loop
-    checkpoint and the API-error-branch interrupt handler so the two returns
-    cannot drift. ``interrupt_text`` MUST describe the actual site (the
-    error-branch text names the API error; the loop-top text says "before the
-    next model call") — do NOT reuse the error-branch text at loop-top, where
-    ``error_type``/``api_error`` don't exist.
+    Closes any dangling tool tail into an API-valid turn, tears down any
+    task-scoped resources acquired during the turn (open VMs / browser
+    sessions / remote agents — otherwise a /stop that halts mid-turn leaks
+    them), persists the truncated transcript, clears the cooperative interrupt
+    flag, and returns the standard interrupted result dict. Used by BOTH the
+    top-of-fallback-loop checkpoint and the API-error-branch interrupt handler
+    so the two returns cannot drift.
+
+    Unlike the normal loop exit (`finalize_turn`), an early interrupt `return`
+    from inside the retry loop bypasses the finalizer, so cleanup must be done
+    here — matching the other early returns in this loop (e.g. the
+    content-policy block) that call `_cleanup_task_resources` before returning.
+
+    ``interrupt_text`` MUST describe the actual site (the error-branch text
+    names the API error; the loop-top text says "before the next model call") —
+    do NOT reuse the error-branch text at loop-top, where ``error_type`` /
+    ``api_error`` don't exist.
     """
     close_interrupted_tool_sequence(
         messages,
         interrupt_text,
         interrupted_assistant_tail=close_tail,
     )
+    if effective_task_id is not None:
+        try:
+            agent._cleanup_task_resources(effective_task_id)
+        except Exception:
+            logger.debug("interrupt cleanup: _cleanup_task_resources failed", exc_info=True)
     agent._persist_session(messages, conversation_history)
     agent.clear_interrupt()
     return {
@@ -1275,6 +1290,7 @@ def run_conversation(
                     conversation_history,
                     api_call_count,
                     "Operation interrupted before the next model call (stop requested).",
+                    effective_task_id=effective_task_id,
                     close_tail=True,
                 )
             # ── Nous Portal rate limit guard ──────────────────────
@@ -3264,6 +3280,7 @@ def run_conversation(
                         conversation_history,
                         api_call_count,
                         _interrupt_text,
+                        effective_task_id=effective_task_id,
                         close_tail=True,
                     )
                 
