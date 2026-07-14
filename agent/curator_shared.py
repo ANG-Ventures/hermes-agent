@@ -521,7 +521,12 @@ def archive_shared_skill(
         
         precheck_dirty = (dirty or []) + intended_pre
         
-        # Perform the rename
+        # P1 FIX (Greptile): Take snapshot BEFORE rename (invariant: manifest before mutation)
+        snap = snapshot_shared([skill_dir.parent], intended_pre, shared_root=root)
+        if snap is None:
+            return False, "shared snapshot failed (hard gate)", []
+        
+        # Perform the rename (AFTER snapshot is safe)
         ok_rename, msg_rename, touched = _archive_shared_skill_impl(
             skill_dir, shared_root=root
         )
@@ -535,17 +540,6 @@ def archive_shared_skill(
                 intended.append(str(p.resolve().relative_to(repo_resolved)))
             except ValueError:
                 pass
-        
-        snap = snapshot_shared([skill_dir.parent], intended, shared_root=root)
-        if snap is None:
-            # Rollback the rename
-            try:
-                dest = touched[1] if len(touched) > 1 else None
-                if dest and dest.exists():
-                    dest.rename(skill_dir)
-            except OSError:
-                pass
-            return False, "shared snapshot failed (hard gate)", []
         
         # Commit the archive operation (pass precheck_dirty for drift detection)
         ok_commit, msg_commit = commit_shared(
