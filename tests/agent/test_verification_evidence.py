@@ -417,6 +417,15 @@ def test_effective_cwd_ignores_cd_dash_flags_and_missing_dir(tmp_path):
     assert _effective_cwd(f"cd {tmp_path / 'nope'} && pytest", tmp_path) == tmp_path
 
 
+def test_effective_cwd_relative_cd_with_no_base_falls_back(monkeypatch, tmp_path):
+    # cwd=None + relative target must NOT resolve against the process CWD
+    # (would otherwise credit an unrelated `tests/` dir that happens to exist).
+    # Chdir into a dir that HAS a `tests/` subdir to make the bug observable.
+    (tmp_path / "tests").mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert _effective_cwd("cd tests && pytest", None) is None
+
+
 def test_cd_prefixed_pytest_credits_the_repo_root_and_clears_stale(tmp_path, monkeypatch):
     """The false-positive fix, end to end.
 

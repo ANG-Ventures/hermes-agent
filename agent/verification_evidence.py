@@ -161,7 +161,12 @@ def _effective_cwd(command: str, cwd: str | Path | None) -> str | Path | None:
         return cwd
     try:
         candidate = Path(target).expanduser()
-        if not candidate.is_absolute() and cwd is not None:
+        if not candidate.is_absolute():
+            # A relative `cd` is only meaningful against a known base cwd.
+            # With no base, resolving would fall through to the process CWD and
+            # could credit an unrelated dir — fall back to the (None) cwd instead.
+            if cwd is None:
+                return cwd
             candidate = Path(cwd) / candidate
         candidate = candidate.resolve()
     except (OSError, ValueError, RuntimeError):
