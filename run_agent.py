@@ -2031,17 +2031,18 @@ class AIAgent:
                 ):
                     if msg.get("role") == "tool":
                         # Suppress ONLY when the owning assistant(tool_calls) is
-                        # also being suppressed this flush; otherwise the owner is
-                        # already durable and this result must land (no orphan).
+                        # also being suppressed (this or any prior drain flush);
+                        # otherwise the owner is already durable and this result
+                        # must land (no orphan).
                         if msg.get("tool_call_id") in _suppressed_tool_call_ids:
                             _suppressed_superseded_rows += 1
                             continue
                         # else: owner already persisted → let the result through.
-                    else:
-                        # assistant / content rows: suppress. If it carries
+                    elif msg.get("role") == "assistant":
+                        # The zombie's continued content: suppress. If it carries
                         # tool_calls, record their ids so the matching results
-                        # (later in this same NEW-row set) are suppressed too,
-                        # keeping the pair atomic.
+                        # (this or a later drain flush) are suppressed too,
+                        # keeping the pair atomic (agent-scoped set, B1′).
                         _tcs = msg.get("tool_calls")
                         if isinstance(_tcs, list):
                             for _tc in _tcs:
@@ -2053,6 +2054,17 @@ class AIAgent:
                                     _suppressed_tool_call_ids.add(_tcid)
                         _suppressed_superseded_rows += 1
                         continue
+                    else:
+                        # 🔴 FAIL-OPEN on any OTHER role (user/system/unexpected):
+                        # a zombie turn only ever writes assistant + tool rows, so
+                        # a NEW user/system row here is anomalous — and dropping a
+                        # real user message would be data loss (I5). Persist it
+                        # normally; log for diagnosability. Greptile-P2.
+                        logger.debug(
+                            "persist gate: superseded turn produced an unexpected "
+                            "new %r row for session %s — persisting (fail-open)",
+                            msg.get("role"), getattr(self, "session_id", "?"),
+                        )
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
                 _row_timestamp = msg.get("timestamp")

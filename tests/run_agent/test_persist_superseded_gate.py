@@ -347,4 +347,36 @@ def _as_list(v):
     return v if isinstance(v, list) else []
 
 
+def test_unexpected_new_user_row_fails_open_during_supersede():
+    """Greptile-P2 / I5: a superseded turn only ever writes assistant + tool
+    rows. If an anomalous NEW `user` (or system) row reaches the gate, it must
+    FAIL OPEN and persist — dropping a real user message would be data loss."""
+    from hermes_state import SessionDB
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = SessionDB(db_path=Path(tmpdir) / "t.db")
+        try:
+            agent = _make_agent(db)
+            agent._flush_messages_to_session_db([{"role": "user", "content": "q"}])
+
+            agent._persist_superseded = True
+            messages = [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": "zombie continuation"},   # suppressed
+                {"role": "user", "content": "REAL new user message"},       # must persist
+            ]
+            agent._flush_messages_to_session_db(messages)
+
+            contents = [r["content"] for r in _rows(db)]
+            assert "REAL new user message" in contents, (
+                "an unexpected new user row must fail OPEN (never drop a real user message)"
+            )
+            assert "zombie continuation" not in contents, (
+                "the assistant zombie row must still be suppressed"
+            )
+        finally:
+            db.close()
+
+
+
 
