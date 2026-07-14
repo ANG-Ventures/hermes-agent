@@ -19829,13 +19829,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # outlives the slot. Idempotent: pop-on-absent is harmless, so a reaper eviction
         # racing this finally double-releases safely (AC-10).
         getattr(self, "_running_agent_tasks", {}).pop(session_key, None)
-        # Clear a DRAINING-turn marker ONLY when its task has actually finished.
-        # /stop calls this release immediately after registering the drain (task
-        # still not-done) — popping unconditionally here would erase the marker
-        # the instant it's set, defeating the /undo guard. The turn's OWN exit
-        # re-enters this method with a done() task, which is when the drain is
-        # genuinely over and the marker should clear. (Prune-on-access in the
-        # /undo·/redo guard is the belt-and-suspenders for any missed exit.)
+        # Clear a DRAINING-turn marker ONLY when its task is None or actually
+        # done(). /stop calls this release immediately after registering the
+        # drain (task still not-done) — popping unconditionally here would erase
+        # the marker the instant it's set, defeating the /undo guard, so the
+        # not-done entry is preserved.
+        #
+        # Lifecycle note (Greptile #339 P2): the draining turn's OWN finally
+        # re-enters this method, but `Task.done()` is still False *inside* that
+        # finally (the coroutine hasn't returned yet), so this block does NOT
+        # clear the entry on the stopped turn's own unwind. Cleanup therefore
+        # happens via two other paths: (1) PRIMARY — prune-on-access in
+        # `_session_turn_draining` (the /undo·/redo guard) pops a done entry the
+        # next time either command runs; (2) the NEXT turn for the same session
+        # completes and re-enters here with the (now truly done) task → cleared.
+        # Net: in active sessions accumulation is bounded to a single
+        # (session_key → done-Task) entry; a session that is /stop'd and then
+        # goes dormant retains one stale entry until its next turn/undo — a
+        # bounded, harmless leak (the guard prunes it on the next access).
         try:
             _draining = getattr(self, "_draining_turns", None)
             if _draining is not None:
