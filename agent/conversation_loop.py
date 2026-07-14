@@ -2458,14 +2458,17 @@ def run_conversation(
                         _agg_cost_model = _agg_slot["model"]
                         _agg_cost_provider = _agg_slot.get("provider") or agent.provider
                         _agg_cost_base_url = _agg_slot.get("base_url") or agent.base_url
-                        if _turn_call is not None:
-                            _turn_call["pricing_calls"] = _build_moa_pricing_calls(
-                                _moa_ref_pricing_calls,
-                                aggregator_usage,
-                                aggregator_model=_agg_cost_model,
-                                aggregator_provider=_agg_cost_provider,
-                                aggregator_base_url=_agg_cost_base_url,
-                            )
+                        try:
+                            if _turn_call is not None:
+                                _turn_call["pricing_calls"] = _build_moa_pricing_calls(
+                                    _moa_ref_pricing_calls,
+                                    aggregator_usage,
+                                    aggregator_model=_agg_cost_model,
+                                    aggregator_provider=_agg_cost_provider,
+                                    aggregator_base_url=_agg_cost_base_url,
+                                )
+                        except Exception:
+                            pass  # telemetry must never break the conversation loop
                     cost_result = estimate_usage_cost(
                         _agg_cost_model,
                         aggregator_usage,

@@ -54,6 +54,9 @@ def compute_turn_cost(
     pricing_calls: list[dict] = []
     for call in calls:
         nested = call.get("pricing_calls") if isinstance(call, dict) else None
+        # An explicitly empty list intentionally falls through to the outer
+        # call: nonzero usage with missing physical attribution must remain
+        # unknown, never be silently reclassified as included/$0.
         if isinstance(nested, list) and nested:
             pricing_calls.extend(item for item in nested if isinstance(item, dict))
         elif isinstance(call, dict):
