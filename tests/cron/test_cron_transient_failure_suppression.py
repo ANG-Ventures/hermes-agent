@@ -107,6 +107,28 @@ def test_summarizer_names_pool_at_capacity():
     assert "RuntimeError" not in msg
 
 
+def test_summarizer_recurring_capacity_says_retrying():
+    msg = sched._summarize_cron_failure_for_delivery(RECURRING_JOB, NO_ELIGIBLE_SUB)
+    assert "retrying on the next scheduled tick" in msg.lower()
+    assert "will not retry" not in msg.lower()
+
+
+def test_summarizer_oneshot_capacity_says_no_auto_retry():
+    # A one-shot capacity failure is NOT suppressed and does NOT self-heal —
+    # the message must not falsely promise a retry (Greptile P1).
+    msg = sched._summarize_cron_failure_for_delivery(ONESHOT_JOB, NO_ELIGIBLE_SUB)
+    assert "provider capacity" in msg.lower()
+    assert "will not retry automatically" in msg.lower()
+    assert "retrying on the next scheduled tick" not in msg.lower()
+
+
+def test_summarizer_bare_quota_gets_quota_framing():
+    # A standalone "quota" error (no 429/rate-limit wording) must still get the
+    # provider-quota-limit framing, not fall through to generic text (P2).
+    msg = sched._summarize_cron_failure_for_delivery(RECURRING_JOB, "QuotaExceededError: over the limit")
+    assert "quota limit" in msg.lower()
+
+
 def test_summarizer_still_handles_real_defect_generically():
     msg = sched._summarize_cron_failure_for_delivery(RECURRING_JOB, REAL_DEFECT)
     assert "provider capacity" not in msg.lower()

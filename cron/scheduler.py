@@ -153,14 +153,22 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             if "pool at capacity" in lower
             else "Claude sub pool capped (no un-capped subscription available)"
         )
+        # Only a recurring job self-heals on the next tick; a one-shot /
+        # finite-repeat capacity failure (never suppressed) must NOT be told it
+        # will retry automatically, or the operator delays manual intervention.
+        retry_note = (
+            "Transient; retrying on the next scheduled tick. "
+            if _job_is_recurring(job)
+            else "Transient; this job will not retry automatically. "
+        )
         return (
             f"⚠️ Cron '{job_name}' failed: provider capacity — {cap}. "
-            "Transient; retrying on the next scheduled tick. "
+            f"{retry_note}"
             "Full details saved in cron output."
         )
 
     # Provider/API failures are the common noisy path. Keep these short.
-    if "429" in text or "rate limit" in lower or "usage limit" in lower:
+    if "429" in text or "rate limit" in lower or "usage limit" in lower or "quota" in lower:
         reason = "rate limit"
         if "weekly usage limit" in lower:
             reason = "weekly usage limit"
