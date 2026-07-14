@@ -2404,7 +2404,7 @@ def run_conversation(
                     # stomp each other's accumulator.
                     _turn_call = None
                     try:
-                        _turn_call = {
+                        _turn_calls.append({
                             "input_tokens": canonical_usage.input_tokens,
                             "output_tokens": canonical_usage.output_tokens,
                             "cache_read_tokens": canonical_usage.cache_read_tokens,
@@ -2415,8 +2415,8 @@ def run_conversation(
                             "total_tokens": total_tokens,
                             "latency_s": api_duration,
                             "composition": _call_composition,
-                        }
-                        _turn_calls.append(_turn_call)
+                        })
+                        _turn_call = _turn_calls[-1]
                     except Exception:
                         pass  # telemetry must never break the conversation loop
 
