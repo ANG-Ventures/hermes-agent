@@ -2451,6 +2451,7 @@ export const ja = defineLocale({
     boundaryTitle: 'インターフェイスで問題が発生しました',
     boundaryDesc: 'ビューで予期しないエラーが発生しました。チャットと設定は安全です。',
     reloadWindow: 'ウィンドウを再読み込み',
+    resetAndRecover: 'リセットして復旧',
     openLogs: 'ログを開く'
   },
 
