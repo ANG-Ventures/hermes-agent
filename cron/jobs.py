@@ -858,9 +858,57 @@ def load_jobs() -> List[Dict[str, Any]]:
     )
 
 
+def _guard_against_test_write_to_live_store(jobs_file: Path) -> None:
+    """Refuse to write the cron store to the REAL production home under a test.
+
+    A test/e2e harness that imports ``cron.jobs`` while ``HERMES_HOME`` points at
+    the real ``~/.hermes`` (e.g. a real-agent blackbox session or a kanban worker
+    booted from a worktree that shares the live home, running the cron test suite
+    outside pytest's hermetic conftest) would otherwise write its fixture jobs
+    (``name=brief``/``claim job``/``paused job``, one-word prompts) straight into
+    the LIVE ``cron/jobs.json`` — re-arming cron-config-lint and paging
+    cron-health (2026-07-15 incident, recurred after the import-freeze fix
+    because the harness runs with the live home, not a stale snapshot).
+
+    We fire ONLY when ``PYTEST_CURRENT_TEST`` is set (a genuine test context) AND
+    the resolved store is the platform-default production cron store AND no
+    explicit ``use_cron_store()`` override is active. Production writes (no
+    ``PYTEST_CURRENT_TEST``) and correctly-isolated tests (store in a tempdir)
+    are unaffected — the guard's whole job is to make a bypassed-conftest leak
+    fail LOUD instead of silently corrupting the live store.
+    """
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    if _cron_store_override.get() is not None:
+        return  # an explicit use_cron_store() scope is a deliberate target
+    try:
+        from hermes_constants import _get_platform_default_hermes_home
+        # Anchor on the PLATFORM-NATIVE home (``~/.hermes``), NOT get_hermes_home()
+        # / get_default_hermes_root() — those follow the HERMES_HOME env, so a
+        # correctly-isolated test (HERMES_HOME=tempdir) would look like "prod" to
+        # them. The platform default is the real production store regardless of
+        # any env override, which is exactly the store we must never let a test
+        # corrupt.
+        prod_jobs_file = _get_platform_default_hermes_home().resolve() / "cron" / "jobs.json"
+        if jobs_file.resolve() == prod_jobs_file:
+            raise RuntimeError(
+                "Refusing to write the cron store to the LIVE production home "
+                f"({jobs_file}) from a pytest context ({os.environ.get('PYTEST_CURRENT_TEST')}). "
+                "This is a test/e2e harness bypassing HERMES_HOME isolation — "
+                "redirect HERMES_HOME to a tempdir (pytest's autouse hermetic "
+                "fixture) or wrap the write in use_cron_store(tmp_home)."
+            )
+    except RuntimeError:
+        raise
+    except Exception:
+        # Root discovery is best-effort; never block a legitimate write on it.
+        return
+
+
 def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
     """Save all jobs to storage. Caller must hold _jobs_lock()."""
     jobs_file = _current_cron_store().jobs_file
+    _guard_against_test_write_to_live_store(jobs_file)
     ensure_dirs()
     fd, tmp_path = tempfile.mkstemp(dir=str(jobs_file.parent), suffix='.tmp', prefix='.jobs_')
     try:
