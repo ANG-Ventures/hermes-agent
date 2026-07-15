@@ -928,6 +928,13 @@ def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
 
 def save_jobs(jobs: List[Dict[str, Any]]):
     """Save all jobs to storage."""
+    # Fire the test-context guard BEFORE acquiring _jobs_lock() (which calls
+    # ensure_dirs() and touches the advisory .jobs.lock). This keeps a blocked
+    # leak from leaving ANY filesystem side effect in the target home, not just
+    # from skipping the jobs.json write. _save_jobs_unlocked re-checks as the
+    # shared chokepoint for the other (non-save_jobs) write paths; the guard is
+    # idempotent and cheap so the double-check is harmless.
+    _guard_against_test_write_to_live_store(_current_cron_store().jobs_file)
     with _jobs_lock():
         _save_jobs_unlocked(jobs)
 

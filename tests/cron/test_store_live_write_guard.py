@@ -74,3 +74,23 @@ def test_production_write_no_pytest_context_is_a_noop(monkeypatch):
     jobs_mod._guard_against_test_write_to_live_store(
         Path("/Users/someone/.hermes/cron/jobs.json")
     )
+
+
+def test_blocked_leak_leaves_no_filesystem_side_effect(tmp_path, monkeypatch):
+    """A blocked save_jobs must NOT create cron/ or the advisory lock in the
+    target home — the guard fires BEFORE _jobs_lock()/ensure_dirs()."""
+    # Simulate a non-temp home by monkeypatching the store to a non-temp path.
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_guard (call)")
+    monkeypatch.setattr(
+        jobs_mod, "_current_cron_store",
+        lambda: jobs_mod._CronStorePaths(
+            Path("/Users/nobody/.hermes/cron"),
+            Path("/Users/nobody/.hermes/cron/jobs.json"),
+            Path("/Users/nobody/.hermes/cron/output"),
+        ),
+    )
+    with pytest.raises(RuntimeError, match="NON-TEMP home"):
+        jobs_mod.save_jobs([{"id": "leak", "prompt": "brief", "name": "brief"}])
+    # The non-temp home must not have been created as a side effect.
+    assert not Path("/Users/nobody/.hermes").exists()
+
