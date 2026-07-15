@@ -27,11 +27,14 @@ logger = logging.getLogger(__name__)
 def _is_transient_db_busy(exc: BaseException) -> bool:
     """True for the SQLite lock/busy class — a transient, retryable condition.
 
-    Mirrors the discrimination in ``SessionDB._execute_write``: only ``locked``/
-    ``busy`` errors are treated as transient. Everything else (schema errors,
-    logic bugs) is a real fault and must NOT be reported to the user as a
-    transient "try again".
+    Mirrors the discrimination in ``SessionDB._execute_write`` (and its sibling
+    ``hermes_undo._is_transient_redo_error``): only a ``sqlite3.OperationalError``
+    whose message names ``locked``/``busy`` is transient. Anything else (schema
+    errors, logic bugs, non-DB exceptions) is a real fault and must NOT be
+    reported to the user as a transient "try again".
     """
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
     msg = str(exc).lower()
     return "locked" in msg or "busy" in msg
 
@@ -2958,11 +2961,12 @@ class SessionStore:
         exception into ``None`` → "Nothing to undo." with only a DEBUG log):
         - a real result dict (has ``rewound_ids``) — success.
         - ``None`` — a genuine, healthy empty (nothing to rewind).
-        - ``{"status": "busy"}`` — a transient lock/busy DB error (rare under WAL,
-          kept as defense-in-depth); render "try again", never "nothing to undo".
-        - ``{"status": "error"}`` — any other exception (e.g. the orphan-guard
-          ValueError, or a real bug); render a distinct internal-error message,
-          logged at ERROR, never "nothing to undo".
+        - ``{"status": "busy"}`` — a RETRYABLE condition: a transient lock/busy
+          DB error, OR the orphan-guard ``RewindWouldOrphanError`` (a mid-flush
+          race that self-heals); render "try again", never "nothing to undo".
+        - ``{"status": "error"}`` — any OTHER exception (a genuine bug, a
+          non-lock ``OperationalError``); render a distinct internal-error
+          message, logged at ERROR, never "nothing to undo".
         Every non-success outcome is safe to call "nothing was changed" because
         ``rewind_to_message`` validates + orphan-guards BEFORE its single write,
         so a raise from that path means no mutation occurred.
@@ -3031,9 +3035,15 @@ class SessionStore:
     def restore_session(self, session_id: str, n: int = 1) -> Optional[Dict[str, Any]]:
         """Redo ``n`` undo operations via the shared undo core.
 
-        Same four-outcome honesty contract as :meth:`rewind_session` (see there):
-        real result | ``None`` (healthy empty) | ``{"status": "busy"}`` |
-        ``{"status": "error"}``.
+        Honesty contract (parallels :meth:`rewind_session` but note: ``redo()``
+        never returns ``None`` for a healthy empty — it returns a real dict with
+        ``reactivated_count == 0``, which the caller renders as "nothing to
+        redo"). Outcomes:
+        - a real result dict (``reactivated_count`` present) — success OR a
+          healthy empty (count 0) OR an honest partial (``partial_retryable``).
+        - ``{"status": "busy"}`` — a RETRYABLE lock/busy DB error.
+        - ``{"status": "error"}`` — a genuine bug / non-lock error (logged ERROR).
+        - ``None`` — only when there is no DB handle at all.
         """
         if not self._db:
             return None

@@ -2938,10 +2938,10 @@ class GatewaySlashCommandsMixin:
         )
         # If only SOME ops were redone (a transcript rewrite or a mid-loop
         # transient/hard error), surface the honest partial note the undo core
-        # produced instead of implying a full redo.
+        # produced instead of implying a full redo. Detect via the language-
+        # neutral ``partial`` flag, not the (English) message text.
         partial_note = str(result.get("message") or "")
-        if partial_note and (result.get("partial_retryable") is not None
-                             or "can't be redone" in partial_note):
+        if result.get("partial") and partial_note:
             base = f"{base}\n⚠️ {partial_note}"
         return base + self._undo_tail_suffix(session_entry.session_id)
 

@@ -437,6 +437,8 @@ def redo(session_id: str, m: int) -> Dict[str, Any]:
         "prefill_text": None,
     }
     if transcript_changed:
+        result["partial"] = True
+        result["partial_retryable"] = False  # transcript rewrite: the rest can't be redone
         result["message"] = (
             f"redid {ops_redone} operation(s); the rest can't be redone "
             "(transcript changed since undo)"
@@ -445,6 +447,7 @@ def redo(session_id: str, m: int) -> Dict[str, Any]:
         # Earlier ops committed; a later op hit a TRANSIENT error and was pushed
         # back onto the stack (recoverable). Report the partial honestly and flag
         # it retryable so the caller can tell the user "the rest can be retried".
+        result["partial"] = True
         result["partial_retryable"] = True
         result["message"] = (
             f"redid {ops_redone} operation(s); the rest hit a transient error — "
@@ -455,6 +458,7 @@ def redo(session_id: str, m: int) -> Dict[str, Any]:
         # bug). The failed op is on the stack but retrying would re-fail
         # identically — do NOT promise retryability. Report the partial + that
         # the rest failed and was logged (RC1: don't mislabel a bug as transient).
+        result["partial"] = True
         result["partial_retryable"] = False
         result["message"] = (
             f"redid {ops_redone} operation(s); the rest hit an error and was "
