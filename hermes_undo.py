@@ -336,7 +336,7 @@ def redo(session_id: str, m: int) -> Dict[str, Any]:
         try:
             reactivated = db.restore_ids(session_id, op.rewound_ids)
         except Exception as exc:
-            # 🔴 A write for THIS op raised. redo() does one _execute_write PER op,
+            # 🔴 A write for THIS op raised. redo() does one DB write PER op,
             # so if an EARLIER op already committed, its rows are live in the DB —
             # we must NOT let the exception unwind into restore_session as
             # "nothing changed" (that would desync the screen and let a retry
