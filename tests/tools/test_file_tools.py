@@ -5,6 +5,8 @@ handling without requiring a running terminal environment.
 """
 
 import json
+import pytest
+import os
 import logging
 from unittest.mock import MagicMock, patch
 
@@ -52,7 +54,7 @@ class TestWriteFileHandler:
         from tools.file_tools import write_file_tool
         result = json.loads(write_file_tool("/tmp/out.txt", "hello world!\n"))
         assert result["status"] == "ok"
-        mock_ops.write_file.assert_called_once_with("/tmp/out.txt", "hello world!\n")
+        mock_ops.write_file.assert_called_once_with(os.path.realpath("/tmp/out.txt"), "hello world!\n")
 
     @patch("tools.file_tools._get_file_ops")
     def test_permission_error_returns_error_json_without_error_log(self, mock_get, caplog):
@@ -143,7 +145,7 @@ class TestPatchHandler:
             old_string="foo", new_string="bar"
         ))
         assert result["status"] == "ok"
-        mock_ops.patch_replace.assert_called_once_with("/tmp/f.py", "foo", "bar", False)
+        mock_ops.patch_replace.assert_called_once_with(os.path.realpath("/tmp/f.py"), "foo", "bar", False)
 
 
     @patch("tools.file_tools._get_file_ops")
@@ -429,8 +431,19 @@ class TestSearchHints:
 class TestSensitivePathCheck:
     """Verify that _check_sensitive_path blocks writes to protected locations."""
 
-    def test_hermes_config_blocked_for_write_file(self, tmp_path, monkeypatch):
-        fake_config = tmp_path / "config.yaml"
+    @pytest.fixture
+    def safe_dir(self, tmp_path):
+        # pytest's tmp_path is under /private/var/folders on macOS, which
+        # _check_sensitive_path treats as a sensitive system prefix -- that
+        # branch fires before the Hermes-config check, masking the config-block
+        # message these tests assert. Use a non-sensitive tmp subdir instead.
+        import os
+        import tempfile
+        d = os.path.realpath(tempfile.mkdtemp(prefix="hermes_cfgtest_", dir="/tmp"))
+        return __import__("pathlib").Path(d)
+
+    def test_hermes_config_blocked_for_write_file(self, safe_dir, monkeypatch):
+        fake_config = safe_dir / "config.yaml"
         monkeypatch.setattr("tools.file_tools._hermes_config_resolved", str(fake_config))
         monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", True)
 
@@ -439,8 +452,8 @@ class TestSensitivePathCheck:
         assert "error" in result
         assert "Hermes config" in result["error"]
 
-    def test_hermes_config_blocked_via_tilde_path(self, tmp_path, monkeypatch):
-        fake_config = tmp_path / "config.yaml"
+    def test_hermes_config_blocked_via_tilde_path(self, safe_dir, monkeypatch):
+        fake_config = safe_dir / "config.yaml"
         monkeypatch.setattr("tools.file_tools._hermes_config_resolved", str(fake_config))
         monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", True)
 
@@ -615,10 +628,17 @@ class TestSilentFileMisplacementE2E:
     makes the resolved path correct.
     """
 
-    def test_relative_write_after_env_cleanup_lands_in_user_cwd(self, tmp_path, monkeypatch):
+    def test_relative_write_after_env_cleanup_lands_in_user_cwd(self, monkeypatch):
+        import tempfile
         import tools.terminal_tool as tt
         import tools.file_tools as ft
 
+        # macOS pytest tmp_path is under /private/var/folders, which
+        # _check_sensitive_path blocks -- a relative write resolved against a
+        # cwd there is refused before it lands. Use a non-sensitive base dir.
+        tmp_path = __import__("pathlib").Path(
+            os.path.realpath(tempfile.mkdtemp(prefix="hermes_cwdtest_", dir="/tmp"))
+        )
         project = tmp_path / "project"
         config_default = tmp_path / "config_default"
         project.mkdir()
