@@ -7098,7 +7098,7 @@ def check_respawn_guard(
         pr_urls.extend(match.group(0) for match in _RESPAWN_GUARD_PR_URL_RE.finditer(body))
     if pr_urls:
         resolver = pr_state_resolver or _PrStateResolver()
-        for url in pr_urls:
+        for url in dict.fromkeys(pr_urls):
             parsed = _parse_github_pr_url(url)
             if parsed is None:
                 return "active_pr"

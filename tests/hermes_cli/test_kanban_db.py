@@ -2196,6 +2196,33 @@ def test_respawn_guard_clears_when_all_recent_prs_closed(kanban_home, monkeypatc
         assert kb.check_respawn_guard(conn, task_id) is None
 
 
+def test_respawn_guard_deduplicates_repeated_pr_urls(kanban_home, monkeypatch):
+    calls = []
+    resolver = kb._PrStateResolver()
+    monkeypatch.setattr(
+        resolver,
+        "resolve",
+        lambda repo, number: calls.append((repo, number)) or "CLOSED",
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="quoted merged PR", assignee="alice")
+        for author in ("worker", "orchestrator"):
+            kb.add_comment(
+                conn,
+                task_id,
+                author,
+                "Continue after https://github.com/o/r/pull/1",
+            )
+        assert kb.check_respawn_guard(
+            conn,
+            task_id,
+            pr_state_resolver=resolver,
+        ) is None
+
+    assert calls == [("o/r", 1)]
+
+
 def test_dispatch_pr_query_budget_is_shared_across_tick(
     kanban_home, all_assignees_spawnable, monkeypatch
 ):
