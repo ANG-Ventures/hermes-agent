@@ -858,9 +858,57 @@ def load_jobs() -> List[Dict[str, Any]]:
     )
 
 
+def _guard_against_test_write_to_live_store(jobs_file: Path) -> None:
+    """Refuse a TEST-context cron write that targets a NON-TEMP (real) store.
+
+    A test/e2e harness that imports ``cron.jobs`` while ``HERMES_HOME`` points at
+    the real ``~/.hermes`` (a real-agent blackbox session, or a kanban worker
+    booted from a worktree that shares the live home, running the cron test suite
+    OUTSIDE pytest's hermetic conftest) would write its fixture jobs
+    (``name=brief``/``claim job``/``paused job``, one-word prompts) straight into
+    the LIVE ``cron/jobs.json`` — re-arming cron-config-lint and paging
+    cron-health (2026-07-15 incident; recurred after the import-freeze fix
+    because the harness runs with the live home, not a stale snapshot).
+
+    Discriminator: a correctly-isolated test ALWAYS writes under the system temp
+    dir (pytest's ``tmp_path`` lives under ``tempfile.gettempdir()`` — ``/tmp``,
+    ``/var/folders``, ``/private/tmp``). The leak writes to a NON-temp home. So
+    we fire ONLY when ``PYTEST_CURRENT_TEST`` is set (a genuine test context),
+    no explicit ``use_cron_store()`` override is active, AND the target is NOT
+    under the system temp dir. This is env-independent (unlike a ``Path.home()``
+    check, which well-behaved tests legitimately monkeypatch to a tmp home), so
+    it never false-fires on an isolated test while still catching the real leak.
+    """
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    if _cron_store_override.get() is not None:
+        return  # an explicit use_cron_store() scope is a deliberate target
+    try:
+        target = jobs_file.resolve()
+        tmp_root = Path(tempfile.gettempdir()).resolve()
+        try:
+            target.relative_to(tmp_root)
+            return  # under the system temp dir → a correctly-isolated test
+        except ValueError:
+            pass
+        raise RuntimeError(
+            f"Refusing to write the cron store to a NON-TEMP home ({jobs_file}) "
+            f"from a pytest context ({os.environ.get('PYTEST_CURRENT_TEST')}). "
+            "This is a test/e2e harness bypassing HERMES_HOME isolation — "
+            "redirect HERMES_HOME to a tmp_path (pytest's autouse hermetic "
+            "fixture) or wrap the write in use_cron_store(tmp_home)."
+        )
+    except RuntimeError:
+        raise
+    except Exception:
+        # Temp-dir discovery is best-effort; never block a legitimate write.
+        return
+
+
 def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
     """Save all jobs to storage. Caller must hold _jobs_lock()."""
     jobs_file = _current_cron_store().jobs_file
+    _guard_against_test_write_to_live_store(jobs_file)
     ensure_dirs()
     fd, tmp_path = tempfile.mkstemp(dir=str(jobs_file.parent), suffix='.tmp', prefix='.jobs_')
     try:
