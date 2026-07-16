@@ -283,6 +283,9 @@ def test_flush_guard_clamps_overshooting_cursor():
         def append_message(self, **kw):
             self.rows.append(kw)
 
+        def recompute_effective_last_active(self, _session_id):
+            pass
+
     agent = _bare_agent()
     agent._session_db = _DB()
     agent._session_db_created = True
