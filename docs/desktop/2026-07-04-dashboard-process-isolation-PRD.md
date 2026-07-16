@@ -284,6 +284,29 @@ their in-memory histories) moved wholesale behind a pipe:
 - STOP conditions evaluated: `delta_relay_p99_over_50ms=false`,
   `interrupt_over_2x_in_process=false`, `cold_start_over_5s=false`.
 
+#### Phase 0 rerun results — Daedalus, 2026-07-16
+
+- Base: current `fork/main` at `b666f803b1eabff282793d84274b5500e35fc97a`, using
+  `~/.hermes/runtime/hermes-agent/venv/bin/python` with the existing
+  `scripts/compute_host_phase0_spike.py` harness.
+- Workload: 2 seeded sessions, 3 turns per session, 1 streaming-heavy turn per
+  session, and 616 host delta samples.
+- Delta relay p99 (milliseconds): direct/in-process `0.000738 ms`; host
+  `0.076344 ms`; process-boundary overhead `0.075606 ms` (**PASS**, stop
+  threshold `>50 ms`).
+- RSS (megabytes): baseline driver `22.328125 MB`; host peak `19.687500 MB`;
+  host delta versus baseline `-2.640625 MB` (no RSS expansion observed).
+- Spawn cold-start: `52.579875 ms` (**PASS**, stop threshold `>5000 ms`).
+- Interrupt-over-pipe: direct end-to-end `6.023625 ms`; host ack `0.070208 ms`;
+  host end-to-end `24.528375 ms`; host/direct ratio `4.072029x` (**STOP**, stop
+  threshold `>2x`).
+- HOL isolation: fast-session solo p99 `0.058967 ms`; fast-session p99 with a
+  slow sibling consumer `0.058337 ms`; delta `-0.000630 ms`; the slow consumer
+  dropped/coalesced 197 deltas.
+- STOP conditions evaluated: `delta_relay_p99_over_50ms=false`,
+  `interrupt_over_2x_in_process=true`, `cold_start_over_5s=false`. The interrupt
+  ratio triggered the Phase 0 stop gate.
+
 ### Phase 1 — Supervisor + worker (flag-gated)
 - `tui_gateway/turn_worker.py` (worker main: agent init from session-key, frame loop) +
   `tui_gateway/turn_supervisor.py` (spawn/registry/reap/relay). Dispatch-site flag switch
