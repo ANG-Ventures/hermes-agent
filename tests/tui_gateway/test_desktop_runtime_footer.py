@@ -109,3 +109,21 @@ class TestFooterConfigKey:
         monkeypatch.setattr(server, "_load_cfg", lambda: cfg)
         res = self._dispatch("config.get")(1, {"key": "footer"})
         assert res["result"]["value"] == "on"
+
+
+class TestFooterIsMetadataNotText:
+    """2026-07-15: footer must ride message.complete as payload["footer"], never
+    appended to payload["text"] — a text-baked footer broke the desktop's
+    streamed-vs-final dedupe (every message duplicated) and was washed away by
+    the session-sync poll (DB rows carry no footer)."""
+
+    def test_complete_payload_shape(self):
+        import re
+
+        src = open("tui_gateway/server.py").read()
+        block = src[src.index('payload = {"text": raw, "usage"'):]
+        block = block[:block.index('_emit("message.complete"')]
+        assert 'payload["footer"] = footer' in block
+        assert not re.search(r'raw\s*=\s*f?"?\{raw\}.*footer', block), (
+            "footer must not be concatenated into the text payload"
+        )
