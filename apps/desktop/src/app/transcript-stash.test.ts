@@ -8,6 +8,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 
 import type { ChatMessage } from '@/lib/chat-messages'
 
+import { MAX_PRELOAD } from './transcript-preload'
 import {
   clearStashedTranscripts,
   cullStashedTranscript,
@@ -47,10 +48,11 @@ describe('transcript-stash', () => {
     expect(stashedTranscriptCount()).toBe(0)
   })
 
-  it('holds the whole boot preload set (12) plus visited sessions without eviction', () => {
+  it('holds the whole boot preload set plus visited sessions without eviction', () => {
     // The cap exists to KEEP the preload set resident — regression guard for
-    // sizing it below MAX_PRELOAD + a working set of clicks.
-    expect(MAX_STASH_ENTRIES).toBeGreaterThanOrEqual(16)
+    // sizing it below MAX_PRELOAD + a working set of clicks. Machine-checked
+    // against the actual preload constant, not a hardcoded floor.
+    expect(MAX_STASH_ENTRIES).toBeGreaterThanOrEqual(MAX_PRELOAD + 4)
   })
 
   it('evicts the least-recently-used entry past the cap', () => {

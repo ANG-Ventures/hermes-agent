@@ -31,7 +31,7 @@ export const SHIKI_COLOR_REPLACEMENTS: Record<string, Record<string, string>> = 
 // of a given fence pays the async tokenize (plain-first once, then cached for
 // the app run). Shiki output is trusted static HTML from our own tokenizer over
 // already-escaped code — the standard shiki consumption pattern.
-const MAX_HTML_ENTRIES = 400
+export const MAX_HTML_ENTRIES = 400
 
 const htmlCache = new Map<string, string>()
 
@@ -70,6 +70,14 @@ export function clearShikiHtmlCache(): void {
 /** Test introspection. */
 export function shikiHtmlCacheSize(): number {
   return htmlCache.size
+}
+
+/**
+ * Test-only: seed the cache directly to exercise the LRU boundary without
+ * driving the async hook N times. Not used by the render path.
+ */
+export function seedShikiHtmlCacheForTest(language: string, code: string, html: string): void {
+  cacheSet(`${resolveLanguage(language)}\u0000${code}`, html)
 }
 
 function resolveLanguage(language: string | undefined): string {

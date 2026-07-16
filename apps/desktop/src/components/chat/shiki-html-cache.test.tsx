@@ -15,7 +15,13 @@ vi.mock('shiki', () => ({
 
 import { codeToHtml } from 'shiki'
 
-import { clearShikiHtmlCache, shikiHtmlCacheSize, useCachedShikiHtml } from './shiki-html-cache'
+import {
+  clearShikiHtmlCache,
+  MAX_HTML_ENTRIES,
+  seedShikiHtmlCacheForTest,
+  shikiHtmlCacheSize,
+  useCachedShikiHtml
+} from './shiki-html-cache'
 
 describe('useCachedShikiHtml', () => {
   beforeEach(() => {
@@ -71,5 +77,35 @@ describe('useCachedShikiHtml', () => {
     // Give the rejection a tick to settle; html must remain null, no throw.
     await act(() => new Promise(resolve => setTimeout(resolve, 10)))
     expect(result.current.html).toBeNull()
+  })
+
+  it('bounds the cache with an LRU (oldest evicted past MAX_HTML_ENTRIES)', async () => {
+    // Seed the cache to exactly the cap without driving the async hook N times.
+    for (let i = 0; i < MAX_HTML_ENTRIES; i++) {
+      seedShikiHtmlCacheForTest('python', `code-${i}`, `<pre>${i}</pre>`)
+    }
+
+    expect(shikiHtmlCacheSize()).toBe(MAX_HTML_ENTRIES)
+
+    // One more unique fence evicts the oldest (code-0), size stays capped.
+    seedShikiHtmlCacheForTest('python', 'code-overflow', '<pre>ovf</pre>')
+    expect(shikiHtmlCacheSize()).toBe(MAX_HTML_ENTRIES)
+
+    // The evicted fence is a MISS again (re-tokenizes); the newest is a HIT.
+    vi.mocked(codeToHtml).mockClear()
+
+    const evicted = renderHook(() => useCachedShikiHtml('code-0', 'python'))
+
+    expect(evicted.result.current.html).toBeNull() // evicted -> miss -> plain pass
+    await waitFor(() => expect(evicted.result.current.html).not.toBeNull())
+    expect(vi.mocked(codeToHtml)).toHaveBeenCalledTimes(1) // had to re-tokenize
+
+    // A still-resident fence is a synchronous HIT (no tokenize).
+    vi.mocked(codeToHtml).mockClear()
+
+    const resident = renderHook(() => useCachedShikiHtml('code-overflow', 'python'))
+
+    expect(resident.result.current.html).toBe('<pre>ovf</pre>')
+    expect(vi.mocked(codeToHtml)).not.toHaveBeenCalled()
   })
 })

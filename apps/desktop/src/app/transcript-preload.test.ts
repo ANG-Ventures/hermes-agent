@@ -2,17 +2,25 @@
  * Tests for src/app/transcript-preload.ts.
  */
 
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 
 import type { SessionInfo } from '@/types/hermes'
 
 import { MAX_PRELOAD, preloadTranscripts, selectPreloadSessions } from './transcript-preload'
+import { clearStashedTranscripts, readStashedTranscript } from './transcript-stash'
 
 function s(id: string, extra: Partial<SessionInfo> = {}): SessionInfo {
   return { id, title: `t-${id}`, pinned: false, archived: false, ...extra } as SessionInfo
 }
 
 const noSleep = () => Promise.resolve()
+
+// preloadTranscripts hydrates the module-global in-memory stash as a direct
+// side effect; drop it after every test so leaked entries can't skew the
+// stash suite's count assertions when they share a worker.
+afterEach(() => {
+  clearStashedTranscripts()
+})
 
 describe('selectPreloadSessions', () => {
   it('pinned first, then visible order, capped', () => {
@@ -151,9 +159,6 @@ describe('preloadTranscripts', () => {
 
 describe('preload hydrates the in-memory stash (instant first click)', () => {
   it('stashes preloaded rows so readStashedTranscript hits synchronously', async () => {
-    const { clearStashedTranscripts, readStashedTranscript } = await import('./transcript-stash')
-
-    clearStashedTranscripts()
     await preloadTranscripts({
       gatewayUrl: 'http://gw',
       sessions: [s('warm1')],
@@ -166,6 +171,5 @@ describe('preload hydrates the in-memory stash (instant first click)', () => {
 
     expect(rows).not.toBeNull()
     expect(rows!.length).toBeGreaterThan(0)
-    clearStashedTranscripts()
   })
 })
