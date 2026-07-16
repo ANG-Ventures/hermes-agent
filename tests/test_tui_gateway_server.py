@@ -1889,22 +1889,34 @@ def test_apply_model_switch_noop_target_skips_side_effects(monkeypatch):
         )
 
     monkeypatch.setattr(_ms, "switch_model", _fake_switch_model)
-    fired = {"marker": 0, "worker": 0, "info": 0}
+    fired = {"marker": 0, "worker": 0, "info": 0, "persist": 0, "expensive": 0}
     monkeypatch.setattr(
         server, "_append_model_switch_marker", lambda *a, **k: fired.__setitem__("marker", fired["marker"] + 1)
     )
     monkeypatch.setattr(
         server, "_restart_slash_worker", lambda *a, **k: fired.__setitem__("worker", fired["worker"] + 1)
     )
-    monkeypatch.setattr(server, "_persist_live_session_runtime", lambda *a, **k: None)
+    monkeypatch.setattr(
+        server, "_persist_live_session_runtime", lambda *a, **k: fired.__setitem__("persist", fired["persist"] + 1)
+    )
     monkeypatch.setattr(server, "_persist_live_session_system_prompt", lambda *a, **k: None)
     monkeypatch.setattr(
         server, "_emit", lambda ev, *a, **k: fired.__setitem__("info", fired["info"] + 1) if ev == "session.info" else None
     )
+    # A no-op must NOT even reach the expensive-model gate (no spurious confirm
+    # dialog when re-selecting the already-active model). If the guard fired the
+    # gate, this stub would bump the counter.
+    import hermes_cli.model_cost_guard as _cost_guard
+    monkeypatch.setattr(
+        _cost_guard, "expensive_model_warning",
+        lambda *a, **k: fired.__setitem__("expensive", fired["expensive"] + 1),
+    )
 
+    # confirm_expensive_model=False is the interactive default — the path that
+    # would otherwise trip the expensive-model gate.
     result = server._apply_model_switch(
         "sid", session, "claude-opus-4-8 --provider claude-apr",
-        confirm_expensive_model=True, pin_session_override=False, persist_override=False,
+        confirm_expensive_model=False, pin_session_override=True, persist_override=False,
     )
 
     assert result["value"] == "claude-opus-4-8"
@@ -1912,8 +1924,11 @@ def test_apply_model_switch_noop_target_skips_side_effects(monkeypatch):
     assert fired["marker"] == 0, "no marker appended on a no-op switch"
     assert fired["worker"] == 0, "slash worker not restarted on a no-op switch"
     assert fired["info"] == 0, "no session.info emit on a no-op switch"
+    assert fired["expensive"] == 0, "no-op must short-circuit before the expensive-model gate"
+    assert fired["persist"] == 1, "no-op with pin_session_override must persist the override"
     assert session["history_version"] == 0, "history_version must not bump on a no-op"
     assert session["history"] == [{"role": "user", "content": "hi"}]
+    assert session["model_override"]["model"] == "claude-opus-4-8"
 
 
 def test_apply_model_switch_real_change_still_commits(monkeypatch):
