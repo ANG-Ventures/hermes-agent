@@ -590,4 +590,17 @@ describe('reconnect-seam zombie optimistic rows (severed message.complete stamp)
 
     expect(remaining.map(row => row.id)).toEqual(['assistant-stream-3'])
   })
+
+  it('MEDIA-tag edge: raw streamed zombie matches its media-rendered committed twin', () => {
+    // Committed rows pass through assistantTextPart -> renderMediaTags; the
+    // streamed zombie may hold the raw MEDIA: line. The join key normalizes
+    // both sides so the zombie still drops (Greptile #361 P2).
+    const zombie = textMessage('assistant-stream-9', 'assistant', 'here you go\nMEDIA:/tmp/pic.png')
+    const committed = appendFetchedMessages([zombie], [
+      { id: 700, role: 'assistant', content: 'here you go\nMEDIA:/tmp/pic.png' }
+    ])
+
+    expect(committed.messages.map(row => row.id)).toEqual(['700'])
+  })
 })
+

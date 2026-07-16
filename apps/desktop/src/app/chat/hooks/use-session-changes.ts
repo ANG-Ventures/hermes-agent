@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef } from 'react'
 
-import { chatMessageText, type ChatMessage, toChatMessages } from '@/lib/chat-messages'
+import { chatMessageText, type ChatMessage, renderMediaTags, toChatMessages } from '@/lib/chat-messages'
 import type { ClientSessionState } from '@/app/types'
 import type { SessionMessage, StatusResponse } from '@/types/hermes'
 
@@ -242,7 +242,13 @@ export function dropZombieOptimisticRows(
   current: readonly ChatMessage[],
   incoming: readonly ChatMessage[]
 ): ChatMessage[] {
-  const contentKey = (message: ChatMessage): string => `${message.role}\u0000${chatMessageText(message).trim()}`
+  // Normalize both sides through renderMediaTags: committed assistant rows
+  // arrive via toChatMessages/assistantTextPart (MEDIA: lines already turned
+  // into markdown links) while a zombie's streamed text may still be raw.
+  // renderMediaTags is idempotent on transformed text, so this makes the
+  // join key representation-stable for both (Greptile #361 P2).
+  const contentKey = (message: ChatMessage): string =>
+    `${message.role}\u0000${renderMediaTags(chatMessageText(message)).trim()}`
   const incomingBudget = new Map<string, number>()
 
   for (const message of incoming) {
