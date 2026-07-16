@@ -2253,6 +2253,13 @@ class AIAgent:
                         _row_id,
                     )
                 msg[_DB_PERSISTED_MARKER] = True
+            if flushed_ids and current_session_id:
+                try:
+                    self._session_db.recompute_effective_last_active(current_session_id)
+                except Exception as _e:
+                    logger.warning(
+                        "Session DB effective_last_active recompute failed: %s", _e
+                    )
             if _suppressed_superseded_rows:
                 logger.info(
                     "persist: suppressed %d superseded-turn content row(s) for session %s "

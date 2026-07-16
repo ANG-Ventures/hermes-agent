@@ -503,6 +503,103 @@ class TestGatewayFlushMaintainsEffectiveLastActive:
         finally:
             db.close()
 
+    @pytest.mark.parametrize("per_row_maintenance", [False, True])
+    def test_batch_flush_recomputes_compression_root_once(
+        self, tmp_path, monkeypatch, per_row_maintenance
+    ):
+        db = _make_db(tmp_path)
+        try:
+            _seed_compression_chain(db)
+            agent = self._make_agent(db, "compressed-tip")
+            if not per_row_maintenance:
+                db._execute_write(
+                    lambda conn: conn.execute(
+                        "UPDATE sessions SET effective_last_active = -1 WHERE id = ?",
+                        ("compressed-root",),
+                    )
+                )
+                # Isolate the batch-level contract in one case; the other keeps
+                # append_message's per-row maintenance enabled to prove composition.
+                monkeypatch.setattr(
+                    db,
+                    "_bump_effective_last_active_for_message",
+                    lambda *_args, **_kwargs: None,
+                )
+            recompute_calls = []
+            recompute = db.recompute_effective_last_active
+
+            def _track_recompute(session_id):
+                recompute_calls.append(session_id)
+                recompute(session_id)
+
+            monkeypatch.setattr(db, "recompute_effective_last_active", _track_recompute)
+
+            agent._flush_messages_to_session_db(
+                [
+                    {"role": "user", "content": "batch user", "timestamp": 700.0},
+                    {"role": "assistant", "content": "batch reply", "timestamp": 800.0},
+                ],
+                conversation_history=[],
+            )
+
+            assert recompute_calls == ["compressed-tip"]
+            assert db._conn is not None
+            stored_root = db._conn.execute(
+                "SELECT effective_last_active FROM sessions WHERE id = ?",
+                ("compressed-root",),
+            ).fetchone()[0]
+            assert stored_root == 800.0
+        finally:
+            db.close()
+
+    def test_batch_flush_skips_recompute_when_all_rows_are_suppressed(
+        self, tmp_path, monkeypatch
+    ):
+        db = _make_db(tmp_path)
+        try:
+            agent = self._make_agent(db, "suppressed-flush")
+            setattr(agent, "_persist_superseded", True)
+            recompute_calls = []
+            monkeypatch.setattr(
+                db,
+                "recompute_effective_last_active",
+                lambda session_id: recompute_calls.append(session_id),
+            )
+
+            agent._flush_messages_to_session_db(
+                [{"role": "assistant", "content": "late zombie reply"}],
+                conversation_history=[],
+            )
+
+            assert recompute_calls == []
+            assert db.get_messages("suppressed-flush") == []
+        finally:
+            db.close()
+
+    def test_batch_recompute_failure_does_not_mask_successful_flush(
+        self, tmp_path, monkeypatch
+    ):
+        db = _make_db(tmp_path)
+        try:
+            agent = self._make_agent(db, "recompute-failure")
+
+            def _raise_recompute(_session_id):
+                raise RuntimeError("recompute failed")
+
+            monkeypatch.setattr(
+                db,
+                "recompute_effective_last_active",
+                _raise_recompute,
+            )
+            messages = [{"role": "user", "content": "durable user turn"}]
+
+            agent._flush_messages_to_session_db(messages, conversation_history=[])
+
+            assert len(db.get_messages("recompute-failure")) == 1
+            assert agent._last_flushed_db_idx == 1
+            assert agent._flushed_db_message_ids == set()
+        finally:
+            db.close()
 
 def _function_sources_by_qualname(source_path: Path) -> Dict[str, str]:
     source = source_path.read_text(encoding="utf-8")
