@@ -61,6 +61,7 @@ import { ChatDropOverlay } from './chat-drop-overlay'
 import { ChatSwapOverlay } from './chat-swap-overlay'
 import { ChatBar, ChatBarFallback } from './composer'
 import { requestComposerInsert, requestComposerInsertRefs } from './composer/focus'
+import { stripRuntimeIdSuffix, stripRuntimeIdSuffixNullable } from './runtime-id-suffix'
 import { droppedFileInlineRefs, type SessionDragPayload, sessionInlineRef } from './composer/inline-refs'
 import type { ChatBarState } from './composer/types'
 import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
@@ -278,9 +279,14 @@ function ChatRuntimeBoundary({
       // Submission is handled explicitly by ChatBar.
       // Keeping this no-op avoids duplicate prompt.submit calls.
     },
-    onEdit,
+    onEdit: async message =>
+      onEdit({
+        ...message,
+        parentId: stripRuntimeIdSuffixNullable(message.parentId),
+        sourceId: stripRuntimeIdSuffixNullable(message.sourceId)
+      }),
     onCancel: async () => onCancel(),
-    onReload
+    onReload: async parentId => onReload(stripRuntimeIdSuffixNullable(parentId))
   })
 
   return <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>
@@ -494,10 +500,14 @@ export function ChatView({
             gateway={gateway}
             intro={showIntro ? { personality: introPersonality, seed: introSeed } : undefined}
             loading={threadLoading}
-            onBranchInNewChat={onBranchInNewChat}
+            onBranchInNewChat={messageId => onBranchInNewChat(stripRuntimeIdSuffix(messageId))}
             onCancel={onCancel}
             onDismissError={onDismissError}
-            onRestoreToMessage={onRestoreToMessage}
+            onRestoreToMessage={
+              onRestoreToMessage
+                ? (messageId, target) => onRestoreToMessage(stripRuntimeIdSuffix(messageId), target)
+                : undefined
+            }
             sessionId={activeSessionId}
             sessionKey={threadKey}
           />
