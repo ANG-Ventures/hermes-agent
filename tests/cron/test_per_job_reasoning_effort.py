@@ -37,9 +37,12 @@ from hermes_constants import parse_reasoning_effort
 if not os.environ.get("PYTEST_VERSION"):  # pragma: no cover - non-pytest harness
     import tempfile as _tempfile
 
-    _standalone_store = jobs_mod.use_cron_store(
-        _tempfile.mkdtemp(prefix="cron-test-home-reasoning-effort-")
+    # TemporaryDirectory (not mkdtemp): its finalizer removes the dir at
+    # interpreter exit, so repeated harness runs don't accumulate orphans.
+    _standalone_tmp = _tempfile.TemporaryDirectory(
+        prefix="cron-test-home-reasoning-effort-"
     )
+    _standalone_store = jobs_mod.use_cron_store(_standalone_tmp.name)
     _standalone_store.__enter__()  # held for the process lifetime, by design
 
 

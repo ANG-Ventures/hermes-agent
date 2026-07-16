@@ -63,6 +63,9 @@ def test_leaky_modules_self_isolate_without_pytest(tmp_path):
             "FAKE_LIVE_HOME": str(fake_live_home),
             "REPO_ROOT": str(REPO),
             "PATH": os.environ.get("PATH", ""),
+            # Pin module resolution to THIS repo's source tree so the harness
+            # can't vacuously exercise an installed/other cron.jobs copy.
+            "PYTHONPATH": str(REPO),
         }
     )
 
