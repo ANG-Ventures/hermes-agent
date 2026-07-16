@@ -791,8 +791,13 @@ def _is_line_oriented_newline_error(error: Optional[str]) -> bool:
     if not error:
         return False
     lowered = error.lower()
-    return "is not allowed in a regex" in lowered or (
-        "not allowed" in lowered and "\\n" in error and "literal" in lowered
+    # Require BOTH the "literal ... not allowed" phrasing AND a newline reference
+    # in the error, so this only matches the newline-in-line-oriented-regex case
+    # and not some other rg diagnostic that happens to say "not allowed".
+    return (
+        "not allowed" in lowered
+        and "literal" in lowered
+        and ("\\n" in error or "newline" in lowered)
     )
 
 
