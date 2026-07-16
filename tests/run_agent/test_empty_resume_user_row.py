@@ -136,13 +136,19 @@ def test_leaked_flag_cannot_drop_next_real_turn_row():
     gsrc = inspect.getsource(gr.GatewayRunner._run_agent_inner)
     reset_marker = "agent._suppress_user_turn_persist = False"
     resume_if_marker = "if _is_resume_pending:"
-    assert reset_marker in gsrc, "gateway must reset the flag each turn"
-    assert resume_if_marker in gsrc
+    # Markers must be UNIQUE, else first-match str.index() could slice the wrong
+    # range and the control-flow assertions pass vacuously (Greptile-P2).
+    assert gsrc.count(reset_marker) == 1, "reset marker must appear exactly once"
+    assert gsrc.count(resume_if_marker) == 1, "resume-if marker must appear exactly once"
     between = gsrc[gsrc.index(reset_marker) + len(reset_marker): gsrc.index(resume_if_marker)]
+    # No control-flow break (at ANY indentation) between the reset and the set —
     # the only intervening code is the _is_resume_pending / _has_fresh_tool_tail
-    # computations + a helper call — no early exit that could skip the reset.
-    for kw in ("\n            return", "\n            continue", "\n            break", "\n            raise"):
-        assert kw not in between, f"unexpected control-flow break ({kw!r}) between reset and set"
+    # computations + a helper call, so the reset always runs before the set.
+    import re
+    for _kw in ("return", "continue", "break", "raise"):
+        assert not re.search(rf"(?m)^\s+{_kw}\b", between), (
+            f"unexpected control-flow break ({_kw!r}) between reset and set"
+        )
 
     class _Agent:
         pass
