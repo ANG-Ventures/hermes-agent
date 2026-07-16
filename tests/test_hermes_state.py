@@ -2571,6 +2571,54 @@ class TestDeleteAndExport:
         assert db.get_session("child")["parent_session_id"] == "parent"
         assert db.get_session("orphan")["parent_session_id"] is None
 
+    def test_import_sessions_recomputes_imported_compression_root_recency(self, db):
+        result = db.import_sessions(
+            [
+                {
+                    "id": "root",
+                    "source": "cli",
+                    "end_reason": "compression",
+                    "messages": [
+                        {"role": "user", "content": "root", "timestamp": 100.0}
+                    ],
+                },
+                {
+                    "id": "child",
+                    "source": "cli",
+                    "parent_session_id": "root",
+                    "messages": [
+                        {"role": "user", "content": "child", "timestamp": 500.0}
+                    ],
+                },
+            ]
+        )
+
+        assert result["ok"] is True
+        assert db.get_session("root")["effective_last_active"] == 500.0
+        assert db.expected_effective_last_active("root") == 500.0
+
+    def test_import_sessions_recomputes_preexisting_compression_root_recency(self, db):
+        db.create_session("root", source="cli")
+        db.append_message("root", role="user", content="root", timestamp=100.0)
+        db.end_session("root", "compression")
+
+        result = db.import_sessions(
+            [
+                {
+                    "id": "child",
+                    "source": "cli",
+                    "parent_session_id": "root",
+                    "messages": [
+                        {"role": "user", "content": "child", "timestamp": 500.0}
+                    ],
+                }
+            ]
+        )
+
+        assert result["ok"] is True
+        assert db.get_session("root")["effective_last_active"] == 500.0
+        assert db.expected_effective_last_active("root") == 500.0
+
     def test_import_sessions_rejects_invalid_batch_atomically(self, db):
         result = db.import_sessions(
             [
