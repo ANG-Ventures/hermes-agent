@@ -56,6 +56,11 @@ export function useTwoPhaseRenderBudget(
   // from an updater side-channel breaks the reschedule chain. The ref reflects
   // the committed budget every render, so the step's check is reliable.
   const budgetRef = useRef(renderBudget)
+  // On a switch, layout effects run BEFORE the previous effect's cleanup gets
+  // to cancel its pending idle callback — a stale callback firing in that gap
+  // would raise the new session's freshly reset budget. Each effect captures
+  // its own key and its step bails when this ref has moved on.
+  const liveKeyRef = useRef(sessionKey)
 
   onBeforeRaiseRef.current = onBeforeRaise
   budgetRef.current = renderBudget
@@ -63,6 +68,7 @@ export function useTwoPhaseRenderBudget(
   // Reset to the slim budget on mount + every switch. Layout effect so the
   // reset commits in the same pass as the caller's scroll pinning.
   useLayoutEffect(() => {
+    liveKeyRef.current = sessionKey
     budgetRef.current = SWITCH_RENDER_BUDGET
     setRenderBudget(SWITCH_RENDER_BUDGET)
   }, [sessionKey])
@@ -70,6 +76,7 @@ export function useTwoPhaseRenderBudget(
   useEffect(() => {
     const idleWindow = window as IdleWindow
     const useIdle = typeof idleWindow.requestIdleCallback === 'function'
+    const ownKey = sessionKey
     let handle: number | null = null
     let cancelled = false
 
@@ -82,7 +89,7 @@ export function useTwoPhaseRenderBudget(
     }
 
     const step = () => {
-      if (cancelled || budgetRef.current >= RENDER_BUDGET) {
+      if (cancelled || liveKeyRef.current !== ownKey || budgetRef.current >= RENDER_BUDGET) {
         return
       }
 

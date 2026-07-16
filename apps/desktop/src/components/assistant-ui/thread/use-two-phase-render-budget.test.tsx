@@ -145,18 +145,21 @@ describe('useTwoPhaseRenderBudget', () => {
     vi.useFakeTimers()
     setIdleApi(undefined, undefined)
 
-    const { result } = renderHook(() => useTwoPhaseRenderBudget('s1', () => {}))
+    try {
+      const { result } = renderHook(() => useTwoPhaseRenderBudget('s1', () => {}))
 
-    expect(result.current[0]).toBe(SWITCH_RENDER_BUDGET)
+      expect(result.current[0]).toBe(SWITCH_RENDER_BUDGET)
 
-    for (let i = 0; i < 10 && result.current[0] < RENDER_BUDGET; i++) {
-      act(() => {
-        vi.runOnlyPendingTimers()
-      })
+      for (let i = 0; i < 10 && result.current[0] < RENDER_BUDGET; i++) {
+        act(() => {
+          vi.runOnlyPendingTimers()
+        })
+      }
+
+      expect(result.current[0]).toBe(RENDER_BUDGET)
+    } finally {
+      vi.useRealTimers()
     }
-
-    expect(result.current[0]).toBe(RENDER_BUDGET)
-    vi.useRealTimers()
   })
 
   it('cancels the pending idle raise on unmount', () => {
