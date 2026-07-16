@@ -112,8 +112,10 @@ class TestVendorPrefixesStillStrip:
         assert cli.model == expected
 
     def test_deepseek_provider_prefix_resolves_and_strips(self):
-        """``deepseek`` resolves as a real provider, so the guard's resolver
-        check passes and the prefix strips (deepseek is also a vendor slug)."""
+        """``deepseek`` is a known vendor namespace (both a key and a value in
+        ``_VENDOR_PREFIXES``), so the guard short-circuits on the vendor
+        fast-path and strips WITHOUT ever calling ``resolve_provider`` — this
+        exercises the vendor-namespace fast-path, not the resolver path."""
         cli = _make_cli("deepseek/deepseek-v4-flash")
         changed = cli._normalize_model_for_provider("openai-codex")
         assert changed is True

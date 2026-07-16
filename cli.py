@@ -5329,6 +5329,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
             if not _is_vendor and _prefix and _prefix != "openai-codex":
                 _provider_resolves = False
+                _resolver_error: Exception | None = None
                 try:
                     from hermes_cli.auth import AuthError, resolve_provider
 
@@ -5337,15 +5338,33 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         _provider_resolves = True
                     except AuthError:
                         _provider_resolves = False
-                except Exception:
-                    # Resolver import/other failure — treat as unresolved so we
-                    # err toward the loud, informative error over a silent swap.
+                    except Exception as exc:  # noqa: BLE001
+                        # A registered provider whose plugin crashed internally
+                        # is a different failure from "provider not found".
+                        # Still err toward the loud error (never silently swap
+                        # providers), but surface the root cause so the two
+                        # cases are distinguishable.
+                        _provider_resolves = False
+                        _resolver_error = exc
+                except Exception as exc:  # noqa: BLE001
+                    # Resolver import failure — treat as unresolved so we err
+                    # toward the loud, informative error over a silent swap.
                     _provider_resolves = False
+                    _resolver_error = exc
 
                 if not _provider_resolves:
+                    _cause = (
+                        f" (provider resolution raised "
+                        f"{type(_resolver_error).__name__}: {_resolver_error} — "
+                        f"this may be a crashing plugin rather than a missing "
+                        f"one)"
+                        if _resolver_error is not None
+                        else ""
+                    )
                     raise ValueError(
                         f"Model '{current_model}' names provider '{prefix}', "
-                        f"which does not resolve for this profile — refusing to "
+                        f"which does not resolve for this profile{_cause} — "
+                        f"refusing to "
                         f"strip the prefix and run '{slug}' on the default "
                         f"provider '{resolved_provider}' (that would silently "
                         f"substitute both the model and the provider). If "
