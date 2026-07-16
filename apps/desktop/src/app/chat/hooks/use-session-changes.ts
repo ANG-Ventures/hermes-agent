@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef } from 'react'
 
-import { type ChatMessage, toChatMessages } from '@/lib/chat-messages'
+import { chatMessageText, type ChatMessage, renderMediaTags, toChatMessages } from '@/lib/chat-messages'
 import type { ClientSessionState } from '@/app/types'
 import type { SessionMessage, StatusResponse } from '@/types/hermes'
 
@@ -132,6 +132,18 @@ export function appendFetchedMessages(
   const materialized = toChatMessages([...newRows])
   const appendable = materialized.filter(message => !renderedIds.has(message.id))
 
+  // Reconnect-seam zombie sweep: when a committed twin of an un-stamped
+  // optimistic row arrives (the message.complete stamp was severed by a
+  // backend restart / WS reconnect), drop the zombie so the committed row
+  // doesn't paint as a duplicate — and transplant the zombie's runtime footer
+  // onto the adopting committed row (footers travel only on the completion
+  // frame; DB rows never carry them). No-op when nothing is appendable.
+  const swept = appendable.length
+    ? dropZombieOptimisticRows(current, appendable)
+    : { messages: [...current], adoptedFooters: new Map<string, string>() }
+  const base = swept.messages
+  const adopted = adoptZombieFooters(appendable, swept.adoptedFooters)
+
   for (const message of appendable) {
     renderedIds.add(message.id)
   }
@@ -146,8 +158,8 @@ export function appendFetchedMessages(
   }
 
   return {
-    cursor: advanceCursorAfterRows(0, fetchedRows, appendable, renderedIds),
-    messages: orderCommittedMessages([...current, ...appendable]),
+    cursor: advanceCursorAfterRows(0, fetchedRows, adopted, renderedIds),
+    messages: orderCommittedMessages([...base, ...adopted]),
     renderedIds
   }
 }
@@ -204,6 +216,126 @@ function optimisticTranscriptIds(messages: readonly ChatMessage[]): string[] {
         (message.id.startsWith('user-') || message.id.startsWith('assistant-') || message.pending)
     )
     .map(message => message.id)
+}
+
+/** A client-minted transcript row id (`user-<ts>` / `assistant-<ts>`), never a committed DB id. */
+export function isOptimisticRowId(id: string): boolean {
+  return !Number.isInteger(Number(id)) && (id.startsWith('user-') || id.startsWith('assistant-'))
+}
+
+/**
+ * Drop ZOMBIE optimistic rows whose committed twin just arrived via the poll.
+ *
+ * The stamping path (message.complete → markTurnComplete) can be severed by a
+ * backend restart / WS reconnect: the turn's committed rows land in the DB but
+ * no completion frame ever reaches this client, so its optimistic rows keep
+ * their client-minted ids (`user-<ts>` / `assistant-stream-<ts>`), `busy`
+ * resets without a stamp, and the id-only dedupe in appendFetchedMessages then
+ * paints the committed rows as DUPLICATES next to the zombies (DB stays clean
+ * — pure render corruption, observed live 2026-07-15). Content is the only
+ * remaining join key, so: an optimistic, NON-pending row whose (role, text)
+ * exactly matches an incoming committed row is the committed row — drop the
+ * zombie and let the committed twin render in its place.
+ *
+ * Deliberately narrow (over-collapse guardrails):
+ *  - only optimistic-id rows are ever dropped (committed rows are untouchable);
+ *  - `pending` rows are exempt (an actively-streaming row must never vanish);
+ *  - empty-text rows are exempt (no reliable join key);
+ *  - each incoming row consumes at most ONE zombie (genuine repeats like a
+ *    user sending "continue" twice keep their second copy).
+ */
+export function dropZombieOptimisticRows(
+  current: readonly ChatMessage[],
+  incoming: readonly ChatMessage[]
+): { messages: ChatMessage[]; adoptedFooters: Map<string, string> } {
+  // Normalize both sides through renderMediaTags: committed assistant rows
+  // arrive via toChatMessages/assistantTextPart (MEDIA: lines already turned
+  // into markdown links) while a zombie's streamed text may still be raw.
+  // renderMediaTags is idempotent on transformed text, so this makes the
+  // join key representation-stable for both (Greptile #361 P2).
+  const contentKey = (message: ChatMessage): string =>
+    `${message.role}\u0000${renderMediaTags(chatMessageText(message)).trim()}`
+  const incomingBudget = new Map<string, number>()
+
+  for (const message of incoming) {
+    const text = chatMessageText(message).trim()
+
+    if (!text) {
+      continue
+    }
+
+    const key = contentKey(message)
+    incomingBudget.set(key, (incomingBudget.get(key) ?? 0) + 1)
+  }
+
+  // Footer transplant: the runtime footer travels ONLY on the message.complete
+  // frame and lives on the streamed (optimistic) row — DB rows never carry it.
+  // Dropping a footer-bearing zombie in favor of its footer-less committed
+  // twin silently loses the footer, so harvest it here and let the caller
+  // graft it onto the adopting committed row (keyed by content).
+  const adoptedFooters = new Map<string, string>()
+
+  if (!incomingBudget.size) {
+    return { messages: [...current], adoptedFooters }
+  }
+
+  const messages = current.filter(message => {
+    if (!isOptimisticRowId(message.id) || message.pending) {
+      return true
+    }
+
+    const text = chatMessageText(message).trim()
+
+    if (!text) {
+      return true
+    }
+
+    const key = contentKey(message)
+    const budget = incomingBudget.get(key) ?? 0
+
+    if (budget <= 0) {
+      return true
+    }
+
+    incomingBudget.set(key, budget - 1)
+
+    if (message.footer && !adoptedFooters.has(key)) {
+      adoptedFooters.set(key, message.footer)
+    }
+
+    return false
+  })
+
+  return { messages, adoptedFooters }
+}
+
+/** Graft footers harvested from swept zombies onto their adopting committed twins. */
+export function adoptZombieFooters(
+  rows: readonly ChatMessage[],
+  adoptedFooters: ReadonlyMap<string, string>
+): ChatMessage[] {
+  if (!adoptedFooters.size) {
+    return [...rows]
+  }
+
+  const remaining = new Map(adoptedFooters)
+
+  return rows.map(row => {
+    if (row.footer || row.role !== 'assistant') {
+      return row
+    }
+
+    const key = `${row.role}\u0000${renderMediaTags(chatMessageText(row)).trim()}`
+    const footer = remaining.get(key)
+
+    if (!footer) {
+      return row
+    }
+
+    remaining.delete(key)
+
+    return { ...row, footer }
+  })
 }
 
 export function extractCommittedMessageIds(payload: unknown): string[] {
