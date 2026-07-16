@@ -7429,6 +7429,7 @@ class SessionDB:
                         "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
                         (parent_id, session_id),
                     )
+                    self._recompute_effective_last_active_for_session(conn, session_id)
                 else:
                     # Drop only the closing edge. Later entries can still attach
                     # to this now-root session, preserving the acyclic portion
