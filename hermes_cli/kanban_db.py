@@ -6029,6 +6029,21 @@ _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 _RESPAWN_GUARD_PR_QUERY_LIMIT = 5
 _RESPAWN_GUARD_PR_QUERY_TIMEOUT_SECONDS = 5
 
+# Process-lifetime cache for PR states the respawn-guard policy treats as
+# terminal. MERGED is irreversible; CLOSED is intentionally cached too even
+# though GitHub permits reopening, so a reopened PR is not observed until the
+# dispatcher process restarts. This tradeoff prevents completed PR history
+# from repeatedly consuming the bounded query budget.
+_PR_TERMINAL_STATE_CACHE: dict[tuple[str, int], str] = {}
+
+# Per-board fairness state for nonterminal PRs. A completed query cycle clears
+# the skip set; while a cycle is budget-starved, prior OPEN/unknown results are
+# reused fail-safe so later PRs receive the next tick's query budget.
+_PR_NONTERMINAL_STATE_CACHES: dict[
+    str, dict[tuple[str, int], Optional[str]]
+] = {}
+_PR_QUERY_CYCLE_SKIPS: dict[str, set[tuple[str, int]]] = {}
+
 # Match PR-shaped GitHub URLs broadly enough that a malformed pull number is
 # still fail-safe guarded rather than silently ignored.
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
@@ -6084,22 +6099,63 @@ def _query_github_pr_state(repo: str, number: int) -> Optional[str]:
 
 @dataclass
 class _PrStateResolver:
-    """Per-dispatch-tick PR-state memo with a hard query budget."""
+    """Per-tick PR memo, optionally backed by a shared terminal-state cache."""
 
     max_queries: int = _RESPAWN_GUARD_PR_QUERY_LIMIT
     cache: dict[tuple[str, int], Optional[str]] = field(default_factory=dict)
+    terminal_cache: dict[tuple[str, int], str] = field(default_factory=dict)
+    nonterminal_cache: dict[tuple[str, int], Optional[str]] = field(default_factory=dict)
+    cycle_skip: set[tuple[str, int]] = field(default_factory=set)
     query_count: int = 0
+    budget_exhausted: bool = False
+    seen_keys: set[tuple[str, int]] = field(default_factory=set, init=False)
+    queried_nonterminal_keys: set[tuple[str, int]] = field(
+        default_factory=set, init=False
+    )
 
     def resolve(self, repo: str, number: int) -> Optional[str]:
         key = (repo.lower(), int(number))
+        self.seen_keys.add(key)
+        if key in self.terminal_cache:
+            return self.terminal_cache[key]
         if key in self.cache:
             return self.cache[key]
+        if key in self.cycle_skip and key in self.nonterminal_cache:
+            state = self.nonterminal_cache[key]
+            self.cache[key] = state
+            return state
         if self.query_count >= self.max_queries:
+            self.budget_exhausted = True
+            _log.debug(
+                "kanban PR-state query budget exhausted for %s#%s "
+                "(max_queries=%s)",
+                key[0], key[1], self.max_queries,
+            )
             return None
         self.query_count += 1
         state = _query_github_pr_state(repo, number)
         self.cache[key] = state
+        if state in {"MERGED", "CLOSED"}:
+            self.terminal_cache[key] = state
+            self.nonterminal_cache.pop(key, None)
+            self.cycle_skip.discard(key)
+        else:
+            self.nonterminal_cache[key] = state
+            self.queried_nonterminal_keys.add(key)
         return state
+
+    def finish_tick(self, *, scan_complete: bool) -> None:
+        """Advance the fair-query cycle after the ready queue scan."""
+        if scan_complete:
+            stale_keys = set(self.nonterminal_cache).difference(self.seen_keys)
+            for key in stale_keys:
+                self.nonterminal_cache.pop(key, None)
+                self.cycle_skip.discard(key)
+
+        if self.budget_exhausted or not scan_complete:
+            self.cycle_skip.update(self.queried_nonterminal_keys)
+        else:
+            self.cycle_skip.clear()
 
 
 @dataclass
@@ -7657,7 +7713,12 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
-    pr_state_resolver = _PrStateResolver()
+    pr_cycle_key = str(kanban_db_path(board))
+    pr_state_resolver = _PrStateResolver(
+        terminal_cache=_PR_TERMINAL_STATE_CACHE,
+        nonterminal_cache=_PR_NONTERMINAL_STATE_CACHES.setdefault(pr_cycle_key, {}),
+        cycle_skip=_PR_QUERY_CYCLE_SKIPS.setdefault(pr_cycle_key, set()),
+    )
     result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
@@ -7753,8 +7814,10 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
+    ready_scan_complete = True
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
+            ready_scan_complete = False
             break
         row_assignee = row["assignee"]
         if not row_assignee:
@@ -7937,6 +8000,8 @@ def _dispatch_once_locked(
             result.spawn_failed.append(claimed.id)
             if auto:
                 result.auto_blocked.append(claimed.id)
+
+    pr_state_resolver.finish_tick(scan_complete=ready_scan_complete)
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
