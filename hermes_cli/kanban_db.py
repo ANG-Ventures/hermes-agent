@@ -812,7 +812,19 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     # A concurrent connect(board=normed) after the rename/delete recreates
     # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
     # dropped first so the schema init pass re-runs on that fresh file.
-    _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
+    db_path = d / "kanban.db"
+    _INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    # Resolver fairness state is process-local except when a live LRU entry
+    # has been spilled beside its DB. Retiring the board must remove both so
+    # an archived directory does not retain an orphaned swap file.
+    pr_cache_key = _pr_state_cache_key(db_path)
+    _PR_NONTERMINAL_STATE_CACHES.pop(pr_cache_key, None)
+    _PR_QUERY_CYCLE_SKIPS.pop(pr_cache_key, None)
+    try:
+        _pr_state_swap_path(pr_cache_key).unlink()
+    except OSError:
+        pass
 
     if archive:
         archive_root = boards_root() / "_archived"
@@ -6028,21 +6040,131 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 _RESPAWN_GUARD_PR_QUERY_LIMIT = 5
 _RESPAWN_GUARD_PR_QUERY_TIMEOUT_SECONDS = 5
+_RESPAWN_GUARD_PR_TERMINAL_CACHE_LIMIT = 1024
+_RESPAWN_GUARD_PR_BOARD_CACHE_LIMIT = 32
 
-# Process-lifetime cache for PR states the respawn-guard policy treats as
-# terminal. MERGED is irreversible; CLOSED is intentionally cached too even
-# though GitHub permits reopening, so a reopened PR is not observed until the
-# dispatcher process restarts. This tradeoff prevents completed PR history
-# from repeatedly consuming the bounded query budget.
+# Bounded process-lifetime cache for PR states the respawn-guard policy treats
+# as terminal. MERGED is irreversible; CLOSED is intentionally cached too even
+# though GitHub permits reopening, so a reopened PR is not observed until its
+# entry is evicted or the dispatcher restarts. This tradeoff prevents completed
+# PR history from repeatedly consuming the bounded query budget.
 _PR_TERMINAL_STATE_CACHE: dict[tuple[str, int], str] = {}
 
-# Per-board fairness state for nonterminal PRs. A completed query cycle clears
-# the skip set; while a cycle is budget-starved, prior OPEN/unknown results are
-# reused fail-safe so later PRs receive the next tick's query budget.
+# Bounded per-board fairness state for nonterminal PRs. A completed query cycle
+# clears the skip set; while a cycle is budget-starved, prior OPEN/unknown
+# results are reused fail-safe so later PRs receive the next tick's query budget.
 _PR_NONTERMINAL_STATE_CACHES: dict[
     str, dict[tuple[str, int], Optional[str]]
 ] = {}
 _PR_QUERY_CYCLE_SKIPS: dict[str, set[tuple[str, int]]] = {}
+
+
+def _pr_state_cache_key(db_path: Path) -> str:
+    return str(db_path)
+
+
+def _pr_state_swap_path(cache_key: str) -> Path:
+    db_path = Path(cache_key)
+    return db_path.with_name(f".{db_path.name}.pr-state-cache.json")
+
+
+def _store_pr_state_cache(
+    cache_key: str,
+    nonterminal_cache: dict[tuple[str, int], Optional[str]],
+    cycle_skip: set[tuple[str, int]],
+) -> bool:
+    """Externalize an evicted active board's fairness state."""
+    db_path = Path(cache_key)
+    if not db_path.exists():
+        return True
+    swap_path = _pr_state_swap_path(cache_key)
+    tmp_path = swap_path.with_name(
+        f"{swap_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    payload = {
+        "nonterminal": [
+            [repo, number, state]
+            for (repo, number), state in nonterminal_cache.items()
+        ],
+        "cycle_skip": [[repo, number] for repo, number in cycle_skip],
+    }
+    try:
+        tmp_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmp_path, swap_path)
+        return True
+    except OSError:
+        _log.debug(
+            "kanban PR-state cache spill failed for %s",
+            cache_key,
+            exc_info=True,
+        )
+        return False
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+
+
+def _load_pr_state_cache(
+    cache_key: str,
+) -> tuple[dict[tuple[str, int], Optional[str]], set[tuple[str, int]]]:
+    """Restore fairness state externalized by board-cache eviction."""
+    swap_path = _pr_state_swap_path(cache_key)
+    if not swap_path.exists():
+        return {}, set()
+    try:
+        payload = json.loads(swap_path.read_text(encoding="utf-8"))
+        nonterminal_cache = {
+            (str(repo), int(number)): state
+            for repo, number, state in payload.get("nonterminal", [])
+            if state in {"OPEN", None}
+        }
+        cycle_skip = {
+            (str(repo), int(number))
+            for repo, number in payload.get("cycle_skip", [])
+        }
+        cycle_skip.intersection_update(nonterminal_cache)
+        return nonterminal_cache, cycle_skip
+    except (AttributeError, OSError, TypeError, ValueError):
+        _log.debug(
+            "kanban PR-state cache restore failed for %s",
+            cache_key,
+            exc_info=True,
+        )
+        return {}, set()
+    finally:
+        try:
+            swap_path.unlink()
+        except OSError:
+            pass
+
+
+def _pr_state_caches_for_board(
+    cache_key: str,
+) -> tuple[dict[tuple[str, int], Optional[str]], set[tuple[str, int]]]:
+    """Return bounded per-board state, spilling live LRU entries to disk."""
+    nonterminal_cache = _PR_NONTERMINAL_STATE_CACHES.pop(cache_key, None)
+    cycle_skip = _PR_QUERY_CYCLE_SKIPS.pop(cache_key, None)
+    if nonterminal_cache is None or cycle_skip is None:
+        restored_cache, restored_skip = _load_pr_state_cache(cache_key)
+        nonterminal_cache = nonterminal_cache or restored_cache
+        cycle_skip = cycle_skip or restored_skip
+    _PR_NONTERMINAL_STATE_CACHES[cache_key] = nonterminal_cache
+    _PR_QUERY_CYCLE_SKIPS[cache_key] = cycle_skip
+
+    for stale_key in list(_PR_NONTERMINAL_STATE_CACHES):
+        if len(_PR_NONTERMINAL_STATE_CACHES) <= _RESPAWN_GUARD_PR_BOARD_CACHE_LIMIT:
+            break
+        if stale_key == cache_key:
+            continue
+        stale_cache = _PR_NONTERMINAL_STATE_CACHES[stale_key]
+        stale_skip = _PR_QUERY_CYCLE_SKIPS.get(stale_key, set())
+        if _store_pr_state_cache(stale_key, stale_cache, stale_skip):
+            _PR_NONTERMINAL_STATE_CACHES.pop(stale_key, None)
+            _PR_QUERY_CYCLE_SKIPS.pop(stale_key, None)
+
+    return nonterminal_cache, cycle_skip
 
 # Match PR-shaped GitHub URLs broadly enough that a malformed pull number is
 # still fail-safe guarded rather than silently ignored.
@@ -6104,6 +6226,7 @@ class _PrStateResolver:
     max_queries: int = _RESPAWN_GUARD_PR_QUERY_LIMIT
     cache: dict[tuple[str, int], Optional[str]] = field(default_factory=dict)
     terminal_cache: dict[tuple[str, int], str] = field(default_factory=dict)
+    terminal_cache_limit: Optional[int] = None
     nonterminal_cache: dict[tuple[str, int], Optional[str]] = field(default_factory=dict)
     cycle_skip: set[tuple[str, int]] = field(default_factory=set)
     query_count: int = 0
@@ -6117,7 +6240,9 @@ class _PrStateResolver:
         key = (repo.lower(), int(number))
         self.seen_keys.add(key)
         if key in self.terminal_cache:
-            return self.terminal_cache[key]
+            state = self.terminal_cache.pop(key)
+            self.terminal_cache[key] = state
+            return state
         if key in self.cache:
             return self.cache[key]
         if key in self.cycle_skip and key in self.nonterminal_cache:
@@ -6137,6 +6262,9 @@ class _PrStateResolver:
         self.cache[key] = state
         if state in {"MERGED", "CLOSED"}:
             self.terminal_cache[key] = state
+            if self.terminal_cache_limit is not None:
+                while len(self.terminal_cache) > self.terminal_cache_limit:
+                    self.terminal_cache.pop(next(iter(self.terminal_cache)))
             self.nonterminal_cache.pop(key, None)
             self.cycle_skip.discard(key)
         else:
@@ -7713,11 +7841,13 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
-    pr_cycle_key = str(kanban_db_path(board))
+    pr_cycle_key = _pr_state_cache_key(kanban_db_path(board))
+    pr_nonterminal_cache, pr_cycle_skip = _pr_state_caches_for_board(pr_cycle_key)
     pr_state_resolver = _PrStateResolver(
         terminal_cache=_PR_TERMINAL_STATE_CACHE,
-        nonterminal_cache=_PR_NONTERMINAL_STATE_CACHES.setdefault(pr_cycle_key, {}),
-        cycle_skip=_PR_QUERY_CYCLE_SKIPS.setdefault(pr_cycle_key, set()),
+        terminal_cache_limit=_RESPAWN_GUARD_PR_TERMINAL_CACHE_LIMIT,
+        nonterminal_cache=pr_nonterminal_cache,
+        cycle_skip=pr_cycle_skip,
     )
     result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
@@ -7814,7 +7944,7 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
-    ready_scan_complete = True
+    ready_scan_complete = bool(ready_rows)
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             ready_scan_complete = False
