@@ -827,6 +827,26 @@ class TestOriginSubHourlyAdmission:
     def test_cron_fixed_minute_is_hourly(self):
         assert _schedule_interval_seconds(parse_schedule("0 9 * * *")) == 3600
 
+    # ---- comma/range/step minute forms (the Greptile bypass, PR #397) ----
+    def test_cron_comma_minute_gap(self):
+        # 0,30 * * * * fires twice an hour → 30-minute min gap → sub-hourly.
+        assert _schedule_interval_seconds(parse_schedule("0,30 * * * *")) == 1800
+
+    def test_cron_comma_quarter_hour_gap(self):
+        assert _schedule_interval_seconds(parse_schedule("0,15,30,45 * * * *")) == 900
+
+    def test_cron_range_minute_gap(self):
+        # 0-29 * * * * fires every minute 0..29 → 1-minute min gap.
+        assert _schedule_interval_seconds(parse_schedule("0-29 * * * *")) == 60
+
+    def test_cron_stepped_range_minute_gap(self):
+        # 0-59/10 → 0,10,20,30,40,50 → 10-minute min gap.
+        assert _schedule_interval_seconds(parse_schedule("0-59/10 * * * *")) == 600
+
+    def test_cron_irregular_comma_uses_min_gap(self):
+        # 0,5 * * * * → gaps {5, 55} → min 5m (the tightest gap is what pollutes).
+        assert _schedule_interval_seconds(parse_schedule("0,5 * * * *")) == 300
+
     def test_once_has_no_interval(self):
         assert _schedule_interval_seconds(parse_schedule("30m")) is None
 
@@ -841,6 +861,16 @@ class TestOriginSubHourlyAdmission:
 
     def test_origin_every_minute_cron_blocked(self):
         assert self._err("origin", "* * * * *") is not None
+
+    def test_origin_comma_minute_blocked(self):
+        # The Greptile bypass: 0,30 * * * * = every 30m, must be blocked.
+        assert self._err("origin", "0,30 * * * *") is not None
+
+    def test_origin_range_minute_blocked(self):
+        assert self._err("origin", "0-29 * * * *") is not None
+
+    def test_origin_stepped_range_minute_blocked(self):
+        assert self._err("origin", "0-59/10 * * * *") is not None
 
     # ---- admissible shapes are NOT blocked ----
     def test_origin_hourly_allowed(self):

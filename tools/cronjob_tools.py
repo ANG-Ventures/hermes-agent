@@ -490,6 +490,55 @@ def _creation_admission_warnings(job: Dict[str, Any]) -> List[str]:
 _ORIGIN_SUBHOURLY_FLOOR_SECONDS = 3600
 
 
+def _cron_minute_field_min_gap_seconds(minute: str) -> Optional[int]:
+    """Smallest gap between consecutive fires (seconds) for a 5-field cron's
+    MINUTE field, assuming the hour/day fields permit firing each hour.
+
+    Expands every form the minute field can take — ``*``, ``*/N``, comma lists
+    (``0,30``), ranges (``0-29``), stepped ranges (``0-59/10``), and any mix —
+    into the concrete set of fire-minutes, then returns the minimum gap between
+    consecutive fires INCLUDING the wrap across the hour boundary (so a job that
+    fires only at :00 has a 3600s gap, but ``0,30`` has 1800s). Returns None if
+    the field can't be parsed. This closes the bypass where non-``*/N`` minute
+    forms fell through to a flat hourly assumption (Greptile, PR #397).
+    """
+    fires: set[int] = set()
+    for token in minute.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        step = 1
+        if "/" in token:
+            base, _, step_s = token.partition("/")
+            if not step_s.isdigit() or int(step_s) <= 0:
+                return None
+            step = int(step_s)
+        else:
+            base = token
+        if base == "*":
+            lo, hi = 0, 59
+        elif "-" in base:
+            lo_s, _, hi_s = base.partition("-")
+            if not (lo_s.isdigit() and hi_s.isdigit()):
+                return None
+            lo, hi = int(lo_s), int(hi_s)
+        elif base.isdigit():
+            lo = hi = int(base)
+        else:
+            return None
+        if not (0 <= lo <= 59 and 0 <= hi <= 59 and lo <= hi):
+            return None
+        fires.update(range(lo, hi + 1, step))
+    if not fires:
+        return None
+    mins = sorted(fires)
+    if len(mins) == 1:
+        return 3600  # fires once per hour
+    gaps = [(b - a) for a, b in zip(mins, mins[1:])]
+    gaps.append((mins[0] + 60) - mins[-1])  # wrap across the hour boundary
+    return min(gaps) * 60
+
+
 def _schedule_interval_seconds(schedule: Optional[Dict[str, Any]]) -> Optional[int]:
     """Best-effort seconds between fires for a PARSED schedule dict; None if
     unknown / one-shot. Mirrors cron-config-lint.interval_seconds so the
@@ -506,13 +555,7 @@ def _schedule_interval_seconds(schedule: Optional[Dict[str, Any]]) -> Optional[i
         expr = schedule.get("expr") or schedule.get("display") or ""
         parts = expr.split()
         if len(parts) == 5:
-            minute = parts[0]
-            m = re.match(r"\*/(\d+)$", minute)
-            if m:
-                return int(m.group(1)) * 60
-            if minute == "*":
-                return 60
-            return 3600  # a fixed minute → at most hourly (good enough for the gate)
+            return _cron_minute_field_min_gap_seconds(parts[0])
     return None
 
 
