@@ -721,15 +721,18 @@ describe('Greptile #364 edge frames', () => {
     expect(stamped.stampedIds.has('500')).toBe(false) // user id dropped, poll reconciles
   })
 
-  it('3+ ids (array + scalar fields both populated): no crash, tail-first assistant preference, extras unstamped', () => {
+  it('3+ ids (array + scalar fields both populated): positional pair stays role-aware, extras unstamped', () => {
     const user = tm('user-1-a', 'user', 'q')
     const assistant = tm('assistant-2', 'assistant', 'a')
     const stamped = stampOptimisticTranscriptRows([user, assistant], ['500', '501', '502'])
 
-    // Two stampable rows, three ids: assistant-preferring walk stamps the
-    // assistant first, then any-role for the next id; the third id is left
-    // for the poll. No row is double-stamped, no id stamped twice.
-    expect(stamped.messages.map(row => row.id)).toEqual(['501', '500'])
+    // Greptile #398: the first two ids keep the [user_id, assistant_id]
+    // positional convention — 500 lands on the USER row, 501 on the assistant
+    // row (an assistant-preferring walk over all ids reversed them). The third
+    // id has no unclaimed row left and is left for the poll.
+    expect(stamped.messages.map(row => row.id)).toEqual(['500', '501'])
+    expect(stamped.messages[0].role).toBe('user')
+    expect(stamped.messages[1].role).toBe('assistant')
     expect(stamped.stampedIds.size).toBe(2)
     expect(stamped.stampedIds.has('502')).toBe(false)
   })

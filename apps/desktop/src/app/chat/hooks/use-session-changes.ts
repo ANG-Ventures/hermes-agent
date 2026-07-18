@@ -415,13 +415,25 @@ export function stampOptimisticTranscriptRows(messages: readonly ChatMessage[], 
     // Unstamped-but-committed is safe; cross-role-stamped is not.
     claim(committedIds[0], 'user')
     claim(committedIds[1], 'assistant')
+  } else if (committedIds.length > 2) {
+    // 3+ ids (array + scalar fields both populated — Greptile #364). The first
+    // two ids still follow the [user_id, assistant_id] positional convention,
+    // so claim them role-aware exactly like the 2-id case (Greptile #398:
+    // assistant-preferring EVERY id here put committedIds[0] — the user's id —
+    // onto an assistant row, a cross-role reversal). Only the EXTRAS beyond the
+    // positional pair fall to assistant-then-any; ids beyond the stampable rows
+    // are simply not stamped (the poll reconciles them).
+    claim(committedIds[0], 'user')
+    claim(committedIds[1], 'assistant')
+    for (const id of committedIds.slice(2)) {
+      if (!claim(id, 'assistant')) {
+        claim(id, null)
+      }
+    }
   } else {
-    // Non-two-id frames (a lone survivor, or 3+ ids when both an array field
-    // and scalar fields populate — Greptile #364). The positional [user,
-    // assistant] contract can't disambiguate here. For each id, prefer an
-    // assistant row (the dup-prone one — the poll always re-fetches the final
-    // text bubble), fall back to any unclaimed stampable row; ids beyond the
-    // stampable rows are simply not stamped (the poll reconciles them).
+    // Lone id: the positional contract can't disambiguate a single survivor.
+    // Prefer the streamed assistant row (the dup-prone one — the poll always
+    // re-fetches the final text bubble), fall back to any unclaimed row.
     for (const id of committedIds) {
       if (!claim(id, 'assistant')) {
         claim(id, null)
