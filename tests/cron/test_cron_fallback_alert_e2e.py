@@ -132,9 +132,10 @@ DIGEST_JOB = {
 }
 
 
-def test_run_job_fires_loud_alert_when_fallback_used(monkeypatch):
-    """E2E (INV-3/INV-5): a real run_job whose agent fell back to Opus produces
-    a #alerts ping carrying the route, separate from the digest delivery."""
+def test_run_job_logs_calm_notice_when_declared_fallback_used(monkeypatch):
+    """E2E: a real run_job whose agent fell back to its DECLARED fallback (Opus)
+    produces a CALM notice to #logs (safety net working as designed), separate
+    from the digest delivery — NOT a loud #alerts page."""
     _patch_agent_bootstrap(monkeypatch)
     _patch_codex_runtime(monkeypatch)
     monkeypatch.setattr(run_agent, "AIAgent", _FellBackToOpusAgent)
@@ -146,21 +147,25 @@ def test_run_job_fires_loud_alert_when_fallback_used(monkeypatch):
     assert success is True, error
     assert final_response == "digest produced on the fallback"
 
-    # 2. Exactly one loud fallback alert fired, to the #alerts default target
-    #    (NOT the job's own #logs deliver), carrying the full route.
-    fallback_alerts = [
+    # 2. Exactly one fallback notice fired, to the #logs default (a DECLARED
+    #    fallback is expected telemetry, not a #alerts incident), carrying the
+    #    full route with calm wording.
+    fallback_notes = [
         c for c in alerts
-        if c["deliver"] == cron_scheduler._DEFAULT_FALLBACK_ALERT_DELIVER
+        if c["deliver"] == cron_scheduler._DEFAULT_FALLBACK_LOG_DELIVER
     ]
-    assert len(fallback_alerts) == 1, alerts
-    alert = fallback_alerts[0]
-    assert "openai-codex/gpt-5.5" in alert["content"]
-    assert "claude-app/claude-opus-4-8" in alert["content"]
-    # delivered UNWRAPPED — no "Cronjob Failed/Response" envelope on an alert
-    # about a job that succeeded on its fallback (matches the unit-test coverage).
-    assert alert["wrap_override"] is False
-    # and it did NOT go to the digest channel
-    assert alert["deliver"] != DIGEST_JOB["deliver"]
+    assert len(fallback_notes) == 1, alerts
+    note = fallback_notes[0]
+    assert "openai-codex/gpt-5.5" in note["content"]
+    assert "claude-app/claude-opus-4-8" in note["content"]
+    # calm — not the 🚨 shouldn't-happen framing
+    assert "🚨" not in note["content"]
+    assert "as designed" in note["content"].lower()
+    # delivered UNWRAPPED — no "Cronjob Failed/Response" envelope.
+    assert note["wrap_override"] is False
+    # it went to #logs, not #alerts, and not the job's own digest deliver.
+    assert note["deliver"] != cron_scheduler._DEFAULT_FALLBACK_ALERT_DELIVER
+    assert note["deliver"] != DIGEST_JOB["deliver"]
 
 
 def test_run_job_no_alert_on_primary_only_run(monkeypatch):
