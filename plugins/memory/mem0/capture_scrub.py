@@ -62,9 +62,12 @@ _OP_REF = re.compile(r"\bop://[^\s'\"]+")
 # fixes folded in (wider value window, 2-word passphrase, 'reset to' connector).
 _CRED_WORD = re.compile(r"(?i)\b(?:pass(?:word|code|phrase)|passwd|pwd)\b")
 # The cred word as a NOUN MODIFIER ('password manager/app/field/policy/...') is not a disclosure.
+# `reset(s)` is only a role noun when NOT followed by 'to' — 'the password reset flow' is a flow
+# term, but 'the password reset to 84719263' is a phrased VALUE disclosure the _CRED_CONNECTOR
+# must see (Greptile #393: a bare `reset` here silently negated the 'reset to' connector).
 _CRED_ROLE_NOUN = re.compile(
     r"(?i)(?:manager|managers|app|apps|application|field|fields|box|prompt|step|screen|wall|"
-    r"policy|policies|reset|resets|recovery|rotation|entry|entries|store|vault|hint|hints|"
+    r"policy|policies|reset(?!\s+to\b)|resets(?!\s+to\b)|recovery|rotation|entry|entries|store|vault|hint|hints|"
     r"strength|length|requirement|requirements|protection|protected|authentication|form)\b"
 )
 _QUOTES = "'\"`\u2018\u2019\u201c\u201d"
@@ -85,8 +88,13 @@ _CRED_STOPWORDS = {"password", "passcode", "passphrase", "passwd", "pwd", "the",
 
 
 def _looks_like_password_value(token: str) -> bool:
-    """A bare token that looks like a real password value: >=6 chars, has a letter, and has a
-    digit OR a strong symbol (so a plain dictionary word is NOT flagged, but 'djt!K9x' is)."""
+    """A bare token that looks like a real password value: has a letter, and has a
+    digit OR a strong symbol (so a plain dictionary word is NOT flagged, but 'djt!K9x' is).
+
+    Called on two token shapes with different length floors: _BARE_TOKEN matches
+    are already >=8 chars; individual WORDS of a quoted multi-word value can be
+    shorter, so the >=6 floor here is the binding one for those (e.g. 'K9x!7a').
+    """
     core = token.strip(".,;:!?)('\"`\u2018\u2019\u201c\u201d")
     if len(core) < 6:
         return False

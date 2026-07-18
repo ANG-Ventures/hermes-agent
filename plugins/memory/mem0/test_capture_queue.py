@@ -229,6 +229,8 @@ NL_CRED_CORPUS = [
     # Greptile #214 P2 (scrub:198): pure-digit PIN after a connector, incl. phrased resets
     ("numeric pin bare", "the router admin password is 84719263 as printed on the label"),
     ("numeric pin reset-to", "the router password has been reset to 84719263 by the technician"),
+    # Greptile #393: bare "reset" right after the cred word must not negate "reset to"
+    ("numeric pin bare reset-to", "the router password reset to 84719263 after the outage"),
     # Greptile #214 P2 (scrub:167): value beyond the old 60-char window (qualifier phrase)
     ("distant qualified value",
      f"the password for the backup router's admin console on the secondary VLAN is {_NLP_ZXCV}"),
@@ -256,6 +258,8 @@ def test_scrubber_nl_credentials_no_false_positives():
         'the password manager is "Bitwarden" and syncs across devices',
         "User's preferred password app is \"1Password\" on all machines",
         "the password field on the login form is currently disabled",
+        # Greptile #393: "password reset" as a FLOW term (no value) stays clean
+        "the password reset flow emails a link that expires in 15 minutes",
         "User's Plex server listens on port 32400 for the local network",
     ]
     for f in clean:
