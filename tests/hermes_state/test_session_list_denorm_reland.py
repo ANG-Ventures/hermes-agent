@@ -2,6 +2,7 @@ import ast
 import json
 import os
 import shutil
+import sqlite3
 import textwrap
 from pathlib import Path
 from typing import Dict
@@ -117,6 +118,16 @@ def _assert_reopened_denorm_matches_oracle(db_path: Path, expected_ids: list[str
         _assert_denorm_matches_oracle(reopened, expected_ids)
     finally:
         reopened.close()
+
+
+def _canonical_bytes(rows):
+    """Stable RPC-equivalent bytes for real-copy contract comparisons."""
+    return json.dumps(
+        rows,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
 
 
 def test_dashboard_session_list_denorm_default_is_false_config_only():
@@ -790,11 +801,13 @@ def test_real_copy_denorm_listing_matches_cte_oracle(tmp_path):
     _write_dashboard_flag(True)
     src = Path(os.environ["SESSION_LIST_REAL_COPY_DB"])
     dst = tmp_path / "real-copy-state.db"
-    shutil.copy2(src, dst)
-    for suffix in ("-wal", "-shm"):
-        sidecar = src.with_name(src.name + suffix)
-        if sidecar.exists():
-            shutil.copy2(sidecar, dst.with_name(dst.name + suffix))
+    source_conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+    destination_conn = sqlite3.connect(dst)
+    try:
+        source_conn.backup(destination_conn)
+    finally:
+        destination_conn.close()
+        source_conn.close()
 
     db = SessionDB(db_path=dst)
     try:
@@ -808,14 +821,20 @@ def test_real_copy_denorm_listing_matches_cte_oracle(tmp_path):
         sample_id = sample[0]["id"]
         sample_source = sample[0]["source"]
         cases = [
-            {"order_by_last_active": True, "limit": 200},
-            {"order_by_last_active": True, "limit": 200, "include_archived": True},
-            {"order_by_last_active": True, "limit": 200, "id_query": sample_id},
-            {"order_by_last_active": True, "limit": 200, "source": sample_source},
+            {"order_by_last_active": True, "limit": 400},
+            {"order_by_last_active": True, "limit": 400, "include_archived": True},
+            {"order_by_last_active": True, "limit": 400, "archived_only": True},
+            {"order_by_last_active": True, "limit": 400, "id_query": sample_id},
+            {"order_by_last_active": True, "limit": 400, "source": sample_source},
+            {
+                "order_by_last_active": True,
+                "limit": 400,
+                "exclude_sources": ["tool"],
+            },
         ]
         for kwargs in cases:
-            assert _normalized(db.list_sessions_rich(**kwargs)) == _normalized(
+            assert _canonical_bytes(db.list_sessions_rich(**kwargs)) == _canonical_bytes(
                 db.list_sessions_rich(_force_cte_oracle=True, **kwargs)
-            )
+            ), kwargs
     finally:
         db.close()

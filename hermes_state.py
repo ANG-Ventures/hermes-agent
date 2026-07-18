@@ -2327,7 +2327,6 @@ class SessionDB:
                 WHERE parent.end_reason = 'compression'
                   AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL
                   AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL
-                  AND COALESCE(child.source, '') != 'tool'
             )
             SELECT id FROM ancestors ORDER BY depth DESC LIMIT 1
             """,
@@ -2357,7 +2356,6 @@ class SessionDB:
                 WHERE parent.end_reason = 'compression'
                   AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL
                   AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL
-                  AND COALESCE(child.source, '') != 'tool'
             )
             SELECT MAX(COALESCE(
                 (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = chain.cur_id),
@@ -2478,7 +2476,6 @@ class SessionDB:
                 WHERE parent.end_reason = 'compression'
                   AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
                   AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
-                  AND COALESCE(child.source, '') != 'tool'
             ),
             chain_max AS (
                 SELECT root_id,
@@ -6695,7 +6692,6 @@ class SessionDB:
                     WHERE parent.end_reason = 'compression'
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
-                      AND COALESCE(child.source, '') != 'tool'
                 ),
                 chain_max AS (
                     SELECT
@@ -10126,6 +10122,7 @@ class SessionDB:
                 "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
                 (session_id,),
             )
+            self._recompute_effective_last_active_for_session(conn, session_id)
         self._execute_write(_do)
 
     @staticmethod
