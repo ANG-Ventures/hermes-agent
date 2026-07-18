@@ -847,6 +847,18 @@ class TestOriginSubHourlyAdmission:
         # 0,5 * * * * → gaps {5, 55} → min 5m (the tightest gap is what pollutes).
         assert _schedule_interval_seconds(parse_schedule("0,5 * * * *")) == 300
 
+    def test_cron_start_with_step_form(self):
+        # 0/30 * * * * = start at 0, step 30 to 59 → {0,30} → 30-minute gap.
+        assert _schedule_interval_seconds(parse_schedule("0/30 * * * *")) == 1800
+
+    def test_cron_start_with_step_quarter_hour(self):
+        # 0/15 → {0,15,30,45} → 15-minute gap.
+        assert _schedule_interval_seconds(parse_schedule("0/15 * * * *")) == 900
+
+    def test_cron_start_with_step_offset_base(self):
+        # 5/20 → {5,25,45} → min gap 20m (wrap 5+60-45=20).
+        assert _schedule_interval_seconds(parse_schedule("5/20 * * * *")) == 1200
+
     def test_once_has_no_interval(self):
         assert _schedule_interval_seconds(parse_schedule("30m")) is None
 
@@ -871,6 +883,11 @@ class TestOriginSubHourlyAdmission:
 
     def test_origin_stepped_range_minute_blocked(self):
         assert self._err("origin", "0-59/10 * * * *") is not None
+
+    def test_origin_start_with_step_blocked(self):
+        # The N/step Greptile bypass: 0/30 = every 30m, must be blocked.
+        assert self._err("origin", "0/30 * * * *") is not None
+        assert self._err("origin", "0/15 * * * *") is not None
 
     # ---- admissible shapes are NOT blocked ----
     def test_origin_hourly_allowed(self):

@@ -495,12 +495,14 @@ def _cron_minute_field_min_gap_seconds(minute: str) -> Optional[int]:
     MINUTE field, assuming the hour/day fields permit firing each hour.
 
     Expands every form the minute field can take — ``*``, ``*/N``, comma lists
-    (``0,30``), ranges (``0-29``), stepped ranges (``0-59/10``), and any mix —
-    into the concrete set of fire-minutes, then returns the minimum gap between
-    consecutive fires INCLUDING the wrap across the hour boundary (so a job that
-    fires only at :00 has a 3600s gap, but ``0,30`` has 1800s). Returns None if
-    the field can't be parsed. This closes the bypass where non-``*/N`` minute
-    forms fell through to a flat hourly assumption (Greptile, PR #397).
+    (``0,30``), ranges (``0-29``), stepped ranges (``0-59/10``), and the
+    start-with-step form (``N/step`` = start at N, step to 59, e.g. ``0/30`` →
+    ``{0,30}``) — into the concrete set of fire-minutes, then returns the minimum
+    gap between consecutive fires INCLUDING the wrap across the hour boundary (so
+    a job that fires only at :00 has a 3600s gap, but ``0,30`` has 1800s).
+    Returns None if the field can't be parsed. This closes the bypass where
+    non-``*/N`` minute forms fell through to a flat hourly assumption (Greptile,
+    PR #397).
     """
     fires: set[int] = set()
     for token in minute.split(","):
@@ -508,7 +510,8 @@ def _cron_minute_field_min_gap_seconds(minute: str) -> Optional[int]:
         if not token:
             continue
         step = 1
-        if "/" in token:
+        has_step = "/" in token
+        if has_step:
             base, _, step_s = token.partition("/")
             if not step_s.isdigit() or int(step_s) <= 0:
                 return None
@@ -523,7 +526,11 @@ def _cron_minute_field_min_gap_seconds(minute: str) -> Optional[int]:
                 return None
             lo, hi = int(lo_s), int(hi_s)
         elif base.isdigit():
-            lo = hi = int(base)
+            # Cron semantics: a bare number WITH a step (``N/step``) means "start
+            # at N, fire every step up to 59" — so the upper bound is 59, not N.
+            # A bare number WITHOUT a step is a single fire at N.
+            lo = int(base)
+            hi = 59 if has_step else lo
         else:
             return None
         if not (0 <= lo <= 59 and 0 <= hi <= 59 and lo <= hi):
