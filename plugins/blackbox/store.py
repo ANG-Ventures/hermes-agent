@@ -90,7 +90,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             interrupted INT,
             alerted INT DEFAULT 0,
             user_text TEXT,
-            final_text TEXT
+            final_text TEXT,
+            cli_invocation_id TEXT
         );
 
         CREATE TABLE IF NOT EXISTS turn_tool_calls (
@@ -170,6 +171,15 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     if "depth" not in _existing:
         try:
             conn.execute("ALTER TABLE turns ADD COLUMN depth INT")
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
+    # CLI correlation column (Phase 3: ccusage <-> Hermes correlation). TEXT,
+    # nullable. Populated only when spawning a CLI subprocess; enables
+    # deduplication in tokens.ace. Same guarded additive pattern.
+    if "cli_invocation_id" not in _existing:
+        try:
+            conn.execute("ALTER TABLE turns ADD COLUMN cli_invocation_id TEXT")
         except sqlite3.OperationalError as e:
             if "duplicate column" not in str(e).lower():
                 raise
@@ -253,8 +263,8 @@ def insert_turn(record: TurnRecord) -> None:
                     cost_uncached_usd, cost_cache_read_usd,
                     cost_cache_write_usd, cost_output_usd,
                     interrupted, alerted, user_text,
-                    final_text
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    final_text, cli_invocation_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.turn_id,
@@ -302,6 +312,7 @@ def insert_turn(record: TurnRecord) -> None:
                     _bool_int(record.alerted),
                     scrub_and_truncate(record.user_text),
                     scrub_and_truncate(record.final_text),
+                    record.cli_invocation_id,
                 ),
             )
             conn.execute("DELETE FROM turn_tool_calls WHERE turn_id = ?", (record.turn_id,))

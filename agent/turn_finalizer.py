@@ -735,6 +735,7 @@ def finalize_turn(
             user_message=original_user_message,
             final_response=final_response,
             turn_usage=_turn_usage,
+            cli_invocation_id=getattr(agent, "_cli_invocation_id", None),
         )
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)

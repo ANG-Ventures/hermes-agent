@@ -369,6 +369,7 @@ def _build_record(
         user_text=str(user_message or "") if store_text else "",
         final_text=str(final_response or "") if store_text else "",
         tool_calls=tool_calls if store_text else [],
+        cli_invocation_id=kwargs.get("cli_invocation_id"),
     )
 
 
