@@ -49,6 +49,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             turn_id TEXT PRIMARY KEY,
             parent_turn_id TEXT,
             is_subagent INT,
+            depth INT,
             ts_start REAL,
             ts_end REAL,
             profile TEXT,
@@ -163,6 +164,15 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 conn.execute(f"ALTER TABLE turns ADD COLUMN {_col} REAL")
             except sqlite3.OperationalError:
                 pass
+    # Depth column (session nesting: 0=parent, 1=child, 2=grandchild, ...).
+    # INT, nullable. Guarded per-column migration (D1: only swallow "duplicate
+    # column" OperationalError, re-raise lock/corruption/other errors).
+    if "depth" not in _existing:
+        try:
+            conn.execute("ALTER TABLE turns ADD COLUMN depth INT")
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
     conn.commit()
 
 
@@ -228,7 +238,7 @@ def insert_turn(record: TurnRecord) -> None:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO turns (
-                    turn_id, parent_turn_id, is_subagent, ts_start, ts_end,
+                    turn_id, parent_turn_id, is_subagent, depth, ts_start, ts_end,
                     profile, provider, model, platform, chat_id, chat_name,
                     api_calls, tools, input_tokens, output_tokens, cache_read,
                     cache_write, reasoning, context_used, context_length,
@@ -244,12 +254,13 @@ def insert_turn(record: TurnRecord) -> None:
                     cost_cache_write_usd, cost_output_usd,
                     interrupted, alerted, user_text,
                     final_text
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.turn_id,
                     record.parent_turn_id,
                     _bool_int(record.is_subagent),
+                    _int_or_none(record.depth),
                     float(record.ts_start or 0.0),
                     float(record.ts_end or 0.0),
                     record.profile or "",

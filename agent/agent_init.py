@@ -1521,6 +1521,11 @@ def init_agent(
         short_uuid = uuid.uuid4().hex[:6]
         agent.session_id = f"{timestamp_str}_{short_uuid}"
 
+    # Blackbox depth tracking (B1 fix): parent agents start at depth 0.
+    # Child agents inherit parent depth + 1 at construction (set in
+    # tools/delegate_tool.py::_build_child_agent).
+    agent._blackbox_depth = 0
+
     # Expose session ID to tools (terminal, execute_code) so agents can
     # reference their own session for --resume commands, cross-session
     # coordination, and logging. Keep the ContextVar and os.environ
