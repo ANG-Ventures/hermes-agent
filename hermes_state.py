@@ -1497,7 +1497,6 @@ class SessionDB:
                 WHERE parent.end_reason = 'compression'
                   AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL
                   AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL
-                  AND COALESCE(child.source, '') != 'tool'
             )
             SELECT id FROM ancestors ORDER BY depth DESC LIMIT 1
             """,
@@ -1527,7 +1526,6 @@ class SessionDB:
                 WHERE parent.end_reason = 'compression'
                   AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL
                   AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL
-                  AND COALESCE(child.source, '') != 'tool'
             )
             SELECT MAX(COALESCE(
                 (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = chain.cur_id),
@@ -1648,7 +1646,6 @@ class SessionDB:
                 WHERE parent.end_reason = 'compression'
                   AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
                   AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
-                  AND COALESCE(child.source, '') != 'tool'
             ),
             chain_max AS (
                 SELECT root_id,
@@ -4800,7 +4797,6 @@ class SessionDB:
                     WHERE parent.end_reason = 'compression'
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
-                      AND COALESCE(child.source, '') != 'tool'
                 ),
                 chain_max AS (
                     SELECT
@@ -7458,6 +7454,7 @@ class SessionDB:
                 "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
                 (session_id,),
             )
+            self._recompute_effective_last_active_for_session(conn, session_id)
         self._execute_write(_do)
 
     @staticmethod
@@ -7746,6 +7743,11 @@ class SessionDB:
                 return 0
 
             placeholders = ",".join("?" * len(session_ids))
+            orphaned_child_ids, affected_root_ids = (
+                self._collect_orphan_effective_last_active_targets(
+                    conn, list(session_ids)
+                )
+            )
             conn.execute(
                 f"UPDATE sessions SET parent_session_id = NULL "
                 f"WHERE parent_session_id IN ({placeholders})",
@@ -7762,6 +7764,9 @@ class SessionDB:
                 )
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
+            self._recompute_effective_last_active_many(
+                conn, affected_root_ids + orphaned_child_ids
+            )
             return len(session_ids)
 
         count = self._execute_write(_do)
@@ -7998,6 +8003,11 @@ class SessionDB:
 
             # Orphan any sessions whose parent is about to be deleted
             placeholders = ",".join("?" * len(session_ids))
+            orphaned_child_ids, affected_root_ids = (
+                self._collect_orphan_effective_last_active_targets(
+                    conn, list(session_ids)
+                )
+            )
             conn.execute(
                 f"UPDATE sessions SET parent_session_id = NULL "
                 f"WHERE parent_session_id IN ({placeholders})",
@@ -8008,6 +8018,9 @@ class SessionDB:
                 conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
+            self._recompute_effective_last_active_many(
+                conn, affected_root_ids + orphaned_child_ids
+            )
             return len(session_ids)
 
         count = self._execute_write(_do)
