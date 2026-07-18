@@ -5,6 +5,7 @@ import pytest
 
 from tools.cronjob_tools import (
     _creation_admission_error,
+    _cron_minute_field_min_gap_seconds,
     _schedule_interval_seconds,
     _scan_cron_prompt,
     check_cronjob_requirements,
@@ -861,6 +862,37 @@ class TestOriginSubHourlyAdmission:
 
     def test_once_has_no_interval(self):
         assert _schedule_interval_seconds(parse_schedule("30m")) is None
+
+    def test_min_gap_matches_croniter_ground_truth(self):
+        # Ground-truth the whole minute-field parser against croniter (the real
+        # cron engine parse_schedule validates with) so no minute form silently
+        # over-reports its cadence and bypasses the gate. Covers */N, comma,
+        # range, stepped range, N/step, offset bases, and boundary cases.
+        croniter = pytest.importorskip("croniter").croniter
+        import datetime
+
+        def truth(minute_field):
+            base = datetime.datetime(2020, 1, 1, 0, 0)
+            it = croniter(f"{minute_field} * * * *", base)
+            fires = []
+            for _ in range(200):
+                t = it.get_next(datetime.datetime)
+                fires.append(t)
+                if t >= base + datetime.timedelta(hours=2):
+                    break
+            gaps = [(fires[i + 1] - fires[i]).total_seconds() for i in range(len(fires) - 1)]
+            return int(min(gaps)) if gaps else None
+
+        forms = [
+            "*", "*/1", "*/5", "*/10", "*/15", "*/30", "0", "30", "0,30",
+            "0,15,30,45", "0,5", "0-29", "0-59/10", "0/30", "0/15", "5/20",
+            "0/60", "1-59/2", "10-20", "0,10,40", "15", "*/7", "0-10/3",
+            "59", "0/59",
+        ]
+        for m in forms:
+            assert _cron_minute_field_min_gap_seconds(m) == truth(m), (
+                f"minute field {m!r}: parser disagrees with croniter"
+            )
 
     # ---- the block: origin + sub-hourly is refused ----
     def test_origin_every_10m_blocked(self):
