@@ -40,6 +40,7 @@ FALLBACK_EVENT = {
     "new_model": "claude-opus-4-8",
     "old_provider": "openai-codex",
     "new_provider": "claude-app",
+    "reason_label": "rate limit",
 }
 
 # A job whose ``fallback`` chain DECLARES the model the run fell back to — the
@@ -69,6 +70,8 @@ def test_declared_fallback_is_calm_and_routes_to_logs(monkeypatch):
     assert "as designed" in content.lower()
     # both models still reported
     assert "claude-opus-4-8" in content and "gpt-5.5" in content
+    # WHY the primary failed is surfaced (not guessed)
+    assert "rate limit" in content
     # routed to #logs, not #alerts
     assert calls[0]["job"]["deliver"] == sched._DEFAULT_FALLBACK_LOG_DELIVER
     assert calls[0]["job"]["deliver"] != sched._DEFAULT_FALLBACK_ALERT_DELIVER
@@ -86,7 +89,24 @@ def test_undeclared_fallback_is_loud_and_routes_to_alerts(monkeypatch):
     content = calls[0]["content"]
     assert "🚨" in content
     assert "UNDECLARED" in content.upper()
+    # WHY the primary failed is surfaced (not guessed)
+    assert "rate limit" in content
     assert calls[0]["job"]["deliver"] == sched._DEFAULT_FALLBACK_ALERT_DELIVER
+
+
+def test_reason_degrades_gracefully_when_unrecorded(monkeypatch):
+    """If the runtime recorded no reason, the notice says so honestly rather
+    than guessing a cause."""
+    calls = _capture_deliver(monkeypatch)
+    event = {k: v for k, v in FALLBACK_EVENT.items() if k != "reason_label"}
+    agent = _FakeAgent(event)
+
+    sched._emit_cron_fallback_alert(DECLARED_JOB, agent)
+
+    content = calls[0]["content"]
+    assert "unrecorded" in content.lower()
+    # must NOT fabricate a specific cause
+    assert "rate limit" not in content
 
 
 def test_alert_fires_when_fallback_event_present(monkeypatch):

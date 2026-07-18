@@ -63,12 +63,15 @@ class _FellBackToOpusAgent(run_agent.AIAgent):
         self._save_trajectory = lambda messages, user_message, completed: None
 
     def run_conversation(self, user_message, conversation_history=None, task_id=None):
-        # The agent walked the chain: openai-codex/gpt-5.5 → claude-app/opus.
+        # The agent walked the chain: openai-codex/gpt-5.5 → claude-app/opus,
+        # recording WHY (rate limit) exactly as the real announce path does.
         self._last_fallback_event = {
             "old_model": "gpt-5.5",
             "new_model": "claude-opus-4-8",
             "old_provider": "openai-codex",
             "new_provider": "claude-app",
+            "reason_label": "rate limit",
+            "reason": "rate_limit",
         }
         return {"final_response": "digest produced on the fallback", "messages": []}
 
@@ -158,6 +161,8 @@ def test_run_job_logs_calm_notice_when_declared_fallback_used(monkeypatch):
     note = fallback_notes[0]
     assert "openai-codex/gpt-5.5" in note["content"]
     assert "claude-app/claude-opus-4-8" in note["content"]
+    # WHY the primary failed is surfaced end-to-end (not guessed)
+    assert "rate limit" in note["content"]
     # calm — not the 🚨 shouldn't-happen framing
     assert "🚨" not in note["content"]
     assert "as designed" in note["content"].lower()
