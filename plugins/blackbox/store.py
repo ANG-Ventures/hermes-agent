@@ -262,7 +262,7 @@ def insert_turn(record: TurnRecord) -> None:
                     cost_uncached_usd, cost_cache_read_usd,
                     cost_cache_write_usd, cost_output_usd,
                     interrupted, alerted, user_text,
-                    final_text, depth, cli_invocation_id
+                    final_text, cli_invocation_id
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
