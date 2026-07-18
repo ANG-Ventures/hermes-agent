@@ -756,6 +756,14 @@ def _run_review_in_thread(
             )
             review_agent._memory_write_origin = "background_review"
             review_agent._memory_write_context = "background_review"
+            # Depth tracking: background review forks inherit parent depth + 1
+            # since they ARE recorded as is_subagent=1 (sibling forks of the parent).
+            parent_depth = getattr(agent, "_blackbox_depth", None)
+            if parent_depth is not None:
+                review_agent._blackbox_depth = parent_depth + 1
+            else:
+                # Fallback: if parent has no depth, assume fork is depth 1
+                review_agent._blackbox_depth = 1
             # Bridge sub-session isolation: mark this fork so the claude-bridge
             # provider routing key gets a distinct "-review" suffix. Without
             # this, the fork shares the parent's session_id (pinned below for

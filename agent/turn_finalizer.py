@@ -602,6 +602,9 @@ def finalize_turn(
                     "parent_chat_id": getattr(agent, "_blackbox_parent_chat_id", None),
                     "parent_chat_name": getattr(agent, "_blackbox_parent_chat_name", None),
                     "is_subagent": bool(getattr(agent, "_blackbox_is_subagent", False)),
+                    # Depth tracking (B1): read from the agent attribute set at
+                    # construction time (0 for parents, parent+1 for children).
+                    "depth": getattr(agent, "_blackbox_depth", None),
                 }
         except Exception:
             _turn_usage = None

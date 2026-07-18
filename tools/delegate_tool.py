@@ -1614,6 +1614,18 @@ def _build_child_agent(
             or getattr(parent_agent, "platform", "") or "")
         child._blackbox_parent_chat_id = _gse("HERMES_SESSION_CHAT_ID", "") or _so_chat or ""
         child._blackbox_parent_chat_name = _gse("HERMES_SESSION_CHAT_NAME", "") or ""
+        # Depth tracking (B1 fix): child depth = parent depth + 1. Use getattr
+        # with None sentinel (B2) to detect missing parent depth and log warning.
+        parent_depth = getattr(parent_agent, "_blackbox_depth", None)
+        if parent_depth is not None:
+            child._blackbox_depth = parent_depth + 1
+        else:
+            # Old code / parent missing depth attribute → assume direct child
+            child._blackbox_depth = 1
+            logger.warning(
+                "blackbox depth fallback: parent agent has no _blackbox_depth, "
+                "assuming child is depth 1 (direct child)"
+            )
         # Routing-only thread id for the child's bare sends (kept separate from
         # the blackbox attribution fields, which don't carry a thread).
         child._send_origin_thread_id = _gse("HERMES_SESSION_THREAD_ID", "") or _so_thread or ""
