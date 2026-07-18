@@ -642,6 +642,11 @@ def _worker_log_stderr_tail(
         return redact_sensitive_text(tail, force=True).strip() or None
     except (OSError, ImportError):
         return None
+    except Exception:
+        # Log-tail capture is observability only. A redactor/runtime failure
+        # must never roll back the surrounding crash-recovery transaction.
+        _log.debug("failed to capture worker log tail for %s", task_id, exc_info=True)
+        return None
 
 
 def board_metadata_path(board: Optional[str] = None) -> Path:
