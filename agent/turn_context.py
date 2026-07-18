@@ -262,7 +262,8 @@ def build_turn_context(
     # Publish this agent's (provider, model) so cronjob(action="create") can
     # resolve model="auto" to the creating agent's own model instead of leaving
     # a new LLM cron unpinned (which inherits the runtime primary — often Opus —
-    # at fire time). ContextVar-backed; propagates into tool-executor threads.
+    # at fire time). Module-global backed (NOT a ContextVar — a ContextVar set
+    # here is invisible across the tool-executor's asyncio task boundary).
     try:
         from tools.cronjob_tools import set_current_agent_model
         set_current_agent_model(

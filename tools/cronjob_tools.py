@@ -20,15 +20,21 @@ logger = logging.getLogger(__name__)
 # Per-turn identity of the CREATING agent's model, so ``cronjob(action="create")``
 # can resolve model="auto" (or an unpinned LLM cron) to the model of whoever is
 # making the job — instead of leaving it None to inherit the runtime primary
-# (often Opus) at fire time. Backed by a ContextVar (not a process global) so a
-# gateway running concurrent agent turns in executor threads never reads another
-# session's model. ``propagate_context_to_thread`` (contextvars.copy_context)
-# carries it into tool-executor worker threads automatically. Set once per turn
-# in ``agent/turn_context.py``; empty default → "unknown", and "auto" then
-# degrades to leaving the job unpinned (today's behavior), never guessing.
-_current_agent_model: contextvars.ContextVar[Tuple[Optional[str], Optional[str]]] = (
-    contextvars.ContextVar("cron_current_agent_model", default=(None, None))
-)
+# (often Opus) at fire time.
+#
+# 🔴 This is a MODULE-GLOBAL, deliberately NOT a ContextVar. A ContextVar set
+# inside ``build_turn_context`` (which runs in the conversation-loop asyncio
+# TASK) is invisible to ``handle_function_call`` when the tool executor runs the
+# call in a SEPARATE asyncio task — asyncio snapshots the context at task
+# creation, so a sibling/child task never sees a later ``.set()``. That async
+# task boundary made the ContextVar always read (None, None) at cron-create time
+# (live-repro 2026-07-18). ``handle_function_call`` is a module-level dispatcher
+# with no agent handle, so the value must live somewhere task-independent — the
+# same process-global pattern ``_last_resolved_tool_names`` uses in model_tools.
+# Set once per turn in ``agent/turn_context.py``; the gateway serializes tool
+# dispatch per turn, and a stale value only ever means model="auto" pins to the
+# most-recent turn's model (still a real agent model, never a wrong guess).
+_current_agent_model: Tuple[Optional[str], Optional[str]] = (None, None)
 
 
 def set_current_agent_model(provider: Optional[str], model: Optional[str]) -> None:
@@ -37,8 +43,9 @@ def set_current_agent_model(provider: Optional[str], model: Optional[str]) -> No
     Called per turn from ``agent/turn_context.py``. Best-effort and cheap; a bad
     value only means model="auto" falls back to leaving the cron unpinned.
     """
+    global _current_agent_model
     try:
-        _current_agent_model.set((provider or None, model or None))
+        _current_agent_model = (provider or None, model or None)
     except Exception:  # never let context bookkeeping break a turn
         pass
 
@@ -46,7 +53,7 @@ def set_current_agent_model(provider: Optional[str], model: Optional[str]) -> No
 def get_current_agent_model() -> Tuple[Optional[str], Optional[str]]:
     """Return the creating agent's (provider, model), or (None, None) if unset."""
     try:
-        return _current_agent_model.get()
+        return _current_agent_model
     except Exception:
         return (None, None)
 
