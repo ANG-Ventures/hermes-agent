@@ -2412,9 +2412,9 @@ def test_dispatch_idle_tick_preserves_pr_query_cycle(
 
 
 def test_pr_state_resolver_idle_tick_does_not_invalidate_persistent_cache():
-    key = ("o/r", 1)
-    nonterminal_cache = {key: "OPEN"}
-    cycle_skip = {key}
+    key: tuple[str, int] = ("o/r", 1)
+    nonterminal_cache: dict[tuple[str, int], str | None] = {key: "OPEN"}
+    cycle_skip: set[tuple[str, int]] = {key}
 
     resolver = kb._PrStateResolver(
         nonterminal_cache=nonterminal_cache,
@@ -2424,6 +2424,39 @@ def test_pr_state_resolver_idle_tick_does_not_invalidate_persistent_cache():
 
     assert nonterminal_cache == {key: "OPEN"}
     assert cycle_skip == {key}
+
+
+def test_pr_state_resolver_real_scan_retains_unseen_persistent_entries(monkeypatch):
+    seen_key = ("o/r", 1)
+    unseen_key = ("o/r", 2)
+    nonterminal_cache = {seen_key: "OPEN", unseen_key: "OPEN"}
+    cycle_skip = {seen_key, unseen_key}
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda _repo, _number: "OPEN")
+
+    resolver = kb._PrStateResolver(
+        nonterminal_cache=nonterminal_cache,
+        cycle_skip=cycle_skip,
+    )
+    assert resolver.resolve(*seen_key) == "OPEN"
+    resolver.finish_tick(scan_complete=True)
+
+    assert nonterminal_cache == {seen_key: "OPEN", unseen_key: "OPEN"}
+
+
+def test_pr_state_resolver_bounds_nonterminal_cache(monkeypatch):
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda _repo, _number: "OPEN")
+    nonterminal_cache = {}
+    cycle_skip = set()
+    resolver = kb._PrStateResolver(
+        nonterminal_cache=nonterminal_cache,
+        nonterminal_cache_limit=2,
+        cycle_skip=cycle_skip,
+    )
+
+    for number in range(1, 4):
+        assert resolver.resolve("o/r", number) == "OPEN"
+
+    assert nonterminal_cache == {("o/r", 2): "OPEN", ("o/r", 3): "OPEN"}
 
 
 def test_dispatch_evicts_board_pr_state_not_seen_within_retention(monkeypatch):
@@ -2440,6 +2473,27 @@ def test_dispatch_evicts_board_pr_state_not_seen_within_retention(monkeypatch):
     assert stale_key not in kb._PR_QUERY_CYCLE_SKIPS
     assert stale_key not in kb._PR_BOARD_CACHE_LAST_SEEN
     assert fresh_key in kb._PR_BOARD_CACHE_LAST_SEEN
+
+
+def test_dispatch_does_not_restore_expired_spilled_board_state(tmp_path, monkeypatch):
+    now = 1_000_000.0
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    cache_key = str(tmp_path / "kanban.db")
+    swap_path = kb._pr_state_swap_path(cache_key)
+    swap_path.write_text(
+        '{"nonterminal":[["o/r",1,"OPEN"]],"cycle_skip":[["o/r",1]]}',
+        encoding="utf-8",
+    )
+    os.utime(
+        swap_path,
+        (now - kb._RESPAWN_GUARD_PR_BOARD_CACHE_RETENTION_SECONDS - 1,) * 2,
+    )
+
+    nonterminal_cache, cycle_skip = kb._pr_state_caches_for_board(cache_key)
+
+    assert nonterminal_cache == {}
+    assert cycle_skip == set()
+    assert not swap_path.exists()
 
 
 def test_dispatch_bounds_pr_state_caches_across_many_boards(kanban_home):

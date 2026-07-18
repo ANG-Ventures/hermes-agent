@@ -6035,6 +6035,7 @@ _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 _RESPAWN_GUARD_PR_QUERY_LIMIT = 5
 _RESPAWN_GUARD_PR_QUERY_TIMEOUT_SECONDS = 5
 _RESPAWN_GUARD_PR_TERMINAL_CACHE_LIMIT = 1024
+_RESPAWN_GUARD_PR_NONTERMINAL_CACHE_LIMIT = 1024
 _RESPAWN_GUARD_PR_BOARD_CACHE_LIMIT = 32
 _RESPAWN_GUARD_PR_BOARD_CACHE_RETENTION_SECONDS = 7 * 86400
 
@@ -6121,6 +6122,11 @@ def _load_pr_state_cache(
     if not swap_path.exists():
         return {}, set()
     try:
+        if (
+            time.time() - swap_path.stat().st_mtime
+            > _RESPAWN_GUARD_PR_BOARD_CACHE_RETENTION_SECONDS
+        ):
+            return {}, set()
         payload = json.loads(swap_path.read_text(encoding="utf-8"))
         nonterminal_cache = {
             (str(repo), int(number)): state
@@ -6242,6 +6248,7 @@ class _PrStateResolver:
     terminal_cache: dict[tuple[str, int], str] = field(default_factory=dict)
     terminal_cache_limit: Optional[int] = None
     nonterminal_cache: dict[tuple[str, int], Optional[str]] = field(default_factory=dict)
+    nonterminal_cache_limit: Optional[int] = None
     cycle_skip: set[tuple[str, int]] = field(default_factory=set)
     query_count: int = 0
     budget_exhausted: bool = False
@@ -6284,6 +6291,11 @@ class _PrStateResolver:
         else:
             self.nonterminal_cache[key] = state
             self.queried_nonterminal_keys.add(key)
+            if self.nonterminal_cache_limit is not None:
+                while len(self.nonterminal_cache) > self.nonterminal_cache_limit:
+                    stale_key = next(iter(self.nonterminal_cache))
+                    self.nonterminal_cache.pop(stale_key)
+                    self.cycle_skip.discard(stale_key)
         return state
 
     def finish_tick(self, *, scan_complete: bool) -> None:
@@ -7855,6 +7867,7 @@ def _dispatch_once_locked(
         terminal_cache=_PR_TERMINAL_STATE_CACHE,
         terminal_cache_limit=_RESPAWN_GUARD_PR_TERMINAL_CACHE_LIMIT,
         nonterminal_cache=pr_nonterminal_cache,
+        nonterminal_cache_limit=_RESPAWN_GUARD_PR_NONTERMINAL_CACHE_LIMIT,
         cycle_skip=pr_cycle_skip,
     )
     result.reclaimed = release_stale_claims(conn)
