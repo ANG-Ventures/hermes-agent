@@ -21,6 +21,7 @@ class TurnRecord:
     turn_id: str                                   # "turn_" + ULID
     parent_turn_id: Optional[str] = None           # set for subagents; None at top level
     is_subagent: bool = False
+    depth: Optional[int] = None                    # 0=parent, 1=child, 2=grandchild, ...
     ts_start: float = 0.0
     ts_end: float = 0.0
     profile: str = ""                              # agent identity, e.g. "aegis"

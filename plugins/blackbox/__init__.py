@@ -297,6 +297,19 @@ def _build_record(
     )
 
     store_text = bool(cfg.get("store_text", True))
+
+    # Depth tracking (B1 + D3): read depth from the agent attribute set at
+    # construction time. Enforce invariant: if not a subagent, depth must be 0
+    # (D3 — never trust the attribute for a parent agent).
+    raw_depth = _int_or_none_value(usage.get("depth"))
+    if not is_subagent:
+        # D3: parents always depth 0 regardless of any attribute
+        depth: int | None = 0
+    elif raw_depth is not None:
+        depth = raw_depth
+    else:
+        # No depth recorded — preserve NULL for historical/unknown
+        depth = None
     chat_id = (
         kwargs.get("chat_id")
         or usage.get("chat_id")
@@ -314,6 +327,7 @@ def _build_record(
         turn_id=_turn_id(),
         parent_turn_id=usage.get("parent_turn_id"),
         is_subagent=is_subagent,
+        depth=depth,
         ts_start=ts_start,
         ts_end=ts_end,
         profile=str(kwargs.get("profile") or _profile_name()),
