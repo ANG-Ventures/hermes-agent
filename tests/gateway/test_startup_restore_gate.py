@@ -172,3 +172,25 @@ class TestGreptileRaces:
 
         asyncio.run(_drive())  # must not raise
         assert len(runner._startup_restore_queue) == 1
+
+    def test_no_loop_unburns_dedupe_key(self):
+        """Greptile #396: a RuntimeError from create_task (no running loop) must
+        un-burn the dedupe key so the chat can still ack later in the cycle."""
+        adapter = AsyncMock()
+        runner, _ = make_restart_runner()
+        _bind(runner)
+        runner.adapters = {Platform.TELEGRAM: adapter}
+        runner._startup_restore_in_progress = True
+
+        src = make_restart_source(chat_id="c1")
+        # No running loop here (sync context) -> create_task raises RuntimeError.
+        runner._queue_startup_restore_event(_make_event(src))
+        acked = getattr(runner, "_startup_restore_acked_chats", set())
+        assert len(acked) == 0  # key un-burned
+
+        async def _drive():
+            runner._queue_startup_restore_event(_make_event(src))
+            await asyncio.sleep(0.05)
+
+        asyncio.run(_drive())
+        assert adapter.send.await_count == 1  # ack still fired once a loop exists

@@ -8807,8 +8807,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             background_tasks.add(task)
             task.add_done_callback(background_tasks.discard)
         except RuntimeError:
-            # No running loop (shouldn't happen on the gateway path); skip the ack.
-            pass
+            # No running loop (shouldn't happen on the gateway path). Un-burn the
+            # dedupe key so a later queued message on this chat can still ack
+            # (Greptile #396: burning it here left the chat permanently un-acked
+            # for the whole restore cycle after a transient loop hiccup).
+            acked.discard(key)
 
     async def _send_startup_restore_ack(self, adapter: Any, chat_id: Any) -> None:
         # Greptile #258: the ack is fire-and-forget, so by the time this task
