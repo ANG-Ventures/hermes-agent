@@ -347,9 +347,24 @@ def run_codex_app_server_turn(
     # Spawned on first turn, reused across turns, closed at AIAgent
     # shutdown (see _cleanup hook).
     if not hasattr(agent, "_codex_session") or agent._codex_session is None:
+        import uuid
         from agent.runtime_cwd import resolve_agent_cwd
 
         cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
+        
+        # CLI correlation (Phase 3: ccusage ↔ Hermes correlation).
+        # Generate a unique invocation ID and set env vars so the Codex CLI
+        # subprocess can log them, enabling deduplication in tokens.ace.
+        invocation_id = str(uuid.uuid4())
+        session_id = getattr(agent, "session_id", None) or ""
+        correlation_env = {
+            "HERMES_SESSION_ID": session_id,
+            "HERMES_SPAWN_SOURCE": "codex_app_server",
+            "HERMES_INVOCATION_ID": invocation_id,
+        }
+        # Store the invocation_id on the agent so blackbox recording can persist it.
+        agent._cli_invocation_id = invocation_id
+        
         # Approval callback: defer to Hermes' standard prompt flow if a
         # CLI thread has installed one. Gateway / cron contexts get the
         # codex-side fail-closed default.
@@ -404,6 +419,7 @@ def run_codex_app_server_turn(
                 auto_approve_apply_patch=auto_approve_requests,
             ),
             on_event=_on_codex_event,
+            env=correlation_env,
         )
 
     # NOTE: the user message is ALREADY appended to messages by the
