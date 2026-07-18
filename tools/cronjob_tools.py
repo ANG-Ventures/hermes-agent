@@ -480,6 +480,69 @@ def _creation_admission_warnings(job: Dict[str, Any]) -> List[str]:
     return warnings
 
 
+# Session-pollution floor for deliver=origin (mirrors cron-config-lint Rule #5
+# I1). A recurring job that delivers into the originating conversation MORE than
+# once an hour spams Ace's live session on every tick — this is never intentional
+# (an ops receipt/heartbeat belongs in #logs, not the session), so unlike the
+# no-cap case in _creation_admission_warnings it is a HARD block at create/update
+# time, not a warning. Caught the rsd-dropbox-finalize job (deliver=origin +
+# every 10m) only AFTER creation via the daily lint, 2026-07-18.
+_ORIGIN_SUBHOURLY_FLOOR_SECONDS = 3600
+
+
+def _schedule_interval_seconds(schedule: Optional[Dict[str, Any]]) -> Optional[int]:
+    """Best-effort seconds between fires for a PARSED schedule dict; None if
+    unknown / one-shot. Mirrors cron-config-lint.interval_seconds so the
+    create-time gate and the after-the-fact lint agree on cadence."""
+    if not isinstance(schedule, dict):
+        return None
+    kind = schedule.get("kind")
+    if kind == "interval":
+        minutes = schedule.get("minutes")
+        if isinstance(minutes, (int, float)) and minutes > 0:
+            return int(minutes * 60)
+        return None
+    if kind == "cron":
+        expr = schedule.get("expr") or schedule.get("display") or ""
+        parts = expr.split()
+        if len(parts) == 5:
+            minute = parts[0]
+            m = re.match(r"\*/(\d+)$", minute)
+            if m:
+                return int(m.group(1)) * 60
+            if minute == "*":
+                return 60
+            return 3600  # a fixed minute → at most hourly (good enough for the gate)
+    return None
+
+
+def _creation_admission_error(job: Dict[str, Any]) -> Optional[str]:
+    """Return a hard-block error string for a cron shape that must be refused at
+    create/update time, or None if the job is admissible.
+
+    Currently a single rule: deliver=origin on a sub-hourly recurring job
+    (Rule #5 I1). Session-pollution every <1h is never a deliberate choice, so
+    this blocks the create rather than warning after the fact.
+    """
+    if (job.get("deliver") or "").strip().lower() != "origin":
+        return None
+    if not job.get("enabled", True):
+        return None
+    schedule = job.get("schedule") or {}
+    if schedule.get("kind") == "once":
+        return None
+    secs = _schedule_interval_seconds(schedule)
+    if secs is not None and secs < _ORIGIN_SUBHOURLY_FLOOR_SECONDS:
+        mins = max(1, secs // 60)
+        return (
+            f"deliver='origin' on a sub-hourly job (every ~{mins}m) would append to "
+            "Ace's live session on every tick (session pollution). Use "
+            "deliver='discord'/'telegram'/a specific channel for an ops receipt/"
+            "heartbeat, or make the cadence hourly-or-slower. (cron Rule #5 I1)"
+        )
+    return None
+
+
 def _repeat_display(job: Dict[str, Any]) -> str:
     times = (job.get("repeat") or {}).get("times")
     completed = (job.get("repeat") or {}).get("completed", 0)
@@ -933,6 +996,19 @@ def cronjob(
                             success=False,
                         )
 
+            # Reject a session-polluting shape BEFORE persisting it (Rule #5 I1):
+            # deliver=origin on a sub-hourly recurring job. Build a preview from
+            # the same inputs create_job() will use so the gate reads the real
+            # parsed schedule/deliver.
+            _preview_job = {
+                "deliver": _normalize_deliver_param(deliver),
+                "enabled": True,
+                "schedule": parse_schedule(schedule),
+            }
+            _admission_error = _creation_admission_error(_preview_job)
+            if _admission_error:
+                return tool_error(_admission_error, success=False)
+
             job = create_job(
                 prompt=prompt or "",
                 schedule=schedule,
@@ -1165,6 +1241,15 @@ def cronjob(
                     updates["enabled"] = True
             if not updates:
                 return tool_error("No updates provided.", success=False)
+            # Re-validate the session-pollution floor on the EFFECTIVE job (Rule
+            # #5 I1). An update that flips deliver→origin, tightens the cadence,
+            # or re-enables a paused job could introduce the sub-hourly-origin
+            # shape; merge this update over the stored job and refuse it here
+            # rather than letting the daily lint catch it after it fires.
+            _effective_job = {**job, **updates}
+            _admission_error = _creation_admission_error(_effective_job)
+            if _admission_error:
+                return tool_error(_admission_error, success=False)
             updated = update_job(job_id, updates)
             if not updated:
                 return tool_error(f"Failed to update cron job '{job_id}'.", success=False)

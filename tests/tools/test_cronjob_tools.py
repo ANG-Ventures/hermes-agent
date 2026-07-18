@@ -4,10 +4,13 @@ import json
 import pytest
 
 from tools.cronjob_tools import (
+    _creation_admission_error,
+    _schedule_interval_seconds,
     _scan_cron_prompt,
     check_cronjob_requirements,
     cronjob,
 )
+from cron.jobs import parse_schedule
 
 
 # =========================================================================
@@ -704,9 +707,11 @@ class TestLocalDeliveryNotice:
         assert "deliver='telegram'" in created["message"]
 
     def test_explicit_origin_no_origin_emits_notice(self):
+        # deliver='origin' with a daily cadence (the sub-hourly-origin gate,
+        # Rule #5 I1, blocks 'every 2m' — see TestOriginSubHourlyAdmission).
         created = json.loads(
             cronjob(
-                action="create", prompt="x", schedule="every 2m", deliver="origin"
+                action="create", prompt="x", schedule="0 9 * * *", deliver="origin"
             )
         )
         assert created["deliver"] == "origin"
@@ -794,3 +799,64 @@ class TestValidateCronBaseUrl:
 
     def test_base_url_without_provider_rejected(self):
         assert self._v(None, "https://x.example/v1") is not None
+
+
+# =========================================================================
+# Rule #5 I1 — deliver=origin sub-hourly session-pollution hard block
+# (create/update-time gate mirroring cron-config-lint; caught the
+# rsd-dropbox-finalize job — origin + every 10m — only after creation, 2026-07-18)
+# =========================================================================
+class TestOriginSubHourlyAdmission:
+    def _err(self, deliver, schedule_str, enabled=True):
+        return _creation_admission_error({
+            "deliver": deliver,
+            "enabled": enabled,
+            "schedule": parse_schedule(schedule_str),
+        })
+
+    # ---- interval helper agrees with the lint's cadence math ----
+    def test_interval_minutes(self):
+        assert _schedule_interval_seconds(parse_schedule("every 10m")) == 600
+
+    def test_interval_hourly(self):
+        assert _schedule_interval_seconds(parse_schedule("every 2h")) == 7200
+
+    def test_cron_stepped_minute(self):
+        assert _schedule_interval_seconds(parse_schedule("*/15 * * * *")) == 900
+
+    def test_cron_fixed_minute_is_hourly(self):
+        assert _schedule_interval_seconds(parse_schedule("0 9 * * *")) == 3600
+
+    def test_once_has_no_interval(self):
+        assert _schedule_interval_seconds(parse_schedule("30m")) is None
+
+    # ---- the block: origin + sub-hourly is refused ----
+    def test_origin_every_10m_blocked(self):
+        # The exact rsd-dropbox-finalize shape.
+        err = self._err("origin", "every 10m")
+        assert err is not None and "session pollution" in err
+
+    def test_origin_stepped_cron_blocked(self):
+        assert self._err("origin", "*/15 * * * *") is not None
+
+    def test_origin_every_minute_cron_blocked(self):
+        assert self._err("origin", "* * * * *") is not None
+
+    # ---- admissible shapes are NOT blocked ----
+    def test_origin_hourly_allowed(self):
+        assert self._err("origin", "every 1h") is None
+
+    def test_origin_daily_allowed(self):
+        assert self._err("origin", "0 9 * * *") is None
+
+    def test_origin_once_allowed(self):
+        assert self._err("origin", "30m") is None  # parses to a one-shot
+
+    def test_non_origin_subhourly_allowed(self):
+        # Same fast cadence but delivering to a channel is fine.
+        assert self._err("discord:123", "every 10m") is None
+        assert self._err("local", "every 5m") is None
+
+    def test_disabled_origin_subhourly_allowed(self):
+        # A paused/disabled job can't pollute; don't block it.
+        assert self._err("origin", "every 10m", enabled=False) is None
