@@ -121,7 +121,7 @@ def _shipped_importers_of(module: str) -> list[str]:
             py_files += [
                 p
                 for p in d.rglob("*.py")
-                if "/tests/" not in str(p) and "/.worktrees/" not in str(p)
+                if "tests" not in p.parts and ".worktrees" not in p.parts
             ]
     for p in py_files:
         try:
