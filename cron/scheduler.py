@@ -2822,16 +2822,22 @@ def _emit_cron_fallback_alert(job: dict, agent, *, adapters=None, loop=None) -> 
 
         job_name = job.get("name", job.get("id", "?"))
         declared = _fallback_was_declared(job, new_provider, new_model)
+        # WHY the primary failed — surfaced from the recorded fallback event so
+        # the notice reports the actual cause (rate limit / provider overloaded /
+        # auth failed / …) instead of guessing. Falls back to a neutral phrase
+        # only when the runtime recorded no reason.
+        reason_label = (ev.get("reason_label") or "").strip()
+        why = f"reason: **{reason_label}**" if reason_label else "reason: unrecorded"
         if declared:
             # The configured safety net caught a capped/unhealthy primary and the
             # run SUCCEEDED — working exactly as designed. Calm telemetry, #logs.
             msg = (
                 f"↩️ Cron fallback used — `{job_name}` ran on its configured "
                 f"fallback model.\n"
-                f"`{old_label}` → `{new_label}`\n"
-                f"The pinned primary was unavailable (typically a rate-limit / "
-                f"pool cap), so the run completed on its declared fallback. This "
-                f"is the safety net working as designed — no action needed."
+                f"`{old_label}` → `{new_label}` ({why})\n"
+                f"The pinned primary failed for the reason above, so the run "
+                f"completed on its declared fallback. This is the safety net "
+                f"working as designed — no action needed."
             )
         else:
             # The agent walked to a provider/model the job never declared —
@@ -2839,7 +2845,7 @@ def _emit_cron_fallback_alert(job: dict, agent, *, adapters=None, loop=None) -> 
             msg = (
                 f"🚨 Cron fallback FIRED — `{job_name}` ran on an UNDECLARED "
                 f"fallback model.\n"
-                f"`{old_label}` → `{new_label}`\n"
+                f"`{old_label}` → `{new_label}` ({why})\n"
                 f"The pinned primary failed after retries and the run completed "
                 f"on a model the job never declared. This is the 'shouldn't "
                 f"happen' path — check the primary provider's health."
