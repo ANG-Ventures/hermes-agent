@@ -818,13 +818,7 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     # Resolver fairness state is process-local except when a live LRU entry
     # has been spilled beside its DB. Retiring the board must remove both so
     # an archived directory does not retain an orphaned swap file.
-    pr_cache_key = _pr_state_cache_key(db_path)
-    _PR_NONTERMINAL_STATE_CACHES.pop(pr_cache_key, None)
-    _PR_QUERY_CYCLE_SKIPS.pop(pr_cache_key, None)
-    try:
-        _pr_state_swap_path(pr_cache_key).unlink()
-    except OSError:
-        pass
+    _invalidate_pr_state_cache(_pr_state_cache_key(db_path))
 
     if archive:
         archive_root = boards_root() / "_archived"
@@ -6042,6 +6036,7 @@ _RESPAWN_GUARD_PR_QUERY_LIMIT = 5
 _RESPAWN_GUARD_PR_QUERY_TIMEOUT_SECONDS = 5
 _RESPAWN_GUARD_PR_TERMINAL_CACHE_LIMIT = 1024
 _RESPAWN_GUARD_PR_BOARD_CACHE_LIMIT = 32
+_RESPAWN_GUARD_PR_BOARD_CACHE_RETENTION_SECONDS = 7 * 86400
 
 # Bounded process-lifetime cache for PR states the respawn-guard policy treats
 # as terminal. MERGED is irreversible; CLOSED is intentionally cached too even
@@ -6057,6 +6052,7 @@ _PR_NONTERMINAL_STATE_CACHES: dict[
     str, dict[tuple[str, int], Optional[str]]
 ] = {}
 _PR_QUERY_CYCLE_SKIPS: dict[str, set[tuple[str, int]]] = {}
+_PR_BOARD_CACHE_LAST_SEEN: dict[str, float] = {}
 
 
 def _pr_state_cache_key(db_path: Path) -> str:
@@ -6066,6 +6062,17 @@ def _pr_state_cache_key(db_path: Path) -> str:
 def _pr_state_swap_path(cache_key: str) -> Path:
     db_path = Path(cache_key)
     return db_path.with_name(f".{db_path.name}.pr-state-cache.json")
+
+
+def _invalidate_pr_state_cache(cache_key: str) -> None:
+    """Discard all persistent resolver state for one board."""
+    _PR_NONTERMINAL_STATE_CACHES.pop(cache_key, None)
+    _PR_QUERY_CYCLE_SKIPS.pop(cache_key, None)
+    _PR_BOARD_CACHE_LAST_SEEN.pop(cache_key, None)
+    try:
+        _pr_state_swap_path(cache_key).unlink()
+    except OSError:
+        pass
 
 
 def _store_pr_state_cache(
@@ -6144,6 +6151,11 @@ def _pr_state_caches_for_board(
     cache_key: str,
 ) -> tuple[dict[tuple[str, int], Optional[str]], set[tuple[str, int]]]:
     """Return bounded per-board state, spilling live LRU entries to disk."""
+    now = time.time()
+    for stale_key, last_seen in list(_PR_BOARD_CACHE_LAST_SEEN.items()):
+        if now - last_seen > _RESPAWN_GUARD_PR_BOARD_CACHE_RETENTION_SECONDS:
+            _invalidate_pr_state_cache(stale_key)
+
     nonterminal_cache = _PR_NONTERMINAL_STATE_CACHES.pop(cache_key, None)
     cycle_skip = _PR_QUERY_CYCLE_SKIPS.pop(cache_key, None)
     if nonterminal_cache is None or cycle_skip is None:
@@ -6152,6 +6164,7 @@ def _pr_state_caches_for_board(
         cycle_skip = cycle_skip or restored_skip
     _PR_NONTERMINAL_STATE_CACHES[cache_key] = nonterminal_cache
     _PR_QUERY_CYCLE_SKIPS[cache_key] = cycle_skip
+    _PR_BOARD_CACHE_LAST_SEEN[cache_key] = now
 
     for stale_key in list(_PR_NONTERMINAL_STATE_CACHES):
         if len(_PR_NONTERMINAL_STATE_CACHES) <= _RESPAWN_GUARD_PR_BOARD_CACHE_LIMIT:
@@ -6163,6 +6176,7 @@ def _pr_state_caches_for_board(
         if _store_pr_state_cache(stale_key, stale_cache, stale_skip):
             _PR_NONTERMINAL_STATE_CACHES.pop(stale_key, None)
             _PR_QUERY_CYCLE_SKIPS.pop(stale_key, None)
+            _PR_BOARD_CACHE_LAST_SEEN.pop(stale_key, None)
 
     return nonterminal_cache, cycle_skip
 
@@ -6274,13 +6288,7 @@ class _PrStateResolver:
 
     def finish_tick(self, *, scan_complete: bool) -> None:
         """Advance the fair-query cycle after the ready queue scan."""
-        if scan_complete:
-            stale_keys = set(self.nonterminal_cache).difference(self.seen_keys)
-            for key in stale_keys:
-                self.nonterminal_cache.pop(key, None)
-                self.cycle_skip.discard(key)
-
-        if self.budget_exhausted or not scan_complete:
+        if self.budget_exhausted or not scan_complete or not self.seen_keys:
             self.cycle_skip.update(self.queried_nonterminal_keys)
         else:
             self.cycle_skip.clear()

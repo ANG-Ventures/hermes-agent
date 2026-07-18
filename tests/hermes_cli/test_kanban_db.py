@@ -27,6 +27,7 @@ def _clear_pr_state_caches():
             "_PR_TERMINAL_STATE_CACHE",
             "_PR_NONTERMINAL_STATE_CACHES",
             "_PR_QUERY_CYCLE_SKIPS",
+            "_PR_BOARD_CACHE_LAST_SEEN",
         )
     ]
     for cache in caches:
@@ -2408,6 +2409,37 @@ def test_dispatch_idle_tick_preserves_pr_query_cycle(
         kb.dispatch_once(conn, dry_run=True)
 
     assert calls == [("o/r", number) for number in range(1, 11)]
+
+
+def test_pr_state_resolver_idle_tick_does_not_invalidate_persistent_cache():
+    key = ("o/r", 1)
+    nonterminal_cache = {key: "OPEN"}
+    cycle_skip = {key}
+
+    resolver = kb._PrStateResolver(
+        nonterminal_cache=nonterminal_cache,
+        cycle_skip=cycle_skip,
+    )
+    resolver.finish_tick(scan_complete=True)
+
+    assert nonterminal_cache == {key: "OPEN"}
+    assert cycle_skip == {key}
+
+
+def test_dispatch_evicts_board_pr_state_not_seen_within_retention(monkeypatch):
+    now = 1_000_000.0
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    stale_key = "/tmp/stale/kanban.db"
+    fresh_key = "/tmp/fresh/kanban.db"
+
+    kb._pr_state_caches_for_board(stale_key)
+    now += kb._RESPAWN_GUARD_PR_BOARD_CACHE_RETENTION_SECONDS + 1
+    kb._pr_state_caches_for_board(fresh_key)
+
+    assert stale_key not in kb._PR_NONTERMINAL_STATE_CACHES
+    assert stale_key not in kb._PR_QUERY_CYCLE_SKIPS
+    assert stale_key not in kb._PR_BOARD_CACHE_LAST_SEEN
+    assert fresh_key in kb._PR_BOARD_CACHE_LAST_SEEN
 
 
 def test_dispatch_bounds_pr_state_caches_across_many_boards(kanban_home):
