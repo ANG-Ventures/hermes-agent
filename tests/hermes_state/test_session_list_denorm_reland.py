@@ -546,6 +546,100 @@ class TestGatewayFlushMaintainsEffectiveLastActive:
         finally:
             db.close()
 
+    def test_multi_session_turn_flushes_keep_denorm_order_in_lockstep(self, tmp_path):
+        """Real agent flushes must maintain the indexed session-list ordering.
+
+        The final turn reproduces the production regression: a session created
+        today has a deliberately stale denormalized value immediately before its
+        first flush, but its newest persisted message must still put it at #1.
+        """
+        _write_dashboard_flag(True)
+        db = _make_db(tmp_path)
+        now = 1_800_000_000.0
+        started_at = {
+            "old-project": now - 3 * 86_400,
+            "recent-project": now - 3_600,
+            "side-chat": now - 2 * 86_400,
+            "today-rank-one": now - 300,
+        }
+        turns = [
+            ("old-project", now - 5_000, "old-project"),
+            ("recent-project", now - 4_000, "recent-project"),
+            ("old-project", now - 3_000, "old-project"),
+            ("side-chat", now - 3_500, "old-project"),
+            ("recent-project", now - 2_000, "recent-project"),
+            ("old-project", now - 1_500, "old-project"),
+            ("side-chat", now - 1_000, "side-chat"),
+            ("today-rank-one", now - 10, "today-rank-one"),
+        ]
+        agents = {}
+        transcripts = {}
+        turn_counts = {}
+
+        try:
+            for turn_number, (session_id, timestamp, expected_first) in enumerate(
+                turns, start=1
+            ):
+                if session_id not in agents:
+                    agents[session_id] = self._make_agent(db, session_id)
+                    agents[session_id]._ensure_db_session()
+                    transcripts[session_id] = []
+                    turn_counts[session_id] = 0
+                    _set_started_at(db, session_id, started_at[session_id])
+
+                if session_id == "today-rank-one":
+                    stale_value = now - 30 * 86_400
+                    db._execute_write(
+                        lambda conn: conn.execute(
+                            "UPDATE sessions SET effective_last_active = ? WHERE id = ?",
+                            (stale_value, session_id),
+                        )
+                    )
+                    assert db.expected_effective_last_active(session_id) == started_at[session_id]
+
+                turn_counts[session_id] += 1
+                transcript = transcripts[session_id]
+                transcript.extend(
+                    [
+                        {
+                            "role": "user",
+                            "content": f"turn {turn_number} user",
+                            "timestamp": timestamp,
+                        },
+                        {
+                            "role": "assistant",
+                            "content": f"turn {turn_number} assistant",
+                            "timestamp": timestamp + 0.5,
+                        },
+                    ]
+                )
+
+                agents[session_id]._flush_messages_to_session_db(
+                    transcript, conversation_history=[]
+                )
+
+                assert len(db.get_messages(session_id)) == 2 * turn_counts[session_id]
+                got = db.list_sessions_rich(order_by_last_active=True, limit=10)
+                oracle = db.list_sessions_rich(
+                    order_by_last_active=True,
+                    limit=10,
+                    _force_cte_oracle=True,
+                )
+                assert _normalized(got) == _normalized(oracle), f"after turn {turn_number}"
+                assert got[0]["id"] == expected_first
+
+            final_rows = db.list_sessions_rich(order_by_last_active=True, limit=10)
+            assert final_rows[0]["id"] == "today-rank-one"
+            assert final_rows[0]["last_active"] == now - 9.5
+            assert db._conn is not None
+            stored = db._conn.execute(
+                "SELECT effective_last_active FROM sessions WHERE id = ?",
+                ("today-rank-one",),
+            ).fetchone()[0]
+            assert stored == now - 9.5
+        finally:
+            db.close()
+
 
 def _function_sources_by_qualname(source_path: Path) -> Dict[str, str]:
     source = source_path.read_text(encoding="utf-8")
