@@ -1,4 +1,5 @@
 import ast
+import hashlib
 import json
 import os
 import shutil
@@ -291,6 +292,214 @@ class TestGatewayFlushMaintainsEffectiveLastActive:
                 "live-gateway-new-session",
                 "older-than-live",
             ]
+        finally:
+            db.close()
+
+    def test_realistic_copy_message_churn_order_hash_matches_cte_oracle(self, tmp_path):
+        """Forty real agent flushes repair stale recency on a copied snapshot.
+
+        The source file models a production DB whose backfill marker is current
+        but whose live-session denorm values were overstated by an older writer.
+        Each active conversation receives realistic cumulative-history flushes;
+        the final visible and include-archived ordering bytes must hash exactly
+        like the independent recursive-CTE oracle.
+        """
+        _write_dashboard_flag(True)
+        snapshot_dir = tmp_path / "snapshot"
+        snapshot_dir.mkdir()
+        snapshot = SessionDB(db_path=snapshot_dir / "state.db")
+        active_ids = [f"churn-live-{i:02d}" for i in range(6)]
+        archived_ids = [f"churn-archived-{i:02d}" for i in range(2)]
+        all_ids = active_ids + archived_ids
+        base_ts = 1_800_000_000.0
+        try:
+            for session_index, session_id in enumerate(all_ids):
+                started_at = base_ts + session_index * 3_600.0
+                snapshot.create_session(
+                    session_id,
+                    source=("desktop", "cli", "discord")[session_index % 3],
+                    model="test/model",
+                )
+                _set_started_at(snapshot, session_id, started_at)
+                for historical_turn in range(4):
+                    turn_ts = started_at + 60.0 + historical_turn * 90.0
+                    snapshot.append_message(
+                        session_id,
+                        role="user",
+                        content=(
+                            f"historical request {historical_turn} for {session_id}\n"
+                            "with enough detail to resemble a real conversation turn"
+                        ),
+                        timestamp=turn_ts,
+                    )
+                    snapshot.append_message(
+                        session_id,
+                        role="assistant",
+                        content=f"historical response {historical_turn} for {session_id}",
+                        reasoning="brief test reasoning",
+                        timestamp=turn_ts + 0.5,
+                    )
+
+            for session_id in archived_ids:
+                snapshot.set_session_archived(session_id, True)
+
+            # Preserve a current migration marker while modelling denorm drift
+            # left by a missed maintenance call. Reopening the copy must not let
+            # migration repair the test fixture before the flush path sees it.
+            for session_index, session_id in enumerate(active_ids):
+                snapshot._execute_write(
+                    lambda conn, sid=session_id, i=session_index: conn.execute(
+                        "UPDATE sessions SET effective_last_active = ? WHERE id = ?",
+                        (base_ts + 10_000_000.0 - i, sid),
+                    )
+                )
+        finally:
+            snapshot.close()
+
+        copied_path = tmp_path / "realistic-copy-state.db"
+        shutil.copy2(snapshot_dir / "state.db", copied_path)
+        db = SessionDB(db_path=copied_path)
+        try:
+            assert db._conn is not None
+            stale_rows = [
+                session_id
+                for session_id in active_ids
+                if db._conn.execute(
+                    "SELECT effective_last_active FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()[0]
+                != db.expected_effective_last_active(session_id)
+            ]
+            assert stale_rows == active_ids, "snapshot-open unexpectedly repaired the churn fixture"
+
+            agents = {}
+            for session_id in active_ids:
+                agent = self._make_agent(db, session_id)
+                # The copied rows already exist, as they do after an agent's
+                # first persistence setup. Keep the flush focused on message
+                # maintenance rather than create_session's separate recompute.
+                agent._session_db_created = True
+                agents[session_id] = agent
+            transcripts = {
+                session_id: db.get_messages_as_conversation(session_id)
+                for session_id in active_ids
+            }
+            turns_by_session = {session_id: 0 for session_id in active_ids}
+            churn_base = base_ts + 2_000_000.0
+
+            for turn_index in range(40):
+                session_id = active_ids[turn_index % len(active_ids)]
+                turn_ts = churn_base + turn_index * 75.0
+                turn_messages = [
+                    {
+                        "role": "user",
+                        "content": (
+                            f"turn {turn_index}: inspect subsystem {turn_index % 7}\n"
+                            "then report the verified result"
+                        ),
+                        "timestamp": turn_ts,
+                    }
+                ]
+                if turn_index % 4 == 0:
+                    call_id = f"call-{turn_index:02d}"
+                    turn_messages.extend(
+                        [
+                            {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": call_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": "read_file",
+                                            "arguments": json.dumps(
+                                                {"path": f"src/module_{turn_index % 5}.py"}
+                                            ),
+                                        },
+                                    }
+                                ],
+                                "timestamp": turn_ts + 0.2,
+                            },
+                            {
+                                "role": "tool",
+                                "tool_name": "read_file",
+                                "tool_call_id": call_id,
+                                "content": f"verified fixture output for turn {turn_index}",
+                                "timestamp": turn_ts + 0.4,
+                            },
+                            {
+                                "role": "assistant",
+                                "content": f"verified result for turn {turn_index}",
+                                "timestamp": turn_ts + 0.6,
+                            },
+                        ]
+                    )
+                else:
+                    turn_messages.append(
+                        {
+                            "role": "assistant",
+                            "content": f"verified result for turn {turn_index}",
+                            "reasoning": "checked the requested subsystem",
+                            "timestamp": turn_ts + 0.5,
+                        }
+                    )
+
+                durable_prefix = list(transcripts[session_id])
+                live_messages = durable_prefix + turn_messages
+                agents[session_id]._flush_messages_to_session_db(
+                    live_messages,
+                    conversation_history=durable_prefix,
+                )
+                transcripts[session_id] = live_messages
+                turns_by_session[session_id] += 1
+
+            assert sum(turns_by_session.values()) == 40
+            assert min(turns_by_session.values()) >= 6
+            assert db._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 164
+
+            for label, include_archived in (
+                ("default", False),
+                ("include_archived", True),
+            ):
+                actual_order = [
+                    row["id"]
+                    for row in db.list_sessions_rich(
+                        order_by_last_active=True,
+                        limit=100,
+                        include_archived=include_archived,
+                    )
+                ]
+                oracle_order = [
+                    row["id"]
+                    for row in db.list_sessions_rich(
+                        order_by_last_active=True,
+                        limit=100,
+                        _force_cte_oracle=True,
+                        include_archived=include_archived,
+                    )
+                ]
+                actual_bytes = json.dumps(
+                    actual_order, separators=(",", ":")
+                ).encode("utf-8")
+                oracle_bytes = json.dumps(
+                    oracle_order, separators=(",", ":")
+                ).encode("utf-8")
+                actual_hash = hashlib.sha256(actual_bytes).hexdigest()
+                oracle_hash = hashlib.sha256(oracle_bytes).hexdigest()
+
+                assert actual_hash == oracle_hash, {
+                    "mode": label,
+                    "actual_hash": actual_hash,
+                    "oracle_hash": oracle_hash,
+                    "actual_order": actual_order,
+                    "oracle_order": oracle_order,
+                }
+                assert actual_order[0] == "churn-live-03"
+                if label == "default":
+                    assert set(actual_order) == set(active_ids)
+                else:
+                    assert set(actual_order) == set(all_ids)
         finally:
             db.close()
 
