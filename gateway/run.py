@@ -5950,6 +5950,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             effort = str(reasoning_config.get("effort", "") or "").strip()
             if effort:
                 return effort
+            # {"enabled": True} with no effort: a shape parse_reasoning_effort
+            # never produces (enabled always carries an effort) — an ambiguous
+            # live value from a nonstandard writer. Deliberately fall through to
+            # the session resolver rather than guess a level.
         return self._reasoning_effort_for_footer(
             source=source, session_key=session_key,
         )

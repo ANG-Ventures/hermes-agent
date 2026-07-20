@@ -239,20 +239,28 @@ def _reasoning_from_config(
     """
     try:
         from hermes_constants import resolve_reasoning_config
-
-        cfg = resolve_reasoning_config(user_config, model or "")
-        if isinstance(cfg, dict):
-            if not cfg.get("enabled", True):
-                return "none"
-            return str(cfg.get("effort", "") or "").strip()
     except Exception:
-        # Defensive fallback to the raw global read — never break the footer.
+        # Import failure only — fall back to the raw global read so a packaging
+        # problem can never break the footer (it silently loses per-model
+        # awareness, which is the pre-existing behavior).
         try:
             agent_cfg = (user_config or {}).get("agent") or {}
             if isinstance(agent_cfg, dict):
                 return str(agent_cfg.get("reasoning_effort", "") or "").strip()
         except Exception:
             pass
+        return ""
+    try:
+        cfg = resolve_reasoning_config(user_config, model or "")
+        if isinstance(cfg, dict):
+            if not cfg.get("enabled", True):
+                return "none"
+            return str(cfg.get("effort", "") or "").strip()
+    except Exception:
+        # Resolution failure (malformed config) — the resolver already
+        # tolerates bad shapes, so this is belt-and-suspenders; footer is
+        # decoration, never worth raising over.
+        pass
     return ""
 
 
