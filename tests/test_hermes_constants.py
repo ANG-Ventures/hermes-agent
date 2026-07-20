@@ -1225,3 +1225,13 @@ class TestReasoningLabel:
         assert reasoning_label(parse_reasoning_effort(False)) == "none"
         assert reasoning_label(parse_reasoning_effort("")) == ""
         assert reasoning_label(parse_reasoning_effort("garbage")) == ""
+
+    def test_falsy_enabled_maps_to_none_deliberately(self):
+        # DELIBERATE semantics (Greptile #405 P2): truthiness, not `is False`.
+        # A falsy enabled (0, None, "") means "disabled" — rendering an effort
+        # level for a disabled config would be the dishonest choice. Note
+        # parse_reasoning_effort only ever produces boolean enabled, so these
+        # shapes come only from nonstandard writers.
+        from hermes_constants import reasoning_label
+        assert reasoning_label({"enabled": 0, "effort": "high"}) == "none"
+        assert reasoning_label({"enabled": None, "effort": "high"}) == "none"
