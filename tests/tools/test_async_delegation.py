@@ -269,6 +269,43 @@ def test_completion_is_persisted_and_delivery_can_be_acknowledged(tmp_path, monk
     assert ad.get_durable_delegation(dispatched["delegation_id"])["delivery_state"] == "delivered"
 
 
+def test_exhausted_pending_completion_is_parked_not_re_enqueued(tmp_path, monkeypatch):
+    """A pending completion whose origin is permanently gone must retire to
+    'parked' after _MAX_DELIVERY_ATTEMPTS instead of re-enqueuing forever.
+
+    Regression for the debug-log 2026-07-20 finding: three completions stuck
+    'pending' since a dead owner pid re-enqueued every boot, failed the
+    fail-closed ownership gate, dropped un-acked, and spammed the
+    "Dropping unowned async_delegation" WARNING indefinitely.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    dispatched = ad.dispatch_async_delegation(
+        goal="orphan", context=None, toolsets=None, role="leaf", model="m",
+        session_key="dead-owner-session", parent_session_id="dead-parent",
+        runner=lambda: {"status": "completed", "summary": "nobody home"},
+    )
+    assert _drain_one() is not None
+    did = dispatched["delegation_id"]
+
+    # Under the cap: still re-enqueued (a legit reconnect must not lose it).
+    for _ in range(ad._MAX_DELIVERY_ATTEMPTS - 1):
+        ad._note_delivery_attempt(did)
+    q = queue.Queue()
+    assert ad.restore_undelivered_completions(q) == 1
+    assert q.qsize() == 1
+    assert ad.get_durable_delegation(did)["delivery_state"] == "pending"
+
+    # At/over the cap: parked, NOT enqueued.
+    ad._note_delivery_attempt(did)  # now == _MAX_DELIVERY_ATTEMPTS
+    q2 = queue.Queue()
+    assert ad.restore_undelivered_completions(q2) == 0
+    assert q2.empty()
+    assert ad.get_durable_delegation(did)["delivery_state"] == "parked"
+    # Parked is terminal: a subsequent restore never touches it again.
+    assert ad.restore_undelivered_completions(queue.Queue()) == 0
+    assert ad.get_durable_delegation(did)["delivery_state"] == "parked"
+
+
 def test_real_process_restart_restores_owned_completion_once(tmp_path):
     """Real-import E2E: a fresh interpreter restores a prior process's result."""
     repo = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))

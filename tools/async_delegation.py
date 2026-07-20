@@ -107,6 +107,15 @@ def _record_profile_home(record: Dict[str, Any]) -> Optional[Path]:
 
 _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_DURABLE_PENDING = 1000
+# A completion whose origin session is permanently gone (dead owner pid) fails
+# the fail-closed ownership gate every boot, gets dropped un-acked, and cycles
+# forever — re-enqueued by restore_undelivered_completions and re-dropped,
+# spamming the "Dropping unowned async_delegation" WARNING. After this many
+# delivery attempts, retire the row to the terminal 'parked' delivery_state
+# instead of re-enqueuing it. Healthy delegations deliver in 1-2 attempts, so
+# the cap only ever catches genuinely-unownable orphans (headroom for a couple
+# of legit reconnect boots).
+_MAX_DELIVERY_ATTEMPTS = 10
 _DB_LOCK = threading.Lock()
 
 
@@ -308,16 +317,31 @@ def restore_undelivered_completions(target_queue) -> int:
     recover_abandoned_delegations()
     with _DB_LOCK, _connect() as conn:
         rows = conn.execute(
-            """SELECT delegation_id, event_json FROM async_delegations
+            """SELECT delegation_id, event_json, delivery_attempts FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id"""
         ).fetchall()
-        for _delegation_id, payload in rows:
+        restored = 0
+        for _delegation_id, payload, _attempts in rows:
+            # Park a completion that has exhausted its delivery budget: its origin
+            # session is permanently gone (dead owner pid), so every boot it
+            # re-enqueues, fails the fail-closed ownership gate, gets dropped
+            # un-acked, and cycles forever — spamming the "Dropping unowned"
+            # WARNING. Retire it to the terminal 'parked' state (audit-retained)
+            # instead of re-enqueuing it to be dropped yet again (#debug-log 2026-07-20).
+            if int(_attempts or 0) >= _MAX_DELIVERY_ATTEMPTS:
+                conn.execute(
+                    """UPDATE async_delegations SET delivery_state='parked', updated_at=?
+                       WHERE delegation_id=?""",
+                    (time.time(), _delegation_id),
+                )
+                continue
             evt = json.loads(payload)
             if isinstance(evt, dict):
                 evt["restored"] = True
             target_queue.put(evt)
-    return len(rows)
+            restored += 1
+    return restored
 
 
 def mark_completion_delivered(delegation_id: str) -> bool:
