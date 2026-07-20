@@ -9998,6 +9998,21 @@ def _notification_poller_loop(
                 str(evt.get("session_key") or ""),
                 sid,
             )
+            # Advance the durable delivery-attempt counter on the drop. This
+            # path drops BEFORE claim_event_delivery (the only other bumper),
+            # so without this a TUI-only deployment never increments
+            # delivery_attempts for an orphan async_delegation and the
+            # restore_undelivered_completions parking threshold
+            # (_MAX_DELIVERY_ATTEMPTS) is never reached — the row re-enqueues
+            # and re-drops every boot forever (Greptile P2 on #408).
+            if evt.get("type") == "async_delegation":
+                _did = str(evt.get("delegation_id") or "")
+                if _did:
+                    try:
+                        from tools.async_delegation import _note_delivery_attempt
+                        _note_delivery_attempt(_did)
+                    except Exception:
+                        pass
             continue
 
         _evt_sid = evt.get("session_id", "")

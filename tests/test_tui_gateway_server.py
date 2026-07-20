@@ -2899,6 +2899,80 @@ def test_notification_poller_live_loop_drops_addressed_orphan(
             isolated_queue.get_nowait()
 
 
+def test_tui_drop_of_unowned_async_delegation_advances_delivery_attempts(
+    monkeypatch, tmp_path
+):
+    """The TUI live-loop drop-path must bump delivery_attempts for an orphan
+    async_delegation so the durable parking threshold is eventually reached.
+
+    Greptile P2 on #408: the drop at :9994 happens BEFORE claim_event_delivery
+    (the only other bumper), so on a TUI-only deployment an orphan's
+    delivery_attempts stayed 0 forever, restore_undelivered_completions kept
+    re-enqueuing it, and it re-dropped every boot — the parking gate never
+    fired.
+    """
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+    from tools import async_delegation as ad
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+
+    # Seed a real durable completion whose origin session is not this session.
+    dispatched = ad.dispatch_async_delegation(
+        goal="orphan-tui", context=None, toolsets=None, role="leaf", model="m",
+        session_key="dead-owner-session", parent_session_id="dead-parent",
+        runner=lambda: {"status": "completed", "summary": "nobody home"},
+    )
+    did = dispatched["delegation_id"]
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and ad.active_count() > 0:
+        time.sleep(0.02)
+    # Capture the baseline rather than asserting == 0: under parallel CI load
+    # the dispatch's own completion/claim machinery may already have bumped the
+    # counter. The behavioral gate is that the DROP increments it by exactly 1.
+    _attempts_before = ad.get_durable_delegation(did)["delivery_attempts"]
+
+    session = _session(session_key="unrelated-live-key")
+    event = {
+        "type": "async_delegation",
+        "delegation_id": did,
+        "session_id": f"proc-{did}",
+        "session_key": "dead-owner-session",
+        "summary": "nobody home",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(
+        server, "_run_prompt_submit", lambda *a, **k: None
+    )
+    server._sessions["sid-tui-orphan"] = session
+    process_registry._completion_consumed.discard(event["session_id"])
+
+    try:
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), "sid-tui-orphan", session
+        )
+        # The orphan was dropped (unowned) AND its durable attempt counter
+        # advanced by exactly one — so repeated boots eventually cross the
+        # park gate.
+        assert isolated_queue.empty()
+        assert (
+            ad.get_durable_delegation(did)["delivery_attempts"]
+            == _attempts_before + 1
+        )
+    finally:
+        server._sessions.pop("sid-tui-orphan", None)
+        process_registry._completion_consumed.discard(event["session_id"])
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()
+        ad._reset_for_tests()
+
+
 @pytest.mark.parametrize(
     "routing",
     [

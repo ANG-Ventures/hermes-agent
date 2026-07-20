@@ -101,6 +101,10 @@ DEFAULT_PORT = 8644
 _INSECURE_NO_AUTH = "INSECURE_NO_AUTH"
 _DYNAMIC_ROUTES_FILENAME = "webhook_subscriptions.json"
 _RATE_WINDOW_SECONDS = 60.0
+# Throttle the per-route invalid-signature 401 warning to at most once per this
+# interval, so a burst of bad-sig probes doesn't spam errors.log while a
+# persistent real failure still re-warns each interval.
+_INVALID_SIG_WARN_INTERVAL_SECONDS = 3600.0
 # Hostnames/IP literals that only serve connections originating on the same
 # machine. Anything else is treated as a public bind for safety-rail purposes.
 _LOOPBACK_HOSTS = frozenset({
@@ -150,6 +154,12 @@ class WebhookAdapter(BasePlatformAdapter):
         # Routes already warned about legacy V1 body-only signatures
         # (once-per-route so a busy sender doesn't spam the log).
         self._v1_signature_warned: set[str] = set()
+        # Last time an invalid-signature 401 was logged per route. Throttled to
+        # once-per-route-per-hour: a burst of bad-sig probes (e.g. an unsigned
+        # local caller) must not spam errors.log, but a PERSISTENT real failure
+        # (a sender whose secret rotated) still re-warns hourly so it stays
+        # visible. Keyed by route_name -> monotonic-ish wall time of last warn.
+        self._invalid_sig_last_warned: Dict[str, float] = {}
 
         # Delivery info keyed by session chat_id.
         #
@@ -575,9 +585,17 @@ class WebhookAdapter(BasePlatformAdapter):
             )
         if secret != _INSECURE_NO_AUTH:
             if not self._validate_signature(request, raw_body, secret):
-                logger.warning(
-                    "[webhook] Invalid signature for route %s", route_name
-                )
+                _now = time.time()
+                _last = self._invalid_sig_last_warned.get(route_name, 0.0)
+                if _now - _last >= _INVALID_SIG_WARN_INTERVAL_SECONDS:
+                    self._invalid_sig_last_warned[route_name] = _now
+                    logger.warning(
+                        "[webhook] Invalid signature for route %s (further "
+                        "invalid-signature rejections on this route are "
+                        "suppressed for %d min)",
+                        route_name,
+                        int(_INVALID_SIG_WARN_INTERVAL_SECONDS // 60),
+                    )
                 return web.json_response(
                     {"error": "Invalid signature"}, status=401
                 )
