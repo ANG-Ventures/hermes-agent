@@ -65,6 +65,25 @@ DEFAULT_CORRECTION_MARKERS = (
 
 _DEFAULT_STAGING_DIR = "~/.hermes/state/capture-router-staged"
 _DEFAULT_BRAIN_INBOX = "~/gbrain/brain/inbox"
+# Transient-narration filter (gbrain residue PRD §5.3 / RC1). Single source of truth lives in
+# ~/gbrain/scripts/transient_fact_filter.py (RC8-pinned to its eval). Loaded GUARDED + FAIL-OPEN:
+# if it can't load, we drop nothing and capture continues exactly as before (never break the turn).
+# Greptile #407 P2: load by FILE PATH via importlib — do NOT mutate the process-global sys.path
+# (an append there permanently makes every later import in this interpreter search ~/gbrain/scripts,
+# risking module shadowing in co-loaded plugins/tests).
+try:
+    import importlib.util as _ilu
+    _TFF = os.path.expanduser("~/gbrain/scripts/transient_fact_filter.py")
+    _spec = _ilu.spec_from_file_location("gbrain_transient_fact_filter", _TFF)
+    if _spec and _spec.loader:
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        _is_transient = _mod.is_transient
+    else:
+        _is_transient = None
+except Exception as _e:  # pragma: no cover - degraded-safe
+    _is_transient = None
+    logging.getLogger(__name__).debug("capture-router: transient filter unavailable, fail-open: %s", _e)
 
 # Prompt assets live alongside the plugin (copied from the benchmark harness so the live wiring does
 # not depend on a path under ~/.hermes/plans, which is not shipped with the plugin).
@@ -419,6 +438,7 @@ class CaptureRouter:
         brain_inbox_dir: str = _DEFAULT_BRAIN_INBOX,
         staging_mode: bool = True,
         confidence_floor: float = 0.0,
+        transient_filter_enabled: bool = True,
         now_fn: Optional[Callable[[], datetime]] = None,
         write_fn: Optional[Callable[[str, str], None]] = None,
         correction_markers: Optional[Any] = None,
@@ -431,13 +451,14 @@ class CaptureRouter:
         self._brain_inbox = os.path.expanduser(brain_inbox_dir)
         self._staging_mode = bool(staging_mode)
         self._confidence_floor = float(confidence_floor)
+        self._transient_filter_enabled = bool(transient_filter_enabled)
         self._now = now_fn or (lambda: datetime.now(timezone.utc))
         self._write = write_fn or self._default_write
         self._correction_markers = _normalise_correction_markers(correction_markers)
         self._existing_fact_lookup = existing_fact_lookup_fn
         self.stats = {"turns_routed": 0, "world_staged": 0, "world_deduped": 0,
                       "prefs_seen": 0, "extract_errors": 0, "fallback_passes": 0,
-                      "corrections_detected": 0}
+                      "corrections_detected": 0, "transient_dropped": 0}
 
     def correction_marker(self, user: str, assistant: str = "") -> Optional[str]:
         return correction_marker_match(user, assistant, self._correction_markers)
@@ -543,6 +564,24 @@ class CaptureRouter:
 
         prefs_cands = self._classify(prefs_res.get("candidates") or [], PREFS_CLASSES)
         world_raw = self._classify(world_res.get("candidates") or [], WORLD_CLASSES)
+        # Transient-narration gate (§5.3 / RC1): drop internal work-narration BEFORE dedup/stage,
+        # logging each drop to _dropped-log.jsonl (RC2). Fail-open: if the filter is unavailable the
+        # comprehension keeps everything. Toggle off restores pre-filter behavior for A/B.
+        # Greptile #407 P1: the WHOLE gate is wrapped — route_turn is contract-bound to "never raises"
+        # (fail-soft), so a filter exception (bad input, regex issue) must degrade to keep-all, never
+        # propagate into the drain worker.
+        if self._transient_filter_enabled and _is_transient is not None:
+            try:
+                kept = []
+                for c in world_raw:
+                    if _is_transient(str(c.get("content") or "")):
+                        self.stats["transient_dropped"] += 1
+                        self._log_dropped(c, turn_id=turn_id, session=session, ts=ts)
+                    else:
+                        kept.append(c)
+                world_raw = kept
+            except Exception as e:  # fail-open: keep everything, never break the turn
+                logger.debug("capture-router: transient gate errored, fail-open keep-all: %s", e)
         # DEDUP world against prefs (the leak fix). RC1 also checks the kept world facts against
         # retrieved existing facts here: a same-subject conflicting exact value is a correction signal.
         world_kept, world_dropped = dedup_world_against_prefs(world_raw, prefs_cands)
@@ -567,6 +606,36 @@ class CaptureRouter:
 
         self.stats["turns_routed"] += 1
         return result
+
+    # -- transient drop log (RC2) ------------------------------------------
+    def _dropped_log_path(self) -> str:
+        """Where the drop-log lives, HONORING the staging contract (Greptile #407 P1). In staging
+        mode world facts go to the staging dir — so the drop-log for those same facts goes there too
+        (_dropped-log.jsonl under the staging dir), NOT the brain repo/inbox. Only when staging_mode
+        is OFF (go-live) does it write beside the brain inbox, matching where facts then land."""
+        if self._staging_mode:
+            return os.path.join(self._staging_dir, "_dropped-log.jsonl")
+        return os.path.join(self._brain_inbox, "_dropped-log.jsonl")
+
+    def _log_dropped(self, cand: Dict[str, Any], *, turn_id: str, session: str,
+                     ts: Optional[str]) -> None:
+        """Append one dropped-fact audit row. Fail-soft: a logging error never breaks capture."""
+        try:
+            path = self._dropped_log_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            row = {
+                "ts": ts or self._now().isoformat(),
+                "turn_id": turn_id,
+                "session": session,
+                "class": (cand.get("class") or "").strip(),
+                "confidence": cand.get("confidence"),
+                "reason": "transient_narration",
+                "text_prefix": str(cand.get("content") or "")[:200],
+            }
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except Exception as e:  # pragma: no cover - degraded-safe
+            logger.debug("capture-router: dropped-log write failed (non-fatal): %s", e)
 
     # -- staged write -------------------------------------------------------
     @staticmethod
