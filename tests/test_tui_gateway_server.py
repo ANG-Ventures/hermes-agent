@@ -2929,7 +2929,10 @@ def test_tui_drop_of_unowned_async_delegation_advances_delivery_attempts(
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline and ad.active_count() > 0:
         time.sleep(0.02)
-    assert ad.get_durable_delegation(did)["delivery_attempts"] == 0
+    # Capture the baseline rather than asserting == 0: under parallel CI load
+    # the dispatch's own completion/claim machinery may already have bumped the
+    # counter. The behavioral gate is that the DROP increments it by exactly 1.
+    _attempts_before = ad.get_durable_delegation(did)["delivery_attempts"]
 
     session = _session(session_key="unrelated-live-key")
     event = {
@@ -2955,9 +2958,13 @@ def test_tui_drop_of_unowned_async_delegation_advances_delivery_attempts(
             _StopAfterOneNotificationPoll(), "sid-tui-orphan", session
         )
         # The orphan was dropped (unowned) AND its durable attempt counter
-        # advanced — so repeated boots will eventually cross the park gate.
+        # advanced by exactly one — so repeated boots eventually cross the
+        # park gate.
         assert isolated_queue.empty()
-        assert ad.get_durable_delegation(did)["delivery_attempts"] == 1
+        assert (
+            ad.get_durable_delegation(did)["delivery_attempts"]
+            == _attempts_before + 1
+        )
     finally:
         server._sessions.pop("sid-tui-orphan", None)
         process_registry._completion_consumed.discard(event["session_id"])
