@@ -565,6 +565,13 @@ def test_completion_cwd_prefers_profile_over_stale_env(monkeypatch, tmp_path):
 
     monkeypatch.setenv("TERMINAL_CWD", str(stale))
     monkeypatch.setattr(server, "_profile_home", lambda name: home if name else None)
+    # The launch profile's configured terminal.cwd (_launch_configured_cwd)
+    # sits AHEAD of TERMINAL_CWD in the precedence chain (added later in
+    # f3af7930c for the dashboard /chat case). Stub it to None so this test
+    # exercises the env-var fallback it asserts on line "No profile" below —
+    # without this stub the real config.yaml cwd shadows the env fallback and
+    # the no-profile assertion resolves to the launch dir instead of $stale.
+    monkeypatch.setattr(server, "_launch_configured_cwd", lambda: None)
 
     assert server._completion_cwd({"profile": "ef-design"}) == str(profile_b)
     # No profile → unchanged fallback to the launch env var.
