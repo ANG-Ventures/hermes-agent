@@ -287,3 +287,66 @@ class TestSignatureBeforeRateLimit:
             assert resp.status == 429
 
         assert len(captured_events) == 3
+
+
+class TestInvalidSignatureWarningThrottle:
+    """Invalid-signature 401s stay enforced, but the WARNING is throttled to
+    once-per-route-per-hour so a bad-sig probe burst does not spam errors.log
+    (debug-log 2026-07-20 greptile-review 401 noise). A persistent real failure
+    still re-warns after the interval."""
+
+    @pytest.mark.asyncio
+    async def test_burst_warns_once_then_again_after_interval(self, monkeypatch, caplog):
+        import logging as _logging
+        from gateway.platforms import webhook as _wh
+
+        secret = 'test-secret-key'
+        route_name = 'greptile-review'
+        routes = {
+            route_name: {
+                'secret': secret,
+                'events': ['push'],
+                'prompt': 'Event: {event}',
+                'deliver': 'log',
+            }
+        }
+        adapter = _make_adapter(routes, rate_limit=1000)
+        app = _create_app(adapter)
+        body = json.dumps(SIMPLE_PAYLOAD).encode()
+
+        fake = {'t': 1_000_000.0}
+        monkeypatch.setattr(_wh.time, 'time', lambda: fake['t'])
+
+        def _bad_post(cli):
+            return cli.post(
+                f'/webhooks/{route_name}',
+                data=body,
+                headers={
+                    'Content-Type': 'application/json',
+                    'X-GitHub-Event': 'push',
+                    'X-Hub-Signature-256': 'sha256=invalid',
+                },
+            )
+
+        def _warn_count() -> int:
+            return sum(
+                1 for r in caplog.records
+                if 'Invalid signature for route' in r.getMessage()
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with caplog.at_level(_logging.WARNING, logger=_wh.logger.name):
+                for _ in range(8):
+                    resp = await _bad_post(cli)
+                    assert resp.status == 401
+                assert _warn_count() == 1, 'burst must warn exactly once'
+
+                fake['t'] += 1800
+                resp = await _bad_post(cli)
+                assert resp.status == 401
+                assert _warn_count() == 1, 'within interval must not re-warn'
+
+                fake['t'] += 1801
+                resp = await _bad_post(cli)
+                assert resp.status == 401
+                assert _warn_count() == 2, 'after interval must re-warn once'
