@@ -36,3 +36,53 @@ def format_provider_model(provider: Optional[str], model: Optional[str]) -> str:
     if prov and mdl:
         return f"{prov}/{mdl}"
     return mdl
+
+
+import re as _re
+
+# Bridge providers front Claude via the Claude Code CLI (subscription billing),
+# which keeps its OWN resident CLI session per conversation. On these providers
+# the operative context manager is the Claude Code CLI itself — NOT the harness
+# context engine (LCM). LCM still INGESTS (the raw lcm.db store stays live, so
+# lcm_grep/lcm_expand still work as a fallback), but LCM compaction does not
+# shrink the CLI-side resident session, so labeling the compaction surface
+# "engine: lcm" is misleading. We relabel the DISPLAY to "cc" on these providers.
+#
+# Matches: claude-bpr (pool face), claude-bpx-N (per-sub bridge), and the legacy
+# names claude-bridge / claude-bridge-fN / claude-bpp. Does NOT match the native
+# proxy lanes claude-apr / claude-apx-N (those forward Anthropic-native and the
+# harness context engine works normally there).
+_BRIDGE_PROVIDER_RE = _re.compile(
+    r"^claude-(?:bpr|bpp|bpx-\d+|bridge(?:-f\d+)?)$"
+)
+
+
+def is_bridge_provider(provider: Optional[str]) -> bool:
+    """True if ``provider`` fronts Claude via the Claude Code CLI bridge.
+
+    Bridge providers keep a resident CLI session that manages context itself;
+    the harness engine (LCM) ingests but is not the operative compactor. Used to
+    relabel the compaction engine display from ``lcm`` to ``cc`` (Claude Code).
+    """
+    prov = (provider or "").strip()
+    # A provider may arrive bare ("claude-bpx-15") or as a "provider/model"
+    # string ("claude-bpx-15/claude-fable-5"); take the provider segment.
+    if "/" in prov:
+        prov = prov.split("/", 1)[0].strip()
+    return bool(prov and _BRIDGE_PROVIDER_RE.match(prov))
+
+
+def engine_display_label(
+    engine_name: Optional[str], provider: Optional[str]
+) -> Optional[str]:
+    """The engine label to DISPLAY for a compaction surface.
+
+    On bridge providers the LCM engine is relabeled ``cc`` (Claude Code) because
+    the Claude Code CLI's own resident session — not LCM — is what actually
+    manages the wire context. Everywhere else the label is the engine's real
+    name. This is a DISPLAY-only mapping; it never changes gating or behavior
+    (callers keep using the real ``engine_name == "lcm"`` test for that).
+    """
+    if engine_name == "lcm" and is_bridge_provider(provider):
+        return "cc"
+    return engine_name

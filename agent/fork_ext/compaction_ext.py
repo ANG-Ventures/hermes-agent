@@ -142,6 +142,14 @@ def _format_compaction_announce(
 ) -> "str | None":
     """Build the engine-aware announce line, or ``None`` if gating says skip."""
     is_lcm = engine_name == "lcm"
+    # DISPLAY label only — on bridge providers (claude-bpx-N / claude-bpr) the
+    # Claude Code CLI's resident session is the operative context manager, so
+    # the engine is shown as "cc". `is_lcm` still drives ALL gating/behavior
+    # below (LCM genuinely still ingests on bridge providers); only the shown
+    # token changes. See provider_model_util.engine_display_label.
+    from agent.provider_model_util import engine_display_label
+
+    _engine_label = engine_display_label(engine_name, provider)
 
     if is_lcm:
         if status in _ANNOUNCE_STATUS_UNCONDITIONAL:
@@ -182,9 +190,9 @@ def _format_compaction_announce(
     if _r and _r not in {"default", "none"}:
         model_part = f"{model_part} · r:{_r}" if model_part else f"r:{_r}"
     if is_lcm and model_part:
-        model_part = f"{model_part} · engine: lcm"
+        model_part = f"{model_part} · engine: {_engine_label}"
     elif is_lcm:
-        model_part = "engine: lcm"
+        model_part = f"engine: {_engine_label}"
 
     if stats is not None:
         line = _format_granular_announce(
@@ -202,7 +210,7 @@ def _format_compaction_announce(
             if wf and wt and wf != wt:
                 parts.append(f"window {wf}→{wt}")
         if is_lcm:
-            parts.append("engine: lcm")
+            parts.append(f"engine: {_engine_label}")
         line = " · ".join(parts)
 
     if recovery_hint:

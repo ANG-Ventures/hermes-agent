@@ -4139,10 +4139,17 @@ class GatewaySlashCommandsMixin:
                             except Exception:
                                 pass
                             if _engine_name == "lcm":
+                                # DISPLAY-only: bridge providers (claude-bpx-N /
+                                # claude-bpr) show "cc" — the Claude Code CLI's
+                                # resident session is the operative compactor.
+                                from agent.provider_model_util import (
+                                    engine_display_label as _eng_label,
+                                )
+                                _elabel = _eng_label(_engine_name, _prov)
                                 _model_part = (
-                                    f"{_model_part} · engine: lcm"
+                                    f"{_model_part} · engine: {_elabel}"
                                     if _model_part
-                                    else "engine: lcm"
+                                    else f"engine: {_elabel}"
                                 )
                             _granular = _format_granular_announce(
                                 f"🗜️ {summary['headline']}",
