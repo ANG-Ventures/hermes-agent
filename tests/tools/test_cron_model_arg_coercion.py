@@ -156,3 +156,29 @@ class TestHandlerFlatStringPins:
         }))
         assert out["success"] is True  # job still created (auto-pinned)
         assert any("model spec ignored" in w for w in out.get("warnings", []))
+
+    def test_uninterpretable_model_does_not_leak_sibling_provider(self):
+        # Greptile #411 P2: a warning-path (uninterpretable) model spec must NOT
+        # let a stray sibling `provider` through as a provider-without-model
+        # half-pin. The intent is auto-pin — here the creating agent is fable,
+        # so the job should pin the AGENT (model+provider together), never end up
+        # with the stray codex provider glued to a fable/auto model.
+        out = json.loads(ct._cronjob_tool_handler({
+            "action": "create",
+            "prompt": "Check",
+            "schedule": "every 1h",
+            "name": "bad-spec-with-provider",
+            "model": ["gpt-5.6-sol"],  # uninterpretable
+            "provider": "openai-codex",  # stray sibling
+        }))
+        assert out["success"] is True
+        assert any("model spec ignored" in w for w in out.get("warnings", []))
+        job = out["job"]
+        # Consistent pin: NOT the stray codex provider with a mismatched model.
+        # Auto-pin resolved the creating agent (fable/claude-apr) as one unit.
+        if job.get("provider") == "openai-codex":
+            # The only acceptable way codex appears is if the MODEL is also codex's
+            # — i.e. never a half-pin. A bare provider without a matching model fails.
+            assert job.get("model") not in (None, "", "claude-fable-5")
+        # The concrete regression guard: provider must not be set without a model.
+        assert not (job.get("provider") and not job.get("model"))

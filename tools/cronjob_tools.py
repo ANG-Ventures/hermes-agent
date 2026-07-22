@@ -1543,6 +1543,11 @@ def _cronjob_tool_handler(args: Dict[str, Any], **kw: Any) -> str:
         args.get("model"), args.get("provider")
     )
     resolved_provider, resolved_model = _resolve_model_override(model_obj)
+    # When the model spec was uninterpretable (spec_warning set), the intent is
+    # to leave the job auto-pinned — so DON'T let a stray sibling ``provider``
+    # arg leak through as a provider-without-model half-pin (Greptile #411 P2).
+    # A clean coercion (no warning) still honors the flat ``provider`` fallback.
+    _fallback_provider = None if spec_warning else args.get("provider")
     return cronjob(
         action=args.get("action", ""),
         job_id=args.get("job_id"),
@@ -1555,7 +1560,7 @@ def _cronjob_tool_handler(args: Dict[str, Any], **kw: Any) -> str:
         skill=args.get("skill"),
         skills=args.get("skills"),
         model=resolved_model,
-        provider=resolved_provider or args.get("provider"),
+        provider=resolved_provider or _fallback_provider,
         base_url=args.get("base_url"),
         reason=args.get("reason"),
         script=args.get("script"),
