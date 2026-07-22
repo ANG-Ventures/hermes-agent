@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from tools.vision_tools import (
     _detect_video_mime_type,
+    _ensure_ytdlp_available,
+    _resolve_video_provider_model,
     _video_to_base64_data_url,
     _handle_video_analyze,
     _MAX_VIDEO_BASE64_BYTES,
@@ -324,6 +326,69 @@ class TestVideoAnalyzeTool:
         assert content[1]["type"] == "video_url"
         assert "video_url" in content[1]
         assert content[1]["video_url"]["url"].startswith("data:video/mp4;base64,")
+
+    def test_page_url_uses_ytdlp_and_direct_gemini(self, tmp_path):
+        """A YouTube watch page is extracted, not downloaded as HTML."""
+        extracted = tmp_path / "extracted.mp4"
+        extracted.write_bytes(b"\x00" * 100)
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "A person demonstrates a task."
+
+        with patch("tools.url_safety.async_is_safe_url", new_callable=AsyncMock, return_value=True), \
+             patch("tools.vision_tools._ensure_ytdlp_available") as ensure_ytdlp, \
+             patch("tools.vision_tools._download_video_via_ytdlp", new_callable=AsyncMock, return_value=extracted) as download, \
+             patch("tools.vision_tools._resolve_video_provider_model", return_value=("gemini", "gemini-3-flash-preview")), \
+             patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock, return_value=mock_response) as llm, \
+             patch("tools.vision_tools.extract_content_or_reasoning", return_value="A person demonstrates a task."):
+            result = self._run(video_analyze_tool(
+                "https://youtu.be/GhSdkmMt4LE?feature=shared", "What happens?"
+            ))
+
+        data = json.loads(result)
+        assert data["success"] is True
+        ensure_ytdlp.assert_called_once_with()
+        download.assert_awaited_once()
+        assert llm.await_args.kwargs["provider"] == "gemini"
+        assert llm.await_args.kwargs["model"] == "gemini-3-flash-preview"
+
+
+class TestVideoDependenciesAndRouting:
+    def test_missing_ytdlp_uses_pinned_lazy_dependency(self):
+        real_import = __import__
+
+        def import_without_ytdlp(name, *args, **kwargs):
+            if name == "yt_dlp":
+                raise ImportError("not installed")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=import_without_ytdlp), \
+             patch("tools.lazy_deps.ensure") as ensure:
+            _ensure_ytdlp_available()
+
+        ensure.assert_called_once_with("tool.video", prompt=False)
+
+    def test_auto_routing_falls_through_to_direct_gemini(self):
+        values = {
+            ("auxiliary", "vision", "video_provider"): "auto",
+            ("auxiliary", "vision", "video_model"): "",
+            ("model", "provider"): "openai-codex",
+            ("model", "default"): "gpt-5.6-sol",
+        }
+
+        def config_value(*path, default=""):
+            return values.get(path, default)
+
+        def resolve(*, provider, model):
+            if provider == "gemini":
+                return provider, object(), model
+            return provider, None, None
+
+        with patch("tools.vision_tools._cfg_get_safe", side_effect=config_value), \
+             patch("agent.auxiliary_client.resolve_vision_provider_client", side_effect=resolve):
+            assert _resolve_video_provider_model() == (
+                "gemini", "gemini-3-flash-preview"
+            )
 
 
 # ---------------------------------------------------------------------------
