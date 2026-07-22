@@ -32,10 +32,24 @@ import importlib.machinery
 import importlib.util
 import logging
 import sys
+import threading
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from cron.scheduler_provider import CronScheduler
 
 logger = logging.getLogger(__name__)
+
+# Serializes the import critical-section in _load_provider_from_dir. Child
+# agents run concurrently in a shared-process ThreadPoolExecutor (delegate_task,
+# max_concurrent_children) sharing one sys.modules. The inner loader registers
+# the module in sys.modules BEFORE exec_module() runs, so without this lock a
+# concurrent caller can grab a half-initialized module, find no register()/
+# scheduler class, and silently fall back to the built-in scheduler. Same
+# partial-import race as the memory/context_engine loaders; RLock guards
+# reentrant loads.
+_LOAD_LOCK = threading.RLock()
 
 _CRON_PLUGINS_DIR = Path(__file__).parent
 
@@ -213,6 +227,18 @@ def load_cron_scheduler(name: str) -> Optional["CronScheduler"]:  # noqa: F821
 
 
 def _load_provider_from_dir(provider_dir: Path) -> Optional["CronScheduler"]:  # noqa: F821
+    """Import a provider module and extract the CronScheduler instance.
+
+    Serialized under _LOAD_LOCK: concurrent child agents share one sys.modules,
+    and the inner loader registers the module in sys.modules BEFORE exec_module()
+    runs. Without this lock a concurrent caller could grab a half-initialized
+    module and silently fall back to the built-in scheduler.
+    """
+    with _LOAD_LOCK:
+        return _load_provider_from_dir_locked(provider_dir)
+
+
+def _load_provider_from_dir_locked(provider_dir: Path) -> Optional["CronScheduler"]:  # noqa: F821
     """Import a provider module and extract the CronScheduler instance.
 
     The module must have either:
