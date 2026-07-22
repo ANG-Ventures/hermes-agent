@@ -1729,6 +1729,20 @@ def _ytdlp_command() -> list[str]:
     return [sys.executable, "-m", "yt_dlp"]
 
 
+def _ytdlp_js_runtime_args() -> list[str]:
+    """Enable an installed JavaScript runtime for YouTube challenges."""
+    import shutil
+
+    # Deno is yt-dlp's enabled-by-default and preferred runtime.
+    if shutil.which("deno"):
+        return []
+    for runtime, executable in (("node", "node"), ("quickjs", "qjs")):
+        path = shutil.which(executable)
+        if path:
+            return ["--js-runtimes", f"{runtime}:{path}"]
+    return []
+
+
 def _ytdlp_cookie_args() -> list:
     """Return yt-dlp cookie args, reusing the fleet cookies jar when available.
 
@@ -1773,6 +1787,7 @@ async def _download_video_via_ytdlp(url: str, dest_dir: Path) -> Path:
         "-f", fmt, "--max-filesize", "35M",
         "-o", out_tmpl,
     ]
+    base += _ytdlp_js_runtime_args()
     # Cookie support: many sites (YouTube especially) gate anonymous fetches
     # behind a "confirm you're not a bot" wall. Reuse the fleet cookies jar
     # (refreshed by the yt-cookies-refresh cron) when present.

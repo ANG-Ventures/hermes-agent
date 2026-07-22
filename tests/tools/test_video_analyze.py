@@ -9,6 +9,7 @@ from tools.vision_tools import (
     _detect_video_mime_type,
     _ensure_ytdlp_available,
     _resolve_video_provider_model,
+    _ytdlp_js_runtime_args,
     _video_to_base64_data_url,
     _handle_video_analyze,
     _MAX_VIDEO_BASE64_BYTES,
@@ -354,6 +355,15 @@ class TestVideoAnalyzeTool:
 
 
 class TestVideoDependenciesAndRouting:
+    def test_ytdlp_enables_installed_node_runtime(self):
+        def which(executable):
+            return "/opt/node/bin/node" if executable == "node" else None
+
+        with patch("shutil.which", side_effect=which):
+            assert _ytdlp_js_runtime_args() == [
+                "--js-runtimes", "node:/opt/node/bin/node"
+            ]
+
     def test_missing_ytdlp_uses_pinned_lazy_dependency(self):
         real_import = __import__
 

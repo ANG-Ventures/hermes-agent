@@ -215,7 +215,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
 
     # ─── Tools ─────────────────────────────────────────────────────────────
     # Page URL extraction for video_analyze (YouTube, Vimeo, etc.).
-    "tool.video": ("yt-dlp==2026.7.4",),
+    "tool.video": ("yt-dlp[default]>=2026.7.4,<2027",),
     # ACP adapter (VS Code / Zed / JetBrains integration)
     "tool.acp": ("agent-client-protocol==0.9.0",),
     # Dashboard (`hermes dashboard`)
