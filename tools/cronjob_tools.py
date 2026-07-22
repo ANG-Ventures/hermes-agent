@@ -669,6 +669,52 @@ def _resolve_model_override(model_obj: Optional[Dict[str, Any]]) -> tuple:
     return (provider_name, model_name)
 
 
+def _coerce_model_override_arg(
+    model_arg: Any, provider_arg: Optional[str]
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Normalize the tool's ``model`` argument into the ``{model, provider}`` object
+    ``_resolve_model_override`` expects, tolerating the common flat-string call shape.
+
+    The ``cronjob`` schema documents ``model`` as an OBJECT
+    (``{"model": "...", "provider": "..."}``), but callers frequently pass a flat
+    string (``model="gpt-5.6-sol"``) plus a sibling ``provider="openai-codex"`` —
+    the shape every OTHER model-bearing tool uses. Before this coercion the flat
+    string silently failed ``_resolve_model_override``'s ``isinstance(dict)`` guard
+    → ``(None, None)`` → the job fell through to ``cron.default_model`` (often
+    ``auto``) and pinned to the CREATING agent's model instead of the requested
+    one — an explicit input SILENTLY dropped.
+
+    Returns ``(model_obj_or_None, warning_or_None)``:
+      * dict passed through untouched (canonical shape) → no warning.
+      * bare string → wrapped as ``{"model": <str>, "provider": <provider_arg>}``
+        (folding in the sibling flat ``provider`` so it isn't masked by the
+        config-main-provider pin) → no warning; the intuitive call now works.
+      * a non-string / non-dict truthy value (e.g. a list/number) → returned as
+        ``None`` WITH a warning, so the caller learns the spec was ignored rather
+        than silently getting auto-pinned.
+    """
+    if model_arg is None:
+        return (None, None)
+    if isinstance(model_arg, dict):
+        return (model_arg, None)
+    if isinstance(model_arg, str):
+        text = model_arg.strip()
+        if not text:
+            return (None, None)
+        obj: Dict[str, Any] = {"model": text}
+        prov = (provider_arg or "").strip() if isinstance(provider_arg, str) else ""
+        if prov:
+            obj["provider"] = prov
+        return (obj, None)
+    # Truthy but neither str nor dict — cannot interpret; do NOT silently drop.
+    return (
+        None,
+        "model spec ignored — expected an object {\"model\": ..., \"provider\": ...} "
+        "or a plain model-name string; the job was left to auto-pin. "
+        f"(got {type(model_arg).__name__})",
+    )
+
+
 def _normalize_optional_job_value(value: Optional[Any], *, strip_trailing_slash: bool = False) -> Optional[str]:
     if value is None:
         return None
@@ -964,6 +1010,7 @@ def cronjob(
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
     reasoning_effort: Optional[str] = None,
+    model_spec_warning: Optional[str] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -1084,6 +1131,8 @@ def cronjob(
             if _local_notice:
                 _create_message = f"{_create_message} {_local_notice}"
             _admission_warnings = _creation_admission_warnings(job)
+            if model_spec_warning:
+                _admission_warnings = [model_spec_warning, *_admission_warnings]
             if _admission_warnings:
                 _create_message = f"{_create_message} {' '.join(_admission_warnings)}"
             return json.dumps(
@@ -1305,6 +1354,8 @@ def cronjob(
                 return tool_error(f"Failed to update cron job '{job_id}'.", success=False)
             _notify_provider_jobs_changed_safe()
             _admission_warnings = _creation_admission_warnings(updated)
+            if model_spec_warning:
+                _admission_warnings = [model_spec_warning, *_admission_warnings]
             _update_message = f"Cron job '{updated['name']}' updated."
             if _admission_warnings:
                 _update_message = f"{_update_message} {' '.join(_admission_warnings)}"
@@ -1382,7 +1433,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "model": {
                 "type": "object",
-                "description": "Optional per-job model override. Use model='auto' to pin the job to the CREATING agent's own model (recommended for LLM crons — otherwise an unpinned job inherits the runtime primary, often Opus, at fire time). If provider is omitted (and model is not 'auto'), the current main provider is pinned at creation time so the job stays stable.",
+                "description": "Optional per-job model override, as an object {\"model\": \"<name>\", \"provider\": \"<provider>\"}. A flat model-name STRING (e.g. model=\"gpt-5.6-sol\" with a sibling provider=\"openai-codex\") is also accepted and coerced to this object. Use model='auto' to pin the job to the CREATING agent's own model (recommended for LLM crons — otherwise an unpinned job inherits the runtime primary, often Opus, at fire time). If provider is omitted (and model is not 'auto'), the current main provider is pinned at creation time so the job stays stable.",
                 "properties": {
                     "provider": {
                         "type": "string",
@@ -1479,11 +1530,20 @@ def check_cronjob_requirements() -> bool:
 # --- Registry ---
 from tools.registry import registry, tool_error
 
-registry.register(
-    name="cronjob",
-    toolset="cronjob",
-    schema=CRONJOB_SCHEMA,
-    handler=lambda args, **kw: (lambda _mo=_resolve_model_override(args.get("model")): cronjob(
+def _cronjob_tool_handler(args: Dict[str, Any], **kw: Any) -> str:
+    """Registry entrypoint for the ``cronjob`` tool.
+
+    Coerces the ``model`` argument (accepting BOTH the canonical
+    ``{model, provider}`` object AND a flat model-name string + sibling
+    ``provider`` arg) into the override object, resolves it to a stored
+    ``(provider, model)`` pair, and threads any coercion warning through so an
+    ignored/malformed model spec is surfaced instead of silently auto-pinned.
+    """
+    model_obj, spec_warning = _coerce_model_override_arg(
+        args.get("model"), args.get("provider")
+    )
+    resolved_provider, resolved_model = _resolve_model_override(model_obj)
+    return cronjob(
         action=args.get("action", ""),
         job_id=args.get("job_id"),
         prompt=args.get("prompt"),
@@ -1494,8 +1554,8 @@ registry.register(
         include_disabled=args.get("include_disabled", True),
         skill=args.get("skill"),
         skills=args.get("skills"),
-        model=_mo[1],
-        provider=_mo[0] or args.get("provider"),
+        model=resolved_model,
+        provider=resolved_provider or args.get("provider"),
         base_url=args.get("base_url"),
         reason=args.get("reason"),
         script=args.get("script"),
@@ -1503,8 +1563,16 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        model_spec_warning=spec_warning,
         task_id=kw.get("task_id"),
-    ))(),
+    )
+
+
+registry.register(
+    name="cronjob",
+    toolset="cronjob",
+    schema=CRONJOB_SCHEMA,
+    handler=_cronjob_tool_handler,
     check_fn=check_cronjob_requirements,
     emoji="⏰",
 )
