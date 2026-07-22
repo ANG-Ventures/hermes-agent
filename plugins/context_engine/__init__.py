@@ -22,10 +22,24 @@ import importlib
 import importlib.util
 import logging
 import sys
+import threading
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from agent.context_engine import ContextEngine
 
 logger = logging.getLogger(__name__)
+
+# Serializes the import critical-section in _load_engine_from_dir. Child agents
+# run concurrently in a shared-process ThreadPoolExecutor (delegate_task,
+# max_concurrent_children), so they share one sys.modules. Without this lock a
+# second caller can observe a module registered in sys.modules but not yet
+# exec_module()'d (the loader sets sys.modules[name]=mod BEFORE executing it),
+# grab the half-initialized shell, find no register()/engine class, and fall
+# back to the built-in compressor — a silent, intermittent partial-import race.
+# RLock (not Lock) guards against any reentrant load during module exec.
+_LOAD_LOCK = threading.RLock()
 
 _CONTEXT_ENGINE_PLUGINS_DIR = Path(__file__).parent
 
@@ -66,8 +80,10 @@ def discover_context_engines() -> List[Tuple[str, str, bool]]:
             engine = _load_engine_from_dir(child)
             if engine is None:
                 available = False
-            elif hasattr(engine, "is_available"):
-                available = engine.is_available()
+            else:
+                _is_available = getattr(engine, "is_available", None)
+                if callable(_is_available):
+                    available = _is_available()
         except Exception:
             available = False
 
@@ -98,6 +114,18 @@ def load_context_engine(name: str) -> Optional["ContextEngine"]:
 
 
 def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
+    """Import an engine module and extract the ContextEngine instance.
+
+    Serialized under _LOAD_LOCK: concurrent child agents share one sys.modules,
+    and the inner loader registers the module in sys.modules BEFORE exec_module()
+    runs. Without this lock a concurrent caller could grab a half-initialized
+    module and silently fall back to the built-in compressor.
+    """
+    with _LOAD_LOCK:
+        return _load_engine_from_dir_locked(engine_dir)
+
+
+def _load_engine_from_dir_locked(engine_dir: Path) -> Optional["ContextEngine"]:
     """Import an engine module and extract the ContextEngine instance.
 
     The module must have either:
