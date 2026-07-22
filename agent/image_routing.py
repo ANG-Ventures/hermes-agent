@@ -395,6 +395,24 @@ def _lookup_supports_vision(
     if caps is not None:
         return bool(caps.supports_vision)
 
+    # Provider-profile self-declaration: when the model catalog has no entry
+    # (proxy/relay provider names models.dev doesn't know, e.g. claude-apr /
+    # claude-bpx-N), honor the registered ProviderProfile's supports_vision
+    # flag. A provider that declares vision then routes native without needing
+    # a per-model config override. Only returns True on an affirmative profile
+    # flag; a False/absent flag falls through so non-vision providers are
+    # unaffected.
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(provider)
+        if profile is not None and getattr(profile, "supports_vision", False):
+            return True
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug(
+            "image_routing: profile vision lookup failed for %s — %s", provider, exc
+        )
+
     base_url = _resolve_inference_base_url(cfg, provider)
     if not base_url and (provider or "").strip().lower() == "ollama":
         base_url = "http://localhost:11434/v1"

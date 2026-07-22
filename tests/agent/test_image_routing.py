@@ -312,6 +312,37 @@ class TestLookupSupportsVisionOverride:
         with patch("agent.models_dev.get_model_capabilities", return_value=None):
             assert _lookup_supports_vision("openrouter", "x", None) is None
 
+    def test_provider_profile_declares_vision_when_models_dev_missing(self):
+        # Proxy/relay providers (claude-apr, claude-bpx-N) that models.dev
+        # doesn't know but whose registered ProviderProfile declares
+        # supports_vision=True must route native — the profile is consulted
+        # after models.dev misses.
+        fake_profile = type("Prof", (), {"supports_vision": True})()
+        with patch("agent.models_dev.get_model_capabilities", return_value=None), \
+             patch("agent.image_routing._should_probe_ollama_vision", return_value=False), \
+             patch("providers.get_provider_profile", return_value=fake_profile):
+            assert _lookup_supports_vision("claude-bpx-15", "claude-fable-5", {}) is True
+
+    def test_provider_profile_no_vision_flag_falls_through_to_none(self):
+        # A profile that does NOT declare vision must not force True — the
+        # lookup falls through and returns None (unknown), leaving non-vision
+        # providers unaffected.
+        fake_profile = type("Prof", (), {"supports_vision": False})()
+        with patch("agent.models_dev.get_model_capabilities", return_value=None), \
+             patch("agent.image_routing._should_probe_ollama_vision", return_value=False), \
+             patch("providers.get_provider_profile", return_value=fake_profile):
+            assert _lookup_supports_vision("some-text-only", "m", {}) is None
+
+    def test_config_override_false_beats_vision_capable_profile(self):
+        # The profile flag is a FALLBACK, not an override: an explicit
+        # config supports_vision=False must still win over a vision-declaring
+        # profile (config-override is checked first and short-circuits).
+        fake_profile = type("Prof", (), {"supports_vision": True})()
+        cfg = {"model": {"supports_vision": False}}
+        with patch("agent.models_dev.get_model_capabilities", return_value=None), \
+             patch("providers.get_provider_profile", return_value=fake_profile):
+            assert _lookup_supports_vision("claude-bpx-15", "claude-fable-5", cfg) is False
+
 
 # ─── decide_image_input_mode with auto + override ────────────────────────────
 
