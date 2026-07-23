@@ -41,6 +41,12 @@ import time
 import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
+
+# Bounds for the orphaned-pipe drain in _reconcile_local_exit. A descendant
+# holding the pipe open can write forever (e.g. a TUI spinner); the drain must
+# never let poll() block or busy-loop past these caps.
+_DRAIN_MAX_BYTES = 1_048_576  # 1 MiB — far above any legitimate leftover output
+_DRAIN_DEADLINE_SECONDS = 1.0
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
@@ -1292,6 +1298,16 @@ class ProcessRegistry:
         # consumed yet. This is best-effort: if the pipe is held open by a
         # descendant, the non-blocking read returns what's immediately
         # available and we stop.
+        #
+        # The drain MUST be bounded. `BufferedReader.read()` (read-to-EOF)
+        # only returns when the pipe hits EOF or a read would block — but a
+        # descendant that continuously writes (e.g. a backgrounded TUI
+        # redrawing a spinner, like `codex login`) produces bytes forever:
+        # never EOF, never a blocking gap. An unbounded read then busy-loops
+        # the poll() caller's worker thread indefinitely (observed 2026-07-23:
+        # two gateway workers pinned for ~2h each on a `codex login 2>&1 &`
+        # session; every /stop-continue retry pinned another thread). Cap the
+        # drain by bytes AND wall-clock so poll() always returns promptly.
         drained = ""
         stdout = getattr(proc, "stdout", None)
         if stdout is not None and not _IS_WINDOWS:
@@ -1301,11 +1317,20 @@ class ProcessRegistry:
                 flags = fcntl.fcntl(fd, fcntl.F_GETFL)
                 fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
                 try:
-                    chunk = stdout.read()
-                    if chunk:
-                        drained = chunk if isinstance(chunk, str) else chunk.decode("utf-8", errors="replace")
-                except (BlockingIOError, OSError, ValueError):
-                    pass
+                    chunks: list[bytes] = []
+                    drained_bytes = 0
+                    deadline = time.monotonic() + _DRAIN_DEADLINE_SECONDS
+                    while drained_bytes < _DRAIN_MAX_BYTES and time.monotonic() < deadline:
+                        try:
+                            piece = os.read(fd, 65536)
+                        except (BlockingIOError, OSError, ValueError):
+                            break
+                        if not piece:
+                            break  # EOF — pipe fully closed.
+                        chunks.append(piece)
+                        drained_bytes += len(piece)
+                    if chunks:
+                        drained = b"".join(chunks).decode("utf-8", errors="replace")
                 finally:
                     try:
                         fcntl.fcntl(fd, fcntl.F_SETFL, flags)
