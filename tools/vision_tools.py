@@ -1725,8 +1725,22 @@ def _ensure_ytdlp_available() -> None:
 
 
 def _ytdlp_command() -> list[str]:
-    """Use the active interpreter so lazy-installed yt-dlp is always found."""
-    return [sys.executable, "-m", "yt_dlp"]
+    """Run the resolved yt-dlp package with the active interpreter.
+
+    Lazy dependencies may live in a target appended only to this process's
+    ``sys.path``. A fresh ``python -m yt_dlp`` child would not inherit that
+    path. Pass the resolved package root explicitly and append it in the child
+    so the core environment keeps precedence over lazy-installed packages.
+    """
+    import yt_dlp
+
+    package_root = str(Path(yt_dlp.__file__).resolve().parent.parent)
+    runner = (
+        "import runpy,sys; "
+        "sys.path.append(sys.argv.pop(1)); "
+        "runpy.run_module('yt_dlp', run_name='__main__')"
+    )
+    return [sys.executable, "-c", runner, package_root]
 
 
 def _ytdlp_js_runtime_args() -> list[str]:
