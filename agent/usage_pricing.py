@@ -376,6 +376,39 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://openai.com/index/previewing-gpt-5-6-sol/",
         pricing_version="openai-gpt-5.6-2026-07",
     ),
+    # ── Anthropic Claude Opus 5 ──────────────────────────────────────────
+    # Released 2026-07-24, same $5/$25 base pricing as Opus 4.8 (announcement:
+    # "priced at $5 per million input tokens and $25 per million output tokens
+    # (the same as Opus 4.8)"). Cache read $0.50 (0.1x input), cache write
+    # $6.25 — same tier as 4.8, all four numbers from one (list) tier. Fast
+    # mode is 2x, mirroring the 4.8-fast pattern. Subscription relays price
+    # NOTIONAL via is_notional_anthropic_provider(); this entry only prices
+    # the bare "anthropic" provider (direct key / Bedrock / Vertex).
+    # Source: https://www.anthropic.com/news/claude-opus-5
+    (
+        "anthropic",
+        "claude-opus-5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("5.00"),
+        output_cost_per_million=Decimal("25.00"),
+        cache_read_cost_per_million=Decimal("0.50"),
+        cache_write_cost_per_million=Decimal("6.25"),
+        source="official_docs_snapshot",
+        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+        pricing_version="anthropic-pricing-2026-07",
+    ),
+    (
+        "anthropic",
+        "claude-opus-5-fast",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("10.00"),
+        output_cost_per_million=Decimal("50.00"),
+        cache_read_cost_per_million=Decimal("1.00"),
+        cache_write_cost_per_million=Decimal("12.50"),
+        source="official_docs_snapshot",
+        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+        pricing_version="anthropic-pricing-2026-07",
+    ),
     # ── Anthropic Claude 4.8 ─────────────────────────────────────────────
     # Same $5/$25 base pricing as 4.6/4.7.  Fast-mode variant is a separate
     # model ID with 2x premium (vs the 6x premium on older Opus generations).
