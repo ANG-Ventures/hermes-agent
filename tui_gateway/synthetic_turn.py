@@ -176,14 +176,18 @@ class SyntheticHeavyAgent:
                 acc = (acc * 1_000_003 + 12_345) & 0xFFFFFFFFFFFFFFFF
             if sleep_s:
                 time.sleep(sleep_s)
-            if now - last_delta >= interval:
+            # Re-sample the clock AFTER the burn/sleep: the streamed-delta
+            # cadence must reflect true elapsed wall-time (including the
+            # slow-consumer stall), not the timestamp taken before the chunk.
+            tick = time.monotonic()
+            if tick - last_delta >= interval:
                 deltas += 1
                 self.session_output_tokens += tokens_per_delta
                 self.session_completion_tokens += tokens_per_delta
                 self.session_total_tokens += tokens_per_delta
                 if stream_callback is not None:
                     stream_callback(f"synthtok-{deltas:05d} ")
-                last_delta = now
+                last_delta = tick
 
         self.session_api_calls += 1
         # Fold the checksum into the reply so the loop is not dead-code-eliminated
