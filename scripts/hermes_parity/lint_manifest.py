@@ -53,6 +53,22 @@ def lint_paths(repo: Path, manifest_path: Path) -> list[str]:
     return errors
 
 
+def lint_schema(manifest_path: Path) -> list[str]:
+    errors: list[str] = []
+    expected = ", ".join(sorted(forkdelta.LIFECYCLES))
+    for feature in forkdelta.load_manifest(manifest_path):
+        if feature.lifecycle not in forkdelta.LIFECYCLES:
+            errors.append(
+                f"invalid lifecycle for {feature.feature!r}: {feature.lifecycle!r} "
+                f"(expected one of: {expected})"
+            )
+        elif feature.lifecycle == "absorbed" and (
+            feature.upstream_ref is None or not feature.upstream_ref.strip()
+        ):
+            errors.append(f"absorbed feature requires upstream_ref: {feature.feature!r}")
+    return errors
+
+
 def lint_nodeids(repo: Path, nodeids: Sequence[str]) -> list[str]:
     if not nodeids:
         return []
@@ -127,7 +143,8 @@ def lint_manifest(
     manifest = repo / (manifest_path or forkdelta.DEFAULT_MANIFEST)
     if not manifest.exists():
         return ManifestLintResult(False, (f"manifest missing: {manifest.relative_to(repo)}",))
-    errors = lint_paths(repo, manifest)
+    errors = lint_schema(manifest)
+    errors.extend(lint_paths(repo, manifest))
     nodeids = forkdelta.manifest_nodeids(manifest)
     errors.extend(lint_nodeids(repo, nodeids))
     if base is not None and touched_paths is not None:
