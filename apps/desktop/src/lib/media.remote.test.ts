@@ -147,36 +147,31 @@ describe('resolveMediaDisplaySrc', () => {
 })
 
 describe('gatewayMediaDataUrl', () => {
-  const api = vi.fn(async () => ({ data_url: 'data:image/png;base64,ZHVtbXk=' }))
+  const api = vi.fn(async ({ path }: { path: string }) => {
+    if (path.startsWith('/api/fs/read-data-url?')) {
+      return { dataUrl: 'data:image/png;base64,ZHVtbXk=' }
+    }
+
+    throw new Error(`unexpected path ${path}`)
+  })
 
   beforeEach(() => {
     api.mockClear()
-    $connection.set(null)
     vi.stubGlobal('window', { hermesDesktop: { api } })
+    $connection.set({ mode: 'remote' } as never)
   })
 
   afterEach(() => {
-    $connection.set(null)
     vi.unstubAllGlobals()
+    $connection.set(null)
   })
 
-  it('requests the encoded gateway path and returns the data URL', async () => {
-    const url = await gatewayMediaDataUrl('/home/u/.hermes/images/a b.png')
+  it('reads gateway media through the desktop fs bridge instead of /api/media roots', async () => {
+    const url = await gatewayMediaDataUrl('/home/u/.hermes/skills/demo/images/a b.png')
 
     expect(url).toBe('data:image/png;base64,ZHVtbXk=')
     expect(api).toHaveBeenCalledWith({
-      path: '/api/media?path=%2Fhome%2Fu%2F.hermes%2Fimages%2Fa%20b.png'
-    })
-  })
-
-  it('passes the active remote profile to the gateway API bridge', async () => {
-    $connection.set({ mode: 'remote', profile: 'mbp' } as never)
-
-    await gatewayMediaDataUrl('/home/u/.hermes/images/a.png')
-
-    expect(api).toHaveBeenCalledWith({
-      path: '/api/media?path=%2Fhome%2Fu%2F.hermes%2Fimages%2Fa.png',
-      profile: 'mbp'
+      path: '/api/fs/read-data-url?path=%2Fhome%2Fu%2F.hermes%2Fskills%2Fdemo%2Fimages%2Fa%20b.png'
     })
   })
 })

@@ -74,7 +74,7 @@ const _chatMessageFieldsExhaustive: {
 } = {}
 
 const COMPARED_FIELDS = ['id', 'role', 'pending', 'error', 'hidden', 'branchGroupId', 'interim'] as const
-const IGNORED_FIELDS = ['timestamp', 'attachmentRefs', 'parts'] as const
+const IGNORED_FIELDS = ['timestamp', 'attachmentRefs', 'parts', 'footer'] as const
 
 // Compile-time check: every ChatMessagePart discriminant must be handled by
 // chatPartsEquivalent. If @assistant-ui adds a new part type, this fails tsc.

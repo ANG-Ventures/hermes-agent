@@ -161,20 +161,12 @@ export function isRemoteGateway(): boolean {
   return $connection.get()?.mode === 'remote'
 }
 
-// Fetch a gateway-local image as a data URL via the authenticated REST bridge.
-// Used in remote mode where readFileDataUrl (which reads THIS machine's disk)
-// can't see files the agent wrote on the gateway. Requires the gateway to
-// expose GET /api/media (hermes_cli/web_server.py).
+// Fetch gateway-local media as a data URL via the authenticated desktop FS
+// bridge. Remote Desktop artifacts can live anywhere the gateway can read
+// (workspace, skills, ~/.hermes/cache, etc.); /api/media is intentionally
+// narrower and rejects non-images plus images outside its media roots.
 export async function gatewayMediaDataUrl(path: string): Promise<string> {
-  const file = filePathFromMediaPath(path)
-  const profile = $connection.get()?.profile || undefined
-
-  const result = await window.hermesDesktop!.api<{ data_url: string }>({
-    path: `/api/media?path=${encodeURIComponent(file)}`,
-    ...(profile ? { profile } : {})
-  })
-
-  return result.data_url
+  return readDesktopFileDataUrl(filePathFromMediaPath(path))
 }
 
 export function mediaDisplayLabel(path: string): string {

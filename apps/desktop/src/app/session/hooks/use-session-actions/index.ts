@@ -1292,17 +1292,11 @@ export function useSessionActions({
       const wasSelected = selectedStoredSessionId === storedSessionId
       const closingRuntimeId = wasSelected ? activeSessionId : null
       const previousMessages = $messages.get()
-      const previousPinned = $pinnedSessionIds.get()
-      // Pins are keyed on the durable lineage-root id; the stored id may be the
-      // live tip after compression. Drop both so the pin can't linger.
-      const removedPinId = removed ? sessionPinId(removed) : storedSessionId
       const removedIds = [storedSessionId, removed?.id, removed?._lineage_root_id]
 
       setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
-      // Drop the pin optimistically too (keyed on the durable lineage-root id;
-      // the stored id may be the live tip after compression), restored on the
-      // rollback below if the delete fails.
-      $pinnedSessionIds.set(previousPinned.filter(id => id !== storedSessionId && id !== removedPinId))
+      // Pin rows derive from $sessions (computed) — removing the session row
+      // below drops the pin automatically; restore happens via setSessions rollback.
       // Evict from the project tree's optimistic layer too (the backend snapshot
       // still lists it until its next refresh), so grouped + flat views drop the
       // row in lockstep. Pin the tombstone against the projects.tree prune while
@@ -1353,7 +1347,6 @@ export function useSessionActions({
         }
 
         untombstoneSessions(removedIds)
-        $pinnedSessionIds.set(previousPinned)
 
         if (wasSelected) {
           setFreshDraftReady(false)
@@ -1402,17 +1395,14 @@ export function useSessionActions({
 
       const archived = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
       const wasSelected = selectedStoredSessionId === storedSessionId
-      const previousPinned = $pinnedSessionIds.get()
       // Pins are keyed on the durable lineage-root id; the stored id may be the
       // live tip after compression. Drop both so the pin can't linger.
-      const archivedPinId = archived ? sessionPinId(archived) : storedSessionId
       const archivedIds = [storedSessionId, archived?.id, archived?._lineage_root_id]
 
       // Soft-hide: drop from the sidebar immediately, keep the data.
       setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
       // Drop the pin optimistically too, restored on the rollback below if the
       // archive PATCH fails.
-      $pinnedSessionIds.set(previousPinned.filter(id => id !== storedSessionId && id !== archivedPinId))
       tombstoneSessions(archivedIds)
       beginSessionMutation(archivedIds)
       // Archived sessions are hidden by the listSessions(min_messages=1) query
@@ -1449,7 +1439,6 @@ export function useSessionActions({
         }
 
         untombstoneSessions(archivedIds)
-        $pinnedSessionIds.set(previousPinned)
         notifyError(err, copy.archiveFailed)
       } finally {
         endSessionMutation(archivedIds)

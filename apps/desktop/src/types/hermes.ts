@@ -262,6 +262,10 @@ export interface HermesConfig {
     repo_scan_enabled?: boolean
     repo_scan_roots?: string[]
     repo_scan_exclude_paths?: string[]
+    // When true, a fresh chat (Cmd+N / app relaunch) reseeds the composer model
+    // to the profile default instead of carrying the last-picked model forward.
+    // Default false preserves the sticky-last-pick behavior.
+    reset_model_on_new_session?: boolean
   }
   terminal?: {
     cwd?: string
@@ -273,12 +277,7 @@ export interface HermesConfig {
     max_recording_seconds?: number
     auto_tts?: boolean
   }
-  desktop?: {
-    // When true, a fresh chat (Cmd+N / app relaunch) reseeds the composer model
-    // to the profile default instead of carrying the last-picked model forward.
-    // Default false preserves the sticky-last-pick behavior.
-    reset_model_on_new_session?: boolean
-  }
+
 }
 
 export type HermesConfigRecord = Record<string, unknown>

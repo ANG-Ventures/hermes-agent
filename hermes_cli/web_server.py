@@ -97,11 +97,6 @@ from gateway.status import (
     parse_active_agents,
     read_runtime_status,
 )
-from hermes_cli.memory_providers import (
-    MemoryProvider as DeclaredMemoryProvider,
-    ProviderField as DeclaredProviderField,
-    get_memory_provider as get_declared_memory_provider,
-)
 from utils import env_var_enabled, is_truthy_value
 
 try:

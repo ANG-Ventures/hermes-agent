@@ -567,7 +567,7 @@ export function useGatewayBoot({
           message: translateNow('boot.steps.loadingSessions'),
           progress: 99
         })
-        await callbacksRef.current.refreshSessions()
+        await callbacksRef.current.refreshSessions().catch(() => undefined)
 
         // Live list has landed (wholesale merge). Report cache divergence,
         // write the fresh list back, and boot-sweep orphaned transcripts (I4b).

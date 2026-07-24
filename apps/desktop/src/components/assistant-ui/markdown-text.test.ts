@@ -6,7 +6,13 @@ import { $connection } from '@/store/session'
 import { mediaSrc } from './markdown-text'
 
 describe('mediaSrc', () => {
-  const api = vi.fn(async () => ({ data_url: 'data:image/png;base64,cmVtb3Rl' }))
+  const api = vi.fn(async ({ path }: { path: string }) => {
+    if (path.startsWith('/api/fs/read-data-url?')) {
+      return { dataUrl: 'data:image/png;base64,cmVtb3Rl' }
+    }
+
+    throw new Error(`unexpected path ${path}`)
+  })
   const readFileDataUrl = vi.fn(async () => 'data:image/png;base64,bG9jYWw=')
 
   beforeEach(() => {
@@ -39,11 +45,11 @@ describe('mediaSrc', () => {
     expect(readFileDataUrl).not.toHaveBeenCalled()
   })
 
-  it('fetches remote images through authenticated gateway media API', async () => {
+  it('fetches remote images through the desktop fs bridge', async () => {
     $connection.set({ mode: 'remote', profile: 'mbp' } as never)
 
     await expect(mediaSrc('/tmp/a image.png')).resolves.toBe('data:image/png;base64,cmVtb3Rl')
-    expect(api).toHaveBeenCalledWith({ path: '/api/media?path=%2Ftmp%2Fa%20image.png', profile: 'mbp' })
+    expect(api).toHaveBeenCalledWith({ path: '/api/fs/read-data-url?path=%2Ftmp%2Fa%20image.png', profile: 'mbp' })
     expect(readFileDataUrl).not.toHaveBeenCalled()
   })
 })

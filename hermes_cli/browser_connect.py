@@ -205,8 +205,8 @@ def discover_local_cdp_url(port: int, timeout: float = 1.0) -> str | None:
     """Return the first loopback URL (IPv4 first, then IPv6) speaking CDP.
 
     Dual-stack discovery: when another application squats the IPv4
-    loopback on ``port``, a debug browser launched with
-    ``--remote-debugging-port`` may bind only ``[::1]``. Probing both
+    loopback on ``port``, a debug browser launched on a remote
+    debugging port may bind only ``[::1]``. Probing both
     literals finds it either way. Returns ``None`` when neither
     loopback exposes a CDP discovery endpoint.
     """

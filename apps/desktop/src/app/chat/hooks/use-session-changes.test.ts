@@ -80,6 +80,7 @@ function Harness({
 }: HarnessProps) {
   const state: ClientSessionState = {
     awaitingResponse: false,
+    interimBoundaryPending: false,
     branch: '',
     busy: false,
     cwd: '',
