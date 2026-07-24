@@ -7429,6 +7429,7 @@ class SessionDB:
                         "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
                         (parent_id, session_id),
                     )
+                    self._recompute_effective_last_active_for_session(conn, session_id)
                 else:
                     # Drop only the closing edge. Later entries can still attach
                     # to this now-root session, preserving the acyclic portion
@@ -7746,6 +7747,11 @@ class SessionDB:
                 return 0
 
             placeholders = ",".join("?" * len(session_ids))
+            orphaned_child_ids, affected_root_ids = (
+                self._collect_orphan_effective_last_active_targets(
+                    conn, list(session_ids)
+                )
+            )
             conn.execute(
                 f"UPDATE sessions SET parent_session_id = NULL "
                 f"WHERE parent_session_id IN ({placeholders})",
@@ -7762,6 +7768,9 @@ class SessionDB:
                 )
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
+            self._recompute_effective_last_active_many(
+                conn, affected_root_ids + orphaned_child_ids
+            )
             return len(session_ids)
 
         count = self._execute_write(_do)
@@ -7998,6 +8007,11 @@ class SessionDB:
 
             # Orphan any sessions whose parent is about to be deleted
             placeholders = ",".join("?" * len(session_ids))
+            orphaned_child_ids, affected_root_ids = (
+                self._collect_orphan_effective_last_active_targets(
+                    conn, list(session_ids)
+                )
+            )
             conn.execute(
                 f"UPDATE sessions SET parent_session_id = NULL "
                 f"WHERE parent_session_id IN ({placeholders})",
@@ -8008,6 +8022,9 @@ class SessionDB:
                 conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
+            self._recompute_effective_last_active_many(
+                conn, affected_root_ids + orphaned_child_ids
+            )
             return len(session_ids)
 
         count = self._execute_write(_do)
