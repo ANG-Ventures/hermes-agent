@@ -47,6 +47,7 @@ def _urlopen_model_catalog_request(req: urllib.request.Request, *, timeout: floa
 OPENROUTER_MODELS: list[tuple[str, str]] = [
     # Anthropic
     ("anthropic/claude-fable-5",               ""),
+    ("anthropic/claude-opus-5",                ""),
     ("anthropic/claude-opus-4.8",              ""),
     ("anthropic/claude-opus-4.8-fast",         "2x price, higher output speed"),
     ("anthropic/claude-sonnet-5",              ""),
@@ -198,6 +199,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "nous": [
         # Anthropic
         "anthropic/claude-fable-5",
+        "anthropic/claude-opus-5",
         "anthropic/claude-opus-4.8",
         "anthropic/claude-sonnet-5",
         "anthropic/claude-haiku-4.5",
@@ -379,9 +381,9 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     ],
     "anthropic": [
         "claude-fable-5",
+        "claude-opus-5",
         "claude-sonnet-5",
         "claude-opus-4-8",
-        "claude-sonnet-5",
         "claude-opus-4-7",
         "claude-opus-4-6",
         "claude-sonnet-4-6",
@@ -442,13 +444,13 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gpt-5-codex",
         "gpt-5-nano",
         "claude-fable-5",
+        "claude-opus-5",
         "claude-sonnet-5",
         "claude-opus-4-8",
         "claude-opus-4-7",
         "claude-opus-4-6",
         "claude-opus-4-5",
         "claude-opus-4-1",
-        "claude-sonnet-5",
         "claude-sonnet-4-6",
         "claude-sonnet-4-5",
         "claude-sonnet-4",
@@ -3673,12 +3675,14 @@ _COPILOT_MODEL_ALIASES = {
     # "model_not_supported".  See issue #6879.
     "claude-sonnet-5": "claude-sonnet-5",
     "claude-opus-4-6": "claude-opus-4.6",
+    "claude-opus-5": "claude-opus-5",
     "claude-sonnet-5": "claude-sonnet-5",
     "claude-sonnet-4-6": "claude-sonnet-4.6",
     "claude-sonnet-4-0": "claude-sonnet-4",
     "claude-sonnet-4-5": "claude-sonnet-4.5",
     "claude-haiku-4-5": "claude-haiku-4.5",
     "anthropic/claude-opus-4-6": "claude-opus-4.6",
+    "anthropic/claude-opus-5": "claude-opus-5",
     "anthropic/claude-sonnet-5": "claude-sonnet-5",
     "anthropic/claude-sonnet-4-6": "claude-sonnet-4.6",
     "anthropic/claude-sonnet-4-0": "claude-sonnet-4",
