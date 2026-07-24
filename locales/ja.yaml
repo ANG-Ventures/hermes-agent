@@ -1,492 +1,678 @@
-# Hermes 静的メッセージカタログ -- 日本語
-# See locales/en.yaml for the source of truth; keep keys in sync.
-
 approval:
-  dangerous_header: "⚠️  危険なコマンド: {description}"
-  choose_long:     "      [o]今回のみ  |  [s]セッション中  |  [a]常に許可  |  [d]拒否"
-  choose_short:    "      [o]今回のみ  |  [s]セッション中  |  [d]拒否"
-  prompt_long:     "      選択 [o/s/a/D]: "
-  prompt_short:    "      選択 [o/s/D]: "
-  choose_smart_deny: "      [o]今回のみ  |  [d]拒否"
-  prompt_smart_deny: "      選択 [o/D]: "
-  smart_deny_once_inputs: "o,once"
-  smart_deny_deny_inputs: "d,deny"
-  timeout:         "      ⏱ タイムアウト — コマンドを拒否しました"
-  allowed_once:    "      ✓ 今回のみ許可"
-  allowed_session: "      ✓ このセッション中は許可"
-  allowed_always:  "      ✓ 永続的な許可リストに追加"
-  denied:          "      ✗ 拒否しました"
-  cancelled:       "      ✗ キャンセルしました"
-  blocklist_message: "このコマンドは無条件ブロックリストに含まれており、承認できません。"
-
+  allowed_always: '      ✓ 永続的な許可リストに追加'
+  allowed_once: '      ✓ 今回のみ許可'
+  allowed_session: '      ✓ このセッション中は許可'
+  blocklist_message: このコマンドは無条件ブロックリストに含まれており、承認できません。
+  cancelled: '      ✗ キャンセルしました'
+  choose_long: '      [o]今回のみ  |  [s]セッション中  |  [a]常に許可  |  [d]拒否'
+  choose_short: '      [o]今回のみ  |  [s]セッション中  |  [d]拒否'
+  choose_smart_deny: '      [o]今回のみ  |  [d]拒否'
+  dangerous_header: '⚠️  危険なコマンド: {description}'
+  denied: '      ✗ 拒否しました'
+  prompt_long: '      選択 [o/s/a/D]: '
+  prompt_short: '      選択 [o/s/D]: '
+  prompt_smart_deny: '      選択 [o/D]: '
+  smart_deny_deny_inputs: d,deny
+  smart_deny_once_inputs: o,once
+  timeout: '      ⏱ タイムアウト — コマンドを拒否しました'
 gateway:
-  approval_expired: "⚠️ 承認の有効期限が切れました（エージェントはもう待機していません）。エージェントに再試行を依頼してください。"
-  draining:         "⏳ 再起動前に {count} 個のアクティブエージェントの終了を待っています..."
-  goal_cleared:     "✓ 目標をクリアしました。"
-  no_active_goal:   "アクティブな目標はありません。"
-  config_read_failed: "⚠️ config.yaml を読み込めませんでした: {error}"
-  config_save_failed: "⚠️ 設定を保存できませんでした: {error}"
-
-  model:
-    error_prefix:           "エラー: {error}"
-    switched:               "モデルを `{model}` に切り替えました"
-    provider_label:         "プロバイダー: {provider}"
-    reasoning_label:        "推論: {effort}"
-    context_label:          "コンテキスト: {tokens} トークン"
-    max_output_label:       "最大出力: {tokens} トークン"
-    cost_label:             "コスト: {cost}"
-    capabilities_label:     "機能: {capabilities}"
-    prompt_caching_enabled: "プロンプトキャッシュ: 有効"
-    warning_prefix:         "警告: {warning}"
-    saved_global:           "config.yaml に保存しました (`--global`)"
-    session_only_hint:      "_(このセッションのみ — 永続化するには `--global` を追加)_"
-    current_label:          "現在: `{model}` ({provider})"
-    current_tag:            " (現在)"
-    more_models_suffix:     " (他 {count} 件)"
-    usage_switch_model:     "`/model <name>` — モデルを切り替え"
-    usage_switch_provider:  "`/model <name> --provider <slug>` — プロバイダーを切り替え"
-    usage_persist:          "`/model <name> --global` — 永続化"
-
   agents:
-    header:                "🤖 **アクティブなエージェントとタスク**"
-    active_agents:         "**アクティブなエージェント:** {count}"
-    this_chat:             " · このチャット"
-    more:                  "... 他に {count} 件"
-    running_processes:     "**実行中のバックグラウンドプロセス:** {count}"
-    async_jobs:            "**ゲートウェイ非同期ジョブ:** {count}"
-    none:                  "アクティブなエージェントや実行中のタスクはありません。"
-    state_starting:        "起動中"
-    state_running:         "実行中"
-
+    active_agents: '**アクティブなエージェント:** {count}'
+    async_jobs: '**ゲートウェイ非同期ジョブ:** {count}'
+    header: 🤖 **アクティブなエージェントとタスク**
+    more: '... 他に {count} 件'
+    none: アクティブなエージェントや実行中のタスクはありません。
+    running_processes: '**実行中のバックグラウンドプロセス:** {count}'
+    state_running: 実行中
+    state_starting: 起動中
+    this_chat: ' · このチャット'
+  approval_expired: ⚠️ 承認の有効期限が切れました（エージェントはもう待機していません）。エージェントに再試行を依頼してください。
   approve:
-    no_pending:            "承認待ちのコマンドはありません。"
-    once_singular:         "✅ コマンドを承認しました。エージェントを再開しています..."
-    once_plural:           "✅ コマンドを承認しました ({count} 件)。エージェントを再開しています..."
-    session_singular:      "✅ コマンドを承認しました (このセッション中はパターンを許可)。エージェントを再開しています..."
-    session_plural:        "✅ コマンドを承認しました (このセッション中はパターンを許可) ({count} 件)。エージェントを再開しています..."
-    always_singular:       "✅ コマンドを承認しました (パターンを永続的に許可)。エージェントを再開しています..."
-    always_plural:         "✅ コマンドを承認しました (パターンを永続的に許可) ({count} 件)。エージェントを再開しています..."
-
+    always_plural: ✅ コマンドを承認しました (パターンを永続的に許可) ({count} 件)。エージェントを再開しています...
+    always_singular: ✅ コマンドを承認しました (パターンを永続的に許可)。エージェントを再開しています...
+    no_pending: 承認待ちのコマンドはありません。
+    once_plural: ✅ コマンドを承認しました ({count} 件)。エージェントを再開しています...
+    once_singular: ✅ コマンドを承認しました。エージェントを再開しています...
+    session_plural: ✅ コマンドを承認しました (このセッション中はパターンを許可) ({count} 件)。エージェントを再開しています...
+    session_singular: ✅ コマンドを承認しました (このセッション中はパターンを許可)。エージェントを再開しています...
   background:
-    usage:                 "使い方: /background <プロンプト>\n例: /background 今日の HN トップ記事を要約して\n\nプロンプトを別のセッションで実行します。チャットを続けられます — 完了したらここに結果が表示されます。"
-    started:               "🔄 バックグラウンドタスクを開始しました: 「{preview}」\nタスク ID: {task_id}\nチャットを続けられます — 完了したらここに結果が表示されます。"
+    started: '🔄 バックグラウンドタスクを開始しました: 「{preview}」
 
+      タスク ID: {task_id}
+
+      チャットを続けられます — 完了したらここに結果が表示されます。'
+    usage: '使い方: /background <プロンプト>
+
+      例: /background 今日の HN トップ記事を要約して
+
+
+      プロンプトを別のセッションで実行します。チャットを続けられます — 完了したらここに結果が表示されます。'
   branch:
-    db_unavailable:        "セッションデータベースは利用できません。"
-    no_conversation:       "分岐する会話がありません — まずメッセージを送信してください。"
-    create_failed:         "ブランチの作成に失敗しました: {error}"
-    switch_failed:         "ブランチは作成されましたが、切り替えに失敗しました。"
-    branched_one:          "⑂ **{title}** に分岐しました ({count} メッセージをコピー)\n元: `{parent}`\nブランチ: `{new}`\n元のセッションに戻るには `/resume` を使用してください。"
-    branched_many:         "⑂ **{title}** に分岐しました ({count} メッセージをコピー)\n元: `{parent}`\nブランチ: `{new}`\n元のセッションに戻るには `/resume` を使用してください。"
-    thread_intro:          "⑂ **Branched thread — {title}**\nThis thread inherits the parent conversation ({count} messages) from {parent}. Explore freely here; the parent channel keeps its own session. Use `/merge` to fold a summary back into the parent."
-    thread_parent_fallback: "the parent conversation"
-    thread_branched_one:   "⑂ Branched into a new thread → {thread} (**{title}**, {count} message inherited).\nThe parent channel stays on its own session; use `/merge` inside the thread to fold it back."
-    thread_branched_many:  "⑂ Branched into a new thread → {thread} (**{title}**, {count} messages inherited).\nThe parent channel stays on its own session; use `/merge` inside the thread to fold it back."
+    branched_many: '⑂ **{title}** に分岐しました ({count} メッセージをコピー)
 
-  merge:
-    not_a_thread:          "`/merge` only works inside a branched thread. Start one with `/branch` in a channel first."
-    not_a_branch:          "This thread wasn't created by `/branch`, so there's no parent session to merge into."
-    not_found:             "No session found matching '{name}'. Use `/merge` with no name to list mergeable sessions."
-    same_session:          "That's the session you're already in — pick a different target to merge into."
-    already_merged:        "This session was already merged into **{title}** — not folding it again. (Start a new exploration to merge fresh material.)"
-    blocked_not_owner:     "You can only merge into sessions you own. '{name}' belongs to a different chat/owner."
-    no_named_sessions:     "No titled sessions to merge into yet. Give a session a name with `/title` first."
-    list_header:           "🔀 **Sessions you can merge into** — reply `/merge <number>` or `/merge <name>`:"
-    list_footer:           "_`/merge <number>` folds a summary of THIS session into that one._"
-    no_conversation:       "Nothing to merge — this session has no conversation yet."
-    no_new_turns:          "Nothing new to merge — no turns happened in this thread after the branch point."
-    no_summary:            "Couldn't generate a summary of this session; nothing was merged. Try again in a moment."
-    fold_failed:           "Failed to fold the summary into the target session: {error}"
-    ledger_failed:         "Couldn't safely record the merge (session store busy) — nothing was folded. Try again in a moment."
-    fold_body:             "[MERGED SESSION — {title}] A summary of another session ('{title}') was folded into this conversation. Treat it as reference context:\n\n{summary}"
-    fold_body_thread:      "[BRANCHED THREAD MERGED — {title}] A branched thread was explored and folded back into this conversation. Summary of what happened in the branch:\n\n{summary}"
-    md_suffix:             " · full record: `{path}`"
-    note_record_suffix:    " · full record: `{path}`"
-    source_marker:         "[MERGED — this thread's new exploration was folded into '{target}' on {when}. You can keep going here, but its summary already lives in that conversation.]"
-    source_marker_named:   "[MERGED — a summary of this session was folded into '{target}' on {when}. You can keep going here, but its summary already lives in that conversation.]"
-    parent_note:           "🔀 **Merged from thread '{title}'**\n{summary}"
-    target_note:           "🔀 **Folded in from _{source}_**{child} — a summary of {turns} message(s) is now in this conversation's context.{record}"
-    target_note_named:     "🔀 **Folded in from _{source}_** — a summary of _{source}_ ({turns} message(s)) is now in this conversation's context.{record}"
-    source_thread_link:    " ({thread})"
-    merged_named:          "✅ Merged into **{title}** — a summary of this session is now in its context.{md}"
-    merged_thread:         "✅ **Folded back into _{title}_**{parent} — a summary of this thread is now in the parent's context, and this thread is archived (still resumable).{md}"
-    merged_thread_no_archive: "✅ **Folded back into _{title}_**{parent} — a summary of this thread is now in the parent's context. (Couldn't archive the thread automatically; you can close it manually.){md}"
-    target_parent_link:    " ({parent})"
+      元: `{parent}`
 
+      ブランチ: `{new}`
+
+      元のセッションに戻るには `/resume` を使用してください。'
+    branched_one: '⑂ **{title}** に分岐しました ({count} メッセージをコピー)
+
+      元: `{parent}`
+
+      ブランチ: `{new}`
+
+      元のセッションに戻るには `/resume` を使用してください。'
+    create_failed: 'ブランチの作成に失敗しました: {error}'
+    db_unavailable: セッションデータベースは利用できません。
+    no_conversation: 分岐する会話がありません — まずメッセージを送信してください。
+    switch_failed: ブランチは作成されましたが、切り替えに失敗しました。
+    thread_branched_many: '⑂ Branched into a new thread → {thread} (**{title}**, {count} messages inherited).
+
+      The parent channel stays on its own session; use `/merge` inside the thread to fold it back.'
+    thread_branched_one: '⑂ Branched into a new thread → {thread} (**{title}**, {count} message inherited).
+
+      The parent channel stays on its own session; use `/merge` inside the thread to fold it back.'
+    thread_intro: '⑂ **Branched thread — {title}**
+
+      This thread inherits the parent conversation ({count} messages) from {parent}. Explore freely here; the parent channel keeps its own session. Use `/merge` to fold a summary back into the parent.'
+    thread_parent_fallback: the parent conversation
   commands:
-    usage:                 "使い方: `/commands [page]`"
-    skill_header:          "⚡ **スキルコマンド**:"
-    default_desc:          "スキルコマンド"
-    none:                  "利用可能なコマンドはありません。"
-    header:                "📚 **コマンド** (合計 {total}、{page}/{total_pages} ページ)"
-    nav_prev:              "`/commands {page}` ← 前へ"
-    nav_next:              "次へ → `/commands {page}`"
-    out_of_range:          "_(要求されたページ {requested} は範囲外のため、{page} ページを表示しています。)_"
-
+    default_desc: スキルコマンド
+    header: 📚 **コマンド** (合計 {total}、{page}/{total_pages} ページ)
+    nav_next: 次へ → `/commands {page}`
+    nav_prev: '`/commands {page}` ← 前へ'
+    none: 利用可能なコマンドはありません。
+    out_of_range: _(要求されたページ {requested} は範囲外のため、{page} ページを表示しています。)_
+    skill_header: '⚡ **スキルコマンド**:'
+    usage: '使い方: `/commands [page]`'
   compress:
-    not_enough:            "圧縮するための会話が不十分です (少なくとも 4 件のメッセージが必要)。"
-    no_provider:           "プロバイダーが構成されていません — 圧縮できません。"
-    nothing_to_do:         "まだ圧縮するものがありません (トランスクリプトはすべて保護されたコンテキストのままです)。"
-    aggressive_unsupported: "--aggressive はサポートされていません。'/compress here [N]' で直近のやり取りだけを残すか、/undo でターンを削除してください。"
-    focus_line:            "フォーカス: \"{topic}\""
-    chat_size:             "Chat size: ~{before:,} → ~{after:,} tokens (excludes system, tools, tool results)"
-    chat_size_unchanged:   "Chat size: ~{before:,} tokens (unchanged; excludes system, tools, tool results)"
-    full_request_real:     "Full request size: {before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; before = last live request, after = estimate of next)"
-    full_request_est:      "Full request size: ~{before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; estimated — no live request yet)"
-    full_request_no_fixed: "after excludes system prompt + tool schemas (no resident agent to measure them); next live turn will show the full size."
-    full_request_unchanged: "Full request size: {before} tokens (unchanged — next turn resends the same context)"
-    persist_failed:        "⚠️ 圧縮は実行されましたが、結果を保存できませんでした — セッションデータベースがビジー（ロック）状態でした。失われたものはなく、トランスクリプトは変更されていません。少し待ってから /compress をもう一度実行して再試行してください。"
-    summary_failed:        "⚠️ 要約の生成に失敗しました ({error})。{count} 件の履歴メッセージが削除され、プレースホルダーに置き換えられました。以前のコンテキストは復元できません。auxiliary.compression モデルの設定を確認してください。"
-    aborted:               "⚠️ 圧縮が中止されました ({error})。メッセージは削除されていません — 会話はそのままです。再試行するには /compress、新しいセッションを開始するには /reset を実行するか、auxiliary.compression モデル設定を確認してください。"
-    aux_failed:            "ℹ️ 構成された圧縮モデル `{model}` が失敗しました ({error})。メインモデルで復旧しました — コンテキストは無傷です — config.yaml の `auxiliary.compression.model` を確認するとよいでしょう。"
-    failed:                "圧縮に失敗しました: {error}"
-
-  debug:
-    upload_failed:         "✗ デバッグレポートのアップロードに失敗しました: {error}"
-    header:                "**デバッグレポートをアップロードしました:**"
-    auto_delete:           "⏱ ペーストは 6 時間後に自動削除されます。"
-    full_logs_hint:        "完全なログのアップロードには、CLI から `hermes debug share` を使用してください。"
-    share_hint:            "サポートを受けるには、このリンクを Hermes チームに共有してください。"
-
-  deny:
-    stale:                 "❌ コマンドを拒否しました (承認は期限切れでした)。"
-    no_pending:            "拒否待ちのコマンドはありません。"
-    denied_singular:       "❌ コマンドを拒否しました。"
-    denied_plural:         "❌ コマンドを拒否しました ({count} 件)。"
-    denied_reason_singular: "❌ コマンドを拒否しました。 理由をエージェントに伝達しました: \"{reason}\""
-    denied_reason_plural:  "❌ コマンドを拒否しました ({count} 件)。 理由をエージェントに伝達しました: \"{reason}\""
-
-  fast:
-    not_supported:         "⚡ /fast は Priority Processing をサポートする OpenAI モデルでのみ利用できます。"
-    status:                "⚡ Priority Processing\n\n現在のモード: `{mode}`\n\n_使い方:_ `/fast <normal|fast|status>`"
-    unknown_arg:           "⚠️ 不明な引数: `{arg}`\n\n**有効なオプション:** normal、fast、status"
-    saved:                 "⚡ ✓ Priority Processing: **{label}** (設定に保存しました)\n_(次のメッセージから有効)_"
-    session_only:          "⚡ ✓ Priority Processing: **{label}** (このセッションのみ)"
-    label_fast:            "FAST"
-    label_normal:          "NORMAL"
-    status_fast:           "fast"
-    status_normal:         "normal"
-
-    route_off:             "⚡ Fast: off — {reason}"
-    route_status:          "⚡ Fast: {state} — {family} on `{route}`"
-    preference_status:     "⚡ Configured session preference: Fast {state} — {family} on `{route}`. Route availability is checked before each turn."
-    preference_off:        "⚡ Configured session preference: Fast off — {reason} Route availability is checked before each turn."
-    preference_unavailable: "⚡ Configured session preference `{route}` is currently unavailable because its credentials could not be resolved. The preference remains saved; restore credentials or use `/model reset`."
-    route_unavailable:     "⚡ Fast unavailable — {reason}"
-    route_saved:           "⚡ ✓ {family}: **{label}** (saved to config)"
-    route_session_only:    "⚡ ✓ {family}: **{label}** (config save failed; applied gateway-process-wide until restart)"
-    model_switch_unavailable: "⚡ Fast: unavailable on `{route}`; requests will use normal speed."
-    family_openai_priority: "OpenAI API Priority Processing"
-    family_codex_fast:     "Codex Fast"
-    family_anthropic_fast: "Anthropic Fast"
-    family_unsupported:    "Fast"
-    state_on:              "on"
-    state_off:             "off"
-
-  footer:
-    status:                "📎 ランタイムフッター: **{state}**\nフィールド: `{fields}`\nプラットフォーム: `{platform}`"
-    usage:                 "使い方: `/footer [on|off|status]`"
-    saved:                 "📎 ランタイムフッター: **{state}**{example}\n_(グローバルに保存しました — 次のメッセージから有効)_"
-    example_line:          "\n例: `{preview}`"
-    state_on:              "ON"
-    state_off:             "OFF"
-
-  goal:
-    unavailable:           "このセッションでは目標機能を利用できません。"
-    no_goal_set:           "目標が設定されていません。"
-    paused:                "⏸ 目標を一時停止しました: {goal}"
-    no_resume:             "再開する目標がありません。"
-    resumed:               "▶ 目標を再開しました: {goal}\nメッセージを送って続行するか、お待ちください — 次のターンで続きを進めます。"
-    invalid:               "無効な目標: {error}"
-    set:                   "⊙ 目標を設定しました ({budget} ターンの予算): {goal}\n目標が完了するか、一時停止/解除されるか、予算が尽きるまで作業を続けます。\nコントロール: /goal status · /goal pause · /goal resume · /goal clear"
-
-  help:
-    header:                "📖 **Hermes コマンド**\n"
-    skill_header:          "\n⚡ **スキルコマンド** ({count} 件アクティブ):"
-    more_use_commands:     "\n... 他に {count} 件。完全なページ分けリストは `/commands` で確認してください。"
-
-  insights:
-    invalid_days:          "--days の値が無効です: {value}"
-    error:                 "インサイトの生成中にエラーが発生しました: {error}"
-
-  kanban:
-    error_prefix:          "⚠ kanban エラー: {error}"
-    subscribed_suffix:     "(購読しました — {task_id} が完了またはブロックされたときに通知されます)"
-    truncated_suffix:      "… (切り詰めました; 完全な出力にはターミナルで `hermes kanban …` を使用してください)"
-    no_output:             "(出力なし)"
-    wake:
-      completed:           "completed"
-      gave_up:             "gave up (retries exhausted)"
-      crashed:             "crashed (worker exited); dispatcher will retry"
-      timed_out:           "timed out; dispatcher will retry"
-      blocked:             "blocked; needs attention"
-      status_default:      "status changed"
-      status_joiner:       ", "
-      message:             "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
-
-  personality:
-    none_configured:       "`{path}/config.yaml` に人格が設定されていません"
-    header:                "🎭 **利用可能な人格**\n"
-    none_option:           "• `none` — (人格オーバーレイなし)"
-    item:                  "• `{name}` — {preview}"
-    usage:                 "\n使い方: `/personality <name>`"
-    save_failed:           "⚠️ 人格変更の保存に失敗しました: {error}"
-    cleared:               "🎭 人格をクリアしました — 基本のエージェント動作を使用します。\n_(次のメッセージから有効)_"
-    set_to:                "🎭 人格を **{name}** に設定しました\n_(次のメッセージから有効)_"
-    unknown:               "不明な人格: `{name}`\n\n利用可能: {available}"
-
-  profile:
-    header:                "👤 **プロファイル:** `{profile}`"
-    home:                  "📂 **ホーム:** `{home}`"
-
-  reasoning:
-    level_default:             "medium (デフォルト)"
-    level_disabled:            "none (無効)"
-    scope_session:             "セッションのオーバーライド"
-    scope_global:              "グローバル設定"
-    status:                    "🧠 **推論設定**\n\n**強度:** `{level}`\n**スコープ:** {scope}\n**表示:** {display}\n\n_使い方:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|reset|show|hide> [--global]`"
-    display_on:                "オン ✓"
-    display_off:               "オフ"
-    display_set_on:            "🧠 ✓ 推論表示: **オン**\n**{platform}** 上で各応答の前にモデルの思考が表示されます。"
-    display_set_off:           "🧠 ✓ **{platform}** での推論表示: **オフ**"
-    reset_global_unsupported:  "⚠️ `/reasoning reset --global` はサポートされていません。グローバルのデフォルトを変更するには `/reasoning <level> --global` を使用してください。"
-    reset_done:                "🧠 ✓ セッションの推論オーバーライドをクリアしました。グローバル設定にフォールバックします。"
-    unknown_arg:               "⚠️ 不明な引数: `{arg}`\n\n**有効なレベル:** none, minimal, low, medium, high, xhigh, max\n**表示:** show, hide\n**永続化:** セッションを越えて保存するには `--global` を追加"
-    set_global:                "🧠 ✓ 推論強度を `{effort}` に設定しました (設定に保存)\n_(次のメッセージから有効)_"
-    set_global_save_failed:    "🧠 ✓ 推論強度を `{effort}` に設定しました (セッションのみ — 設定の保存に失敗)\n_(次のメッセージから有効)_"
-    set_session:               "🧠 ✓ 推論強度を `{effort}` に設定しました (セッションのみ — 永続化するには `--global` を追加)\n_(次のメッセージから有効)_"
-
-  reload_mcp:
-    cancelled:             "🟡 /reload-mcp をキャンセルしました。MCP ツールは変更されていません。"
-    always_followup:       "ℹ️ 今後の `/reload-mcp` は確認なしで実行されます。`config.yaml` で `approvals.mcp_reload_confirm: true` を設定すると再有効化できます。"
-    confirm_prompt:        "⚠️ **/reload-mcp の確認**\n\nMCP サーバーを再読み込みすると、このセッションのツールセットが再構築され、**プロバイダーのプロンプトキャッシュが無効化されます** — 次のメッセージで完全な入力トークンが再送信されます。長コンテキストや高推論モデルではコストが高くなる可能性があります。\n\n選択してください:\n• **一度だけ承認** — 今すぐ再読み込み\n• **常に承認** — 今すぐ再読み込みし、このプロンプトを永続的に非表示\n• **キャンセル** — MCP ツールを変更しない\n\n_テキスト代替: `/approve`、`/always`、または `/cancel` と返信してください。_"
-    header:                "🔄 **MCP サーバーを再読み込みしました**\n"
-    reconnected:           "♻️ 再接続: {names}"
-    added:                 "➕ 追加: {names}"
-    removed:               "➖ 削除: {names}"
-    none_connected:        "接続中の MCP サーバーはありません。"
-    tools_available:       "\n🔧 {servers} 台のサーバーから {tools} 個のツールが利用可能"
-    failed:                "❌ MCP の再読み込みに失敗しました: {error}"
-
-  reload_skills:
-    header:                "🔄 **スキルを再読み込みしました**\n"
-    no_new:                "新しいスキルは検出されませんでした。"
-    total:                 "\n📚 {count} 個のスキルが利用可能"
-    added_header:          "➕ **追加されたスキル:**"
-    removed_header:        "➖ **削除されたスキル:**"
-    item_with_desc:        "    - {name}: {desc}"
-    item_no_desc:          "    - {name}"
-    failed:                "❌ スキルの再読み込みに失敗しました: {error}"
-
-  reset:
-    preferences_preserved: "\n↪ Preserved explicit {preferences} preferences. Use `/model reset` and `/reasoning reset` to return to configured defaults."
-    model_preference_unavailable: "\n⚠ Preserved the explicit model preference, but it is currently unavailable because its credentials could not be resolved. Restore credentials or use `/model reset`."
-    header_default:        "✨ セッションをリセットしました。新たに開始します。"
-    header_new:            "✨ 新しいセッションを開始しました。"
-    header_titled:         "✨ 新しいセッションを開始しました: {title}"
-    title_rejected:        "\n⚠️ タイトルが拒否されました: {error}"
-    title_error_untitled:  "\n⚠️ {error} — タイトルなしでセッションを開始しました。"
-    title_empty_untitled:  "\n⚠️ クリーンアップ後にタイトルが空になりました — タイトルなしでセッションを開始しました。"
-    tip:                   "\n✦ ヒント: {tip}"
-
-  restart:
-    in_progress:           "⏳ ゲートウェイの再起動はすでに進行中です..."
-    restarting:            "♻ ゲートウェイを再起動しています。60 秒以内に通知が届かない場合は、コンソールで `hermes gateway restart` を実行してください。"
-
-  resume:
-    db_unavailable:        "セッションデータベースは利用できません。"
-    parse_error:           "⚠️ Could not parse `/resume` arguments: {error}.
-Use quotes around titles with spaces, for example: `/resume \"Project A Plan\"`."
-    matrix_no_named_sessions: "No named sessions found for this Matrix room.
-Use `/title My Session` to name the current room session, `/resume --all` to list all Matrix sessions, or `/resume --cross-room <session name>` to explicitly cross room boundaries."
-    matrix_blocked_no_origin: "⚠️ Matrix /resume blocked: this named session has no recorded room origin, so Hermes will not resume it inside the current room by default. Use `/resume --cross-room {name}` if you intentionally want to cross room boundaries."
-    matrix_blocked_other_room: "⚠️ Matrix /resume blocked: that session belongs to a different Matrix room ({room}). Use `/resume --cross-room {name}` if you intentionally want to resume it here."
-    matrix_cross_room_success: "⚠️ Cross-room resume: resumed **{title}** inside Matrix room **{room}**.
-Future messages in this room will use that transcript until `/reset` or another `/resume`.{msg_part}"
-    blocked_not_owner:     "⚠️ /resume blocked: '**{name}**' belongs to a different user or chat. You can only resume sessions from this chat."
-    no_named_sessions:     "名前付きセッションが見つかりません。\n`/title セッション名` で現在のセッションに名前を付けると、後で `/resume セッション名` で戻れます。"
-    list_header:           "📋 **名前付きセッション**\n"
-    list_item:             "• **{title}**{preview_part}"
-    list_item_numbered:    "{index}. **{title}**{preview_part}"
-    list_preview_suffix:   " — _{preview}_"
-    list_footer:           "\n使い方: `/resume <セッション名>`"
-    list_footer_numbered:  "\n使い方: `/resume <セッション名>` または `/resume <番号>`（例: 最新のセッションには `/resume 1`）"
-    list_failed:           "セッションを一覧表示できませんでした: {error}"
-    out_of_range:          "再開インデックス {index} は範囲外です。\n引数なしで `/resume` を実行すると、利用可能なセッションが表示されます。"
-    not_found:             "'**{name}**' に一致するセッションが見つかりません。\n引数なしで `/resume` を実行すると利用可能なセッションを表示します。"
-    already_on:            "📌 既にセッション **{name}** にいます。"
-    switch_failed:         "セッションの切り替えに失敗しました。"
-    resumed_one:           "↻ セッション **{title}** を再開しました ({count} メッセージ)。会話を復元しました。"
-    resumed_many:          "↻ セッション **{title}** を再開しました ({count} メッセージ)。会話を復元しました。"
-    resumed_no_count:      "↻ セッション **{title}** を再開しました。会話を復元しました。"
-
-  retry:
-    no_previous:           "再試行する前のメッセージがありません。"
-
-  rollback:
-    not_enabled:           "チェックポイントは有効になっていません。\nconfig.yaml で有効にしてください:\n```\ncheckpoints:\n  enabled: true\n```"
-    none_found:            "{cwd} のチェックポイントが見つかりません"
-    invalid_number:        "無効なチェックポイント番号です。1-{max} を使用してください。"
-    restored:              "✅ チェックポイント {hash} に復元しました: {reason}\nロールバック前のスナップショットが自動的に保存されました。"
-    restore_failed:        "❌ {error}"
-
-  set_home:
-    save_failed:           "ホームチャンネルを保存できませんでした: {error}"
-    success:               "✅ ホームチャンネルを **{name}** (ID: {chat_id}) に設定しました。\nCron ジョブとプラットフォーム間メッセージはここに配信されます。"
-
-  status:
-    header:                "📊 **Hermes ゲートウェイ状態**"
-    matrix_scope_header:   "**Matrix scope:**"
-    matrix_scope_room:     "  room: {room}"
-    matrix_scope_room_id:  "  room_id: {room_id}"
-    matrix_scope_thread:   "  thread_id: {thread_id}"
-    matrix_scope_mode:     "  session_scope: {scope}"
-    matrix_scope_key:      "  session_key: {session_key}"
-    session_id:            "**セッション ID:** `{session_id}`"
-    title:                 "**タイトル:** {title}"
-    created:               "**作成日時:** {timestamp}"
-    last_activity:         "**最終アクティビティ:** {timestamp}"
-    model:                 "**Model:** `{model}`"
-    model_provider:        "**Model:** `{model}` ({provider})"
-    context:               "**Context:** {used} / {total} ({pct}%)"
-    context_used:          "**Context:** ~{used} tokens"
-    tokens:                "**トークン:** {tokens}"
-    agent_running:         "**エージェント実行中:** {state}"
-    state_yes:             "はい ⚡"
-    state_no:              "いいえ"
-    queued:                "**キュー内の後続:** {count}"
-    platforms:             "**接続プラットフォーム:** {platforms}"
-
-  stop:
-    stopped_pending:       "⚡ 停止しました。エージェントはまだ開始していません — このセッションを続行できます。"
-    stopped:               "⚡ 停止中 — 現在のステップを完了して停止します。このセッションを続行できます。"
-    no_active:             "停止できるアクティブなタスクはありません。"
-
-  title:
-    db_unavailable:        "セッションデータベースは利用できません。"
-    warn_prefix:           "⚠️ {error}"
-    empty_after_clean:     "⚠️ クリーンアップ後にタイトルが空になりました。印字可能な文字を使用してください。"
-    set_to:                "✏️ セッションタイトルを設定しました: **{title}**"
-    not_found:             "データベースにセッションが見つかりません。"
-    current_with_title:    "📌 セッション: `{session_id}`\nタイトル: **{title}**"
-    current_no_title:      "📌 セッション: `{session_id}`\nタイトル未設定。使い方: `/title セッション名`"
-
-  topic:
-    not_telegram_dm:         "/topic コマンドは Telegram のプライベートチャットでのみ利用できます。"
-    no_session_db:           "セッションデータベースを利用できません。"
-    unauthorized:            "この bot で /topic を使用する権限がありません。"
-    restore_needs_topic:     "セッションを復元するには、まず Telegram topic を作成または開いてから、その topic 内で /topic <session-id> を送信してください。新しい topic を作成するには、All Messages を開いて任意のメッセージを送信してください。"
-    topics_disabled:         "この bot ではまだ Telegram topics が有効になっていません。\n\n有効にする方法:\n1. @BotFather を開きます。\n2. 自分の bot を選びます。\n3. Bot Settings → Threads Settings を開きます。\n4. Threaded Mode をオンにし、ユーザーが新しいスレッドを作成できるように設定します。\n\nそして /topic をもう一度送信してください。"
-    topics_user_disallowed:  "Telegram topics は有効ですが、ユーザーは topic を作成できません。\n\n@BotFather → 自分の bot → Bot Settings → Threads Settings を開き、'Disallow users to create new threads' をオフにしてください。\n\nそして /topic をもう一度送信してください。"
-    enable_failed:           "Telegram topic モードの有効化に失敗しました: {error}"
-    bound_status:            "この topic は次にリンクされています:\nセッション: {label}\nID: {session_id}\n\nこの topic を新しいセッションに置き換えるには /new を使用してください。\n並行作業には、All Messages を開いてメッセージを送信し、別の topic を作成してください。"
-    thread_ready:            "Telegram のマルチセッション topics が有効です。\n\nこの topic は独立した Hermes セッションとして使用されます。この topic の現在のセッションを置き換えるには /new を使用してください。並行作業には、All Messages を開いてメッセージを送信し、別の topic を作成してください。"
-    untitled_session:        "無題のセッション"
-
-  undo:
-    nothing:               "Nothing to undo."
-    busy:                  "⏳ The database was busy — nothing was changed. Try /undo again in a moment."
-    error:                 "⚠️ Couldn't complete /undo (internal error — nothing was changed). It's been logged."
-    removed:               "↩️ Undid {turns} half-turn(s) ({count} message(s))."
-    invalid_count:         "Invalid count \"{arg}\" — use /undo or /undo N."
-    draining:              "⏳ 直前のターンは停止されましたが、現在のステップをまだ完了中です — /undo はまだ実行できません。少し待ってから再試行してください。"
-    now_at:                "↦ Now at — {who}:\n“{preview}”"
-    now_at_notext:         "↦ Now at — {who} (no text)."
-    now_empty:             "↦ Now at — start of the thread (no messages left)."
-    party:
-      user:                "your message"
-      assistant:           "my reply"
-      tool:                "a tool result"
-      message:             "the last message"
-
-  redo:
-    nothing:               "Nothing to redo."
-    busy:                  "⏳ The database was busy — nothing was changed. Try /redo again in a moment."
-    error:                 "⚠️ Couldn't complete /redo (internal error — nothing was changed). It's been logged."
-    restart_lost:          "Nothing to redo — redo history does not survive a restart."
-    restored:              "↪️ Redid {ops} undo operation(s) ({count} message(s) restored)."
-    invalid_count:         "Invalid count \"{arg}\" — use /redo or /redo N."
-    draining:              "⏳ 直前のターンは停止されましたが、現在のステップをまだ完了中です — /redo はまだ実行できません。少し待ってから再試行してください。"
-
-  update:
-    platform_not_messaging:  "✗ /update はメッセージングプラットフォームでのみ利用可能です。ターミナルで `hermes update` を実行してください。"
-    not_git_repo:            "✗ Git リポジトリではありません — 更新できません。"
-    hermes_cmd_not_found:    "✗ `hermes` コマンドが見つかりません。Hermes は実行中ですが、更新コマンドは PATH 上にも現在の Python インタープリタ経由でも実行可能ファイルを見つけられませんでした。ターミナルで `hermes update` を手動で実行してみてください。"
-    start_failed:            "✗ 更新の開始に失敗しました: {error}"
-    starting:                "⚕ Hermes の更新を開始しています… 進捗をここにストリーミングします。"
-
-  usage:
-    rate_limits:              "⏱️ **レート制限:** {state}"
-    header_session:           "📊 **セッショントークン使用状況**"
-    label_model:              "モデル: `{model}`"
-    label_input_tokens:       "入力トークン: {count}"
-    label_cache_read:         "キャッシュ読み取りトークン: {count}"
-    label_cache_write:        "キャッシュ書き込みトークン: {count}"
-    label_output_tokens:      "出力トークン: {count}"
-    label_total:              "合計: {count}"
-    label_api_calls:          "API 呼び出し: {count}"
-    label_cost:               "コスト: {prefix}${amount}"
-    label_cost_included:      "コスト: 含まれています"
-    label_context:            "コンテキスト: {used} / {total} ({pct}%)"
-    comp_header:              "Last request composition (char/4 estimate):"
-    comp_fixed:               "• Fixed: ~{fixed} tok ({sys} system + {tools} tool schemas)"
-    comp_nonfixed:            "• Non-fixed: ~{nonfixed} tok ({hist} history + {results} tool results + {args} tool args)"
-    comp_total:               "• Estimated request total: ~{total} tok (sums exactly; fixed + non-fixed)"
-    label_compressions:       "圧縮回数: {count}"
-    breakdown_header: "🧩 **コンテキスト内訳** _(推定)_"
-    breakdown_line: "• {label}: 約{count} ({pct}%)"
-    breakdown_cat_system_prompt: "システムプロンプト"
-    breakdown_cat_tool_definitions: "ツール定義"
-    breakdown_cat_rules: "ルール"
-    breakdown_cat_skills: "スキル"
-    breakdown_cat_mcp: "MCP"
-    breakdown_cat_subagent_definitions: "サブエージェント定義"
-    breakdown_cat_memory: "メモリ"
-    breakdown_cat_conversation: "会話"
-    header_session_info:      "📊 **セッション情報**"
-    label_messages:           "メッセージ数: {count}"
-    label_estimated_context:  "推定コンテキスト: ~{count} トークン"
-    detailed_after_first:     "_(詳細な使用状況は最初のエージェント応答後に利用可能)_"
-    no_data:                  "このセッションの使用データはありません。"
-    unknown_subcommand:       "不明な /usage サブコマンド: `{args}`。`/usage` または `/usage reset [--force]` をお試しください。"
-    reset_wrong_provider:     "バンクされた使用制限リセットは openai-codex プロバイダーでのみ利用できます。まず `/model` で切り替えてください。"
-
+    aborted: ⚠️ 圧縮が中止されました ({error})。メッセージは削除されていません — 会話はそのままです。再試行するには /compress、新しいセッションを開始するには /reset を実行するか、auxiliary.compression モデル設定を確認してください。
+    aggressive_unsupported: --aggressive はサポートされていません。'/compress here [N]' で直近のやり取りだけを残すか、/undo でターンを削除してください。
+    aux_failed: ℹ️ 構成された圧縮モデル `{model}` が失敗しました ({error})。メインモデルで復旧しました — コンテキストは無傷です — config.yaml の `auxiliary.compression.model` を確認するとよいでしょう。
+    chat_size: 'Chat size: ~{before:,} → ~{after:,} tokens (excludes system, tools, tool results)'
+    chat_size_unchanged: 'Chat size: ~{before:,} tokens (unchanged; excludes system, tools, tool results)'
+    failed: '圧縮に失敗しました: {error}'
+    focus_line: 'フォーカス: "{topic}"'
+    full_request_est: 'Full request size: ~{before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; estimated — no live request yet)'
+    full_request_no_fixed: after excludes system prompt + tool schemas (no resident agent to measure them); next live turn will show the full size.
+    full_request_real: 'Full request size: {before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; before = last live request, after = estimate of next)'
+    full_request_unchanged: 'Full request size: {before} tokens (unchanged — next turn resends the same context)'
+    no_provider: プロバイダーが構成されていません — 圧縮できません。
+    not_enough: 圧縮するための会話が不十分です (少なくとも 4 件のメッセージが必要)。
+    nothing_to_do: まだ圧縮するものがありません (トランスクリプトはすべて保護されたコンテキストのままです)。
+    persist_failed: ⚠️ 圧縮は実行されましたが、結果を保存できませんでした — セッションデータベースがビジー（ロック）状態でした。失われたものはなく、トランスクリプトは変更されていません。少し待ってから /compress をもう一度実行して再試行してください。
+    summary_failed: ⚠️ 要約の生成に失敗しました ({error})。{count} 件の履歴メッセージが削除され、プレースホルダーに置き換えられました。以前のコンテキストは復元できません。auxiliary.compression モデルの設定を確認してください。
+  config_read_failed: '⚠️ config.yaml を読み込めませんでした: {error}'
+  config_save_failed: '⚠️ 設定を保存できませんでした: {error}'
   credits:
-    not_logged_in:            "Nous Portal にログインしていません。ログインすると残高の確認とチャージができます。"
+    not_logged_in: Nous Portal にログインしていません。ログインすると残高の確認とチャージができます。
+  debug:
+    auto_delete: ⏱ ペーストは 6 時間後に自動削除されます。
+    full_logs_hint: 完全なログのアップロードには、CLI から `hermes debug share` を使用してください。
+    header: '**デバッグレポートをアップロードしました:**'
+    share_hint: サポートを受けるには、このリンクを Hermes チームに共有してください。
+    upload_failed: '✗ デバッグレポートのアップロードに失敗しました: {error}'
+  deny:
+    denied_plural: ❌ コマンドを拒否しました ({count} 件)。
+    denied_reason_plural: '❌ コマンドを拒否しました ({count} 件)。 理由をエージェントに伝達しました: "{reason}"'
+    denied_reason_singular: '❌ コマンドを拒否しました。 理由をエージェントに伝達しました: "{reason}"'
+    denied_singular: ❌ コマンドを拒否しました。
+    no_pending: 拒否待ちのコマンドはありません。
+    stale: ❌ コマンドを拒否しました (承認は期限切れでした)。
+  draining: ⏳ 再起動前に {count} 個のアクティブエージェントの終了を待っています...
+  fast:
+    choice_fast: fast — Priority Processing オン
+    choice_normal: normal — 標準処理
+    family_anthropic_fast: Anthropic Fast
+    family_codex_fast: Codex Fast
+    family_openai_priority: OpenAI API Priority Processing
+    family_unsupported: Fast
+    label_fast: FAST
+    label_normal: NORMAL
+    model_switch_unavailable: '⚡ Fast: unavailable on `{route}`; requests will use normal speed.'
+    not_supported: ⚡ /fast は Priority Processing をサポートする OpenAI モデルでのみ利用できます。
+    picker_title: '⚡ **Priority Processing**\n\n現在のモード: `{mode}`\n\nオプションを選択:'
+    preference_off: '⚡ Configured session preference: Fast off — {reason} Route availability is checked before each turn.'
+    preference_status: '⚡ Configured session preference: Fast {state} — {family} on `{route}`. Route availability is checked before each turn.'
+    preference_unavailable: ⚡ Configured session preference `{route}` is currently unavailable because its credentials could not be resolved. The preference remains saved; restore credentials or use `/model reset`.
+    route_off: '⚡ Fast: off — {reason}'
+    route_saved: '⚡ ✓ {family}: **{label}** (saved to config)'
+    route_session_only: '⚡ ✓ {family}: **{label}** (config save failed; applied gateway-process-wide until restart)'
+    route_status: '⚡ Fast: {state} — {family} on `{route}`'
+    route_unavailable: ⚡ Fast unavailable — {reason}
+    saved: '⚡ ✓ Priority Processing: **{label}** (設定に保存しました)
 
-  verbose:
-    not_enabled:           "`/verbose` コマンドはメッセージングプラットフォームで有効になっていません。\n\n`config.yaml` で有効にしてください:\n```yaml\ndisplay:\n  tool_progress_command: true\n```"
-    mode_off:              "⚙️ ツール進捗: **OFF** — ツールの動作は表示されません。"
-    mode_new:              "⚙️ ツール進捗: **NEW** — ツールが変わったときに表示 (プレビュー長: `display.tool_preview_length`、デフォルト 40)。"
-    mode_all:              "⚙️ ツール進捗: **ALL** — すべてのツール呼び出しを表示 (プレビュー長: `display.tool_preview_length`、デフォルト 40)。"
-    mode_verbose:          "⚙️ ツール進捗: **VERBOSE** — すべてのツール呼び出しを完全な引数とともに表示。"
-    mode_log:              "⚙️ ツール進捗: **LOG** — チャットには表示せず、ツール呼び出しを ~/.hermes/logs/tool_calls.log に記録します。"
-    saved_suffix:          "_(**{platform}** に保存しました — 次のメッセージから有効)_"
-    save_failed:           "_(設定に保存できませんでした: {error})_"
+      _(次のメッセージから有効)_'
+    session_only: '⚡ ✓ Priority Processing: **{label}** (このセッションのみ)'
+    state_off: 'off'
+    state_on: 'on'
+    status: '⚡ Priority Processing
 
-  voice:
-    enabled_voice_only:    "音声モードを有効にしました。\n音声メッセージを送ると音声で返信します。\nすべてのメッセージへの音声返信は /voice tts を使ってください。"
-    disabled_text:         "音声モードを無効にしました。テキストのみで返信します。"
-    tts_enabled:           "自動 TTS を有効にしました。\nすべての返信に音声メッセージが含まれます。"
-    status_mode:           "音声モード: {label}"
-    status_channel:        "音声チャンネル: #{channel}"
-    status_participants:   "参加者: {count}"
-    status_member:         "  - {name}{status}"
-    speaking:              " (発話中)"
-    enabled_short:         "音声モードを有効にしました。"
-    disabled_short:        "音声モードを無効にしました。"
-    label_off:             "オフ (テキストのみ)"
-    label_voice_only:      "オン (音声メッセージにのみ音声で返信)"
-    label_all:             "TTS (すべてのメッセージに音声で返信)"
-    help:                  "{toggle}\n\n**/voice の使い方**\n• `/voice on` — 音声メッセージを送ると音声で返信\n• `/voice tts` — *すべての*メッセージに音声で返信\n• `/voice off` — テキストのみの返信に戻す\n• `/voice status` — 現在のモードを表示\n• `/voice`（引数なし）— オンとオフをすばやく切り替え{channels}"
-    help_channels:         "\n\n**ライブ音声チャンネル (Discord)**\n• 先に音声チャンネルに参加してから `/voice channel` — 参加して聞き取り、音声で返信します\n• `/voice leave` — 音声チャンネルから切断"
 
-  yolo:
-    disabled:                   "⚠️ このセッションの YOLO モードは **OFF** — 危険なコマンドには承認が必要です。"
-    enabled:                    "⚡ このセッションの YOLO モードは **ON** — すべてのコマンドが自動承認されます。注意して使用してください。"
+      現在のモード: `{mode}`
 
+
+      _使い方:_ `/fast <normal|fast|status>`'
+    status_fast: fast
+    status_normal: normal
+    unknown_arg: '⚠️ 不明な引数: `{arg}`
+
+
+      **有効なオプション:** normal、fast、status'
+  footer:
+    example_line: '
+
+      例: `{preview}`'
+    saved: '📎 ランタイムフッター: **{state}**{example}
+
+      _(グローバルに保存しました — 次のメッセージから有効)_'
+    state_off: 'OFF'
+    state_on: 'ON'
+    status: '📎 ランタイムフッター: **{state}**
+
+      フィールド: `{fields}`
+
+      プラットフォーム: `{platform}`'
+    usage: '使い方: `/footer [on|off|status]`'
+  goal:
+    invalid: '無効な目標: {error}'
+    no_goal_set: 目標が設定されていません。
+    no_resume: 再開する目標がありません。
+    paused: '⏸ 目標を一時停止しました: {goal}'
+    resumed: '▶ 目標を再開しました: {goal}
+
+      メッセージを送って続行するか、お待ちください — 次のターンで続きを進めます。'
+    set: '⊙ 目標を設定しました ({budget} ターンの予算): {goal}
+
+      目標が完了するか、一時停止/解除されるか、予算が尽きるまで作業を続けます。
+
+      コントロール: /goal status · /goal pause · /goal resume · /goal clear'
+    unavailable: このセッションでは目標機能を利用できません。
+  goal_cleared: ✓ 目標をクリアしました。
+  help:
+    header: '📖 **Hermes コマンド**
+
+      '
+    more_use_commands: '
+
+      ... 他に {count} 件。完全なページ分けリストは `/commands` で確認してください。'
+    skill_header: '
+
+      ⚡ **スキルコマンド** ({count} 件アクティブ):'
+  insights:
+    error: 'インサイトの生成中にエラーが発生しました: {error}'
+    invalid_days: '--days の値が無効です: {value}'
+  kanban:
+    error_prefix: '⚠ kanban エラー: {error}'
+    no_output: (出力なし)
+    subscribed_suffix: (購読しました — {task_id} が完了またはブロックされたときに通知されます)
+    truncated_suffix: … (切り詰めました; 完全な出力にはターミナルで `hermes kanban …` を使用してください)
+    wake:
+      blocked: blocked; needs attention
+      completed: completed
+      crashed: crashed (worker exited); dispatcher will retry
+      gave_up: gave up (retries exhausted)
+      message: '[kanban] Task {task_id} {status}.
+
+        Title: {title}
+
+        Assignee: @{assignee}
+
+        Board: {board}
+
+
+        Check the result or decide the next step.'
+      status_default: status changed
+      status_joiner: ', '
+      timed_out: timed out; dispatcher will retry
+  merge:
+    already_merged: This session was already merged into **{title}** — not folding it again. (Start a new exploration to merge fresh material.)
+    blocked_not_owner: You can only merge into sessions you own. '{name}' belongs to a different chat/owner.
+    fold_body: '[MERGED SESSION — {title}] A summary of another session (''{title}'') was folded into this conversation. Treat it as reference context:
+
+
+      {summary}'
+    fold_body_thread: '[BRANCHED THREAD MERGED — {title}] A branched thread was explored and folded back into this conversation. Summary of what happened in the branch:
+
+
+      {summary}'
+    fold_failed: 'Failed to fold the summary into the target session: {error}'
+    ledger_failed: Couldn't safely record the merge (session store busy) — nothing was folded. Try again in a moment.
+    list_footer: _`/merge <number>` folds a summary of THIS session into that one._
+    list_header: '🔀 **Sessions you can merge into** — reply `/merge <number>` or `/merge <name>`:'
+    md_suffix: ' · full record: `{path}`'
+    merged_named: ✅ Merged into **{title}** — a summary of this session is now in its context.{md}
+    merged_thread: ✅ **Folded back into _{title}_**{parent} — a summary of this thread is now in the parent's context, and this thread is archived (still resumable).{md}
+    merged_thread_no_archive: ✅ **Folded back into _{title}_**{parent} — a summary of this thread is now in the parent's context. (Couldn't archive the thread automatically; you can close it manually.){md}
+    no_conversation: Nothing to merge — this session has no conversation yet.
+    no_named_sessions: No titled sessions to merge into yet. Give a session a name with `/title` first.
+    no_new_turns: Nothing new to merge — no turns happened in this thread after the branch point.
+    no_summary: Couldn't generate a summary of this session; nothing was merged. Try again in a moment.
+    not_a_branch: This thread wasn't created by `/branch`, so there's no parent session to merge into.
+    not_a_thread: '`/merge` only works inside a branched thread. Start one with `/branch` in a channel first.'
+    not_found: No session found matching '{name}'. Use `/merge` with no name to list mergeable sessions.
+    note_record_suffix: ' · full record: `{path}`'
+    parent_note: '🔀 **Merged from thread ''{title}''**
+
+      {summary}'
+    same_session: That's the session you're already in — pick a different target to merge into.
+    source_marker: '[MERGED — this thread''s new exploration was folded into ''{target}'' on {when}. You can keep going here, but its summary already lives in that conversation.]'
+    source_marker_named: '[MERGED — a summary of this session was folded into ''{target}'' on {when}. You can keep going here, but its summary already lives in that conversation.]'
+    source_thread_link: ' ({thread})'
+    target_note: 🔀 **Folded in from _{source}_**{child} — a summary of {turns} message(s) is now in this conversation's context.{record}
+    target_note_named: 🔀 **Folded in from _{source}_** — a summary of _{source}_ ({turns} message(s)) is now in this conversation's context.{record}
+    target_parent_link: ' ({parent})'
+  model:
+    capabilities_label: '機能: {capabilities}'
+    context_label: 'コンテキスト: {tokens} トークン'
+    cost_label: 'コスト: {cost}'
+    current_label: '現在: `{model}` ({provider})'
+    current_tag: ' (現在)'
+    error_prefix: 'エラー: {error}'
+    max_output_label: '最大出力: {tokens} トークン'
+    more_models_suffix: ' (他 {count} 件)'
+    prompt_caching_enabled: 'プロンプトキャッシュ: 有効'
+    provider_label: 'プロバイダー: {provider}'
+    reasoning_label: '推論: {effort}'
+    saved_global: config.yaml に保存しました (`--global`)
+    session_only_hint: _(このセッションのみ — 永続化するには `--global` を追加)_
+    switched: モデルを `{model}` に切り替えました
+    usage_persist: '`/model <name> --global` — 永続化'
+    usage_switch_model: '`/model <name>` — モデルを切り替え'
+    usage_switch_provider: '`/model <name> --provider <slug>` — プロバイダーを切り替え'
+    warning_prefix: '警告: {warning}'
+  no_active_goal: アクティブな目標はありません。
+  personality:
+    cleared: '🎭 人格をクリアしました — 基本のエージェント動作を使用します。
+
+      _(次のメッセージから有効)_'
+    header: '🎭 **利用可能な人格**
+
+      '
+    item: • `{name}` — {preview}
+    none_configured: '`{path}/config.yaml` に人格が設定されていません'
+    none_option: • `none` — (人格オーバーレイなし)
+    save_failed: '⚠️ 人格変更の保存に失敗しました: {error}'
+    set_to: '🎭 人格を **{name}** に設定しました
+
+      _(次のメッセージから有効)_'
+    unknown: '不明な人格: `{name}`
+
+
+      利用可能: {available}'
+    usage: '
+
+      使い方: `/personality <name>`'
+  profile:
+    header: 👤 **プロファイル:** `{profile}`
+    home: 📂 **ホーム:** `{home}`
+  reasoning:
+    choice_hide: 返信の推論を非表示
+    choice_none: none — 推論を無効化
+    choice_reset: reset — セッション上書きをクリア
+    choice_show: 返信に推論を表示
+    display_off: オフ
+    display_on: オン ✓
+    display_set_off: '🧠 ✓ **{platform}** での推論表示: **オフ**'
+    display_set_on: '🧠 ✓ 推論表示: **オン**
+
+      **{platform}** 上で各応答の前にモデルの思考が表示されます。'
+    level_default: medium (デフォルト)
+    level_disabled: none (無効)
+    picker_title: '🧠 **推論設定**\n\n**強度:** `{level}`\n**スコープ:** {scope}\n**表示:** {display}\n\nオプションを選択:'
+    reset_done: 🧠 ✓ セッションの推論オーバーライドをクリアしました。グローバル設定にフォールバックします。
+    reset_global_unsupported: ⚠️ `/reasoning reset --global` はサポートされていません。グローバルのデフォルトを変更するには `/reasoning <level> --global` を使用してください。
+    scope_global: グローバル設定
+    scope_session: セッションのオーバーライド
+    set_global: '🧠 ✓ 推論強度を `{effort}` に設定しました (設定に保存)
+
+      _(次のメッセージから有効)_'
+    set_global_save_failed: '🧠 ✓ 推論強度を `{effort}` に設定しました (セッションのみ — 設定の保存に失敗)
+
+      _(次のメッセージから有効)_'
+    set_session: '🧠 ✓ 推論強度を `{effort}` に設定しました (セッションのみ — 永続化するには `--global` を追加)
+
+      _(次のメッセージから有効)_'
+    status: '🧠 **推論設定**
+
+
+      **強度:** `{level}`
+
+      **スコープ:** {scope}
+
+      **表示:** {display}
+
+
+      _使い方:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|reset|show|hide> [--global]`'
+    unknown_arg: '⚠️ 不明な引数: `{arg}`
+
+
+      **有効なレベル:** none, minimal, low, medium, high, xhigh, max
+
+      **表示:** show, hide
+
+      **永続化:** セッションを越えて保存するには `--global` を追加'
+  redo:
+    busy: ⏳ The database was busy — nothing was changed. Try /redo again in a moment.
+    draining: ⏳ 直前のターンは停止されましたが、現在のステップをまだ完了中です — /redo はまだ実行できません。少し待ってから再試行してください。
+    error: ⚠️ Couldn't complete /redo (internal error — nothing was changed). It's been logged.
+    invalid_count: Invalid count "{arg}" — use /redo or /redo N.
+    nothing: Nothing to redo.
+    restart_lost: Nothing to redo — redo history does not survive a restart.
+    restored: ↪️ Redid {ops} undo operation(s) ({count} message(s) restored).
+  reload_mcp:
+    added: '➕ 追加: {names}'
+    always_followup: 'ℹ️ 今後の `/reload-mcp` は確認なしで実行されます。`config.yaml` で `approvals.mcp_reload_confirm: true` を設定すると再有効化できます。'
+    cancelled: 🟡 /reload-mcp をキャンセルしました。MCP ツールは変更されていません。
+    confirm_prompt: '⚠️ **/reload-mcp の確認**
+
+
+      MCP サーバーを再読み込みすると、このセッションのツールセットが再構築され、**プロバイダーのプロンプトキャッシュが無効化されます** — 次のメッセージで完全な入力トークンが再送信されます。長コンテキストや高推論モデルではコストが高くなる可能性があります。
+
+
+      選択してください:
+
+      • **一度だけ承認** — 今すぐ再読み込み
+
+      • **常に承認** — 今すぐ再読み込みし、このプロンプトを永続的に非表示
+
+      • **キャンセル** — MCP ツールを変更しない
+
+
+      _テキスト代替: `/approve`、`/always`、または `/cancel` と返信してください。_'
+    failed: '❌ MCP の再読み込みに失敗しました: {error}'
+    header: '🔄 **MCP サーバーを再読み込みしました**
+
+      '
+    none_connected: 接続中の MCP サーバーはありません。
+    reconnected: '♻️ 再接続: {names}'
+    removed: '➖ 削除: {names}'
+    tools_available: '
+
+      🔧 {servers} 台のサーバーから {tools} 個のツールが利用可能'
+  reload_skills:
+    added_header: ➕ **追加されたスキル:**
+    failed: '❌ スキルの再読み込みに失敗しました: {error}'
+    header: '🔄 **スキルを再読み込みしました**
+
+      '
+    item_no_desc: '    - {name}'
+    item_with_desc: '    - {name}: {desc}'
+    no_new: 新しいスキルは検出されませんでした。
+    removed_header: ➖ **削除されたスキル:**
+    total: '
+
+      📚 {count} 個のスキルが利用可能'
+  reset:
+    header_default: ✨ セッションをリセットしました。新たに開始します。
+    header_new: ✨ 新しいセッションを開始しました。
+    header_titled: '✨ 新しいセッションを開始しました: {title}'
+    model_preference_unavailable: '
+
+      ⚠ Preserved the explicit model preference, but it is currently unavailable because its credentials could not be resolved. Restore credentials or use `/model reset`.'
+    preferences_preserved: '
+
+      ↪ Preserved explicit {preferences} preferences. Use `/model reset` and `/reasoning reset` to return to configured defaults.'
+    tip: '
+
+      ✦ ヒント: {tip}'
+    title_empty_untitled: '
+
+      ⚠️ クリーンアップ後にタイトルが空になりました — タイトルなしでセッションを開始しました。'
+    title_error_untitled: '
+
+      ⚠️ {error} — タイトルなしでセッションを開始しました。'
+    title_rejected: '
+
+      ⚠️ タイトルが拒否されました: {error}'
+  restart:
+    in_progress: ⏳ ゲートウェイの再起動はすでに進行中です...
+    restarting: ♻ ゲートウェイを再起動しています。60 秒以内に通知が届かない場合は、コンソールで `hermes gateway restart` を実行してください。
+  resume:
+    already_on: 📌 既にセッション **{name}** にいます。
+    blocked_not_owner: '⚠️ /resume blocked: ''**{name}**'' belongs to a different user or chat. You can only resume sessions from this chat.'
+    db_unavailable: セッションデータベースは利用できません。
+    list_failed: 'セッションを一覧表示できませんでした: {error}'
+    list_footer: '
+
+      使い方: `/resume <セッション名>`'
+    list_footer_numbered: '
+
+      使い方: `/resume <セッション名>` または `/resume <番号>`（例: 最新のセッションには `/resume 1`）'
+    list_header: '📋 **名前付きセッション**
+
+      '
+    list_item: • **{title}**{preview_part}
+    list_item_numbered: '{index}. **{title}**{preview_part}'
+    list_preview_suffix: ' — _{preview}_'
+    matrix_blocked_no_origin: '⚠️ Matrix /resume blocked: this named session has no recorded room origin, so Hermes will not resume it inside the current room by default. Use `/resume --cross-room {name}` if you intentionally want to cross room boundaries.'
+    matrix_blocked_other_room: '⚠️ Matrix /resume blocked: that session belongs to a different Matrix room ({room}). Use `/resume --cross-room {name}` if you intentionally want to resume it here.'
+    matrix_cross_room_success: '⚠️ Cross-room resume: resumed **{title}** inside Matrix room **{room}**. Future messages in this room will use that transcript until `/reset` or another `/resume`.{msg_part}'
+    matrix_no_named_sessions: No named sessions found for this Matrix room. Use `/title My Session` to name the current room session, `/resume --all` to list all Matrix sessions, or `/resume --cross-room <session name>` to explicitly cross room boundaries.
+    no_named_sessions: '名前付きセッションが見つかりません。
+
+      `/title セッション名` で現在のセッションに名前を付けると、後で `/resume セッション名` で戻れます。'
+    not_found: '''**{name}**'' に一致するセッションが見つかりません。
+
+      引数なしで `/resume` を実行すると利用可能なセッションを表示します。'
+    out_of_range: '再開インデックス {index} は範囲外です。
+
+      引数なしで `/resume` を実行すると、利用可能なセッションが表示されます。'
+    parse_error: '⚠️ Could not parse `/resume` arguments: {error}. Use quotes around titles with spaces, for example: `/resume "Project A Plan"`.'
+    resumed_many: ↻ セッション **{title}** を再開しました ({count} メッセージ)。会話を復元しました。
+    resumed_no_count: ↻ セッション **{title}** を再開しました。会話を復元しました。
+    resumed_one: ↻ セッション **{title}** を再開しました ({count} メッセージ)。会話を復元しました。
+    switch_failed: セッションの切り替えに失敗しました。
+  retry:
+    no_previous: 再試行する前のメッセージがありません。
+  rollback:
+    invalid_number: 無効なチェックポイント番号です。1-{max} を使用してください。
+    none_found: '{cwd} のチェックポイントが見つかりません'
+    not_enabled: "チェックポイントは有効になっていません。\nconfig.yaml で有効にしてください:\n```\ncheckpoints:\n  enabled: true\n```"
+    restore_failed: ❌ {error}
+    restored: '✅ チェックポイント {hash} に復元しました: {reason}
+
+      ロールバック前のスナップショットが自動的に保存されました。'
+  set_home:
+    save_failed: 'ホームチャンネルを保存できませんでした: {error}'
+    success: '✅ ホームチャンネルを **{name}** (ID: {chat_id}) に設定しました。
+
+      Cron ジョブとプラットフォーム間メッセージはここに配信されます。'
   shared:
-    session_db_unavailable:      "セッションデータベースが利用できません。"
-    session_db_unavailable_prefix: "セッションデータベースが利用できません"
-    session_not_found:           "データベースにセッションが見つかりません。"
-    warn_passthrough:            "⚠️ {error}"
+    session_db_unavailable: セッションデータベースが利用できません。
+    session_db_unavailable_prefix: セッションデータベースが利用できません
+    session_not_found: データベースにセッションが見つかりません。
+    warn_passthrough: ⚠️ {error}
+  status:
+    agent_running: '**エージェント実行中:** {state}'
+    context: '**Context:** {used} / {total} ({pct}%)'
+    context_used: '**Context:** ~{used} tokens'
+    created: '**作成日時:** {timestamp}'
+    header: 📊 **Hermes ゲートウェイ状態**
+    last_activity: '**最終アクティビティ:** {timestamp}'
+    matrix_scope_header: '**Matrix scope:**'
+    matrix_scope_key: '  session_key: {session_key}'
+    matrix_scope_mode: '  session_scope: {scope}'
+    matrix_scope_room: '  room: {room}'
+    matrix_scope_room_id: '  room_id: {room_id}'
+    matrix_scope_thread: '  thread_id: {thread_id}'
+    model: '**Model:** `{model}`'
+    model_provider: '**Model:** `{model}` ({provider})'
+    platforms: '**接続プラットフォーム:** {platforms}'
+    queued: '**キュー内の後続:** {count}'
+    session_id: '**セッション ID:** `{session_id}`'
+    state_no: いいえ
+    state_yes: はい ⚡
+    title: '**タイトル:** {title}'
+    tokens: '**トークン:** {tokens}'
+  stop:
+    no_active: 停止できるアクティブなタスクはありません。
+    stopped: ⚡ 停止しました。このセッションを続行できます。
+    stopped_pending: ⚡ 停止しました。エージェントはまだ開始していません — このセッションを続行できます。
+  title:
+    current_no_title: '📌 セッション: `{session_id}`
+
+      タイトル未設定。使い方: `/title セッション名`'
+    current_with_title: '📌 セッション: `{session_id}`
+
+      タイトル: **{title}**'
+    db_unavailable: セッションデータベースは利用できません。
+    empty_after_clean: ⚠️ クリーンアップ後にタイトルが空になりました。印字可能な文字を使用してください。
+    not_found: データベースにセッションが見つかりません。
+    set_to: '✏️ セッションタイトルを設定しました: **{title}**'
+    warn_prefix: ⚠️ {error}
+  topic:
+    bound_status: 'この topic は次にリンクされています:
+
+      セッション: {label}
+
+      ID: {session_id}
+
+
+      この topic を新しいセッションに置き換えるには /new を使用してください。
+
+      並行作業には、All Messages を開いてメッセージを送信し、別の topic を作成してください。'
+    enable_failed: 'Telegram topic モードの有効化に失敗しました: {error}'
+    no_session_db: セッションデータベースを利用できません。
+    not_telegram_dm: /topic コマンドは Telegram のプライベートチャットでのみ利用できます。
+    restore_needs_topic: セッションを復元するには、まず Telegram topic を作成または開いてから、その topic 内で /topic <session-id> を送信してください。新しい topic を作成するには、All Messages を開いて任意のメッセージを送信してください。
+    thread_ready: 'Telegram のマルチセッション topics が有効です。
+
+
+      この topic は独立した Hermes セッションとして使用されます。この topic の現在のセッションを置き換えるには /new を使用してください。並行作業には、All Messages を開いてメッセージを送信し、別の topic を作成してください。'
+    topics_disabled: 'この bot ではまだ Telegram topics が有効になっていません。
+
+
+      有効にする方法:
+
+      1. @BotFather を開きます。
+
+      2. 自分の bot を選びます。
+
+      3. Bot Settings → Threads Settings を開きます。
+
+      4. Threaded Mode をオンにし、ユーザーが新しいスレッドを作成できるように設定します。
+
+
+      そして /topic をもう一度送信してください。'
+    topics_user_disallowed: 'Telegram topics は有効ですが、ユーザーは topic を作成できません。
+
+
+      @BotFather → 自分の bot → Bot Settings → Threads Settings を開き、''Disallow users to create new threads'' をオフにしてください。
+
+
+      そして /topic をもう一度送信してください。'
+    unauthorized: この bot で /topic を使用する権限がありません。
+    untitled_session: 無題のセッション
+  undo:
+    busy: ⏳ The database was busy — nothing was changed. Try /undo again in a moment.
+    draining: ⏳ 直前のターンは停止されましたが、現在のステップをまだ完了中です — /undo はまだ実行できません。少し待ってから再試行してください。
+    error: ⚠️ Couldn't complete /undo (internal error — nothing was changed). It's been logged.
+    invalid_count: 無効な数値「{arg}」— /undo または /undo N を使用してください。
+    nothing: 元に戻せる操作がありません。
+    now_at: '↦ Now at — {who}:
+
+      “{preview}”'
+    now_at_notext: ↦ Now at — {who} (no text).
+    now_empty: ↦ Now at — start of the thread (no messages left).
+    party:
+      assistant: my reply
+      message: the last message
+      tool: a tool result
+      user: your message
+    removed: "↩️ Undid {turns} half-turn(s) ({count} message(s))."
+  update:
+    hermes_cmd_not_found: ✗ `hermes` コマンドが見つかりません。Hermes は実行中ですが、更新コマンドは PATH 上にも現在の Python インタープリタ経由でも実行可能ファイルを見つけられませんでした。ターミナルで `hermes update` を手動で実行してみてください。
+    not_git_repo: ✗ Git リポジトリではありません — 更新できません。
+    platform_not_messaging: ✗ /update はメッセージングプラットフォームでのみ利用可能です。ターミナルで `hermes update` を実行してください。
+    start_failed: '✗ 更新の開始に失敗しました: {error}'
+    starting: ⚕ Hermes の更新を開始しています… 進捗をここにストリーミングします。
+  usage:
+    breakdown_cat_conversation: 会話
+    breakdown_cat_mcp: MCP
+    breakdown_cat_memory: メモリ
+    breakdown_cat_rules: ルール
+    breakdown_cat_skills: スキル
+    breakdown_cat_subagent_definitions: サブエージェント定義
+    breakdown_cat_system_prompt: システムプロンプト
+    breakdown_cat_tool_definitions: ツール定義
+    breakdown_header: 🧩 **コンテキスト内訳** _(推定)_
+    breakdown_line: '• {label}: 約{count} ({pct}%)'
+    comp_fixed: '• Fixed: ~{fixed} tok ({sys} system + {tools} tool schemas)'
+    comp_header: 'Last request composition (char/4 estimate):'
+    comp_nonfixed: '• Non-fixed: ~{nonfixed} tok ({hist} history + {results} tool results + {args} tool args)'
+    comp_total: '• Estimated request total: ~{total} tok (sums exactly; fixed + non-fixed)'
+    detailed_after_first: _(詳細な使用状況は最初のエージェント応答後に利用可能)_
+    header_session: 📊 **セッショントークン使用状況**
+    header_session_info: 📊 **セッション情報**
+    label_api_calls: 'API 呼び出し: {count}'
+    label_cache_read: 'キャッシュ読み取りトークン: {count}'
+    label_cache_write: 'キャッシュ書き込みトークン: {count}'
+    label_compressions: '圧縮回数: {count}'
+    label_context: 'コンテキスト: {used} / {total} ({pct}%)'
+    label_cost: 'コスト: {prefix}${amount}'
+    label_cost_included: 'コスト: 含まれています'
+    label_estimated_context: '推定コンテキスト: ~{count} トークン'
+    label_input_tokens: '入力トークン: {count}'
+    label_messages: 'メッセージ数: {count}'
+    label_model: 'モデル: `{model}`'
+    label_output_tokens: '出力トークン: {count}'
+    label_total: '合計: {count}'
+    no_data: このセッションの使用データはありません。
+    rate_limits: ⏱️ **レート制限:** {state}
+    reset_wrong_provider: バンクされた使用制限リセットは openai-codex プロバイダーでのみ利用できます。まず `/model` で切り替えてください。
+    unknown_subcommand: '不明な /usage サブコマンド: `{args}`。`/usage` または `/usage reset [--force]` をお試しください。'
+  verbose:
+    mode_all: '⚙️ ツール進捗: **ALL** — すべてのツール呼び出しを表示 (プレビュー長: `display.tool_preview_length`、デフォルト 40)。'
+    mode_log: '⚙️ ツール進捗: **LOG** — チャットには表示せず、ツール呼び出しを ~/.hermes/logs/tool_calls.log に記録します。'
+    mode_new: '⚙️ ツール進捗: **NEW** — ツールが変わったときに表示 (プレビュー長: `display.tool_preview_length`、デフォルト 40)。'
+    mode_off: '⚙️ ツール進捗: **OFF** — ツールの動作は表示されません。'
+    mode_verbose: '⚙️ ツール進捗: **VERBOSE** — すべてのツール呼び出しを完全な引数とともに表示。'
+    not_enabled: "`/verbose` コマンドはメッセージングプラットフォームで有効になっていません。\n\n`config.yaml` で有効にしてください:\n```yaml\ndisplay:\n  tool_progress_command: true\n```"
+    save_failed: '_(設定に保存できませんでした: {error})_'
+    saved_suffix: _(**{platform}** に保存しました — 次のメッセージから有効)_
+  voice:
+    disabled_short: 音声モードを無効にしました。
+    disabled_text: 音声モードを無効にしました。テキストのみで返信します。
+    enabled_short: 音声モードを有効にしました。
+    enabled_voice_only: '音声モードを有効にしました。
+
+      音声メッセージを送ると音声で返信します。
+
+      すべてのメッセージへの音声返信は /voice tts を使ってください。'
+    help: '{toggle}
+
+
+      **/voice の使い方**
+
+      • `/voice on` — 音声メッセージを送ると音声で返信
+
+      • `/voice tts` — *すべての*メッセージに音声で返信
+
+      • `/voice off` — テキストのみの返信に戻す
+
+      • `/voice status` — 現在のモードを表示
+
+      • `/voice`（引数なし）— オンとオフをすばやく切り替え{channels}'
+    help_channels: '
+
+
+      **ライブ音声チャンネル (Discord)**
+
+      • 先に音声チャンネルに参加してから `/voice channel` — 参加して聞き取り、音声で返信します
+
+      • `/voice leave` — 音声チャンネルから切断'
+    label_all: TTS (すべてのメッセージに音声で返信)
+    label_off: オフ (テキストのみ)
+    label_voice_only: オン (音声メッセージにのみ音声で返信)
+    speaking: ' (発話中)'
+    status_channel: '音声チャンネル: #{channel}'
+    status_member: '  - {name}{status}'
+    status_mode: '音声モード: {label}'
+    status_participants: '参加者: {count}'
+    tts_enabled: '自動 TTS を有効にしました。
+
+      すべての返信に音声メッセージが含まれます。'
+  yolo:
+    disabled: ⚠️ このセッションの YOLO モードは **OFF** — 危険なコマンドには承認が必要です。
+    enabled: ⚡ このセッションの YOLO モードは **ON** — すべてのコマンドが自動承認されます。注意して使用してください。

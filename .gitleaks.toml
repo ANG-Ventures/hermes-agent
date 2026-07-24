@@ -64,6 +64,14 @@ paths = [
   '''optional-skills/productivity/shop/references/.*\.md''',
   # --- optional-skills Unsloth training docs: code-example API-key placeholders in llms.txt refs ---
   '''optional-skills/mlops/training/unsloth/references/.*\.md''',
+  # --- 2026-07-23 upstream parity sync: new fake fixtures / vendored FP (path-scoped, see docs/sync/review/FORKDELTA-REVIEW.md) ---
+  '''tests/test_honcho_client_config\.py''',          # Honcho memory-client config stubs (test-api-key-12345 / env-api-key-67890)
+  '''tests/hermes_cli/test_xiaomi_provider\.py''',    # Xiaomi provider-gate fake sk- keys
+  '''tests/gateway/test_discord_plugin_setup\.py''',  # DISCORD_HOME_CHANNEL snowflake fixture — discord-client-id FP
+  '''tests/gateway/test_api_server_bind_guard\.py''', # bind-guard fake sk-test key
+  '''tests/hermes_cli/test_auth_provider_gate\.py''', # OpenRouter auth-gate fake sk-or- key
+  '''tests/run_agent/test_moa_privacy_filter\.py''',  # fabricated JWT for privacy-filter redaction test
+  '''native/fts5_cjk/vendor/sqlite3ext\.h''',         # VENDORED SQLite header — fn-ptr names, not credentials
 ]
 # Regex allowlist — SOURCE files keep full scanning EXCEPT public OAuth *client
 # IDs* (client IDs are sent in browser auth flows — public by design, not

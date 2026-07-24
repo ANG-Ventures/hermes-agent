@@ -5,9 +5,11 @@ import { $connection } from '@/store/session'
 import {
   filePathFromMediaPath,
   gatewayMediaDataUrl,
+  isInlineMediaSrc,
   isRemoteGateway,
   mediaExternalUrl,
-  pathFromRemoteGatewayFileUrl
+  pathFromRemoteGatewayFileUrl,
+  resolveMediaDisplaySrc
 } from './media'
 
 describe('isRemoteGateway', () => {
@@ -79,6 +81,68 @@ describe('mediaExternalUrl', () => {
     expect(url).toBe('hermes-gateway-file://open?path=%2Ftmp%2Fa.png&profile=mbp')
     expect(url).not.toMatch(/^file:/)
     expect(pathFromRemoteGatewayFileUrl(url)).toEqual({ path: '/tmp/a.png', profile: 'mbp' })
+  })
+})
+
+describe('resolveMediaDisplaySrc', () => {
+  const api = vi.fn(async ({ path }: { path: string }) => {
+    if (path.startsWith('/api/fs/read-data-url?')) {
+      return { dataUrl: 'data:image/png;base64,ZHVtbXk=' }
+    }
+
+    throw new Error(`unexpected path ${path}`)
+  })
+
+  beforeEach(() => {
+    api.mockClear()
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    $connection.set(null)
+  })
+
+  it('recognizes inline image URLs', () => {
+    expect(isInlineMediaSrc('https://example.com/a.png')).toBe(true)
+    expect(isInlineMediaSrc('data:image/png;base64,ZHVtbXk=')).toBe(true)
+    expect(isInlineMediaSrc('/Users/me/a.png')).toBe(false)
+  })
+
+  it('leaves web, data, and relative markdown image sources unchanged', async () => {
+    vi.stubGlobal('window', { hermesDesktop: { api } })
+    $connection.set({ mode: 'remote', profile: 'remote-work' } as never)
+
+    await expect(resolveMediaDisplaySrc('https://example.com/a.png')).resolves.toBe('https://example.com/a.png')
+    await expect(resolveMediaDisplaySrc('data:image/png;base64,ZHVtbXk=')).resolves.toBe(
+      'data:image/png;base64,ZHVtbXk='
+    )
+    await expect(resolveMediaDisplaySrc('images/a.png')).resolves.toBe('images/a.png')
+    await expect(resolveMediaDisplaySrc('./images/a.png')).resolves.toBe('./images/a.png')
+    await expect(resolveMediaDisplaySrc('../images/a.png')).resolves.toBe('../images/a.png')
+    expect(api).not.toHaveBeenCalled()
+  })
+
+  it('reads remote gateway-local file paths through the desktop fs bridge', async () => {
+    vi.stubGlobal('window', { hermesDesktop: { api } })
+    $connection.set({ mode: 'remote', profile: 'remote-work' } as never)
+
+    await expect(resolveMediaDisplaySrc('/Users/me/project/a b.png')).resolves.toBe('data:image/png;base64,ZHVtbXk=')
+    expect(api).toHaveBeenCalledWith({
+      path: '/api/fs/read-data-url?path=%2FUsers%2Fme%2Fproject%2Fa%20b.png',
+      profile: 'remote-work'
+    })
+  })
+
+  it('reads local desktop file paths from the local desktop shell', async () => {
+    const readFileDataUrl = vi.fn(async () => 'data:image/png;base64,bG9jYWw=')
+
+    vi.stubGlobal('window', { hermesDesktop: { readFileDataUrl } })
+    $connection.set({ mode: 'local' } as never)
+
+    await expect(resolveMediaDisplaySrc('file:///Users/me/project/a%20b.png')).resolves.toBe(
+      'data:image/png;base64,bG9jYWw='
+    )
+    expect(readFileDataUrl).toHaveBeenCalledWith('/Users/me/project/a b.png')
   })
 })
 

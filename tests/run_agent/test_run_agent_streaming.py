@@ -303,12 +303,22 @@ class TestAnthropicInterruptHandler:
             "interruptible_api_call must handle Anthropic interrupt (api_mode check)"
 
     def test_interruptible_rebuilds_anthropic_client(self):
-        """After interrupting, the Anthropic client should be rebuilt."""
+        """After interrupting, the Anthropic client should be rebuilt.
+
+        #67142: the interrupt path no longer inlines ``build_anthropic_client``
+        — it builds a per-request Anthropic client via
+        ``_create_request_anthropic_client`` (FD-ownership safety), which
+        mirrors ``_rebuild_anthropic_client`` construction (calls
+        ``build_anthropic_client`` internally). Accept either the direct
+        rebuild or the per-request helper.
+        """
         import inspect
         from agent.chat_completion_helpers import interruptible_api_call
         source = inspect.getsource(interruptible_api_call)
-        assert "build_anthropic_client" in source, \
-            "interruptible_api_call must rebuild Anthropic client after interrupt"
+        assert (
+            "build_anthropic_client" in source
+            or "_create_request_anthropic_client" in source
+        ), "interruptible_api_call must rebuild Anthropic client after interrupt"
 
     def test_streaming_has_anthropic_branch(self):
         """_streaming_api_call must also handle Anthropic interrupt."""

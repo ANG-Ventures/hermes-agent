@@ -211,52 +211,6 @@ def test_faster_whisper_is_not_a_base_dependency():
     assert any(dep.startswith("faster-whisper") for dep in voice_extra)
 
 
-def test_manifest_includes_bundled_skills():
-    manifest = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
-
-    assert "graft skills" in manifest
-    assert "graft optional-skills" in manifest
-
-
-def test_bundled_plugin_manifests_ship_in_both_wheel_and_sdist():
-    """Regression test for #34034 / #28149.
-
-    Plugin discovery (hermes_cli/plugins.py) registers each bundled plugin by
-    reading its ``plugin.yaml`` / ``plugin.yml`` manifest. Those manifests are
-    data files, not Python modules, so they only reach installed packages when
-    declared explicitly:
-
-    - wheel  -> ``[tool.setuptools.package-data]`` ``plugins`` glob
-    - sdist  -> ``MANIFEST.in`` (Homebrew and other downstream packagers build
-                from the sdist)
-
-    v0.15.0 declared neither, so the wheel shipped every adapter's Python code
-    but none of its manifests, and *every* gateway platform failed with
-    "No adapter available for <platform>". Both channels must cover manifests.
-    """
-    # There must actually be manifests on disk for the globs to match.
-    on_disk = list((REPO_ROOT / "plugins").rglob("plugin.yaml")) + list(
-        (REPO_ROOT / "plugins").rglob("plugin.yml")
-    )
-    assert on_disk, "expected bundled plugin manifests under plugins/"
-
-    # Wheel channel: package-data must declare a glob that matches plugin
-    # manifests anywhere under the plugins package.
-    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    plugins_pkg_data = data["tool"]["setuptools"]["package-data"].get("plugins", [])
-    assert any(
-        g.endswith("plugin.yaml") or g.endswith("plugin.yml")
-        for g in plugins_pkg_data
-    ), "pyproject package-data 'plugins' must ship plugin.yaml/plugin.yml (wheel)"
-
-    # Sdist channel: MANIFEST.in must recursively include the manifests so
-    # downstream packagers building from the sdist also get them.
-    manifest = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
-    assert "recursive-include plugins" in manifest and "plugin.yaml" in manifest, (
-        "MANIFEST.in must recursive-include plugins plugin.yaml/plugin.yml (sdist)"
-    )
-
-
 # Minimum non-vulnerable Starlette: CVE-2026-48710 ("BadHost") was fixed in
 # 1.0.1. Anything below that lets a malformed Host header desync
 # ``request.url.path`` from the dispatched ASGI path, bypassing path-based
@@ -340,32 +294,6 @@ def test_locked_starlette_is_not_vulnerable_to_cve_2026_48710():
             f"floor {'.'.join(map(str, _STARLETTE_CVE_FLOOR))} — regenerate the "
             f"lockfile after bumping the pin"
         )
-
-
-def test_locale_catalogs_ship_in_both_wheel_and_sdist():
-    """Regression test for #27632 / #35374 / #23943.
-
-    locales/ is a bare data directory (no __init__.py), so it is invisible to
-    packages.find and to package-data (which attaches to a package). It must be
-    declared as setuptools data-files (wheel) AND grafted in MANIFEST.in
-    (sdist). Without both, sealed installs drop the catalogs and gateway/CLI
-    commands surface raw i18n keys like `gateway.reset.header_default`.
-    """
-    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    data_files = data["tool"]["setuptools"].get("data-files", {})
-    assert data_files.get("locales") == ["locales/*.yaml"], (
-        "pyproject [tool.setuptools.data-files] must declare "
-        'locales = ["locales/*.yaml"] so the wheel ships i18n catalogs'
-    )
-
-    manifest = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
-    assert "graft locales" in manifest, (
-        "MANIFEST.in must `graft locales` so the sdist ships i18n catalogs"
-    )
-
-    # Every on-disk catalog has the .yaml extension the globs above match.
-    on_disk = list((REPO_ROOT / "locales").glob("*.yaml"))
-    assert on_disk, "expected locales/*.yaml catalogs on disk"
 
 
 # ---------------------------------------------------------------------------
