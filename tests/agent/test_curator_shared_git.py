@@ -108,6 +108,46 @@ class TestPrecheckAndSnapshot:
         assert not ok and reason == "dirty working tree"
         assert any("clanker-e2e" in p for p in dirty)
 
+    def test_precheck_scoped_out_of_scope_dirt_passes(self, git_env):
+        """Dirt on a sibling skill must NOT block a pass scoped elsewhere."""
+        cs = git_env["cs"]
+        (git_env["big"] / "SKILL.md").write_text("sibling dirt", encoding="utf-8")
+        ok, reason, ignored = cs.git_precheck_shared(
+            git_env["shared"], scope_paths=[git_env["small"]]
+        )
+        assert ok
+        assert reason == "clean (out-of-scope dirt ignored)"
+        # the ignored dirt is REPORTED so callers can thread it into
+        # commit_shared(precheck_dirty=...)
+        assert any("clanker-e2e" in p for p in ignored)
+
+    def test_precheck_scoped_in_scope_dirt_still_blocks(self, git_env):
+        cs = git_env["cs"]
+        (git_env["big"] / "SKILL.md").write_text("in-scope dirt", encoding="utf-8")
+        ok, reason, dirty = cs.git_precheck_shared(
+            git_env["shared"], scope_paths=[git_env["big"]]
+        )
+        assert not ok and reason == "dirty working tree"
+        assert any("clanker-e2e" in p for p in dirty)
+
+    def test_precheck_scope_outside_repo_falls_back_conservative(self, git_env, tmp_path):
+        """A scope path outside the repo -> whole-tree gate (fail on any dirt)."""
+        cs = git_env["cs"]
+        (git_env["big"] / "SKILL.md").write_text("dirt", encoding="utf-8")
+        outside = tmp_path / "not-in-repo"
+        outside.mkdir(exist_ok=True)
+        ok, reason, dirty = cs.git_precheck_shared(
+            git_env["shared"], scope_paths=[outside]
+        )
+        assert not ok and reason == "dirty working tree"
+
+    def test_precheck_scoped_clean_tree_is_plain_clean(self, git_env):
+        cs = git_env["cs"]
+        ok, reason, dirty = cs.git_precheck_shared(
+            git_env["shared"], scope_paths=[git_env["small"]]
+        )
+        assert ok and reason == "clean" and dirty == []
+
     def test_snapshot_writes_separate_tar_and_manifest(self, git_env):
         cs = git_env["cs"]
         snap = cs.snapshot_shared(
@@ -218,16 +258,31 @@ class TestSharedPassE2E:
         assert r.returncode == 0, r.stderr
         assert (git_env["big"] / "SKILL.md").stat().st_size > 100 * 1024
 
-    def test_dirty_tree_skips_with_zero_edits(self, git_env, monkeypatch):
-        # make the tree dirty with a SIBLING edit (not in any manifest)
+    def test_out_of_scope_sibling_dirt_no_longer_skips(self, git_env, monkeypatch):
+        """Scoped precheck (2026-07-25): dirt OUTSIDE the candidate skill dirs
+        must not block the pass — and must survive uncommitted/untouched."""
         marker = git_env["shared"] / "devops" / "sibling-file.md"
         marker.write_text("sibling", encoding="utf-8")
+        report = self._run_pass(monkeypatch)
+        # pass ran (not skipped on precheck)
+        assert not (report.get("skipped") or "").startswith("precheck failed")
+        assert any("clanker-e2e" in s for s in report["split"])
+        # sibling dirt untouched and not absorbed into the curator commit
+        assert marker.read_text(encoding="utf-8") == "sibling"
+        files = _git(git_env["home"], "show", "--name-only", "--pretty=",
+                     "HEAD").stdout
+        assert "sibling-file" not in files
+
+    def test_in_scope_dirty_candidate_skips_with_zero_edits(self, git_env, monkeypatch):
+        """Dirt INSIDE a candidate skill dir still hard-blocks the pass."""
+        marker = git_env["big"] / "wip-notes.md"
+        marker.write_text("in-scope dirt", encoding="utf-8")
         before = (git_env["big"] / "SKILL.md").read_bytes()
         report = self._run_pass(monkeypatch)
         assert report["skipped"] is not None
         assert "precheck failed" in report["skipped"]
         assert (git_env["big"] / "SKILL.md").read_bytes() == before
-        assert marker.read_text(encoding="utf-8") == "sibling"
+        assert marker.read_text(encoding="utf-8") == "in-scope dirt"
         log = _git(git_env["home"], "log", "-1", "--pretty=%s").stdout.strip()
         assert log == "baseline"
 
@@ -252,14 +307,14 @@ class TestSharedPassE2E:
         sibling_path = git_env["shared"] / "devops" / "concurrent-sibling.md"
         real_commit = cs.commit_shared
 
-        def commit_with_concurrent_writer(summary, written, precheck=None, **kw):
+        def commit_with_concurrent_writer(summary, written, *a, **kw):
             # a real second process writes DURING the pass
             code = (
                 "import pathlib,sys; "
                 f"pathlib.Path({str(sibling_path)!r}).write_text('sibling mid-pass')"
             )
             subprocess.run([sys.executable, "-c", code], check=True)
-            return real_commit(summary, written, precheck, **kw)
+            return real_commit(summary, written, *a, **kw)
 
         monkeypatch.setattr(cs, "commit_shared", commit_with_concurrent_writer)
         report = self._run_pass(monkeypatch)
@@ -388,6 +443,32 @@ class TestSharedArchive:
             stray, shared_root=git_env["shared"],
         )
         assert not ok
+
+    @pytest.mark.live_system_guard_bypass
+    def test_archive_succeeds_despite_sibling_dirt(self, git_env):
+        """THE production scenario (2026-07-21): unrelated dirt elsewhere in
+        the repo must not block archiving an untouched skill — and the
+        sibling dirt must NOT be absorbed into the curator's commit."""
+        cs = git_env["cs"]
+        home = git_env["home"]
+        # sibling skill dirty + an untracked non-skill file (live-home churn)
+        (git_env["big"] / "SKILL.md").write_text("sibling edit", encoding="utf-8")
+        churn = home / "cron-state.json"
+        churn.write_text("{}", encoding="utf-8")
+
+        ok, msg, touched = cs.archive_shared_skill(
+            git_env["small"], shared_root=git_env["shared"],
+        )
+        assert ok, msg
+        dest = git_env["shared"] / "devops" / ".archive" / "cron-alert-discipline"
+        assert dest.is_dir()
+        assert not git_env["small"].exists()
+        # sibling dirt untouched and NOT committed
+        assert (git_env["big"] / "SKILL.md").read_text() == "sibling edit"
+        show = _git(home, "show", "--name-only", "--format=", "HEAD")
+        committed = set(show.stdout.split())
+        assert not any("clanker-e2e" in p for p in committed)
+        assert not any("cron-state" in p for p in committed)
 
     @pytest.mark.live_system_guard_bypass
     def test_archive_skill_routes_shared_to_in_tree(self, git_env, monkeypatch):
