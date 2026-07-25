@@ -369,7 +369,9 @@ export function stampOptimisticTranscriptRows(messages: readonly ChatMessage[], 
     if (Number.isInteger(Number(message.id))) {
       return
     }
+
     const isOptimisticId = message.id.startsWith('user-') || message.id.startsWith('assistant-')
+
     if (isOptimisticId || message.pending) {
       stampable.push(index)
     }
@@ -388,21 +390,28 @@ export function stampOptimisticTranscriptRows(messages: readonly ChatMessage[], 
   // zombies stay optimistic — and therefore sweepable.
   const assignment = new Map<number, string>()
   const claimed = new Set<number>()
+
   const claim = (id: string, wantRole: 'user' | 'assistant' | null): boolean => {
     for (let j = stampable.length - 1; j >= 0; j--) {
       const index = stampable[j]
+
       if (claimed.has(index)) {
         continue
       }
+
       if (wantRole && messages[index].role !== wantRole) {
         continue
       }
+
       assignment.set(index, id)
       claimed.add(index)
+
       return true
     }
+
     return false
   }
+
   if (committedIds.length === 2) {
     // [user_id, assistant_id] positional contract. A failed role-scoped claim
     // deliberately DROPS the id (Greptile #364 flagged the silent discard —
@@ -425,6 +434,7 @@ export function stampOptimisticTranscriptRows(messages: readonly ChatMessage[], 
     // are simply not stamped (the poll reconciles them).
     claim(committedIds[0], 'user')
     claim(committedIds[1], 'assistant')
+
     for (const id of committedIds.slice(2)) {
       if (!claim(id, 'assistant')) {
         claim(id, null)
@@ -442,6 +452,7 @@ export function stampOptimisticTranscriptRows(messages: readonly ChatMessage[], 
   }
 
   const stampedIds = new Set<string>()
+
   const next = messages.map((message, index) => {
     const id = assignment.get(index)
 

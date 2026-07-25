@@ -443,8 +443,7 @@ function mergeToolParts(prevParts: ChatMessagePart[], nextParts: ChatMessagePart
   const indexByToolCallId = new Map<string, number>()
 
   for (const part of [...prevParts, ...nextParts]) {
-    const id =
-      part.type === 'tool-call' && typeof part.toolCallId === 'string' ? part.toolCallId : undefined
+    const id = part.type === 'tool-call' && typeof part.toolCallId === 'string' ? part.toolCallId : undefined
 
     if (id === undefined) {
       merged.push(part)

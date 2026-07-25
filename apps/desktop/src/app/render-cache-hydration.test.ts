@@ -69,7 +69,10 @@ describe('hydrateFromRenderCache', () => {
     expect(result.painted).toBe(true)
     expect(result.gatewayUrl).toBe('http://studio:9119')
     expect(result.cachedSessionIds).toEqual(['a', 'b'])
-    expect(setSessions).toHaveBeenCalledWith([expect.objectContaining({ id: 'a' }), expect.objectContaining({ id: 'b' })])
+    expect(setSessions).toHaveBeenCalledWith([
+      expect.objectContaining({ id: 'a' }),
+      expect.objectContaining({ id: 'b' })
+    ])
     expect(setTotal).toHaveBeenCalledWith(42)
   })
 
@@ -330,9 +333,7 @@ describe('optimistic-row cache hygiene (zombie re-infection guard)', () => {
 
   it('write-through skips the put entirely when ALL rows are optimistic', () => {
     const api = stubApi()
-    pushTranscriptToRenderCache('http://g', 'sid', [
-      { id: 'assistant-stream-1', role: 'assistant', parts: [] }
-    ])
+    pushTranscriptToRenderCache('http://g', 'sid', [{ id: 'assistant-stream-1', role: 'assistant', parts: [] }])
     expect(api.putTranscript).not.toHaveBeenCalled()
   })
 

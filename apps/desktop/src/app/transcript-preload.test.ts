@@ -68,7 +68,9 @@ describe('preloadTranscripts', () => {
       gatewayUrl: 'http://g',
       sessions: [s('cached'), s('empty'), s('real')],
       freshCached: new Set(['cached']),
-      fetchMessages: (async (id: string) => ({ messages: id === 'empty' ? [] : [{ role: 'user', content: 'hi' }] })) as never,
+      fetchMessages: (async (id: string) => ({
+        messages: id === 'empty' ? [] : [{ role: 'user', content: 'hi' }]
+      })) as never,
       push: ((_u: string, id: string) => pushed.push(id)) as never,
       sleep: noSleep
     })
@@ -84,7 +86,9 @@ describe('preloadTranscripts', () => {
       gatewayUrl: 'http://g',
       sessions: [s('bad'), s('good')],
       fetchMessages: (async (id: string) => {
-        if (id === 'bad') {throw new Error('boom')}
+        if (id === 'bad') {
+          throw new Error('boom')
+        }
 
         return { messages: [{ role: 'user', content: 'hi' }] }
       }) as never,
@@ -114,9 +118,7 @@ describe('preloadTranscripts', () => {
 
     expect(n).toBe(1)
 
-    expect(
-      await preloadTranscripts({ gatewayUrl: null, sessions: [s('a')], sleep: noSleep })
-    ).toBe(0)
+    expect(await preloadTranscripts({ gatewayUrl: null, sessions: [s('a')], sleep: noSleep })).toBe(0)
   })
 
   it('passes the session profile through to the fetch', async () => {

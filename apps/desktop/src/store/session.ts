@@ -466,8 +466,7 @@ export const setCurrentFastMode = (next: Updater<boolean>) => {
   persistBoolean(COMPOSER_FAST_KEY, $currentFastMode.get())
 }
 
-export const setResetModelOnNewSession = (next: Updater<boolean>) =>
-  updateAtom($resetModelOnNewSession, next)
+export const setResetModelOnNewSession = (next: Updater<boolean>) => updateAtom($resetModelOnNewSession, next)
 
 export const setYoloActive = (next: Updater<boolean>) => updateAtom($yoloActive, next)
 

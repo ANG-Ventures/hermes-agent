@@ -277,7 +277,6 @@ export interface HermesConfig {
     max_recording_seconds?: number
     auto_tts?: boolean
   }
-
 }
 
 export type HermesConfigRecord = Record<string, unknown>

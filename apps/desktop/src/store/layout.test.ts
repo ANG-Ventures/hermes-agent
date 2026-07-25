@@ -53,9 +53,13 @@ describe('server-side pinned sessions', () => {
     const log = { info: vi.fn() }
 
     await expect(
-      migrateLegacyPinnedSessions([session({ id: 'already', pinned: true })], async id => {
-        pushed.push(id)
-      }, log)
+      migrateLegacyPinnedSessions(
+        [session({ id: 'already', pinned: true })],
+        async id => {
+          pushed.push(id)
+        },
+        log
+      )
     ).resolves.toBe(1)
 
     expect(pushed).toEqual(['legacy'])
