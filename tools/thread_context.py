@@ -61,6 +61,35 @@ def _callback_api():
     )
 
 
+def copy_context_to_thread(target: Callable) -> Callable:
+    """Wrap *target* to run on a worker thread with the *current* thread's
+    ContextVars propagated — and **nothing else**.
+
+    Same ContextVar semantics as :func:`propagate_context_to_thread`, but it
+    does not capture or install the approval/sudo callbacks.
+
+    Use this variant when the worker thread must run under the parent's
+    *session identity* while keeping its own approval policy. The subagent
+    executors in ``tools/delegate_tool.py`` are exactly that case: they install
+    a deliberately **non-interactive** approval callback via the executor's
+    ``initializer`` (``_set_subagent_approval_cb``), because a subagent worker
+    that reached the CLI's interactive callback would call ``input()`` from a
+    non-main thread and deadlock against the parent's prompt_toolkit TUI, which
+    owns stdin (#15216, GHSA-qg5c-hvr5-hjgr). Propagating the parent callbacks
+    there would reintroduce that deadlock, so only the ContextVars travel.
+
+    Each returned wrapper owns a single ``contextvars.Context`` and a Context
+    cannot be entered twice, so call this **once per submitted job** rather
+    than reusing one wrapper across several ``submit()`` calls.
+    """
+    ctx = contextvars.copy_context()
+
+    def _runner(*args, **kwargs):
+        return ctx.run(target, *args, **kwargs)
+
+    return _runner
+
+
 def propagate_context_to_thread(target: Callable) -> Callable:
     """Wrap *target* for execution on a worker thread with the *current*
     thread's ContextVars and approval/sudo callbacks propagated.

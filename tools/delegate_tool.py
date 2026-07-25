@@ -39,6 +39,7 @@ from toolsets import TOOLSETS
 _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
+from tools.thread_context import copy_context_to_thread
 from utils import base_url_hostname, is_truthy_value
 
 
@@ -2014,7 +2015,16 @@ def _run_single_child(
                     stream_callback=_relay_child_text,
                 )
 
-        _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        # ContextVars do not cross the executor boundary — snapshot the
+        # parent's Context here, on the parent thread, before submit(), so the
+        # child agent runs under the originating session's identity. Callbacks
+        # are deliberately NOT propagated: the executor's initializer above
+        # installs the subagent's non-interactive approval policy, and
+        # propagating the CLI's interactive callback into a worker thread would
+        # reintroduce the input()-vs-prompt_toolkit deadlock (#15216).
+        _child_future = _timeout_executor.submit(
+            copy_context_to_thread(_run_with_thread_capture)
+        )
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
@@ -2670,8 +2680,16 @@ def delegate_task(
             with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
                 for i, t, child in children:
+                    # ContextVars do not cross the executor boundary: a worker
+                    # thread starts with an empty Context, so the child agent
+                    # would run with NO gateway session identity (see
+                    # tools/thread_context.copy_context_to_thread). Snapshot
+                    # the parent's Context here, on the parent thread, before
+                    # submit(). Callbacks are deliberately NOT propagated —
+                    # the executor's own initializer installs the subagent's
+                    # non-interactive approval policy.
                     future = executor.submit(
-                        _run_single_child,
+                        copy_context_to_thread(_run_single_child),
                         task_index=i,
                         goal=t["goal"],
                         child=child,
