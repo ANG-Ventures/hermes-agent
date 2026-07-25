@@ -168,7 +168,11 @@ describe('ModelEditSubmenu reasoning effort parity', () => {
     fireEvent.click(effortRadio('Extra High'))
 
     await waitFor(() =>
-      expect(requestGateway).toHaveBeenCalledWith('config.set', { key: 'reasoning', session_id: 'sess1', value: 'xhigh' })
+      expect(requestGateway).toHaveBeenCalledWith('config.set', {
+        key: 'reasoning',
+        session_id: 'sess1',
+        value: 'xhigh'
+      })
     )
     expect($currentReasoningEffort.get()).toBe('xhigh')
     expect(getModelPreset('p1', 'm1').effort).toBe('xhigh')

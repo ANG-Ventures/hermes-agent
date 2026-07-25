@@ -2,7 +2,14 @@ import { describe, expect, it } from 'vitest'
 
 import type { SessionInfo } from '@/types/hermes'
 
-import { rankTitleMatchesFirst, sessionChannelMatches, sessionMatchesSearch, sessionOriginContext, sessionPlatformMatches, sessionTitleMatches } from './session-search'
+import {
+  rankTitleMatchesFirst,
+  sessionChannelMatches,
+  sessionMatchesSearch,
+  sessionOriginContext,
+  sessionPlatformMatches,
+  sessionTitleMatches
+} from './session-search'
 
 function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
   return {

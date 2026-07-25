@@ -13,6 +13,7 @@ describe('mediaSrc', () => {
 
     throw new Error(`unexpected path ${path}`)
   })
+
   const readFileDataUrl = vi.fn(async () => 'data:image/png;base64,bG9jYWw=')
 
   beforeEach(() => {

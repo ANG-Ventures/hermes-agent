@@ -57,7 +57,6 @@ const renderCacheSweptRef = { current: false }
 // One transcript-preload pass per launch, same reasoning.
 const transcriptPreloadStartedRef = { current: false }
 
-
 // After this many consecutive failed reconnects (≈45s with the 1→15s backoff)
 // raise a recoverable boot error. Otherwise a dropped remote gateway loops the
 // backoff forever behind the fullscreen CONNECTING overlay with no way to reach

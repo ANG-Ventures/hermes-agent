@@ -458,9 +458,7 @@ function pinIdForSession(session: { id: string; _lineage_root_id?: null | string
 }
 
 function markSessionPinned(pinId: string, pinned: boolean) {
-  setSessions(prev =>
-    prev.map(session => (sessionMatchesPinId(session, pinId) ? { ...session, pinned } : session))
-  )
+  setSessions(prev => prev.map(session => (sessionMatchesPinId(session, pinId) ? { ...session, pinned } : session)))
 }
 
 export async function setSessionPinned(sessionId: string, pinned: boolean): Promise<void> {

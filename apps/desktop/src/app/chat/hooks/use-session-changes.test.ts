@@ -200,7 +200,9 @@ describe('useSessionChanges B1', () => {
     expect(requestGateway).toHaveBeenCalled()
 
     for (const call of requestGateway.mock.calls as unknown[][]) {
-      if (call[0] !== 'session.changes') {continue}
+      if (call[0] !== 'session.changes') {
+        continue
+      }
       expect((call[1] as { session_id: string }).session_id).toBe(STORED_SID)
       expect((call[1] as { session_id: string }).session_id).not.toBe(SID)
     }
@@ -260,10 +262,13 @@ describe('useSessionChanges B1', () => {
 
 describe('useSessionChanges B2 materialization', () => {
   it('dedupes already-rendered committed ids and appends new rows through the resume materializer', () => {
-    const result = appendFetchedMessages([message('10', 'user')], [
-      { id: 10, role: 'user', content: 'already rendered' },
-      { id: 11, role: 'assistant', content: 'new assistant', timestamp: 11 }
-    ])
+    const result = appendFetchedMessages(
+      [message('10', 'user')],
+      [
+        { id: 10, role: 'user', content: 'already rendered' },
+        { id: 11, role: 'assistant', content: 'new assistant', timestamp: 11 }
+      ]
+    )
 
     expect(result.messages).toHaveLength(2)
     expect(result.messages.map(row => row.id)).toEqual(['10', '11'])
@@ -275,25 +280,30 @@ describe('useSessionChanges B2 materialization', () => {
     // result row (id=13) into ONE ChatMessage carrying id=12. Row 13 is
     // consumed, not surfaced — the cursor must still advance past it, or
     // every subsequent poll re-fetches 13 and appends a duplicate tool card.
-    const result = appendFetchedMessages([], [
-      {
-        id: 12,
-        role: 'assistant',
-        content: '',
-        timestamp: 12,
-        tool_calls: [{ id: 'call_x', function: { name: 'search_files', arguments: '{}' } }]
-      },
-      { id: 13, role: 'tool', content: '{}', tool_call_id: 'call_x', timestamp: 13 }
-    ])
+    const result = appendFetchedMessages(
+      [],
+      [
+        {
+          id: 12,
+          role: 'assistant',
+          content: '',
+          timestamp: 12,
+          tool_calls: [{ id: 'call_x', function: { name: 'search_files', arguments: '{}' } }]
+        },
+        { id: 13, role: 'tool', content: '{}', tool_call_id: 'call_x', timestamp: 13 }
+      ]
+    )
 
     expect(result.cursor).toBe(13)
     expect(result.renderedIds.has('13')).toBe(true)
 
     // Re-poll returning row 13 again (unchanged-cursor path) must be a
     // no-op, not a duplicate — renderedIds carry consumed row ids forward.
-    const again = appendFetchedMessages(result.messages, [
-      { id: 13, role: 'tool', content: '{}', tool_call_id: 'call_x', timestamp: 13 }
-    ], result.renderedIds)
+    const again = appendFetchedMessages(
+      result.messages,
+      [{ id: 13, role: 'tool', content: '{}', tool_call_id: 'call_x', timestamp: 13 }],
+      result.renderedIds
+    )
 
     expect(again.messages).toHaveLength(result.messages.length)
   })
@@ -301,19 +311,22 @@ describe('useSessionChanges B2 materialization', () => {
 
 describe('useSessionChanges B3 partial turns', () => {
   it('renders a polled assistant tool-call prefix as the existing pending tool-call shape', () => {
-    const result = appendFetchedMessages([], [
-      {
-        id: 20,
-        role: 'assistant',
-        content: '',
-        tool_calls: [
-          {
-            id: 'call-1',
-            function: { name: 'search_files', arguments: { query: 'needle' } }
-          }
-        ]
-      }
-    ])
+    const result = appendFetchedMessages(
+      [],
+      [
+        {
+          id: 20,
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            {
+              id: 'call-1',
+              function: { name: 'search_files', arguments: { query: 'needle' } }
+            }
+          ]
+        }
+      ]
+    )
 
     expect(result.messages).toHaveLength(1)
     expect(result.messages[0]?.id).toBe('20')
@@ -346,10 +359,7 @@ describe('useSessionChanges B3 partial turns', () => {
 describe('useSessionChanges B4 own-turn suspension helpers', () => {
   it('stamps optimistic transcript rows from completion frame committed ids', () => {
     const stamped = stampOptimisticTranscriptRows(
-      [
-        message('user-temp', 'user'),
-        { ...message('assistant-stream-1', 'assistant'), pending: true }
-      ],
+      [message('user-temp', 'user'), { ...message('assistant-stream-1', 'assistant'), pending: true }],
       extractCommittedMessageIds({ message_ids: [100, 103] })
     )
 
@@ -359,10 +369,7 @@ describe('useSessionChanges B4 own-turn suspension helpers', () => {
 
   it('drops own rows re-returned by the post-completion poll after stamping', () => {
     const stamped = stampOptimisticTranscriptRows(
-      [
-        message('user-temp', 'user'),
-        { ...message('assistant-stream-1', 'assistant'), pending: true }
-      ],
+      [message('user-temp', 'user'), { ...message('assistant-stream-1', 'assistant'), pending: true }],
       ['100', '101']
     )
 
@@ -383,10 +390,7 @@ describe('useSessionChanges B4 own-turn suspension helpers', () => {
     // keeps its optimistic id, and the post-completion poll then appends the
     // committed integer row as a DUPLICATE (the reported desktop bug).
     const stamped = stampOptimisticTranscriptRows(
-      [
-        message('user-temp', 'user'),
-        { ...message('assistant-1', 'assistant'), pending: false }
-      ],
+      [message('user-temp', 'user'), { ...message('assistant-1', 'assistant'), pending: false }],
       extractCommittedMessageIds({ message_ids: [100, 103] })
     )
 
@@ -398,10 +402,7 @@ describe('useSessionChanges B4 own-turn suspension helpers', () => {
     // Full seam: optimistic user + completed assistant → stamp from completion
     // ids → post-completion poll returns the same committed rows → no dup.
     const stamped = stampOptimisticTranscriptRows(
-      [
-        message('user-temp', 'user'),
-        { ...message('assistant-1', 'assistant'), pending: false }
-      ],
+      [message('user-temp', 'user'), { ...message('assistant-1', 'assistant'), pending: false }],
       extractCommittedMessageIds({ message_ids: [100, 101] })
     )
 
@@ -415,10 +416,7 @@ describe('useSessionChanges B4 own-turn suspension helpers', () => {
 
   it('renders remote ids interleaved between own ids and advances only through rendered rows', () => {
     const stamped = stampOptimisticTranscriptRows(
-      [
-        message('user-temp', 'user'),
-        { ...message('assistant-stream-1', 'assistant'), pending: true }
-      ],
+      [message('user-temp', 'user'), { ...message('assistant-stream-1', 'assistant'), pending: true }],
       ['100', '103']
     )
 
@@ -450,7 +448,10 @@ describe('useSessionChanges B5 watchdog and hatch', () => {
     render(
       createElement(Harness, {
         busy: true,
-        initialMessages: [message('user-temp', 'user'), { ...message('assistant-stream-1', 'assistant'), pending: true }],
+        initialMessages: [
+          message('user-temp', 'user'),
+          { ...message('assistant-stream-1', 'assistant'), pending: true }
+        ],
         onState: state => states.push(state),
         requestGateway
       })
@@ -491,7 +492,10 @@ describe('useSessionChanges B5 watchdog and hatch', () => {
     render(
       createElement(Harness, {
         busy: true,
-        initialMessages: [message('user-temp', 'user'), { ...message('assistant-stream-1', 'assistant'), pending: true }],
+        initialMessages: [
+          message('user-temp', 'user'),
+          { ...message('assistant-stream-1', 'assistant'), pending: true }
+        ],
         onState: state => states.push(state),
         requestGateway
       })
@@ -542,9 +546,7 @@ describe('reconnect-seam zombie optimistic rows (severed message.complete stamp)
       textMessage('assistant-stream-1784172446416', 'assistant', 'the reply')
     ]
 
-    const result = appendFetchedMessages(current, [
-      { id: 101, role: 'assistant', content: 'the reply' }
-    ])
+    const result = appendFetchedMessages(current, [{ id: 101, role: 'assistant', content: 'the reply' }])
 
     const texts = result.messages.map(row => row.parts.map(p => (p as { text?: string }).text ?? '').join(''))
     expect(texts.filter(t => t === 'the reply')).toHaveLength(1)
@@ -552,13 +554,9 @@ describe('reconnect-seam zombie optimistic rows (severed message.complete stamp)
   })
 
   it('drops a zombie USER row too (user optimistic id, committed twin polled)', () => {
-    const current = [
-      textMessage('user-1784173429344-vh9u3f', 'user', 'i see the footer!!!')
-    ]
+    const current = [textMessage('user-1784173429344-vh9u3f', 'user', 'i see the footer!!!')]
 
-    const result = appendFetchedMessages(current, [
-      { id: 200, role: 'user', content: 'i see the footer!!!' }
-    ])
+    const result = appendFetchedMessages(current, [{ id: 200, role: 'user', content: 'i see the footer!!!' }])
 
     expect(result.messages.map(row => row.id)).toEqual(['200'])
   })
@@ -566,9 +564,7 @@ describe('reconnect-seam zombie optimistic rows (severed message.complete stamp)
   it('never drops a PENDING (actively streaming) optimistic row', () => {
     const current = [textMessage('assistant-stream-1', 'assistant', 'partial text', true)]
 
-    const result = appendFetchedMessages(current, [
-      { id: 300, role: 'assistant', content: 'partial text' }
-    ])
+    const result = appendFetchedMessages(current, [{ id: 300, role: 'assistant', content: 'partial text' }])
 
     // orderCommittedMessages (pre-existing) sorts optimistic rows after committed
     // ones; the contract here is SURVIVAL of the pending row, not its position.
@@ -581,9 +577,7 @@ describe('reconnect-seam zombie optimistic rows (severed message.complete stamp)
       textMessage('assistant-stream-2', 'assistant', 'different words')
     ]
 
-    const result = appendFetchedMessages(current, [
-      { id: 401, role: 'assistant', content: 'same words' }
-    ])
+    const result = appendFetchedMessages(current, [{ id: 401, role: 'assistant', content: 'same words' }])
 
     // committed 400 untouched; zombie has different content so it stays
     // (position governed by pre-existing orderCommittedMessages, assert survival)
@@ -591,16 +585,12 @@ describe('reconnect-seam zombie optimistic rows (severed message.complete stamp)
   })
 
   it('one incoming row consumes at most ONE zombie (genuine repeats survive)', () => {
-    const zombies = [
-      textMessage('user-a', 'user', 'continue'),
-      textMessage('user-b', 'user', 'continue')
-    ]
+    const zombies = [textMessage('user-a', 'user', 'continue'), textMessage('user-b', 'user', 'continue')]
 
     const remaining = dropZombieOptimisticRows(zombies, [textMessage('500', 'user', 'continue')])
 
     expect(remaining.messages.map(row => row.id)).toEqual(['user-b'])
   })
-
 
   it('transplants the zombie footer onto the adopting committed twin', () => {
     // The runtime footer travels ONLY on the message.complete frame and lives
@@ -609,9 +599,7 @@ describe('reconnect-seam zombie optimistic rows (severed message.complete stamp)
     // 2026-07-16: footer visible live, gone after the poll adopted the twin).
     const zombie = { ...textMessage('assistant-stream-7', 'assistant', 'the reply'), footer: 'model · 5% · 3s' }
 
-    const result = appendFetchedMessages([zombie], [
-      { id: 800, role: 'assistant', content: 'the reply' }
-    ])
+    const result = appendFetchedMessages([zombie], [{ id: 800, role: 'assistant', content: 'the reply' }])
 
     expect(result.messages.map(row => row.id)).toEqual(['800'])
     expect(result.messages[0].footer).toBe('model · 5% · 3s')
@@ -639,9 +627,10 @@ describe('reconnect-seam zombie optimistic rows (severed message.complete stamp)
     // both sides so the zombie still drops (Greptile #361 P2).
     const zombie = textMessage('assistant-stream-9', 'assistant', 'here you go\nMEDIA:/tmp/pic.png')
 
-    const committed = appendFetchedMessages([zombie], [
-      { id: 700, role: 'assistant', content: 'here you go\nMEDIA:/tmp/pic.png' }
-    ])
+    const committed = appendFetchedMessages(
+      [zombie],
+      [{ id: 700, role: 'assistant', content: 'here you go\nMEDIA:/tmp/pic.png' }]
+    )
 
     expect(committed.messages.map(row => row.id)).toEqual(['700'])
   })
@@ -676,6 +665,7 @@ describe('role-aware tail-first stamping (stale zombie + fresh turn, live 2026-0
     const freshAssistant = textMessage2('assistant-201', 'assistant', 'hello!')
 
     const stamped = stampOptimisticTranscriptRows([stale, freshUser, freshAssistant], ['500', '501'])
+
     // poll returns the stale turn's committed rows + the fresh ones
     const result = appendFetchedMessages(stamped.messages, [
       { id: 400, role: 'assistant', content: 'old severed reply' },
@@ -693,6 +683,7 @@ describe('role-aware tail-first stamping (stale zombie + fresh turn, live 2026-0
       [textMessage2('user-1-x', 'user', 'q'), { ...textMessage2('assistant-2', 'assistant', 'a'), pending: false }],
       ['100', '101']
     )
+
     expect(stamped.messages.map(row => row.id)).toEqual(['100', '101'])
   })
 

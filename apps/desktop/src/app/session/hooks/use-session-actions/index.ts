@@ -67,7 +67,11 @@ import { broadcastSessionsChanged } from '@/store/session-sync'
 import { isWatchWindow } from '@/store/windows'
 import type { SessionCreateResponse, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'
 
-import { cullRenderCacheSession, normalizeCachedTranscriptRows, readCachedTranscript } from '../../../render-cache-hydration'
+import {
+  cullRenderCacheSession,
+  normalizeCachedTranscriptRows,
+  readCachedTranscript
+} from '../../../render-cache-hydration'
 import { NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
 import { cullStashedTranscript, readStashedTranscript, stashTranscript } from '../../../transcript-stash'
 import type { ClientSessionState, SidebarNavItem } from '../../../types'

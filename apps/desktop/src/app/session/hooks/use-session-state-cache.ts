@@ -164,11 +164,7 @@ export function useSessionStateCache({
       // Render-cache write-through (Phase 2, startup-latency): persist the
       // active session's transcript tail so the next cold launch can paint it.
       // Fire-and-forget + debounced in the main process; row cap applied there.
-      pushTranscriptToRenderCache(
-        $connection.get()?.baseUrl ?? null,
-        selectedStoredSessionIdRef.current,
-        nextMessages
-      )
+      pushTranscriptToRenderCache($connection.get()?.baseUrl ?? null, selectedStoredSessionIdRef.current, nextMessages)
     }
 
     viewSessionIdRef.current = pending.sessionId

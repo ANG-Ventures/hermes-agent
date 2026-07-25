@@ -220,6 +220,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
             legacyPinnedMigrationStartedRef.current = false
           })
         }
+
         setSessionsTotal(typeof recents.total === 'number' ? recents.total : recents.sessions.length)
         setSessionProfileTotals(prev => {
           const next = recents.profile_totals ?? {}

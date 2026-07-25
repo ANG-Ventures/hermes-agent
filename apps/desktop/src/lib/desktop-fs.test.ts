@@ -243,7 +243,9 @@ describe('desktop filesystem facade', () => {
     $connection.set({ mode: 'remote' } as never)
 
     await expect(revealDesktopFile('/remote/file.txt')).rejects.toThrow(REMOTE_REVEAL_UNAVAILABLE_MESSAGE)
-    await expect(renameDesktopFile('/remote/file.txt', 'renamed.txt')).rejects.toThrow(REMOTE_MUTATION_UNAVAILABLE_MESSAGE)
+    await expect(renameDesktopFile('/remote/file.txt', 'renamed.txt')).rejects.toThrow(
+      REMOTE_MUTATION_UNAVAILABLE_MESSAGE
+    )
     await expect(trashDesktopFile('/remote/file.txt')).rejects.toThrow(REMOTE_MUTATION_UNAVAILABLE_MESSAGE)
 
     expect(revealPath).not.toHaveBeenCalled()

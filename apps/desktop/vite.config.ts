@@ -22,9 +22,7 @@ const real = (p: string): string | null => {
 // lives outside the worktree root, so without whitelisting it the staged import
 // 404s with "Cannot find module …/unixTerminal.js". Only widen fs.allow for test
 // runs (VITEST set) — the shipped dev/preview server keeps the strict root.
-const tmpRoots = process.env.VITEST
-  ? [os.tmpdir(), real(os.tmpdir())].filter((p): p is string => p !== null)
-  : []
+const tmpRoots = process.env.VITEST ? [os.tmpdir(), real(os.tmpdir())].filter((p): p is string => p !== null) : []
 
 const fsAllow = [
   ...new Set(

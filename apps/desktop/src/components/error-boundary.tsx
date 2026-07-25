@@ -105,14 +105,22 @@ function RootErrorFallback({ error, reset }: ErrorBoundaryFallbackProps) {
         }
       }
 
-      window.indexedDB?.databases?.().then(dbs => {
-        for (const db of dbs) {
-          if (db.name) {window.indexedDB.deleteDatabase(db.name)}
-        }
-      }).catch(() => undefined)
+      window.indexedDB
+        ?.databases?.()
+        .then(dbs => {
+          for (const db of dbs) {
+            if (db.name) {
+              window.indexedDB.deleteDatabase(db.name)
+            }
+          }
+        })
+        .catch(() => undefined)
 
       if (window.caches?.keys) {
-        void window.caches.keys().then(keys => Promise.all(keys.map(k => window.caches.delete(k)))).catch(() => undefined)
+        void window.caches
+          .keys()
+          .then(keys => Promise.all(keys.map(k => window.caches.delete(k))))
+          .catch(() => undefined)
       }
     } catch {
       // ignore — still reload below

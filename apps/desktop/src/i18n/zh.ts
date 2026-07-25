@@ -2818,7 +2818,8 @@ export const zh: Translations = {
       failed: '无法更新页脚'
     },
     reasoning: {
-      status: (level, display) => `推理强度：${level} · 显示：${display}。使用 /reasoning <none|minimal|low|medium|high|xhigh|max|show|hide>。`,
+      status: (level, display) =>
+        `推理强度：${level} · 显示：${display}。使用 /reasoning <none|minimal|low|medium|high|xhigh|max|show|hide>。`,
       effortSet: level => `此会话的推理强度已设为 ${level}`,
       displaySet: value => `推理显示：${value}`,
       failed: '无法更新推理设置'

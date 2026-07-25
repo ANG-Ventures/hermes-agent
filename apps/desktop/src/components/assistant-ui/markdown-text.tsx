@@ -97,7 +97,6 @@ export async function mediaSrc(path: string): Promise<string> {
   }
 
   return readDesktopFileDataUrl(filePathFromMediaPath(path))
-
 }
 
 function useOpenMediaFile(path: string) {

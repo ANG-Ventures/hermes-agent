@@ -2659,7 +2659,8 @@ export const en: Translations = {
       failed: 'Could not update footer'
     },
     reasoning: {
-      status: (level, display) => `Reasoning effort: ${level} · display: ${display}. Use /reasoning <none|minimal|low|medium|high|xhigh|max|show|hide>.`,
+      status: (level, display) =>
+        `Reasoning effort: ${level} · display: ${display}. Use /reasoning <none|minimal|low|medium|high|xhigh|max|show|hide>.`,
       effortSet: level => `Reasoning effort set to ${level} for this session`,
       displaySet: value => `Reasoning display: ${value}`,
       failed: 'Could not update reasoning'
