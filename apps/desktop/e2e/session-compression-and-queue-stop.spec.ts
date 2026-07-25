@@ -126,17 +126,23 @@ auxiliary:
     await waitForTranscript(page, MOCK_REPLY)
     await pasteAndSend(page, 'E2E_COMPACTION_HISTORY_TWO '.repeat(5))
     await waitForTranscript(page, MOCK_REPLY)
-    // 1200 repeats (upstream had 500): the fork's P2 skew-calibrated trigger
-    // (agent/context_engine.py _trigger_skew) applies a conservative 0.7
-    // cold-start prior on an empty skew history — the mock backend never
-    // returns real prompt_tokens, so history stays empty and the trigger
-    // fires at raw-rough >= threshold/0.7 (~31.5k for the 22k threshold),
-    // not at raw >= 22k as upstream's estimator assumed (guards the
-    // 2026-07-18 premature-compaction incident). 1200 repeats lands
-    // ~35k raw — decisively over the calibrated trigger, well under the
-    // 95% hard ceiling (60.8k) — preserving the fork trigger contract
-    // while exercising upstream's queue-during-compaction behavior.
-    await pasteAndSend(page, 'E2E_TRIGGER_AUTOMATIC_COMPACTION '.repeat(1200))
+    // Upstream pasted 500 repeats of one phrase and expected automatic
+    // compaction at raw-estimate >= 22k. Two fork behaviors make that
+    // under-provisioned: (1) the P2 skew-calibrated trigger
+    // (agent/context_engine.py) applies a conservative cold-start prior when
+    // the mock backend never returns real prompt_tokens, so the trigger fires
+    // at raw >= threshold/skew (worst case threshold/0.5 = 44k), guarding the
+    // 2026-07-18 premature-lossy-compaction incident; (2) the rough estimator
+    // discounts repeated identical tokens, so repeating ONE phrase grows
+    // sublinearly (measured: 500 reps -> 21.4k, 1200 -> 28k). Use VARIED text
+    // (indexed words) so the estimate scales linearly, and size it past the
+    // worst-case trigger (~48k raw) while staying under the 95% window hard
+    // ceiling (60.8k) and the paste path's own limits.
+    const compactionFiller = Array.from(
+      { length: 4200 },
+      (_, i) => `E2E_TRIGGER_AUTOMATIC_COMPACTION_${i.toString(36)}_${(i * 7919).toString(36)}`,
+    ).join(' ')
+    await pasteAndSend(page, compactionFiller)
     await fixture.mock.waitForHeldCompletion()
     await expect(page.getByRole('status', { name: 'Summarizing thread' }).last()).toBeVisible()
 
