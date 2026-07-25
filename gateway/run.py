@@ -19030,6 +19030,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if adapter and hasattr(adapter, "get_pending_message"):
             adapter.get_pending_message(session_key)  # consume and discard
         self._pending_messages.pop(session_key, None)
+        # Cancel any pending clarify prompts NOW, rather than relying on the
+        # turn's own ``finally`` cleanup.  ``interrupt()`` is cooperative and
+        # cannot reach a thread parked inside
+        # ``clarify_gateway.wait_for_response``, so on a session that is
+        # waiting on a clarify the finalizer does not run at interrupt time
+        # and the entry stays armed.  The user's NEXT message is then
+        # intercepted by ``handle_message``'s clarify hook and fed to the
+        # already-invalidated turn — whose reply is suppressed as stale, so
+        # the message is silently swallowed and the user must send it twice.
+        #
+        # ``clear_session`` also resolves the entry with the empty-string
+        # sentinel, which unblocks the parked thread immediately and lets the
+        # drain finish instead of waiting out the full clarify timeout.
+        #
+        # Placed in this shared helper, so it covers every interrupt-and-clear
+        # call path (``/stop`` and ``/new``/``/reset``) rather than one site.
+        # Idempotent and best-effort — the turn's ``finally`` still calls
+        # ``clear_session`` and a second call is a no-op.
+        try:
+            from tools.clarify_gateway import clear_session as _clear_clarify
+
+            _cancelled = _clear_clarify(session_key)
+            if _cancelled:
+                logger.info(
+                    "Cancelled %d pending clarify prompt(s) for %s on %s",
+                    _cancelled,
+                    session_key,
+                    interrupt_reason,
+                )
+        except Exception:
+            logger.debug(
+                "clarify cancel skipped for %s", session_key, exc_info=True
+            )
         if release_running_state:
             self._release_running_agent_state(session_key)
             # Evict the cached agent: ``_interrupt_requested`` is only
