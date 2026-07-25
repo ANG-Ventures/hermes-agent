@@ -508,6 +508,11 @@ def _terminal_payload(record: dict[str, Any], result: dict[str, Any], status: st
         "redispatch_count": record.get("attempt", {}).get("redispatch_count", 0),
         "session_key": route.get("session_key", ""),
         "origin_ui_session_id": route.get("origin_ui_session_id", ""),
+        # Raw api_server wake target — see the route note in
+        # delegate_tool._build_durable_background_spec. The gateway completion
+        # router reads this off the event to self-post the wake when the
+        # session_key is a raw (unparseable) id.
+        "origin_session_id": route.get("origin_session_id", ""),
         "parent_session_id": route.get("parent_session_id"),
         "platform": route.get("platform"),
         "chat_type": route.get("chat_type"),
@@ -772,10 +777,13 @@ def _restart_payload(record: dict[str, Any], interrupted_at: float, restarted_at
         "session_key": route.get("session_key", ""),
         "parent_session_id": route.get("parent_session_id"),
         "origin_ui_session_id": route.get("origin_ui_session_id", ""),
+        # Same raw api_server wake target as the terminal payload — a restart
+        # notice must be routable on an unparseable session_key too.
+        "origin_session_id": route.get("origin_session_id", ""),
         "platform": route.get("platform"),
         "chat_type": route.get("chat_type"),
         "chat_id": route.get("chat_id"),
-        "thread_id": route.get("thread_id"),
+        "session_id": route.get("session_id"),
         "user_id": route.get("user_id"),
         "user_name": route.get("user_name"),
         "profile": route.get("profile") or record.get("profile"),

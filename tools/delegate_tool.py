@@ -2754,6 +2754,7 @@ def _build_durable_background_spec(
     session_key: str,
     parent_session_id: Optional[str],
     origin_ui_session_id: str,
+    origin_session_id: str = "",
     max_iterations: int,
     children: Optional[List[Any]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -2866,6 +2867,13 @@ def _build_durable_background_spec(
             "session_key": session_key,
             "parent_session_id": parent_session_id,
             "origin_ui_session_id": origin_ui_session_id,
+            # Raw api_server wake target (the X-Hermes-Session-Id the request
+            # bound as chat_id). The gateway's completion router needs it to
+            # self-post the wake when the session_key is a RAW id with no
+            # parseable routing metadata (gateway/run.py `raw_sid`). Without it
+            # on the durable route, a restart-safe background batch that
+            # completes through the terminal-store path loses its wake target.
+            "origin_session_id": origin_session_id,
             "platform": platform,
             "chat_type": chat_type,
             "chat_id": chat_id,
@@ -3593,6 +3601,7 @@ def delegate_task(
                 session_key=_session_key,
                 parent_session_id=_parent_session_id,
                 origin_ui_session_id=_origin_ui_session_id,
+                origin_session_id=_wake_sid,
                 max_iterations=effective_max_iter,
                 children=_child_agents,
             )

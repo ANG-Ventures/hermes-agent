@@ -76,9 +76,42 @@ def _fake_parent():
 def _patch_delegate(monkeypatch):
     import tools.delegate_tool as dt
 
+    # The child double is also the ``effective_agent`` the fork's
+    # ``_build_durable_background_spec`` reads to persist the restart-safe
+    # background intent (a FORK feature, absent upstream — this file is
+    # upstream-new and its bare ``MagicMock()`` predates it). A bare MagicMock
+    # auto-creates a Mock for every attribute the spec reads (``provider``,
+    # ``api_mode``, ``reasoning_config``, ``service_tier``, ``providers_*``,
+    # ``enabled_toolsets``, …), which is NOT JSON-serializable → the persist
+    # raises → delegate_task's "durable persistence unavailable" guard falls
+    # back to SYNCHRONOUS execution, and the returned payload is a results
+    # block with no ``status`` key. Give the double concrete, serializable
+    # values (matching the fork's own SimpleNamespace pattern in
+    # tests/tools/test_delegate_restart_recovery.py::_parent) so the durable
+    # spec persists and the real background-dispatch path under test runs.
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
     fake_child._subagent_id = "s1"
+    fake_child.model = "m"
+    fake_child.provider = "openrouter"
+    fake_child.custom_provider = None
+    fake_child.base_url = "https://parent.invalid/v1"
+    fake_child.api_mode = "chat_completions"
+    fake_child.acp_command = None
+    fake_child.acp_args = None
+    fake_child.enabled_toolsets = ["file", "terminal"]
+    fake_child.reasoning_config = None
+    fake_child.fallback_model = None
+    fake_child.service_tier = None
+    fake_child.providers_allowed = None
+    fake_child.providers_ignored = None
+    fake_child.providers_order = None
+    fake_child.provider_sort = None
+    fake_child.provider_require_parameters = False
+    fake_child.provider_data_collection = None
+    fake_child.openrouter_min_coding_score = None
+    fake_child.prefill_messages = None
+    fake_child.terminal_cwd = "/tmp"
 
     def fast_child(task_index, goal, child=None, parent_agent=None, **kw):
         return {
