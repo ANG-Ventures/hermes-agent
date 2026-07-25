@@ -1051,41 +1051,48 @@ moa:
     assert calls[-1]["task"] == "moa_aggregator"
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "LOAD-SENSITIVE TIMING (flake, not a regression): asserts advisor calls "
-        "overlap in wall-clock; green in isolation (verified 3x locally and on "
-        "several CI rounds during the 2026-07-23 parity sync) but intermittently "
-        "red under CI's 12-worker parallelism where scheduling can serialize the "
-        "coroutines. strict=False so a green run still passes. Proper fix is to "
-        "assert concurrency via an ordering/barrier signal instead of elapsed "
-        "time — follow-up card on the parity-doctrine board."
-    ),
-)
 def test_references_run_in_parallel(monkeypatch):
     """References fan out concurrently (delegate-batch semantics), not serially.
 
-    Each reference sleeps; wall-time must approximate the slowest single call,
-    not the sum. Order is preserved and a failing reference is isolated.
+    Order is preserved and a failing reference is isolated.
     """
-    import time
+    import threading
 
     from agent import moa_loop
 
     # Force _extract_text down its fallback path (no transport normalize).
     monkeypatch.setattr(moa_loop, "get_transport", lambda *_a, **_k: None)
 
-    barrier_hits = []
+    # Concurrency is proven by construction, not by measuring elapsed time.
+    #
+    # The old form timed the fan-out and asserted the total came in under the
+    # serial floor of the sleeps. That makes the OS scheduler part of the
+    # assertion: under a loaded CI box (12 parallel workers) the runtime can
+    # serialize the worker threads and the inequality flips, so the test went
+    # red without anything being wrong. It also silently assumed ~zero fixed
+    # setup before dispatch, which stopped holding once `_run_reference` began
+    # probing each reference model's context window.
+    #
+    # A barrier asserts the invariant directly: both sleeping references must
+    # be inside `call_llm` AT THE SAME TIME before either is allowed to return.
+    # If the fan-out ever runs serially the first reference blocks forever
+    # waiting for a partner that will not arrive, `wait()` raises BrokenBarrier
+    # on timeout, and the test fails with an explicit message. No wall-clock
+    # constant, no load sensitivity, and still a hard failure on serialization.
+    SLEEPERS = 2
+    rendezvous = threading.Barrier(SLEEPERS)
+    overlapped = threading.Event()
+    entered: list[str] = []
 
     def slow_call_llm(**kwargs):
         model = kwargs["model"]
+        entered.append(model)
         if model == "boom":
-            barrier_hits.append(("enter", model, time.monotonic()))
             raise RuntimeError("kaboom")
-        barrier_hits.append(("enter", model, time.monotonic()))
-        time.sleep(0.5)
-        barrier_hits.append(("exit", model, time.monotonic()))
+        # Generous relative to real scheduling latency, but finite so a serial
+        # regression fails fast instead of hanging the suite.
+        rendezvous.wait(timeout=30)
+        overlapped.set()
         return _response(f"resp-{kwargs['provider']}")
 
     monkeypatch.setattr(moa_loop, "call_llm", slow_call_llm)
@@ -1097,45 +1104,22 @@ def test_references_run_in_parallel(monkeypatch):
         {"provider": "p3", "model": "ok"},
     ]
 
-    start = time.monotonic()
-    out = moa_loop._run_references_parallel(
-        refs, [{"role": "user", "content": "hi"}], temperature=0.6, max_tokens=64
-    )
-    elapsed = time.monotonic() - start
+    try:
+        out = moa_loop._run_references_parallel(
+            refs, [{"role": "user", "content": "hi"}], temperature=0.6, max_tokens=64
+        )
+    except threading.BrokenBarrierError:  # pragma: no cover - serial regression
+        pytest.fail(
+            "references did not run in parallel: a reference reached the "
+            "rendezvous alone, so the fan-out never had "
+            f"{SLEEPERS} references inside call_llm at once (entered: {entered})"
+        )
 
-    # Assert the INVARIANT (concurrency), not a wall-clock constant.
-    #
-    # The old form asserted `elapsed < 0.95`, i.e. "total wall time is under the
-    # 1.0s serial floor of two 0.5s sleeps". That silently assumed ~zero fixed
-    # setup before dispatch. It no longer holds: `_run_reference` now calls the
-    # upstream-new `_trim_messages_for_reference` (#60345 — trims the advisory
-    # request to the REFERENCE model's own window), whose
-    # `get_model_context_length` probe costs ~0.4s per distinct (provider,
-    # model) for models with no cached metadata (as here — "ok"/"boom" are
-    # fabricated). That overhead is itself incurred CONCURRENTLY in the worker
-    # threads, so the fan-out is still fully parallel — but `elapsed` becomes
-    # ~0.4 + 0.5 ≈ 0.95s+ and trips a threshold that was never measuring setup.
-    #
-    # The real contract is that the sleeping calls OVERLAP. Assert that
-    # directly from the timestamps the test already collects: the second
-    # reference must enter `call_llm` before the first one exits. This is exact,
-    # immune to fixed setup cost and machine load, and still fails hard if the
-    # references ever run serially.
-    sleepers = [h for h in barrier_hits if h[1] == "ok"]
-    enters = sorted(t for kind, _model, t in sleepers if kind == "enter")
-    exits = sorted(t for kind, _model, t in sleepers if kind == "exit")
-    assert len(enters) == 2 and len(exits) == 2, f"expected 2 sleeping refs, got {barrier_hits}"
-    assert enters[1] < exits[0], (
-        "references did not run in parallel: the second reference entered "
-        f"call_llm at +{enters[1] - start:.2f}s, after the first exited at "
-        f"+{exits[0] - start:.2f}s (total {elapsed:.2f}s)"
+    # The barrier only clears when both sleepers are inside call_llm together.
+    assert overlapped.is_set(), (
+        f"references never overlapped inside call_llm (entered: {entered})"
     )
-    # Sanity bound: overlapping 0.5s sleeps must never approach the 1.0s serial
-    # floor of sleep time itself. Measured from the first sleeper's entry so
-    # per-reference setup (the context-window probe above) is excluded.
-    assert exits[-1] - enters[0] < 0.95, (
-        f"sleep phase took {exits[-1] - enters[0]:.2f}s — at/over the serial floor"
-    )
+    assert entered.count("ok") == SLEEPERS, f"expected 2 sleeping refs, got {entered}"
     # Output order matches input order (stable Reference N labelling).
     assert [label for label, _, _ in out] == ["p1:ok", "moa:preset", "p2:boom", "p3:ok"]
     assert "recursively reference MoA" in out[1][1]
