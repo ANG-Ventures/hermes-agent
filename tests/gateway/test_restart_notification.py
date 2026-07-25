@@ -103,6 +103,14 @@ async def test_restart_command_uses_detached_without_systemd(tmp_path, monkeypat
     """Without systemd, /restart uses the detached subprocess approach."""
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.delenv("INVOCATION_ID", raising=False)
+    monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
+    monkeypatch.delenv("HERMES_S6_SUPERVISED_CHILD", raising=False)
+    monkeypatch.delenv("HERMES_GATEWAY_EXTERNAL_SUPERVISOR", raising=False)
+    # Hermeticity: a containerized CI runner's /.dockerenv would flip the
+    # routing to via_service=True regardless of the env markers under test.
+    monkeypatch.setattr(
+        "gateway.restart.is_container_restart_context", lambda: False
+    )
 
     runner, _adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
