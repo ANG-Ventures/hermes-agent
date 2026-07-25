@@ -6,6 +6,7 @@ enumeration — and verifies each one implements the required contract.
 """
 
 import importlib
+import os
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -14,7 +15,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PLATFORMS_DIR = PROJECT_ROOT / "plugins" / "platforms"
 
 
@@ -33,6 +34,32 @@ def _discover_platform_plugins() -> list[str]:
 _PLATFORM_NAMES = _discover_platform_plugins()
 
 
+def test_platform_discovery_is_not_empty():
+    """Discovery must find the bundled platform plugins.
+
+    Every test below is parametrised over ``_PLATFORM_NAMES``. If discovery
+    returns an empty list, pytest silently reports "skipped" for each one and
+    the whole module asserts nothing — a green run that guards no regression.
+    This test makes that failure mode loud.
+
+    Empty is never legitimate when running against a source checkout:
+    ``plugins/platforms/`` is tracked in git and ships in the wheel
+    (``plugins.*`` is in ``[tool.setuptools.packages.find] include``). The
+    only honest reason to find nothing is that the tests are running somewhere
+    without the repo tree at all, which is gated below rather than blanket
+    -skipped, so a real discovery break still fails.
+    """
+    if not (PROJECT_ROOT / "pyproject.toml").is_file():
+        pytest.skip(f"not a source checkout: {PROJECT_ROOT} has no pyproject.toml")
+
+    assert PLATFORMS_DIR.is_dir(), f"platform plugin dir missing: {PLATFORMS_DIR}"
+    assert _PLATFORM_NAMES, (
+        f"no platform plugins discovered under {PLATFORMS_DIR} — the "
+        f"interface-compliance tests in this module would all silently skip. "
+        f"Directory contains: {sorted(p.name for p in PLATFORMS_DIR.iterdir())}"
+    )
+
+
 @pytest.fixture
 def clean_registry():
     """Yield with a clean platform registry, restoring state afterwards."""
@@ -48,12 +75,17 @@ def clean_registry():
 class _MockPluginContext:
     """Minimal mock of hermes_cli.plugins.PluginContext.
 
-    Only implements register_platform so we can exercise the plugin's
-    register() entrypoint without importing the real plugin system.
+    Implements the registration surface a platform plugin's ``register()``
+    entrypoint may touch, so we can exercise it without importing the real
+    plugin system. Platform plugins legitimately register hooks and CLI
+    subcommands alongside their platform (e.g. photon, raft), so those are
+    recorded as no-ops rather than raising AttributeError.
     """
 
     def __init__(self):
         self.registered_names: list[str] = []
+        self.registered_hooks: list[str] = []
+        self.registered_cli_commands: list[str] = []
 
     def register_platform(
         self,
@@ -75,6 +107,19 @@ class _MockPluginContext:
         )
         platform_registry.register(entry)
         self.registered_names.append(name)
+
+    def register_hook(self, hook_name: str, callback: Any) -> None:
+        self.registered_hooks.append(hook_name)
+
+    def register_cli_command(
+        self,
+        name: str,
+        help: str = "",
+        setup_fn: Any = None,
+        handler_fn: Any = None,
+        description: str = "",
+    ) -> None:
+        self.registered_cli_commands.append(name)
 
 
 def _import_platform_module(name: str) -> ModuleType:
@@ -139,7 +184,9 @@ def test_platform_entry_has_required_fields(platform_name: str, clean_registry):
 
 
 @pytest.mark.parametrize("platform_name", _PLATFORM_NAMES)
-def test_adapter_factory_produces_valid_adapter(platform_name: str, clean_registry):
+def test_adapter_factory_produces_valid_adapter(
+    platform_name: str, clean_registry, monkeypatch
+):
     """The adapter factory must return an object with the base interface."""
     module = _import_platform_module(platform_name)
     ctx = _MockPluginContext()
@@ -148,6 +195,14 @@ def test_adapter_factory_produces_valid_adapter(platform_name: str, clean_regist
     from gateway.platform_registry import platform_registry
     entry = platform_registry.get(platform_name)
     assert entry is not None
+
+    # Some adapters read their declared credentials at construction time (the
+    # sms adapter indexes os.environ[...] directly). Satisfy the plugin's own
+    # ``required_env`` contract with dummy values so construction is testable
+    # without real credentials — rather than skipping, which would silently
+    # drop this check for every credentialed platform.
+    for key in getattr(entry, "required_env", None) or []:
+        monkeypatch.setenv(key, os.environ.get(key) or f"test-{key.lower()}")
 
     # Build a minimal synthetic config that shouldn't crash __init__
     mock_config = MagicMock()
