@@ -136,6 +136,45 @@ def _should_suppress_transient_failure_page(job: dict, error: str | None) -> boo
     return bool(enabled)
 
 
+def _set_cron_session_title(session_db, session_id, base_title):
+    """Robustly title a finished cron session before it is closed.
+
+    Centralizes the title write so the cron finally block can guarantee a
+    non-blank, unique title is persisted before end_session()/close() tear
+    the connection down (issues #50535, #50536, #50537):
+
+    - #50535: never leaves the session blank. base_title already carries a
+      cron-id fallback for nameless jobs; this also guards a failed write.
+    - #50537: a duplicate title makes set_session_title raise ValueError (the
+      unique-title index). Recover by appending a #N suffix via
+      get_next_title_in_lineage() when supported, instead of swallowing the
+      error and ending up untitled. If lineage dedup is unavailable, raise.
+    - #50536: this runs synchronously in the cron finally block ahead of the
+      session close, so no in-flight title write can race the close.
+
+    Returns the title actually persisted, or None if nothing could be set.
+    """
+    if not session_db or not session_id:
+        return None
+    title = (base_title or "").strip()
+    if not title:
+        return None
+    try:
+        session_db.set_session_title(session_id, title)
+        return title
+    except ValueError:
+        # Title collision against the unique-title index. Fall back to the
+        # next title in the lineage (base #2, base #3, ...) when supported.
+        next_title_fn = getattr(session_db, "get_next_title_in_lineage", None)
+        if next_title_fn is None:
+            raise
+        deduped = next_title_fn(title)
+        if not deduped or deduped == title:
+            raise
+        session_db.set_session_title(session_id, deduped)
+        return deduped
+
+
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     """Return a compact one-line failure message for chat delivery.
 
@@ -436,6 +475,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, get_job, claim_dispatch, heartbeat_run_claim
+from cron.executions import create_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -1379,6 +1419,16 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
         except Exception:
             pass
 
+        if (
+            thread_id is None
+            and platform_key == "slack"
+            and origin
+            and str(origin.get("platform") or "").lower() == platform_key
+            and str(origin.get("chat_id")) == str(chat_id)
+            and origin.get("thread_id")
+        ):
+            thread_id = origin.get("thread_id")
+
         return {
             "platform": platform_name,
             "chat_id": chat_id,
@@ -1387,6 +1437,13 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
 
     platform_name = deliver_value
     if origin and origin.get("platform") == platform_name:
+        chat_id = _get_home_target_chat_id(platform_name)
+        if chat_id:
+            return {
+                "platform": platform_name,
+                "chat_id": chat_id,
+                "thread_id": _get_home_target_thread_id(platform_name),
+            }
         return {
             "platform": platform_name,
             "chat_id": str(origin["chat_id"]),
@@ -1789,6 +1846,19 @@ def _deliver_result(job: dict, content: str, success: bool = True, adapters=None
         # Prefer the live adapter when the gateway is running — this supports E2EE
         # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
         runtime_adapter = (adapters or {}).get(platform)
+        # The live-send path (which SEEDS the flat in_channel continuation
+        # session via _seed_cron_channel_session) needs not just a live adapter
+        # but a running event loop to schedule the async send onto. Compute that
+        # gate ONCE so the in_channel thread_id clear below stays in lockstep
+        # with the live-send/seed block further down (they used to drift): an
+        # adapter can be present while the loop is absent/not-running, in which
+        # case the live-send block is skipped and delivery falls through to the
+        # standalone path — which cannot seed the flat session (r3609147550).
+        live_adapter_ready = (
+            runtime_adapter is not None
+            and loop is not None
+            and getattr(loop, "is_running", lambda: False)()
+        )
         delivered = False
         target_errors = []
 
@@ -1821,6 +1891,33 @@ def _deliver_result(job: dict, content: str, success: bool = True, adapters=None
                 job.get("id", "?"), platform_name,
             )
             in_channel_surface = False
+
+        if in_channel_surface and mirror_this_target and live_adapter_ready:
+            # Force flat delivery (D2): the continuable-channel target must
+            # ignore any inherited origin/target thread_id, or the flat
+            # continuable session seeded below (thread_id=None, via
+            # _seed_cron_channel_session) never matches where the brief is
+            # actually delivered — route_thread_id further down in this loop
+            # reads `thread_id` and would otherwise route into the origin
+            # thread instead of flat into the channel.
+            #
+            # Gated on `live_adapter_ready` (adapter present AND a running loop)
+            # so the clear fires ONLY on the live-send path that actually seeds
+            # the flat session — the SAME condition as the live-send block
+            # below. `runtime_adapter is not None` alone is broader than that
+            # path: an adapter can be present while the event loop is absent or
+            # not running, in which case the live-send/seed block is skipped and
+            # delivery falls through to the standalone path. Clearing thread_id
+            # there would flatten a brief into a channel with NO seeded
+            # continuable session behind it (and bypass the D6 capability
+            # check), so the standalone fallback must keep the origin thread
+            # (review r3609147550).
+            #
+            # Fan-out / broadcast / explicit-thread targets keep their thread_id
+            # (they are not continuable and are never seeded). Placed AFTER
+            # mirror_this_target / origin_user_id are computed above — those
+            # need the ORIGINAL thread_id to match the origin conversation.
+            thread_id = None
 
         # For an in_channel delivery the flat continuation session is created
         # explicitly below (the shipped mirror only APPENDS to an existing
@@ -1874,7 +1971,7 @@ def _deliver_result(job: dict, content: str, success: bool = True, adapters=None
                 thread_id = new_thread_id
                 opened_thread_id = new_thread_id
 
-        if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
+        if live_adapter_ready:
             # Telegram topic routing (#22773, regression fixed #52060): a
             # ``telegram:<positive_chat_id>:<numeric_thread_id>`` cron target is
             # ambiguous — a forum-style topic in a private chat and a genuine
@@ -2229,6 +2326,64 @@ _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 _RUN_CLAIM_HEARTBEAT_SECONDS = 60.0
 
 
+def _read_windows_pyvenv_cfg(venv_dir: Path) -> dict[str, str]:
+    cfg_path = venv_dir / "pyvenv.cfg"
+    try:
+        lines = cfg_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+
+    parsed: dict[str, str] = {}
+    for raw in lines:
+        if "=" not in raw:
+            continue
+        key, value = raw.split("=", 1)
+        parsed[key.strip().lower()] = value.strip()
+    return parsed
+
+
+def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str]]:
+    """Return an output-capable hidden Python invocation for Windows scripts.
+
+    Cron scripts capture stdout/stderr, so using ``pythonw.exe`` directly can
+    lose script output.  uv-created venv ``python.exe`` launchers are also a
+    problem: even with CREATE_NO_WINDOW, the launcher can re-exec the base
+    console interpreter and flash a visible window.  For uv venvs, bypass the
+    launcher and run the base ``python.exe`` directly with the venv paths
+    overlaid in the environment.
+    """
+    if sys.platform != "win32":
+        return python_exe, {}
+
+    interpreter = Path(python_exe)
+    venv_dir = interpreter.parent.parent
+    env_overlay: dict[str, str] = {}
+
+    if interpreter.name.lower() == "pythonw.exe":
+        sibling = interpreter.with_name("python.exe")
+        if sibling.exists():
+            interpreter = sibling
+
+    cfg = _read_windows_pyvenv_cfg(venv_dir)
+    home = cfg.get("home", "")
+    site_packages = venv_dir / "Lib" / "site-packages"
+    if "uv" in cfg and home:
+        base_python = Path(home) / "python.exe"
+        if base_python.exists() and site_packages.exists():
+            interpreter = base_python
+            env_overlay["VIRTUAL_ENV"] = str(venv_dir)
+            pythonpath_entries = [
+                str(Path(__file__).resolve().parents[1]),
+                str(site_packages),
+            ]
+            existing_pythonpath = os.environ.get("PYTHONPATH", "")
+            if existing_pythonpath:
+                pythonpath_entries.append(existing_pythonpath)
+            env_overlay["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
+
+    return str(interpreter), env_overlay
+
+
 def _run_job_script(script_path: str) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -2306,22 +2461,32 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
                 f"Cannot run .sh/.bash script {path.name!r}: bash not found on PATH. "
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
-            )
+        )
         argv = [_bash, str(path)]
+        env_overlay: dict[str, str] = {}
     else:
-        argv = [sys.executable, str(path)]
+        python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
+        argv = [python_exe, str(path)]
 
     try:
         from tools.environments.local import _sanitize_subprocess_env
 
-        popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
+        popen_kwargs = {}
+        if sys.platform == "win32":
+            popen_kwargs = {
+                "creationflags": windows_hide_flags(),
+                "encoding": "utf-8",
+                "errors": "replace",
+            }
+        env = _sanitize_subprocess_env(os.environ.copy())
+        env.update(env_overlay)
         result = subprocess.run(
             argv,
             capture_output=True,
             text=True,
             timeout=script_timeout,
             cwd=str(path.parent),
-            env=_sanitize_subprocess_env(os.environ.copy()),
+            env=env,
             **popen_kwargs,
         )
         stdout = (result.stdout or "").strip()
@@ -3242,6 +3407,20 @@ def run_job(
         platform="",
         chat_id="",
         chat_name="",
+        # A cron job cannot receive a completion after its turn ends. We clear the
+        # HERMES_SESSION_* routing keys just below, so an async delegation's
+        # completion event carries session_key="" — _enrich_async_delegation_routing
+        # cannot resolve it and _inject_watch_notification drops it ("no routing
+        # metadata"). And by the time a child finishes, run_job has already shipped
+        # the job's final response via _deliver_result; there is no turn left to
+        # re-enter. (Worse, get_current_session_key() can fall back to the ambient
+        # os.environ HERMES_SESSION_KEY, which risks routing a cron subagent's output
+        # into an unrelated user chat.)
+        #
+        # Declaring the channel stateless routes delegate_task to its existing
+        # inline/synchronous path, so results return within the job's own turn.
+        # See declare_stateless_channel(). Upstream: #53027, #63142.
+        async_delivery=False,
     )
     _cron_delivery_vars = (
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
@@ -3338,6 +3517,7 @@ def run_job(
 
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
+        _model_cfg = {}
         try:
             import yaml
             _cfg_path = str(_get_hermes_home() / "config.yaml")
@@ -3391,12 +3571,9 @@ def run_job(
         except Exception:
             pass
 
-        # Reasoning config: a per-job ``reasoning_effort`` override (mirrors the
-        # per-job ``model`` override above) wins when it parses to a valid effort;
-        # otherwise fall back to the shared config resolver (per-model override
-        # > global). Re-read from job storage every tick so a ``cronjob
-        # action=update reasoning_effort=...`` takes effect next tick.
-        reasoning_config = scheduler_ext.resolve_cron_reasoning_config(job, _cfg, str(model))
+        # Reasoning config is resolved after provider authentication so an auth
+        # fallback can first replace the primary model with its configured model.
+        from hermes_constants import resolve_reasoning_config
 
         # Prefill messages from env or config.yaml. The top-level
         # prefill_messages_file key is canonical; agent.prefill_messages_file is
@@ -3442,6 +3619,17 @@ def run_job(
         # off-host call is ever made with a stored key.
         _guard_job_credential_exfil(job)
 
+        primary_model_for_drift = model
+        configured_provider_for_drift = (
+            str(_model_cfg.get("provider") or "").strip().lower()
+            if isinstance(_model_cfg, dict)
+            else ""
+        )
+        primary_provider_for_drift = (
+            str(job.get("provider") or "").strip().lower()
+            or configured_provider_for_drift
+            or None
+        )
         try:
             # Do not inject HERMES_INFERENCE_PROVIDER here. resolve_runtime_provider()
             # already prefers persisted config over stale shell/env overrides when
@@ -3450,32 +3638,75 @@ def run_job(
             # example DeepSeek) for cron jobs that do not pin provider/model.
             runtime_kwargs = {
                 "requested": job.get("provider"),
+                # Derive provider-specific api_mode from the model this job
+                # will actually run (per-job pin > env > config default), not
+                # the stale persisted default — mirrors the fallback path
+                # below, which already passes its fb_model.
+                "target_model": model,
             }
             if job.get("base_url"):
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
             runtime = resolve_runtime_provider(**runtime_kwargs)
+            primary_provider_for_drift = (
+                str(runtime.get("provider") or "").strip().lower()
+                or primary_provider_for_drift
+            )
         except AuthError as auth_exc:
-            # Primary provider auth failed — try fallback chain before giving up.
+            # Primary provider auth failed — try each configured provider/model
+            # pair atomically. Keeping the primary model while changing only the
+            # provider can silently route a paid GPT model through OpenRouter.
+            primary_provider_for_drift = (
+                str(getattr(auth_exc, "provider", "") or "").strip().lower()
+                or primary_provider_for_drift
+            )
             logger.warning("Job '%s': primary auth failed (%s), trying fallback", job_id, auth_exc)
             fb_list = get_fallback_chain(_cfg)
             runtime = None
             for entry in fb_list:
+                if not isinstance(entry, dict):
+                    continue
+                fb_provider = str(entry.get("provider") or "").strip()
+                fb_model = str(entry.get("model") or "").strip()
+                if not fb_provider or not fb_model:
+                    continue
                 try:
-                    fb_kwargs = {"requested": entry.get("provider")}
+                    from hermes_cli.fallback_config import resolve_entry_api_key
+
+                    fb_kwargs = {
+                        "requested": fb_provider,
+                        "target_model": fb_model,
+                    }
                     if entry.get("base_url"):
                         fb_kwargs["explicit_base_url"] = entry["base_url"]
-                    if entry.get("api_key"):
-                        fb_kwargs["explicit_api_key"] = entry["api_key"]
+                    fb_api_key = resolve_entry_api_key(entry)
+                    if fb_api_key:
+                        fb_kwargs["explicit_api_key"] = fb_api_key
                     runtime = resolve_runtime_provider(**fb_kwargs)
-                    logger.info("Job '%s': fallback resolved to %s", job_id, runtime.get("provider"))
+                    model = fb_model
+                    logger.info(
+                        "Job '%s': fallback resolved to %s model %s",
+                        job_id,
+                        runtime.get("provider"),
+                        fb_model,
+                    )
                     break
                 except Exception as fb_exc:
-                    logger.debug("Job '%s': fallback %s failed: %s", job_id, entry.get("provider"), fb_exc)
+                    logger.debug("Job '%s': fallback %s failed: %s", job_id, fb_provider, fb_exc)
             if runtime is None:
                 raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
         except Exception as exc:
             message = format_runtime_provider_error(exc)
             raise RuntimeError(message) from exc
+
+        # Reasoning config resolved AFTER provider authentication (so an auth
+        # fallback can first replace the primary model with its configured
+        # model). Fork feature: a per-job ``reasoning_effort`` override
+        # (scheduler_ext.resolve_cron_reasoning_config) wins when it parses to a
+        # valid effort; otherwise falls back to the shared config resolver
+        # (per-model override > global) against the final model.
+        reasoning_config = scheduler_ext.resolve_cron_reasoning_config(
+            job, _cfg, str(model)
+        )
 
         # Provider/model-drift fail-closed guard (#44585).
         #
@@ -3499,14 +3730,16 @@ def run_job(
         _drift: list[str] = []
         _provider_snapshot = (job.get("provider_snapshot") or "").strip().lower()
         if _provider_snapshot and not (job.get("provider") or "").strip():
-            _current_provider = str(runtime.get("provider") or "").strip().lower()
+            _current_provider = str(
+                primary_provider_for_drift or runtime.get("provider") or ""
+            ).strip().lower()
             if _current_provider and _current_provider != _provider_snapshot:
                 _drift.append(
                     f"provider '{_provider_snapshot}' -> '{_current_provider}'"
                 )
         _model_snapshot = (job.get("model_snapshot") or "").strip().lower()
         if _model_snapshot and not (job.get("model") or "").strip():
-            _current_model = str(model or "").strip().lower()
+            _current_model = str(primary_model_for_drift or "").strip().lower()
             if _current_model and _current_model != _model_snapshot:
                 _drift.append(
                     f"model '{_model_snapshot}' -> '{_current_model}'"
@@ -3582,6 +3815,7 @@ def run_job(
             api_key=runtime.get("api_key"),
             base_url=runtime.get("base_url"),
             provider=runtime.get("provider"),
+            requested_provider=runtime.get("requested_provider"),
             api_mode=runtime.get("api_mode"),
             acp_command=runtime.get("command"),
             acp_args=runtime.get("args"),
@@ -3887,20 +4121,69 @@ def run_job(
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
         if _session_db:
-            # Title the cron session from the job (name → short prompt → id) so
-            # sidebars/history show a meaningful label instead of the injected
-            # "[IMPORTANT: …]" hint that is the session's first message. Set here
-            # (not at create time) so the agent's own INSERT keeps model /
-            # system_prompt; this only UPDATEs the title column. The run-time
-            # suffix keeps it unique against the sessions.title index across runs.
+            # Compression can rotate the live agent onto a continuation while
+            # this run is in flight. Finalize that continuation, not the stale
+            # cron id captured before AIAgent started. SessionDB is the source
+            # of truth for the lineage; agent.session_id is only a fail-safe
+            # when the lookup itself is unavailable.
+            _final_cron_session_id = _cron_session_id
+            try:
+                _compression_tip = _session_db.get_compression_tip(
+                    _cron_session_id
+                )
+                if _compression_tip:
+                    _final_cron_session_id = _compression_tip
+            except (Exception, KeyboardInterrupt) as e:
+                try:
+                    _agent_session_id = getattr(agent, "session_id", None)
+                    if _agent_session_id:
+                        _final_cron_session_id = _agent_session_id
+                except (Exception, KeyboardInterrupt):
+                    pass
+                logger.debug(
+                    "Job '%s': failed to resolve cron compression tip: %s",
+                    job_id,
+                    e,
+                )
+            # Title the cron session from the job (name -> id) and PERSIST it
+            # BEFORE end_session()/close() tear the connection down, so the
+            # close can never run over an in-flight title write (#50536). The
+            # run-time suffix keeps it unique against the sessions.title index
+            # across runs; _set_cron_session_title dedupes (#50537) and the
+            # except-fallback below guarantees a non-blank title (#50535).
             try:
                 _title_base = " ".join(job_name.split())[:60].strip() or f"cron {job_id}"
                 _cron_title = f"{_title_base} · {_hermes_now().strftime('%b %d %H:%M')}"
-                _session_db.set_session_title(_cron_session_id, _cron_title)
+                if not _set_cron_session_title(
+                    _session_db, _final_cron_session_id, _cron_title
+                ):
+                    # Helper returned None (blank base) -> use the id fallback.
+                    _set_cron_session_title(
+                        _session_db, _final_cron_session_id, f"cron {job_id}"
+                    )
             except (Exception, KeyboardInterrupt) as e:
-                logger.debug("Job '%s': failed to set cron session title: %s", job_id, e)
+                logger.debug(
+                    "Job '%s': failed to set cron session title: %s", job_id, e
+                )
+                # Last-resort: never leave the session blank (#50535). Try the
+                # next free title in the lineage, then a bare id-stamped title.
+                for _fallback in (
+                    getattr(_session_db, "get_next_title_in_lineage", lambda b: b)(
+                        f"cron {job_id}"
+                    ),
+                    f"cron {job_id} {_final_cron_session_id[-6:]}",
+                ):
+                    try:
+                        if _set_cron_session_title(
+                            _session_db, _final_cron_session_id, _fallback
+                        ):
+                            break
+                    except (Exception, KeyboardInterrupt):
+                        continue
             try:
-                _session_db.end_session(_cron_session_id, "cron_complete")
+                _session_db.end_session(
+                    _final_cron_session_id, "cron_complete"
+                )
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug("Job '%s': failed to end session: %s", job_id, e)
             try:
@@ -4111,6 +4394,9 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    execution_id = job.get("execution_id")
+    if not execution_id:
+        execution_id = create_execution(job["id"], source="direct")["id"]
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -4124,7 +4410,16 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 "Job '%s': one-shot dispatch limit reached — skipping",
                 job.get("name", job["id"]),
             )
+            finish_execution(
+                execution_id,
+                success=False,
+                error="Dispatch claim rejected; execution was not started.",
+            )
             return True  # not an error — already handled/removed
+
+        # The attempt is claimed durably before executor/provider dispatch and
+        # becomes running only immediately before the actual run.
+        mark_execution_running(execution_id)
 
         # Run the job under the profile's secret scope. get_secret() fails
         # closed outside a scope once profile isolation is in play (multiple
@@ -4242,12 +4537,14 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        finish_execution(execution_id, success=success, error=error)
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], False, str(e))
+        finish_execution(execution_id, success=False, error=str(e))
         return False
 
 
@@ -4402,9 +4699,13 @@ def tick(
                     logger.info("Job '%s' already running — skipping", job.get("name", job_id))
                     return None
                 _running_job_ids.add(job_id)
+            # Record the attempt before executor dispatch. Recovery classifies
+            # abandoned records as unknown; it never automatically retries them.
+            execution = create_execution(job_id, source="builtin")
+            dispatched_job = dict(job, execution_id=execution["id"])
             _ctx = contextvars.copy_context()
 
-            def _run_and_release(j=job, ctx=_ctx):
+            def _run_and_release(j=dispatched_job, ctx=_ctx):
                 try:
                     return ctx.run(_process_job, j)
                 finally:
@@ -4413,18 +4714,28 @@ def tick(
 
             try:
                 return pool.submit(_run_and_release)
-            except RuntimeError as submit_err:
+            except Exception as submit_err:
+                with _running_lock:
+                    _running_job_ids.discard(job_id)
+                finish_execution(
+                    execution["id"],
+                    success=False,
+                    error=f"Executor dispatch failed: {submit_err}",
+                )
                 # Interpreter began finalizing between the guard above and the
                 # submit — release the in-flight claim we just took and skip.
-                if _interpreter_shutting_down(submit_err):
-                    with _running_lock:
-                        _running_job_ids.discard(job_id)
+                if isinstance(submit_err, RuntimeError) and _interpreter_shutting_down(submit_err):
                     logger.warning(
                         "Job '%s' not dispatched — interpreter is shutting down",
                         job.get("name", job_id),
                     )
                     return None
-                raise
+                logger.error(
+                    "Job '%s' not dispatched: %s",
+                    job.get("name", job_id),
+                    submit_err,
+                )
+                return None
 
         # Sequential pass for env-mutating (workdir) jobs.
         # Queued to a persistent single-thread pool so they run one at a time

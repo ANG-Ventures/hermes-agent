@@ -1,496 +1,678 @@
-# Hermes static-message catalog -- Gaeilge (Irish)
-# See locales/en.yaml for the source of truth; keep keys in sync.
-#
-# Modern Irish technical writing freely uses English loanwords for terms
-# without good native equivalents (e.g. "session", "tokens", "API").
-# Where Irish has a settled term we use it; otherwise we keep the English.
-
 approval:
-  dangerous_header: "⚠️  ORDÚ CONTÚIRTEACH: {description}"
-  choose_long:     "      [o]uair amháin  |  [s]eisiún  |  [a]i gcónaí  |  [d]iúltaigh"
-  choose_short:    "      [o]uair amháin  |  [s]eisiún  |  [d]iúltaigh"
-  prompt_long:     "      Rogha [o/s/a/D]: "
-  prompt_short:    "      Rogha [o/s/D]: "
-  choose_smart_deny: "      [o]uair amháin  |  [d]iúltaigh"
-  prompt_smart_deny: "      Rogha [o/D]: "
-  smart_deny_once_inputs: "o,once"
-  smart_deny_deny_inputs: "d,deny"
-  timeout:         "      ⏱ Am istigh — ag diúltú don ordú"
-  allowed_once:    "      ✓ Ceadaithe uair amháin"
-  allowed_session: "      ✓ Ceadaithe don seisiún seo"
-  allowed_always:  "      ✓ Curtha leis an liosta ceadaithe buan"
-  denied:          "      ✗ Diúltaithe"
-  cancelled:       "      ✗ Cealaithe"
-  blocklist_message: "Tá an t-ordú seo ar an liosta cosc gan choinníoll agus ní féidir é a cheadú."
-
+  allowed_always: '      ✓ Curtha leis an liosta ceadaithe buan'
+  allowed_once: '      ✓ Ceadaithe uair amháin'
+  allowed_session: '      ✓ Ceadaithe don seisiún seo'
+  blocklist_message: Tá an t-ordú seo ar an liosta cosc gan choinníoll agus ní féidir é a cheadú.
+  cancelled: '      ✗ Cealaithe'
+  choose_long: '      [o]uair amháin  |  [s]eisiún  |  [a]i gcónaí  |  [d]iúltaigh'
+  choose_short: '      [o]uair amháin  |  [s]eisiún  |  [d]iúltaigh'
+  choose_smart_deny: '      [o]uair amháin  |  [d]iúltaigh'
+  dangerous_header: '⚠️  ORDÚ CONTÚIRTEACH: {description}'
+  denied: '      ✗ Diúltaithe'
+  prompt_long: '      Rogha [o/s/a/D]: '
+  prompt_short: '      Rogha [o/s/D]: '
+  prompt_smart_deny: '      Rogha [o/D]: '
+  smart_deny_deny_inputs: d,deny
+  smart_deny_once_inputs: o,once
+  timeout: '      ⏱ Am istigh — ag diúltú don ordú'
 gateway:
-  approval_expired: "⚠️ Tá an cead imithe in éag (níl an gníomhaire ag fanacht níos mó). Iarr ar an ngníomhaire iarracht eile a dhéanamh."
-  draining:         "⏳ Ag fanacht le {count} gníomhaire(í) gníomhach roimh atosú..."
-  goal_cleared:     "✓ Sprioc glanta."
-  no_active_goal:   "Níl aon sprioc ghníomhach ann."
-  config_read_failed: "⚠️ Níorbh fhéidir config.yaml a léamh: {error}"
-  config_save_failed: "⚠️ Níorbh fhéidir an chumraíocht a shábháil: {error}"
-
-  model:
-    error_prefix:           "Earráid: {error}"
-    switched:               "Athraíodh an tsamhail go `{model}`"
-    provider_label:         "Soláthraí: {provider}"
-    reasoning_label:        "Réasúnaíocht: {effort}"
-    context_label:          "Comhthéacs: {tokens} comhartha"
-    max_output_label:       "Aschur uasta: {tokens} comhartha"
-    cost_label:             "Costas: {cost}"
-    capabilities_label:     "Cumais: {capabilities}"
-    prompt_caching_enabled: "Taisceadh leid: cumasaithe"
-    warning_prefix:         "Rabhadh: {warning}"
-    saved_global:           "Sábháilte i config.yaml (`--global`)"
-    session_only_hint:      "_(seisiún amháin — cuir `--global` leis chun é a choinneáil)_"
-    current_label:          "Reatha: `{model}` ar {provider}"
-    current_tag:            " (reatha)"
-    more_models_suffix:     " (+{count} eile)"
-    usage_switch_model:     "`/model <name>` — athraigh an tsamhail"
-    usage_switch_provider:  "`/model <name> --provider <slug>` — athraigh an soláthraí"
-    usage_persist:          "`/model <name> --global` — coinnigh"
-
   agents:
-    header:                "🤖 **Gníomhairí & Tascanna Gníomhacha**"
-    active_agents:         "**Gníomhairí gníomhacha:** {count}"
-    this_chat:             " · an comhrá seo"
-    more:                  "... agus {count} eile"
-    running_processes:     "**Próisis chúlra ag rith:** {count}"
-    async_jobs:            "**Tascanna asincrónacha gateway:** {count}"
-    none:                  "Níl aon ghníomhairí gníomhacha ná tascanna ag rith."
-    state_starting:        "ag tosú"
-    state_running:         "ag rith"
-
+    active_agents: '**Gníomhairí gníomhacha:** {count}'
+    async_jobs: '**Tascanna asincrónacha gateway:** {count}'
+    header: 🤖 **Gníomhairí & Tascanna Gníomhacha**
+    more: '... agus {count} eile'
+    none: Níl aon ghníomhairí gníomhacha ná tascanna ag rith.
+    running_processes: '**Próisis chúlra ag rith:** {count}'
+    state_running: ag rith
+    state_starting: ag tosú
+    this_chat: ' · an comhrá seo'
+  approval_expired: ⚠️ Tá an cead imithe in éag (níl an gníomhaire ag fanacht níos mó). Iarr ar an ngníomhaire iarracht eile a dhéanamh.
   approve:
-    no_pending:            "Níl aon ordú ag fanacht le ceadú."
-    once_singular:         "✅ Ordú ceadaithe. Tá an gníomhaire ag atosú..."
-    once_plural:           "✅ Orduithe ceadaithe ({count} ordú). Tá an gníomhaire ag atosú..."
-    session_singular:      "✅ Ordú ceadaithe (patrún ceadaithe don seisiún seo). Tá an gníomhaire ag atosú..."
-    session_plural:        "✅ Orduithe ceadaithe (patrún ceadaithe don seisiún seo) ({count} ordú). Tá an gníomhaire ag atosú..."
-    always_singular:       "✅ Ordú ceadaithe (patrún ceadaithe go buan). Tá an gníomhaire ag atosú..."
-    always_plural:         "✅ Orduithe ceadaithe (patrún ceadaithe go buan) ({count} ordú). Tá an gníomhaire ag atosú..."
-
+    always_plural: ✅ Orduithe ceadaithe (patrún ceadaithe go buan) ({count} ordú). Tá an gníomhaire ag atosú...
+    always_singular: ✅ Ordú ceadaithe (patrún ceadaithe go buan). Tá an gníomhaire ag atosú...
+    no_pending: Níl aon ordú ag fanacht le ceadú.
+    once_plural: ✅ Orduithe ceadaithe ({count} ordú). Tá an gníomhaire ag atosú...
+    once_singular: ✅ Ordú ceadaithe. Tá an gníomhaire ag atosú...
+    session_plural: ✅ Orduithe ceadaithe (patrún ceadaithe don seisiún seo) ({count} ordú). Tá an gníomhaire ag atosú...
+    session_singular: ✅ Ordú ceadaithe (patrún ceadaithe don seisiún seo). Tá an gníomhaire ag atosú...
   background:
-    usage:                 "Úsáid: /background <leid>\nSampla: /background Déan achoimre ar phríomhscéalta HN inniu\n\nRitheann an leid i seisiún ar leith. Is féidir leat leanúint leis an gcomhrá — taispeánfar an toradh anseo nuair a bheidh sé críochnaithe."
-    started:               "🔄 Tasc cúlra tosaithe: \"{preview}\"\nAitheantas an tasc: {task_id}\nIs féidir leat leanúint leis an gcomhrá — taispeánfar na torthaí nuair a bheidh sé críochnaithe."
+    started: '🔄 Tasc cúlra tosaithe: "{preview}"
 
+      Aitheantas an tasc: {task_id}
+
+      Is féidir leat leanúint leis an gcomhrá — taispeánfar na torthaí nuair a bheidh sé críochnaithe.'
+    usage: 'Úsáid: /background <leid>
+
+      Sampla: /background Déan achoimre ar phríomhscéalta HN inniu
+
+
+      Ritheann an leid i seisiún ar leith. Is féidir leat leanúint leis an gcomhrá — taispeánfar an toradh anseo nuair a bheidh sé críochnaithe.'
   branch:
-    db_unavailable:        "Níl bunachar sonraí na seisiún ar fáil."
-    no_conversation:       "Níl aon chomhrá le brainseáil — seol teachtaireacht ar dtús."
-    create_failed:         "Theip ar an mbrainse a chruthú: {error}"
-    switch_failed:         "Cruthaíodh an brainse ach theip ar athrú chuige."
-    branched_one:          "⑂ Brainseáilte go **{title}** ({count} teachtaireacht cóipeáilte)\nBunaidh: `{parent}`\nBrainse: `{new}`\nÚsáid `/resume` chun filleadh ar an mbunaidh."
-    branched_many:         "⑂ Brainseáilte go **{title}** ({count} teachtaireacht cóipeáilte)\nBunaidh: `{parent}`\nBrainse: `{new}`\nÚsáid `/resume` chun filleadh ar an mbunaidh."
-    thread_intro:          "⑂ **Branched thread — {title}**\nThis thread inherits the parent conversation ({count} messages) from {parent}. Explore freely here; the parent channel keeps its own session. Use `/merge` to fold a summary back into the parent."
-    thread_parent_fallback: "the parent conversation"
-    thread_branched_one:   "⑂ Branched into a new thread → {thread} (**{title}**, {count} message inherited).\nThe parent channel stays on its own session; use `/merge` inside the thread to fold it back."
-    thread_branched_many:  "⑂ Branched into a new thread → {thread} (**{title}**, {count} messages inherited).\nThe parent channel stays on its own session; use `/merge` inside the thread to fold it back."
+    branched_many: '⑂ Brainseáilte go **{title}** ({count} teachtaireacht cóipeáilte)
 
-  merge:
-    not_a_thread:          "`/merge` only works inside a branched thread. Start one with `/branch` in a channel first."
-    not_a_branch:          "This thread wasn't created by `/branch`, so there's no parent session to merge into."
-    not_found:             "No session found matching '{name}'. Use `/merge` with no name to list mergeable sessions."
-    same_session:          "That's the session you're already in — pick a different target to merge into."
-    already_merged:        "This session was already merged into **{title}** — not folding it again. (Start a new exploration to merge fresh material.)"
-    blocked_not_owner:     "You can only merge into sessions you own. '{name}' belongs to a different chat/owner."
-    no_named_sessions:     "No titled sessions to merge into yet. Give a session a name with `/title` first."
-    list_header:           "🔀 **Sessions you can merge into** — reply `/merge <number>` or `/merge <name>`:"
-    list_footer:           "_`/merge <number>` folds a summary of THIS session into that one._"
-    no_conversation:       "Nothing to merge — this session has no conversation yet."
-    no_new_turns:          "Nothing new to merge — no turns happened in this thread after the branch point."
-    no_summary:            "Couldn't generate a summary of this session; nothing was merged. Try again in a moment."
-    fold_failed:           "Failed to fold the summary into the target session: {error}"
-    ledger_failed:         "Couldn't safely record the merge (session store busy) — nothing was folded. Try again in a moment."
-    fold_body:             "[MERGED SESSION — {title}] A summary of another session ('{title}') was folded into this conversation. Treat it as reference context:\n\n{summary}"
-    fold_body_thread:      "[BRANCHED THREAD MERGED — {title}] A branched thread was explored and folded back into this conversation. Summary of what happened in the branch:\n\n{summary}"
-    md_suffix:             " · full record: `{path}`"
-    note_record_suffix:    " · full record: `{path}`"
-    source_marker:         "[MERGED — this thread's new exploration was folded into '{target}' on {when}. You can keep going here, but its summary already lives in that conversation.]"
-    source_marker_named:   "[MERGED — a summary of this session was folded into '{target}' on {when}. You can keep going here, but its summary already lives in that conversation.]"
-    parent_note:           "🔀 **Merged from thread '{title}'**\n{summary}"
-    target_note:           "🔀 **Folded in from _{source}_**{child} — a summary of {turns} message(s) is now in this conversation's context.{record}"
-    target_note_named:     "🔀 **Folded in from _{source}_** — a summary of _{source}_ ({turns} message(s)) is now in this conversation's context.{record}"
-    source_thread_link:    " ({thread})"
-    merged_named:          "✅ Merged into **{title}** — a summary of this session is now in its context.{md}"
-    merged_thread:         "✅ **Folded back into _{title}_**{parent} — a summary of this thread is now in the parent's context, and this thread is archived (still resumable).{md}"
-    merged_thread_no_archive: "✅ **Folded back into _{title}_**{parent} — a summary of this thread is now in the parent's context. (Couldn't archive the thread automatically; you can close it manually.){md}"
-    target_parent_link:    " ({parent})"
+      Bunaidh: `{parent}`
 
+      Brainse: `{new}`
+
+      Úsáid `/resume` chun filleadh ar an mbunaidh.'
+    branched_one: '⑂ Brainseáilte go **{title}** ({count} teachtaireacht cóipeáilte)
+
+      Bunaidh: `{parent}`
+
+      Brainse: `{new}`
+
+      Úsáid `/resume` chun filleadh ar an mbunaidh.'
+    create_failed: 'Theip ar an mbrainse a chruthú: {error}'
+    db_unavailable: Níl bunachar sonraí na seisiún ar fáil.
+    no_conversation: Níl aon chomhrá le brainseáil — seol teachtaireacht ar dtús.
+    switch_failed: Cruthaíodh an brainse ach theip ar athrú chuige.
+    thread_branched_many: '⑂ Branched into a new thread → {thread} (**{title}**, {count} messages inherited).
+
+      The parent channel stays on its own session; use `/merge` inside the thread to fold it back.'
+    thread_branched_one: '⑂ Branched into a new thread → {thread} (**{title}**, {count} message inherited).
+
+      The parent channel stays on its own session; use `/merge` inside the thread to fold it back.'
+    thread_intro: '⑂ **Branched thread — {title}**
+
+      This thread inherits the parent conversation ({count} messages) from {parent}. Explore freely here; the parent channel keeps its own session. Use `/merge` to fold a summary back into the parent.'
+    thread_parent_fallback: the parent conversation
   commands:
-    usage:                 "Úsáid: `/commands [page]`"
-    skill_header:          "⚡ **Orduithe Scileanna**:"
-    default_desc:          "Ordú scile"
-    none:                  "Níl aon ordú ar fáil."
-    header:                "📚 **Orduithe** ({total} san iomlán, leathanach {page}/{total_pages})"
-    nav_prev:              "`/commands {page}` ← roimhe seo"
-    nav_next:              "ar aghaidh → `/commands {page}`"
-    out_of_range:          "_(Bhí leathanach {requested} a iarradh as raon, ag taispeáint leathanach {page}.)_"
-
+    default_desc: Ordú scile
+    header: 📚 **Orduithe** ({total} san iomlán, leathanach {page}/{total_pages})
+    nav_next: ar aghaidh → `/commands {page}`
+    nav_prev: '`/commands {page}` ← roimhe seo'
+    none: Níl aon ordú ar fáil.
+    out_of_range: _(Bhí leathanach {requested} a iarradh as raon, ag taispeáint leathanach {page}.)_
+    skill_header: '⚡ **Orduithe Scileanna**:'
+    usage: 'Úsáid: `/commands [page]`'
   compress:
-    not_enough:            "Níl go leor comhrá le dlúthú (teastaíonn 4 theachtaireacht ar a laghad)."
-    no_provider:           "Níl aon soláthraí cumraithe — ní féidir dlúthú."
-    nothing_to_do:         "Níl aon rud le dlúthú fós (tá an traschríbhinn fós uile mar chomhthéacs cosanta)."
-    aggressive_unsupported: "Ní thacaítear le --aggressive; úsáid '/compress here [N]' chun na malartuithe is déanaí amháin a choinneáil, nó /undo chun sealanna a scriosadh."
-    focus_line:            "Fócas: \"{topic}\""
-    chat_size:             "Chat size: ~{before:,} → ~{after:,} tokens (excludes system, tools, tool results)"
-    chat_size_unchanged:   "Chat size: ~{before:,} tokens (unchanged; excludes system, tools, tool results)"
-    full_request_real:     "Full request size: {before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; before = last live request, after = estimate of next)"
-    full_request_est:      "Full request size: ~{before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; estimated — no live request yet)"
-    full_request_no_fixed: "after excludes system prompt + tool schemas (no resident agent to measure them); next live turn will show the full size."
-    full_request_unchanged: "Full request size: {before} tokens (unchanged — next turn resends the same context)"
-    persist_failed:        "⚠️ Rith an comhbhrú, ach níorbh fhéidir an toradh a shábháil — bhí bunachar sonraí an tseisiúin gnóthach (faoi ghlas). Níor cailleadh aon rud; tá do thras-scríbhinn gan athrú. Rith /compress arís i gceann nóiméid chun triail eile a bhaint as."
-    summary_failed:        "⚠️ Theip ar ghiniúint achoimre ({error}). Baineadh {count} teachtaireacht stairiúil agus cuireadh ionadaí ina n-áit; níl an comhthéacs roimhe seo in-aisghabhála a thuilleadh. Smaoinigh ar an gcumraíocht auxiliary.compression a sheiceáil."
-    aborted:               "⚠️ Cuireadh deireadh leis an dlúthú ({error}). Níor baineadh aon teachtaireacht — tá an comhrá gan athrú. Rith /compress chun é a thriail arís, /reset le haghaidh seisiún glan, nó seiceáil do chumraíocht samhla auxiliary.compression."
-    aux_failed:            "ℹ️ Theip ar an tsamhail dlúthúcháin chumraithe `{model}` ({error}). Aisghafa ag baint úsáide as do phríomhshamhail — tá an comhthéacs slán — ach b'fhéidir gur mhaith leat `auxiliary.compression.model` i config.yaml a sheiceáil."
-    failed:                "Theip ar dhlúthú: {error}"
-
-  debug:
-    upload_failed:         "✗ Theip ar uaslódáil tuairisce dífhabhtaithe: {error}"
-    header:                "**Tuairisc dhífhabhtaithe uaslódáilte:**"
-    auto_delete:           "⏱ Scriosfar na pastes go huathoibríoch i 6 huaire."
-    full_logs_hint:        "Le haghaidh uaslódálacha logála iomlána, úsáid `hermes debug share` ón CLI."
-    share_hint:            "Roinn na naisc seo le foireann Hermes le haghaidh tacaíochta."
-
-  deny:
-    stale:                 "❌ Ordú diúltaithe (bhí an cead imithe i léig)."
-    no_pending:            "Níl aon ordú ag fanacht le diúltú."
-    denied_singular:       "❌ Ordú diúltaithe."
-    denied_plural:         "❌ Orduithe diúltaithe ({count} ordú)."
-    denied_reason_singular: "❌ Ordú diúltaithe. Cúis curtha ar aghaidh chuig an ngníomhaire: \"{reason}\""
-    denied_reason_plural:  "❌ Orduithe diúltaithe ({count} ordú). Cúis curtha ar aghaidh chuig an ngníomhaire: \"{reason}\""
-
-  fast:
-    not_supported:         "⚡ Tá /fast ar fáil amháin do shamhlacha OpenAI a thacaíonn le Priority Processing."
-    status:                "⚡ Priority Processing\n\nMód reatha: `{mode}`\n\n_Úsáid:_ `/fast <normal|fast|status>`"
-    unknown_arg:           "⚠️ Argóint anaithnid: `{arg}`\n\n**Roghanna bailí:** normal, fast, status"
-    saved:                 "⚡ ✓ Priority Processing: **{label}** (sábháilte sa chumraíocht)\n_(éifeachtach ón gcéad teachtaireacht eile)_"
-    session_only:          "⚡ ✓ Priority Processing: **{label}** (an seisiún seo amháin)"
-    label_fast:            "FAST"
-    label_normal:          "NORMAL"
-    status_fast:           "fast"
-    status_normal:         "normal"
-
-    route_off:             "⚡ Fast: off — {reason}"
-    route_status:          "⚡ Fast: {state} — {family} on `{route}`"
-    preference_status:     "⚡ Configured session preference: Fast {state} — {family} on `{route}`. Route availability is checked before each turn."
-    preference_off:        "⚡ Configured session preference: Fast off — {reason} Route availability is checked before each turn."
-    preference_unavailable: "⚡ Configured session preference `{route}` is currently unavailable because its credentials could not be resolved. The preference remains saved; restore credentials or use `/model reset`."
-    route_unavailable:     "⚡ Fast unavailable — {reason}"
-    route_saved:           "⚡ ✓ {family}: **{label}** (saved to config)"
-    route_session_only:    "⚡ ✓ {family}: **{label}** (config save failed; applied gateway-process-wide until restart)"
-    model_switch_unavailable: "⚡ Fast: unavailable on `{route}`; requests will use normal speed."
-    family_openai_priority: "OpenAI API Priority Processing"
-    family_codex_fast:     "Codex Fast"
-    family_anthropic_fast: "Anthropic Fast"
-    family_unsupported:    "Fast"
-    state_on:              "on"
-    state_off:             "off"
-
-  footer:
-    status:                "📎 Buntásc rite: **{state}**\nRéimsí: `{fields}`\nArdán: `{platform}`"
-    usage:                 "Úsáid: `/footer [on|off|status]`"
-    saved:                 "📎 Buntásc rite: **{state}**{example}\n_(sábháilte go domhanda — éifeachtach ón gcéad teachtaireacht eile)_"
-    example_line:          "\nSampla: `{preview}`"
-    state_on:              "AR"
-    state_off:             "AS"
-
-  goal:
-    unavailable:           "Níl spriocanna ar fáil sa seisiún seo."
-    no_goal_set:           "Níl aon sprioc socraithe."
-    paused:                "⏸ Sprioc curtha ar sos: {goal}"
-    no_resume:             "Níl aon sprioc le hatosú."
-    resumed:               "▶ Sprioc atosaithe: {goal}\nSeol teachtaireacht ar bith chun leanúint, nó fan — déanfaidh mé an chéad chéim eile sa chéad seal eile."
-    invalid:               "Sprioc neamhbhailí: {error}"
-    set:                   "⊙ Sprioc socraithe (buiséad {budget} seal): {goal}\nLeanfaidh mé ag obair go dtí go bhfuil an sprioc críochnaithe, go gcuirfidh tú ar sos / go nglanfaidh tú í, nó go n-úsáidfear an buiséad.\nSmacht: /goal status · /goal pause · /goal resume · /goal clear"
-
-  help:
-    header:                "📖 **Orduithe Hermes**\n"
-    skill_header:          "\n⚡ **Orduithe Scileanna** ({count} gníomhach):"
-    more_use_commands:     "\n... agus {count} eile. Úsáid `/commands` don liosta iomlán uimhrithe."
-
-  insights:
-    invalid_days:          "Luach --days neamhbhailí: {value}"
-    error:                 "Earráid agus léargais á gcruthú: {error}"
-
-  kanban:
-    error_prefix:          "⚠ earráid kanban: {error}"
-    subscribed_suffix:     "(síntiúsaithe — cuirfear in iúl duit nuair a chríochnóidh nó a stopfaidh {task_id})"
-    truncated_suffix:      "… (giorraithe; úsáid `hermes kanban …` i do theirminéal le haghaidh aschur iomláin)"
-    no_output:             "(gan aschur)"
-    wake:
-      completed:           "completed"
-      gave_up:             "gave up (retries exhausted)"
-      crashed:             "crashed (worker exited); dispatcher will retry"
-      timed_out:           "timed out; dispatcher will retry"
-      blocked:             "blocked; needs attention"
-      status_default:      "status changed"
-      status_joiner:       ", "
-      message:             "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
-
-  personality:
-    none_configured:       "Níl aon phearsantachtaí cumraithe in `{path}/config.yaml`"
-    header:                "🎭 **Pearsantachtaí ar fáil**\n"
-    none_option:           "• `none` — (gan forleagan pearsantachta)"
-    item:                  "• `{name}` — {preview}"
-    usage:                 "\nÚsáid: `/personality <name>`"
-    save_failed:           "⚠️ Theip ar shábháil athraithe pearsantachta: {error}"
-    cleared:               "🎭 Pearsantacht glanta — ag úsáid iompair bunúsaigh an ghníomhaire.\n_(éifeachtach ón gcéad teachtaireacht eile)_"
-    set_to:                "🎭 Pearsantacht socraithe go **{name}**\n_(éifeachtach ón gcéad teachtaireacht eile)_"
-    unknown:               "Pearsantacht anaithnid: `{name}`\n\nAr fáil: {available}"
-
-  profile:
-    header:                "👤 **Próifíl:** `{profile}`"
-    home:                  "📂 **Baile:** `{home}`"
-
-  reasoning:
-    level_default:             "medium (réamhshocraithe)"
-    level_disabled:            "none (díchumasaithe)"
-    scope_session:             "sárú seisiúin"
-    scope_global:              "cumraíocht dhomhanda"
-    status:                    "🧠 **Socruithe Réasúnaíochta**\n\n**Iarracht:** `{level}`\n**Scóip:** {scope}\n**Taispeáint:** {display}\n\n_Úsáid:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|reset|show|hide> [--global]`"
-    display_on:                "ar ✓"
-    display_off:               "as"
-    display_set_on:            "🧠 ✓ Taispeáint réasúnaíochta: **AR**\nTaispeánfar smaointeoireacht na samhla roimh gach freagra ar **{platform}**."
-    display_set_off:           "🧠 ✓ Taispeáint réasúnaíochta: **AS** do **{platform}**"
-    reset_global_unsupported:  "⚠️ Ní thacaítear le `/reasoning reset --global`. Úsáid `/reasoning <level> --global` chun an réamhshocrú domhanda a athrú."
-    reset_done:                "🧠 ✓ Sárú réasúnaíochta seisiúin glanta; ag titim siar ar an gcumraíocht dhomhanda."
-    unknown_arg:               "⚠️ Argóint anaithnid: `{arg}`\n\n**Leibhéil bhailí:** none, minimal, low, medium, high, xhigh, max\n**Taispeáint:** show, hide\n**Coinnigh:** cuir `--global` leis chun sábháil thar an seisiún seo"
-    set_global:                "🧠 ✓ Iarracht réasúnaíochta socraithe go `{effort}` (sábháilte sa chumraíocht)\n_(éifeachtach ón gcéad teachtaireacht eile)_"
-    set_global_save_failed:    "🧠 ✓ Iarracht réasúnaíochta socraithe go `{effort}` (seisiún amháin — theip ar shábháil cumraíochta)\n_(éifeachtach ón gcéad teachtaireacht eile)_"
-    set_session:               "🧠 ✓ Iarracht réasúnaíochta socraithe go `{effort}` (seisiún amháin — cuir `--global` leis chun é a choinneáil)\n_(éifeachtach ón gcéad teachtaireacht eile)_"
-
-  reload_mcp:
-    cancelled:             "🟡 /reload-mcp cealaithe. Tá uirlisí MCP gan athrú."
-    always_followup:       "ℹ️ Rithfear glaonna `/reload-mcp` amach anseo gan dearbhú. Athchumasaigh trí `approvals.mcp_reload_confirm: true` a shocrú in config.yaml."
-    confirm_prompt:        "⚠️ **Dearbhaigh /reload-mcp**\n\nAthlódáil freastalaithe MCP a athchruthaíonn an tacar uirlisí don seisiún seo agus **cuireann sé taisce leid an tsoláthraí ar neamhní** — seolfaidh an chéad teachtaireacht eile na comharthaí ionchuir iomlána arís. Ar shamhlacha le comhthéacs fada nó réasúnaíocht ard, is féidir leis seo a bheith costasach.\n\nRoghnaigh:\n• **Approve Once** — athlódáil anois\n• **Always Approve** — athlódáil anois agus an leid seo a chiúnú go buan\n• **Cancel** — fág uirlisí MCP gan athrú\n\n_Cúltaca téacs: freagair `/approve`, `/always`, nó `/cancel`._"
-    header:                "🔄 **Freastalaithe MCP Athlódáilte**\n"
-    reconnected:           "♻️ Athcheanglaithe: {names}"
-    added:                 "➕ Curtha leis: {names}"
-    removed:               "➖ Bainte: {names}"
-    none_connected:        "Níl aon fhreastalaí MCP ceangailte."
-    tools_available:       "\n🔧 {tools} uirlis(í) ar fáil ó {servers} freastalaí(thí)"
-    failed:                "❌ Theip ar athlódáil MCP: {error}"
-
-  reload_skills:
-    header:                "🔄 **Scileanna Athlódáilte**\n"
-    no_new:                "Níor braitheadh aon scil nua."
-    total:                 "\n📚 {count} scil(eanna) ar fáil"
-    added_header:          "➕ **Scileanna Curtha leis:**"
-    removed_header:        "➖ **Scileanna Bainte:**"
-    item_with_desc:        "    - {name}: {desc}"
-    item_no_desc:          "    - {name}"
-    failed:                "❌ Theip ar athlódáil scileanna: {error}"
-
-  reset:
-    preferences_preserved: "\n↪ Preserved explicit {preferences} preferences. Use `/model reset` and `/reasoning reset` to return to configured defaults."
-    model_preference_unavailable: "\n⚠ Preserved the explicit model preference, but it is currently unavailable because its credentials could not be resolved. Restore credentials or use `/model reset`."
-    header_default:        "✨ Seisiún athshocraithe! Ag tosú as an nua."
-    header_new:            "✨ Seisiún nua tosaithe!"
-    header_titled:         "✨ Seisiún nua tosaithe: {title}"
-    title_rejected:        "\n⚠️ Teideal diúltaithe: {error}"
-    title_error_untitled:  "\n⚠️ {error} — seisiún tosaithe gan teideal."
-    title_empty_untitled:  "\n⚠️ Tá an teideal folamh tar éis glanta — seisiún tosaithe gan teideal."
-    tip:                   "\n✦ Leid: {tip}"
-
-  restart:
-    in_progress:           "⏳ Tá atosú gateway ar siúl cheana féin..."
-    restarting:            "♻ Ag atosú gateway. Mura gcuirfear in iúl duit laistigh de 60 soicind, atosaigh ón gconsól le `hermes gateway restart`."
-
-  resume:
-    db_unavailable:        "Níl bunachar sonraí na seisiún ar fáil."
-    parse_error:           "⚠️ Could not parse `/resume` arguments: {error}.
-Use quotes around titles with spaces, for example: `/resume \"Project A Plan\"`."
-    matrix_no_named_sessions: "No named sessions found for this Matrix room.
-Use `/title My Session` to name the current room session, `/resume --all` to list all Matrix sessions, or `/resume --cross-room <session name>` to explicitly cross room boundaries."
-    matrix_blocked_no_origin: "⚠️ Matrix /resume blocked: this named session has no recorded room origin, so Hermes will not resume it inside the current room by default. Use `/resume --cross-room {name}` if you intentionally want to cross room boundaries."
-    matrix_blocked_other_room: "⚠️ Matrix /resume blocked: that session belongs to a different Matrix room ({room}). Use `/resume --cross-room {name}` if you intentionally want to resume it here."
-    matrix_cross_room_success: "⚠️ Cross-room resume: resumed **{title}** inside Matrix room **{room}**.
-Future messages in this room will use that transcript until `/reset` or another `/resume`.{msg_part}"
-    blocked_not_owner:     "⚠️ /resume blocked: '**{name}**' belongs to a different user or chat. You can only resume sessions from this chat."
-    no_named_sessions:     "Níor aimsíodh aon seisiún ainmnithe.\nÚsáid `/title M'Ainm Seisiúin` chun do sheisiún reatha a ainmniú, ansin `/resume M'Ainm Seisiúin` chun filleadh air níos déanaí."
-    list_header:           "📋 **Seisiúin Ainmnithe**\n"
-    list_item:             "• **{title}**{preview_part}"
-    list_item_numbered:    "{index}. **{title}**{preview_part}"
-    list_preview_suffix:   " — _{preview}_"
-    list_footer:           "\nÚsáid: `/resume <session name>`"
-    list_footer_numbered:  "\nÚsáid: `/resume <ainm seisiúin>` nó `/resume <uimhir>` (m.sh. `/resume 1` don cheann is déanaí)"
-    list_failed:           "Níorbh fhéidir seisiúin a liostáil: {error}"
-    out_of_range:          "Tá an t-innéacs atosaithe {index} as raon.\nÚsáid `/resume` gan argóintí chun na seisiúin atá ar fáil a fheiceáil."
-    not_found:             "Níor aimsíodh aon seisiún ag teacht le '**{name}**'.\nÚsáid `/resume` gan argóintí chun seisiúin atá ar fáil a fheiceáil."
-    already_on:            "📌 Cheana ar an seisiún **{name}**."
-    switch_failed:         "Theip ar athrú seisiúin."
-    resumed_one:           "↻ Seisiún **{title}** atosaithe ({count} teachtaireacht). Comhrá aischurtha."
-    resumed_many:          "↻ Seisiún **{title}** atosaithe ({count} teachtaireacht). Comhrá aischurtha."
-    resumed_no_count:      "↻ Seisiún **{title}** atosaithe. Comhrá aischurtha."
-
-  retry:
-    no_previous:           "Níl aon teachtaireacht roimhe seo le hath-iarraidh."
-
-  rollback:
-    not_enabled:           "Níl seicphointí cumasaithe.\nCumasaigh in config.yaml:\n```\ncheckpoints:\n  enabled: true\n```"
-    none_found:            "Níor aimsíodh aon seicphointe do {cwd}"
-    invalid_number:        "Uimhir seicphointe neamhbhailí. Úsáid 1-{max}."
-    restored:              "✅ Aischurtha go seicphointe {hash}: {reason}\nSábháladh roghchóip réamh-rollback go huathoibríoch."
-    restore_failed:        "❌ {error}"
-
-  set_home:
-    save_failed:           "Theip ar shábháil chainéil bhaile: {error}"
-    success:               "✅ Cainéal baile socraithe go **{name}** (ID: {chat_id}).\nSeachadfar tascanna cron agus teachtaireachtaí trasardáin anseo."
-
-  status:
-    header:                "📊 **Stádas Hermes Gateway**"
-    matrix_scope_header:   "**Matrix scope:**"
-    matrix_scope_room:     "  room: {room}"
-    matrix_scope_room_id:  "  room_id: {room_id}"
-    matrix_scope_thread:   "  thread_id: {thread_id}"
-    matrix_scope_mode:     "  session_scope: {scope}"
-    matrix_scope_key:      "  session_key: {session_key}"
-    session_id:            "**ID Seisiúin:** `{session_id}`"
-    title:                 "**Teideal:** {title}"
-    created:               "**Cruthaithe:** {timestamp}"
-    last_activity:         "**Gníomhaíocht is déanaí:** {timestamp}"
-    model:                 "**Model:** `{model}`"
-    model_provider:        "**Model:** `{model}` ({provider})"
-    context:               "**Context:** {used} / {total} ({pct}%)"
-    context_used:          "**Context:** ~{used} tokens"
-    tokens:                "**Comharthaí:** {tokens}"
-    agent_running:         "**Gníomhaire ag rith:** {state}"
-    state_yes:             "Tá ⚡"
-    state_no:              "Níl"
-    queued:                "**Tascanna i scuaine:** {count}"
-    platforms:             "**Ardáin Cheangailte:** {platforms}"
-
-  stop:
-    stopped_pending:       "⚡ Stoptha. Ní raibh an gníomhaire tosaithe fós — is féidir leat leanúint leis an seisiún seo."
-    stopped:               "⚡ Á stopadh — an chéim reatha á críochnú agus á stopadh. Is féidir leat leanúint leis an seisiún seo."
-    no_active:             "Níl aon tasc gníomhach le stopadh."
-
-  title:
-    db_unavailable:        "Níl bunachar sonraí na seisiún ar fáil."
-    warn_prefix:           "⚠️ {error}"
-    empty_after_clean:     "⚠️ Tá an teideal folamh tar éis glanta. Bain úsáid as carachtair inphriontáilte le do thoil."
-    set_to:                "✏️ Teideal seisiúin socraithe: **{title}**"
-    not_found:             "Seisiún gan a aimsiú sa bhunachar sonraí."
-    current_with_title:    "📌 Seisiún: `{session_id}`\nTeideal: **{title}**"
-    current_no_title:      "📌 Seisiún: `{session_id}`\nGan teideal socraithe. Úsáid: `/title M'Ainm Seisiúin`"
-
-  topic:
-    not_telegram_dm:         "Tá an t-ordú /topic ar fáil amháin i gcomhráite príobháideacha Telegram."
-    no_session_db:           "Níl bunachar sonraí na seisiún ar fáil."
-    unauthorized:            "Níl tú údaraithe chun /topic a úsáid ar an mbot seo."
-    restore_needs_topic:     "Chun seisiún a athchóiriú, cruthaigh nó oscail topaic Telegram ar dtús, ansin seol /topic <session-id> taobh istigh den topaic sin. Chun topaic nua a chruthú, oscail All Messages agus seol teachtaireacht ar bith ann."
-    topics_disabled:         "Níl topaicí Telegram cumasaithe don bhot seo fós.\n\nConas iad a chumasú:\n1. Oscail @BotFather.\n2. Roghnaigh do bhot.\n3. Oscail Bot Settings → Threads Settings.\n4. Casadh ar Threaded Mode agus déan cinnte go bhfuil cead ag úsáideoirí snáitheanna nua a chruthú.\n\nAnsin seol /topic arís."
-    topics_user_disallowed:  "Tá topaicí Telegram cumasaithe, ach níl cead ag úsáideoirí topaicí a chruthú.\n\nOscail @BotFather → roghnaigh do bhot → Bot Settings → Threads Settings, ansin múchadh 'Disallow users to create new threads'.\n\nAnsin seol /topic arís."
-    enable_failed:           "Theip ar mhodh topaice Telegram a chumasú: {error}"
-    bound_status:            "Tá an topaic seo nasctha le:\nSeisiún: {label}\nID: {session_id}\n\nÚsáid /new chun an topaic seo a athsholáthar le seisiún úr.\nLe haghaidh oibre comhthreomhaire, oscail All Messages agus seol teachtaireacht ann chun topaic eile a chruthú."
-    thread_ready:            "Tá topaicí il-seisiúin Telegram cumasaithe.\n\nÚsáidfear an topaic seo mar sheisiún Hermes neamhspleách. Úsáid /new chun seisiún reatha na topaice seo a athsholáthar. Le haghaidh oibre comhthreomhaire, oscail All Messages agus seol teachtaireacht ann chun topaic eile a chruthú."
-    untitled_session:        "Seisiún gan teideal"
-
-  undo:
-    nothing:               "Nothing to undo."
-    busy:                  "⏳ The database was busy — nothing was changed. Try /undo again in a moment."
-    error:                 "⚠️ Couldn't complete /undo (internal error — nothing was changed). It's been logged."
-    removed:               "↩️ Undid {turns} half-turn(s) ({count} message(s))."
-    invalid_count:         "Invalid count \"{arg}\" — use /undo or /undo N."
-    draining:              "⏳ Stopadh an seal deireanach ach tá sé fós ag críochnú a chéim reatha — ní féidir /undo a rith go fóill. Bain triail eile as i gceann nóiméid."
-    now_at:                "↦ Now at — {who}:\n“{preview}”"
-    now_at_notext:         "↦ Now at — {who} (no text)."
-    now_empty:             "↦ Now at — start of the thread (no messages left)."
-    party:
-      user:                "your message"
-      assistant:           "my reply"
-      tool:                "a tool result"
-      message:             "the last message"
-
-  redo:
-    nothing:               "Nothing to redo."
-    busy:                  "⏳ The database was busy — nothing was changed. Try /redo again in a moment."
-    error:                 "⚠️ Couldn't complete /redo (internal error — nothing was changed). It's been logged."
-    restart_lost:          "Nothing to redo — redo history does not survive a restart."
-    restored:              "↪️ Redid {ops} undo operation(s) ({count} message(s) restored)."
-    invalid_count:         "Invalid count \"{arg}\" — use /redo or /redo N."
-    draining:              "⏳ Stopadh an seal deireanach ach tá sé fós ag críochnú a chéim reatha — ní féidir /redo a rith go fóill. Bain triail eile as i gceann nóiméid."
-
-  update:
-    platform_not_messaging:  "✗ Tá /update ar fáil amháin ó ardáin teachtaireachtaí. Rith `hermes update` ón teirminéal."
-    not_git_repo:            "✗ Ní stór git é seo — ní féidir nuashonrú."
-    hermes_cmd_not_found:    "✗ Níorbh fhéidir an t-ordú `hermes` a aimsiú. Tá Hermes ag rith, ach níorbh fhéidir leis an ordú nuashonraithe an inrite a aimsiú ar PATH ná tríd an léirmhínitheoir Python reatha. Bain triail as `hermes update` a rith de láimh i do theirminéal."
-    start_failed:            "✗ Theip ar nuashonrú a thosú: {error}"
-    starting:                "⚕ Ag tosú nuashonrú Hermes… Cuirfidh mé an dul chun cinn ar shruth anseo."
-
-  usage:
-    rate_limits:              "⏱️ **Teorainneacha Ráta:** {state}"
-    header_session:           "📊 **Úsáid Comharthaí Seisiúin**"
-    label_model:              "Samhail: `{model}`"
-    label_input_tokens:       "Comharthaí ionchuir: {count}"
-    label_cache_read:         "Comharthaí léite ón taisce: {count}"
-    label_cache_write:        "Comharthaí scríofa sa taisce: {count}"
-    label_output_tokens:      "Comharthaí aschuir: {count}"
-    label_total:              "Iomlán: {count}"
-    label_api_calls:          "Glaonna API: {count}"
-    label_cost:               "Costas: {prefix}${amount}"
-    label_cost_included:      "Costas: san áireamh"
-    label_context:            "Comhthéacs: {used} / {total} ({pct}%)"
-    comp_header:              "Last request composition (char/4 estimate):"
-    comp_fixed:               "• Fixed: ~{fixed} tok ({sys} system + {tools} tool schemas)"
-    comp_nonfixed:            "• Non-fixed: ~{nonfixed} tok ({hist} history + {results} tool results + {args} tool args)"
-    comp_total:               "• Estimated request total: ~{total} tok (sums exactly; fixed + non-fixed)"
-    label_compressions:       "Dlúthuithe: {count}"
-    breakdown_header: "🧩 **Miondealú comhthéacs** _(measta)_"
-    breakdown_line: "• {label}: ~{count} ({pct}%)"
-    breakdown_cat_system_prompt: "Leid an chórais"
-    breakdown_cat_tool_definitions: "Sainmhínithe uirlisí"
-    breakdown_cat_rules: "Rialacha"
-    breakdown_cat_skills: "Scileanna"
-    breakdown_cat_mcp: "MCP"
-    breakdown_cat_subagent_definitions: "Sainmhínithe fo-ghníomhairí"
-    breakdown_cat_memory: "Cuimhne"
-    breakdown_cat_conversation: "Comhrá"
-    header_session_info:      "📊 **Eolas Seisiúin**"
-    label_messages:           "Teachtaireachtaí: {count}"
-    label_estimated_context:  "Comhthéacs measta: ~{count} comhartha"
-    detailed_after_first:     "_(Úsáid mhionsonraithe ar fáil tar éis chéad fhreagra an ghníomhaire)_"
-    no_data:                  "Níl aon sonraí úsáide ar fáil don seisiún seo."
-    unknown_subcommand:       "Fo-ordú /usage anaithnid: `{args}`. Bain triail as `/usage` nó `/usage reset [--force]`."
-    reset_wrong_provider:     "Níl athshocruithe teorann bainc ar fáil ach ar an soláthraí openai-codex. Athraigh le `/model` ar dtús."
-
+    aborted: ⚠️ Cuireadh deireadh leis an dlúthú ({error}). Níor baineadh aon teachtaireacht — tá an comhrá gan athrú. Rith /compress chun é a thriail arís, /reset le haghaidh seisiún glan, nó seiceáil do chumraíocht samhla auxiliary.compression.
+    aggressive_unsupported: Ní thacaítear le --aggressive; úsáid '/compress here [N]' chun na malartuithe is déanaí amháin a choinneáil, nó /undo chun sealanna a scriosadh.
+    aux_failed: ℹ️ Theip ar an tsamhail dlúthúcháin chumraithe `{model}` ({error}). Aisghafa ag baint úsáide as do phríomhshamhail — tá an comhthéacs slán — ach b'fhéidir gur mhaith leat `auxiliary.compression.model` i config.yaml a sheiceáil.
+    chat_size: 'Chat size: ~{before:,} → ~{after:,} tokens (excludes system, tools, tool results)'
+    chat_size_unchanged: 'Chat size: ~{before:,} tokens (unchanged; excludes system, tools, tool results)'
+    failed: 'Theip ar dhlúthú: {error}'
+    focus_line: 'Fócas: "{topic}"'
+    full_request_est: 'Full request size: ~{before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; estimated — no live request yet)'
+    full_request_no_fixed: after excludes system prompt + tool schemas (no resident agent to measure them); next live turn will show the full size.
+    full_request_real: 'Full request size: {before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; before = last live request, after = estimate of next)'
+    full_request_unchanged: 'Full request size: {before} tokens (unchanged — next turn resends the same context)'
+    no_provider: Níl aon soláthraí cumraithe — ní féidir dlúthú.
+    not_enough: Níl go leor comhrá le dlúthú (teastaíonn 4 theachtaireacht ar a laghad).
+    nothing_to_do: Níl aon rud le dlúthú fós (tá an traschríbhinn fós uile mar chomhthéacs cosanta).
+    persist_failed: ⚠️ Rith an comhbhrú, ach níorbh fhéidir an toradh a shábháil — bhí bunachar sonraí an tseisiúin gnóthach (faoi ghlas). Níor cailleadh aon rud; tá do thras-scríbhinn gan athrú. Rith /compress arís i gceann nóiméid chun triail eile a bhaint as.
+    summary_failed: ⚠️ Theip ar ghiniúint achoimre ({error}). Baineadh {count} teachtaireacht stairiúil agus cuireadh ionadaí ina n-áit; níl an comhthéacs roimhe seo in-aisghabhála a thuilleadh. Smaoinigh ar an gcumraíocht auxiliary.compression a sheiceáil.
+  config_read_failed: '⚠️ Níorbh fhéidir config.yaml a léamh: {error}'
+  config_save_failed: '⚠️ Níorbh fhéidir an chumraíocht a shábháil: {error}'
   credits:
-    not_logged_in:            "Níl tú logáilte isteach i Nous Portal. Logáil isteach chun d'iarmhéid creidmheasa a fheiceáil agus breis a chur leis."
+    not_logged_in: Níl tú logáilte isteach i Nous Portal. Logáil isteach chun d'iarmhéid creidmheasa a fheiceáil agus breis a chur leis.
+  debug:
+    auto_delete: ⏱ Scriosfar na pastes go huathoibríoch i 6 huaire.
+    full_logs_hint: Le haghaidh uaslódálacha logála iomlána, úsáid `hermes debug share` ón CLI.
+    header: '**Tuairisc dhífhabhtaithe uaslódáilte:**'
+    share_hint: Roinn na naisc seo le foireann Hermes le haghaidh tacaíochta.
+    upload_failed: '✗ Theip ar uaslódáil tuairisce dífhabhtaithe: {error}'
+  deny:
+    denied_plural: ❌ Orduithe diúltaithe ({count} ordú).
+    denied_reason_plural: '❌ Orduithe diúltaithe ({count} ordú). Cúis curtha ar aghaidh chuig an ngníomhaire: "{reason}"'
+    denied_reason_singular: '❌ Ordú diúltaithe. Cúis curtha ar aghaidh chuig an ngníomhaire: "{reason}"'
+    denied_singular: ❌ Ordú diúltaithe.
+    no_pending: Níl aon ordú ag fanacht le diúltú.
+    stale: ❌ Ordú diúltaithe (bhí an cead imithe i léig).
+  draining: ⏳ Ag fanacht le {count} gníomhaire(í) gníomhach roimh atosú...
+  fast:
+    choice_fast: fast — Priority Processing ar siúl
+    choice_normal: normal — gnáthphróiseáil
+    family_anthropic_fast: Anthropic Fast
+    family_codex_fast: Codex Fast
+    family_openai_priority: OpenAI API Priority Processing
+    family_unsupported: Fast
+    label_fast: FAST
+    label_normal: NORMAL
+    model_switch_unavailable: '⚡ Fast: unavailable on `{route}`; requests will use normal speed.'
+    not_supported: ⚡ Tá /fast ar fáil amháin do shamhlacha OpenAI a thacaíonn le Priority Processing.
+    picker_title: '⚡ **Priority Processing**\n\nMód reatha: `{mode}`\n\nRoghnaigh rogha:'
+    preference_off: '⚡ Configured session preference: Fast off — {reason} Route availability is checked before each turn.'
+    preference_status: '⚡ Configured session preference: Fast {state} — {family} on `{route}`. Route availability is checked before each turn.'
+    preference_unavailable: ⚡ Configured session preference `{route}` is currently unavailable because its credentials could not be resolved. The preference remains saved; restore credentials or use `/model reset`.
+    route_off: '⚡ Fast: off — {reason}'
+    route_saved: '⚡ ✓ {family}: **{label}** (saved to config)'
+    route_session_only: '⚡ ✓ {family}: **{label}** (config save failed; applied gateway-process-wide until restart)'
+    route_status: '⚡ Fast: {state} — {family} on `{route}`'
+    route_unavailable: ⚡ Fast unavailable — {reason}
+    saved: '⚡ ✓ Priority Processing: **{label}** (sábháilte sa chumraíocht)
 
-  verbose:
-    not_enabled:           "Níl an t-ordú `/verbose` cumasaithe d'ardáin teachtaireachtaí.\n\nCumasaigh in `config.yaml`:\n```yaml\ndisplay:\n  tool_progress_command: true\n```"
-    mode_off:              "⚙️ Dul chun cinn uirlise: **AS** — gan aon ghníomhaíocht uirlise á thaispeáint."
-    mode_new:              "⚙️ Dul chun cinn uirlise: **NUA** — taispeánta nuair a athraíonn an uirlis (fad réamhamhairc: `display.tool_preview_length`, réamhshocrú 40)."
-    mode_all:              "⚙️ Dul chun cinn uirlise: **GACH CEANN** — taispeántar gach glao uirlise (fad réamhamhairc: `display.tool_preview_length`, réamhshocrú 40)."
-    mode_verbose:          "⚙️ Dul chun cinn uirlise: **BÉALSCAOILTE** — gach glao uirlise le hargóintí iomlána."
-    mode_log:              "⚙️ Dul chun cinn uirlise: **LOG** — ciúin sa chomhrá; scríobhtar glaonna uirlise chuig ~/.hermes/logs/tool_calls.log."
-    saved_suffix:          "_(sábháilte do **{platform}** — éifeachtach ón gcéad teachtaireacht eile)_"
-    save_failed:           "_(níorbh fhéidir sábháil sa chumraíocht: {error})_"
+      _(éifeachtach ón gcéad teachtaireacht eile)_'
+    session_only: '⚡ ✓ Priority Processing: **{label}** (an seisiún seo amháin)'
+    state_off: 'off'
+    state_on: 'on'
+    status: '⚡ Priority Processing
 
-  voice:
-    enabled_voice_only:    "Mód gutha cumasaithe.\nFreagróidh mé le guth nuair a sheolann tú teachtaireachtaí gutha.\nÚsáid /voice tts chun freagraí gutha a fháil do gach teachtaireacht."
-    disabled_text:         "Mód gutha díchumasaithe. Freagraí téacs amháin."
-    tts_enabled:           "Auto-TTS cumasaithe.\nBeidh teachtaireacht gutha mar chuid de gach freagra."
-    status_mode:           "Mód gutha: {label}"
-    status_channel:        "Cainéal gutha: #{channel}"
-    status_participants:   "Rannpháirtithe: {count}"
-    status_member:         "  - {name}{status}"
-    speaking:              " (ag labhairt)"
-    enabled_short:         "Mód gutha cumasaithe."
-    disabled_short:        "Mód gutha díchumasaithe."
-    label_off:             "As (téacs amháin)"
-    label_voice_only:      "Ar (freagra gutha do theachtaireachtaí gutha)"
-    label_all:             "TTS (freagra gutha do gach teachtaireacht)"
-    help:                  "{toggle}\n\n**Conas a oibríonn /voice**\n• `/voice on` — freagra gutha nuair a sheolann tú teachtaireacht gutha\n• `/voice tts` — freagra gutha do *gach* teachtaireacht\n• `/voice off` — ar ais go freagraí téacs amháin\n• `/voice status` — taispeáin an mód reatha\n• `/voice` (gan argóint) — scoránaigh go tapa idir air agus as{channels}"
-    help_channels:         "\n\n**Cainéil gutha bheo (Discord)**\n• Téigh isteach i gcainéal gutha ar dtús, ansin `/voice channel` — téim isteach, éistim agus labhraím mo fhreagraí\n• `/voice leave` — dícheangail ón gcainéal gutha"
 
-  yolo:
-    disabled:                   "⚠️ Mód YOLO **AS** don seisiún seo — beidh cead de dhíth d'orduithe contúirteacha."
-    enabled:                    "⚡ Mód YOLO **AR** don seisiún seo — gach ordú ceadaithe go huathoibríoch. Úsáid go cúramach."
+      Mód reatha: `{mode}`
 
+
+      _Úsáid:_ `/fast <normal|fast|status>`'
+    status_fast: fast
+    status_normal: normal
+    unknown_arg: '⚠️ Argóint anaithnid: `{arg}`
+
+
+      **Roghanna bailí:** normal, fast, status'
+  footer:
+    example_line: '
+
+      Sampla: `{preview}`'
+    saved: '📎 Buntásc rite: **{state}**{example}
+
+      _(sábháilte go domhanda — éifeachtach ón gcéad teachtaireacht eile)_'
+    state_off: AS
+    state_on: AR
+    status: '📎 Buntásc rite: **{state}**
+
+      Réimsí: `{fields}`
+
+      Ardán: `{platform}`'
+    usage: 'Úsáid: `/footer [on|off|status]`'
+  goal:
+    invalid: 'Sprioc neamhbhailí: {error}'
+    no_goal_set: Níl aon sprioc socraithe.
+    no_resume: Níl aon sprioc le hatosú.
+    paused: '⏸ Sprioc curtha ar sos: {goal}'
+    resumed: '▶ Sprioc atosaithe: {goal}
+
+      Seol teachtaireacht ar bith chun leanúint, nó fan — déanfaidh mé an chéad chéim eile sa chéad seal eile.'
+    set: '⊙ Sprioc socraithe (buiséad {budget} seal): {goal}
+
+      Leanfaidh mé ag obair go dtí go bhfuil an sprioc críochnaithe, go gcuirfidh tú ar sos / go nglanfaidh tú í, nó go n-úsáidfear an buiséad.
+
+      Smacht: /goal status · /goal pause · /goal resume · /goal clear'
+    unavailable: Níl spriocanna ar fáil sa seisiún seo.
+  goal_cleared: ✓ Sprioc glanta.
+  help:
+    header: '📖 **Orduithe Hermes**
+
+      '
+    more_use_commands: '
+
+      ... agus {count} eile. Úsáid `/commands` don liosta iomlán uimhrithe.'
+    skill_header: '
+
+      ⚡ **Orduithe Scileanna** ({count} gníomhach):'
+  insights:
+    error: 'Earráid agus léargais á gcruthú: {error}'
+    invalid_days: 'Luach --days neamhbhailí: {value}'
+  kanban:
+    error_prefix: '⚠ earráid kanban: {error}'
+    no_output: (gan aschur)
+    subscribed_suffix: (síntiúsaithe — cuirfear in iúl duit nuair a chríochnóidh nó a stopfaidh {task_id})
+    truncated_suffix: … (giorraithe; úsáid `hermes kanban …` i do theirminéal le haghaidh aschur iomláin)
+    wake:
+      blocked: blocked; needs attention
+      completed: completed
+      crashed: crashed (worker exited); dispatcher will retry
+      gave_up: gave up (retries exhausted)
+      message: '[kanban] Task {task_id} {status}.
+
+        Title: {title}
+
+        Assignee: @{assignee}
+
+        Board: {board}
+
+
+        Check the result or decide the next step.'
+      status_default: status changed
+      status_joiner: ', '
+      timed_out: timed out; dispatcher will retry
+  merge:
+    already_merged: This session was already merged into **{title}** — not folding it again. (Start a new exploration to merge fresh material.)
+    blocked_not_owner: You can only merge into sessions you own. '{name}' belongs to a different chat/owner.
+    fold_body: '[MERGED SESSION — {title}] A summary of another session (''{title}'') was folded into this conversation. Treat it as reference context:
+
+
+      {summary}'
+    fold_body_thread: '[BRANCHED THREAD MERGED — {title}] A branched thread was explored and folded back into this conversation. Summary of what happened in the branch:
+
+
+      {summary}'
+    fold_failed: 'Failed to fold the summary into the target session: {error}'
+    ledger_failed: Couldn't safely record the merge (session store busy) — nothing was folded. Try again in a moment.
+    list_footer: _`/merge <number>` folds a summary of THIS session into that one._
+    list_header: '🔀 **Sessions you can merge into** — reply `/merge <number>` or `/merge <name>`:'
+    md_suffix: ' · full record: `{path}`'
+    merged_named: ✅ Merged into **{title}** — a summary of this session is now in its context.{md}
+    merged_thread: ✅ **Folded back into _{title}_**{parent} — a summary of this thread is now in the parent's context, and this thread is archived (still resumable).{md}
+    merged_thread_no_archive: ✅ **Folded back into _{title}_**{parent} — a summary of this thread is now in the parent's context. (Couldn't archive the thread automatically; you can close it manually.){md}
+    no_conversation: Nothing to merge — this session has no conversation yet.
+    no_named_sessions: No titled sessions to merge into yet. Give a session a name with `/title` first.
+    no_new_turns: Nothing new to merge — no turns happened in this thread after the branch point.
+    no_summary: Couldn't generate a summary of this session; nothing was merged. Try again in a moment.
+    not_a_branch: This thread wasn't created by `/branch`, so there's no parent session to merge into.
+    not_a_thread: '`/merge` only works inside a branched thread. Start one with `/branch` in a channel first.'
+    not_found: No session found matching '{name}'. Use `/merge` with no name to list mergeable sessions.
+    note_record_suffix: ' · full record: `{path}`'
+    parent_note: '🔀 **Merged from thread ''{title}''**
+
+      {summary}'
+    same_session: That's the session you're already in — pick a different target to merge into.
+    source_marker: '[MERGED — this thread''s new exploration was folded into ''{target}'' on {when}. You can keep going here, but its summary already lives in that conversation.]'
+    source_marker_named: '[MERGED — a summary of this session was folded into ''{target}'' on {when}. You can keep going here, but its summary already lives in that conversation.]'
+    source_thread_link: ' ({thread})'
+    target_note: 🔀 **Folded in from _{source}_**{child} — a summary of {turns} message(s) is now in this conversation's context.{record}
+    target_note_named: 🔀 **Folded in from _{source}_** — a summary of _{source}_ ({turns} message(s)) is now in this conversation's context.{record}
+    target_parent_link: ' ({parent})'
+  model:
+    capabilities_label: 'Cumais: {capabilities}'
+    context_label: 'Comhthéacs: {tokens} comhartha'
+    cost_label: 'Costas: {cost}'
+    current_label: 'Reatha: `{model}` ar {provider}'
+    current_tag: ' (reatha)'
+    error_prefix: 'Earráid: {error}'
+    max_output_label: 'Aschur uasta: {tokens} comhartha'
+    more_models_suffix: ' (+{count} eile)'
+    prompt_caching_enabled: 'Taisceadh leid: cumasaithe'
+    provider_label: 'Soláthraí: {provider}'
+    reasoning_label: 'Réasúnaíocht: {effort}'
+    saved_global: Sábháilte i config.yaml (`--global`)
+    session_only_hint: _(seisiún amháin — cuir `--global` leis chun é a choinneáil)_
+    switched: Athraíodh an tsamhail go `{model}`
+    usage_persist: '`/model <name> --global` — coinnigh'
+    usage_switch_model: '`/model <name>` — athraigh an tsamhail'
+    usage_switch_provider: '`/model <name> --provider <slug>` — athraigh an soláthraí'
+    warning_prefix: 'Rabhadh: {warning}'
+  no_active_goal: Níl aon sprioc ghníomhach ann.
+  personality:
+    cleared: '🎭 Pearsantacht glanta — ag úsáid iompair bunúsaigh an ghníomhaire.
+
+      _(éifeachtach ón gcéad teachtaireacht eile)_'
+    header: '🎭 **Pearsantachtaí ar fáil**
+
+      '
+    item: • `{name}` — {preview}
+    none_configured: Níl aon phearsantachtaí cumraithe in `{path}/config.yaml`
+    none_option: • `none` — (gan forleagan pearsantachta)
+    save_failed: '⚠️ Theip ar shábháil athraithe pearsantachta: {error}'
+    set_to: '🎭 Pearsantacht socraithe go **{name}**
+
+      _(éifeachtach ón gcéad teachtaireacht eile)_'
+    unknown: 'Pearsantacht anaithnid: `{name}`
+
+
+      Ar fáil: {available}'
+    usage: '
+
+      Úsáid: `/personality <name>`'
+  profile:
+    header: 👤 **Próifíl:** `{profile}`
+    home: 📂 **Baile:** `{home}`
+  reasoning:
+    choice_hide: folaigh réasúnaíocht ó na freagraí
+    choice_none: none — díchumasaigh réasúnaíocht
+    choice_reset: reset — glan sárú an tseisiúin
+    choice_show: taispeáin réasúnaíocht sna freagraí
+    display_off: as
+    display_on: ar ✓
+    display_set_off: '🧠 ✓ Taispeáint réasúnaíochta: **AS** do **{platform}**'
+    display_set_on: '🧠 ✓ Taispeáint réasúnaíochta: **AR**
+
+      Taispeánfar smaointeoireacht na samhla roimh gach freagra ar **{platform}**.'
+    level_default: medium (réamhshocraithe)
+    level_disabled: none (díchumasaithe)
+    picker_title: '🧠 **Socruithe Réasúnaíochta**\n\n**Iarracht:** `{level}`\n**Scóip:** {scope}\n**Taispeáint:** {display}\n\nRoghnaigh rogha:'
+    reset_done: 🧠 ✓ Sárú réasúnaíochta seisiúin glanta; ag titim siar ar an gcumraíocht dhomhanda.
+    reset_global_unsupported: ⚠️ Ní thacaítear le `/reasoning reset --global`. Úsáid `/reasoning <level> --global` chun an réamhshocrú domhanda a athrú.
+    scope_global: cumraíocht dhomhanda
+    scope_session: sárú seisiúin
+    set_global: '🧠 ✓ Iarracht réasúnaíochta socraithe go `{effort}` (sábháilte sa chumraíocht)
+
+      _(éifeachtach ón gcéad teachtaireacht eile)_'
+    set_global_save_failed: '🧠 ✓ Iarracht réasúnaíochta socraithe go `{effort}` (seisiún amháin — theip ar shábháil cumraíochta)
+
+      _(éifeachtach ón gcéad teachtaireacht eile)_'
+    set_session: '🧠 ✓ Iarracht réasúnaíochta socraithe go `{effort}` (seisiún amháin — cuir `--global` leis chun é a choinneáil)
+
+      _(éifeachtach ón gcéad teachtaireacht eile)_'
+    status: '🧠 **Socruithe Réasúnaíochta**
+
+
+      **Iarracht:** `{level}`
+
+      **Scóip:** {scope}
+
+      **Taispeáint:** {display}
+
+
+      _Úsáid:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|reset|show|hide> [--global]`'
+    unknown_arg: '⚠️ Argóint anaithnid: `{arg}`
+
+
+      **Leibhéil bhailí:** none, minimal, low, medium, high, xhigh, max
+
+      **Taispeáint:** show, hide
+
+      **Coinnigh:** cuir `--global` leis chun sábháil thar an seisiún seo'
+  redo:
+    busy: ⏳ The database was busy — nothing was changed. Try /redo again in a moment.
+    draining: ⏳ Stopadh an seal deireanach ach tá sé fós ag críochnú a chéim reatha — ní féidir /redo a rith go fóill. Bain triail eile as i gceann nóiméid.
+    error: ⚠️ Couldn't complete /redo (internal error — nothing was changed). It's been logged.
+    invalid_count: Invalid count "{arg}" — use /redo or /redo N.
+    nothing: Nothing to redo.
+    restart_lost: Nothing to redo — redo history does not survive a restart.
+    restored: ↪️ Redid {ops} undo operation(s) ({count} message(s) restored).
+  reload_mcp:
+    added: '➕ Curtha leis: {names}'
+    always_followup: 'ℹ️ Rithfear glaonna `/reload-mcp` amach anseo gan dearbhú. Athchumasaigh trí `approvals.mcp_reload_confirm: true` a shocrú in config.yaml.'
+    cancelled: 🟡 /reload-mcp cealaithe. Tá uirlisí MCP gan athrú.
+    confirm_prompt: '⚠️ **Dearbhaigh /reload-mcp**
+
+
+      Athlódáil freastalaithe MCP a athchruthaíonn an tacar uirlisí don seisiún seo agus **cuireann sé taisce leid an tsoláthraí ar neamhní** — seolfaidh an chéad teachtaireacht eile na comharthaí ionchuir iomlána arís. Ar shamhlacha le comhthéacs fada nó réasúnaíocht ard, is féidir leis seo a bheith costasach.
+
+
+      Roghnaigh:
+
+      • **Approve Once** — athlódáil anois
+
+      • **Always Approve** — athlódáil anois agus an leid seo a chiúnú go buan
+
+      • **Cancel** — fág uirlisí MCP gan athrú
+
+
+      _Cúltaca téacs: freagair `/approve`, `/always`, nó `/cancel`._'
+    failed: '❌ Theip ar athlódáil MCP: {error}'
+    header: '🔄 **Freastalaithe MCP Athlódáilte**
+
+      '
+    none_connected: Níl aon fhreastalaí MCP ceangailte.
+    reconnected: '♻️ Athcheanglaithe: {names}'
+    removed: '➖ Bainte: {names}'
+    tools_available: '
+
+      🔧 {tools} uirlis(í) ar fáil ó {servers} freastalaí(thí)'
+  reload_skills:
+    added_header: ➕ **Scileanna Curtha leis:**
+    failed: '❌ Theip ar athlódáil scileanna: {error}'
+    header: '🔄 **Scileanna Athlódáilte**
+
+      '
+    item_no_desc: '    - {name}'
+    item_with_desc: '    - {name}: {desc}'
+    no_new: Níor braitheadh aon scil nua.
+    removed_header: ➖ **Scileanna Bainte:**
+    total: '
+
+      📚 {count} scil(eanna) ar fáil'
+  reset:
+    header_default: ✨ Seisiún athshocraithe! Ag tosú as an nua.
+    header_new: ✨ Seisiún nua tosaithe!
+    header_titled: '✨ Seisiún nua tosaithe: {title}'
+    model_preference_unavailable: '
+
+      ⚠ Preserved the explicit model preference, but it is currently unavailable because its credentials could not be resolved. Restore credentials or use `/model reset`.'
+    preferences_preserved: '
+
+      ↪ Preserved explicit {preferences} preferences. Use `/model reset` and `/reasoning reset` to return to configured defaults.'
+    tip: '
+
+      ✦ Leid: {tip}'
+    title_empty_untitled: '
+
+      ⚠️ Tá an teideal folamh tar éis glanta — seisiún tosaithe gan teideal.'
+    title_error_untitled: '
+
+      ⚠️ {error} — seisiún tosaithe gan teideal.'
+    title_rejected: '
+
+      ⚠️ Teideal diúltaithe: {error}'
+  restart:
+    in_progress: ⏳ Tá atosú gateway ar siúl cheana féin...
+    restarting: ♻ Ag atosú gateway. Mura gcuirfear in iúl duit laistigh de 60 soicind, atosaigh ón gconsól le `hermes gateway restart`.
+  resume:
+    already_on: 📌 Cheana ar an seisiún **{name}**.
+    blocked_not_owner: '⚠️ /resume blocked: ''**{name}**'' belongs to a different user or chat. You can only resume sessions from this chat.'
+    db_unavailable: Níl bunachar sonraí na seisiún ar fáil.
+    list_failed: 'Níorbh fhéidir seisiúin a liostáil: {error}'
+    list_footer: '
+
+      Úsáid: `/resume <session name>`'
+    list_footer_numbered: '
+
+      Úsáid: `/resume <ainm seisiúin>` nó `/resume <uimhir>` (m.sh. `/resume 1` don cheann is déanaí)'
+    list_header: '📋 **Seisiúin Ainmnithe**
+
+      '
+    list_item: • **{title}**{preview_part}
+    list_item_numbered: '{index}. **{title}**{preview_part}'
+    list_preview_suffix: ' — _{preview}_'
+    matrix_blocked_no_origin: '⚠️ Matrix /resume blocked: this named session has no recorded room origin, so Hermes will not resume it inside the current room by default. Use `/resume --cross-room {name}` if you intentionally want to cross room boundaries.'
+    matrix_blocked_other_room: '⚠️ Matrix /resume blocked: that session belongs to a different Matrix room ({room}). Use `/resume --cross-room {name}` if you intentionally want to resume it here.'
+    matrix_cross_room_success: '⚠️ Cross-room resume: resumed **{title}** inside Matrix room **{room}**. Future messages in this room will use that transcript until `/reset` or another `/resume`.{msg_part}'
+    matrix_no_named_sessions: No named sessions found for this Matrix room. Use `/title My Session` to name the current room session, `/resume --all` to list all Matrix sessions, or `/resume --cross-room <session name>` to explicitly cross room boundaries.
+    no_named_sessions: 'Níor aimsíodh aon seisiún ainmnithe.
+
+      Úsáid `/title M''Ainm Seisiúin` chun do sheisiún reatha a ainmniú, ansin `/resume M''Ainm Seisiúin` chun filleadh air níos déanaí.'
+    not_found: 'Níor aimsíodh aon seisiún ag teacht le ''**{name}**''.
+
+      Úsáid `/resume` gan argóintí chun seisiúin atá ar fáil a fheiceáil.'
+    out_of_range: 'Tá an t-innéacs atosaithe {index} as raon.
+
+      Úsáid `/resume` gan argóintí chun na seisiúin atá ar fáil a fheiceáil.'
+    parse_error: '⚠️ Could not parse `/resume` arguments: {error}. Use quotes around titles with spaces, for example: `/resume "Project A Plan"`.'
+    resumed_many: ↻ Seisiún **{title}** atosaithe ({count} teachtaireacht). Comhrá aischurtha.
+    resumed_no_count: ↻ Seisiún **{title}** atosaithe. Comhrá aischurtha.
+    resumed_one: ↻ Seisiún **{title}** atosaithe ({count} teachtaireacht). Comhrá aischurtha.
+    switch_failed: Theip ar athrú seisiúin.
+  retry:
+    no_previous: Níl aon teachtaireacht roimhe seo le hath-iarraidh.
+  rollback:
+    invalid_number: Uimhir seicphointe neamhbhailí. Úsáid 1-{max}.
+    none_found: Níor aimsíodh aon seicphointe do {cwd}
+    not_enabled: "Níl seicphointí cumasaithe.\nCumasaigh in config.yaml:\n```\ncheckpoints:\n  enabled: true\n```"
+    restore_failed: ❌ {error}
+    restored: '✅ Aischurtha go seicphointe {hash}: {reason}
+
+      Sábháladh roghchóip réamh-rollback go huathoibríoch.'
+  set_home:
+    save_failed: 'Theip ar shábháil chainéil bhaile: {error}'
+    success: '✅ Cainéal baile socraithe go **{name}** (ID: {chat_id}).
+
+      Seachadfar tascanna cron agus teachtaireachtaí trasardáin anseo.'
   shared:
-    session_db_unavailable:      "Níl bunachar sonraí na seisiún ar fáil."
-    session_db_unavailable_prefix: "Níl bunachar sonraí na seisiún ar fáil"
-    session_not_found:           "Seisiún gan a aimsiú sa bhunachar sonraí."
-    warn_passthrough:            "⚠️ {error}"
+    session_db_unavailable: Níl bunachar sonraí na seisiún ar fáil.
+    session_db_unavailable_prefix: Níl bunachar sonraí na seisiún ar fáil
+    session_not_found: Seisiún gan a aimsiú sa bhunachar sonraí.
+    warn_passthrough: ⚠️ {error}
+  status:
+    agent_running: '**Gníomhaire ag rith:** {state}'
+    context: '**Context:** {used} / {total} ({pct}%)'
+    context_used: '**Context:** ~{used} tokens'
+    created: '**Cruthaithe:** {timestamp}'
+    header: 📊 **Stádas Hermes Gateway**
+    last_activity: '**Gníomhaíocht is déanaí:** {timestamp}'
+    matrix_scope_header: '**Matrix scope:**'
+    matrix_scope_key: '  session_key: {session_key}'
+    matrix_scope_mode: '  session_scope: {scope}'
+    matrix_scope_room: '  room: {room}'
+    matrix_scope_room_id: '  room_id: {room_id}'
+    matrix_scope_thread: '  thread_id: {thread_id}'
+    model: '**Model:** `{model}`'
+    model_provider: '**Model:** `{model}` ({provider})'
+    platforms: '**Ardáin Cheangailte:** {platforms}'
+    queued: '**Tascanna i scuaine:** {count}'
+    session_id: '**ID Seisiúin:** `{session_id}`'
+    state_no: Níl
+    state_yes: Tá ⚡
+    title: '**Teideal:** {title}'
+    tokens: '**Comharthaí:** {tokens}'
+  stop:
+    no_active: Níl aon tasc gníomhach le stopadh.
+    stopped: ⚡ Stoptha. Is féidir leat leanúint leis an seisiún seo.
+    stopped_pending: ⚡ Stoptha. Ní raibh an gníomhaire tosaithe fós — is féidir leat leanúint leis an seisiún seo.
+  title:
+    current_no_title: '📌 Seisiún: `{session_id}`
+
+      Gan teideal socraithe. Úsáid: `/title M''Ainm Seisiúin`'
+    current_with_title: '📌 Seisiún: `{session_id}`
+
+      Teideal: **{title}**'
+    db_unavailable: Níl bunachar sonraí na seisiún ar fáil.
+    empty_after_clean: ⚠️ Tá an teideal folamh tar éis glanta. Bain úsáid as carachtair inphriontáilte le do thoil.
+    not_found: Seisiún gan a aimsiú sa bhunachar sonraí.
+    set_to: '✏️ Teideal seisiúin socraithe: **{title}**'
+    warn_prefix: ⚠️ {error}
+  topic:
+    bound_status: 'Tá an topaic seo nasctha le:
+
+      Seisiún: {label}
+
+      ID: {session_id}
+
+
+      Úsáid /new chun an topaic seo a athsholáthar le seisiún úr.
+
+      Le haghaidh oibre comhthreomhaire, oscail All Messages agus seol teachtaireacht ann chun topaic eile a chruthú.'
+    enable_failed: 'Theip ar mhodh topaice Telegram a chumasú: {error}'
+    no_session_db: Níl bunachar sonraí na seisiún ar fáil.
+    not_telegram_dm: Tá an t-ordú /topic ar fáil amháin i gcomhráite príobháideacha Telegram.
+    restore_needs_topic: Chun seisiún a athchóiriú, cruthaigh nó oscail topaic Telegram ar dtús, ansin seol /topic <session-id> taobh istigh den topaic sin. Chun topaic nua a chruthú, oscail All Messages agus seol teachtaireacht ar bith ann.
+    thread_ready: 'Tá topaicí il-seisiúin Telegram cumasaithe.
+
+
+      Úsáidfear an topaic seo mar sheisiún Hermes neamhspleách. Úsáid /new chun seisiún reatha na topaice seo a athsholáthar. Le haghaidh oibre comhthreomhaire, oscail All Messages agus seol teachtaireacht ann chun topaic eile a chruthú.'
+    topics_disabled: 'Níl topaicí Telegram cumasaithe don bhot seo fós.
+
+
+      Conas iad a chumasú:
+
+      1. Oscail @BotFather.
+
+      2. Roghnaigh do bhot.
+
+      3. Oscail Bot Settings → Threads Settings.
+
+      4. Casadh ar Threaded Mode agus déan cinnte go bhfuil cead ag úsáideoirí snáitheanna nua a chruthú.
+
+
+      Ansin seol /topic arís.'
+    topics_user_disallowed: 'Tá topaicí Telegram cumasaithe, ach níl cead ag úsáideoirí topaicí a chruthú.
+
+
+      Oscail @BotFather → roghnaigh do bhot → Bot Settings → Threads Settings, ansin múchadh ''Disallow users to create new threads''.
+
+
+      Ansin seol /topic arís.'
+    unauthorized: Níl tú údaraithe chun /topic a úsáid ar an mbot seo.
+    untitled_session: Seisiún gan teideal
+  undo:
+    busy: ⏳ The database was busy — nothing was changed. Try /undo again in a moment.
+    draining: ⏳ Stopadh an seal deireanach ach tá sé fós ag críochnú a chéim reatha — ní féidir /undo a rith go fóill. Bain triail eile as i gceann nóiméid.
+    error: ⚠️ Couldn't complete /undo (internal error — nothing was changed). It's been logged.
+    invalid_count: Líon neamhbhailí "{arg}" — úsáid /undo nó /undo N.
+    nothing: Níl aon rud le cealú.
+    now_at: '↦ Now at — {who}:
+
+      “{preview}”'
+    now_at_notext: ↦ Now at — {who} (no text).
+    now_empty: ↦ Now at — start of the thread (no messages left).
+    party:
+      assistant: my reply
+      message: the last message
+      tool: a tool result
+      user: your message
+    removed: "↩️ Undid {turns} half-turn(s) ({count} message(s))."
+  update:
+    hermes_cmd_not_found: ✗ Níorbh fhéidir an t-ordú `hermes` a aimsiú. Tá Hermes ag rith, ach níorbh fhéidir leis an ordú nuashonraithe an inrite a aimsiú ar PATH ná tríd an léirmhínitheoir Python reatha. Bain triail as `hermes update` a rith de láimh i do theirminéal.
+    not_git_repo: ✗ Ní stór git é seo — ní féidir nuashonrú.
+    platform_not_messaging: ✗ Tá /update ar fáil amháin ó ardáin teachtaireachtaí. Rith `hermes update` ón teirminéal.
+    start_failed: '✗ Theip ar nuashonrú a thosú: {error}'
+    starting: ⚕ Ag tosú nuashonrú Hermes… Cuirfidh mé an dul chun cinn ar shruth anseo.
+  usage:
+    breakdown_cat_conversation: Comhrá
+    breakdown_cat_mcp: MCP
+    breakdown_cat_memory: Cuimhne
+    breakdown_cat_rules: Rialacha
+    breakdown_cat_skills: Scileanna
+    breakdown_cat_subagent_definitions: Sainmhínithe fo-ghníomhairí
+    breakdown_cat_system_prompt: Leid an chórais
+    breakdown_cat_tool_definitions: Sainmhínithe uirlisí
+    breakdown_header: 🧩 **Miondealú comhthéacs** _(measta)_
+    breakdown_line: '• {label}: ~{count} ({pct}%)'
+    comp_fixed: '• Fixed: ~{fixed} tok ({sys} system + {tools} tool schemas)'
+    comp_header: 'Last request composition (char/4 estimate):'
+    comp_nonfixed: '• Non-fixed: ~{nonfixed} tok ({hist} history + {results} tool results + {args} tool args)'
+    comp_total: '• Estimated request total: ~{total} tok (sums exactly; fixed + non-fixed)'
+    detailed_after_first: _(Úsáid mhionsonraithe ar fáil tar éis chéad fhreagra an ghníomhaire)_
+    header_session: 📊 **Úsáid Comharthaí Seisiúin**
+    header_session_info: 📊 **Eolas Seisiúin**
+    label_api_calls: 'Glaonna API: {count}'
+    label_cache_read: 'Comharthaí léite ón taisce: {count}'
+    label_cache_write: 'Comharthaí scríofa sa taisce: {count}'
+    label_compressions: 'Dlúthuithe: {count}'
+    label_context: 'Comhthéacs: {used} / {total} ({pct}%)'
+    label_cost: 'Costas: {prefix}${amount}'
+    label_cost_included: 'Costas: san áireamh'
+    label_estimated_context: 'Comhthéacs measta: ~{count} comhartha'
+    label_input_tokens: 'Comharthaí ionchuir: {count}'
+    label_messages: 'Teachtaireachtaí: {count}'
+    label_model: 'Samhail: `{model}`'
+    label_output_tokens: 'Comharthaí aschuir: {count}'
+    label_total: 'Iomlán: {count}'
+    no_data: Níl aon sonraí úsáide ar fáil don seisiún seo.
+    rate_limits: ⏱️ **Teorainneacha Ráta:** {state}
+    reset_wrong_provider: Níl athshocruithe teorann bainc ar fáil ach ar an soláthraí openai-codex. Athraigh le `/model` ar dtús.
+    unknown_subcommand: 'Fo-ordú /usage anaithnid: `{args}`. Bain triail as `/usage` nó `/usage reset [--force]`.'
+  verbose:
+    mode_all: '⚙️ Dul chun cinn uirlise: **GACH CEANN** — taispeántar gach glao uirlise (fad réamhamhairc: `display.tool_preview_length`, réamhshocrú 40).'
+    mode_log: '⚙️ Dul chun cinn uirlise: **LOG** — ciúin sa chomhrá; scríobhtar glaonna uirlise chuig ~/.hermes/logs/tool_calls.log.'
+    mode_new: '⚙️ Dul chun cinn uirlise: **NUA** — taispeánta nuair a athraíonn an uirlis (fad réamhamhairc: `display.tool_preview_length`, réamhshocrú 40).'
+    mode_off: '⚙️ Dul chun cinn uirlise: **AS** — gan aon ghníomhaíocht uirlise á thaispeáint.'
+    mode_verbose: '⚙️ Dul chun cinn uirlise: **BÉALSCAOILTE** — gach glao uirlise le hargóintí iomlána.'
+    not_enabled: "Níl an t-ordú `/verbose` cumasaithe d'ardáin teachtaireachtaí.\n\nCumasaigh in `config.yaml`:\n```yaml\ndisplay:\n  tool_progress_command: true\n```"
+    save_failed: '_(níorbh fhéidir sábháil sa chumraíocht: {error})_'
+    saved_suffix: _(sábháilte do **{platform}** — éifeachtach ón gcéad teachtaireacht eile)_
+  voice:
+    disabled_short: Mód gutha díchumasaithe.
+    disabled_text: Mód gutha díchumasaithe. Freagraí téacs amháin.
+    enabled_short: Mód gutha cumasaithe.
+    enabled_voice_only: 'Mód gutha cumasaithe.
+
+      Freagróidh mé le guth nuair a sheolann tú teachtaireachtaí gutha.
+
+      Úsáid /voice tts chun freagraí gutha a fháil do gach teachtaireacht.'
+    help: '{toggle}
+
+
+      **Conas a oibríonn /voice**
+
+      • `/voice on` — freagra gutha nuair a sheolann tú teachtaireacht gutha
+
+      • `/voice tts` — freagra gutha do *gach* teachtaireacht
+
+      • `/voice off` — ar ais go freagraí téacs amháin
+
+      • `/voice status` — taispeáin an mód reatha
+
+      • `/voice` (gan argóint) — scoránaigh go tapa idir air agus as{channels}'
+    help_channels: '
+
+
+      **Cainéil gutha bheo (Discord)**
+
+      • Téigh isteach i gcainéal gutha ar dtús, ansin `/voice channel` — téim isteach, éistim agus labhraím mo fhreagraí
+
+      • `/voice leave` — dícheangail ón gcainéal gutha'
+    label_all: TTS (freagra gutha do gach teachtaireacht)
+    label_off: As (téacs amháin)
+    label_voice_only: Ar (freagra gutha do theachtaireachtaí gutha)
+    speaking: ' (ag labhairt)'
+    status_channel: 'Cainéal gutha: #{channel}'
+    status_member: '  - {name}{status}'
+    status_mode: 'Mód gutha: {label}'
+    status_participants: 'Rannpháirtithe: {count}'
+    tts_enabled: 'Auto-TTS cumasaithe.
+
+      Beidh teachtaireacht gutha mar chuid de gach freagra.'
+  yolo:
+    disabled: ⚠️ Mód YOLO **AS** don seisiún seo — beidh cead de dhíth d'orduithe contúirteacha.
+    enabled: ⚡ Mód YOLO **AR** don seisiún seo — gach ordú ceadaithe go huathoibríoch. Úsáid go cúramach.

@@ -59,6 +59,30 @@ export function mediaMarkdownHref(path: string): string {
   return `#media:${encodeURIComponent(path)}`
 }
 
+export function isInlineMediaSrc(path: string): boolean {
+  return /^(?:https?|data):/i.test(path)
+}
+
+function isFileMediaPath(path: string): boolean {
+  return /^(?:file:|\/|~\/|[a-z]:[\\/]|\\\\)/i.test(path)
+}
+
+export async function resolveMediaDisplaySrc(path: string): Promise<string> {
+  if (isInlineMediaSrc(path) || !isFileMediaPath(path)) {
+    return path
+  }
+
+  if (window.hermesDesktop && isRemoteGateway()) {
+    return gatewayMediaDataUrl(path)
+  }
+
+  if (!window.hermesDesktop?.readFileDataUrl) {
+    return mediaExternalUrl(path)
+  }
+
+  return window.hermesDesktop.readFileDataUrl(filePathFromMediaPath(path))
+}
+
 // Resolve a media path to a URL the shell can open. Remote mode cannot hand a
 // gateway-local path to this machine's OS as file://, and Ace's OAuth config has
 // no scoped query token. Route through Electron's authenticated bytes-to-temp
@@ -137,20 +161,12 @@ export function isRemoteGateway(): boolean {
   return $connection.get()?.mode === 'remote'
 }
 
-// Fetch a gateway-local image as a data URL via the authenticated REST bridge.
-// Used in remote mode where readFileDataUrl (which reads THIS machine's disk)
-// can't see files the agent wrote on the gateway. Requires the gateway to
-// expose GET /api/media (hermes_cli/web_server.py).
+// Fetch gateway-local media as a data URL via the authenticated desktop FS
+// bridge. Remote Desktop artifacts can live anywhere the gateway can read
+// (workspace, skills, ~/.hermes/cache, etc.); /api/media is intentionally
+// narrower and rejects non-images plus images outside its media roots.
 export async function gatewayMediaDataUrl(path: string): Promise<string> {
-  const file = filePathFromMediaPath(path)
-  const profile = $connection.get()?.profile || undefined
-
-  const result = await window.hermesDesktop!.api<{ data_url: string }>({
-    path: `/api/media?path=${encodeURIComponent(file)}`,
-    ...(profile ? { profile } : {})
-  })
-
-  return result.data_url
+  return readDesktopFileDataUrl(filePathFromMediaPath(path))
 }
 
 export function mediaDisplayLabel(path: string): string {

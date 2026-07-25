@@ -388,6 +388,12 @@ class LCMEngine(ContextEngine):
         # silent maintenance. Manual /lcm diagnostics and warning/error paths
         # remain explicit.
         self.emit_automatic_compaction_status = False
+        # ...but the in-chat compaction ANNOUNCE stays ON: LCM moves raw turns
+        # out of the live context into lcm.db, and the announce is the only
+        # place the user is told they are recoverable (lcm_grep / lcm_expand).
+        # Silencing it would make LCM compaction look lossy. Explicit True
+        # (not inherit) — see ContextEngine.emit_automatic_compaction_announce.
+        self.emit_automatic_compaction_announce = True
         self.quiet_mode = True
         self.summary_model = self._config.summary_model
         self._summary_circuit_breaker = SummaryCircuitBreaker(
@@ -955,8 +961,16 @@ class LCMEngine(ContextEngine):
 
     def compress(self, messages: List[Dict[str, Any]],
                  current_tokens: Optional[int] = None,
-                 focus_topic: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Main compaction entry point with fail-open degraded handling."""
+                 focus_topic: Optional[str] = None,
+                 force: bool = False,
+                 memory_context: str = "") -> List[Dict[str, Any]]:
+        """Main compaction entry point with fail-open degraded handling.
+
+        ``force`` and ``memory_context`` are part of the ContextEngine ABC
+        contract. LCM has no engine-owned cooldown to bypass and builds its
+        own lossless handoff, so both are accepted for signature parity and
+        intentionally ignored.
+        """
         try:
             compressed = self._compress_lossless(
                 messages,

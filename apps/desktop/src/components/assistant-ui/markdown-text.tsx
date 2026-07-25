@@ -2,7 +2,6 @@
 
 import { TextMessagePartProvider, useMessagePartText } from '@assistant-ui/react'
 import {
-  parseMarkdownIntoBlocks,
   type StreamdownTextComponents,
   StreamdownTextPrimitive,
   type SyntaxHighlighterProps,
@@ -18,17 +17,20 @@ import { ZoomableImage } from '@/components/chat/zoomable-image'
 import { readDesktopFileDataUrl } from '@/lib/desktop-fs'
 import { normalizeExternalUrl, openExternalLink, PrettyLink } from '@/lib/external-link'
 import { createMemoizedMathPlugin } from '@/lib/katex-memo'
+import { parseMarkdownIntoBlocksCached } from '@/lib/markdown-blocks'
 import { preprocessMarkdown } from '@/lib/markdown-preprocess'
 import {
   downloadGatewayMediaFile,
   filePathFromMediaPath,
   gatewayMediaDataUrl,
+  isInlineMediaSrc,
   isRemoteGateway,
   mediaExternalUrl,
   mediaKind,
   mediaName,
   mediaPathFromMarkdownHref,
-  mediaStreamUrl
+  mediaStreamUrl,
+  resolveMediaDisplaySrc
 } from '@/lib/media'
 import { previewTargetFromMarkdownHref } from '@/lib/preview-targets'
 import { cn } from '@/lib/utils'
@@ -60,42 +62,9 @@ function preprocessWithTailRepair(text: string): string {
   }
 }
 
-// Memoized block splitter. Streamdown calls `parseMarkdownIntoBlocks` (a full
-// `marked` lex of the entire message, ~1.6ms per 28KB) inside a useMemo keyed
-// on the text — but the same text is re-lexed every time a message REMOUNTS
-// (virtualizer scroll, session switch). A small module-level
-// LRU keyed by the exact source string removes all of those repeat parses
-// with zero correctness risk (same input → same output). Streaming tail
-// growth misses the cache by design (every flush is a new string) — that
-// single lex is the irreducible cost.
-const BLOCK_CACHE_MAX = 64
-const BLOCK_CACHE_MIN_LENGTH = 1024
-const blockCache = new Map<string, string[]>()
-
-function parseMarkdownIntoBlocksCached(markdown: string): string[] {
-  if (markdown.length < BLOCK_CACHE_MIN_LENGTH) {
-    return parseMarkdownIntoBlocks(markdown)
-  }
-
-  const hit = blockCache.get(markdown)
-
-  if (hit) {
-    // Refresh recency (Map iteration order is insertion order).
-    blockCache.delete(markdown)
-    blockCache.set(markdown, hit)
-
-    return hit
-  }
-
-  const blocks = parseMarkdownIntoBlocks(markdown)
-  blockCache.set(markdown, blocks)
-
-  if (blockCache.size > BLOCK_CACHE_MAX) {
-    blockCache.delete(blockCache.keys().next().value as string)
-  }
-
-  return blocks
-}
+// Memoized block splitting lives in `@/lib/markdown-blocks`
+// (`parseMarkdownIntoBlocksCached`, imported above) so the cache is shared and
+// unit-tested once.
 
 const AUDIO_VIDEO_KINDS = new Set(['audio', 'video'])
 
@@ -128,6 +97,7 @@ export async function mediaSrc(path: string): Promise<string> {
   }
 
   return readDesktopFileDataUrl(filePathFromMediaPath(path))
+
 }
 
 function useOpenMediaFile(path: string) {
@@ -353,6 +323,65 @@ function MarkdownLink({ children, className, href, ...props }: ComponentProps<'a
 }
 
 function MarkdownImage({ className, src, alt, ...props }: ComponentProps<'img'>) {
+  const rawSrc = typeof src === 'string' ? src : ''
+  const [resolvedSrc, setResolvedSrc] = useState(() => (rawSrc && isInlineMediaSrc(rawSrc) ? rawSrc : ''))
+  const [failed, setFailed] = useState(false)
+  const { open, openFailed } = useOpenMediaFile(rawSrc)
+  const name = mediaName(rawSrc || String(alt || 'image'))
+
+  useEffect(() => {
+    let cancelled = false
+
+    setFailed(false)
+    setResolvedSrc(rawSrc && isInlineMediaSrc(rawSrc) ? rawSrc : '')
+
+    if (!rawSrc || isInlineMediaSrc(rawSrc)) {
+      return () => {
+        cancelled = true
+      }
+    }
+
+    void resolveMediaDisplaySrc(rawSrc)
+      .then(value => {
+        if (!cancelled) {
+          setResolvedSrc(value)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setFailed(true)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [rawSrc])
+
+  if (!rawSrc) {
+    return null
+  }
+
+  if (failed) {
+    return (
+      <span className="my-2 block text-sm text-muted-foreground">
+        Couldn&apos;t load {name}.{' '}
+        <button
+          className="bg-transparent font-medium text-foreground underline underline-offset-4 decoration-current/20 hover:text-foreground"
+          onClick={open}
+          type="button"
+        >
+          Open image
+        </button>
+        {openFailed && <OpenMediaFailedNote name={name} />}
+      </span>
+    )
+  }
+
+  if (!resolvedSrc) {
+    return <span className="my-2 block text-sm text-muted-foreground">Loading {name}...</span>
+  }
+
   return (
     <ZoomableImage
       alt={alt}
@@ -362,7 +391,7 @@ function MarkdownImage({ className, src, alt, ...props }: ComponentProps<'img'>)
       )}
       containerClassName="my-2 block w-fit max-w-full"
       slot="aui_markdown-image"
-      src={src}
+      src={resolvedSrc}
       {...props}
     />
   )

@@ -464,12 +464,27 @@ class EventBridge:
         if db_mtime == self._state_db_mtime:
             return  # Nothing changed since last poll — skip entirely
 
-        self._state_db_mtime = db_mtime
         # Refresh the routing index from state.db on every change tick —
         # it's a single indexed query and it can never lag the messages
         # table (both live in the same database file).
         self._cached_sessions_index = _load_sessions_index()
         entries = self._cached_sessions_index
+
+        # Re-read state.db's mtime AFTER loading the routing index and record
+        # THAT as the baseline. Opening a SessionDB to read the index can
+        # itself write to state.db (schema/FTS reconciliation on open bumps
+        # the file mtime), and that self-inflicted write lands AFTER the
+        # pre-load mtime we gated on. Storing the pre-load value would make
+        # the very next poll see a "changed" file and reprocess every session
+        # forever (a busy-poll that defeats the mtime short-circuit). Capturing
+        # the post-load mtime folds our own read-side write into the baseline
+        # so only a genuine external change re-triggers work.
+        try:
+            self._state_db_mtime = (
+                db_file.stat().st_mtime if db_file.exists() else db_mtime
+            )
+        except OSError:
+            self._state_db_mtime = db_mtime
 
         for session_key, entry in entries.items():
             session_id = entry.get("session_id", "")

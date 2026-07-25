@@ -29,7 +29,7 @@ import { RENDER_BUDGET, useTwoPhaseRenderBudget } from './use-two-phase-render-b
 
 type ThreadMessageComponents = ComponentProps<typeof ThreadPrimitive.MessageByIndex>['components']
 
-type MessageGroup = { id: string; weight: number } & (
+export type MessageGroup = { id: string; weight: number } & (
   | { index: number; kind: 'standalone' }
   | { indices: number[]; kind: 'turn' }
 )
@@ -53,7 +53,7 @@ interface ThreadMessageListProps {
 // Group each user message with the assistant turn(s) that follow it so the
 // human bubble can `position: sticky` against the scroller across its whole
 // turn (see StickyHumanMessageContainer in thread.tsx).
-function buildGroups(signature: string): MessageGroup[] {
+export function buildGroups(signature: string): MessageGroup[] {
   if (!signature) {
     return []
   }
@@ -89,6 +89,45 @@ function buildGroups(signature: string): MessageGroup[] {
   return groups
 }
 
+// Walk turns newest-first, summing their part weights until the budget is met;
+// everything before the first kept turn is hidden. Returns the index of that
+// first visible group.
+export function firstVisibleGroupIndex(groups: readonly MessageGroup[], budget: number): number {
+  let firstVisible = groups.length
+
+  for (let i = groups.length - 1, weight = 0; i >= 0; i--) {
+    weight += groups[i].weight
+    firstVisible = i
+
+    if (weight >= budget) {
+      break
+    }
+  }
+
+  return firstVisible
+}
+
+// content-visibility:auto skips off-screen turns for perf, but with
+// contain-intrinsic-size:auto the browser only remembers a turn's size AFTER
+// it has rendered. A turn that finishes streaming near the bottom may have had
+// its (smaller) mid-stream size remembered; when it scrolls just off the top
+// edge and gets skipped, it snaps back to that stale height, shifting content
+// down. With overflow-anchor:none (the viewport can't self-correct) the
+// stick-to-bottom lock drifts and the view creeps up over older turns — the
+// "long session eventually shows old responses" glitch.
+//
+// Keep the newest N turns always-rendered so a turn is only ever virtualized
+// once its layout has settled at its final size (remembered == real → skipping
+// it changes no height). Off-screen OLDER turns still skip, so the dialog/popover
+// recalc win on long transcripts is preserved (that scales with the hundreds of
+// old turns, not this small live tail).
+export const LIVE_TAIL_GROUPS = 6
+
+/** True when a visible group is old enough to virtualize (outside the live tail). */
+export function isVirtualizedGroup(indexInVisible: number, visibleCount: number, liveTail = LIVE_TAIL_GROUPS): boolean {
+  return indexInVisible < visibleCount - liveTail
+}
+
 const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   clampToComposer,
   components,
@@ -122,26 +161,16 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   // Before the raise commits, record the distance-from-bottom so the restore
   // effect below (shared with "Show earlier") preserves the viewport — at the
   // bottom this restores to the bottom; scrolled up it holds the reading spot.
+  // The hook owns the render-phase switch reset + the idle-time backfill raise
+  // (upstream's inline budgetSessionKey/backfill machinery is the same feature
+  // as this hook; fork extracted it, so it lives in the hook, not here).
   const [renderBudget, setRenderBudget] = useTwoPhaseRenderBudget(sessionKey, () => {
     const el = scrollRef.current
 
     restoreFromBottomRef.current = el ? el.scrollHeight - el.scrollTop : null
   })
 
-  // Walk turns newest-first, summing their part weights until the budget is met;
-  // everything before that first kept turn is hidden.
-  let firstVisible = groups.length
-
-  for (let i = groups.length - 1, weight = 0; i >= 0; i--) {
-    weight += groups[i].weight
-    firstVisible = i
-
-    if (weight >= renderBudget) {
-      break
-    }
-  }
-
-  const hiddenCount = firstVisible
+  const hiddenCount = firstVisibleGroupIndex(groups, renderBudget)
   const visibleGroups = hiddenCount > 0 ? groups.slice(hiddenCount) : groups
   // Secondary windows (new-session scratch, subagent watch, cmd-click pop-out)
   // hide the titlebar tool cluster + session header, but the OS traffic lights
@@ -223,8 +252,10 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
       lastHeight = height
       node.scrollTop = height
 
-      // ~5 steady frames ≈ layout has settled; the frame cap bounds slow loads.
-      if (stableFrames >= 5 || ++frame > 90) {
+      // Most session switches are synchronous and stabilize within 2 frames;
+      // the old 90-frame ceiling was for slow async image loads. Cap at 15
+      // frames to minimize the settle-loop racing markdown paint on every switch.
+      if (stableFrames >= 2 || ++frame > 15) {
         void scrollToBottom('instant')
 
         return
@@ -306,9 +337,28 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
                 {t.assistant.thread.showEarlier}
               </button>
             )}
-            {visibleGroups.map(group => (
+            {visibleGroups.map((group, indexInVisible) => (
+              // content-visibility:auto — off-screen turns skip style recalc,
+              // layout, and paint. On a long transcript this is what keeps
+              // UNRELATED UI fast: any dialog/popover mount (Radix Presence
+              // reads getComputedStyle) forces a whole-document style recalc,
+              // measured ~650-730ms per open on a 1300-message session and
+              // ~100-200ms with this on. contain-intrinsic-size keeps a
+              // placeholder height for never-rendered turns (auto: remembered
+              // real size once rendered), so scrollbar/anchoring stay stable.
+              // Sticky human bubbles are unaffected — their turn is rendered
+              // whenever any part of it intersects the viewport.
+              //
+              // The live tail (newest turns) is exempt: virtualizing a turn
+              // whose final size hasn't been remembered yet snaps it to a stale
+              // height when it scrolls off, drifting stick-to-bottom up over old
+              // turns. See isVirtualizedGroup.
               <div
-                className="flex min-w-0 flex-col gap-(--conversation-turn-gap) pb-(--conversation-turn-gap)"
+                className={cn(
+                  'flex min-w-0 flex-col gap-(--conversation-turn-gap) pb-(--conversation-turn-gap)',
+                  isVirtualizedGroup(indexInVisible, visibleGroups.length) &&
+                    '[contain-intrinsic-size:auto_37.5rem] [content-visibility:auto]'
+                )}
                 key={group.id}
               >
                 <MessageRenderBoundary resetKey={messageSignature}>

@@ -1,492 +1,678 @@
-# Hermes static-message catalog -- French (français)
-# See locales/en.yaml for the source of truth; keep keys in sync.
-
 approval:
-  dangerous_header: "⚠️  COMMANDE DANGEREUSE : {description}"
-  choose_long:     "      [o]ne fois  |  [s]ession  |  [t]oujours  |  [r]efuser"
-  choose_short:    "      [o]ne fois  |  [s]ession  |  [r]efuser"
-  prompt_long:     "      Choix [o/s/t/R] : "
-  prompt_short:    "      Choix [o/s/R] : "
-  choose_smart_deny: "      [o]ne fois  |  [r]efuser"
-  prompt_smart_deny: "      Choix [o/R] : "
-  smart_deny_once_inputs: "o,once"
-  smart_deny_deny_inputs: "r,refuser"
-  timeout:         "      ⏱ Délai dépassé — commande refusée"
-  allowed_once:    "      ✓ Autorisé une fois"
-  allowed_session: "      ✓ Autorisé pour cette session"
-  allowed_always:  "      ✓ Ajouté à la liste d'autorisation permanente"
-  denied:          "      ✗ Refusé"
-  cancelled:       "      ✗ Annulé"
-  blocklist_message: "Cette commande est sur la liste de blocage inconditionnel et ne peut pas être approuvée."
-
+  allowed_always: '      ✓ Ajouté à la liste d''autorisation permanente'
+  allowed_once: '      ✓ Autorisé une fois'
+  allowed_session: '      ✓ Autorisé pour cette session'
+  blocklist_message: Cette commande est sur la liste de blocage inconditionnel et ne peut pas être approuvée.
+  cancelled: '      ✗ Annulé'
+  choose_long: '      [o]ne fois  |  [s]ession  |  [t]oujours  |  [r]efuser'
+  choose_short: '      [o]ne fois  |  [s]ession  |  [r]efuser'
+  choose_smart_deny: '      [o]ne fois  |  [r]efuser'
+  dangerous_header: '⚠️  COMMANDE DANGEREUSE : {description}'
+  denied: '      ✗ Refusé'
+  prompt_long: '      Choix [o/s/t/R] : '
+  prompt_short: '      Choix [o/s/R] : '
+  prompt_smart_deny: '      Choix [o/R] : '
+  smart_deny_deny_inputs: r,refuser
+  smart_deny_once_inputs: o,once
+  timeout: '      ⏱ Délai dépassé — commande refusée'
 gateway:
-  approval_expired: "⚠️ Approbation expirée (l'agent n'attend plus). Demandez à l'agent de réessayer."
-  draining:         "⏳ Vidage de {count} agent(s) actif(s) avant redémarrage..."
-  goal_cleared:     "✓ Objectif effacé."
-  no_active_goal:   "Aucun objectif actif."
-  config_read_failed: "⚠️ Impossible de lire config.yaml : {error}"
-  config_save_failed: "⚠️ Impossible de sauvegarder la configuration : {error}"
-
-  model:
-    error_prefix:           "Erreur : {error}"
-    switched:               "Modèle changé pour `{model}`"
-    provider_label:         "Fournisseur : {provider}"
-    reasoning_label:        "Raisonnement : {effort}"
-    context_label:          "Contexte : {tokens} tokens"
-    max_output_label:       "Sortie max. : {tokens} tokens"
-    cost_label:             "Coût : {cost}"
-    capabilities_label:     "Capacités : {capabilities}"
-    prompt_caching_enabled: "Cache de prompts : activé"
-    warning_prefix:         "Avertissement : {warning}"
-    saved_global:           "Enregistré dans config.yaml (`--global`)"
-    session_only_hint:      "_(session uniquement — ajoutez `--global` pour conserver)_"
-    current_label:          "Actuel : `{model}` chez {provider}"
-    current_tag:            " (actuel)"
-    more_models_suffix:     " (+{count} autres)"
-    usage_switch_model:     "`/model <name>` — changer de modèle"
-    usage_switch_provider:  "`/model <name> --provider <slug>` — changer de fournisseur"
-    usage_persist:          "`/model <name> --global` — conserver"
-
   agents:
-    header:                "🤖 **Agents et tâches actifs**"
-    active_agents:         "**Agents actifs :** {count}"
-    this_chat:             " · ce chat"
-    more:                  "... et {count} de plus"
-    running_processes:     "**Processus d'arrière-plan en cours :** {count}"
-    async_jobs:            "**Tâches asynchrones du gateway :** {count}"
-    none:                  "Aucun agent actif ni tâche en cours."
-    state_starting:        "démarrage"
-    state_running:         "en cours"
-
+    active_agents: '**Agents actifs :** {count}'
+    async_jobs: '**Tâches asynchrones du gateway :** {count}'
+    header: 🤖 **Agents et tâches actifs**
+    more: '... et {count} de plus'
+    none: Aucun agent actif ni tâche en cours.
+    running_processes: '**Processus d''arrière-plan en cours :** {count}'
+    state_running: en cours
+    state_starting: démarrage
+    this_chat: ' · ce chat'
+  approval_expired: ⚠️ Approbation expirée (l'agent n'attend plus). Demandez à l'agent de réessayer.
   approve:
-    no_pending:            "Aucune commande en attente d'approbation."
-    once_singular:         "✅ Commande approuvée. L'agent reprend..."
-    once_plural:           "✅ Commandes approuvées ({count} commandes). L'agent reprend..."
-    session_singular:      "✅ Commande approuvée (modèle approuvé pour cette session). L'agent reprend..."
-    session_plural:        "✅ Commandes approuvées (modèle approuvé pour cette session) ({count} commandes). L'agent reprend..."
-    always_singular:       "✅ Commande approuvée (modèle approuvé de manière permanente). L'agent reprend..."
-    always_plural:         "✅ Commandes approuvées (modèle approuvé de manière permanente) ({count} commandes). L'agent reprend..."
-
+    always_plural: ✅ Commandes approuvées (modèle approuvé de manière permanente) ({count} commandes). L'agent reprend...
+    always_singular: ✅ Commande approuvée (modèle approuvé de manière permanente). L'agent reprend...
+    no_pending: Aucune commande en attente d'approbation.
+    once_plural: ✅ Commandes approuvées ({count} commandes). L'agent reprend...
+    once_singular: ✅ Commande approuvée. L'agent reprend...
+    session_plural: ✅ Commandes approuvées (modèle approuvé pour cette session) ({count} commandes). L'agent reprend...
+    session_singular: ✅ Commande approuvée (modèle approuvé pour cette session). L'agent reprend...
   background:
-    usage:                 "Usage : /background <prompt>\nExemple : /background Résume les meilleures histoires HN d'aujourd'hui\n\nExécute le prompt dans une session séparée. Vous pouvez continuer à discuter — le résultat apparaîtra ici une fois terminé."
-    started:               "🔄 Tâche d'arrière-plan démarrée : « {preview} »\nID de tâche : {task_id}\nVous pouvez continuer à discuter — les résultats apparaîtront ici une fois terminés."
+    started: '🔄 Tâche d''arrière-plan démarrée : « {preview} »
 
+      ID de tâche : {task_id}
+
+      Vous pouvez continuer à discuter — les résultats apparaîtront ici une fois terminés.'
+    usage: 'Usage : /background <prompt>
+
+      Exemple : /background Résume les meilleures histoires HN d''aujourd''hui
+
+
+      Exécute le prompt dans une session séparée. Vous pouvez continuer à discuter — le résultat apparaîtra ici une fois terminé.'
   branch:
-    db_unavailable:        "Base de données des sessions indisponible."
-    no_conversation:       "Aucune conversation à brancher — envoyez d'abord un message."
-    create_failed:         "Échec de la création de la branche : {error}"
-    switch_failed:         "Branche créée mais impossible de basculer dessus."
-    branched_one:          "⑂ Branche **{title}** créée ({count} message copié)\nOriginal : `{parent}`\nBranche : `{new}`\nUtilisez `/resume` pour revenir à l'original."
-    branched_many:         "⑂ Branche **{title}** créée ({count} messages copiés)\nOriginal : `{parent}`\nBranche : `{new}`\nUtilisez `/resume` pour revenir à l'original."
-    thread_intro:          "⑂ **Branched thread — {title}**\nThis thread inherits the parent conversation ({count} messages) from {parent}. Explore freely here; the parent channel keeps its own session. Use `/merge` to fold a summary back into the parent."
-    thread_parent_fallback: "the parent conversation"
-    thread_branched_one:   "⑂ Branched into a new thread → {thread} (**{title}**, {count} message inherited).\nThe parent channel stays on its own session; use `/merge` inside the thread to fold it back."
-    thread_branched_many:  "⑂ Branched into a new thread → {thread} (**{title}**, {count} messages inherited).\nThe parent channel stays on its own session; use `/merge` inside the thread to fold it back."
+    branched_many: '⑂ Branche **{title}** créée ({count} messages copiés)
 
-  merge:
-    not_a_thread:          "`/merge` only works inside a branched thread. Start one with `/branch` in a channel first."
-    not_a_branch:          "This thread wasn't created by `/branch`, so there's no parent session to merge into."
-    not_found:             "No session found matching '{name}'. Use `/merge` with no name to list mergeable sessions."
-    same_session:          "That's the session you're already in — pick a different target to merge into."
-    already_merged:        "This session was already merged into **{title}** — not folding it again. (Start a new exploration to merge fresh material.)"
-    blocked_not_owner:     "You can only merge into sessions you own. '{name}' belongs to a different chat/owner."
-    no_named_sessions:     "No titled sessions to merge into yet. Give a session a name with `/title` first."
-    list_header:           "🔀 **Sessions you can merge into** — reply `/merge <number>` or `/merge <name>`:"
-    list_footer:           "_`/merge <number>` folds a summary of THIS session into that one._"
-    no_conversation:       "Nothing to merge — this session has no conversation yet."
-    no_new_turns:          "Nothing new to merge — no turns happened in this thread after the branch point."
-    no_summary:            "Couldn't generate a summary of this session; nothing was merged. Try again in a moment."
-    fold_failed:           "Failed to fold the summary into the target session: {error}"
-    ledger_failed:         "Couldn't safely record the merge (session store busy) — nothing was folded. Try again in a moment."
-    fold_body:             "[MERGED SESSION — {title}] A summary of another session ('{title}') was folded into this conversation. Treat it as reference context:\n\n{summary}"
-    fold_body_thread:      "[BRANCHED THREAD MERGED — {title}] A branched thread was explored and folded back into this conversation. Summary of what happened in the branch:\n\n{summary}"
-    md_suffix:             " · full record: `{path}`"
-    note_record_suffix:    " · full record: `{path}`"
-    source_marker:         "[MERGED — this thread's new exploration was folded into '{target}' on {when}. You can keep going here, but its summary already lives in that conversation.]"
-    source_marker_named:   "[MERGED — a summary of this session was folded into '{target}' on {when}. You can keep going here, but its summary already lives in that conversation.]"
-    parent_note:           "🔀 **Merged from thread '{title}'**\n{summary}"
-    target_note:           "🔀 **Folded in from _{source}_**{child} — a summary of {turns} message(s) is now in this conversation's context.{record}"
-    target_note_named:     "🔀 **Folded in from _{source}_** — a summary of _{source}_ ({turns} message(s)) is now in this conversation's context.{record}"
-    source_thread_link:    " ({thread})"
-    merged_named:          "✅ Merged into **{title}** — a summary of this session is now in its context.{md}"
-    merged_thread:         "✅ **Folded back into _{title}_**{parent} — a summary of this thread is now in the parent's context, and this thread is archived (still resumable).{md}"
-    merged_thread_no_archive: "✅ **Folded back into _{title}_**{parent} — a summary of this thread is now in the parent's context. (Couldn't archive the thread automatically; you can close it manually.){md}"
-    target_parent_link:    " ({parent})"
+      Original : `{parent}`
 
+      Branche : `{new}`
+
+      Utilisez `/resume` pour revenir à l''original.'
+    branched_one: '⑂ Branche **{title}** créée ({count} message copié)
+
+      Original : `{parent}`
+
+      Branche : `{new}`
+
+      Utilisez `/resume` pour revenir à l''original.'
+    create_failed: 'Échec de la création de la branche : {error}'
+    db_unavailable: Base de données des sessions indisponible.
+    no_conversation: Aucune conversation à brancher — envoyez d'abord un message.
+    switch_failed: Branche créée mais impossible de basculer dessus.
+    thread_branched_many: '⑂ Branched into a new thread → {thread} (**{title}**, {count} messages inherited).
+
+      The parent channel stays on its own session; use `/merge` inside the thread to fold it back.'
+    thread_branched_one: '⑂ Branched into a new thread → {thread} (**{title}**, {count} message inherited).
+
+      The parent channel stays on its own session; use `/merge` inside the thread to fold it back.'
+    thread_intro: '⑂ **Branched thread — {title}**
+
+      This thread inherits the parent conversation ({count} messages) from {parent}. Explore freely here; the parent channel keeps its own session. Use `/merge` to fold a summary back into the parent.'
+    thread_parent_fallback: the parent conversation
   commands:
-    usage:                 "Utilisation : `/commands [page]`"
-    skill_header:          "⚡ **Commandes de skill** :"
-    default_desc:          "Commande de skill"
-    none:                  "Aucune commande disponible."
-    header:                "📚 **Commandes** ({total} au total, page {page}/{total_pages})"
-    nav_prev:              "`/commands {page}` ← précédent"
-    nav_next:              "suivant → `/commands {page}`"
-    out_of_range:          "_(La page demandée {requested} était hors limites, affichage de la page {page}.)_"
-
+    default_desc: Commande de skill
+    header: 📚 **Commandes** ({total} au total, page {page}/{total_pages})
+    nav_next: suivant → `/commands {page}`
+    nav_prev: '`/commands {page}` ← précédent'
+    none: Aucune commande disponible.
+    out_of_range: _(La page demandée {requested} était hors limites, affichage de la page {page}.)_
+    skill_header: '⚡ **Commandes de skill** :'
+    usage: 'Utilisation : `/commands [page]`'
   compress:
-    not_enough:            "Conversation insuffisante pour la compression (au moins 4 messages nécessaires)."
-    no_provider:           "Aucun fournisseur configuré — compression impossible."
-    nothing_to_do:         "Rien à compresser pour l'instant (la transcription est encore entièrement du contexte protégé)."
-    aggressive_unsupported: "--aggressive n'est pas pris en charge ; utilisez '/compress here [N]' pour ne conserver que les échanges récents, ou /undo pour supprimer des tours."
-    focus_line:            "Focus : \"{topic}\""
-    chat_size:             "Chat size: ~{before:,} → ~{after:,} tokens (excludes system, tools, tool results)"
-    chat_size_unchanged:   "Chat size: ~{before:,} tokens (unchanged; excludes system, tools, tool results)"
-    full_request_real:     "Full request size: {before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; before = last live request, after = estimate of next)"
-    full_request_est:      "Full request size: ~{before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; estimated — no live request yet)"
-    full_request_no_fixed: "after excludes system prompt + tool schemas (no resident agent to measure them); next live turn will show the full size."
-    full_request_unchanged: "Full request size: {before} tokens (unchanged — next turn resends the same context)"
-    persist_failed:        "⚠️ La compression a bien été exécutée, mais le résultat n'a pas pu être enregistré — la base de données de la session était occupée (verrouillée). Rien n'a été perdu ; votre transcription est inchangée. Relancez /compress dans un instant pour réessayer."
-    summary_failed:        "⚠️ Échec de la génération du résumé ({error}). {count} message(s) historique(s) ont été supprimés et remplacés par un espace réservé ; le contexte antérieur n'est plus récupérable. Vérifiez la configuration du modèle auxiliary.compression."
-    aborted:               "⚠️ Compression interrompue ({error}). Aucun message n'a été supprimé — la conversation est inchangée. Lancez /compress pour réessayer, /reset pour une nouvelle session, ou vérifiez la configuration de votre modèle auxiliary.compression."
-    aux_failed:            "ℹ️ Le modèle de compression configuré `{model}` a échoué ({error}). Récupéré avec votre modèle principal — le contexte est intact — mais vous pouvez vérifier `auxiliary.compression.model` dans config.yaml."
-    failed:                "Échec de la compression : {error}"
-
-  debug:
-    upload_failed:         "✗ Échec de l'envoi du rapport de débogage : {error}"
-    header:                "**Rapport de débogage envoyé :**"
-    auto_delete:           "⏱ Les pastes s'effaceront automatiquement dans 6 heures."
-    full_logs_hint:        "Pour envoyer les journaux complets, utilisez `hermes debug share` depuis la CLI."
-    share_hint:            "Partagez ces liens avec l'équipe Hermes pour obtenir de l'aide."
-
-  deny:
-    stale:                 "❌ Commande refusée (l'approbation était périmée)."
-    no_pending:            "Aucune commande en attente de refus."
-    denied_singular:       "❌ Commande refusée."
-    denied_plural:         "❌ Commandes refusées ({count} commandes)."
-    denied_reason_singular: "❌ Commande refusée. Raison transmise à l'agent: \"{reason}\""
-    denied_reason_plural:  "❌ Commandes refusées ({count} commandes). Raison transmise à l'agent: \"{reason}\""
-
-  fast:
-    not_supported:         "⚡ /fast n'est disponible que pour les modèles OpenAI qui prennent en charge Priority Processing."
-    status:                "⚡ Priority Processing\n\nMode actuel : `{mode}`\n\n_Usage :_ `/fast <normal|fast|status>`"
-    unknown_arg:           "⚠️ Argument inconnu : `{arg}`\n\n**Options valides :** normal, fast, status"
-    saved:                 "⚡ ✓ Priority Processing : **{label}** (enregistré dans la configuration)\n_(prend effet au prochain message)_"
-    session_only:          "⚡ ✓ Priority Processing : **{label}** (cette session uniquement)"
-    label_fast:            "FAST"
-    label_normal:          "NORMAL"
-    status_fast:           "fast"
-    status_normal:         "normal"
-
-    route_off:             "⚡ Fast: off — {reason}"
-    route_status:          "⚡ Fast: {state} — {family} on `{route}`"
-    preference_status:     "⚡ Configured session preference: Fast {state} — {family} on `{route}`. Route availability is checked before each turn."
-    preference_off:        "⚡ Configured session preference: Fast off — {reason} Route availability is checked before each turn."
-    preference_unavailable: "⚡ Configured session preference `{route}` is currently unavailable because its credentials could not be resolved. The preference remains saved; restore credentials or use `/model reset`."
-    route_unavailable:     "⚡ Fast unavailable — {reason}"
-    route_saved:           "⚡ ✓ {family}: **{label}** (saved to config)"
-    route_session_only:    "⚡ ✓ {family}: **{label}** (config save failed; applied gateway-process-wide until restart)"
-    model_switch_unavailable: "⚡ Fast: unavailable on `{route}`; requests will use normal speed."
-    family_openai_priority: "OpenAI API Priority Processing"
-    family_codex_fast:     "Codex Fast"
-    family_anthropic_fast: "Anthropic Fast"
-    family_unsupported:    "Fast"
-    state_on:              "on"
-    state_off:             "off"
-
-  footer:
-    status:                "📎 Pied de page d'exécution : **{state}**\nChamps : `{fields}`\nPlateforme : `{platform}`"
-    usage:                 "Usage : `/footer [on|off|status]`"
-    saved:                 "📎 Pied de page d'exécution : **{state}**{example}\n_(enregistré globalement — prend effet au prochain message)_"
-    example_line:          "\nExemple : `{preview}`"
-    state_on:              "ON"
-    state_off:             "OFF"
-
-  goal:
-    unavailable:           "Les objectifs ne sont pas disponibles dans cette session."
-    no_goal_set:           "Aucun objectif défini."
-    paused:                "⏸ Objectif en pause : {goal}"
-    no_resume:             "Aucun objectif à reprendre."
-    resumed:               "▶ Objectif repris : {goal}\nEnvoyez un message pour continuer, ou attendez — je passerai à l'étape suivante au prochain tour."
-    invalid:               "Objectif invalide : {error}"
-    set:                   "⊙ Objectif défini (budget de {budget} tours) : {goal}\nJe continuerai jusqu'à ce que l'objectif soit terminé, que vous le mettiez en pause/effaciez, ou que le budget soit épuisé.\nContrôles : /goal status · /goal pause · /goal resume · /goal clear"
-
-  help:
-    header:                "📖 **Commandes Hermes**\n"
-    skill_header:          "\n⚡ **Commandes de skill** ({count} actives) :"
-    more_use_commands:     "\n... et {count} de plus. Utilisez `/commands` pour la liste paginée complète."
-
-  insights:
-    invalid_days:          "Valeur --days invalide : {value}"
-    error:                 "Erreur lors de la génération des analyses : {error}"
-
-  kanban:
-    error_prefix:          "⚠ erreur kanban : {error}"
-    subscribed_suffix:     "(abonné — vous serez notifié lorsque {task_id} se terminera ou sera bloqué)"
-    truncated_suffix:      "… (tronqué ; utilisez `hermes kanban …` dans votre terminal pour la sortie complète)"
-    no_output:             "(aucune sortie)"
-    wake:
-      completed:           "completed"
-      gave_up:             "gave up (retries exhausted)"
-      crashed:             "crashed (worker exited); dispatcher will retry"
-      timed_out:           "timed out; dispatcher will retry"
-      blocked:             "blocked; needs attention"
-      status_default:      "status changed"
-      status_joiner:       ", "
-      message:             "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
-
-  personality:
-    none_configured:       "Aucune personnalité configurée dans `{path}/config.yaml`"
-    header:                "🎭 **Personnalités disponibles**\n"
-    none_option:           "• `none` — (aucune superposition de personnalité)"
-    item:                  "• `{name}` — {preview}"
-    usage:                 "\nUtilisation : `/personality <name>`"
-    save_failed:           "⚠️ Échec de l'enregistrement du changement de personnalité : {error}"
-    cleared:               "🎭 Personnalité effacée — comportement de base de l'agent utilisé.\n_(prend effet au prochain message)_"
-    set_to:                "🎭 Personnalité définie sur **{name}**\n_(prend effet au prochain message)_"
-    unknown:               "Personnalité inconnue : `{name}`\n\nDisponibles : {available}"
-
-  profile:
-    header:                "👤 **Profil :** `{profile}`"
-    home:                  "📂 **Dossier personnel :** `{home}`"
-
-  reasoning:
-    level_default:             "medium (par défaut)"
-    level_disabled:            "none (désactivé)"
-    scope_session:             "remplacement de session"
-    scope_global:              "configuration globale"
-    status:                    "🧠 **Paramètres de raisonnement**\n\n**Effort :** `{level}`\n**Portée :** {scope}\n**Affichage :** {display}\n\n_Usage :_ `/reasoning <none|minimal|low|medium|high|xhigh|max|reset|show|hide> [--global]`"
-    display_on:                "activé ✓"
-    display_off:               "désactivé"
-    display_set_on:            "🧠 ✓ Affichage du raisonnement : **ACTIVÉ**\nLa réflexion du modèle sera affichée avant chaque réponse sur **{platform}**."
-    display_set_off:           "🧠 ✓ Affichage du raisonnement : **DÉSACTIVÉ** pour **{platform}**"
-    reset_global_unsupported:  "⚠️ `/reasoning reset --global` n'est pas pris en charge. Utilisez `/reasoning <level> --global` pour modifier la valeur globale par défaut."
-    reset_done:                "🧠 ✓ Remplacement de raisonnement de la session effacé ; retour à la configuration globale."
-    unknown_arg:               "⚠️ Argument inconnu : `{arg}`\n\n**Niveaux valides :** none, minimal, low, medium, high, xhigh, max\n**Affichage :** show, hide\n**Persister :** ajoutez `--global` pour enregistrer au-delà de cette session"
-    set_global:                "🧠 ✓ Effort de raisonnement défini sur `{effort}` (enregistré dans la configuration)\n_(prend effet au prochain message)_"
-    set_global_save_failed:    "🧠 ✓ Effort de raisonnement défini sur `{effort}` (session uniquement — échec de l'enregistrement de la configuration)\n_(prend effet au prochain message)_"
-    set_session:               "🧠 ✓ Effort de raisonnement défini sur `{effort}` (session uniquement — ajoutez `--global` pour persister)\n_(prend effet au prochain message)_"
-
-  reload_mcp:
-    cancelled:             "🟡 /reload-mcp annulé. Outils MCP inchangés."
-    always_followup:       "ℹ️ Les prochains appels `/reload-mcp` s'exécuteront sans confirmation. Réactivez via `approvals.mcp_reload_confirm: true` dans `config.yaml`."
-    confirm_prompt:        "⚠️ **Confirmer /reload-mcp**\n\nRecharger les serveurs MCP reconstruit l'ensemble d'outils de cette session et **invalide le cache de prompt du fournisseur** — le prochain message renverra l'intégralité des jetons d'entrée. Sur les modèles à long contexte ou à raisonnement élevé, cela peut être coûteux.\n\nChoisissez :\n• **Approuver une fois** — recharger maintenant\n• **Toujours approuver** — recharger maintenant et masquer cette confirmation définitivement\n• **Annuler** — laisser les outils MCP inchangés\n\n_Alternative texte : répondez `/approve`, `/always` ou `/cancel`._"
-    header:                "🔄 **Serveurs MCP rechargés**\n"
-    reconnected:           "♻️ Reconnectés : {names}"
-    added:                 "➕ Ajoutés : {names}"
-    removed:               "➖ Supprimés : {names}"
-    none_connected:        "Aucun serveur MCP connecté."
-    tools_available:       "\n🔧 {tools} outil(s) disponible(s) sur {servers} serveur(s)"
-    failed:                "❌ Échec du rechargement MCP : {error}"
-
-  reload_skills:
-    header:                "🔄 **Skills rechargées**\n"
-    no_new:                "Aucune nouvelle skill détectée."
-    total:                 "\n📚 {count} skill(s) disponible(s)"
-    added_header:          "➕ **Skills ajoutées :**"
-    removed_header:        "➖ **Skills supprimées :**"
-    item_with_desc:        "    - {name} : {desc}"
-    item_no_desc:          "    - {name}"
-    failed:                "❌ Échec du rechargement des skills : {error}"
-
-  reset:
-    preferences_preserved: "\n↪ Preserved explicit {preferences} preferences. Use `/model reset` and `/reasoning reset` to return to configured defaults."
-    model_preference_unavailable: "\n⚠ Preserved the explicit model preference, but it is currently unavailable because its credentials could not be resolved. Restore credentials or use `/model reset`."
-    header_default:        "✨ Session réinitialisée ! Nouveau départ."
-    header_new:            "✨ Nouvelle session démarrée !"
-    header_titled:         "✨ Nouvelle session démarrée : {title}"
-    title_rejected:        "\n⚠️ Titre refusé : {error}"
-    title_error_untitled:  "\n⚠️ {error} — session démarrée sans titre."
-    title_empty_untitled:  "\n⚠️ Le titre est vide après nettoyage — session démarrée sans titre."
-    tip:                   "\n✦ Astuce : {tip}"
-
-  restart:
-    in_progress:           "⏳ Redémarrage du gateway déjà en cours..."
-    restarting:            "♻ Redémarrage du gateway. Si vous n'êtes pas notifié dans les 60 secondes, redémarrez depuis la console avec `hermes gateway restart`."
-
-  resume:
-    db_unavailable:        "Base de données des sessions indisponible."
-    parse_error:           "⚠️ Could not parse `/resume` arguments: {error}.
-Use quotes around titles with spaces, for example: `/resume \"Project A Plan\"`."
-    matrix_no_named_sessions: "No named sessions found for this Matrix room.
-Use `/title My Session` to name the current room session, `/resume --all` to list all Matrix sessions, or `/resume --cross-room <session name>` to explicitly cross room boundaries."
-    matrix_blocked_no_origin: "⚠️ Matrix /resume blocked: this named session has no recorded room origin, so Hermes will not resume it inside the current room by default. Use `/resume --cross-room {name}` if you intentionally want to cross room boundaries."
-    matrix_blocked_other_room: "⚠️ Matrix /resume blocked: that session belongs to a different Matrix room ({room}). Use `/resume --cross-room {name}` if you intentionally want to resume it here."
-    matrix_cross_room_success: "⚠️ Cross-room resume: resumed **{title}** inside Matrix room **{room}**.
-Future messages in this room will use that transcript until `/reset` or another `/resume`.{msg_part}"
-    blocked_not_owner:     "⚠️ /resume blocked: '**{name}**' belongs to a different user or chat. You can only resume sessions from this chat."
-    no_named_sessions:     "Aucune session nommée trouvée.\nUtilisez `/title Ma session` pour nommer la session actuelle, puis `/resume Ma session` pour y revenir plus tard."
-    list_header:           "📋 **Sessions nommées**\n"
-    list_item:             "• **{title}**{preview_part}"
-    list_item_numbered:    "{index}. **{title}**{preview_part}"
-    list_preview_suffix:   " — _{preview}_"
-    list_footer:           "\nUsage : `/resume <nom de session>`"
-    list_footer_numbered:  "\nUtilisation : `/resume <nom de session>` ou `/resume <numéro>` (par exemple `/resume 1` pour la plus récente)"
-    list_failed:           "Impossible de lister les sessions : {error}"
-    out_of_range:          "L'index de reprise {index} est hors limites.\nUtilisez `/resume` sans arguments pour voir les sessions disponibles."
-    not_found:             "Aucune session correspondant à '**{name}**' trouvée.\nUtilisez `/resume` sans argument pour voir les sessions disponibles."
-    already_on:            "📌 Déjà sur la session **{name}**."
-    switch_failed:         "Échec du changement de session."
-    resumed_one:           "↻ Session **{title}** reprise ({count} message). Conversation restaurée."
-    resumed_many:          "↻ Session **{title}** reprise ({count} messages). Conversation restaurée."
-    resumed_no_count:      "↻ Session **{title}** reprise. Conversation restaurée."
-
-  retry:
-    no_previous:           "Aucun message précédent à réessayer."
-
-  rollback:
-    not_enabled:           "Les points de contrôle ne sont pas activés.\nActivez-les dans config.yaml :\n```\ncheckpoints:\n  enabled: true\n```"
-    none_found:            "Aucun point de contrôle trouvé pour {cwd}"
-    invalid_number:        "Numéro de point de contrôle invalide. Utilisez 1-{max}."
-    restored:              "✅ Restauré au point de contrôle {hash} : {reason}\nUn instantané pré-rollback a été enregistré automatiquement."
-    restore_failed:        "❌ {error}"
-
-  set_home:
-    save_failed:           "Impossible d'enregistrer le canal principal : {error}"
-    success:               "✅ Canal principal défini sur **{name}** (ID : {chat_id}).\nLes tâches cron et les messages multi-plateformes seront livrés ici."
-
-  status:
-    header:                "📊 **État de Hermes Gateway**"
-    matrix_scope_header:   "**Matrix scope:**"
-    matrix_scope_room:     "  room: {room}"
-    matrix_scope_room_id:  "  room_id: {room_id}"
-    matrix_scope_thread:   "  thread_id: {thread_id}"
-    matrix_scope_mode:     "  session_scope: {scope}"
-    matrix_scope_key:      "  session_key: {session_key}"
-    session_id:            "**ID de session :** `{session_id}`"
-    title:                 "**Titre :** {title}"
-    created:               "**Créé :** {timestamp}"
-    last_activity:         "**Dernière activité :** {timestamp}"
-    model:                 "**Model:** `{model}`"
-    model_provider:        "**Model:** `{model}` ({provider})"
-    context:               "**Context:** {used} / {total} ({pct}%)"
-    context_used:          "**Context:** ~{used} tokens"
-    tokens:                "**Jetons :** {tokens}"
-    agent_running:         "**Agent en cours :** {state}"
-    state_yes:             "Oui ⚡"
-    state_no:              "Non"
-    queued:                "**Suivis en file :** {count}"
-    platforms:             "**Plateformes connectées :** {platforms}"
-
-  stop:
-    stopped_pending:       "⚡ Arrêté. L'agent n'avait pas encore commencé — vous pouvez continuer cette session."
-    stopped:               "⚡ Arrêt en cours — l'étape actuelle se termine puis s'arrête. Vous pouvez continuer cette session."
-    no_active:             "Aucune tâche active à arrêter."
-
-  title:
-    db_unavailable:        "Base de données des sessions indisponible."
-    warn_prefix:           "⚠️ {error}"
-    empty_after_clean:     "⚠️ Le titre est vide après nettoyage. Utilisez des caractères imprimables."
-    set_to:                "✏️ Titre de session défini : **{title}**"
-    not_found:             "Session introuvable dans la base de données."
-    current_with_title:    "📌 Session : `{session_id}`\nTitre : **{title}**"
-    current_no_title:      "📌 Session : `{session_id}`\nAucun titre défini. Usage : `/title Mon nom de session`"
-
-  topic:
-    not_telegram_dm:         "La commande /topic n'est disponible que dans les chats privés Telegram."
-    no_session_db:           "Base de données de sessions non disponible."
-    unauthorized:            "Vous n'êtes pas autorisé à utiliser /topic sur ce bot."
-    restore_needs_topic:     "Pour restaurer une session, créez ou ouvrez d'abord un topic Telegram, puis envoyez /topic <session-id> dans ce topic. Pour créer un nouveau topic, ouvrez All Messages et envoyez-y n'importe quel message."
-    topics_disabled:         "Les topics Telegram ne sont pas encore activés pour ce bot.\n\nComment les activer :\n1. Ouvrez @BotFather.\n2. Choisissez votre bot.\n3. Ouvrez Bot Settings → Threads Settings.\n4. Activez Threaded Mode et assurez-vous que les utilisateurs sont autorisés à créer de nouveaux threads.\n\nPuis envoyez /topic à nouveau."
-    topics_user_disallowed:  "Les topics Telegram sont activés, mais les utilisateurs ne peuvent pas en créer.\n\nOuvrez @BotFather → choisissez votre bot → Bot Settings → Threads Settings, puis désactivez 'Disallow users to create new threads'.\n\nPuis envoyez /topic à nouveau."
-    enable_failed:           "Échec de l'activation du mode topic Telegram : {error}"
-    bound_status:            "Ce topic est lié à :\nSession : {label}\nID : {session_id}\n\nUtilisez /new pour remplacer ce topic par une nouvelle session.\nPour un travail parallèle, ouvrez All Messages et envoyez-y un message pour créer un autre topic."
-    thread_ready:            "Les topics multi-sessions Telegram sont activés.\n\nCe topic sera utilisé comme session Hermes indépendante. Utilisez /new pour remplacer la session actuelle de ce topic. Pour un travail parallèle, ouvrez All Messages et envoyez-y un message pour créer un autre topic."
-    untitled_session:        "Session sans titre"
-
-  undo:
-    nothing:               "Nothing to undo."
-    busy:                  "⏳ The database was busy — nothing was changed. Try /undo again in a moment."
-    error:                 "⚠️ Couldn't complete /undo (internal error — nothing was changed). It's been logged."
-    removed:               "↩️ Undid {turns} half-turn(s) ({count} message(s))."
-    invalid_count:         "Invalid count \"{arg}\" — use /undo or /undo N."
-    draining:              "⏳ Le dernier tour a été arrêté mais termine encore son étape en cours — /undo ne peut pas encore s'exécuter. Réessayez dans un instant."
-    now_at:                "↦ Now at — {who}:\n“{preview}”"
-    now_at_notext:         "↦ Now at — {who} (no text)."
-    now_empty:             "↦ Now at — start of the thread (no messages left)."
-    party:
-      user:                "your message"
-      assistant:           "my reply"
-      tool:                "a tool result"
-      message:             "the last message"
-
-  redo:
-    nothing:               "Nothing to redo."
-    busy:                  "⏳ The database was busy — nothing was changed. Try /redo again in a moment."
-    error:                 "⚠️ Couldn't complete /redo (internal error — nothing was changed). It's been logged."
-    restart_lost:          "Nothing to redo — redo history does not survive a restart."
-    restored:              "↪️ Redid {ops} undo operation(s) ({count} message(s) restored)."
-    invalid_count:         "Invalid count \"{arg}\" — use /redo or /redo N."
-    draining:              "⏳ Le dernier tour a été arrêté mais termine encore son étape en cours — /redo ne peut pas encore s'exécuter. Réessayez dans un instant."
-
-  update:
-    platform_not_messaging:  "✗ /update n'est disponible que depuis les plateformes de messagerie. Exécutez `hermes update` depuis le terminal."
-    not_git_repo:            "✗ Pas un dépôt git — impossible de mettre à jour."
-    hermes_cmd_not_found:    "✗ Impossible de localiser la commande `hermes`. Hermes est en cours d'exécution, mais la commande de mise à jour n'a pas pu trouver l'exécutable dans le PATH ni via l'interpréteur Python actuel. Essayez d'exécuter `hermes update` manuellement dans votre terminal."
-    start_failed:            "✗ Échec du démarrage de la mise à jour : {error}"
-    starting:                "⚕ Démarrage de la mise à jour Hermes… Je diffuserai la progression ici."
-
-  usage:
-    rate_limits:              "⏱️ **Limites de débit :** {state}"
-    header_session:           "📊 **Utilisation des jetons de session**"
-    label_model:              "Modèle : `{model}`"
-    label_input_tokens:       "Jetons d'entrée : {count}"
-    label_cache_read:         "Jetons de lecture du cache : {count}"
-    label_cache_write:        "Jetons d'écriture du cache : {count}"
-    label_output_tokens:      "Jetons de sortie : {count}"
-    label_total:              "Total : {count}"
-    label_api_calls:          "Appels API : {count}"
-    label_cost:               "Coût : {prefix}${amount}"
-    label_cost_included:      "Coût : inclus"
-    label_context:            "Contexte : {used} / {total} ({pct}%)"
-    comp_header:              "Last request composition (char/4 estimate):"
-    comp_fixed:               "• Fixed: ~{fixed} tok ({sys} system + {tools} tool schemas)"
-    comp_nonfixed:            "• Non-fixed: ~{nonfixed} tok ({hist} history + {results} tool results + {args} tool args)"
-    comp_total:               "• Estimated request total: ~{total} tok (sums exactly; fixed + non-fixed)"
-    label_compressions:       "Compressions : {count}"
-    breakdown_header: "🧩 **Répartition du contexte** _(estimée)_"
-    breakdown_line: "• {label} : ~{count} ({pct} %)"
-    breakdown_cat_system_prompt: "Invite système"
-    breakdown_cat_tool_definitions: "Définitions des outils"
-    breakdown_cat_rules: "Règles"
-    breakdown_cat_skills: "Compétences"
-    breakdown_cat_mcp: "MCP"
-    breakdown_cat_subagent_definitions: "Définitions des sous-agents"
-    breakdown_cat_memory: "Mémoire"
-    breakdown_cat_conversation: "Conversation"
-    header_session_info:      "📊 **Infos de session**"
-    label_messages:           "Messages : {count}"
-    label_estimated_context:  "Contexte estimé : ~{count} jetons"
-    detailed_after_first:     "_(Utilisation détaillée disponible après la première réponse de l'agent)_"
-    no_data:                  "Aucune donnée d'utilisation disponible pour cette session."
-    unknown_subcommand:       "Sous-commande /usage inconnue : `{args}`. Essayez `/usage` ou `/usage reset [--force]`."
-    reset_wrong_provider:     "Les réinitialisations de limite en réserve ne sont disponibles qu'avec le fournisseur openai-codex. Changez d'abord avec `/model`."
-
+    aborted: ⚠️ Compression interrompue ({error}). Aucun message n'a été supprimé — la conversation est inchangée. Lancez /compress pour réessayer, /reset pour une nouvelle session, ou vérifiez la configuration de votre modèle auxiliary.compression.
+    aggressive_unsupported: --aggressive n'est pas pris en charge ; utilisez '/compress here [N]' pour ne conserver que les échanges récents, ou /undo pour supprimer des tours.
+    aux_failed: ℹ️ Le modèle de compression configuré `{model}` a échoué ({error}). Récupéré avec votre modèle principal — le contexte est intact — mais vous pouvez vérifier `auxiliary.compression.model` dans config.yaml.
+    chat_size: 'Chat size: ~{before:,} → ~{after:,} tokens (excludes system, tools, tool results)'
+    chat_size_unchanged: 'Chat size: ~{before:,} tokens (unchanged; excludes system, tools, tool results)'
+    failed: 'Échec de la compression : {error}'
+    focus_line: 'Focus : "{topic}"'
+    full_request_est: 'Full request size: ~{before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; estimated — no live request yet)'
+    full_request_no_fixed: after excludes system prompt + tool schemas (no resident agent to measure them); next live turn will show the full size.
+    full_request_real: 'Full request size: {before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; before = last live request, after = estimate of next)'
+    full_request_unchanged: 'Full request size: {before} tokens (unchanged — next turn resends the same context)'
+    no_provider: Aucun fournisseur configuré — compression impossible.
+    not_enough: Conversation insuffisante pour la compression (au moins 4 messages nécessaires).
+    nothing_to_do: Rien à compresser pour l'instant (la transcription est encore entièrement du contexte protégé).
+    persist_failed: ⚠️ La compression a bien été exécutée, mais le résultat n'a pas pu être enregistré — la base de données de la session était occupée (verrouillée). Rien n'a été perdu ; votre transcription est inchangée. Relancez /compress dans un instant pour réessayer.
+    summary_failed: ⚠️ Échec de la génération du résumé ({error}). {count} message(s) historique(s) ont été supprimés et remplacés par un espace réservé ; le contexte antérieur n'est plus récupérable. Vérifiez la configuration du modèle auxiliary.compression.
+  config_read_failed: '⚠️ Impossible de lire config.yaml : {error}'
+  config_save_failed: '⚠️ Impossible de sauvegarder la configuration : {error}'
   credits:
-    not_logged_in:            "Non connecté à Nous Portal. Connecte-toi pour voir ton solde de crédits et recharger."
+    not_logged_in: Non connecté à Nous Portal. Connecte-toi pour voir ton solde de crédits et recharger.
+  debug:
+    auto_delete: ⏱ Les pastes s'effaceront automatiquement dans 6 heures.
+    full_logs_hint: Pour envoyer les journaux complets, utilisez `hermes debug share` depuis la CLI.
+    header: '**Rapport de débogage envoyé :**'
+    share_hint: Partagez ces liens avec l'équipe Hermes pour obtenir de l'aide.
+    upload_failed: '✗ Échec de l''envoi du rapport de débogage : {error}'
+  deny:
+    denied_plural: ❌ Commandes refusées ({count} commandes).
+    denied_reason_plural: '❌ Commandes refusées ({count} commandes). Raison transmise à l''agent: "{reason}"'
+    denied_reason_singular: '❌ Commande refusée. Raison transmise à l''agent: "{reason}"'
+    denied_singular: ❌ Commande refusée.
+    no_pending: Aucune commande en attente de refus.
+    stale: ❌ Commande refusée (l'approbation était périmée).
+  draining: ⏳ Vidage de {count} agent(s) actif(s) avant redémarrage...
+  fast:
+    choice_fast: fast — Priority Processing activé
+    choice_normal: normal — traitement standard
+    family_anthropic_fast: Anthropic Fast
+    family_codex_fast: Codex Fast
+    family_openai_priority: OpenAI API Priority Processing
+    family_unsupported: Fast
+    label_fast: FAST
+    label_normal: NORMAL
+    model_switch_unavailable: '⚡ Fast: unavailable on `{route}`; requests will use normal speed.'
+    not_supported: ⚡ /fast n'est disponible que pour les modèles OpenAI qui prennent en charge Priority Processing.
+    picker_title: '⚡ **Priority Processing**\n\nMode actuel : `{mode}`\n\nChoisissez une option :'
+    preference_off: '⚡ Configured session preference: Fast off — {reason} Route availability is checked before each turn.'
+    preference_status: '⚡ Configured session preference: Fast {state} — {family} on `{route}`. Route availability is checked before each turn.'
+    preference_unavailable: ⚡ Configured session preference `{route}` is currently unavailable because its credentials could not be resolved. The preference remains saved; restore credentials or use `/model reset`.
+    route_off: '⚡ Fast: off — {reason}'
+    route_saved: '⚡ ✓ {family}: **{label}** (saved to config)'
+    route_session_only: '⚡ ✓ {family}: **{label}** (config save failed; applied gateway-process-wide until restart)'
+    route_status: '⚡ Fast: {state} — {family} on `{route}`'
+    route_unavailable: ⚡ Fast unavailable — {reason}
+    saved: '⚡ ✓ Priority Processing : **{label}** (enregistré dans la configuration)
 
-  verbose:
-    not_enabled:           "La commande `/verbose` n'est pas activée pour les plateformes de messagerie.\n\nActivez-la dans `config.yaml` :\n```yaml\ndisplay:\n  tool_progress_command: true\n```"
-    mode_off:              "⚙️ Progression des outils : **OFF** — aucune activité d'outil affichée."
-    mode_new:              "⚙️ Progression des outils : **NEW** — affichée lors d'un changement d'outil (longueur d'aperçu : `display.tool_preview_length`, par défaut 40)."
-    mode_all:              "⚙️ Progression des outils : **ALL** — chaque appel d'outil est affiché (longueur d'aperçu : `display.tool_preview_length`, par défaut 40)."
-    mode_verbose:          "⚙️ Progression des outils : **VERBOSE** — chaque appel d'outil avec ses arguments complets."
-    mode_log:              "⚙️ Progression des outils : **LOG** — silencieux dans le chat ; les appels d'outils sont écrits dans ~/.hermes/logs/tool_calls.log."
-    saved_suffix:          "_(enregistré pour **{platform}** — prend effet au prochain message)_"
-    save_failed:           "_(impossible d'enregistrer dans la configuration : {error})_"
+      _(prend effet au prochain message)_'
+    session_only: '⚡ ✓ Priority Processing : **{label}** (cette session uniquement)'
+    state_off: 'off'
+    state_on: 'on'
+    status: '⚡ Priority Processing
 
-  voice:
-    enabled_voice_only:    "Mode vocal activé.\nJe répondrai en vocal quand vous envoyez des messages vocaux.\nUtilisez /voice tts pour obtenir des réponses vocales à tous les messages."
-    disabled_text:         "Mode vocal désactivé. Réponses uniquement textuelles."
-    tts_enabled:           "TTS automatique activé.\nToutes les réponses incluront un message vocal."
-    status_mode:           "Mode vocal : {label}"
-    status_channel:        "Canal vocal : #{channel}"
-    status_participants:   "Participants : {count}"
-    status_member:         "  - {name}{status}"
-    speaking:              " (parle)"
-    enabled_short:         "Mode vocal activé."
-    disabled_short:        "Mode vocal désactivé."
-    label_off:             "Désactivé (texte seulement)"
-    label_voice_only:      "Activé (réponse vocale aux messages vocaux)"
-    label_all:             "TTS (réponse vocale à tous les messages)"
-    help:                  "{toggle}\n\n**Comment fonctionne /voice**\n• `/voice on` — réponse vocale quand vous envoyez un message vocal\n• `/voice tts` — réponse vocale à *chaque* message\n• `/voice off` — retour aux réponses texte uniquement\n• `/voice status` — afficher le mode actuel\n• `/voice` (sans argument) — bascule rapide entre activé et désactivé{channels}"
-    help_channels:         "\n\n**Salons vocaux en direct (Discord)**\n• Rejoignez d'abord un salon vocal, puis `/voice channel` — je rejoins, j'écoute et je parle mes réponses\n• `/voice leave` — se déconnecter du salon vocal"
 
-  yolo:
-    disabled:                   "⚠️ Mode YOLO **DÉSACTIVÉ** pour cette session — les commandes dangereuses nécessiteront une approbation."
-    enabled:                    "⚡ Mode YOLO **ACTIVÉ** pour cette session — toutes les commandes sont auto-approuvées. À utiliser avec prudence."
+      Mode actuel : `{mode}`
 
+
+      _Usage :_ `/fast <normal|fast|status>`'
+    status_fast: fast
+    status_normal: normal
+    unknown_arg: '⚠️ Argument inconnu : `{arg}`
+
+
+      **Options valides :** normal, fast, status'
+  footer:
+    example_line: '
+
+      Exemple : `{preview}`'
+    saved: '📎 Pied de page d''exécution : **{state}**{example}
+
+      _(enregistré globalement — prend effet au prochain message)_'
+    state_off: 'OFF'
+    state_on: 'ON'
+    status: '📎 Pied de page d''exécution : **{state}**
+
+      Champs : `{fields}`
+
+      Plateforme : `{platform}`'
+    usage: 'Usage : `/footer [on|off|status]`'
+  goal:
+    invalid: 'Objectif invalide : {error}'
+    no_goal_set: Aucun objectif défini.
+    no_resume: Aucun objectif à reprendre.
+    paused: '⏸ Objectif en pause : {goal}'
+    resumed: '▶ Objectif repris : {goal}
+
+      Envoyez un message pour continuer, ou attendez — je passerai à l''étape suivante au prochain tour.'
+    set: '⊙ Objectif défini (budget de {budget} tours) : {goal}
+
+      Je continuerai jusqu''à ce que l''objectif soit terminé, que vous le mettiez en pause/effaciez, ou que le budget soit épuisé.
+
+      Contrôles : /goal status · /goal pause · /goal resume · /goal clear'
+    unavailable: Les objectifs ne sont pas disponibles dans cette session.
+  goal_cleared: ✓ Objectif effacé.
+  help:
+    header: '📖 **Commandes Hermes**
+
+      '
+    more_use_commands: '
+
+      ... et {count} de plus. Utilisez `/commands` pour la liste paginée complète.'
+    skill_header: '
+
+      ⚡ **Commandes de skill** ({count} actives) :'
+  insights:
+    error: 'Erreur lors de la génération des analyses : {error}'
+    invalid_days: 'Valeur --days invalide : {value}'
+  kanban:
+    error_prefix: '⚠ erreur kanban : {error}'
+    no_output: (aucune sortie)
+    subscribed_suffix: (abonné — vous serez notifié lorsque {task_id} se terminera ou sera bloqué)
+    truncated_suffix: … (tronqué ; utilisez `hermes kanban …` dans votre terminal pour la sortie complète)
+    wake:
+      blocked: blocked; needs attention
+      completed: completed
+      crashed: crashed (worker exited); dispatcher will retry
+      gave_up: gave up (retries exhausted)
+      message: '[kanban] Task {task_id} {status}.
+
+        Title: {title}
+
+        Assignee: @{assignee}
+
+        Board: {board}
+
+
+        Check the result or decide the next step.'
+      status_default: status changed
+      status_joiner: ', '
+      timed_out: timed out; dispatcher will retry
+  merge:
+    already_merged: This session was already merged into **{title}** — not folding it again. (Start a new exploration to merge fresh material.)
+    blocked_not_owner: You can only merge into sessions you own. '{name}' belongs to a different chat/owner.
+    fold_body: '[MERGED SESSION — {title}] A summary of another session (''{title}'') was folded into this conversation. Treat it as reference context:
+
+
+      {summary}'
+    fold_body_thread: '[BRANCHED THREAD MERGED — {title}] A branched thread was explored and folded back into this conversation. Summary of what happened in the branch:
+
+
+      {summary}'
+    fold_failed: 'Failed to fold the summary into the target session: {error}'
+    ledger_failed: Couldn't safely record the merge (session store busy) — nothing was folded. Try again in a moment.
+    list_footer: _`/merge <number>` folds a summary of THIS session into that one._
+    list_header: '🔀 **Sessions you can merge into** — reply `/merge <number>` or `/merge <name>`:'
+    md_suffix: ' · full record: `{path}`'
+    merged_named: ✅ Merged into **{title}** — a summary of this session is now in its context.{md}
+    merged_thread: ✅ **Folded back into _{title}_**{parent} — a summary of this thread is now in the parent's context, and this thread is archived (still resumable).{md}
+    merged_thread_no_archive: ✅ **Folded back into _{title}_**{parent} — a summary of this thread is now in the parent's context. (Couldn't archive the thread automatically; you can close it manually.){md}
+    no_conversation: Nothing to merge — this session has no conversation yet.
+    no_named_sessions: No titled sessions to merge into yet. Give a session a name with `/title` first.
+    no_new_turns: Nothing new to merge — no turns happened in this thread after the branch point.
+    no_summary: Couldn't generate a summary of this session; nothing was merged. Try again in a moment.
+    not_a_branch: This thread wasn't created by `/branch`, so there's no parent session to merge into.
+    not_a_thread: '`/merge` only works inside a branched thread. Start one with `/branch` in a channel first.'
+    not_found: No session found matching '{name}'. Use `/merge` with no name to list mergeable sessions.
+    note_record_suffix: ' · full record: `{path}`'
+    parent_note: '🔀 **Merged from thread ''{title}''**
+
+      {summary}'
+    same_session: That's the session you're already in — pick a different target to merge into.
+    source_marker: '[MERGED — this thread''s new exploration was folded into ''{target}'' on {when}. You can keep going here, but its summary already lives in that conversation.]'
+    source_marker_named: '[MERGED — a summary of this session was folded into ''{target}'' on {when}. You can keep going here, but its summary already lives in that conversation.]'
+    source_thread_link: ' ({thread})'
+    target_note: 🔀 **Folded in from _{source}_**{child} — a summary of {turns} message(s) is now in this conversation's context.{record}
+    target_note_named: 🔀 **Folded in from _{source}_** — a summary of _{source}_ ({turns} message(s)) is now in this conversation's context.{record}
+    target_parent_link: ' ({parent})'
+  model:
+    capabilities_label: 'Capacités : {capabilities}'
+    context_label: 'Contexte : {tokens} tokens'
+    cost_label: 'Coût : {cost}'
+    current_label: 'Actuel : `{model}` chez {provider}'
+    current_tag: ' (actuel)'
+    error_prefix: 'Erreur : {error}'
+    max_output_label: 'Sortie max. : {tokens} tokens'
+    more_models_suffix: ' (+{count} autres)'
+    prompt_caching_enabled: 'Cache de prompts : activé'
+    provider_label: 'Fournisseur : {provider}'
+    reasoning_label: 'Raisonnement : {effort}'
+    saved_global: Enregistré dans config.yaml (`--global`)
+    session_only_hint: _(session uniquement — ajoutez `--global` pour conserver)_
+    switched: Modèle changé pour `{model}`
+    usage_persist: '`/model <name> --global` — conserver'
+    usage_switch_model: '`/model <name>` — changer de modèle'
+    usage_switch_provider: '`/model <name> --provider <slug>` — changer de fournisseur'
+    warning_prefix: 'Avertissement : {warning}'
+  no_active_goal: Aucun objectif actif.
+  personality:
+    cleared: '🎭 Personnalité effacée — comportement de base de l''agent utilisé.
+
+      _(prend effet au prochain message)_'
+    header: '🎭 **Personnalités disponibles**
+
+      '
+    item: • `{name}` — {preview}
+    none_configured: Aucune personnalité configurée dans `{path}/config.yaml`
+    none_option: • `none` — (aucune superposition de personnalité)
+    save_failed: '⚠️ Échec de l''enregistrement du changement de personnalité : {error}'
+    set_to: '🎭 Personnalité définie sur **{name}**
+
+      _(prend effet au prochain message)_'
+    unknown: 'Personnalité inconnue : `{name}`
+
+
+      Disponibles : {available}'
+    usage: '
+
+      Utilisation : `/personality <name>`'
+  profile:
+    header: 👤 **Profil :** `{profile}`
+    home: 📂 **Dossier personnel :** `{home}`
+  reasoning:
+    choice_hide: masquer le raisonnement dans les réponses
+    choice_none: none — désactiver le raisonnement
+    choice_reset: reset — effacer le réglage de session
+    choice_show: afficher le raisonnement dans les réponses
+    display_off: désactivé
+    display_on: activé ✓
+    display_set_off: '🧠 ✓ Affichage du raisonnement : **DÉSACTIVÉ** pour **{platform}**'
+    display_set_on: '🧠 ✓ Affichage du raisonnement : **ACTIVÉ**
+
+      La réflexion du modèle sera affichée avant chaque réponse sur **{platform}**.'
+    level_default: medium (par défaut)
+    level_disabled: none (désactivé)
+    picker_title: '🧠 **Paramètres de raisonnement**\n\n**Effort :** `{level}`\n**Portée :** {scope}\n**Affichage :** {display}\n\nChoisissez une option :'
+    reset_done: 🧠 ✓ Remplacement de raisonnement de la session effacé ; retour à la configuration globale.
+    reset_global_unsupported: ⚠️ `/reasoning reset --global` n'est pas pris en charge. Utilisez `/reasoning <level> --global` pour modifier la valeur globale par défaut.
+    scope_global: configuration globale
+    scope_session: remplacement de session
+    set_global: '🧠 ✓ Effort de raisonnement défini sur `{effort}` (enregistré dans la configuration)
+
+      _(prend effet au prochain message)_'
+    set_global_save_failed: '🧠 ✓ Effort de raisonnement défini sur `{effort}` (session uniquement — échec de l''enregistrement de la configuration)
+
+      _(prend effet au prochain message)_'
+    set_session: '🧠 ✓ Effort de raisonnement défini sur `{effort}` (session uniquement — ajoutez `--global` pour persister)
+
+      _(prend effet au prochain message)_'
+    status: '🧠 **Paramètres de raisonnement**
+
+
+      **Effort :** `{level}`
+
+      **Portée :** {scope}
+
+      **Affichage :** {display}
+
+
+      _Usage :_ `/reasoning <none|minimal|low|medium|high|xhigh|max|reset|show|hide> [--global]`'
+    unknown_arg: '⚠️ Argument inconnu : `{arg}`
+
+
+      **Niveaux valides :** none, minimal, low, medium, high, xhigh, max
+
+      **Affichage :** show, hide
+
+      **Persister :** ajoutez `--global` pour enregistrer au-delà de cette session'
+  redo:
+    busy: ⏳ The database was busy — nothing was changed. Try /redo again in a moment.
+    draining: ⏳ Le dernier tour a été arrêté mais termine encore son étape en cours — /redo ne peut pas encore s'exécuter. Réessayez dans un instant.
+    error: ⚠️ Couldn't complete /redo (internal error — nothing was changed). It's been logged.
+    invalid_count: Invalid count "{arg}" — use /redo or /redo N.
+    nothing: Nothing to redo.
+    restart_lost: Nothing to redo — redo history does not survive a restart.
+    restored: ↪️ Redid {ops} undo operation(s) ({count} message(s) restored).
+  reload_mcp:
+    added: '➕ Ajoutés : {names}'
+    always_followup: 'ℹ️ Les prochains appels `/reload-mcp` s''exécuteront sans confirmation. Réactivez via `approvals.mcp_reload_confirm: true` dans `config.yaml`.'
+    cancelled: 🟡 /reload-mcp annulé. Outils MCP inchangés.
+    confirm_prompt: '⚠️ **Confirmer /reload-mcp**
+
+
+      Recharger les serveurs MCP reconstruit l''ensemble d''outils de cette session et **invalide le cache de prompt du fournisseur** — le prochain message renverra l''intégralité des jetons d''entrée. Sur les modèles à long contexte ou à raisonnement élevé, cela peut être coûteux.
+
+
+      Choisissez :
+
+      • **Approuver une fois** — recharger maintenant
+
+      • **Toujours approuver** — recharger maintenant et masquer cette confirmation définitivement
+
+      • **Annuler** — laisser les outils MCP inchangés
+
+
+      _Alternative texte : répondez `/approve`, `/always` ou `/cancel`._'
+    failed: '❌ Échec du rechargement MCP : {error}'
+    header: '🔄 **Serveurs MCP rechargés**
+
+      '
+    none_connected: Aucun serveur MCP connecté.
+    reconnected: '♻️ Reconnectés : {names}'
+    removed: '➖ Supprimés : {names}'
+    tools_available: '
+
+      🔧 {tools} outil(s) disponible(s) sur {servers} serveur(s)'
+  reload_skills:
+    added_header: ➕ **Skills ajoutées :**
+    failed: '❌ Échec du rechargement des skills : {error}'
+    header: '🔄 **Skills rechargées**
+
+      '
+    item_no_desc: '    - {name}'
+    item_with_desc: '    - {name} : {desc}'
+    no_new: Aucune nouvelle skill détectée.
+    removed_header: ➖ **Skills supprimées :**
+    total: '
+
+      📚 {count} skill(s) disponible(s)'
+  reset:
+    header_default: ✨ Session réinitialisée ! Nouveau départ.
+    header_new: ✨ Nouvelle session démarrée !
+    header_titled: '✨ Nouvelle session démarrée : {title}'
+    model_preference_unavailable: '
+
+      ⚠ Preserved the explicit model preference, but it is currently unavailable because its credentials could not be resolved. Restore credentials or use `/model reset`.'
+    preferences_preserved: '
+
+      ↪ Preserved explicit {preferences} preferences. Use `/model reset` and `/reasoning reset` to return to configured defaults.'
+    tip: '
+
+      ✦ Astuce : {tip}'
+    title_empty_untitled: '
+
+      ⚠️ Le titre est vide après nettoyage — session démarrée sans titre.'
+    title_error_untitled: '
+
+      ⚠️ {error} — session démarrée sans titre.'
+    title_rejected: '
+
+      ⚠️ Titre refusé : {error}'
+  restart:
+    in_progress: ⏳ Redémarrage du gateway déjà en cours...
+    restarting: ♻ Redémarrage du gateway. Si vous n'êtes pas notifié dans les 60 secondes, redémarrez depuis la console avec `hermes gateway restart`.
+  resume:
+    already_on: 📌 Déjà sur la session **{name}**.
+    blocked_not_owner: '⚠️ /resume blocked: ''**{name}**'' belongs to a different user or chat. You can only resume sessions from this chat.'
+    db_unavailable: Base de données des sessions indisponible.
+    list_failed: 'Impossible de lister les sessions : {error}'
+    list_footer: '
+
+      Usage : `/resume <nom de session>`'
+    list_footer_numbered: '
+
+      Utilisation : `/resume <nom de session>` ou `/resume <numéro>` (par exemple `/resume 1` pour la plus récente)'
+    list_header: '📋 **Sessions nommées**
+
+      '
+    list_item: • **{title}**{preview_part}
+    list_item_numbered: '{index}. **{title}**{preview_part}'
+    list_preview_suffix: ' — _{preview}_'
+    matrix_blocked_no_origin: '⚠️ Matrix /resume blocked: this named session has no recorded room origin, so Hermes will not resume it inside the current room by default. Use `/resume --cross-room {name}` if you intentionally want to cross room boundaries.'
+    matrix_blocked_other_room: '⚠️ Matrix /resume blocked: that session belongs to a different Matrix room ({room}). Use `/resume --cross-room {name}` if you intentionally want to resume it here.'
+    matrix_cross_room_success: '⚠️ Cross-room resume: resumed **{title}** inside Matrix room **{room}**. Future messages in this room will use that transcript until `/reset` or another `/resume`.{msg_part}'
+    matrix_no_named_sessions: No named sessions found for this Matrix room. Use `/title My Session` to name the current room session, `/resume --all` to list all Matrix sessions, or `/resume --cross-room <session name>` to explicitly cross room boundaries.
+    no_named_sessions: 'Aucune session nommée trouvée.
+
+      Utilisez `/title Ma session` pour nommer la session actuelle, puis `/resume Ma session` pour y revenir plus tard.'
+    not_found: 'Aucune session correspondant à ''**{name}**'' trouvée.
+
+      Utilisez `/resume` sans argument pour voir les sessions disponibles.'
+    out_of_range: 'L''index de reprise {index} est hors limites.
+
+      Utilisez `/resume` sans arguments pour voir les sessions disponibles.'
+    parse_error: '⚠️ Could not parse `/resume` arguments: {error}. Use quotes around titles with spaces, for example: `/resume "Project A Plan"`.'
+    resumed_many: ↻ Session **{title}** reprise ({count} messages). Conversation restaurée.
+    resumed_no_count: ↻ Session **{title}** reprise. Conversation restaurée.
+    resumed_one: ↻ Session **{title}** reprise ({count} message). Conversation restaurée.
+    switch_failed: Échec du changement de session.
+  retry:
+    no_previous: Aucun message précédent à réessayer.
+  rollback:
+    invalid_number: Numéro de point de contrôle invalide. Utilisez 1-{max}.
+    none_found: Aucun point de contrôle trouvé pour {cwd}
+    not_enabled: "Les points de contrôle ne sont pas activés.\nActivez-les dans config.yaml :\n```\ncheckpoints:\n  enabled: true\n```"
+    restore_failed: ❌ {error}
+    restored: '✅ Restauré au point de contrôle {hash} : {reason}
+
+      Un instantané pré-rollback a été enregistré automatiquement.'
+  set_home:
+    save_failed: 'Impossible d''enregistrer le canal principal : {error}'
+    success: '✅ Canal principal défini sur **{name}** (ID : {chat_id}).
+
+      Les tâches cron et les messages multi-plateformes seront livrés ici.'
   shared:
-    session_db_unavailable:      "Base de données de sessions indisponible."
-    session_db_unavailable_prefix: "Base de données de sessions indisponible"
-    session_not_found:           "Session introuvable dans la base de données."
-    warn_passthrough:            "⚠️ {error}"
+    session_db_unavailable: Base de données de sessions indisponible.
+    session_db_unavailable_prefix: Base de données de sessions indisponible
+    session_not_found: Session introuvable dans la base de données.
+    warn_passthrough: ⚠️ {error}
+  status:
+    agent_running: '**Agent en cours :** {state}'
+    context: '**Context:** {used} / {total} ({pct}%)'
+    context_used: '**Context:** ~{used} tokens'
+    created: '**Créé :** {timestamp}'
+    header: 📊 **État de Hermes Gateway**
+    last_activity: '**Dernière activité :** {timestamp}'
+    matrix_scope_header: '**Matrix scope:**'
+    matrix_scope_key: '  session_key: {session_key}'
+    matrix_scope_mode: '  session_scope: {scope}'
+    matrix_scope_room: '  room: {room}'
+    matrix_scope_room_id: '  room_id: {room_id}'
+    matrix_scope_thread: '  thread_id: {thread_id}'
+    model: '**Model:** `{model}`'
+    model_provider: '**Model:** `{model}` ({provider})'
+    platforms: '**Plateformes connectées :** {platforms}'
+    queued: '**Suivis en file :** {count}'
+    session_id: '**ID de session :** `{session_id}`'
+    state_no: Non
+    state_yes: Oui ⚡
+    title: '**Titre :** {title}'
+    tokens: '**Jetons :** {tokens}'
+  stop:
+    no_active: Aucune tâche active à arrêter.
+    stopped: ⚡ Arrêté. Vous pouvez continuer cette session.
+    stopped_pending: ⚡ Arrêté. L'agent n'avait pas encore commencé — vous pouvez continuer cette session.
+  title:
+    current_no_title: '📌 Session : `{session_id}`
+
+      Aucun titre défini. Usage : `/title Mon nom de session`'
+    current_with_title: '📌 Session : `{session_id}`
+
+      Titre : **{title}**'
+    db_unavailable: Base de données des sessions indisponible.
+    empty_after_clean: ⚠️ Le titre est vide après nettoyage. Utilisez des caractères imprimables.
+    not_found: Session introuvable dans la base de données.
+    set_to: '✏️ Titre de session défini : **{title}**'
+    warn_prefix: ⚠️ {error}
+  topic:
+    bound_status: 'Ce topic est lié à :
+
+      Session : {label}
+
+      ID : {session_id}
+
+
+      Utilisez /new pour remplacer ce topic par une nouvelle session.
+
+      Pour un travail parallèle, ouvrez All Messages et envoyez-y un message pour créer un autre topic.'
+    enable_failed: 'Échec de l''activation du mode topic Telegram : {error}'
+    no_session_db: Base de données de sessions non disponible.
+    not_telegram_dm: La commande /topic n'est disponible que dans les chats privés Telegram.
+    restore_needs_topic: Pour restaurer une session, créez ou ouvrez d'abord un topic Telegram, puis envoyez /topic <session-id> dans ce topic. Pour créer un nouveau topic, ouvrez All Messages et envoyez-y n'importe quel message.
+    thread_ready: 'Les topics multi-sessions Telegram sont activés.
+
+
+      Ce topic sera utilisé comme session Hermes indépendante. Utilisez /new pour remplacer la session actuelle de ce topic. Pour un travail parallèle, ouvrez All Messages et envoyez-y un message pour créer un autre topic.'
+    topics_disabled: 'Les topics Telegram ne sont pas encore activés pour ce bot.
+
+
+      Comment les activer :
+
+      1. Ouvrez @BotFather.
+
+      2. Choisissez votre bot.
+
+      3. Ouvrez Bot Settings → Threads Settings.
+
+      4. Activez Threaded Mode et assurez-vous que les utilisateurs sont autorisés à créer de nouveaux threads.
+
+
+      Puis envoyez /topic à nouveau.'
+    topics_user_disallowed: 'Les topics Telegram sont activés, mais les utilisateurs ne peuvent pas en créer.
+
+
+      Ouvrez @BotFather → choisissez votre bot → Bot Settings → Threads Settings, puis désactivez ''Disallow users to create new threads''.
+
+
+      Puis envoyez /topic à nouveau.'
+    unauthorized: Vous n'êtes pas autorisé à utiliser /topic sur ce bot.
+    untitled_session: Session sans titre
+  undo:
+    busy: ⏳ The database was busy — nothing was changed. Try /undo again in a moment.
+    draining: ⏳ Le dernier tour a été arrêté mais termine encore son étape en cours — /undo ne peut pas encore s'exécuter. Réessayez dans un instant.
+    error: ⚠️ Couldn't complete /undo (internal error — nothing was changed). It's been logged.
+    invalid_count: Nombre invalide « {arg} » — utilisez /undo ou /undo N.
+    nothing: Rien à annuler.
+    now_at: '↦ Now at — {who}:
+
+      “{preview}”'
+    now_at_notext: ↦ Now at — {who} (no text).
+    now_empty: ↦ Now at — start of the thread (no messages left).
+    party:
+      assistant: my reply
+      message: the last message
+      tool: a tool result
+      user: your message
+    removed: "↩️ Undid {turns} half-turn(s) ({count} message(s))."
+  update:
+    hermes_cmd_not_found: ✗ Impossible de localiser la commande `hermes`. Hermes est en cours d'exécution, mais la commande de mise à jour n'a pas pu trouver l'exécutable dans le PATH ni via l'interpréteur Python actuel. Essayez d'exécuter `hermes update` manuellement dans votre terminal.
+    not_git_repo: ✗ Pas un dépôt git — impossible de mettre à jour.
+    platform_not_messaging: ✗ /update n'est disponible que depuis les plateformes de messagerie. Exécutez `hermes update` depuis le terminal.
+    start_failed: '✗ Échec du démarrage de la mise à jour : {error}'
+    starting: ⚕ Démarrage de la mise à jour Hermes… Je diffuserai la progression ici.
+  usage:
+    breakdown_cat_conversation: Conversation
+    breakdown_cat_mcp: MCP
+    breakdown_cat_memory: Mémoire
+    breakdown_cat_rules: Règles
+    breakdown_cat_skills: Compétences
+    breakdown_cat_subagent_definitions: Définitions des sous-agents
+    breakdown_cat_system_prompt: Invite système
+    breakdown_cat_tool_definitions: Définitions des outils
+    breakdown_header: 🧩 **Répartition du contexte** _(estimée)_
+    breakdown_line: '• {label} : ~{count} ({pct} %)'
+    comp_fixed: '• Fixed: ~{fixed} tok ({sys} system + {tools} tool schemas)'
+    comp_header: 'Last request composition (char/4 estimate):'
+    comp_nonfixed: '• Non-fixed: ~{nonfixed} tok ({hist} history + {results} tool results + {args} tool args)'
+    comp_total: '• Estimated request total: ~{total} tok (sums exactly; fixed + non-fixed)'
+    detailed_after_first: _(Utilisation détaillée disponible après la première réponse de l'agent)_
+    header_session: 📊 **Utilisation des jetons de session**
+    header_session_info: 📊 **Infos de session**
+    label_api_calls: 'Appels API : {count}'
+    label_cache_read: 'Jetons de lecture du cache : {count}'
+    label_cache_write: 'Jetons d''écriture du cache : {count}'
+    label_compressions: 'Compressions : {count}'
+    label_context: 'Contexte : {used} / {total} ({pct}%)'
+    label_cost: 'Coût : {prefix}${amount}'
+    label_cost_included: 'Coût : inclus'
+    label_estimated_context: 'Contexte estimé : ~{count} jetons'
+    label_input_tokens: 'Jetons d''entrée : {count}'
+    label_messages: 'Messages : {count}'
+    label_model: 'Modèle : `{model}`'
+    label_output_tokens: 'Jetons de sortie : {count}'
+    label_total: 'Total : {count}'
+    no_data: Aucune donnée d'utilisation disponible pour cette session.
+    rate_limits: ⏱️ **Limites de débit :** {state}
+    reset_wrong_provider: Les réinitialisations de limite en réserve ne sont disponibles qu'avec le fournisseur openai-codex. Changez d'abord avec `/model`.
+    unknown_subcommand: 'Sous-commande /usage inconnue : `{args}`. Essayez `/usage` ou `/usage reset [--force]`.'
+  verbose:
+    mode_all: '⚙️ Progression des outils : **ALL** — chaque appel d''outil est affiché (longueur d''aperçu : `display.tool_preview_length`, par défaut 40).'
+    mode_log: '⚙️ Progression des outils : **LOG** — silencieux dans le chat ; les appels d''outils sont écrits dans ~/.hermes/logs/tool_calls.log.'
+    mode_new: '⚙️ Progression des outils : **NEW** — affichée lors d''un changement d''outil (longueur d''aperçu : `display.tool_preview_length`, par défaut 40).'
+    mode_off: '⚙️ Progression des outils : **OFF** — aucune activité d''outil affichée.'
+    mode_verbose: '⚙️ Progression des outils : **VERBOSE** — chaque appel d''outil avec ses arguments complets.'
+    not_enabled: "La commande `/verbose` n'est pas activée pour les plateformes de messagerie.\n\nActivez-la dans `config.yaml` :\n```yaml\ndisplay:\n  tool_progress_command: true\n```"
+    save_failed: '_(impossible d''enregistrer dans la configuration : {error})_'
+    saved_suffix: _(enregistré pour **{platform}** — prend effet au prochain message)_
+  voice:
+    disabled_short: Mode vocal désactivé.
+    disabled_text: Mode vocal désactivé. Réponses uniquement textuelles.
+    enabled_short: Mode vocal activé.
+    enabled_voice_only: 'Mode vocal activé.
+
+      Je répondrai en vocal quand vous envoyez des messages vocaux.
+
+      Utilisez /voice tts pour obtenir des réponses vocales à tous les messages.'
+    help: '{toggle}
+
+
+      **Comment fonctionne /voice**
+
+      • `/voice on` — réponse vocale quand vous envoyez un message vocal
+
+      • `/voice tts` — réponse vocale à *chaque* message
+
+      • `/voice off` — retour aux réponses texte uniquement
+
+      • `/voice status` — afficher le mode actuel
+
+      • `/voice` (sans argument) — bascule rapide entre activé et désactivé{channels}'
+    help_channels: '
+
+
+      **Salons vocaux en direct (Discord)**
+
+      • Rejoignez d''abord un salon vocal, puis `/voice channel` — je rejoins, j''écoute et je parle mes réponses
+
+      • `/voice leave` — se déconnecter du salon vocal'
+    label_all: TTS (réponse vocale à tous les messages)
+    label_off: Désactivé (texte seulement)
+    label_voice_only: Activé (réponse vocale aux messages vocaux)
+    speaking: ' (parle)'
+    status_channel: 'Canal vocal : #{channel}'
+    status_member: '  - {name}{status}'
+    status_mode: 'Mode vocal : {label}'
+    status_participants: 'Participants : {count}'
+    tts_enabled: 'TTS automatique activé.
+
+      Toutes les réponses incluront un message vocal.'
+  yolo:
+    disabled: ⚠️ Mode YOLO **DÉSACTIVÉ** pour cette session — les commandes dangereuses nécessiteront une approbation.
+    enabled: ⚡ Mode YOLO **ACTIVÉ** pour cette session — toutes les commandes sont auto-approuvées. À utiliser avec prudence.

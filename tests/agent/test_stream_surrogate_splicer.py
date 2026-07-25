@@ -298,6 +298,16 @@ class TestAnthropicMessagesStreamPath:
         agent._anthropic_client = SimpleNamespace(
             messages=SimpleNamespace(stream=lambda **_kwargs: FakeAnthropicStream())
         )
+        # #67142: the streaming path now builds a per-request Anthropic client
+        # (FD-ownership safety) via _create_request_anthropic_client instead of
+        # reading the shared _anthropic_client directly. On a bare __new__ agent
+        # that helper would touch _anthropic_api_key / provider timeouts; return
+        # the fake shared client and no-op the request-client close/abort hooks.
+        agent._create_request_anthropic_client = (
+            lambda **_kwargs: agent._anthropic_client
+        )
+        agent._close_request_anthropic_client = lambda *_args, **_kwargs: None
+        agent._abort_request_anthropic_client = lambda *_args, **_kwargs: None
         agent._stream_diag_init = lambda: {}
         agent._stream_diag_capture_response = lambda *_args, **_kwargs: None
         agent._touch_activity = lambda *_args, **_kwargs: None

@@ -31,6 +31,7 @@ from typing import Any, Optional, Union
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
+from agent.turn_context import extract_api_content_sidecar
 from gateway.config import HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
 from gateway.session import (
@@ -265,12 +266,11 @@ class GatewaySlashCommandsMixin:
                     )
         self._evict_cached_agent(session_key)
 
-        # Discard any /queue overflow for this session — /new is a
-        # conversation-boundary operation, queued follow-ups from the
-        # previous conversation must not bleed into the new one.
-        _qe = getattr(self, "_queued_events", None)
-        if _qe is not None:
-            _qe.pop(session_key, None)
+        # Conversation boundary: clear ALL conversation-scoped per-session
+        # state (model/reasoning overrides, one-turn restores, model notes,
+        # last-resolved cache, /queue overflow) + security state in one
+        # funnel call. See _CONVERSATION_SCOPED_STATE in gateway/run.py.
+        self._clear_conversation_scope(session_key, reason="session_reset")
 
         # The old conversation's in-flight async delegations end WITH it
         # (#55578): after the reset rotates the session id, their completions
@@ -466,12 +466,44 @@ class GatewaySlashCommandsMixin:
         return EphemeralReply(f"{header}{_tip_line}")
 
     async def _handle_profile_command(self, event: MessageEvent) -> str:
-        """Handle /profile — show active profile name and home directory."""
+        """Handle /profile — show the profile serving this source and its home.
+
+        On a multiplexed gateway the process-level active profile is always
+        the multiplexer's own (usually ``default``), so reporting it would
+        answer "default" in every chat regardless of which profile actually
+        serves the room/channel (``source.profile`` — stamped by the
+        ``/p/<profile>/`` URL prefix, a per-credential adapter, or a room→
+        profile map). When ``multiplex_profiles`` is on, report the stamped
+        profile and, like the scoped /reset banner (#59003), resolve the
+        displayed home under that profile's runtime scope. When multiplexing
+        is off (the default) the stamp is ignored — mirroring the gating in
+        ``_run_agent`` and ``_reset_notice_session_info`` — and the command
+        reports the active profile and default home, byte-identical to before.
+        """
         from hermes_constants import display_hermes_home
         from hermes_cli.profiles import get_active_profile_name
 
-        display = display_hermes_home()
-        profile_name = get_active_profile_name()
+        multiplexed = getattr(
+            getattr(self, "config", None), "multiplex_profiles", False
+        )
+        source = getattr(event, "source", None)
+
+        profile_name = ""
+        if multiplexed:
+            profile_name = (getattr(source, "profile", "") or "").strip()
+        profile_name = profile_name or get_active_profile_name()
+
+        if multiplexed:
+            try:
+                from gateway.run import _profile_runtime_scope
+
+                profile_home = self._resolve_profile_home_for_source(source)
+                with _profile_runtime_scope(profile_home):
+                    display = display_hermes_home()
+            except Exception:
+                display = display_hermes_home()
+        else:
+            display = display_hermes_home()
 
         lines = [
             t("gateway.profile.header", profile=profile_name),
@@ -1469,15 +1501,12 @@ class GatewaySlashCommandsMixin:
         # us.  The detached subprocess approach (setsid + bash) doesn't work
         # under systemd (KillMode=mixed kills the cgroup) or Docker (tini
         # exits when the gateway dies, taking the detached helper with it).
-        # systemd sets INVOCATION_ID; launchd sets XPC_SERVICE_NAME to the
-        # job label.  Without the launchd check, macOS /restart takes the
-        # detached path and exits 0, which KeepAlive.SuccessfulExit=false
-        # treats as a deliberate stop — the gateway stays dead until next
-        # login.  Interactive macOS shells inherit XPC_SERVICE_NAME=0, so
-        # "0" must count as not-under-launchd.
-        _under_service = bool(os.environ.get("INVOCATION_ID")) or os.environ.get(
-            "XPC_SERVICE_NAME", "0"
-        ) not in ("", "0")
+        # Native supervisor markers cover direct systemd/launchd starts. The
+        # explicit marker covers wrappers such as ``sudo env -i`` that strip
+        # those markers before execing the foreground gateway.
+        from gateway.restart import is_gateway_supervisor_process
+
+        _under_service = is_gateway_supervisor_process()
         _in_container = os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
         if _under_service or _in_container:
             self.request_restart(detached=False, via_service=True)
@@ -1670,16 +1699,17 @@ class GatewaySlashCommandsMixin:
 
         Supports:
           /model                              — interactive picker (Telegram/Discord) or text list
-          /model <name>                       — switch model (persists by default)
-          /model <name> --session             — switch for this session only
-          /model <name> --global              — switch and persist (explicit)
+          /model <name>                       — switch model (this session only)
+          /model <name> --once                — switch for the next turn only
+          /model <name> --session             — switch for this session only (explicit)
+          /model <name> --global              — switch and persist to config.yaml
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
         """
         from gateway.run import _hermes_home, _load_gateway_config
         import yaml
         from hermes_cli.model_switch import (
-            switch_model as _switch_model, parse_model_flags,
+            switch_model as _switch_model, parse_model_flags_detailed,
             resolve_persist_behavior,
             list_authenticated_providers,
             list_picker_providers,
@@ -1687,16 +1717,31 @@ class GatewaySlashCommandsMixin:
         from hermes_cli.providers import get_label
 
         raw_args = event.get_command_args().strip()
+        source = event.source
+        _command_profile_home = None
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            _command_profile_home = getattr(
+                self, "_resolve_profile_home_for_source"
+            )(source)
 
-        # Parse --provider, --global, --session, and --refresh flags
-        (
-            model_input,
-            explicit_provider,
+        # Parse --provider, --global, --session, --once, and --refresh flags
+        parsed_flags = parse_model_flags_detailed(raw_args)
+        model_input = parsed_flags.model_input
+        explicit_provider = parsed_flags.explicit_provider
+        is_global_flag = parsed_flags.is_global
+        force_refresh = parsed_flags.force_refresh
+        is_session = parsed_flags.is_session
+        one_turn = parsed_flags.is_once
+        if is_global_flag and one_turn:
+            return "❌ /model --once cannot be combined with --global"
+        if one_turn and not model_input and not explicit_provider:
+            return "❌ /model --once requires a model or provider."
+        persist_global = resolve_persist_behavior(
             is_global_flag,
-            force_refresh,
             is_session,
-        ) = parse_model_flags(raw_args)
-        persist_global = resolve_persist_behavior(is_global_flag, is_session)
+            is_once=one_turn,
+            explicit_provider=explicit_provider,
+        )
 
         # --refresh: bust the disk cache so the picker shows live data.
         if force_refresh:
@@ -1713,7 +1758,8 @@ class GatewaySlashCommandsMixin:
         current_api_key = ""
         user_provs = None
         custom_provs = None
-        config_path = _hermes_home / "config.yaml"
+        excluded_provs = []
+        config_path = (_command_profile_home or _hermes_home) / "config.yaml"
         try:
             cfg = _load_gateway_config()
             if cfg:
@@ -1728,12 +1774,14 @@ class GatewaySlashCommandsMixin:
                     custom_provs = get_compatible_custom_providers(cfg)
                 except Exception:
                     custom_provs = cfg.get("custom_providers")
+                _excl = cfg.get("model_catalog", {}).get("excluded_providers")
+                if isinstance(_excl, list):
+                    excluded_provs = _excl
         except Exception:
             pass
 
-        # Check for session override
-        source = event.source
-        # Normalize the source the same way a normal message turn does
+        # Check for session override. Normalize the source the same way a normal
+        # message turn does
         # (Telegram DM topic recovery) before deriving the override key, so
         # the override is stored under the key the next message turn reads
         # (#30479).
@@ -1742,6 +1790,9 @@ class GatewaySlashCommandsMixin:
         configured_model = current_model
         configured_provider = current_provider
         override = self._session_model_overrides.get(session_key, {})
+        restore_snapshot = (
+            self._snapshot_session_model_override(session_key) if one_turn else None
+        )
         if override:
             current_model = override.get("model", current_model)
             current_provider = override.get("provider", current_provider)
@@ -1785,7 +1836,7 @@ class GatewaySlashCommandsMixin:
         # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:
             # Try interactive picker if the platform supports it
-            adapter = self.adapters.get(source.platform)
+            adapter = getattr(self, "_adapter_for_source")(source)
             has_picker = (
                 adapter is not None
                 and getattr(type(adapter), "send_model_picker", None) is not None
@@ -1805,6 +1856,7 @@ class GatewaySlashCommandsMixin:
                         custom_providers=custom_provs,
                         max_models=50,
                         include_moa=True,
+                        excluded_providers=excluded_provs,
                     )
                 except Exception:
                     providers = []
@@ -1818,6 +1870,7 @@ class GatewaySlashCommandsMixin:
                     _cur_provider = current_provider
                     _cur_base_url = current_base_url
                     _cur_api_key = current_api_key
+                    _picker_profile_home = _command_profile_home
 
                     async def _on_model_selected(
                         _chat_id: str, model_id: str, provider_slug: str
@@ -1956,11 +2009,17 @@ class GatewaySlashCommandsMixin:
                                     "Failed to persist model switch to DB: %s", exc
                                 )
 
-                        # Store model note + session override
+                        # Store model note + session override.  Use display
+                        # form (strips opaque Palantir prefix) for the user-
+                        # visible note; session-override map still gets the
+                        # full opaque ID, which is what the wire needs.
+                        from hermes_cli.model_switch import format_model_for_display
+                        _display_cur = format_model_for_display(_cur_model)
+                        _display_new = format_model_for_display(result.new_model)
                         if not hasattr(_self, "_pending_model_notes"):
                             _self._pending_model_notes = {}
                         _self._pending_model_notes[_session_key] = (
-                            f"[Note: model was just switched from {_cur_model} to {result.new_model} "
+                            f"[Note: model was just switched from {_display_cur} to {_display_new} "
                             f"via {result.provider_label or result.target_provider}. "
                             f"Adjust your self-identification accordingly.]"
                         )
@@ -2018,20 +2077,52 @@ class GatewaySlashCommandsMixin:
                                 else:
                                     _persist_model_cfg = {}
                                     _persist_cfg["model"] = _persist_model_cfg
+                                try:
+                                    from hermes_cli.route_identity import should_clear_context_pin
+
+                                    if should_clear_context_pin(
+                                        _persist_model_cfg.get("default")
+                                        or _persist_model_cfg.get("model"),
+                                        result.new_model,
+                                        _persist_model_cfg.get("base_url"),
+                                        result.base_url,
+                                        _persist_model_cfg.get("provider"),
+                                        result.target_provider,
+                                    ):
+                                        _persist_model_cfg.pop("context_length", None)
+                                except Exception:
+                                    _persist_model_cfg.pop("context_length", None)
                                 _persist_model_cfg["default"] = result.new_model
                                 _persist_model_cfg["provider"] = result.target_provider
+                                # Named providers always resolve base_url/api_mode fresh,
+                                # so any leftover is cleared unconditionally below. Custom
+                                # providers have no registry entry to re-derive from, so
+                                # they need an explicit set-or-clear here — the previous
+                                # lone `if result.base_url:` left a stale base_url behind
+                                # when switching to a custom provider whose resolver
+                                # returned an empty base_url (#25107).
+                                _is_custom_target = str(result.target_provider or "").strip().lower() == "custom"
                                 if result.base_url:
                                     _persist_model_cfg["base_url"] = result.base_url
-                                if str(result.target_provider or "").strip().lower() != "custom":
+                                elif _is_custom_target:
+                                    _persist_model_cfg.pop("base_url", None)
+                                if _is_custom_target:
+                                    if result.api_mode:
+                                        _persist_model_cfg["api_mode"] = result.api_mode
+                                    else:
+                                        _persist_model_cfg.pop("api_mode", None)
+                                else:
                                     clear_model_endpoint_credentials(_persist_model_cfg, clear_base_url=True)
                                 from hermes_cli.config import save_config
                                 save_config(_persist_cfg)
                             except Exception as e:
                                 logger.warning("Failed to persist model switch: %s", e)
 
-                        # Build confirmation text
+                        # Build confirmation text.  Use display form so opaque
+                        # Palantir IDs (ri.language-model-service..*) get
+                        # shortened to their trailing slug for the UI.
                         plabel = result.provider_label or result.target_provider
-                        lines = [t("gateway.model.switched", model=result.new_model)]
+                        lines = [t("gateway.model.switched", model=format_model_for_display(result.new_model))]
                         _fast_row = self._fast_unavailable_model_switch_row(result)
                         if _fast_row:
                             lines.append(_fast_row)
@@ -2047,6 +2138,7 @@ class GatewaySlashCommandsMixin:
                         mi = result.model_info
                         from hermes_cli.model_switch import resolve_display_context_length
                         _sw_config_ctx = None
+                        _sw_model_cfg = {}
                         try:
                             _sw_cfg = _load_gateway_config()
                             _sw_model_cfg = _sw_cfg.get("model", {})
@@ -2056,6 +2148,8 @@ class GatewaySlashCommandsMixin:
                                     _sw_config_ctx = int(_sw_raw)
                         except Exception:
                             pass
+                        if not isinstance(_sw_model_cfg, dict):
+                            _sw_model_cfg = {}
                         ctx = resolve_display_context_length(
                             result.new_model,
                             result.target_provider,
@@ -2064,6 +2158,12 @@ class GatewaySlashCommandsMixin:
                             model_info=mi,
                             custom_providers=custom_provs,
                             config_context_length=_sw_config_ctx,
+                            configured_model=(
+                                _sw_model_cfg.get("default")
+                                or _sw_model_cfg.get("model")
+                            ),
+                            configured_provider=_sw_model_cfg.get("provider"),
+                            configured_base_url=_sw_model_cfg.get("base_url"),
                         )
                         if ctx:
                             lines.append(t("gateway.model.context_label", tokens=f"{ctx:,}"))
@@ -2079,6 +2179,20 @@ class GatewaySlashCommandsMixin:
                             lines.append(t("gateway.model.session_only_hint"))
                         return "\n".join(lines)
 
+                    async def _on_model_selected_dispatch(
+                        _chat_id: str, model_id: str, provider_slug: str
+                    ) -> str:
+                        if _picker_profile_home is None:
+                            return await _on_model_selected(
+                                _chat_id, model_id, provider_slug
+                            )
+                        from gateway.run import _profile_runtime_scope
+
+                        with _profile_runtime_scope(_picker_profile_home):
+                            return await _on_model_selected(
+                                _chat_id, model_id, provider_slug
+                            )
+
                     metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
                     result = await adapter.send_model_picker(
                         chat_id=source.chat_id,
@@ -2086,7 +2200,7 @@ class GatewaySlashCommandsMixin:
                         current_model=current_model,
                         current_provider=current_provider,
                         session_key=session_key,
-                        on_model_selected=_on_model_selected,
+                        on_model_selected=_on_model_selected_dispatch,
                         metadata=metadata,
                     )
                     if result.success:
@@ -2107,6 +2221,7 @@ class GatewaySlashCommandsMixin:
                     user_providers=user_provs,
                     custom_providers=custom_provs,
                     max_models=5,
+                    excluded_providers=excluded_provs,
                 )
                 for p in providers:
                     tag = t("gateway.model.current_tag") if p["is_current"] else ""
@@ -2262,11 +2377,15 @@ class GatewaySlashCommandsMixin:
 
             # Store a note to prepend to the next user message so the model
             # knows about the switch (avoids system messages mid-history).
+            # Display form strips opaque Palantir RID prefixes; the override
+            # map below keeps the full ID for the wire.
+            from hermes_cli.model_switch import format_model_for_display
             if not hasattr(self, "_pending_model_notes"):
                 self._pending_model_notes = {}
             self._pending_model_notes[session_key] = (
-                f"[Note: model was just switched from {current_model} to {result.new_model} "
+                f"[Note: model was just switched from {format_model_for_display(current_model)} to {format_model_for_display(result.new_model)} "
                 f"via {result.provider_label or result.target_provider}. "
+                f"{'This override applies to the next turn only. ' if one_turn else ''}"
                 f"Adjust your self-identification accordingly.]"
             )
 
@@ -2279,6 +2398,14 @@ class GatewaySlashCommandsMixin:
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
             })
+            if one_turn:
+                if not hasattr(self, "_pending_one_turn_model_restores"):
+                    self._pending_one_turn_model_restores = {}
+                self._pending_one_turn_model_restores[session_key] = (
+                    restore_snapshot or {"had_override": False, "override": None}
+                )
+            elif hasattr(self, "_pending_one_turn_model_restores"):
+                self._pending_one_turn_model_restores.pop(session_key, None)
 
             # Announce the deliberate switch to the conversation (P2). Compares the
             # (provider, model, api_mode) route so a same-slug/different-endpoint
@@ -2294,15 +2421,24 @@ class GatewaySlashCommandsMixin:
             # the session store so the override survives a gateway restart.
             # api_key/api_mode are never persisted — they are re-resolved via
             # runtime provider resolution on rehydration.
-            try:
-                await self.async_session_store.set_model_override(
-                    session_key,
-                    self._session_model_overrides[session_key],
-                )
-            except Exception:
-                logger.debug(
-                    "Failed to persist session model override", exc_info=True
-                )
+            #
+            # /model --once is intentionally EXCLUDED from the write-through:
+            # a one-turn override must never survive a restart. The persisted
+            # value stays at the pre-once state (the prior session override,
+            # or nothing), which is exactly what the finally-restore reverts
+            # the in-memory dict to. (#29923 review defect: the original
+            # implementation wrote through, so a crash before the restore
+            # rehydrated the once-model permanently.)
+            if not one_turn:
+                try:
+                    await self.async_session_store.set_model_override(
+                        session_key,
+                        self._session_model_overrides[session_key],
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to persist session model override", exc_info=True
+                    )
 
             # Evict cached agent so the next turn creates a fresh agent from the
             # override rather than relying on cache signature mismatch detection.
@@ -2331,11 +2467,35 @@ class GatewaySlashCommandsMixin:
                     else:
                         model_cfg = {}
                         cfg["model"] = model_cfg
+                    try:
+                        from hermes_cli.route_identity import should_clear_context_pin
+
+                        if should_clear_context_pin(
+                            model_cfg.get("default") or model_cfg.get("model"),
+                            result.new_model,
+                            model_cfg.get("base_url"),
+                            result.base_url,
+                            model_cfg.get("provider"),
+                            result.target_provider,
+                        ):
+                            model_cfg.pop("context_length", None)
+                    except Exception:
+                        model_cfg.pop("context_length", None)
                     model_cfg["default"] = result.new_model
                     model_cfg["provider"] = result.target_provider
+                    # See the picker handler above for why custom providers need an
+                    # explicit set-or-clear instead of the old lone truthy check (#25107).
+                    _is_custom_target = str(result.target_provider or "").strip().lower() == "custom"
                     if result.base_url:
                         model_cfg["base_url"] = result.base_url
-                    if str(result.target_provider or "").strip().lower() != "custom":
+                    elif _is_custom_target:
+                        model_cfg.pop("base_url", None)
+                    if _is_custom_target:
+                        if result.api_mode:
+                            model_cfg["api_mode"] = result.api_mode
+                        else:
+                            model_cfg.pop("api_mode", None)
+                    else:
                         clear_model_endpoint_credentials(model_cfg, clear_base_url=True)
                     from hermes_cli.config import save_config
                     save_config(cfg)
@@ -2344,7 +2504,7 @@ class GatewaySlashCommandsMixin:
 
             # Build confirmation message with full metadata
             provider_label = result.provider_label or result.target_provider
-            lines = [t("gateway.model.switched", model=result.new_model)]
+            lines = [t("gateway.model.switched", model=format_model_for_display(result.new_model))]
             lines.append(t("gateway.model.provider_label", provider=provider_label))
             _fast_row = self._fast_unavailable_model_switch_row(result)
             if _fast_row:
@@ -2367,6 +2527,7 @@ class GatewaySlashCommandsMixin:
             mi = result.model_info
             from hermes_cli.model_switch import resolve_display_context_length
             _sw2_config_ctx = None
+            _sw2_model_cfg = {}
             try:
                 _sw2_cfg = _load_gateway_config()
                 _sw2_model_cfg = _sw2_cfg.get("model", {})
@@ -2376,6 +2537,8 @@ class GatewaySlashCommandsMixin:
                         _sw2_config_ctx = int(_sw2_raw)
             except Exception:
                 pass
+            if not isinstance(_sw2_model_cfg, dict):
+                _sw2_model_cfg = {}
             ctx = resolve_display_context_length(
                 result.new_model,
                 result.target_provider,
@@ -2384,6 +2547,12 @@ class GatewaySlashCommandsMixin:
                 model_info=mi,
                 custom_providers=custom_provs,
                 config_context_length=_sw2_config_ctx,
+                configured_model=(
+                    _sw2_model_cfg.get("default")
+                    or _sw2_model_cfg.get("model")
+                ),
+                configured_provider=_sw2_model_cfg.get("provider"),
+                configured_base_url=_sw2_model_cfg.get("base_url"),
             )
             if ctx:
                 lines.append(t("gateway.model.context_label", tokens=f"{ctx:,}"))
@@ -2405,6 +2574,8 @@ class GatewaySlashCommandsMixin:
 
             if persist_global:
                 lines.append(t("gateway.model.saved_global"))
+            elif one_turn:
+                lines.append("    (next turn only — restores after one response)")
             else:
                 lines.append(t("gateway.model.session_only_hint"))
 
@@ -3087,31 +3258,19 @@ class GatewaySlashCommandsMixin:
 
     async def _handle_rollback_command(self, event: MessageEvent) -> str:
         """Handle /rollback command — list or restore filesystem checkpoints."""
-        from gateway.run import _hermes_home
+        from gateway.run import _checkpoint_agent_kwargs, _load_gateway_config
         from tools.checkpoint_manager import CheckpointManager, format_checkpoint_list
 
-        # Read checkpoint config from config.yaml
-        cp_cfg = {}
-        try:
-            import yaml as _y
-            _cfg_path = _hermes_home / "config.yaml"
-            if _cfg_path.exists():
-                with open(_cfg_path, encoding="utf-8") as _f:
-                    _data = _y.safe_load(_f) or {}
-                cp_cfg = _data.get("checkpoints", {})
-                if isinstance(cp_cfg, bool):
-                    cp_cfg = {"enabled": cp_cfg}
-        except Exception:
-            pass
+        cp_kwargs = _checkpoint_agent_kwargs(_load_gateway_config())
 
-        if not cp_cfg.get("enabled", False):
+        if not cp_kwargs["checkpoints_enabled"]:
             return t("gateway.rollback.not_enabled")
 
         mgr = CheckpointManager(
             enabled=True,
-            max_snapshots=cp_cfg.get("max_snapshots", 50),
-            max_total_size_mb=cp_cfg.get("max_total_size_mb", 500),
-            max_file_size_mb=cp_cfg.get("max_file_size_mb", 10),
+            max_snapshots=cp_kwargs["checkpoint_max_snapshots"],
+            max_total_size_mb=cp_kwargs["checkpoint_max_total_size_mb"],
+            max_file_size_mb=cp_kwargs["checkpoint_max_file_size_mb"],
         )
 
         cwd = os.getenv("TERMINAL_CWD", str(Path.home()))
@@ -3182,7 +3341,197 @@ class GatewaySlashCommandsMixin:
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return t("gateway.background.started", preview=preview, task_id=task_id)
 
-    async def _handle_reasoning_command(self, event: MessageEvent) -> str:
+    def _save_gateway_config_key(self, key_path: str, value) -> bool:
+        """Save a dot-separated key to config.yaml (shared by /reasoning, /fast
+        and their interactive pickers)."""
+        import yaml
+        from gateway.run import _hermes_home
+        config_path = _hermes_home / "config.yaml"
+        try:
+            user_config = {}
+            if config_path.exists():
+                with open(config_path, encoding="utf-8") as f:
+                    user_config = yaml.safe_load(f) or {}
+            keys = key_path.split(".")
+            current = user_config
+            for k in keys[:-1]:
+                if k not in current or not isinstance(current[k], dict):
+                    current[k] = {}
+                current = current[k]
+            current[keys[-1]] = value
+            atomic_config_write(config_path, user_config)
+            return True
+        except Exception as e:
+            logger.error("Failed to save config key %s: %s", key_path, e)
+            return False
+
+    def _persist_session_service_tier(
+        self, session_key: str, service_tier, clear: bool = False
+    ) -> bool:
+        """Durably persist a session-scoped /fast override.
+
+        Written to a dedicated ``gateway_session_tiers.yaml`` (NOT
+        ``config.yaml`` — the ``--global`` lane owns ``agent.service_tier``) so
+        a session /fast toggle survives a gateway restart. Routes through the
+        same fail-closed ``atomic_config_write`` chokepoint config edits use.
+        Returns ``True`` on a durable write; ``False`` when persistence failed —
+        the caller keeps the in-memory override live and reports the change as
+        honestly gateway-process-wide until restart rather than claiming a
+        durable per-session save.
+        """
+        if not session_key:
+            return False
+        import yaml
+        path = self._session_service_tiers_path()
+        try:
+            existing = {}
+            if path.exists():
+                with open(path, encoding="utf-8") as f:
+                    loaded = yaml.safe_load(f) or {}
+                if isinstance(loaded, dict):
+                    existing = loaded
+            tiers = existing.get("session_service_tiers")
+            if not isinstance(tiers, dict):
+                tiers = {}
+            if clear:
+                tiers.pop(session_key, None)
+            else:
+                tiers[session_key] = service_tier
+            existing["session_service_tiers"] = tiers
+            atomic_config_write(path, existing)
+            return True
+        except Exception as exc:
+            logger.error(
+                "Failed to persist session service tier (session=%s error=%s)",
+                session_key,
+                type(exc).__name__,
+            )
+            return False
+
+    def _apply_reasoning_selection(
+        self,
+        session_key: str,
+        platform_key: str,
+        value: str,
+        persist_global: bool = False,
+    ) -> str:
+        """Apply a /reasoning argument (typed or picked) and return the reply.
+
+        Single application path shared by the typed `/reasoning <arg>` branch
+        and the interactive choice picker, so both surfaces stay in lockstep
+        with the canonical parser.
+        """
+        from hermes_constants import parse_reasoning_effort
+
+        value = (value or "").strip().lower()
+
+        # Display toggle (per-platform)
+        if value in {"show", "on"}:
+            self._show_reasoning = True
+            self._save_gateway_config_key(
+                f"display.platforms.{platform_key}.show_reasoning", True
+            )
+            return t("gateway.reasoning.display_set_on", platform=platform_key)
+        if value in {"hide", "off"}:
+            self._show_reasoning = False
+            self._save_gateway_config_key(
+                f"display.platforms.{platform_key}.show_reasoning", False
+            )
+            return t("gateway.reasoning.display_set_off", platform=platform_key)
+
+        if value == "reset":
+            if persist_global:
+                return t("gateway.reasoning.reset_global_unsupported")
+            self._set_session_reasoning_override(session_key, None)
+            self._reasoning_config = self._load_reasoning_config()
+            self._evict_cached_agent(session_key)
+            return t("gateway.reasoning.reset_done")
+
+        parsed = parse_reasoning_effort(value)
+        if parsed is None:
+            return t("gateway.reasoning.unknown_arg", arg=value)
+
+        self._reasoning_config = parsed
+        if persist_global:
+            if self._save_gateway_config_key("agent.reasoning_effort", value):
+                self._set_session_reasoning_override(session_key, None)
+                self._evict_cached_agent(session_key)
+                return t("gateway.reasoning.set_global", effort=value)
+            self._set_session_reasoning_override(session_key, parsed)
+            self._evict_cached_agent(session_key)
+            return t("gateway.reasoning.set_global_save_failed", effort=value)
+
+        self._set_session_reasoning_override(session_key, parsed)
+        self._evict_cached_agent(session_key)
+        return t("gateway.reasoning.set_session", effort=value)
+
+    def _reasoning_picker_choices(self, current_effort: str) -> list:
+        """Build the choice list for the interactive /reasoning picker."""
+        from hermes_constants import VALID_REASONING_EFFORTS
+
+        choices = [
+            {
+                "value": "none",
+                "label": t("gateway.reasoning.choice_none"),
+                "is_current": current_effort == "none",
+            }
+        ]
+        for level in VALID_REASONING_EFFORTS:
+            choices.append(
+                {
+                    "value": level,
+                    "label": level,
+                    "is_current": level == current_effort,
+                }
+            )
+        choices.extend(
+            [
+                {"value": "reset", "label": t("gateway.reasoning.choice_reset"), "is_current": False},
+                {"value": "show", "label": t("gateway.reasoning.choice_show"), "is_current": False},
+                {"value": "hide", "label": t("gateway.reasoning.choice_hide"), "is_current": False},
+            ]
+        )
+        return choices
+
+    async def _try_send_choice_picker(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        title: str,
+        choices: list,
+        on_choice_selected,
+    ) -> bool:
+        """Send an interactive choice picker when the platform supports it.
+
+        Mirrors the `/model` picker gate: the capability is detected on the
+        adapter *type* (``send_choice_picker``), and a failed send falls back
+        to the text path (returns False) instead of erroring the command.
+        """
+        adapter = getattr(self, "_adapter_for_source")(event.source)
+        has_picker = (
+            adapter is not None
+            and getattr(type(adapter), "send_choice_picker", None) is not None
+        )
+        if not has_picker:
+            return False
+        try:
+            metadata = self._thread_metadata_for_source(
+                event.source, self._reply_anchor_for_event(event)
+            )
+            result = await adapter.send_choice_picker(
+                chat_id=event.source.chat_id,
+                title=title,
+                choices=choices,
+                session_key=session_key,
+                on_choice_selected=on_choice_selected,
+                metadata=metadata,
+            )
+            return bool(getattr(result, "success", False))
+        except Exception as e:
+            logger.warning("send_choice_picker failed, falling back to text: %s", e)
+            return False
+
+    async def _handle_reasoning_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /reasoning command — manage reasoning effort and display toggle.
 
         Usage:
@@ -3245,10 +3594,13 @@ class GatewaySlashCommandsMixin:
             rc = self._reasoning_config
             if rc is None:
                 level = t("gateway.reasoning.level_default")
+                current_effort = "medium"
             elif rc.get("enabled") is False:
                 level = t("gateway.reasoning.level_disabled")
+                current_effort = "none"
             else:
                 level = rc.get("effort", "medium")
+                current_effort = level
             display_state = (
                 t("gateway.reasoning.display_on")
                 if self._show_reasoning
@@ -3260,6 +3612,31 @@ class GatewaySlashCommandsMixin:
                 if has_session_override
                 else t("gateway.reasoning.scope_global")
             )
+
+            # Interactive picker on platforms that support it (parity with the
+            # /model picker). Falls through to the text status card otherwise.
+            _picker_platform_key = _platform_config_key(event.source.platform)
+
+            async def _on_reasoning_choice(_chat_id: str, value: str) -> str:
+                return self._apply_reasoning_selection(
+                    session_key, _picker_platform_key, value
+                )
+
+            picker_sent = await self._try_send_choice_picker(
+                event,
+                session_key,
+                title=t(
+                    "gateway.reasoning.picker_title",
+                    level=level,
+                    scope=scope,
+                    display=display_state,
+                ),
+                choices=self._reasoning_picker_choices(current_effort),
+                on_choice_selected=_on_reasoning_choice,
+            )
+            if picker_sent:
+                return None  # Picker sent — adapter handles the response
+
             return t(
                 "gateway.reasoning.status",
                 level=level,
@@ -3435,15 +3812,20 @@ class GatewaySlashCommandsMixin:
                      f"~/.hermes/pending/skills/{pending_id}.json)")
         return out
 
-    async def _handle_fast_command(self, event: MessageEvent) -> str:
+    async def _handle_fast_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /fast — mirror the CLI Priority Processing toggle in gateway chats."""
         from gateway.run import _hermes_home, _load_gateway_config
         import yaml
         from hermes_cli.models import resolve_fast_mode_capability
 
-        args = event.get_command_args().strip().lower()
-        config_path = _hermes_home / "config.yaml"
-        self._service_tier = self._load_service_tier()
+        raw_args = event.get_command_args().strip().lower()
+        # Reuse the /reasoning arg parser: strips --global (any position),
+        # normalizes unicode dashes.
+        args, persist_global = self._parse_reasoning_command_args(raw_args)
+        session_key = self._session_key_for_source(event.source)
+        self._service_tier = self._resolve_session_service_tier(
+            session_key=session_key
+        )
 
         user_config = _load_gateway_config()
         session_key = self._session_key_for_source(event.source)
@@ -3474,31 +3856,173 @@ class GatewaySlashCommandsMixin:
             capability.supported,
         )
 
-        def _save_config_key(key_path: str, value):
-            """Save a dot-separated key to config.yaml."""
-            try:
-                user_config = {}
-                if config_path.exists():
-                    with open(config_path, encoding="utf-8") as f:
-                        user_config = yaml.safe_load(f) or {}
-                keys = key_path.split(".")
-                current = user_config
-                for k in keys[:-1]:
-                    if k not in current or not isinstance(current[k], dict):
-                        current[k] = {}
-                    current = current[k]
-                current[keys[-1]] = value
-                atomic_config_write(config_path, user_config)
-                return True
-            except Exception as exc:
-                logger.error(
-                    "Failed to save config key %s (error=%s)",
-                    key_path,
-                    type(exc).__name__,
+        def _apply_fast_selection(value: str, persist: bool = False) -> Optional[str]:
+            """Apply a /fast argument (typed or picked) and return the reply.
+
+            Session-scoped by default; ``persist`` (``--global``) writes
+            agent.service_tier to config.yaml. Route-capability aware: an
+            unsupported route refuses to enable Fast, and the reply names the
+            resolved family/route (fork route-preference response layer).
+            """
+            if value in {"fast", "on"}:
+                if persist:
+                    # ``--global`` lane (upstream scoping): the persisted
+                    # agent.service_tier default applies to the configured
+                    # gateway model, so gate on that model's fast support
+                    # rather than the current session route.
+                    from gateway.run import _resolve_gateway_model
+                    from hermes_cli.models import model_supports_fast_mode
+                    if not model_supports_fast_mode(
+                        _resolve_gateway_model(user_config)
+                    ):
+                        return t("gateway.fast.not_supported")
+                else:
+                    if persisted_preference and preference_unavailable:
+                        return t("gateway.fast.preference_unavailable", route=route)
+                    if not capability.supported:
+                        return t(
+                            "gateway.fast.route_unavailable", reason=capability.reason
+                        )
+                tier = "priority"
+                saved_value = "fast"
+                label = t("gateway.fast.label_fast")
+            elif value in {"normal", "off"}:
+                tier = None
+                saved_value = "normal"
+                label = t("gateway.fast.label_normal")
+            else:
+                return t("gateway.fast.unknown_arg", arg=value)
+            self._service_tier = tier
+            family_label = t(f"gateway.fast.family_{capability.family}")
+            if persist:
+                if self._save_gateway_config_key("agent.service_tier", saved_value):
+                    # Global write supersedes any session override.
+                    self._set_session_service_tier_override(
+                        session_key, None, clear=True
+                    )
+                    self._persist_session_service_tier(
+                        session_key, None, clear=True
+                    )
+                    self._evict_cached_agent(session_key)
+                    return t("gateway.fast.route_saved", family=family_label, label=label)
+                # Config write failed. ``self._service_tier`` is process-wide
+                # runner state, so the applied change is honestly gateway-
+                # process-wide until restart — NOT this-session-only.
+                self._evict_cached_agent(session_key)
+                return t(
+                    "gateway.fast.route_session_only", family=family_label, label=label
                 )
-                return False
+            # Session-scoped (default): record the override in memory and
+            # durably persist it so it survives a restart. A persistence
+            # failure keeps the in-memory override live but the change is then
+            # honestly gateway-process-wide until restart.
+            self._set_session_service_tier_override(session_key, tier)
+            self._evict_cached_agent(session_key)
+            if self._persist_session_service_tier(session_key, tier):
+                return t("gateway.fast.route_saved", family=family_label, label=label)
+            return t(
+                "gateway.fast.route_session_only", family=family_label, label=label
+            )
 
         if not args or args == "status":
+            # Interactive picker on platforms that support it (parity with the
+            # /model + /reasoning pickers). Gated on the configured gateway
+            # model's fast support; falls through to the text status card when
+            # the platform has no picker or the send fails. Session-scoped by
+            # default; `/fast --global` persists agent.service_tier.
+            from gateway.run import _resolve_gateway_model
+            from hermes_cli.models import model_supports_fast_mode
+
+            _fast_supported = False
+            try:
+                _fast_supported = model_supports_fast_mode(
+                    _resolve_gateway_model(user_config)
+                )
+            except Exception:
+                _fast_supported = False
+
+            if _fast_supported:
+                _is_fast = self._service_tier == "priority"
+
+                def _apply_fast_choice(value: str) -> str:
+                    """Apply a picker tap. The picker was already gated on fast
+                    support at display time, so it trusts that gate rather than
+                    re-checking the session route capability."""
+                    if value in {"fast", "on"}:
+                        tier = "priority"
+                        saved_value = "fast"
+                        label = t("gateway.fast.label_fast")
+                    elif value in {"normal", "off"}:
+                        tier = None
+                        saved_value = "normal"
+                        label = t("gateway.fast.label_normal")
+                    else:
+                        return t("gateway.fast.unknown_arg", arg=value)
+                    self._service_tier = tier
+                    family_label = t(f"gateway.fast.family_{capability.family}")
+                    if persist_global:
+                        if self._save_gateway_config_key(
+                            "agent.service_tier", saved_value
+                        ):
+                            self._set_session_service_tier_override(
+                                session_key, None, clear=True
+                            )
+                            self._persist_session_service_tier(
+                                session_key, None, clear=True
+                            )
+                            self._evict_cached_agent(session_key)
+                            return t(
+                                "gateway.fast.route_saved",
+                                family=family_label,
+                                label=label,
+                            )
+                        self._evict_cached_agent(session_key)
+                        return t(
+                            "gateway.fast.route_session_only",
+                            family=family_label,
+                            label=label,
+                        )
+                    self._set_session_service_tier_override(session_key, tier)
+                    self._evict_cached_agent(session_key)
+                    if self._persist_session_service_tier(session_key, tier):
+                        return t(
+                            "gateway.fast.route_saved",
+                            family=family_label,
+                            label=label,
+                        )
+                    return t(
+                        "gateway.fast.route_session_only",
+                        family=family_label,
+                        label=label,
+                    )
+
+                async def _on_fast_choice(_chat_id: str, value: str) -> str:
+                    return _apply_fast_choice(value)
+
+                _fast_status = t(
+                    "gateway.fast.state_on" if _is_fast else "gateway.fast.state_off"
+                )
+                picker_sent = await self._try_send_choice_picker(
+                    event,
+                    session_key,
+                    title=t("gateway.fast.picker_title", mode=_fast_status),
+                    choices=[
+                        {
+                            "value": "fast",
+                            "label": t("gateway.fast.choice_fast"),
+                            "is_current": _is_fast,
+                        },
+                        {
+                            "value": "normal",
+                            "label": t("gateway.fast.choice_normal"),
+                            "is_current": not _is_fast,
+                        },
+                    ],
+                    on_choice_selected=_on_fast_choice,
+                )
+                if picker_sent:
+                    return None  # Picker sent — adapter handles the response
+
             if persisted_preference and preference_unavailable:
                 return t(
                     "gateway.fast.preference_unavailable",
@@ -3526,30 +4050,7 @@ class GatewaySlashCommandsMixin:
                 route=route,
             )
 
-        if args in {"fast", "on"}:
-            if persisted_preference and preference_unavailable:
-                return t(
-                    "gateway.fast.preference_unavailable",
-                    route=route,
-                )
-            if not capability.supported:
-                return t("gateway.fast.route_unavailable", reason=capability.reason)
-            self._service_tier = "priority"
-            saved_value = "fast"
-            label = t("gateway.fast.label_fast")
-        elif args in {"normal", "off"}:
-            self._service_tier = None
-            saved_value = "normal"
-            label = t("gateway.fast.label_normal")
-        else:
-            return t("gateway.fast.unknown_arg", arg=args)
-
-        family_label = t(f"gateway.fast.family_{capability.family}")
-        if _save_config_key("agent.service_tier", saved_value):
-            return t("gateway.fast.route_saved", family=family_label, label=label)
-        return t(
-            "gateway.fast.route_session_only", family=family_label, label=label
-        )
+        return _apply_fast_selection(args, persist=persist_global)
 
     async def _handle_yolo_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /yolo — toggle dangerous command approval bypass for this session only."""
@@ -3756,6 +4257,9 @@ class GatewaySlashCommandsMixin:
             split_history_for_partial_compress,
             summarize_compress_preview,
         )
+        from agent.conversation_compression import (
+            finalize_context_engine_compression_notification,
+        )
         _raw_args = (event.get_command_args() or "").strip()
         # Strip --preview/--dry-run/--aggressive before positional parsing
         # so the flags coexist with 'here [N]' / focus-topic forms.
@@ -3815,17 +4319,32 @@ class GatewaySlashCommandsMixin:
             if not runtime_kwargs.get("api_key"):
                 return t("gateway.compress.no_provider")
 
-            # Chat-only compression input: user/assistant turns with real
-            # content, PROJECTED to {role, content} so tool_calls/other keys
-            # don't leak into the summarizer. Tool results, system rows, and
-            # contentless (tool-call-only) turns are handled separately as
-            # ``non_chat_rows`` below and dropped by the transcript rewrite —
-            # feeding them here would double-count and break the both-axes
-            # feedback reconciliation (#F1, 2026-07-02 compress-feedback-honesty).
+            # Chat-only projection: user/assistant turns with real content,
+            # PROJECTED to {role, content}. This drives the DISPLAY/ESTIMATE
+            # axes only (chat_before_tokens, the "N chat" message count, the
+            # both-axes feedback reconciliation) — NOT the compressor input.
+            # Tool results, system rows, and contentless (tool-call-only) turns
+            # are measured separately as ``non_chat_rows`` (#F1, 2026-07-02
+            # compress-feedback-honesty).
             msgs = [
                 {"role": m.get("role"), "content": m.get("content")}
                 for m in history
                 if m.get("role") in {"user", "assistant"} and m.get("content")
+            ]
+
+            # Compressor input: the FULL transcript (tool results included) —
+            # same rationale as the session-hygiene auto-compress in
+            # gateway/run.py (#3854 / #58551). Filtering to user/assistant-only
+            # starves the compressor's tool-result pruning (tool results are
+            # usually the bulk of the context) and trips the protect-first/last
+            # early-return on short filtered histories, making /compress a no-op
+            # on huge tool-heavy sessions. Keep the full message dicts (tool_calls
+            # stubs, tool results) intact, matching what the agent loop feeds
+            # _compress_context.
+            compress_input = [
+                m
+                for m in history
+                if m.get("role") in {"user", "assistant", "tool"}
             ]
 
             # The rows EXCLUDED from the chat-only compression input: tool
@@ -3845,15 +4364,16 @@ class GatewaySlashCommandsMixin:
             # Boundary-aware split: only the head is summarized; the most
             # recent `keep_last` exchanges are preserved verbatim. The
             # split snaps the tail to a user-turn start so the rejoined
-            # transcript keeps role alternation valid.
+            # transcript keeps role alternation valid. Operates on the FULL
+            # compressor input (tool rows included), not the chat-only `msgs`.
             tail: list = []
-            head = msgs
+            head = compress_input
             if partial:
-                head, tail = split_history_for_partial_compress(msgs, keep_last)
+                head, tail = split_history_for_partial_compress(compress_input, keep_last)
                 if not tail:
                     # Degenerate split — fall back to full compression.
                     partial = False
-                    head = msgs
+                    head = compress_input
 
             # Bind the temporary compression agent to the originating source's
             # platform + stable gateway session key. These are *authoritative*
@@ -3928,11 +4448,31 @@ class GatewaySlashCommandsMixin:
                 loop = asyncio.get_running_loop()
                 compressed, _ = await loop.run_in_executor(
                     None,
-                    lambda: tmp_agent._compress_context(head, "", approx_tokens=approx_tokens, focus_topic=focus_topic, force=True)
+                    lambda: tmp_agent._compress_context(
+                        head,
+                        "",
+                        approx_tokens=approx_tokens,
+                        focus_topic=focus_topic,
+                        force=True,
+                        defer_context_engine_notification=True,
+                    )
                 )
 
-                # Re-append the verbatim tail after the compressed head,
-                # guarding the seam against illegal role adjacency.
+                # If _compress_context returned unchanged because a
+                # concurrent compression lock is held, tell the user
+                # clearly instead of showing the misleading
+                # "No changes from compression" no-op text. The wording
+                # distinguishes a confirmed holder from an unconfirmed
+                # acquisition failure (describe_compression_lock_skip).
+                # The deferred context-engine notification is discarded by
+                # the finally block below (finalize committed=False).
+                _lock_skipped = getattr(tmp_agent, "_compression_skipped_due_to_lock", None)
+                if _lock_skipped is True or isinstance(_lock_skipped, str):
+                    from agent.manual_compression_feedback import (
+                        describe_compression_lock_skip,
+                    )
+                    return describe_compression_lock_skip(_lock_skipped)
+
                 if partial and tail:
                     compressed = rejoin_compressed_head_and_tail(compressed, tail)
 
@@ -4038,11 +4578,35 @@ class GatewaySlashCommandsMixin:
                 #    Basis: the rows the next request will actually carry —
                 #    `compressed` after a real rewrite, the ORIGINAL `history`
                 #    when the store was preserved (#F2).
-                _after_basis = compressed if _rewritten else history
+                # Chat-side view of the compressor output. The compressor now
+                # receives the FULL transcript (tool rows included, #58551), so
+                # `compressed` carries tool/system rows too. The chat-axis
+                # feedback (#172: CASE A/B/C headline, chat_after token delta)
+                # must compare the chat-only `msgs` against the chat-only slice
+                # of the result — otherwise a chat no-op (compressor returned the
+                # rows unchanged) looks like a change purely because tool /
+                # contentless-tool-call rows are present on both sides. Apply the
+                # SAME eligibility filter as `msgs` (content-bearing user /
+                # assistant), but preserve object identity when nothing is
+                # stripped so pre-existing chat-only outputs are measured exactly
+                # as before (baseline fed the compressor a chat-only list).
+                _chat_slice = [
+                    m
+                    for m in compressed
+                    if m.get("role") != "tool" and m.get("content")
+                ]
+                compressed_chat = (
+                    compressed if len(_chat_slice) == len(compressed) else _chat_slice
+                )
+                _after_basis = compressed_chat if _rewritten else history
                 chat_after_tokens = (
-                    estimate_messages_tokens_rough(compressed)
+                    estimate_messages_tokens_rough(compressed_chat)
                     if _rewritten
                     else chat_before_tokens
+                )
+                finalize_context_engine_compression_notification(
+                    tmp_agent,
+                    committed=True,
                 )
                 non_chat_tokens = (
                     estimate_messages_tokens_rough(non_chat_rows)
@@ -4069,7 +4633,7 @@ class GatewaySlashCommandsMixin:
                 # the token math (#F1/#F5).
                 summary = summarize_manual_compression(
                     msgs,
-                    compressed,
+                    compressed_chat,
                     chat_before_tokens,
                     chat_after_tokens,
                     non_chat_count=non_chat_count,
@@ -4087,7 +4651,7 @@ class GatewaySlashCommandsMixin:
                 # ship wrong math (same contract as the hygiene announce).
                 _granular = None
                 _granular_has_wire = False
-                if _rewritten and len(compressed) != len(history):
+                if _rewritten and len(compressed_chat) != len(msgs):
                     try:
                         from agent.compaction_stats import build_hygiene_stats
                         from agent.conversation_compression import (
@@ -4099,7 +4663,7 @@ class GatewaySlashCommandsMixin:
                         _stats = build_hygiene_stats(
                             raw_history=history,
                             eligible_msgs=msgs,
-                            compressed=compressed,
+                            compressed=compressed_chat,
                             estimator=estimate_messages_tokens_rough,
                             engine_is_lcm=(_engine_name == "lcm"),
                         )
@@ -4209,6 +4773,10 @@ class GatewaySlashCommandsMixin:
                 _aux_fail_model = getattr(compressor, "_last_aux_model_failure_model", None)
                 _aux_fail_err = getattr(compressor, "_last_aux_model_failure_error", None)
             finally:
+                finalize_context_engine_compression_notification(
+                    tmp_agent,
+                    committed=False,
+                )
                 # Evict cached agent so next turn rebuilds system prompt
                 # from current files (SOUL.md, memory, etc.).
                 self._evict_cached_agent(session_key)
@@ -4633,28 +5201,13 @@ class GatewaySlashCommandsMixin:
         new_entry = await self.async_session_store.switch_session(session_key, target_id)
         if not new_entry:
             return t("gateway.resume.switch_failed")
-        self._clear_session_boundary_security_state(session_key)
 
-        # Clear session-scoped model/reasoning overrides so the resumed
-        # conversation picks up configured defaults instead of a /model
-        # switch made in the previous session under the same chat
-        # session_key. /resume is a conversation boundary just like /new
-        # (which clears these too); without this, a stale override leaks
-        # across the switch. See #10702.
-        _overrides = getattr(self, "_session_model_overrides", None)
-        if isinstance(_overrides, dict):
-            _overrides.pop(session_key, None)
-        self._set_session_reasoning_override(session_key, None)
-        _pending_notes = getattr(self, "_pending_model_notes", None)
-        if isinstance(_pending_notes, dict):
-            _pending_notes.pop(session_key, None)
-        # Clear per-session model cache too, for the same reason — the
-        # resumed conversation must resolve from current config, not a
-        # stale value cached under this session_key before the switch
-        # (mirrors /new and the compression-exhausted auto-reset, #58403).
-        _lrm = getattr(self, "_last_resolved_model", None)
-        if isinstance(_lrm, dict):
-            _lrm.pop(session_key, None)
+        # Conversation boundary: clear ALL conversation-scoped per-session
+        # state (model/reasoning overrides #10702, one-turn restores, model
+        # notes, last-resolved cache #58403, /queue overflow) + security
+        # state in one funnel call. See _CONVERSATION_SCOPED_STATE in
+        # gateway/run.py.
+        self._clear_conversation_scope(session_key, reason="resume")
 
         # Evict any cached agent for this session so the next message
         # rebuilds with the correct session_id end-to-end — mirrors
@@ -4933,6 +5486,11 @@ class GatewaySlashCommandsMixin:
                     reasoning_details=msg.get("reasoning_details"),
                     codex_reasoning_items=msg.get("codex_reasoning_items"),
                     codex_message_items=msg.get("codex_message_items"),
+                    # Keep the api_content sidecar so the branch's first turn
+                    # replays the parent's exact wire bytes (warm provider
+                    # prompt cache) instead of a full cold prefill.
+                    api_content=extract_api_content_sidecar(msg),
+                    timestamp=msg.get("timestamp"),
                 )
             except Exception:
                 pass  # Best-effort copy
@@ -5542,15 +6100,15 @@ class GatewaySlashCommandsMixin:
             return t(confirm_key, title=target_title, md=md_part, parent=parent_link)
         return t("gateway.merge.merged_named", title=target_title, md=md_part)
 
-    async def _handle_credits_command(self, event: MessageEvent) -> str:
-        """Handle /credits -- show Nous credit balance and the top-up handoff.
+    async def _handle_topup_command(self, event: MessageEvent) -> str:
+        """Handle /topup -- show Nous credit balance and the top-up handoff.
 
-        Renders the balance block + identity line + a tappable top-up URL that
-        opens the portal billing page with the modal open. The terminal does NOT
-        confirm, poll, or track payment (billing phase 2a) — checkout happens in
-        the browser and the next /credits shows the new balance. The tappable URL
-        is the affordance: it works on every platform (button-capable or plain
-        text like SMS/email). Fetched off the event loop; fail-open.
+        Renders the balance block + identity line + a tappable portal URL that
+        opens the billing page. Remote spending is managed on the portal: this
+        messaging command does NOT charge, confirm, or track payment here —
+        everything happens in the browser and the next /topup shows the new balance. The
+        tappable URL is the affordance and works on every platform (button-capable
+        or plain text like SMS/email). Fetched off the event loop; fail-open.
         """
         from agent.account_usage import build_credits_view
 
@@ -5562,7 +6120,7 @@ class GatewaySlashCommandsMixin:
         if view is None or not view.logged_in:
             return t("gateway.credits.not_logged_in")
 
-        lines: list[str] = ["💳 **Nous credits**"]
+        lines: list[str] = ["💳 **Nous balance**"]
         for line in view.balance_lines:
             if line.lstrip().startswith("📈"):
                 continue  # drop the helper's header; we print our own
@@ -5572,8 +6130,8 @@ class GatewaySlashCommandsMixin:
             lines.append(view.identity_line)
         if view.topup_url:
             lines.append("")
-            lines.append(f"Top up: {view.topup_url}")
-            lines.append("Complete your top-up in the browser — credits will appear in /credits shortly.")
+            lines.append(f"Manage billing on the portal: {view.topup_url}")
+            lines.append("Top up and manage billing in the browser — your balance updates here after.")
         return "\n".join(lines)
 
     def _compact_account_limit_lines(self) -> list:

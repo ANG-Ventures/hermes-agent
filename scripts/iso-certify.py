@@ -299,16 +299,28 @@ def drive_heavy_turn(port: int, token: str, turn_spec: dict, stop_at: float, res
             deltas = 0
             done = False
             errored = False
+            started = False
             while time.monotonic() < deadline:
                 try:
                     o = cli._recv_until(
                         lambda o: o.get("method") == "event"
-                        and (o.get("params") or {}).get("type") in {"message.delta", "message.complete", "error"},
+                        and (o.get("params") or {}).get("type")
+                        in {"message.start", "message.delta", "message.complete", "error"},
                         timeout=max(0.5, deadline - time.monotonic()),
                     )
                 except TimeoutError:
                     break
                 ptype = (o.get("params") or {}).get("type")
+                if ptype == "message.start":
+                    started = True
+                    turn_start = time.monotonic()
+                    deltas = 0
+                    continue
+                # prompt.submit's RPC response may race with a duplicate terminal
+                # event from the previous turn. Only events after this turn's
+                # message.start can satisfy or score its load boundary.
+                if not started:
+                    continue
                 if ptype == "message.delta":
                     deltas += 1
                     continue

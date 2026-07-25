@@ -54,6 +54,7 @@ export function createClientSessionState(
     sawAssistantPayload: false,
     pendingBranchGroup: null,
     interrupted: false,
+    interimBoundaryPending: false,
     needsInput: false,
     turnStartedAt: null,
     usage: null
@@ -380,7 +381,11 @@ export function toRuntimeMessage(message: ChatMessage): ThreadMessage {
       unstable_annotations: [],
       unstable_data: [],
       steps: [],
-      custom: message.footer ? { footer: message.footer } : {}
+      // Merge fork footer surfacing with upstream interim footer-gate flag.
+      custom: {
+        ...(message.footer ? { footer: message.footer } : {}),
+        ...(message.interim ? { interim: true } : {})
+      }
     }
   } as ThreadMessage
 }

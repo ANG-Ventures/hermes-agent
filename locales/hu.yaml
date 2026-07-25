@@ -1,492 +1,678 @@
-# Hermes statikus üzenetkatalógus -- Magyar
-# See locales/en.yaml for the source of truth; keep keys in sync.
-
 approval:
-  dangerous_header: "⚠️  VESZÉLYES PARANCS: {description}"
-  choose_long:     "      [o]egyszer  |  [s]munkamenet  |  [a]mindig  |  [d]elutasít"
-  choose_short:    "      [o]egyszer  |  [s]munkamenet  |  [d]elutasít"
-  prompt_long:     "      Választás [o/s/a/D]: "
-  prompt_short:    "      Választás [o/s/D]: "
-  choose_smart_deny: "      [o]egyszer  |  [d]elutasít"
-  prompt_smart_deny: "      Választás [o/D]: "
-  smart_deny_once_inputs: "o,once"
-  smart_deny_deny_inputs: "d,deny"
-  timeout:         "      ⏱ Időtúllépés - parancs elutasítva"
-  allowed_once:    "      ✓ Egyszer engedélyezve"
-  allowed_session: "      ✓ Engedélyezve ehhez a munkamenethez"
-  allowed_always:  "      ✓ Hozzáadva az állandó engedélylistához"
-  denied:          "      ✗ Elutasítva"
-  cancelled:       "      ✗ Megszakítva"
-  blocklist_message: "Ez a parancs a feltétel nélküli tiltólistán van, és nem hagyható jóvá."
-
+  allowed_always: '      ✓ Hozzáadva az állandó engedélylistához'
+  allowed_once: '      ✓ Egyszer engedélyezve'
+  allowed_session: '      ✓ Engedélyezve ehhez a munkamenethez'
+  blocklist_message: Ez a parancs a feltétel nélküli tiltólistán van, és nem hagyható jóvá.
+  cancelled: '      ✗ Megszakítva'
+  choose_long: '      [o]egyszer  |  [s]munkamenet  |  [a]mindig  |  [d]elutasít'
+  choose_short: '      [o]egyszer  |  [s]munkamenet  |  [d]elutasít'
+  choose_smart_deny: '      [o]egyszer  |  [d]elutasít'
+  dangerous_header: '⚠️  VESZÉLYES PARANCS: {description}'
+  denied: '      ✗ Elutasítva'
+  prompt_long: '      Választás [o/s/a/D]: '
+  prompt_short: '      Választás [o/s/D]: '
+  prompt_smart_deny: '      Választás [o/D]: '
+  smart_deny_deny_inputs: d,deny
+  smart_deny_once_inputs: o,once
+  timeout: '      ⏱ Időtúllépés - parancs elutasítva'
 gateway:
-  approval_expired: "⚠️ A jóváhagyás lejárt (az ügynök már nem vár). Kérd meg az ügynököt, hogy próbálja újra."
-  draining:         "⏳ {count} aktív ügynök befejezésére várunk az újraindítás előtt..."
-  goal_cleared:     "✓ A cél törölve."
-  no_active_goal:   "Nincs aktív cél."
-  config_read_failed: "⚠️ Nem sikerült olvasni a config.yaml fájlt: {error}"
-  config_save_failed: "⚠️ Nem sikerült menteni a konfigurációt: {error}"
-
-  model:
-    error_prefix:           "Hiba: {error}"
-    switched:               "Modell átváltva: `{model}`"
-    provider_label:         "Szolgáltató: {provider}"
-    reasoning_label:        "Gondolkodás: {effort}"
-    context_label:          "Kontextus: {tokens} token"
-    max_output_label:       "Max. kimenet: {tokens} token"
-    cost_label:             "Költség: {cost}"
-    capabilities_label:     "Képességek: {capabilities}"
-    prompt_caching_enabled: "Prompt-gyorsítótárazás: bekapcsolva"
-    warning_prefix:         "Figyelmeztetés: {warning}"
-    saved_global:           "Mentve a config.yaml fájlba (`--global`)"
-    session_only_hint:      "_(csak ehhez a munkamenethez — add hozzá a `--global` opciót a megőrzéshez)_"
-    current_label:          "Aktuális: `{model}` ezen: {provider}"
-    current_tag:            " (aktuális)"
-    more_models_suffix:     " (+{count} további)"
-    usage_switch_model:     "`/model <name>` — modell váltása"
-    usage_switch_provider:  "`/model <name> --provider <slug>` — szolgáltató váltása"
-    usage_persist:          "`/model <name> --global` — megőrzés"
-
   agents:
-    header:                "🤖 **Aktív ügynökök és feladatok**"
-    active_agents:         "**Aktív ügynökök:** {count}"
-    this_chat:             " · ez a csevegés"
-    more:                  "... és még {count}"
-    running_processes:     "**Futó háttérfolyamatok:** {count}"
-    async_jobs:            "**Átjáró aszinkron feladatai:** {count}"
-    none:                  "Nincsenek aktív ügynökök vagy futó feladatok."
-    state_starting:        "indul"
-    state_running:         "fut"
-
+    active_agents: '**Aktív ügynökök:** {count}'
+    async_jobs: '**Átjáró aszinkron feladatai:** {count}'
+    header: 🤖 **Aktív ügynökök és feladatok**
+    more: '... és még {count}'
+    none: Nincsenek aktív ügynökök vagy futó feladatok.
+    running_processes: '**Futó háttérfolyamatok:** {count}'
+    state_running: fut
+    state_starting: indul
+    this_chat: ' · ez a csevegés'
+  approval_expired: ⚠️ A jóváhagyás lejárt (az ügynök már nem vár). Kérd meg az ügynököt, hogy próbálja újra.
   approve:
-    no_pending:            "Nincs jóváhagyásra váró parancs."
-    once_singular:         "✅ Parancs jóváhagyva. Az ügynök folytatja..."
-    once_plural:           "✅ Parancsok jóváhagyva ({count} parancs). Az ügynök folytatja..."
-    session_singular:      "✅ Parancs jóváhagyva (minta jóváhagyva ehhez a munkamenethez). Az ügynök folytatja..."
-    session_plural:        "✅ Parancsok jóváhagyva (minta jóváhagyva ehhez a munkamenethez) ({count} parancs). Az ügynök folytatja..."
-    always_singular:       "✅ Parancs jóváhagyva (minta véglegesen jóváhagyva). Az ügynök folytatja..."
-    always_plural:         "✅ Parancsok jóváhagyva (minta véglegesen jóváhagyva) ({count} parancs). Az ügynök folytatja..."
-
+    always_plural: ✅ Parancsok jóváhagyva (minta véglegesen jóváhagyva) ({count} parancs). Az ügynök folytatja...
+    always_singular: ✅ Parancs jóváhagyva (minta véglegesen jóváhagyva). Az ügynök folytatja...
+    no_pending: Nincs jóváhagyásra váró parancs.
+    once_plural: ✅ Parancsok jóváhagyva ({count} parancs). Az ügynök folytatja...
+    once_singular: ✅ Parancs jóváhagyva. Az ügynök folytatja...
+    session_plural: ✅ Parancsok jóváhagyva (minta jóváhagyva ehhez a munkamenethez) ({count} parancs). Az ügynök folytatja...
+    session_singular: ✅ Parancs jóváhagyva (minta jóváhagyva ehhez a munkamenethez). Az ügynök folytatja...
   background:
-    usage:                 "Használat: /background <prompt>\nPélda: /background Foglald össze a mai legjobb HN sztorikat\n\nKülön munkamenetben futtatja a promptot. Folytathatod a beszélgetést — az eredmény itt jelenik meg, amint elkészül."
-    started:               "🔄 Háttérfeladat elindítva: \"{preview}\"\nFeladatazonosító: {task_id}\nFolytathatod a beszélgetést — az eredmények itt jelennek meg, amint elkészülnek."
+    started: '🔄 Háttérfeladat elindítva: "{preview}"
 
+      Feladatazonosító: {task_id}
+
+      Folytathatod a beszélgetést — az eredmények itt jelennek meg, amint elkészülnek.'
+    usage: 'Használat: /background <prompt>
+
+      Példa: /background Foglald össze a mai legjobb HN sztorikat
+
+
+      Külön munkamenetben futtatja a promptot. Folytathatod a beszélgetést — az eredmény itt jelenik meg, amint elkészül.'
   branch:
-    db_unavailable:        "A munkamenet-adatbázis nem érhető el."
-    no_conversation:       "Nincs elágaztatható beszélgetés — küldj előbb egy üzenetet."
-    create_failed:         "Nem sikerült létrehozni az ágat: {error}"
-    switch_failed:         "Az ág létrejött, de nem sikerült rá váltani."
-    branched_one:          "⑂ Új ág: **{title}** ({count} üzenet másolva)\nEredeti: `{parent}`\nÁg: `{new}`\nHasználd a `/resume` parancsot az eredetihez való visszatéréshez."
-    branched_many:         "⑂ Új ág: **{title}** ({count} üzenet másolva)\nEredeti: `{parent}`\nÁg: `{new}`\nHasználd a `/resume` parancsot az eredetihez való visszatéréshez."
-    thread_intro:          "⑂ **Branched thread — {title}**\nThis thread inherits the parent conversation ({count} messages) from {parent}. Explore freely here; the parent channel keeps its own session. Use `/merge` to fold a summary back into the parent."
-    thread_parent_fallback: "the parent conversation"
-    thread_branched_one:   "⑂ Branched into a new thread → {thread} (**{title}**, {count} message inherited).\nThe parent channel stays on its own session; use `/merge` inside the thread to fold it back."
-    thread_branched_many:  "⑂ Branched into a new thread → {thread} (**{title}**, {count} messages inherited).\nThe parent channel stays on its own session; use `/merge` inside the thread to fold it back."
+    branched_many: '⑂ Új ág: **{title}** ({count} üzenet másolva)
 
-  merge:
-    not_a_thread:          "`/merge` only works inside a branched thread. Start one with `/branch` in a channel first."
-    not_a_branch:          "This thread wasn't created by `/branch`, so there's no parent session to merge into."
-    not_found:             "No session found matching '{name}'. Use `/merge` with no name to list mergeable sessions."
-    same_session:          "That's the session you're already in — pick a different target to merge into."
-    already_merged:        "This session was already merged into **{title}** — not folding it again. (Start a new exploration to merge fresh material.)"
-    blocked_not_owner:     "You can only merge into sessions you own. '{name}' belongs to a different chat/owner."
-    no_named_sessions:     "No titled sessions to merge into yet. Give a session a name with `/title` first."
-    list_header:           "🔀 **Sessions you can merge into** — reply `/merge <number>` or `/merge <name>`:"
-    list_footer:           "_`/merge <number>` folds a summary of THIS session into that one._"
-    no_conversation:       "Nothing to merge — this session has no conversation yet."
-    no_new_turns:          "Nothing new to merge — no turns happened in this thread after the branch point."
-    no_summary:            "Couldn't generate a summary of this session; nothing was merged. Try again in a moment."
-    fold_failed:           "Failed to fold the summary into the target session: {error}"
-    ledger_failed:         "Couldn't safely record the merge (session store busy) — nothing was folded. Try again in a moment."
-    fold_body:             "[MERGED SESSION — {title}] A summary of another session ('{title}') was folded into this conversation. Treat it as reference context:\n\n{summary}"
-    fold_body_thread:      "[BRANCHED THREAD MERGED — {title}] A branched thread was explored and folded back into this conversation. Summary of what happened in the branch:\n\n{summary}"
-    md_suffix:             " · full record: `{path}`"
-    note_record_suffix:    " · full record: `{path}`"
-    source_marker:         "[MERGED — this thread's new exploration was folded into '{target}' on {when}. You can keep going here, but its summary already lives in that conversation.]"
-    source_marker_named:   "[MERGED — a summary of this session was folded into '{target}' on {when}. You can keep going here, but its summary already lives in that conversation.]"
-    parent_note:           "🔀 **Merged from thread '{title}'**\n{summary}"
-    target_note:           "🔀 **Folded in from _{source}_**{child} — a summary of {turns} message(s) is now in this conversation's context.{record}"
-    target_note_named:     "🔀 **Folded in from _{source}_** — a summary of _{source}_ ({turns} message(s)) is now in this conversation's context.{record}"
-    source_thread_link:    " ({thread})"
-    merged_named:          "✅ Merged into **{title}** — a summary of this session is now in its context.{md}"
-    merged_thread:         "✅ **Folded back into _{title}_**{parent} — a summary of this thread is now in the parent's context, and this thread is archived (still resumable).{md}"
-    merged_thread_no_archive: "✅ **Folded back into _{title}_**{parent} — a summary of this thread is now in the parent's context. (Couldn't archive the thread automatically; you can close it manually.){md}"
-    target_parent_link:    " ({parent})"
+      Eredeti: `{parent}`
 
+      Ág: `{new}`
+
+      Használd a `/resume` parancsot az eredetihez való visszatéréshez.'
+    branched_one: '⑂ Új ág: **{title}** ({count} üzenet másolva)
+
+      Eredeti: `{parent}`
+
+      Ág: `{new}`
+
+      Használd a `/resume` parancsot az eredetihez való visszatéréshez.'
+    create_failed: 'Nem sikerült létrehozni az ágat: {error}'
+    db_unavailable: A munkamenet-adatbázis nem érhető el.
+    no_conversation: Nincs elágaztatható beszélgetés — küldj előbb egy üzenetet.
+    switch_failed: Az ág létrejött, de nem sikerült rá váltani.
+    thread_branched_many: '⑂ Branched into a new thread → {thread} (**{title}**, {count} messages inherited).
+
+      The parent channel stays on its own session; use `/merge` inside the thread to fold it back.'
+    thread_branched_one: '⑂ Branched into a new thread → {thread} (**{title}**, {count} message inherited).
+
+      The parent channel stays on its own session; use `/merge` inside the thread to fold it back.'
+    thread_intro: '⑂ **Branched thread — {title}**
+
+      This thread inherits the parent conversation ({count} messages) from {parent}. Explore freely here; the parent channel keeps its own session. Use `/merge` to fold a summary back into the parent.'
+    thread_parent_fallback: the parent conversation
   commands:
-    usage:                 "Használat: `/commands [page]`"
-    skill_header:          "⚡ **Készségparancsok**:"
-    default_desc:          "Készségparancs"
-    none:                  "Nincsenek elérhető parancsok."
-    header:                "📚 **Parancsok** (összesen {total}, {page}/{total_pages}. oldal)"
-    nav_prev:              "`/commands {page}` ← előző"
-    nav_next:              "következő → `/commands {page}`"
-    out_of_range:          "_(A kért {requested}. oldal a tartományon kívül esik, a(z) {page}. oldal jelenik meg.)_"
-
+    default_desc: Készségparancs
+    header: 📚 **Parancsok** (összesen {total}, {page}/{total_pages}. oldal)
+    nav_next: következő → `/commands {page}`
+    nav_prev: '`/commands {page}` ← előző'
+    none: Nincsenek elérhető parancsok.
+    out_of_range: _(A kért {requested}. oldal a tartományon kívül esik, a(z) {page}. oldal jelenik meg.)_
+    skill_header: '⚡ **Készségparancsok**:'
+    usage: 'Használat: `/commands [page]`'
   compress:
-    not_enough:            "Nincs elég beszélgetés a tömörítéshez (legalább 4 üzenet kell)."
-    no_provider:           "Nincs konfigurált szolgáltató — nem lehet tömöríteni."
-    nothing_to_do:         "Még nincs mit tömöríteni (a teljes átirat még védett kontextus)."
-    aggressive_unsupported: "A --aggressive nem támogatott; használd a '/compress here [N]' parancsot, hogy csak a legutóbbi váltásokat tartsd meg, vagy a /undo parancsot körök törléséhez."
-    focus_line:            "Fókusz: \"{topic}\""
-    chat_size:             "Chat size: ~{before:,} → ~{after:,} tokens (excludes system, tools, tool results)"
-    chat_size_unchanged:   "Chat size: ~{before:,} tokens (unchanged; excludes system, tools, tool results)"
-    full_request_real:     "Full request size: {before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; before = last live request, after = estimate of next)"
-    full_request_est:      "Full request size: ~{before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; estimated — no live request yet)"
-    full_request_no_fixed: "after excludes system prompt + tool schemas (no resident agent to measure them); next live turn will show the full size."
-    full_request_unchanged: "Full request size: {before} tokens (unchanged — next turn resends the same context)"
-    persist_failed:        "⚠️ A tömörítés lefutott, de az eredményt nem sikerült menteni — a munkamenet-adatbázis foglalt volt (zárolva). Semmi sem veszett el; az átirat változatlan. Futtasd újra a /compress parancsot egy pillanat múlva az újrapróbálkozáshoz."
-    summary_failed:        "⚠️ Az összefoglaló generálása sikertelen ({error}). {count} korábbi üzenet eltávolítva és helykitöltővel helyettesítve; a korábbi kontextus már nem helyreállítható. Érdemes ellenőrizni az auxiliary.compression modell konfigurációját."
-    aborted:               "⚠️ Tömörítés megszakítva ({error}). Egyetlen üzenet sem lett eldobva — a beszélgetés változatlan. Futtass /compress parancsot az újrapróbálkozáshoz, /reset egy új munkamenethez, vagy ellenőrizd az auxiliary.compression modell konfigurációt."
-    aux_failed:            "ℹ️ A beállított tömörítőmodell (`{model}`) hibát adott ({error}). A főmodellel helyreállítva — a kontextus érintetlen — de érdemes ellenőrizni az `auxiliary.compression.model` beállítást a config.yaml fájlban."
-    failed:                "Tömörítés sikertelen: {error}"
-
-  debug:
-    upload_failed:         "✗ Nem sikerült feltölteni a hibakeresési jelentést: {error}"
-    header:                "**Hibakeresési jelentés feltöltve:**"
-    auto_delete:           "⏱ A beillesztések 6 óra múlva automatikusan törlődnek."
-    full_logs_hint:        "Teljes naplók feltöltéséhez használd a `hermes debug share` parancsot a CLI-ből."
-    share_hint:            "Oszd meg ezeket a hivatkozásokat a Hermes csapattal támogatásért."
-
-  deny:
-    stale:                 "❌ Parancs elutasítva (a jóváhagyás elavult)."
-    no_pending:            "Nincs elutasítható függőben lévő parancs."
-    denied_singular:       "❌ Parancs elutasítva."
-    denied_plural:         "❌ Parancsok elutasítva ({count} parancs)."
-    denied_reason_singular: "❌ Parancs elutasítva. Indok továbbítva az ügynöknek: \"{reason}\""
-    denied_reason_plural:  "❌ Parancsok elutasítva ({count} parancs). Indok továbbítva az ügynöknek: \"{reason}\""
-
-  fast:
-    not_supported:         "⚡ A /fast csak olyan OpenAI modelleknél érhető el, amelyek támogatják a Priority Processinget."
-    status:                "⚡ Priority Processing\n\nJelenlegi mód: `{mode}`\n\n_Használat:_ `/fast <normal|fast|status>`"
-    unknown_arg:           "⚠️ Ismeretlen argumentum: `{arg}`\n\n**Érvényes lehetőségek:** normal, fast, status"
-    saved:                 "⚡ ✓ Priority Processing: **{label}** (mentve a konfigurációba)\n_(a következő üzenettől lép életbe)_"
-    session_only:          "⚡ ✓ Priority Processing: **{label}** (csak ebben a munkamenetben)"
-    label_fast:            "FAST"
-    label_normal:          "NORMAL"
-    status_fast:           "fast"
-    status_normal:         "normal"
-
-    route_off:             "⚡ Fast: off — {reason}"
-    route_status:          "⚡ Fast: {state} — {family} on `{route}`"
-    preference_status:     "⚡ Configured session preference: Fast {state} — {family} on `{route}`. Route availability is checked before each turn."
-    preference_off:        "⚡ Configured session preference: Fast off — {reason} Route availability is checked before each turn."
-    preference_unavailable: "⚡ Configured session preference `{route}` is currently unavailable because its credentials could not be resolved. The preference remains saved; restore credentials or use `/model reset`."
-    route_unavailable:     "⚡ Fast unavailable — {reason}"
-    route_saved:           "⚡ ✓ {family}: **{label}** (saved to config)"
-    route_session_only:    "⚡ ✓ {family}: **{label}** (config save failed; applied gateway-process-wide until restart)"
-    model_switch_unavailable: "⚡ Fast: unavailable on `{route}`; requests will use normal speed."
-    family_openai_priority: "OpenAI API Priority Processing"
-    family_codex_fast:     "Codex Fast"
-    family_anthropic_fast: "Anthropic Fast"
-    family_unsupported:    "Fast"
-    state_on:              "on"
-    state_off:             "off"
-
-  footer:
-    status:                "📎 Futási idejű lábléc: **{state}**\nMezők: `{fields}`\nPlatform: `{platform}`"
-    usage:                 "Használat: `/footer [on|off|status]`"
-    saved:                 "📎 Futási idejű lábléc: **{state}**{example}\n_(globálisan elmentve — a következő üzenettől lép életbe)_"
-    example_line:          "\nPélda: `{preview}`"
-    state_on:              "ON"
-    state_off:             "OFF"
-
-  goal:
-    unavailable:           "A célok nem érhetők el ebben a munkamenetben."
-    no_goal_set:           "Nincs cél beállítva."
-    paused:                "⏸ Cél szüneteltetve: {goal}"
-    no_resume:             "Nincs folytatható cél."
-    resumed:               "▶ Cél folytatva: {goal}\nKüldj bármilyen üzenetet a folytatáshoz, vagy várj — a következő körben megteszem a következő lépést."
-    invalid:               "Érvénytelen cél: {error}"
-    set:                   "⊙ Cél beállítva ({budget} körös keret): {goal}\nDolgozni fogok rajta, amíg a cél el nem készül, te nem szünetelteted/törlöd, vagy a keret ki nem merül.\nVezérlés: /goal status · /goal pause · /goal resume · /goal clear"
-
-  help:
-    header:                "📖 **Hermes parancsok**\n"
-    skill_header:          "\n⚡ **Készségparancsok** ({count} aktív):"
-    more_use_commands:     "\n... és még {count}. Használd a `/commands` parancsot a teljes, lapozható listához."
-
-  insights:
-    invalid_days:          "Érvénytelen --days érték: {value}"
-    error:                 "Hiba a betekintések generálásakor: {error}"
-
-  kanban:
-    error_prefix:          "⚠ kanban hiba: {error}"
-    subscribed_suffix:     "(feliratkozva — értesítést kapsz, ha a {task_id} befejeződik vagy elakad)"
-    truncated_suffix:      "… (csonkítva; használd a `hermes kanban …` parancsot a terminálban a teljes kimenethez)"
-    no_output:             "(nincs kimenet)"
-    wake:
-      completed:           "completed"
-      gave_up:             "gave up (retries exhausted)"
-      crashed:             "crashed (worker exited); dispatcher will retry"
-      timed_out:           "timed out; dispatcher will retry"
-      blocked:             "blocked; needs attention"
-      status_default:      "status changed"
-      status_joiner:       ", "
-      message:             "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
-
-  personality:
-    none_configured:       "Nincs személyiség beállítva itt: `{path}/config.yaml`"
-    header:                "🎭 **Elérhető személyiségek**\n"
-    none_option:           "• `none` — (nincs személyiségréteg)"
-    item:                  "• `{name}` — {preview}"
-    usage:                 "\nHasználat: `/personality <name>`"
-    save_failed:           "⚠️ Nem sikerült menteni a személyiség módosítását: {error}"
-    cleared:               "🎭 Személyiség törölve — alap ügynöki viselkedés használatban.\n_(a következő üzenettől lép életbe)_"
-    set_to:                "🎭 Személyiség beállítva: **{name}**\n_(a következő üzenettől lép életbe)_"
-    unknown:               "Ismeretlen személyiség: `{name}`\n\nElérhetők: {available}"
-
-  profile:
-    header:                "👤 **Profil:** `{profile}`"
-    home:                  "📂 **Kezdőkönyvtár:** `{home}`"
-
-  reasoning:
-    level_default:             "medium (alapértelmezett)"
-    level_disabled:            "none (kikapcsolva)"
-    scope_session:             "munkamenet-felülbírálás"
-    scope_global:              "globális konfiguráció"
-    status:                    "🧠 **Gondolkodási beállítások**\n\n**Erőfeszítés:** `{level}`\n**Hatókör:** {scope}\n**Megjelenítés:** {display}\n\n_Használat:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|reset|show|hide> [--global]`"
-    display_on:                "be ✓"
-    display_off:               "ki"
-    display_set_on:            "🧠 ✓ Gondolkodás megjelenítése: **BE**\nA modell gondolatai minden válasz előtt megjelennek itt: **{platform}**."
-    display_set_off:           "🧠 ✓ Gondolkodás megjelenítése: **KI** itt: **{platform}**"
-    reset_global_unsupported:  "⚠️ A `/reasoning reset --global` nem támogatott. Használd a `/reasoning <level> --global` parancsot a globális alapérték módosításához."
-    reset_done:                "🧠 ✓ A munkamenet gondolkodási felülbírálása törölve; visszaállás a globális konfigurációra."
-    unknown_arg:               "⚠️ Ismeretlen argumentum: `{arg}`\n\n**Érvényes szintek:** none, minimal, low, medium, high, xhigh, max\n**Megjelenítés:** show, hide\n**Megőrzés:** add hozzá a `--global` opciót a munkameneten túli mentéshez"
-    set_global:                "🧠 ✓ Gondolkodási erőfeszítés beállítva: `{effort}` (mentve a konfigurációba)\n_(a következő üzenettől lép életbe)_"
-    set_global_save_failed:    "🧠 ✓ Gondolkodási erőfeszítés beállítva: `{effort}` (csak ebben a munkamenetben — a konfiguráció mentése sikertelen)\n_(a következő üzenettől lép életbe)_"
-    set_session:               "🧠 ✓ Gondolkodási erőfeszítés beállítva: `{effort}` (csak ebben a munkamenetben — add hozzá a `--global` opciót a megőrzéshez)\n_(a következő üzenettől lép életbe)_"
-
-  reload_mcp:
-    cancelled:             "🟡 /reload-mcp megszakítva. Az MCP-eszközök változatlanok."
-    always_followup:       "ℹ️ A jövőbeli `/reload-mcp` hívások megerősítés nélkül futnak. Újra engedélyezhető az `approvals.mcp_reload_confirm: true` beállítással a config.yaml fájlban."
-    confirm_prompt:        "⚠️ **A /reload-mcp megerősítése**\n\nAz MCP-szerverek újratöltése újraépíti az eszközkészletet ehhez a munkamenethez, és **érvényteleníti a szolgáltató prompt-gyorsítótárát** — a következő üzenet újraküldi a teljes bemeneti tokent. Hosszú kontextusú vagy magas gondolkodási szintű modelleknél ez költséges lehet.\n\nVálassz:\n• **Egyszeri jóváhagyás** — újratöltés most\n• **Mindig jóváhagy** — újratöltés most, és ennek a kérdésnek a végleges elnémítása\n• **Megszakítás** — az MCP-eszközök változatlanok maradnak\n\n_Szöveges alternatíva: válaszolj `/approve`, `/always` vagy `/cancel` paranccsal._"
-    header:                "🔄 **MCP-szerverek újratöltve**\n"
-    reconnected:           "♻️ Újracsatlakozva: {names}"
-    added:                 "➕ Hozzáadva: {names}"
-    removed:               "➖ Eltávolítva: {names}"
-    none_connected:        "Nincsenek csatlakoztatott MCP-szerverek."
-    tools_available:       "\n🔧 {tools} eszköz érhető el {servers} szerverről"
-    failed:                "❌ MCP újratöltés sikertelen: {error}"
-
-  reload_skills:
-    header:                "🔄 **Készségek újratöltve**\n"
-    no_new:                "Nem észleltünk új készséget."
-    total:                 "\n📚 {count} készség érhető el"
-    added_header:          "➕ **Hozzáadott készségek:**"
-    removed_header:        "➖ **Eltávolított készségek:**"
-    item_with_desc:        "    - {name}: {desc}"
-    item_no_desc:          "    - {name}"
-    failed:                "❌ Készségek újratöltése sikertelen: {error}"
-
-  reset:
-    preferences_preserved: "\n↪ Preserved explicit {preferences} preferences. Use `/model reset` and `/reasoning reset` to return to configured defaults."
-    model_preference_unavailable: "\n⚠ Preserved the explicit model preference, but it is currently unavailable because its credentials could not be resolved. Restore credentials or use `/model reset`."
-    header_default:        "✨ Munkamenet visszaállítva! Kezdjük tiszta lappal."
-    header_new:            "✨ Új munkamenet elindítva!"
-    header_titled:         "✨ Új munkamenet elindítva: {title}"
-    title_rejected:        "\n⚠️ Cím elutasítva: {error}"
-    title_error_untitled:  "\n⚠️ {error} — a munkamenet cím nélkül indult."
-    title_empty_untitled:  "\n⚠️ Tisztítás után a cím üres — a munkamenet cím nélkül indult."
-    tip:                   "\n✦ Tipp: {tip}"
-
-  restart:
-    in_progress:           "⏳ Az átjáró újraindítása már folyamatban van..."
-    restarting:            "♻ Átjáró újraindítása. Ha 60 másodpercen belül nem kapsz értesítést, indítsd újra a konzolból a `hermes gateway restart` paranccsal."
-
-  resume:
-    db_unavailable:        "A munkamenet-adatbázis nem érhető el."
-    parse_error:           "⚠️ Could not parse `/resume` arguments: {error}.
-Use quotes around titles with spaces, for example: `/resume \"Project A Plan\"`."
-    matrix_no_named_sessions: "No named sessions found for this Matrix room.
-Use `/title My Session` to name the current room session, `/resume --all` to list all Matrix sessions, or `/resume --cross-room <session name>` to explicitly cross room boundaries."
-    matrix_blocked_no_origin: "⚠️ Matrix /resume blocked: this named session has no recorded room origin, so Hermes will not resume it inside the current room by default. Use `/resume --cross-room {name}` if you intentionally want to cross room boundaries."
-    matrix_blocked_other_room: "⚠️ Matrix /resume blocked: that session belongs to a different Matrix room ({room}). Use `/resume --cross-room {name}` if you intentionally want to resume it here."
-    matrix_cross_room_success: "⚠️ Cross-room resume: resumed **{title}** inside Matrix room **{room}**.
-Future messages in this room will use that transcript until `/reset` or another `/resume`.{msg_part}"
-    blocked_not_owner:     "⚠️ /resume blocked: '**{name}**' belongs to a different user or chat. You can only resume sessions from this chat."
-    no_named_sessions:     "Nem található elnevezett munkamenet.\nHasználd a `/title Saját munkamenet` parancsot a jelenlegi munkamenet elnevezéséhez, majd a `/resume Saját munkamenet` paranccsal térhetsz vissza hozzá."
-    list_header:           "📋 **Elnevezett munkamenetek**\n"
-    list_item:             "• **{title}**{preview_part}"
-    list_item_numbered:    "{index}. **{title}**{preview_part}"
-    list_preview_suffix:   " — _{preview}_"
-    list_footer:           "\nHasználat: `/resume <munkamenet neve>`"
-    list_footer_numbered:  "\nHasználat: `/resume <munkamenet neve>` vagy `/resume <szám>` (pl. `/resume 1` a legutóbbihoz)"
-    list_failed:           "Nem sikerült listázni a munkameneteket: {error}"
-    out_of_range:          "A folytatási index ({index}) tartományon kívül esik.\nA `/resume` argumentumok nélküli használata megjeleníti az elérhető munkameneteket."
-    not_found:             "Nem található '**{name}**' nevű munkamenet.\nArgumentumok nélkül használd a `/resume` parancsot az elérhető munkamenetek megtekintéséhez."
-    already_on:            "📌 Már a **{name}** munkamenetben vagy."
-    switch_failed:         "Nem sikerült munkamenetet váltani."
-    resumed_one:           "↻ **{title}** munkamenet folytatva ({count} üzenet). Beszélgetés visszaállítva."
-    resumed_many:          "↻ **{title}** munkamenet folytatva ({count} üzenet). Beszélgetés visszaállítva."
-    resumed_no_count:      "↻ **{title}** munkamenet folytatva. Beszélgetés visszaállítva."
-
-  retry:
-    no_previous:           "Nincs előző üzenet az újrapróbáláshoz."
-
-  rollback:
-    not_enabled:           "Az ellenőrzőpontok nincsenek bekapcsolva.\nKapcsold be a config.yaml fájlban:\n```\ncheckpoints:\n  enabled: true\n```"
-    none_found:            "Nem található ellenőrzőpont ehhez: {cwd}"
-    invalid_number:        "Érvénytelen ellenőrzőpont-szám. Használj 1-{max} közötti értéket."
-    restored:              "✅ Visszaállítva a(z) {hash} ellenőrzőpontra: {reason}\nA visszaállítás előtti pillanatkép automatikusan elmentve."
-    restore_failed:        "❌ {error}"
-
-  set_home:
-    save_failed:           "Nem sikerült menteni a kezdőcsatornát: {error}"
-    success:               "✅ Kezdőcsatorna beállítva: **{name}** (ID: {chat_id}).\nA cron-feladatok és a platformok közötti üzenetek ide érkeznek."
-
-  status:
-    header:                "📊 **Hermes Gateway állapot**"
-    matrix_scope_header:   "**Matrix scope:**"
-    matrix_scope_room:     "  room: {room}"
-    matrix_scope_room_id:  "  room_id: {room_id}"
-    matrix_scope_thread:   "  thread_id: {thread_id}"
-    matrix_scope_mode:     "  session_scope: {scope}"
-    matrix_scope_key:      "  session_key: {session_key}"
-    session_id:            "**Munkamenet-azonosító:** `{session_id}`"
-    title:                 "**Cím:** {title}"
-    created:               "**Létrehozva:** {timestamp}"
-    last_activity:         "**Utolsó tevékenység:** {timestamp}"
-    model:                 "**Model:** `{model}`"
-    model_provider:        "**Model:** `{model}` ({provider})"
-    context:               "**Context:** {used} / {total} ({pct}%)"
-    context_used:          "**Context:** ~{used} tokens"
-    tokens:                "**Tokenek:** {tokens}"
-    agent_running:         "**Ügynök fut:** {state}"
-    state_yes:             "Igen ⚡"
-    state_no:              "Nem"
-    queued:                "**Sorban álló folytatások:** {count}"
-    platforms:             "**Csatlakoztatott platformok:** {platforms}"
-
-  stop:
-    stopped_pending:       "⚡ Leállítva. Az ügynök még el sem kezdte — folytathatod ezt a munkamenetet."
-    stopped:               "⚡ Leállítás — az aktuális lépés befejezése és leállás. Folytathatja ezt a munkamenetet."
-    no_active:             "Nincs leállítható aktív feladat."
-
-  title:
-    db_unavailable:        "A munkamenet-adatbázis nem érhető el."
-    warn_prefix:           "⚠️ {error}"
-    empty_after_clean:     "⚠️ Tisztítás után a cím üres. Használj nyomtatható karaktereket."
-    set_to:                "✏️ Munkamenet címe beállítva: **{title}**"
-    not_found:             "A munkamenet nem található az adatbázisban."
-    current_with_title:    "📌 Munkamenet: `{session_id}`\nCím: **{title}**"
-    current_no_title:      "📌 Munkamenet: `{session_id}`\nNincs cím beállítva. Használat: `/title Saját munkamenet neve`"
-
-  topic:
-    not_telegram_dm:         "A /topic parancs csak Telegram privát csevegésekben érhető el."
-    no_session_db:           "A munkamenet-adatbázis nem érhető el."
-    unauthorized:            "Nincs jogosultságod a /topic használatához ezen a boton."
-    restore_needs_topic:     "Egy munkamenet visszaállításához először hozz létre vagy nyiss meg egy Telegram topicot, majd küldd a /topic <session-id> parancsot abban a topicban. Új topic létrehozásához nyisd meg az All Messagest, és küldj oda bármilyen üzenetet."
-    topics_disabled:         "A Telegram topicok még nincsenek engedélyezve ehhez a bothoz.\n\nHogyan engedélyezd:\n1. Nyisd meg a @BotFathert.\n2. Válaszd ki a botod.\n3. Nyisd meg a Bot Settings → Threads Settings menüt.\n4. Kapcsold be a Threaded Mode-ot, és győződj meg róla, hogy a felhasználók új threadeket hozhatnak létre.\n\nEzután küldd újra a /topic parancsot."
-    topics_user_disallowed:  "A Telegram topicok engedélyezve vannak, de a felhasználók nem hozhatnak létre topicokat.\n\nNyisd meg a @BotFather → válaszd ki a botod → Bot Settings → Threads Settings menüt, majd kapcsold ki a 'Disallow users to create new threads' opciót.\n\nEzután küldd újra a /topic parancsot."
-    enable_failed:           "Nem sikerült engedélyezni a Telegram topic módot: {error}"
-    bound_status:            "Ez a topic ehhez van kapcsolva:\nMunkamenet: {label}\nID: {session_id}\n\nHasználd a /new parancsot, hogy lecseréld ezt a topicot új munkamenetre.\nPárhuzamos munkához nyisd meg az All Messagest, és küldj oda egy üzenetet egy másik topic létrehozásához."
-    thread_ready:            "A többmunkamenetes Telegram topicok engedélyezve vannak.\n\nEz a topic független Hermes-munkamenetként szolgál. Használd a /new parancsot, hogy lecseréld a topic jelenlegi munkamenetét. Párhuzamos munkához nyisd meg az All Messagest, és küldj oda egy üzenetet egy másik topic létrehozásához."
-    untitled_session:        "Cím nélküli munkamenet"
-
-  undo:
-    nothing:               "Nothing to undo."
-    busy:                  "⏳ The database was busy — nothing was changed. Try /undo again in a moment."
-    error:                 "⚠️ Couldn't complete /undo (internal error — nothing was changed). It's been logged."
-    removed:               "↩️ Undid {turns} half-turn(s) ({count} message(s))."
-    invalid_count:         "Invalid count \"{arg}\" — use /undo or /undo N."
-    draining:              "⏳ Az utolsó kör leállt, de még az aktuális lépését fejezi be — a /undo még nem futtatható. Próbáld újra egy pillanat múlva."
-    now_at:                "↦ Now at — {who}:\n“{preview}”"
-    now_at_notext:         "↦ Now at — {who} (no text)."
-    now_empty:             "↦ Now at — start of the thread (no messages left)."
-    party:
-      user:                "your message"
-      assistant:           "my reply"
-      tool:                "a tool result"
-      message:             "the last message"
-
-  redo:
-    nothing:               "Nothing to redo."
-    busy:                  "⏳ The database was busy — nothing was changed. Try /redo again in a moment."
-    error:                 "⚠️ Couldn't complete /redo (internal error — nothing was changed). It's been logged."
-    restart_lost:          "Nothing to redo — redo history does not survive a restart."
-    restored:              "↪️ Redid {ops} undo operation(s) ({count} message(s) restored)."
-    invalid_count:         "Invalid count \"{arg}\" — use /redo or /redo N."
-    draining:              "⏳ Az utolsó kör leállt, de még az aktuális lépését fejezi be — a /redo még nem futtatható. Próbáld újra egy pillanat múlva."
-
-  update:
-    platform_not_messaging:  "✗ A /update csak üzenetküldő platformokról érhető el. Futtasd a `hermes update` parancsot a terminálból."
-    not_git_repo:            "✗ Nem git-tárhely — frissítés nem lehetséges."
-    hermes_cmd_not_found:    "✗ Nem sikerült megtalálni a `hermes` parancsot. A Hermes fut, de a frissítőparancs nem találta a futtatható fájlt a PATH-on vagy a jelenlegi Python interpreteren keresztül. Próbáld futtatni a `hermes update` parancsot manuálisan a terminálban."
-    start_failed:            "✗ Nem sikerült elindítani a frissítést: {error}"
-    starting:                "⚕ Hermes frissítés indítása… A folyamatot itt fogom közvetíteni."
-
-  usage:
-    rate_limits:              "⏱️ **Sebességkorlátok:** {state}"
-    header_session:           "📊 **Munkamenet tokenhasználat**"
-    label_model:              "Modell: `{model}`"
-    label_input_tokens:       "Bemeneti tokenek: {count}"
-    label_cache_read:         "Gyorsítótár-olvasási tokenek: {count}"
-    label_cache_write:        "Gyorsítótár-írási tokenek: {count}"
-    label_output_tokens:      "Kimeneti tokenek: {count}"
-    label_total:              "Összesen: {count}"
-    label_api_calls:          "API-hívások: {count}"
-    label_cost:               "Költség: {prefix}${amount}"
-    label_cost_included:      "Költség: belefoglalva"
-    label_context:            "Kontextus: {used} / {total} ({pct}%)"
-    comp_header:              "Last request composition (char/4 estimate):"
-    comp_fixed:               "• Fixed: ~{fixed} tok ({sys} system + {tools} tool schemas)"
-    comp_nonfixed:            "• Non-fixed: ~{nonfixed} tok ({hist} history + {results} tool results + {args} tool args)"
-    comp_total:               "• Estimated request total: ~{total} tok (sums exactly; fixed + non-fixed)"
-    label_compressions:       "Tömörítések: {count}"
-    breakdown_header: "🧩 **Kontextus-bontás** _(becsült)_"
-    breakdown_line: "• {label}: ~{count} ({pct}%)"
-    breakdown_cat_system_prompt: "Rendszerüzenet"
-    breakdown_cat_tool_definitions: "Eszközdefiníciók"
-    breakdown_cat_rules: "Szabályok"
-    breakdown_cat_skills: "Készségek"
-    breakdown_cat_mcp: "MCP"
-    breakdown_cat_subagent_definitions: "Alügynök-definíciók"
-    breakdown_cat_memory: "Memória"
-    breakdown_cat_conversation: "Beszélgetés"
-    header_session_info:      "📊 **Munkamenet-információ**"
-    label_messages:           "Üzenetek: {count}"
-    label_estimated_context:  "Becsült kontextus: ~{count} token"
-    detailed_after_first:     "_(A részletes használat az első ügynökválasz után érhető el)_"
-    no_data:                  "Ehhez a munkamenethez nincsenek elérhető használati adatok."
-    unknown_subcommand:       "Ismeretlen /usage alparancs: `{args}`. Próbáld: `/usage` vagy `/usage reset [--force]`."
-    reset_wrong_provider:     "A félretett limit-visszaállítások csak az openai-codex szolgáltatónál érhetők el. Válts először a `/model` paranccsal."
-
+    aborted: ⚠️ Tömörítés megszakítva ({error}). Egyetlen üzenet sem lett eldobva — a beszélgetés változatlan. Futtass /compress parancsot az újrapróbálkozáshoz, /reset egy új munkamenethez, vagy ellenőrizd az auxiliary.compression modell konfigurációt.
+    aggressive_unsupported: A --aggressive nem támogatott; használd a '/compress here [N]' parancsot, hogy csak a legutóbbi váltásokat tartsd meg, vagy a /undo parancsot körök törléséhez.
+    aux_failed: ℹ️ A beállított tömörítőmodell (`{model}`) hibát adott ({error}). A főmodellel helyreállítva — a kontextus érintetlen — de érdemes ellenőrizni az `auxiliary.compression.model` beállítást a config.yaml fájlban.
+    chat_size: 'Chat size: ~{before:,} → ~{after:,} tokens (excludes system, tools, tool results)'
+    chat_size_unchanged: 'Chat size: ~{before:,} tokens (unchanged; excludes system, tools, tool results)'
+    failed: 'Tömörítés sikertelen: {error}'
+    focus_line: 'Fókusz: "{topic}"'
+    full_request_est: 'Full request size: ~{before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; estimated — no live request yet)'
+    full_request_no_fixed: after excludes system prompt + tool schemas (no resident agent to measure them); next live turn will show the full size.
+    full_request_real: 'Full request size: {before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; before = last live request, after = estimate of next)'
+    full_request_unchanged: 'Full request size: {before} tokens (unchanged — next turn resends the same context)'
+    no_provider: Nincs konfigurált szolgáltató — nem lehet tömöríteni.
+    not_enough: Nincs elég beszélgetés a tömörítéshez (legalább 4 üzenet kell).
+    nothing_to_do: Még nincs mit tömöríteni (a teljes átirat még védett kontextus).
+    persist_failed: ⚠️ A tömörítés lefutott, de az eredményt nem sikerült menteni — a munkamenet-adatbázis foglalt volt (zárolva). Semmi sem veszett el; az átirat változatlan. Futtasd újra a /compress parancsot egy pillanat múlva az újrapróbálkozáshoz.
+    summary_failed: ⚠️ Az összefoglaló generálása sikertelen ({error}). {count} korábbi üzenet eltávolítva és helykitöltővel helyettesítve; a korábbi kontextus már nem helyreállítható. Érdemes ellenőrizni az auxiliary.compression modell konfigurációját.
+  config_read_failed: '⚠️ Nem sikerült olvasni a config.yaml fájlt: {error}'
+  config_save_failed: '⚠️ Nem sikerült menteni a konfigurációt: {error}'
   credits:
-    not_logged_in:            "Nincs bejelentkezve a Nous Portalra. Jelentkezz be a kreditegyenleg megtekintéséhez és feltöltéséhez."
+    not_logged_in: Nincs bejelentkezve a Nous Portalra. Jelentkezz be a kreditegyenleg megtekintéséhez és feltöltéséhez.
+  debug:
+    auto_delete: ⏱ A beillesztések 6 óra múlva automatikusan törlődnek.
+    full_logs_hint: Teljes naplók feltöltéséhez használd a `hermes debug share` parancsot a CLI-ből.
+    header: '**Hibakeresési jelentés feltöltve:**'
+    share_hint: Oszd meg ezeket a hivatkozásokat a Hermes csapattal támogatásért.
+    upload_failed: '✗ Nem sikerült feltölteni a hibakeresési jelentést: {error}'
+  deny:
+    denied_plural: ❌ Parancsok elutasítva ({count} parancs).
+    denied_reason_plural: '❌ Parancsok elutasítva ({count} parancs). Indok továbbítva az ügynöknek: "{reason}"'
+    denied_reason_singular: '❌ Parancs elutasítva. Indok továbbítva az ügynöknek: "{reason}"'
+    denied_singular: ❌ Parancs elutasítva.
+    no_pending: Nincs elutasítható függőben lévő parancs.
+    stale: ❌ Parancs elutasítva (a jóváhagyás elavult).
+  draining: ⏳ {count} aktív ügynök befejezésére várunk az újraindítás előtt...
+  fast:
+    choice_fast: fast — Priority Processing bekapcsolva
+    choice_normal: normal — normál feldolgozás
+    family_anthropic_fast: Anthropic Fast
+    family_codex_fast: Codex Fast
+    family_openai_priority: OpenAI API Priority Processing
+    family_unsupported: Fast
+    label_fast: FAST
+    label_normal: NORMAL
+    model_switch_unavailable: '⚡ Fast: unavailable on `{route}`; requests will use normal speed.'
+    not_supported: ⚡ A /fast csak olyan OpenAI modelleknél érhető el, amelyek támogatják a Priority Processinget.
+    picker_title: '⚡ **Priority Processing**\n\nJelenlegi mód: `{mode}`\n\nVálassz egy opciót:'
+    preference_off: '⚡ Configured session preference: Fast off — {reason} Route availability is checked before each turn.'
+    preference_status: '⚡ Configured session preference: Fast {state} — {family} on `{route}`. Route availability is checked before each turn.'
+    preference_unavailable: ⚡ Configured session preference `{route}` is currently unavailable because its credentials could not be resolved. The preference remains saved; restore credentials or use `/model reset`.
+    route_off: '⚡ Fast: off — {reason}'
+    route_saved: '⚡ ✓ {family}: **{label}** (saved to config)'
+    route_session_only: '⚡ ✓ {family}: **{label}** (config save failed; applied gateway-process-wide until restart)'
+    route_status: '⚡ Fast: {state} — {family} on `{route}`'
+    route_unavailable: ⚡ Fast unavailable — {reason}
+    saved: '⚡ ✓ Priority Processing: **{label}** (mentve a konfigurációba)
 
-  verbose:
-    not_enabled:           "A `/verbose` parancs nincs engedélyezve az üzenetküldő platformokon.\n\nEngedélyezd a `config.yaml` fájlban:\n```yaml\ndisplay:\n  tool_progress_command: true\n```"
-    mode_off:              "⚙️ Eszközfolyamat: **OFF** — nem jelenik meg eszközaktivitás."
-    mode_new:              "⚙️ Eszközfolyamat: **NEW** — eszközváltáskor jelenik meg (előnézet hossza: `display.tool_preview_length`, alapértelmezetten 40)."
-    mode_all:              "⚙️ Eszközfolyamat: **ALL** — minden eszközhívás megjelenik (előnézet hossza: `display.tool_preview_length`, alapértelmezetten 40)."
-    mode_verbose:          "⚙️ Eszközfolyamat: **VERBOSE** — minden eszközhívás teljes argumentumokkal."
-    mode_log:              "⚙️ Eszközfolyamat: **LOG** — csendes a csevegésben; az eszközhívások a ~/.hermes/logs/tool_calls.log fájlba íródnak."
-    saved_suffix:          "_(elmentve ehhez: **{platform}** — a következő üzenettől lép életbe)_"
-    save_failed:           "_(nem sikerült menteni a konfigurációba: {error})_"
+      _(a következő üzenettől lép életbe)_'
+    session_only: '⚡ ✓ Priority Processing: **{label}** (csak ebben a munkamenetben)'
+    state_off: 'off'
+    state_on: 'on'
+    status: '⚡ Priority Processing
 
-  voice:
-    enabled_voice_only:    "Hangmód bekapcsolva.\nHanggal válaszolok, ha hangüzenetet küldesz.\nHasználd a /voice tts parancsot, hogy minden üzenetre hangválaszt kapj."
-    disabled_text:         "Hangmód kikapcsolva. Csak szöveges válaszok."
-    tts_enabled:           "Auto-TTS bekapcsolva.\nMinden válasz tartalmaz egy hangüzenetet."
-    status_mode:           "Hangmód: {label}"
-    status_channel:        "Hangcsatorna: #{channel}"
-    status_participants:   "Résztvevők: {count}"
-    status_member:         "  - {name}{status}"
-    speaking:              " (beszél)"
-    enabled_short:         "Hangmód bekapcsolva."
-    disabled_short:        "Hangmód kikapcsolva."
-    label_off:             "Ki (csak szöveg)"
-    label_voice_only:      "Be (hangválasz hangüzenetekre)"
-    label_all:             "TTS (hangválasz minden üzenetre)"
-    help:                  "{toggle}\n\n**Hogyan működik a /voice**\n• `/voice on` — hangválasz, amikor hangüzenetet küldesz\n• `/voice tts` — hangválasz *minden* üzenetre\n• `/voice off` — vissza a csak szöveges válaszokhoz\n• `/voice status` — az aktuális mód megjelenítése\n• `/voice` (argumentum nélkül) — gyors váltás be és ki között{channels}"
-    help_channels:         "\n\n**Élő hangcsatornák (Discord)**\n• Először lépj be egy hangcsatornába, majd `/voice channel` — csatlakozom, hallgatok és hangosan válaszolok\n• `/voice leave` — lecsatlakozás a hangcsatornáról"
 
-  yolo:
-    disabled:                   "⚠️ YOLO mód **KI** ebben a munkamenetben — a veszélyes parancsok jóváhagyást igényelnek."
-    enabled:                    "⚡ YOLO mód **BE** ebben a munkamenetben — minden parancs automatikusan jóváhagyva. Óvatosan használd."
+      Jelenlegi mód: `{mode}`
 
+
+      _Használat:_ `/fast <normal|fast|status>`'
+    status_fast: fast
+    status_normal: normal
+    unknown_arg: '⚠️ Ismeretlen argumentum: `{arg}`
+
+
+      **Érvényes lehetőségek:** normal, fast, status'
+  footer:
+    example_line: '
+
+      Példa: `{preview}`'
+    saved: '📎 Futási idejű lábléc: **{state}**{example}
+
+      _(globálisan elmentve — a következő üzenettől lép életbe)_'
+    state_off: 'OFF'
+    state_on: 'ON'
+    status: '📎 Futási idejű lábléc: **{state}**
+
+      Mezők: `{fields}`
+
+      Platform: `{platform}`'
+    usage: 'Használat: `/footer [on|off|status]`'
+  goal:
+    invalid: 'Érvénytelen cél: {error}'
+    no_goal_set: Nincs cél beállítva.
+    no_resume: Nincs folytatható cél.
+    paused: '⏸ Cél szüneteltetve: {goal}'
+    resumed: '▶ Cél folytatva: {goal}
+
+      Küldj bármilyen üzenetet a folytatáshoz, vagy várj — a következő körben megteszem a következő lépést.'
+    set: '⊙ Cél beállítva ({budget} körös keret): {goal}
+
+      Dolgozni fogok rajta, amíg a cél el nem készül, te nem szünetelteted/törlöd, vagy a keret ki nem merül.
+
+      Vezérlés: /goal status · /goal pause · /goal resume · /goal clear'
+    unavailable: A célok nem érhetők el ebben a munkamenetben.
+  goal_cleared: ✓ A cél törölve.
+  help:
+    header: '📖 **Hermes parancsok**
+
+      '
+    more_use_commands: '
+
+      ... és még {count}. Használd a `/commands` parancsot a teljes, lapozható listához.'
+    skill_header: '
+
+      ⚡ **Készségparancsok** ({count} aktív):'
+  insights:
+    error: 'Hiba a betekintések generálásakor: {error}'
+    invalid_days: 'Érvénytelen --days érték: {value}'
+  kanban:
+    error_prefix: '⚠ kanban hiba: {error}'
+    no_output: (nincs kimenet)
+    subscribed_suffix: (feliratkozva — értesítést kapsz, ha a {task_id} befejeződik vagy elakad)
+    truncated_suffix: … (csonkítva; használd a `hermes kanban …` parancsot a terminálban a teljes kimenethez)
+    wake:
+      blocked: blocked; needs attention
+      completed: completed
+      crashed: crashed (worker exited); dispatcher will retry
+      gave_up: gave up (retries exhausted)
+      message: '[kanban] Task {task_id} {status}.
+
+        Title: {title}
+
+        Assignee: @{assignee}
+
+        Board: {board}
+
+
+        Check the result or decide the next step.'
+      status_default: status changed
+      status_joiner: ', '
+      timed_out: timed out; dispatcher will retry
+  merge:
+    already_merged: This session was already merged into **{title}** — not folding it again. (Start a new exploration to merge fresh material.)
+    blocked_not_owner: You can only merge into sessions you own. '{name}' belongs to a different chat/owner.
+    fold_body: '[MERGED SESSION — {title}] A summary of another session (''{title}'') was folded into this conversation. Treat it as reference context:
+
+
+      {summary}'
+    fold_body_thread: '[BRANCHED THREAD MERGED — {title}] A branched thread was explored and folded back into this conversation. Summary of what happened in the branch:
+
+
+      {summary}'
+    fold_failed: 'Failed to fold the summary into the target session: {error}'
+    ledger_failed: Couldn't safely record the merge (session store busy) — nothing was folded. Try again in a moment.
+    list_footer: _`/merge <number>` folds a summary of THIS session into that one._
+    list_header: '🔀 **Sessions you can merge into** — reply `/merge <number>` or `/merge <name>`:'
+    md_suffix: ' · full record: `{path}`'
+    merged_named: ✅ Merged into **{title}** — a summary of this session is now in its context.{md}
+    merged_thread: ✅ **Folded back into _{title}_**{parent} — a summary of this thread is now in the parent's context, and this thread is archived (still resumable).{md}
+    merged_thread_no_archive: ✅ **Folded back into _{title}_**{parent} — a summary of this thread is now in the parent's context. (Couldn't archive the thread automatically; you can close it manually.){md}
+    no_conversation: Nothing to merge — this session has no conversation yet.
+    no_named_sessions: No titled sessions to merge into yet. Give a session a name with `/title` first.
+    no_new_turns: Nothing new to merge — no turns happened in this thread after the branch point.
+    no_summary: Couldn't generate a summary of this session; nothing was merged. Try again in a moment.
+    not_a_branch: This thread wasn't created by `/branch`, so there's no parent session to merge into.
+    not_a_thread: '`/merge` only works inside a branched thread. Start one with `/branch` in a channel first.'
+    not_found: No session found matching '{name}'. Use `/merge` with no name to list mergeable sessions.
+    note_record_suffix: ' · full record: `{path}`'
+    parent_note: '🔀 **Merged from thread ''{title}''**
+
+      {summary}'
+    same_session: That's the session you're already in — pick a different target to merge into.
+    source_marker: '[MERGED — this thread''s new exploration was folded into ''{target}'' on {when}. You can keep going here, but its summary already lives in that conversation.]'
+    source_marker_named: '[MERGED — a summary of this session was folded into ''{target}'' on {when}. You can keep going here, but its summary already lives in that conversation.]'
+    source_thread_link: ' ({thread})'
+    target_note: 🔀 **Folded in from _{source}_**{child} — a summary of {turns} message(s) is now in this conversation's context.{record}
+    target_note_named: 🔀 **Folded in from _{source}_** — a summary of _{source}_ ({turns} message(s)) is now in this conversation's context.{record}
+    target_parent_link: ' ({parent})'
+  model:
+    capabilities_label: 'Képességek: {capabilities}'
+    context_label: 'Kontextus: {tokens} token'
+    cost_label: 'Költség: {cost}'
+    current_label: 'Aktuális: `{model}` ezen: {provider}'
+    current_tag: ' (aktuális)'
+    error_prefix: 'Hiba: {error}'
+    max_output_label: 'Max. kimenet: {tokens} token'
+    more_models_suffix: ' (+{count} további)'
+    prompt_caching_enabled: 'Prompt-gyorsítótárazás: bekapcsolva'
+    provider_label: 'Szolgáltató: {provider}'
+    reasoning_label: 'Gondolkodás: {effort}'
+    saved_global: Mentve a config.yaml fájlba (`--global`)
+    session_only_hint: _(csak ehhez a munkamenethez — add hozzá a `--global` opciót a megőrzéshez)_
+    switched: 'Modell átváltva: `{model}`'
+    usage_persist: '`/model <name> --global` — megőrzés'
+    usage_switch_model: '`/model <name>` — modell váltása'
+    usage_switch_provider: '`/model <name> --provider <slug>` — szolgáltató váltása'
+    warning_prefix: 'Figyelmeztetés: {warning}'
+  no_active_goal: Nincs aktív cél.
+  personality:
+    cleared: '🎭 Személyiség törölve — alap ügynöki viselkedés használatban.
+
+      _(a következő üzenettől lép életbe)_'
+    header: '🎭 **Elérhető személyiségek**
+
+      '
+    item: • `{name}` — {preview}
+    none_configured: 'Nincs személyiség beállítva itt: `{path}/config.yaml`'
+    none_option: • `none` — (nincs személyiségréteg)
+    save_failed: '⚠️ Nem sikerült menteni a személyiség módosítását: {error}'
+    set_to: '🎭 Személyiség beállítva: **{name}**
+
+      _(a következő üzenettől lép életbe)_'
+    unknown: 'Ismeretlen személyiség: `{name}`
+
+
+      Elérhetők: {available}'
+    usage: '
+
+      Használat: `/personality <name>`'
+  profile:
+    header: 👤 **Profil:** `{profile}`
+    home: 📂 **Kezdőkönyvtár:** `{home}`
+  reasoning:
+    choice_hide: gondolkodás elrejtése a válaszokból
+    choice_none: none — gondolkodás kikapcsolása
+    choice_reset: reset — munkameneti felülbírálás törlése
+    choice_show: gondolkodás megjelenítése a válaszokban
+    display_off: ki
+    display_on: be ✓
+    display_set_off: '🧠 ✓ Gondolkodás megjelenítése: **KI** itt: **{platform}**'
+    display_set_on: '🧠 ✓ Gondolkodás megjelenítése: **BE**
+
+      A modell gondolatai minden válasz előtt megjelennek itt: **{platform}**.'
+    level_default: medium (alapértelmezett)
+    level_disabled: none (kikapcsolva)
+    picker_title: '🧠 **Gondolkodási beállítások**\n\n**Erőfeszítés:** `{level}`\n**Hatókör:** {scope}\n**Megjelenítés:** {display}\n\nVálassz egy opciót:'
+    reset_done: 🧠 ✓ A munkamenet gondolkodási felülbírálása törölve; visszaállás a globális konfigurációra.
+    reset_global_unsupported: ⚠️ A `/reasoning reset --global` nem támogatott. Használd a `/reasoning <level> --global` parancsot a globális alapérték módosításához.
+    scope_global: globális konfiguráció
+    scope_session: munkamenet-felülbírálás
+    set_global: '🧠 ✓ Gondolkodási erőfeszítés beállítva: `{effort}` (mentve a konfigurációba)
+
+      _(a következő üzenettől lép életbe)_'
+    set_global_save_failed: '🧠 ✓ Gondolkodási erőfeszítés beállítva: `{effort}` (csak ebben a munkamenetben — a konfiguráció mentése sikertelen)
+
+      _(a következő üzenettől lép életbe)_'
+    set_session: '🧠 ✓ Gondolkodási erőfeszítés beállítva: `{effort}` (csak ebben a munkamenetben — add hozzá a `--global` opciót a megőrzéshez)
+
+      _(a következő üzenettől lép életbe)_'
+    status: '🧠 **Gondolkodási beállítások**
+
+
+      **Erőfeszítés:** `{level}`
+
+      **Hatókör:** {scope}
+
+      **Megjelenítés:** {display}
+
+
+      _Használat:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|reset|show|hide> [--global]`'
+    unknown_arg: '⚠️ Ismeretlen argumentum: `{arg}`
+
+
+      **Érvényes szintek:** none, minimal, low, medium, high, xhigh, max
+
+      **Megjelenítés:** show, hide
+
+      **Megőrzés:** add hozzá a `--global` opciót a munkameneten túli mentéshez'
+  redo:
+    busy: ⏳ The database was busy — nothing was changed. Try /redo again in a moment.
+    draining: ⏳ Az utolsó kör leállt, de még az aktuális lépését fejezi be — a /redo még nem futtatható. Próbáld újra egy pillanat múlva.
+    error: ⚠️ Couldn't complete /redo (internal error — nothing was changed). It's been logged.
+    invalid_count: Invalid count "{arg}" — use /redo or /redo N.
+    nothing: Nothing to redo.
+    restart_lost: Nothing to redo — redo history does not survive a restart.
+    restored: ↪️ Redid {ops} undo operation(s) ({count} message(s) restored).
+  reload_mcp:
+    added: '➕ Hozzáadva: {names}'
+    always_followup: 'ℹ️ A jövőbeli `/reload-mcp` hívások megerősítés nélkül futnak. Újra engedélyezhető az `approvals.mcp_reload_confirm: true` beállítással a config.yaml fájlban.'
+    cancelled: 🟡 /reload-mcp megszakítva. Az MCP-eszközök változatlanok.
+    confirm_prompt: '⚠️ **A /reload-mcp megerősítése**
+
+
+      Az MCP-szerverek újratöltése újraépíti az eszközkészletet ehhez a munkamenethez, és **érvényteleníti a szolgáltató prompt-gyorsítótárát** — a következő üzenet újraküldi a teljes bemeneti tokent. Hosszú kontextusú vagy magas gondolkodási szintű modelleknél ez költséges lehet.
+
+
+      Válassz:
+
+      • **Egyszeri jóváhagyás** — újratöltés most
+
+      • **Mindig jóváhagy** — újratöltés most, és ennek a kérdésnek a végleges elnémítása
+
+      • **Megszakítás** — az MCP-eszközök változatlanok maradnak
+
+
+      _Szöveges alternatíva: válaszolj `/approve`, `/always` vagy `/cancel` paranccsal._'
+    failed: '❌ MCP újratöltés sikertelen: {error}'
+    header: '🔄 **MCP-szerverek újratöltve**
+
+      '
+    none_connected: Nincsenek csatlakoztatott MCP-szerverek.
+    reconnected: '♻️ Újracsatlakozva: {names}'
+    removed: '➖ Eltávolítva: {names}'
+    tools_available: '
+
+      🔧 {tools} eszköz érhető el {servers} szerverről'
+  reload_skills:
+    added_header: ➕ **Hozzáadott készségek:**
+    failed: '❌ Készségek újratöltése sikertelen: {error}'
+    header: '🔄 **Készségek újratöltve**
+
+      '
+    item_no_desc: '    - {name}'
+    item_with_desc: '    - {name}: {desc}'
+    no_new: Nem észleltünk új készséget.
+    removed_header: ➖ **Eltávolított készségek:**
+    total: '
+
+      📚 {count} készség érhető el'
+  reset:
+    header_default: ✨ Munkamenet visszaállítva! Kezdjük tiszta lappal.
+    header_new: ✨ Új munkamenet elindítva!
+    header_titled: '✨ Új munkamenet elindítva: {title}'
+    model_preference_unavailable: '
+
+      ⚠ Preserved the explicit model preference, but it is currently unavailable because its credentials could not be resolved. Restore credentials or use `/model reset`.'
+    preferences_preserved: '
+
+      ↪ Preserved explicit {preferences} preferences. Use `/model reset` and `/reasoning reset` to return to configured defaults.'
+    tip: '
+
+      ✦ Tipp: {tip}'
+    title_empty_untitled: '
+
+      ⚠️ Tisztítás után a cím üres — a munkamenet cím nélkül indult.'
+    title_error_untitled: '
+
+      ⚠️ {error} — a munkamenet cím nélkül indult.'
+    title_rejected: '
+
+      ⚠️ Cím elutasítva: {error}'
+  restart:
+    in_progress: ⏳ Az átjáró újraindítása már folyamatban van...
+    restarting: ♻ Átjáró újraindítása. Ha 60 másodpercen belül nem kapsz értesítést, indítsd újra a konzolból a `hermes gateway restart` paranccsal.
+  resume:
+    already_on: 📌 Már a **{name}** munkamenetben vagy.
+    blocked_not_owner: '⚠️ /resume blocked: ''**{name}**'' belongs to a different user or chat. You can only resume sessions from this chat.'
+    db_unavailable: A munkamenet-adatbázis nem érhető el.
+    list_failed: 'Nem sikerült listázni a munkameneteket: {error}'
+    list_footer: '
+
+      Használat: `/resume <munkamenet neve>`'
+    list_footer_numbered: '
+
+      Használat: `/resume <munkamenet neve>` vagy `/resume <szám>` (pl. `/resume 1` a legutóbbihoz)'
+    list_header: '📋 **Elnevezett munkamenetek**
+
+      '
+    list_item: • **{title}**{preview_part}
+    list_item_numbered: '{index}. **{title}**{preview_part}'
+    list_preview_suffix: ' — _{preview}_'
+    matrix_blocked_no_origin: '⚠️ Matrix /resume blocked: this named session has no recorded room origin, so Hermes will not resume it inside the current room by default. Use `/resume --cross-room {name}` if you intentionally want to cross room boundaries.'
+    matrix_blocked_other_room: '⚠️ Matrix /resume blocked: that session belongs to a different Matrix room ({room}). Use `/resume --cross-room {name}` if you intentionally want to resume it here.'
+    matrix_cross_room_success: '⚠️ Cross-room resume: resumed **{title}** inside Matrix room **{room}**. Future messages in this room will use that transcript until `/reset` or another `/resume`.{msg_part}'
+    matrix_no_named_sessions: No named sessions found for this Matrix room. Use `/title My Session` to name the current room session, `/resume --all` to list all Matrix sessions, or `/resume --cross-room <session name>` to explicitly cross room boundaries.
+    no_named_sessions: 'Nem található elnevezett munkamenet.
+
+      Használd a `/title Saját munkamenet` parancsot a jelenlegi munkamenet elnevezéséhez, majd a `/resume Saját munkamenet` paranccsal térhetsz vissza hozzá.'
+    not_found: 'Nem található ''**{name}**'' nevű munkamenet.
+
+      Argumentumok nélkül használd a `/resume` parancsot az elérhető munkamenetek megtekintéséhez.'
+    out_of_range: 'A folytatási index ({index}) tartományon kívül esik.
+
+      A `/resume` argumentumok nélküli használata megjeleníti az elérhető munkameneteket.'
+    parse_error: '⚠️ Could not parse `/resume` arguments: {error}. Use quotes around titles with spaces, for example: `/resume "Project A Plan"`.'
+    resumed_many: ↻ **{title}** munkamenet folytatva ({count} üzenet). Beszélgetés visszaállítva.
+    resumed_no_count: ↻ **{title}** munkamenet folytatva. Beszélgetés visszaállítva.
+    resumed_one: ↻ **{title}** munkamenet folytatva ({count} üzenet). Beszélgetés visszaállítva.
+    switch_failed: Nem sikerült munkamenetet váltani.
+  retry:
+    no_previous: Nincs előző üzenet az újrapróbáláshoz.
+  rollback:
+    invalid_number: Érvénytelen ellenőrzőpont-szám. Használj 1-{max} közötti értéket.
+    none_found: 'Nem található ellenőrzőpont ehhez: {cwd}'
+    not_enabled: "Az ellenőrzőpontok nincsenek bekapcsolva.\nKapcsold be a config.yaml fájlban:\n```\ncheckpoints:\n  enabled: true\n```"
+    restore_failed: ❌ {error}
+    restored: '✅ Visszaállítva a(z) {hash} ellenőrzőpontra: {reason}
+
+      A visszaállítás előtti pillanatkép automatikusan elmentve.'
+  set_home:
+    save_failed: 'Nem sikerült menteni a kezdőcsatornát: {error}'
+    success: '✅ Kezdőcsatorna beállítva: **{name}** (ID: {chat_id}).
+
+      A cron-feladatok és a platformok közötti üzenetek ide érkeznek.'
   shared:
-    session_db_unavailable:      "A munkamenet-adatbázis nem érhető el."
-    session_db_unavailable_prefix: "A munkamenet-adatbázis nem érhető el"
-    session_not_found:           "A munkamenet nem található az adatbázisban."
-    warn_passthrough:            "⚠️ {error}"
+    session_db_unavailable: A munkamenet-adatbázis nem érhető el.
+    session_db_unavailable_prefix: A munkamenet-adatbázis nem érhető el
+    session_not_found: A munkamenet nem található az adatbázisban.
+    warn_passthrough: ⚠️ {error}
+  status:
+    agent_running: '**Ügynök fut:** {state}'
+    context: '**Context:** {used} / {total} ({pct}%)'
+    context_used: '**Context:** ~{used} tokens'
+    created: '**Létrehozva:** {timestamp}'
+    header: 📊 **Hermes Gateway állapot**
+    last_activity: '**Utolsó tevékenység:** {timestamp}'
+    matrix_scope_header: '**Matrix scope:**'
+    matrix_scope_key: '  session_key: {session_key}'
+    matrix_scope_mode: '  session_scope: {scope}'
+    matrix_scope_room: '  room: {room}'
+    matrix_scope_room_id: '  room_id: {room_id}'
+    matrix_scope_thread: '  thread_id: {thread_id}'
+    model: '**Model:** `{model}`'
+    model_provider: '**Model:** `{model}` ({provider})'
+    platforms: '**Csatlakoztatott platformok:** {platforms}'
+    queued: '**Sorban álló folytatások:** {count}'
+    session_id: '**Munkamenet-azonosító:** `{session_id}`'
+    state_no: Nem
+    state_yes: Igen ⚡
+    title: '**Cím:** {title}'
+    tokens: '**Tokenek:** {tokens}'
+  stop:
+    no_active: Nincs leállítható aktív feladat.
+    stopped: ⚡ Leállítva. Folytathatod ezt a munkamenetet.
+    stopped_pending: ⚡ Leállítva. Az ügynök még el sem kezdte — folytathatod ezt a munkamenetet.
+  title:
+    current_no_title: '📌 Munkamenet: `{session_id}`
+
+      Nincs cím beállítva. Használat: `/title Saját munkamenet neve`'
+    current_with_title: '📌 Munkamenet: `{session_id}`
+
+      Cím: **{title}**'
+    db_unavailable: A munkamenet-adatbázis nem érhető el.
+    empty_after_clean: ⚠️ Tisztítás után a cím üres. Használj nyomtatható karaktereket.
+    not_found: A munkamenet nem található az adatbázisban.
+    set_to: '✏️ Munkamenet címe beállítva: **{title}**'
+    warn_prefix: ⚠️ {error}
+  topic:
+    bound_status: 'Ez a topic ehhez van kapcsolva:
+
+      Munkamenet: {label}
+
+      ID: {session_id}
+
+
+      Használd a /new parancsot, hogy lecseréld ezt a topicot új munkamenetre.
+
+      Párhuzamos munkához nyisd meg az All Messagest, és küldj oda egy üzenetet egy másik topic létrehozásához.'
+    enable_failed: 'Nem sikerült engedélyezni a Telegram topic módot: {error}'
+    no_session_db: A munkamenet-adatbázis nem érhető el.
+    not_telegram_dm: A /topic parancs csak Telegram privát csevegésekben érhető el.
+    restore_needs_topic: Egy munkamenet visszaállításához először hozz létre vagy nyiss meg egy Telegram topicot, majd küldd a /topic <session-id> parancsot abban a topicban. Új topic létrehozásához nyisd meg az All Messagest, és küldj oda bármilyen üzenetet.
+    thread_ready: 'A többmunkamenetes Telegram topicok engedélyezve vannak.
+
+
+      Ez a topic független Hermes-munkamenetként szolgál. Használd a /new parancsot, hogy lecseréld a topic jelenlegi munkamenetét. Párhuzamos munkához nyisd meg az All Messagest, és küldj oda egy üzenetet egy másik topic létrehozásához.'
+    topics_disabled: 'A Telegram topicok még nincsenek engedélyezve ehhez a bothoz.
+
+
+      Hogyan engedélyezd:
+
+      1. Nyisd meg a @BotFathert.
+
+      2. Válaszd ki a botod.
+
+      3. Nyisd meg a Bot Settings → Threads Settings menüt.
+
+      4. Kapcsold be a Threaded Mode-ot, és győződj meg róla, hogy a felhasználók új threadeket hozhatnak létre.
+
+
+      Ezután küldd újra a /topic parancsot.'
+    topics_user_disallowed: 'A Telegram topicok engedélyezve vannak, de a felhasználók nem hozhatnak létre topicokat.
+
+
+      Nyisd meg a @BotFather → válaszd ki a botod → Bot Settings → Threads Settings menüt, majd kapcsold ki a ''Disallow users to create new threads'' opciót.
+
+
+      Ezután küldd újra a /topic parancsot.'
+    unauthorized: Nincs jogosultságod a /topic használatához ezen a boton.
+    untitled_session: Cím nélküli munkamenet
+  undo:
+    busy: ⏳ The database was busy — nothing was changed. Try /undo again in a moment.
+    draining: ⏳ Az utolsó kör leállt, de még az aktuális lépését fejezi be — a /undo még nem futtatható. Próbáld újra egy pillanat múlva.
+    error: ⚠️ Couldn't complete /undo (internal error — nothing was changed). It's been logged.
+    invalid_count: Érvénytelen szám "{arg}" — használd a /undo vagy /undo N parancsot.
+    nothing: Nincs mit visszavonni.
+    now_at: '↦ Now at — {who}:
+
+      “{preview}”'
+    now_at_notext: ↦ Now at — {who} (no text).
+    now_empty: ↦ Now at — start of the thread (no messages left).
+    party:
+      assistant: my reply
+      message: the last message
+      tool: a tool result
+      user: your message
+    removed: "↩️ Undid {turns} half-turn(s) ({count} message(s))."
+  update:
+    hermes_cmd_not_found: ✗ Nem sikerült megtalálni a `hermes` parancsot. A Hermes fut, de a frissítőparancs nem találta a futtatható fájlt a PATH-on vagy a jelenlegi Python interpreteren keresztül. Próbáld futtatni a `hermes update` parancsot manuálisan a terminálban.
+    not_git_repo: ✗ Nem git-tárhely — frissítés nem lehetséges.
+    platform_not_messaging: ✗ A /update csak üzenetküldő platformokról érhető el. Futtasd a `hermes update` parancsot a terminálból.
+    start_failed: '✗ Nem sikerült elindítani a frissítést: {error}'
+    starting: ⚕ Hermes frissítés indítása… A folyamatot itt fogom közvetíteni.
+  usage:
+    breakdown_cat_conversation: Beszélgetés
+    breakdown_cat_mcp: MCP
+    breakdown_cat_memory: Memória
+    breakdown_cat_rules: Szabályok
+    breakdown_cat_skills: Készségek
+    breakdown_cat_subagent_definitions: Alügynök-definíciók
+    breakdown_cat_system_prompt: Rendszerüzenet
+    breakdown_cat_tool_definitions: Eszközdefiníciók
+    breakdown_header: 🧩 **Kontextus-bontás** _(becsült)_
+    breakdown_line: '• {label}: ~{count} ({pct}%)'
+    comp_fixed: '• Fixed: ~{fixed} tok ({sys} system + {tools} tool schemas)'
+    comp_header: 'Last request composition (char/4 estimate):'
+    comp_nonfixed: '• Non-fixed: ~{nonfixed} tok ({hist} history + {results} tool results + {args} tool args)'
+    comp_total: '• Estimated request total: ~{total} tok (sums exactly; fixed + non-fixed)'
+    detailed_after_first: _(A részletes használat az első ügynökválasz után érhető el)_
+    header_session: 📊 **Munkamenet tokenhasználat**
+    header_session_info: 📊 **Munkamenet-információ**
+    label_api_calls: 'API-hívások: {count}'
+    label_cache_read: 'Gyorsítótár-olvasási tokenek: {count}'
+    label_cache_write: 'Gyorsítótár-írási tokenek: {count}'
+    label_compressions: 'Tömörítések: {count}'
+    label_context: 'Kontextus: {used} / {total} ({pct}%)'
+    label_cost: 'Költség: {prefix}${amount}'
+    label_cost_included: 'Költség: belefoglalva'
+    label_estimated_context: 'Becsült kontextus: ~{count} token'
+    label_input_tokens: 'Bemeneti tokenek: {count}'
+    label_messages: 'Üzenetek: {count}'
+    label_model: 'Modell: `{model}`'
+    label_output_tokens: 'Kimeneti tokenek: {count}'
+    label_total: 'Összesen: {count}'
+    no_data: Ehhez a munkamenethez nincsenek elérhető használati adatok.
+    rate_limits: ⏱️ **Sebességkorlátok:** {state}
+    reset_wrong_provider: A félretett limit-visszaállítások csak az openai-codex szolgáltatónál érhetők el. Válts először a `/model` paranccsal.
+    unknown_subcommand: 'Ismeretlen /usage alparancs: `{args}`. Próbáld: `/usage` vagy `/usage reset [--force]`.'
+  verbose:
+    mode_all: '⚙️ Eszközfolyamat: **ALL** — minden eszközhívás megjelenik (előnézet hossza: `display.tool_preview_length`, alapértelmezetten 40).'
+    mode_log: '⚙️ Eszközfolyamat: **LOG** — csendes a csevegésben; az eszközhívások a ~/.hermes/logs/tool_calls.log fájlba íródnak.'
+    mode_new: '⚙️ Eszközfolyamat: **NEW** — eszközváltáskor jelenik meg (előnézet hossza: `display.tool_preview_length`, alapértelmezetten 40).'
+    mode_off: '⚙️ Eszközfolyamat: **OFF** — nem jelenik meg eszközaktivitás.'
+    mode_verbose: '⚙️ Eszközfolyamat: **VERBOSE** — minden eszközhívás teljes argumentumokkal.'
+    not_enabled: "A `/verbose` parancs nincs engedélyezve az üzenetküldő platformokon.\n\nEngedélyezd a `config.yaml` fájlban:\n```yaml\ndisplay:\n  tool_progress_command: true\n```"
+    save_failed: '_(nem sikerült menteni a konfigurációba: {error})_'
+    saved_suffix: '_(elmentve ehhez: **{platform}** — a következő üzenettől lép életbe)_'
+  voice:
+    disabled_short: Hangmód kikapcsolva.
+    disabled_text: Hangmód kikapcsolva. Csak szöveges válaszok.
+    enabled_short: Hangmód bekapcsolva.
+    enabled_voice_only: 'Hangmód bekapcsolva.
+
+      Hanggal válaszolok, ha hangüzenetet küldesz.
+
+      Használd a /voice tts parancsot, hogy minden üzenetre hangválaszt kapj.'
+    help: '{toggle}
+
+
+      **Hogyan működik a /voice**
+
+      • `/voice on` — hangválasz, amikor hangüzenetet küldesz
+
+      • `/voice tts` — hangválasz *minden* üzenetre
+
+      • `/voice off` — vissza a csak szöveges válaszokhoz
+
+      • `/voice status` — az aktuális mód megjelenítése
+
+      • `/voice` (argumentum nélkül) — gyors váltás be és ki között{channels}'
+    help_channels: '
+
+
+      **Élő hangcsatornák (Discord)**
+
+      • Először lépj be egy hangcsatornába, majd `/voice channel` — csatlakozom, hallgatok és hangosan válaszolok
+
+      • `/voice leave` — lecsatlakozás a hangcsatornáról'
+    label_all: TTS (hangválasz minden üzenetre)
+    label_off: Ki (csak szöveg)
+    label_voice_only: Be (hangválasz hangüzenetekre)
+    speaking: ' (beszél)'
+    status_channel: 'Hangcsatorna: #{channel}'
+    status_member: '  - {name}{status}'
+    status_mode: 'Hangmód: {label}'
+    status_participants: 'Résztvevők: {count}'
+    tts_enabled: 'Auto-TTS bekapcsolva.
+
+      Minden válasz tartalmaz egy hangüzenetet.'
+  yolo:
+    disabled: ⚠️ YOLO mód **KI** ebben a munkamenetben — a veszélyes parancsok jóváhagyást igényelnek.
+    enabled: ⚡ YOLO mód **BE** ebben a munkamenetben — minden parancs automatikusan jóváhagyva. Óvatosan használd.
