@@ -609,10 +609,18 @@ const WINDOW_BUTTON_POSITION = {
 // (pure + unit-testable); computeNativeOverlayWidth() applies it per platform.
 // It's only the pre-layout fallback — the renderer measures the exact overlay
 // width live via the Window Controls Overlay API.
+// Ordered by NATIVE readability, not by convenience: `app.dock.setIcon()` and
+// BrowserWindow's `icon` are native calls that cannot read inside an asar
+// archive, while `fs.statSync` CAN (Electron shims fs for asar paths). So an
+// existence check alone picks a path that exists for JS and throws for native
+// ("Failed to load image from path .../app.asar/public/apple-touch-icon.png",
+// an uncaught main-process exception at startup). Put the asar.unpacked copy
+// first so the native call gets a real on-disk file; the in-asar paths remain
+// as fallbacks for dev runs (unpacked tree, where APP_ROOT has no .asar).
 const APP_ICON_PATHS = [
+  path.join(unpackedPathFor(APP_ROOT), 'dist', 'apple-touch-icon.png'),
   path.join(APP_ROOT, 'public', 'apple-touch-icon.png'),
-  path.join(APP_ROOT, 'dist', 'apple-touch-icon.png'),
-  path.join(unpackedPathFor(APP_ROOT), 'dist', 'apple-touch-icon.png')
+  path.join(APP_ROOT, 'dist', 'apple-touch-icon.png')
 ]
 
 let rendererTitleBarTheme = null
@@ -8385,7 +8393,15 @@ function createWindow() {
     mainWindow.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
 
     if (icon) {
-      app.dock?.setIcon(icon)
+      // Cosmetic only — never let a dock-icon load failure take down the
+      // window. setIcon() is a native call that throws on an unreadable path
+      // (e.g. an in-asar file), and an uncaught throw here aborts createWindow()
+      // and leaves the app with no window at all.
+      try {
+        app.dock?.setIcon(icon)
+      } catch (error) {
+        console.warn(`[main] failed to set dock icon from ${icon}:`, error)
+      }
     }
   }
 
