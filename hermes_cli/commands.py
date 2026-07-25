@@ -80,7 +80,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("retry", "Retry the last message (resend to agent)", "Session"),
     CommandDef("prompt", "Compose your next prompt in $EDITOR (markdown), then send it", "Session",
                cli_only=True, args_hint="[initial text]", aliases=("compose",)),
-    CommandDef("undo", "Back up N user turns and re-prompt (default 1)", "Session",
+    CommandDef("undo", "Back up N half-turns and re-prompt (default 1)", "Session",
+               args_hint="[N]"),
+    CommandDef("redo", "Redo N undo operations (default 1)", "Session",
                args_hint="[N]"),
     CommandDef("title", "Set a title for the current session", "Session",
                args_hint="[name]"),
@@ -1172,7 +1174,12 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
 #   - egress: Docker-only proxy status; reachable as /hermes egress on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress"})
+#   - version: low-frequency diagnostics; reached via /hermes version on
+#     Slack. Added when /redo took the registry over Slack's 50-slash cap —
+#     an explicit, reviewed curation rather than letting the clamp silently
+#     drop whichever command happened to sort last. Native on the CLI, TUI,
+#     Telegram and Discord; only Slack routes it through /hermes.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "version"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
