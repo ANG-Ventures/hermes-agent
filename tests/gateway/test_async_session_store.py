@@ -57,7 +57,16 @@ def test_gateway_async_code_uses_one_awaited_session_store_boundary() -> None:
     """Loop-side store calls must use the facade; raw store remains sync-only."""
     root = Path(__file__).resolve().parents[2]
     violations: list[str] = []
-    for rel in ("gateway/run.py", "gateway/slash_commands.py"):
+    # The slash-command handlers moved from a single gateway/slash_commands.py
+    # into the gateway/slash_commands/ package, so glob the package rather than
+    # naming one path. Asserting non-empty keeps a bad glob from silently turning
+    # this invariant guard into a no-op that passes forever.
+    _slash_files = sorted(
+        str(p.relative_to(root))
+        for p in (root / "gateway" / "slash_commands").glob("*.py")
+    )
+    assert _slash_files, "gateway/slash_commands/*.py matched nothing"
+    for rel in ("gateway/run.py", *_slash_files):
         tree = ast.parse((root / rel).read_text(encoding="utf-8"))
         parents = {
             child: parent

@@ -119,7 +119,24 @@ def test_non_callable_attribute_passes_through():
 # Guard: no raw self._session_db.<method>( on the gateway loop
 # --------------------------------------------------------------------------
 
-_GATEWAY_FILES = ("gateway/run.py", "gateway/slash_commands.py")
+def _slash_command_files() -> tuple[str, ...]:
+    """gateway/run.py plus every module of the gateway/slash_commands/ package.
+
+    The slash-command handlers used to live in a single gateway/slash_commands.py;
+    the god-file split turned it into a package, so this guard globs instead of
+    naming one path. The glob is strictly stronger than the old literal — it picks
+    up every future leaf module automatically.
+    """
+    root = Path(__file__).resolve().parents[2]
+    pkg = sorted(
+        str(p.relative_to(root))
+        for p in (root / "gateway" / "slash_commands").glob("*.py")
+    )
+    assert pkg, "gateway/slash_commands/*.py matched nothing — guard would be a no-op"
+    return ("gateway/run.py", *pkg)
+
+
+_GATEWAY_FILES = _slash_command_files()
 # The only legitimate non-loop paths:
 #   - SessionDB.sanitize_title: pure @staticmethod string cleaning, no DB.
 #   - self._session_db._db.<x>: the sync escape, allowed ONLY where the call is

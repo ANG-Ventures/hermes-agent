@@ -241,11 +241,15 @@ class TestTitleInHelp:
         assert "/title" in result
 
     def test_title_is_known_command(self):
-        """The /title command is in the _known_commands set."""
-        from gateway.run import GatewayRunner
-        import inspect
-        source = inspect.getsource(GatewayRunner._handle_message)
-        assert '"title"' in source
+        """The /title command is bound in the gateway slash-command registry."""
+        # The name->handler binding moved from a hand-written branch in
+        # _handle_message into gateway/slash_commands/registry.py, so assert the
+        # binding where it now lives rather than grepping dispatcher source.
+        from gateway.slash_commands import GatewaySlashCommandsMixin
+        from gateway.slash_commands.registry import GATEWAY_SLASH_HANDLERS
+
+        assert GATEWAY_SLASH_HANDLERS["title"] == "_handle_title_command"
+        assert hasattr(GatewaySlashCommandsMixin, "_handle_title_command")
 
 
 # ---------------------------------------------------------------------------

@@ -78,8 +78,15 @@ class TestReasoningCommand:
         assert "level" in result and "show" in result and "hide" in result
 
     def test_reasoning_is_known_command(self):
-        source = inspect.getsource(gateway_run.GatewayRunner._handle_message)
-        assert '"reasoning"' in source
+        # The name->handler binding moved from a hand-written branch in
+        # _handle_message into gateway/slash_commands/registry.py, so assert the
+        # binding where it now lives (and that it names a real method) rather
+        # than grepping the dispatcher's source text.
+        from gateway.slash_commands import GatewaySlashCommandsMixin
+        from gateway.slash_commands.registry import GATEWAY_SLASH_HANDLERS
+
+        assert GATEWAY_SLASH_HANDLERS["reasoning"] == "_handle_reasoning_command"
+        assert hasattr(GatewaySlashCommandsMixin, "_handle_reasoning_command")
 
     def test_parse_reasoning_command_args_accepts_ascii_and_smart_global_flags(self):
         assert gateway_run.GatewayRunner._parse_reasoning_command_args("high --global") == ("high", True)

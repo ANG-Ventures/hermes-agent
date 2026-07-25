@@ -178,7 +178,12 @@ async def test_reset_completes_when_cleanup_raises(caplog):
 async def test_reset_completes_when_cleanup_times_out(caplog):
     """#35994: if cleanup exceeds the bounded timeout, the reset still completes
     (graceful degradation) and the timeout warning fires."""
-    import gateway.slash_commands as _sc
+    # _handle_reset_command lives in gateway/slash_commands/session_lifecycle.py
+    # after the god-file package split. This patches the `asyncio` reference held
+    # by the module that actually runs the handler, so it must bind the leaf
+    # module rather than the package (the package __init__ does not import
+    # asyncio, so the attribute would not resolve there).
+    import gateway.slash_commands.session_lifecycle as _sc
 
     # Force the wait_for to time out immediately, closing the offloaded awaitable
     # so no worker thread dangles past the test.

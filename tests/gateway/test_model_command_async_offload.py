@@ -23,7 +23,12 @@ import asyncio
 
 import pytest
 
-import gateway.slash_commands as slash_commands
+# _handle_model_command lives in gateway/slash_commands/model.py after the
+# god-file package split. This module patches `slash_commands.asyncio`, i.e. the
+# asyncio reference held by the module that actually runs the handler, so it must
+# bind the leaf module, not the package (the package __init__ does not import
+# asyncio and the attribute would not resolve).
+import gateway.slash_commands.model as slash_commands
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner

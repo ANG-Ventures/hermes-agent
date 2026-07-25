@@ -82,13 +82,15 @@ class TestSourceLinesAreClamped:
 
     def test_gateway_run_clamped(self):
         # The /usage stats handler was extracted from gateway/run.py into
-        # gateway/slash_commands.py (god-file decomposition Phase 3b).
-        src = self._read_file("gateway/slash_commands.py")
+        # gateway/slash_commands.py (god-file decomposition Phase 3b) and then
+        # into gateway/slash_commands/usage.py when that file became a package.
+        src = self._read_file("gateway/slash_commands/usage.py")
+        assert src, "gateway/slash_commands/usage.py is empty or unreadable"
         # Check that the stats handler clamps the context pct with min(100, ...).
         # Assert the clamp intent, not a specific local name (the occupancy
         # value is read into a clamped `_lpt` local, #50421).
         assert "min(100, _lpt / ctx.context_length" in src, (
-            "gateway/slash_commands.py stats pct is not clamped with min(100, ...)"
+            "gateway/slash_commands/usage.py stats pct is not clamped with min(100, ...)"
         )
 
     def test_cli_clamped(self):

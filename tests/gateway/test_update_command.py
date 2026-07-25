@@ -76,14 +76,15 @@ class TestHandleUpdateCommand:
                 pass
 
             # Actually, simplest: just patch the specific file attr.
-            # The _handle_update_command handler lives in gateway/slash_commands.py
-            # (extracted from run.py in the god-file decomposition); it resolves
-            # project_root via Path(__file__).parent.parent, so fake that file.
-            fake_file = str(fake_root / "gateway" / "slash_commands.py")
-            (fake_root / "gateway").mkdir(parents=True)
-            (fake_root / "gateway" / "slash_commands.py").touch()
+            # The _handle_update_command handler lives in
+            # gateway/slash_commands/update.py (god-file decomposition); it
+            # resolves project_root via Path(__file__).parent.parent.parent, so
+            # fake that file at the matching depth.
+            fake_file = str(fake_root / "gateway" / "slash_commands" / "update.py")
+            (fake_root / "gateway" / "slash_commands").mkdir(parents=True)
+            (fake_root / "gateway" / "slash_commands" / "update.py").touch()
 
-            with patch("gateway.slash_commands.__file__", fake_file):
+            with patch("gateway.slash_commands.update.__file__", fake_file):
                 result = await runner._handle_update_command(event)
 
         assert "Not a git repository" in result
@@ -905,10 +906,72 @@ class TestUpdateInHelp:
         assert "/update" in result
 
     def test_update_is_known_command(self):
-        """The /update command is in the help text (proxy for _known_commands)."""
-        # _known_commands is local to _handle_message, so we verify by
-        # checking the help output includes it.
-        from gateway.run import GatewayRunner
+        """The /update command is bound in the gateway slash-command registry."""
+        # The name->handler binding moved from a hand-written branch in
+        # _handle_message into gateway/slash_commands/registry.py, so assert the
+        # binding where it now lives rather than grepping dispatcher source.
+        from gateway.slash_commands import GatewaySlashCommandsMixin
+        from gateway.slash_commands.registry import GATEWAY_SLASH_HANDLERS
+
+        assert GATEWAY_SLASH_HANDLERS["update"] == "_handle_update_command"
+        assert hasattr(GatewaySlashCommandsMixin, "_handle_update_command")
+
+
+class TestUpdateProjectRootDepth:
+    """Guard the one non-move edit in the god-file package split.
+
+    ``_handle_update_command`` resolves the repo root from its own ``__file__``.
+    Moving it from ``gateway/slash_commands.py`` into
+    ``gateway/slash_commands/update.py`` added a directory level, so the old
+    ``.parent.parent`` would resolve to ``gateway/`` and ``/update`` would
+    silently report "Not a git repository".
+
+    The existing test above patches ``__file__``, so it passes on BOTH the
+    correct and the broken depth — it cannot catch this. This asserts the real,
+    unpatched path.
+    """
+
+    def test_update_module_resolves_the_real_repo_root(self):
+        """Evaluate the handler's OWN project_root expression, unpatched.
+
+        Deliberately not `Path(_u.__file__).parent.parent.parent` written out
+        here — that would assert a fact about the filesystem that stays true no
+        matter what the handler's source says, and would pass even if the depth
+        compensation were reverted. Instead, extract the expression the handler
+        actually evaluates and run it against the module's real __file__.
+        """
+        import ast
         import inspect
-        source = inspect.getsource(GatewayRunner._handle_message)
-        assert '"update"' in source
+        import textwrap
+
+        from gateway.slash_commands import GatewaySlashCommandsMixin
+        from gateway.slash_commands import update as _u
+
+        src = textwrap.dedent(
+            inspect.getsource(GatewaySlashCommandsMixin._handle_update_command)
+        )
+        expr = None
+        for node in ast.walk(ast.parse(src)):
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "project_root"
+            ):
+                expr = node.value
+        assert expr is not None, "no `project_root = ...` assignment in the handler"
+
+        root = eval(  # noqa: S307 - evaluating the handler's own literal expression
+            compile(ast.Expression(expr), "<handler>", "eval"),
+            {"Path": Path, "__file__": _u.__file__},
+        )
+        assert root.name != "gateway", (
+            f"the handler's project_root expression resolves to {root} — the "
+            f"/update depth compensation is wrong for "
+            f"gateway/slash_commands/update.py (it needs one more .parent than "
+            f"the pre-split gateway/slash_commands.py did)"
+        )
+        assert (root / "AGENTS.md").exists() or (root / ".git").exists(), (
+            f"the handler's project_root resolves to {root}, which does not look "
+            f"like the repo root"
+        )

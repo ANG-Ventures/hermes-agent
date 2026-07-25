@@ -22,9 +22,9 @@ from __future__ import annotations
 
 import ast
 import inspect
+import textwrap
 
 from gateway import run as gateway_run
-from gateway import slash_commands as gateway_slash
 
 
 def _assigns_false(node: ast.AST, attr: str) -> bool:
@@ -75,13 +75,22 @@ def test_run_consumes_was_auto_reset_in_cleanup_block():
 
 
 def test_slash_command_model_path_consumes_was_auto_reset():
-    """The slash-command model path in gateway/slash_commands.py must consume
-    `was_auto_reset` before storing the new model override, so a
-    /model-first-after-auto-reset isn't wiped by the next message's cleanup
-    (#48031)."""
-    src = inspect.getsource(gateway_slash)
+    """The slash-command model path must consume `was_auto_reset` before storing
+    the new model override, so a /model-first-after-auto-reset isn't wiped by the
+    next message's cleanup (#48031).
+
+    ``_handle_model_command`` moved from ``gateway/slash_commands.py`` into
+    ``gateway/slash_commands/model.py`` in the god-file package split, so read the
+    handler itself rather than the whole module — that is narrower than the old
+    module-wide scan and cannot be satisfied by an unrelated sibling handler.
+    """
+    from gateway.slash_commands import GatewaySlashCommandsMixin
+
+    src = textwrap.dedent(
+        inspect.getsource(GatewaySlashCommandsMixin._handle_model_command)
+    )
     tree = ast.parse(src)
     assert _assigns_false(tree, "was_auto_reset"), (
-        "gateway/slash_commands.py model path must set "
+        "the _handle_model_command model path must set "
         "`was_auto_reset = False` before storing the model override (#48031)."
     )

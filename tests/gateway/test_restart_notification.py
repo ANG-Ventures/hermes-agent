@@ -182,9 +182,11 @@ async def test_restart_command_uses_atomic_json_writes_for_marker_files(tmp_path
     def _fake_atomic_json_write(path, payload, **kwargs):
         calls.append((Path(path).name, payload, kwargs))
 
-    # _handle_restart_command lives in gateway/slash_commands.py (extracted from
-    # run.py); it uses that module's top-level atomic_json_write import.
-    import gateway.slash_commands as gateway_slash
+    # _handle_restart_command lives in gateway/slash_commands/agents_ops.py; it
+    # uses that module's top-level atomic_json_write import. (Note: the sibling
+    # persist_home_channel patches in this file target home.py instead, because
+    # persist_home_channel is read by _handle_set_home_command, not by restart.)
+    import gateway.slash_commands.agents_ops as gateway_slash
     monkeypatch.setattr(gateway_slash, "atomic_json_write", _fake_atomic_json_write)
     monkeypatch.setattr(gateway_run, "atomic_json_write", _fake_atomic_json_write)
 
@@ -218,7 +220,7 @@ async def test_sethome_updates_running_config_for_same_process_restart(tmp_path,
         saved[key] = value
 
     monkeypatch.setattr("hermes_cli.config.save_env_value", _fake_save_env_value)
-    monkeypatch.setattr("gateway.slash_commands.persist_home_channel", lambda home, **kwargs: None)
+    monkeypatch.setattr("gateway.slash_commands.home.persist_home_channel", lambda home, **kwargs: None)
 
     runner, _adapter = make_restart_runner()
     source = make_restart_source(chat_id="home-42")
@@ -251,7 +253,7 @@ async def test_sethome_preserves_thread_target_for_same_process_restart(tmp_path
         saved[key] = value
 
     monkeypatch.setattr("hermes_cli.config.save_env_value", _fake_save_env_value)
-    monkeypatch.setattr("gateway.slash_commands.persist_home_channel", lambda home, **kwargs: None)
+    monkeypatch.setattr("gateway.slash_commands.home.persist_home_channel", lambda home, **kwargs: None)
 
     runner, _adapter = make_restart_runner()
     source = make_restart_source(chat_id="parent-42", thread_id="topic-7")
@@ -278,7 +280,7 @@ async def test_sethome_preserves_thread_target_for_same_process_restart(tmp_path
 async def test_relay_sethome_persists_authenticated_logical_owner(monkeypatch):
     persisted = []
     monkeypatch.setattr(
-        "gateway.slash_commands.persist_home_channel",
+        "gateway.slash_commands.home.persist_home_channel",
         lambda home, **kwargs: persisted.append(home),
     )
     monkeypatch.setattr("hermes_cli.config.save_env_value", lambda key, value: None)
@@ -312,7 +314,7 @@ async def test_relay_sethome_persists_authenticated_logical_owner(monkeypatch):
 @pytest.mark.asyncio
 async def test_relay_sethome_rejects_unadvertised_platform(monkeypatch):
     persist = MagicMock()
-    monkeypatch.setattr("gateway.slash_commands.persist_home_channel", persist)
+    monkeypatch.setattr("gateway.slash_commands.home.persist_home_channel", persist)
 
     runner, _adapter = make_restart_runner()
     relay = MagicMock()
