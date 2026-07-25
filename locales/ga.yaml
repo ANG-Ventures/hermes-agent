@@ -211,6 +211,15 @@ gateway:
     set_global_save_failed:    "🧠 ✓ Iarracht réasúnaíochta socraithe go `{effort}` (seisiún amháin — theip ar shábháil cumraíochta)\n_(éifeachtach ón gcéad teachtaireacht eile)_"
     set_session:               "🧠 ✓ Iarracht réasúnaíochta socraithe go `{effort}` (seisiún amháin — cuir `--global` leis chun é a choinneáil)\n_(éifeachtach ón gcéad teachtaireacht eile)_"
 
+  redo:
+    busy: "⏳ The database was busy — nothing was changed. Try /redo again in a moment."
+    draining: "⏳ Stopadh an seal deireanach ach tá sé fós ag críochnú a chéim reatha — ní féidir /redo a rith go fóill. Bain triail eile as i gceann nóiméid."
+    error: "⚠️ Couldn't complete /redo (internal error — nothing was changed). It's been logged."
+    invalid_count: "Invalid count \"{arg}\" — use /redo or /redo N."
+    nothing: "Nothing to redo."
+    restart_lost: "Nothing to redo — redo history does not survive a restart."
+    restored: "↪️ Redid {ops} undo operation(s) ({count} message(s) restored)."
+
   reload_mcp:
     cancelled:             "🟡 /reload-mcp cealaithe. Tá uirlisí MCP gan athrú."
     always_followup:       "ℹ️ Rithfear glaonna `/reload-mcp` amach anseo gan dearbhú. Athchumasaigh trí `approvals.mcp_reload_confirm: true` a shocrú in config.yaml."
@@ -360,9 +369,20 @@ Future messages in this room will use that transcript until `/reset` or another 
     untitled_session:        "Seisiún gan teideal"
 
   undo:
-    nothing:               "Níl aon rud le cealú."
-    removed:               "↩️ Cealaíodh {turns} seal ({count} teachtaireacht).\nCúltacaíodh chuig: \"{preview}\"\nCóipeáil/cuir an téacs thuas in eagar agus seol é chun athleideadh ón áit seo."
-    invalid_count:         "Líon neamhbhailí \"{arg}\" — úsáid /undo nó /undo N."
+    busy: "⏳ The database was busy — nothing was changed. Try /undo again in a moment."
+    draining: "⏳ Stopadh an seal deireanach ach tá sé fós ag críochnú a chéim reatha — ní féidir /undo a rith go fóill. Bain triail eile as i gceann nóiméid."
+    error: "⚠️ Couldn't complete /undo (internal error — nothing was changed). It's been logged."
+    invalid_count: "Líon neamhbhailí \"{arg}\" — úsáid /undo nó /undo N."
+    nothing: "Níl aon rud le cealú."
+    now_at: "↦ Now at — {who}:\n“{preview}”"
+    now_at_notext: "↦ Now at — {who} (no text)."
+    now_empty: "↦ Now at — start of the thread (no messages left)."
+    party:
+      assistant: "my reply"
+      message: "the last message"
+      tool: "a tool result"
+      user: "your message"
+    removed: "↩️ Undid {turns} half-turn(s) ({count} message(s))."
 
   update:
     platform_not_messaging:  "✗ Tá /update ar fáil amháin ó ardáin teachtaireachtaí. Rith `hermes update` ón teirminéal."

@@ -207,6 +207,15 @@ gateway:
     set_global_save_failed:    "🧠 ✓ 推理強度已設定為 `{effort}`（僅本工作階段 — 設定儲存失敗）\n_（下一則訊息生效）_"
     set_session:               "🧠 ✓ 推理強度已設定為 `{effort}`（僅本工作階段 — 加上 `--global` 可持久化）\n_（下一則訊息生效）_"
 
+  redo:
+    busy: "⏳ The database was busy — nothing was changed. Try /redo again in a moment."
+    draining: "⏳ 上一輪已停止，但仍在完成目前步驟 — /redo 暫時無法執行。請稍後再試。"
+    error: "⚠️ Couldn't complete /redo (internal error — nothing was changed). It's been logged."
+    invalid_count: "Invalid count \"{arg}\" — use /redo or /redo N."
+    nothing: "Nothing to redo."
+    restart_lost: "Nothing to redo — redo history does not survive a restart."
+    restored: "↪️ Redid {ops} undo operation(s) ({count} message(s) restored)."
+
   reload_mcp:
     cancelled:             "🟡 已取消 /reload-mcp。MCP 工具未變更。"
     always_followup:       "ℹ️ 後續 `/reload-mcp` 呼叫將不再要求確認。可在 `config.yaml` 中將 `approvals.mcp_reload_confirm: true` 重新啟用。"
@@ -356,9 +365,20 @@ Future messages in this room will use that transcript until `/reset` or another 
     untitled_session:        "未命名工作階段"
 
   undo:
-    nothing:               "沒有可復原的內容。"
-    removed:               "↩️ 已復原 {turns} 個回合（{count} 則訊息）。\n已備份至：「{preview}」\n複製/編輯上方的文字並傳送，即可從此處重新提問。"
-    invalid_count:         "無效的數量「{arg}」—— 請使用 /undo 或 /undo N。"
+    busy: "⏳ The database was busy — nothing was changed. Try /undo again in a moment."
+    draining: "⏳ 上一輪已停止，但仍在完成目前步驟 — /undo 暫時無法執行。請稍後再試。"
+    error: "⚠️ Couldn't complete /undo (internal error — nothing was changed). It's been logged."
+    invalid_count: "無效的數量「{arg}」—— 請使用 /undo 或 /undo N。"
+    nothing: "沒有可復原的內容。"
+    now_at: "↦ Now at — {who}:\n“{preview}”"
+    now_at_notext: "↦ Now at — {who} (no text)."
+    now_empty: "↦ Now at — start of the thread (no messages left)."
+    party:
+      assistant: "my reply"
+      message: "the last message"
+      tool: "a tool result"
+      user: "your message"
+    removed: "↩️ Undid {turns} half-turn(s) ({count} message(s))."
 
   update:
     platform_not_messaging:  "✗ /update 僅在訊息平台上可用。請在終端機執行 `hermes update`。"

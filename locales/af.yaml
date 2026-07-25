@@ -207,6 +207,15 @@ gateway:
     set_global_save_failed:    "🧠 ✓ Redenering-inspanning gestel op `{effort}` (slegs sessie — konfigurasie-stoor het misluk)\n_(neem effek by die volgende boodskap)_"
     set_session:               "🧠 ✓ Redenering-inspanning gestel op `{effort}` (slegs sessie — voeg `--global` by om permanent te stoor)\n_(neem effek by die volgende boodskap)_"
 
+  redo:
+    busy: "⏳ The database was busy — nothing was changed. Try /redo again in a moment."
+    draining: "⏳ Die laaste beurt is gestop maar voltooi steeds sy huidige stap — /redo kan nog nie loop nie. Probeer netnou weer."
+    error: "⚠️ Couldn't complete /redo (internal error — nothing was changed). It's been logged."
+    invalid_count: "Invalid count \"{arg}\" — use /redo or /redo N."
+    nothing: "Nothing to redo."
+    restart_lost: "Nothing to redo — redo history does not survive a restart."
+    restored: "↪️ Redid {ops} undo operation(s) ({count} message(s) restored)."
+
   reload_mcp:
     cancelled:             "🟡 /reload-mcp gekanselleer. MCP-gereedskap onveranderd."
     always_followup:       "ℹ️ Toekomstige `/reload-mcp`-oproepe sal sonder bevestiging loop. Heraktiveer via `approvals.mcp_reload_confirm: true` in config.yaml."
@@ -356,9 +365,20 @@ Future messages in this room will use that transcript until `/reset` or another 
     untitled_session:        "Sessie sonder titel"
 
   undo:
-    nothing:               "Niks om ongedaan te maak nie."
-    removed:               "↩️ {turns} beurt(e) ongedaan gemaak ({count} boodskap(pe)).\nGerugsteun na: \"{preview}\"\nKopieer/wysig die teks hierbo en stuur dit om van hier af weer te vra."
-    invalid_count:         "Ongeldige getal \"{arg}\" — gebruik /undo of /undo N."
+    busy: "⏳ The database was busy — nothing was changed. Try /undo again in a moment."
+    draining: "⏳ Die laaste beurt is gestop maar voltooi steeds sy huidige stap — /undo kan nog nie loop nie. Probeer netnou weer."
+    error: "⚠️ Couldn't complete /undo (internal error — nothing was changed). It's been logged."
+    invalid_count: "Ongeldige getal \"{arg}\" — gebruik /undo of /undo N."
+    nothing: "Niks om ongedaan te maak nie."
+    now_at: "↦ Now at — {who}:\n“{preview}”"
+    now_at_notext: "↦ Now at — {who} (no text)."
+    now_empty: "↦ Now at — start of the thread (no messages left)."
+    party:
+      assistant: "my reply"
+      message: "the last message"
+      tool: "a tool result"
+      user: "your message"
+    removed: "↩️ Undid {turns} half-turn(s) ({count} message(s))."
 
   update:
     platform_not_messaging:  "✗ /update is slegs beskikbaar vanaf boodskapplatforms. Voer `hermes update` vanaf die terminale uit."

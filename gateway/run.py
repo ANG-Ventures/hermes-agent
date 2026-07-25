@@ -12037,9 +12037,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except (ValueError, IndexError):
                     _undo_n = 1
             _undo_detail = (
-                "This removes the last user/assistant exchange from history."
+                "This backs up the last half-turn from history."
                 if _undo_n == 1
-                else f"This removes the last {_undo_n} user turns from history."
+                else f"This backs up the last {_undo_n} half-turns from history."
             )
             return await self._maybe_confirm_destructive_slash(
                 event=event,
@@ -12048,6 +12048,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 detail=_undo_detail,
                 execute=_do_undo,
             )
+
+        if canonical == "redo":
+            return await self._handle_redo_command(event)
         
         if canonical == "sethome":
             return await self._handle_set_home_command(event)
@@ -14686,6 +14689,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_entry.session_id, entry,
                             skip_db=agent_persisted,
                         )
+                        if agent_persisted and msg.get("role") == "user":
+                            try:
+                                from hermes_undo import on_user_message_appended
+
+                                on_user_message_appended(session_entry.session_id)
+                            except Exception as e:
+                                logger.debug("redo clear on user append failed: %s", e)
             
             # Token counts and model are now persisted by the agent directly.
             # Keep only last_prompt_tokens here for context-window tracking and

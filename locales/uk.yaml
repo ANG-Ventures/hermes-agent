@@ -207,6 +207,15 @@ gateway:
     set_global_save_failed:    "🧠 ✓ Зусилля мислення встановлено на `{effort}` (лише цей сеанс — не вдалося зберегти конфігурацію)\n_(набуде чинності з наступного повідомлення)_"
     set_session:               "🧠 ✓ Зусилля мислення встановлено на `{effort}` (лише цей сеанс — додайте `--global`, щоб зберегти)\n_(набуде чинності з наступного повідомлення)_"
 
+  redo:
+    busy: "⏳ The database was busy — nothing was changed. Try /redo again in a moment."
+    draining: "⏳ Останній хід зупинено, але він ще завершує поточний крок — /redo поки недоступний. Повторіть за мить."
+    error: "⚠️ Couldn't complete /redo (internal error — nothing was changed). It's been logged."
+    invalid_count: "Invalid count \"{arg}\" — use /redo or /redo N."
+    nothing: "Nothing to redo."
+    restart_lost: "Nothing to redo — redo history does not survive a restart."
+    restored: "↪️ Redid {ops} undo operation(s) ({count} message(s) restored)."
+
   reload_mcp:
     cancelled:             "🟡 /reload-mcp скасовано. MCP-інструменти без змін."
     always_followup:       "ℹ️ Наступні виклики `/reload-mcp` виконуватимуться без підтвердження. Увімкнути знову можна через `approvals.mcp_reload_confirm: true` у `config.yaml`."
@@ -356,9 +365,20 @@ Future messages in this room will use that transcript until `/reset` or another 
     untitled_session:        "Сесія без назви"
 
   undo:
-    nothing:               "Немає чого скасовувати."
-    removed:               "↩️ Скасовано ходів: {turns} (повідомлень: {count}).\nРезервна копія: «{preview}»\nСкопіюйте/відредагуйте текст вище та надішліть його, щоб запитати знову звідси."
-    invalid_count:         "Недійсне число «{arg}» — використовуйте /undo або /undo N."
+    busy: "⏳ The database was busy — nothing was changed. Try /undo again in a moment."
+    draining: "⏳ Останній хід зупинено, але він ще завершує поточний крок — /undo поки недоступний. Повторіть за мить."
+    error: "⚠️ Couldn't complete /undo (internal error — nothing was changed). It's been logged."
+    invalid_count: "Недійсне число «{arg}» — використовуйте /undo або /undo N."
+    nothing: "Немає чого скасовувати."
+    now_at: "↦ Now at — {who}:\n“{preview}”"
+    now_at_notext: "↦ Now at — {who} (no text)."
+    now_empty: "↦ Now at — start of the thread (no messages left)."
+    party:
+      assistant: "my reply"
+      message: "the last message"
+      tool: "a tool result"
+      user: "your message"
+    removed: "↩️ Undid {turns} half-turn(s) ({count} message(s))."
 
   update:
     platform_not_messaging:  "✗ /update доступний лише на платформах обміну повідомленнями. Виконайте `hermes update` у терміналі."

@@ -207,6 +207,15 @@ gateway:
     set_global_save_failed:    "🧠 ✓ 추론 노력이 `{effort}`(으)로 설정되었습니다 (세션 한정 — 설정 저장 실패)\n_(다음 메시지부터 적용됩니다)_"
     set_session:               "🧠 ✓ 추론 노력이 `{effort}`(으)로 설정되었습니다 (세션 한정 — 영구 저장하려면 `--global` 추가)\n_(다음 메시지부터 적용됩니다)_"
 
+  redo:
+    busy: "⏳ The database was busy — nothing was changed. Try /redo again in a moment."
+    draining: "⏳ 마지막 턴이 중지되었지만 현재 단계를 아직 완료하는 중입니다 — /redo를 아직 실행할 수 없습니다. 잠시 후 다시 시도하세요."
+    error: "⚠️ Couldn't complete /redo (internal error — nothing was changed). It's been logged."
+    invalid_count: "Invalid count \"{arg}\" — use /redo or /redo N."
+    nothing: "Nothing to redo."
+    restart_lost: "Nothing to redo — redo history does not survive a restart."
+    restored: "↪️ Redid {ops} undo operation(s) ({count} message(s) restored)."
+
   reload_mcp:
     cancelled:             "🟡 /reload-mcp가 취소되었습니다. MCP 도구는 변경되지 않았습니다."
     always_followup:       "ℹ️ 이후 `/reload-mcp` 호출은 확인 없이 실행됩니다. config.yaml의 `approvals.mcp_reload_confirm: true`로 다시 활성화할 수 있습니다."
@@ -356,9 +365,20 @@ Future messages in this room will use that transcript until `/reset` or another 
     untitled_session:        "제목 없는 세션"
 
   undo:
-    nothing:               "되돌릴 내용이 없습니다."
-    removed:               "↩️ {turns}개 턴을 되돌렸습니다 (메시지 {count}개).\n백업 위치: \"{preview}\"\n위 텍스트를 복사/편집한 후 보내면 여기서 다시 프롬프트할 수 있습니다."
-    invalid_count:         "잘못된 개수 \"{arg}\" — /undo 또는 /undo N을 사용하세요."
+    busy: "⏳ The database was busy — nothing was changed. Try /undo again in a moment."
+    draining: "⏳ 마지막 턴이 중지되었지만 현재 단계를 아직 완료하는 중입니다 — /undo를 아직 실행할 수 없습니다. 잠시 후 다시 시도하세요."
+    error: "⚠️ Couldn't complete /undo (internal error — nothing was changed). It's been logged."
+    invalid_count: "잘못된 개수 \"{arg}\" — /undo 또는 /undo N을 사용하세요."
+    nothing: "되돌릴 내용이 없습니다."
+    now_at: "↦ Now at — {who}:\n“{preview}”"
+    now_at_notext: "↦ Now at — {who} (no text)."
+    now_empty: "↦ Now at — start of the thread (no messages left)."
+    party:
+      assistant: "my reply"
+      message: "the last message"
+      tool: "a tool result"
+      user: "your message"
+    removed: "↩️ Undid {turns} half-turn(s) ({count} message(s))."
 
   update:
     platform_not_messaging:  "✗ /update는 메시징 플랫폼에서만 사용할 수 있습니다. 터미널에서 `hermes update`를 실행하세요."
