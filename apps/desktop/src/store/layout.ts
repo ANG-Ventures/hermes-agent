@@ -2,7 +2,7 @@ import { atom, computed, type ReadableAtom } from 'nanostores'
 
 import { setSessionPinned as patchSessionPinned } from '@/hermes'
 import { Codecs, persistentAtom } from '@/lib/persisted'
-import { arraysEqual, insertUniqueId, readKey, writeKey } from '@/lib/storage'
+import { arraysEqual, readKey, writeKey } from '@/lib/storage'
 import { activeGateway } from '@/store/gateway'
 
 import { $paneStates, ensurePaneRegistered, setPaneOpen, setPaneWidthOverride, togglePane } from './panes'

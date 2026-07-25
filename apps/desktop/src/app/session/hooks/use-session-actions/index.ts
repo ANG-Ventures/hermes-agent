@@ -10,7 +10,6 @@ import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
-import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import {
@@ -34,7 +33,6 @@ import {
   $yoloActive,
   type NewChatWorkspaceTarget,
   resolveComposerSessionKey,
-  sessionPinId,
   setActiveSessionId,
   setActiveSessionStoredIdRotation,
   setAwaitingResponse,
