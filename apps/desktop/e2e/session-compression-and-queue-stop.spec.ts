@@ -126,7 +126,17 @@ auxiliary:
     await waitForTranscript(page, MOCK_REPLY)
     await pasteAndSend(page, 'E2E_COMPACTION_HISTORY_TWO '.repeat(5))
     await waitForTranscript(page, MOCK_REPLY)
-    await pasteAndSend(page, 'E2E_TRIGGER_AUTOMATIC_COMPACTION '.repeat(500))
+    // 1200 repeats (upstream had 500): the fork's P2 skew-calibrated trigger
+    // (agent/context_engine.py _trigger_skew) applies a conservative 0.7
+    // cold-start prior on an empty skew history — the mock backend never
+    // returns real prompt_tokens, so history stays empty and the trigger
+    // fires at raw-rough >= threshold/0.7 (~31.5k for the 22k threshold),
+    // not at raw >= 22k as upstream's estimator assumed (guards the
+    // 2026-07-18 premature-compaction incident). 1200 repeats lands
+    // ~35k raw — decisively over the calibrated trigger, well under the
+    // 95% hard ceiling (60.8k) — preserving the fork trigger contract
+    // while exercising upstream's queue-during-compaction behavior.
+    await pasteAndSend(page, 'E2E_TRIGGER_AUTOMATIC_COMPACTION '.repeat(1200))
     await fixture.mock.waitForHeldCompletion()
     await expect(page.getByRole('status', { name: 'Summarizing thread' }).last()).toBeVisible()
 
