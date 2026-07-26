@@ -1322,7 +1322,13 @@ class TestConvertMessages:
 
         assert system == "You are helpful."
         assert result[0]["role"] == "user"
-        assert result[0]["content"] == [{"type": "text", "text": " "}]
+        # The synthetic turn must carry NON-WHITESPACE text: the Messages
+        # input schema rejects blank text blocks, and this turn is
+        # re-prepended on EVERY conversion — a whitespace placeholder makes
+        # the whole session a deterministic 400 (2026-07-25 incident).
+        lead_blocks = result[0]["content"]
+        assert isinstance(lead_blocks, list) and lead_blocks[0]["type"] == "text"
+        assert lead_blocks[0]["text"].strip() != ""
         assert result[1]["role"] == "assistant"
         assert any(
             m["role"] == "assistant" and "Context compaction summary" in str(m["content"])
@@ -1346,7 +1352,9 @@ class TestConvertMessages:
 
         assert system is None
         assert result[0]["role"] == "user"
-        assert result[0]["content"] == [{"type": "text", "text": " "}]
+        lead = result[0]["content"]
+        assert isinstance(lead, list) and lead[0]["type"] == "text"
+        assert lead[0]["text"].strip() != ""  # non-whitespace or the API 400s
         assert result[1]["role"] == "assistant"
         assert "Context compaction summary" in str(result[1]["content"])
 
