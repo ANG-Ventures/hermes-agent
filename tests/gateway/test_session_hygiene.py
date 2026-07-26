@@ -1674,3 +1674,187 @@ def test_hygiene_threshold_out_of_range_falls_back(bad):
 def test_hygiene_threshold_is_in_config_defaults():
     from hermes_cli.config import DEFAULT_CONFIG
     assert DEFAULT_CONFIG["compression"]["hygiene_threshold"] == 0.85
+
+
+# ---------------------------------------------------------------------------
+# Hygiene deadline derivation + repeated-failure escalation
+#
+# The outer asyncio.wait_for guard around hygiene compression used to be a
+# hardcoded 30.0s while the summariser call it wraps gets
+# auxiliary.compression.timeout (default 300s). An outer guard TIGHTER than the
+# inner deadline is a guaranteed kill on any large transcript, so hygiene could
+# never succeed and the session grew unboundedly.
+# ---------------------------------------------------------------------------
+
+
+def test_hygiene_timeout_default_derives_from_auxiliary_compression():
+    """Unset hygiene_timeout_seconds -> follow auxiliary.compression.timeout."""
+    from agent.hygiene_timeout import resolve_hygiene_timeout_seconds
+
+    seconds, explicit = resolve_hygiene_timeout_seconds(
+        {"enabled": True},
+        {"compression": {"provider": "auto", "model": "", "timeout": 300}},
+    )
+    # Pre-fix this was 30.0 — the value that killed the 3,000-message session.
+    assert seconds == 300.0
+    assert explicit is False
+
+
+def test_hygiene_failure_alert_after_is_in_config_defaults():
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["compression"]["hygiene_failure_alert_after"] == 3
+
+
+def test_hygiene_timeout_seconds_default_is_unset_for_derivation():
+    """A literal 30 in DEFAULT_CONFIG would re-pin the guard below the inner
+    deadline via the explicit branch, reintroducing the bug."""
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["compression"]["hygiene_timeout_seconds"] is None
+
+
+def test_hygiene_failure_streak_bumps_and_clears():
+    """The streak is what makes 'compression can never succeed' visible."""
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+
+    assert runner._record_hygiene_compression_failure("s1") == 1
+    assert runner._record_hygiene_compression_failure("s1") == 2
+    assert runner._record_hygiene_compression_failure("s1") == 3
+    # Independent per session.
+    assert runner._record_hygiene_compression_failure("s2") == 1
+
+    # A real compaction resets only that session's streak.
+    runner._clear_hygiene_compression_failures("s1")
+    assert runner._record_hygiene_compression_failure("s1") == 1
+    assert runner._record_hygiene_compression_failure("s2") == 2
+
+    # Clearing an unknown session is a no-op, not a KeyError.
+    runner._clear_hygiene_compression_failures("never-seen")
+
+
+@pytest.mark.asyncio
+async def test_repeated_hygiene_timeouts_escalate_to_a_loud_warning(monkeypatch, tmp_path):
+    """3 consecutive timeouts -> the warning names the unbounded growth and the
+    knob, instead of repeating the same benign-sounding line forever."""
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_db = MagicMock()
+
+    class AlwaysTimingOutAgent:
+        def __init__(self, **kwargs):
+            self.session_id = kwargs.get("session_id", "fake-session")
+            self._session_db = kwargs.get("session_db")
+            self._last_compaction_in_place = False
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, messages, *_args, commit_fence=None, **_kwargs):
+            # Outlive the (tiny, explicitly pinned) deadline every time.
+            time.sleep(0.5)
+            return (messages, None)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = AlwaysTimingOutAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    cfg_path = tmp_path / "config.yaml"
+    # cooldown 0 so each turn actually retries; alert on the 3rd failure.
+    cfg_path.write_text(
+        "compression:\n"
+        "  enabled: true\n"
+        "  hygiene_timeout_seconds: 0.01\n"
+        "  hygiene_failure_cooldown_seconds: 0\n"
+        "  hygiene_failure_alert_after: 3\n"
+    )
+
+    gateway_run = importlib.import_module("gateway.run")
+    adapter = HygieneCaptureAdapter()
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
+    )
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._voice_mode = {}
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key="agent:main:telegram:dm:12345",
+        session_id="sess-loud",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store.load_transcript.return_value = _make_history(6, content_size=400)
+    runner.session_store.has_any_sessions.return_value = True
+    runner.session_store.rewrite_transcript = MagicMock()
+    runner.session_store.append_to_transcript = MagicMock()
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._session_db = SimpleNamespace(_db=fake_db)
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ok",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"}
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100,
+    )
+
+    def _event(n):
+        return MessageEvent(
+            text=f"hello {n}",
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="12345",
+                chat_type="dm",
+                user_id="12345",
+            ),
+            message_id=str(n),
+        )
+
+    for n in range(3):
+        assert await runner._handle_message(_event(n)) == "ok"
+
+    warnings = [s["content"] for s in adapter.sent if "compression" in s["content"].lower()]
+    assert len(warnings) == 3
+
+    # First two: the benign per-occurrence line.
+    for quiet in warnings[:2]:
+        assert "Context compression timed out" in quiet
+        assert "🚨" not in quiet
+
+    # Third: loud, names the growth AND the knob — but still truthful about
+    # the no-data-loss semantics.
+    loud = warnings[2]
+    assert "🚨" in loud
+    assert "3 times in a row" in loud
+    assert "growing" in loud
+    assert "compression.hygiene_timeout_seconds" in loud
+    assert "No messages have been dropped" in loud
+
+    # No-data-loss invariant held throughout: nothing was ever written back.
+    fake_db.archive_and_compact.assert_not_called()
+    runner.session_store.rewrite_transcript.assert_not_called()

@@ -750,8 +750,9 @@ compression:
   protect_first_n: 3                                # Non-system head messages pinned across compactions (0 = pin nothing)
   idle_compact_after_seconds: 0                     # Opt-in idle compaction (0 = disabled) — see below
   hygiene_hard_message_limit: 5000                  # Gateway safety valve — see below
-  hygiene_timeout_seconds: 30                       # Max seconds gateway waits for pre-agent hygiene compression
+  hygiene_timeout_seconds: null                     # Max seconds gateway waits for pre-agent hygiene compression (null = derive from auxiliary.compression.timeout)
   hygiene_failure_cooldown_seconds: 300             # Skip repeated failed hygiene attempts for this session
+  hygiene_failure_alert_after: 3                    # Escalate the warning after N consecutive hygiene failures (0 = never)
   proactive_prune_tokens: 0                         # Opt-in tokens trigger for the no-LLM tool-result prune (0 = off; see below)
   proactive_prune_min_result_chars: 8000            # Prune's summarize pass only touches tool results larger than this (clamped >= 200)
   proactive_prune_min_reclaim_tokens: 4096          # Prune only commits when it reclaims at least this many tokens (0 = commit any)
@@ -772,7 +773,15 @@ Older configs with `compression.summary_model`, `compression.summary_provider`, 
 
 `hygiene_timeout_seconds` caps how long the gateway waits for this pre-agent compression pass. If the auxiliary compression backend is down or very slow, the gateway warns the user, continues the incoming message without compression, and records a temporary per-session failure cooldown instead of appearing stuck.
 
+**Leave it unset (`null`) unless you have a reason not to.** When unset, it is derived from `auxiliary.compression.timeout` (floored at 30s, capped at 900s) so this outer wall-clock guard is never *tighter* than the inner LLM deadline it wraps. A guard tighter than the summarizer's own deadline is not a safety net — it is a guaranteed kill for any summary that legitimately needs longer, which is exactly what long-lived sessions (thousands of messages) require. Setting an explicit number pins it verbatim and disables the derivation.
+
+`hygiene_failure_alert_after` (default `3`, `0` disables) controls when repeated hygiene failures stop being a routine per-occurrence notice and become a loud warning. Each individual failure is benign — nothing is dropped — but a session whose compression *never* succeeds grows until it overflows the model's context window. After N consecutive failures the gateway says so plainly and names the knob to raise. Any successful compaction resets the counter.
+
 `hygiene_failure_cooldown_seconds` controls that per-session cooldown after a hygiene compression timeout or abort. During the cooldown, the gateway skips repeated hygiene attempts for the same oversized session so every incoming message does not block on the same broken auxiliary backend. `/compress`, `/reset`, or a healthy later turn can still recover the session.
+
+:::tip Recovering a session that keeps timing out
+`/compress` runs the same compressor **without** any wall-clock deadline — only the auxiliary model's own `auxiliary.compression.timeout` applies. If automatic hygiene compression keeps timing out on a very large session, running `/compress` manually will usually succeed where the automatic pass could not.
+:::
 
 `protect_first_n` controls how many **non-system** head messages are pinned across every compaction. Default `3` — the opening user/assistant exchange survives every summarizer pass so the original goal stays visible. On long-running rolling-compaction sessions where the opening turn is no longer relevant, set `protect_first_n: 0` to pin nothing but the system prompt + summary + tail. The system prompt itself is always preserved regardless of this setting.
 
