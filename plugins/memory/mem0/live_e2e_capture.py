@@ -17,19 +17,49 @@ import capture_pipeline as cp
 import capture_scrub as scrub
 from capture_queue import idem_key
 
-CFG = json.load(open(os.path.expanduser("~/.hermes/mem0.json"), encoding="utf-8"))
-HOST = CFG["host"].rstrip("/")
-KEY = CFG["admin_api_key"]
-CA = CFG["ca_bundle"]
 TEST_USER = f"__capture_e2e_{uuid.uuid4().hex[:8]}"
 
-_ctx = ssl.create_default_context(cafile=CA)
+# Config is loaded LAZILY (not at import time): importing this module under a
+# hermetic run (or on a host without mem0.json) must not open a real prod config.
+# Resolve the config path under the active HERMES_HOME so per-profile / hermetic
+# runs don't read the raw real home. See 2026-07-24 WAL incident / t_43d5c42d.
+_CFG_CACHE: dict | None = None
+
+
+def _mem0_config_path() -> str:
+    env_home = os.environ.get("HERMES_HOME")
+    if env_home:
+        return os.path.join(env_home, "mem0.json")
+    try:
+        from hermes_constants import get_hermes_home
+
+        return str(get_hermes_home() / "mem0.json")
+    except Exception:
+        return os.path.expanduser("~/.hermes/mem0.json")
+
+
+def _cfg() -> dict:
+    global _CFG_CACHE
+    if _CFG_CACHE is None:
+        with open(_mem0_config_path(), encoding="utf-8") as fh:
+            _CFG_CACHE = json.load(fh)
+    assert _CFG_CACHE is not None
+    return _CFG_CACHE
+
+
+def _host() -> str:
+    return _cfg()["host"].rstrip("/")
+
+
+def _ssl_ctx():
+    return ssl.create_default_context(cafile=_cfg()["ca_bundle"])
+
 
 def _req(method, path, body=None):
     data = json.dumps(body).encode() if body is not None else None
-    r = urllib.request.Request(HOST + path, data=data, method=method,
-                               headers={"X-API-Key": KEY, "Content-Type": "application/json"})
-    with urllib.request.urlopen(r, context=_ctx, timeout=60) as resp:
+    r = urllib.request.Request(_host() + path, data=data, method=method,
+                               headers={"X-API-Key": _cfg()["admin_api_key"], "Content-Type": "application/json"})
+    with urllib.request.urlopen(r, context=_ssl_ctx(), timeout=60) as resp:
         return json.loads(resp.read().decode() or "{}")
 
 # real client hooks (mirror what the plugin wires, but standalone here)
@@ -62,7 +92,7 @@ def cleanup():
         except Exception as e: print("cleanup err", e)
 
 def main():
-    print(f"LIVE E2E against {HOST}  user_id={TEST_USER}")
+    print(f"LIVE E2E against {_host()}  user_id={TEST_USER}")
     pipe = cp.CapturePipeline(
         capture_on_fn=lambda: True,
         add_fn=add_fn, recall_idem_fn=recall_idem_fn,
