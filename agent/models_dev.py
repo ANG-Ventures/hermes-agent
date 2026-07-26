@@ -318,6 +318,34 @@ def fetch_models_dev(force_refresh: bool = False) -> Dict[str, Any]:
     return _models_dev_cache
 
 
+def cached_models_dev() -> Dict[str, Any]:
+    """Return the models.dev registry WITHOUT ever touching the network.
+
+    Cache-only twin of :func:`fetch_models_dev`: fresh in-memory cache, else
+    the on-disk cache (at any age), else an empty dict. Used by pure
+    predicates that must not block — see
+    ``usage_pricing.has_known_pricing``.
+
+    An empty result means "not known from cache", not "not priced".
+    """
+    global _models_dev_cache, _models_dev_cache_time
+
+    if _models_dev_cache and (time.time() - _models_dev_cache_time) < _MODELS_DEV_CACHE_TTL:
+        return _models_dev_cache
+
+    disk_data = _load_disk_cache()
+    if disk_data:
+        _models_dev_cache = disk_data
+        disk_age = _disk_cache_age_seconds()
+        if disk_age is not None:
+            _models_dev_cache_time = time.time() - disk_age
+        else:
+            _models_dev_cache_time = time.time() - _MODELS_DEV_CACHE_TTL
+        return disk_data
+
+    return _models_dev_cache or {}
+
+
 def lookup_models_dev_context(provider: str, model: str) -> Optional[int]:
     """Look up context_length for a provider+model combo in models.dev.
 
@@ -443,7 +471,9 @@ def _extract_cost(entry: Dict[str, Any]) -> Optional[Dict[str, float]]:
     return result
 
 
-def lookup_models_dev_pricing(provider: str, model: str) -> Optional[Dict[str, float]]:
+def lookup_models_dev_pricing(
+    provider: str, model: str, *, cache_only: bool = False
+) -> Optional[Dict[str, float]]:
     """Look up per-million USD pricing for a provider+model in models.dev.
 
     Cost-dimension twin of :func:`lookup_models_dev_context`. Resolution is
@@ -452,8 +482,10 @@ def lookup_models_dev_pricing(provider: str, model: str) -> Optional[Dict[str, f
     None rather than falling back to a cross-provider id scan, so a
     self-hosted model that happens to share an id with a hosted one is never
     billed at the hosted vendor's rate.
+
+    With ``cache_only=True`` the registry is never fetched over the network.
     """
-    models = _get_provider_models(provider)
+    models = _get_provider_models(provider, cache_only=cache_only)
     if models is None:
         return None
     entry = _find_model_entry(models, model)
@@ -479,16 +511,18 @@ class ModelCapabilities:
     model_family: str = ""
 
 
-def _get_provider_models(provider: str) -> Optional[Dict[str, Any]]:
+def _get_provider_models(provider: str, *, cache_only: bool = False) -> Optional[Dict[str, Any]]:
     """Resolve a Hermes provider ID to its models dict from models.dev.
 
     Returns the models dict or None if the provider is unknown or has no data.
+    With ``cache_only=True`` the registry is read from cache only, never the
+    network (for pure predicates on display paths).
     """
     mdev_provider_id = PROVIDER_TO_MODELS_DEV.get(provider)
     if not mdev_provider_id:
         return None
 
-    data = fetch_models_dev()
+    data = cached_models_dev() if cache_only else fetch_models_dev()
     provider_data = data.get(mdev_provider_id)
     if not isinstance(provider_data, dict):
         return None
