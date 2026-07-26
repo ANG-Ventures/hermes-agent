@@ -763,18 +763,21 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
 
 
 def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
-    """Remove toolsets that are blocked from default subagent inheritance.
+    """Remove toolsets that must never reach a subagent.
 
-    Applied only when toolsets are *inherited* from the parent or fall back
-    to DEFAULT_TOOLSETS — *explicit* caller requests at the
-    ``delegate_task()`` call site bypass this strip (see the explicit-
-    request branch around line ~945).  Rationale: silent deletion of
-    explicitly requested toolsets is a footgun; user intent wins.
+    Applied on EVERY path — inherited from the parent, fallen back to
+    DEFAULT_TOOLSETS, *and* explicitly requested at the ``delegate_task()``
+    call site. ``delegation`` is granted by ROLE (the orchestrator re-add in
+    ``_build_child_agent``), never by request: allowing a caller to request it
+    would let a subagent spawn subagents recursively, defeating the gate.
+    ``clarify`` and ``memory`` are likewise parent-only surfaces.
 
     ``code_execution`` is intentionally NOT in this set: subagents already
     receive ``terminal`` (a strictly larger capability), so blocking
     ``execute_code`` is asymmetric and prevents legitimate use cases like
-    "compute SHA256 + sum of primes" from working at all.
+    "compute SHA256 + sum of primes" from working at all. Removing it from
+    the strip set is what lets an explicit request obtain it, without
+    unblocking the three safety-critical toolsets alongside it.
     """
     # Composite toolsets that should never pass through to children, even
     # though their individual tools aren't all in DELEGATE_BLOCKED_TOOLS.
@@ -1133,9 +1136,15 @@ def _build_child_agent(
             child_toolsets = _preserve_parent_mcp_toolsets(
                 child_toolsets, parent_toolsets
             )
-        # Explicit caller requests bypass the default block list (memory,
-        # clarify, delegation): user intent wins over implicit safety
-        # defaults.  See _strip_blocked_tools() docstring for rationale.
+        # Explicit caller requests still lose the safety-critical toolsets.
+        # `code_execution` is no longer in the strip set (see
+        # _strip_blocked_tools), so an explicit request now gets it — which is
+        # this PR's stated goal. `delegation`/`clarify`/`memory` must NOT ride
+        # along: `delegation` in particular is gated by ROLE, not by request
+        # (see the orchestrator re-add below), and granting it per-request lets
+        # a subagent spawn subagents that spawn subagents. Caught by
+        # @liuhao1024 on #34294.
+        child_toolsets = _strip_blocked_tools(child_toolsets)
     elif parent_agent and parent_enabled is not None:
         child_toolsets = _strip_blocked_tools(parent_enabled)
     elif parent_toolsets:

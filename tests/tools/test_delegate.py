@@ -169,6 +169,59 @@ class TestStripBlockedTools(unittest.TestCase):
         result = _strip_blocked_tools(["code_execution"])
         self.assertEqual(result, ["code_execution"])
 
+    def test_explicit_request_cannot_obtain_delegation(self):
+        """Explicit toolsets must NOT bypass the recursion gate.
+
+        Caught by @liuhao1024 on #34294: removing the strip from the
+        explicit-request branch unblocked delegation/clarify/memory as well
+        as code_execution. `delegation` is granted by ROLE (the orchestrator
+        re-add), not by request -- granting it per-request lets a subagent
+        spawn subagents recursively.
+        """
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = [
+            "terminal", "file", "web",
+            "delegation", "clarify", "memory", "code_execution",
+        ]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="explicitly ask for everything",
+                context=None,
+                toolsets=[
+                    "terminal", "delegation", "clarify",
+                    "memory", "code_execution",
+                ],
+                model=None,
+                max_iterations=5,
+                parent_agent=parent,
+                task_count=1,
+            )
+            kwargs = MockAgent.call_args.kwargs
+
+        child = kwargs.get("enabled_toolsets") or kwargs.get("toolsets") or []
+        # This PR's stated goal: explicit code_execution is honored.
+        self.assertIn("code_execution", child)
+        self.assertIn("terminal", child)
+        # The safety gate holds regardless of what the caller asked for.
+        for blocked in ("delegation", "clarify", "memory"):
+            self.assertNotIn(
+                blocked, child,
+                f"{blocked} must not be grantable by explicit request",
+            )
+
+    def test_strip_keeps_code_execution_but_drops_safety_toolsets(self):
+        """The strip set change is scoped to code_execution only."""
+        result = _strip_blocked_tools(
+            ["terminal", "file", "delegation", "clarify",
+             "memory", "code_execution"]
+        )
+        self.assertEqual(
+            sorted(result), ["code_execution", "file", "terminal"]
+        )
+
     def test_preserves_allowed_toolsets(self):
         result = _strip_blocked_tools(["terminal", "file", "web", "browser"])
         self.assertEqual(sorted(result), ["browser", "file", "terminal", "web"])
