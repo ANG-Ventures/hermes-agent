@@ -33,12 +33,12 @@ from .externalize import (
     find_externalized_payload_for_message,
     load_externalized_payload,
     maybe_externalize_tool_output,
-    reassign_externalized_payloads,
 )
 from .extraction import (
     extract_before_compaction,
     sanitize_pre_compaction_content,
     sanitize_pre_compaction_tool_arguments,
+    strip_injected_context_blocks,
 )
 from .ingest_protection import (
     _json_has_duplicate_object_keys,
@@ -453,6 +453,20 @@ class LCMEngine(ContextEngine):
             config=copy.deepcopy(self._config),
             hermes_home=self._hermes_home,
         )
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "LCMEngine":
+        """Copy the plugin runtime without pickling SQLite-backed helpers.
+
+        Hermes core may deepcopy plugin context engines while creating isolated
+        AIAgent instances. A default object deepcopy walks into MessageStore,
+        SummaryDAG, and LifecycleStateStore sqlite3.Connection handles, which
+        cannot be pickled. LCM already exposes clone_for_agent() as the safe
+        boundary: share durable configuration/database path, but allocate fresh
+        per-agent runtime/storage helper objects.
+        """
+        clone = self.clone_for_agent()
+        memo[id(self)] = clone
+        return clone
 
     def _resolve_db_path(self, hermes_home: str = "") -> Path:
         """Resolve the SQLite path for the active Hermes profile/home."""
@@ -2465,21 +2479,17 @@ class LCMEngine(ContextEngine):
                 source_session_id,
                 frontier_store_id=frontier,
             )
-            moved_messages = self._store.reassign_session_messages(source_session_id, session_id)
+            # Compression rollover carries derived context forward, but raw
+            # messages remain owned by the session that produced them. Moving
+            # raw rows here makes session-scoped transcript recovery report the
+            # old/child session as missing even though its payload was only
+            # reassigned to the next compression segment.
             moved_nodes = self._dag.reassign_session_nodes(source_session_id, session_id)
-            moved_payloads = reassign_externalized_payloads(
-                source_session_id,
-                session_id,
-                config=self._config,
-                hermes_home=self._hermes_home,
-            )
             logger.debug(
-                "LCM compression boundary continued %s -> %s: moved %d messages, %d DAG nodes, %d externalized payloads",
+                "LCM compression boundary continued %s -> %s: carried %d DAG nodes; preserved raw message ownership",
                 source_session_id,
                 session_id,
-                moved_messages,
                 moved_nodes,
-                moved_payloads,
             )
         elif old_session_id:
             logger.warning(
@@ -2930,7 +2940,7 @@ class LCMEngine(ContextEngine):
             status["storage_retention"] = {"error": str(exc)}
         if session_id:
             status["store_messages"] = self._store.get_session_count(session_id)
-            status["dag_nodes"] = len(self._dag.get_session_nodes(session_id))
+            status["dag_nodes"] = self._dag.get_session_node_count(session_id)
             status["session_platform"] = self.current_session_platform
             status["session_ignored"] = self.current_session_ignored
             status["session_stateless"] = self.current_session_stateless
@@ -4077,10 +4087,23 @@ class LCMEngine(ContextEngine):
         content from older already-compacted history cannot hijack the mapping.
         Synthetic summary messages simply fail to match and are skipped.
         """
-        candidates = [
-            stored for stored in self._store.get_session_messages(self._session_id)
-            if stored["store_id"] > self._last_compacted_store_id
-        ]
+        candidates: list[Dict[str, Any]] = []
+        next_candidate_after = self._last_compacted_store_id
+        candidates_exhausted = False
+
+        def ensure_candidate_loaded(index: int) -> bool:
+            nonlocal next_candidate_after, candidates_exhausted
+            while index >= len(candidates) and not candidates_exhausted:
+                page = self._store.get_session_messages_after(
+                    self._session_id,
+                    after_store_id=next_candidate_after,
+                )
+                if not page:
+                    candidates_exhausted = True
+                    break
+                candidates.extend(page)
+                next_candidate_after = page[-1]["store_id"]
+            return index < len(candidates)
 
         ids: list[int] = []
         store_idx = 0
@@ -4088,7 +4111,7 @@ class LCMEngine(ContextEngine):
             message_identity = self._message_replay_identity(msg)
             wanted_cleanup_identity = self._active_cleanup_replay_identity(message_identity)
             probe_idx = store_idx
-            while probe_idx < len(candidates):
+            while ensure_candidate_loaded(probe_idx):
                 stored = candidates[probe_idx]
                 stored_identity = self._message_replay_identity(stored, stored_row=True)
                 if stored_identity == message_identity:
@@ -4203,8 +4226,6 @@ class LCMEngine(ContextEngine):
                 self._config,
                 parse_json_strings=False,
             )
-            content = sanitize_pre_compaction_content(content)
-
             if role == "tool":
                 tool_id = str(msg.get("tool_call_id") or "").strip()
                 externalized = maybe_externalize_tool_output(
@@ -4216,10 +4237,14 @@ class LCMEngine(ContextEngine):
                 )
                 if externalized:
                     content = externalized["placeholder"]
-                elif len(content) > 3000:
-                    content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
+                else:
+                    content = sanitize_pre_compaction_content(content)
+                    if len(content) > 3000:
+                        content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
                 parts.append(f"[TOOL RESULT {tool_id}]: {content}")
                 continue
+
+            content = sanitize_pre_compaction_content(content)
 
             if role == "assistant":
                 tool_calls = msg.get("tool_calls", [])
@@ -4410,6 +4435,7 @@ class LCMEngine(ContextEngine):
         dropped_assistant_messages = 0
         stripped_assistant_messages = 0
         for msg in messages:
+            msg = self._sanitize_active_preserved_objective_message(msg)
             if msg.get("role") == "assistant":
                 cleaned_msg = self._clean_active_assistant_message(msg)
                 if cleaned_msg is None:
@@ -4664,15 +4690,40 @@ class LCMEngine(ContextEngine):
         content = text_content_for_pattern_matching(message.get("content")) or ""
         return content if content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX) else ""
 
-    def _build_preserved_objective_summary_part(self, message: Dict[str, Any]) -> str:
-        content = text_content_for_pattern_matching(message.get("content")) or ""
+    def _sanitized_preserved_objective_context_content(self, message: Dict[str, Any]) -> str:
+        preserved_objective = self._preserved_objective_context_content(message)
+        if not preserved_objective:
+            return ""
+        return self._sanitize_preserved_objective_content(
+            preserved_objective,
+            role=str(message.get("role") or "user"),
+        )
+
+    def _sanitize_active_preserved_objective_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        sanitized_content = self._sanitized_preserved_objective_context_content(message)
+        if not sanitized_content or sanitized_content == message.get("content"):
+            return message
+        sanitized = dict(message)
+        sanitized["content"] = sanitized_content
+        return sanitized
+
+    def _sanitize_preserved_objective_content(self, content: str, role: str = "user") -> str:
+        content = strip_injected_context_blocks(content)
         content = protect_inline_payloads_in_text(
             content,
-            role=str(message.get("role") or "user"),
+            role=role,
             session_id=self._session_id,
             field_path="preserved_objective.content",
             config=self._config,
             hermes_home=self._hermes_home,
+        )
+        return content
+
+    def _build_preserved_objective_summary_part(self, message: Dict[str, Any]) -> str:
+        content = text_content_for_pattern_matching(message.get("content")) or ""
+        content = self._sanitize_preserved_objective_content(
+            content,
+            role=str(message.get("role") or "user"),
         )
         return f"{_PRESERVED_OBJECTIVE_CONTEXT_PREFIX}\n{content}"
 
@@ -4698,14 +4749,14 @@ class LCMEngine(ContextEngine):
         for message in reversed(messages):
             if not isinstance(message, dict):
                 continue
-            preserved_objective = self._preserved_objective_context_content(message)
-            if preserved_objective:
+            sanitized_preserved_objective = self._sanitized_preserved_objective_context_content(message)
+            if sanitized_preserved_objective:
                 if any(
-                    self._preserved_objective_context_content(selected) == preserved_objective
+                    self._sanitized_preserved_objective_context_content(selected) == sanitized_preserved_objective
                     for selected in selected_tail_messages
                 ):
                     return None
-                return preserved_objective
+                return sanitized_preserved_objective
             if message.get("role") != "user":
                 continue
             if self._is_preserved_todo_context_message(message):
@@ -4786,7 +4837,16 @@ class LCMEngine(ContextEngine):
         # Collect DAG summaries — highest depth first for context hierarchy
         summary_parts: list[str] = []
         last_role = result[-1].get("role", "system") if result else "system"
-        summary_role = "assistant" if last_role != "assistant" else "user"
+        if not result or result[-1].get("role") == "system":
+            # The summary becomes the first provider-visible message: either no
+            # leading anchor exists (gateway-style assembly) or the system
+            # prompt is the only anchor, which Anthropic extracts into a
+            # separate field. Either way messages[0] must be role "user"; an
+            # assistant summary here is rejected with HTTP 400 after the second
+            # compaction.
+            summary_role = "user"
+        else:
+            summary_role = "assistant" if last_role != "assistant" else "user"
         if anchor_part is not None:
             anchor_msg = {"role": summary_role, "content": anchor_part}
             if summary_budget is None or count_message_tokens(anchor_msg) <= summary_budget:

@@ -2498,6 +2498,62 @@ def resolve_fast_mode_capability(
     )
 
 
+# A provider that is absent or still ``auto`` has not been pinned to a
+# transport yet, so a route built from it cannot be evaluated as a real one.
+_UNRESOLVED_PROVIDERS = frozenset({"", "auto"})
+
+# The documented native route that carries Fast for each capability family.
+# The catalogs are disjoint by model, so at most one entry can match.
+_NATIVE_FAST_ROUTES: tuple[tuple[str, str, str], ...] = (
+    ("anthropic_fast", "anthropic", "anthropic_messages"),
+    ("openai_priority", "openai-api", "codex_responses"),
+)
+
+
+def _native_fast_route(model_id: Optional[str]) -> Optional[tuple[str, str]]:
+    """Return the ``(provider, api_mode)`` whose contract documents Fast for a model."""
+    base = _fast_model_base(model_id)
+    if not base:
+        return None
+    for family, provider, api_mode in _NATIVE_FAST_ROUTES:
+        if base in FAST_MODE_CAPABILITY_CATALOG[family]["models"]:
+            return provider, api_mode
+    return None
+
+
+def resolve_fast_mode_capability_for_configured_route(
+    *,
+    model: Optional[str],
+    provider: Optional[str],
+    api_mode: Optional[str],
+) -> FastModeCapability:
+    """Resolve Fast support for a configured route whose provider may be unpinned.
+
+    Config surfaces name a model before its transport is necessarily pinned:
+    ``model.provider`` may be absent, or still ``auto``. That is not the same
+    as naming a *wrong* provider, so it must not fail closed the way
+    :func:`resolve_fast_mode_capability` deliberately does for unknown
+    providers and proxies — doing so would hide ``/fast`` from a default
+    config whose model genuinely supports it.
+
+    A concrete provider therefore resolves through the full route contract
+    unchanged. An unresolved one resolves against the model's own documented
+    native route, which is the answer a model-only gate reports.
+    """
+    if str(provider or "").strip().lower() not in _UNRESOLVED_PROVIDERS:
+        return resolve_fast_mode_capability(
+            model=model, provider=provider, api_mode=api_mode
+        )
+    native = _native_fast_route(model)
+    if native is None:
+        return resolve_fast_mode_capability(
+            model=model, provider=provider, api_mode=api_mode
+        )
+    return resolve_fast_mode_capability(
+        model=model, provider=native[0], api_mode=native[1]
+    )
+
+
 def model_supports_fast_mode(model_id: Optional[str]) -> bool:
     """Return whether Hermes should expose the /fast toggle for this model."""
     return _is_anthropic_fast_model(model_id) or _is_openai_fast_model(model_id)
