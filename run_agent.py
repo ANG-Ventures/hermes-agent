@@ -171,6 +171,7 @@ from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock
 from agent.process_bootstrap import _get_proxy_from_env  # noqa: F401
 from agent.message_sanitization import (  # noqa: F401
     _SURROGATE_RE,
+    _INTERRUPT_CLOSE_FINISH_REASON,
     _sanitize_surrogates,
     _sanitize_structure_surrogates,
     _sanitize_messages_surrogates,
@@ -1959,6 +1960,36 @@ class AIAgent:
                 if isinstance(item, dict)
             }
 
+            # ── Superseded-turn write gate ──────────────────────────────────
+            # Resolve the flag ONCE and FAIL OPEN: any error reading it leaves
+            # suppression OFF, so a guard bug can never lose a real row. A stray
+            # late row is cosmetic; a dropped real row is data loss.
+            try:
+                _persist_superseded = bool(getattr(self, "_persist_superseded", False))
+            except Exception:
+                _persist_superseded = False
+            # Pairing safety: the tool_call ids whose owning assistant(tool_calls)
+            # row WE suppressed. A `tool` result may be suppressed ONLY if its
+            # owner was suppressed too — otherwise it orphans an already-durable
+            # tool call, which is the role-alternation corruption the
+            # interrupt-close repair exists to prevent.
+            #
+            # AGENT-scoped, not per-flush: within one iteration the
+            # assistant(tool_calls) row and its tool result flush SEPARATELY
+            # (conversation_loop appends the assistant row → flush → executes
+            # tools → flush). A per-flush set would be empty when the result's
+            # flush runs, letting it persist orphaned. Allocated lazily, so a
+            # normal turn never pays for it, and it dies with the agent object.
+            _suppressed_tool_call_ids = None
+            if _persist_superseded:
+                _suppressed_tool_call_ids = getattr(
+                    self, "_superseded_suppressed_tool_call_ids", None
+                )
+                if not isinstance(_suppressed_tool_call_ids, set):
+                    _suppressed_tool_call_ids = set()
+                    self._superseded_suppressed_tool_call_ids = _suppressed_tool_call_ids
+            _suppressed_superseded_rows = 0
+
             for _msg_idx, msg in enumerate(messages):
                 if not isinstance(msg, dict):
                     continue
@@ -1981,6 +2012,55 @@ class AIAgent:
                 if id(msg) in history_ids or id(msg) in seed_ids:
                     msg[_DB_PERSISTED_MARKER] = True
                     continue
+                # Superseded-turn gate. Runs AFTER every "already durable" skip
+                # above, so it only ever sees a genuinely NEW, about-to-be-
+                # written row. When the gateway invalidated this turn's run
+                # generation (/stop, /new), the turn is a zombie whose continued
+                # writes are unwanted: they land after the user stopped it and
+                # come back on the next /resume.
+                #
+                # LOAD-BEARING CARVE-OUT: the interrupt-close tail must ALWAYS
+                # persist — it is the role-alternation repair that stops the
+                # next user message landing as `... tool -> user`.
+                #
+                # PAIRING SAFETY: a `tool` result is suppressed only when its
+                # owning assistant(tool_calls) is also being suppressed. An
+                # already-durable owner was skipped above and its id never
+                # entered the set, so its result passes through and no dangling
+                # tool call is created.
+                if _persist_superseded and (
+                    msg.get("finish_reason") != _INTERRUPT_CLOSE_FINISH_REASON
+                ):
+                    if msg.get("role") == "tool":
+                        if msg.get("tool_call_id") in _suppressed_tool_call_ids:
+                            _suppressed_superseded_rows += 1
+                            continue
+                        # else: owner already durable → let the result through.
+                    elif msg.get("role") == "assistant":
+                        # The zombie's continued content. Record any tool_call
+                        # ids it carries so the matching results — in this or a
+                        # later flush — are suppressed too, keeping pairs atomic.
+                        _tcs = msg.get("tool_calls")
+                        if isinstance(_tcs, list):
+                            for _tc in _tcs:
+                                if isinstance(_tc, dict):
+                                    _tcid = _tc.get("id") or _tc.get("tool_call_id")
+                                else:
+                                    _tcid = getattr(_tc, "id", None)
+                                if _tcid:
+                                    _suppressed_tool_call_ids.add(_tcid)
+                        _suppressed_superseded_rows += 1
+                        continue
+                    else:
+                        # FAIL OPEN on any other role. A zombie turn only emits
+                        # assistant + tool rows, so a NEW user/system row here is
+                        # anomalous — and dropping a real user message would be
+                        # data loss. Persist it; log for diagnosability.
+                        logger.debug(
+                            "persist gate: superseded turn produced an unexpected "
+                            "new %r row for session %s — persisting (fail-open)",
+                            msg.get("role"), getattr(self, "session_id", "?"),
+                        )
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
                 # api_content sidecar: the exact bytes sent to the API when
@@ -2102,6 +2182,14 @@ class AIAgent:
                     ),
                 )
                 msg[_DB_PERSISTED_MARKER] = True
+            if _suppressed_superseded_rows:
+                logger.info(
+                    "persist: suppressed %d superseded-turn content row(s) for "
+                    "session %s (turn was /stop'd or /new'd; interrupt-close "
+                    "tail preserved)",
+                    _suppressed_superseded_rows,
+                    getattr(self, "session_id", "?"),
+                )
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
             # allocated next turn at a recycled address.

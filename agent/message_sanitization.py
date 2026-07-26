@@ -279,6 +279,9 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     return "{}"
 
 
+_INTERRUPT_CLOSE_FINISH_REASON = "interrupt_close"
+
+
 def close_interrupted_tool_sequence(messages: list, final_response: Any = None) -> bool:
     """Append a synthetic assistant turn when an interrupted tail is a tool result.
 
@@ -297,6 +300,11 @@ def close_interrupted_tool_sequence(messages: list, final_response: Any = None) 
     placeholder is used rather than an empty-content assistant turn.
 
     Mutates ``messages`` in place. Returns True if a closing turn was appended.
+
+    The appended turn is stamped ``finish_reason =
+    _INTERRUPT_CLOSE_FINISH_REASON`` so downstream persistence can recognise it
+    as the load-bearing role-alternation repair and never suppress it, even
+    when the rest of the interrupted turn's writes are being dropped.
     """
     if not messages:
         return False
@@ -307,6 +315,7 @@ def close_interrupted_tool_sequence(messages: list, final_response: Any = None) 
     messages.append({
         "role": "assistant",
         "content": text.strip() or "Operation interrupted.",
+        "finish_reason": _INTERRUPT_CLOSE_FINISH_REASON,
     })
     return True
 
@@ -463,6 +472,7 @@ def _sanitize_structure_non_ascii(payload: Any) -> bool:
 
 __all__ = [
     "_SURROGATE_RE",
+    "_INTERRUPT_CLOSE_FINISH_REASON",
     "close_interrupted_tool_sequence",
     "_sanitize_surrogates",
     "_sanitize_structure_surrogates",

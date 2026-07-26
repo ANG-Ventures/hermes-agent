@@ -19057,6 +19057,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         running_agent = self._running_agents.get(session_key)
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             running_agent.interrupt(interrupt_reason)
+            # This turn's generation is about to be invalidated (below), so its
+            # continued CONTENT writes are unwanted. Flag the live agent so the
+            # persist layer suppresses the zombie's post-stop rows while still
+            # writing the interrupt-close tail. Every caller of this helper is a
+            # stop-family invalidation (/stop, /new), so it is unconditional.
+            # Best-effort: a set failure must never break /stop.
+            try:
+                running_agent._persist_superseded = True
+            except Exception:
+                logger.debug(
+                    "persist-superseded flag set skipped for %s",
+                    session_key, exc_info=True,
+                )
         self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
         adapter = self._adapter_for_source(source)
         interrupt_session_activity = getattr(
