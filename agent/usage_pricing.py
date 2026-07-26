@@ -442,7 +442,13 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     # cache read 0.1x input, cache write 1.25x input). Subscription relays
     # (claude-apr/-bpr/-api-proxy/-bridge) price NOTIONAL via
     # is_notional_anthropic_provider(); this entry supplies the rate.
-    # Source: https://openrouter.ai/anthropic/claude-fable-5
+    # Rates confirmed by Anthropic's official model page: "$10 per million
+    # input tokens and $50 per million output tokens, with the existing 90%
+    # input token discount for prompt caching" — the 90% caching discount is
+    # exactly the cache_read = 0.1x input below. Numbers UNCHANGED from the
+    # prior OpenRouter-sourced entry; this is a provenance upgrade only
+    # (openrouter.ai/anthropic/claude-fable-5 agrees at $10/$50).
+    # Source: https://www.anthropic.com/claude/fable
     (
         "anthropic",
         "claude-fable-5",
@@ -452,8 +458,8 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         cache_read_cost_per_million=Decimal("1.00"),
         cache_write_cost_per_million=Decimal("12.50"),
         source="official_docs_snapshot",
-        source_url="https://openrouter.ai/anthropic/claude-fable-5",
-        pricing_version="anthropic-pricing-2026-06",
+        source_url="https://www.anthropic.com/claude/fable",
+        pricing_version="anthropic-pricing-2026-07",
     ),
     # ── Anthropic Claude Sonnet 5 ────────────────────────────────────────
     # Launched 2026-06-30. Introductory pricing ($2/$10 per MTok) runs
