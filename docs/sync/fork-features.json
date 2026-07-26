@@ -73,7 +73,7 @@
    "plugins/platforms/telegram/*.py",
    "tests/gateway/test_telegram_restart_parity.py"
   ],
-  "why": "Recovery paths must keep Telegram pending updates; only cold bootstrap may drop stale backlog. CONVERGED in adapter code (2026-07-16 audit: zero fork delta on the drop_pending path) \u2014 the fork's contribution is now only the guard-test file, kept as a regression tripwire against upstream refactors reintroducing queue drops.",
+  "why": "Recovery paths must keep Telegram pending updates; only cold bootstrap may drop stale backlog. CONVERGED in adapter code (2026-07-16 audit: zero fork delta on the drop_pending path) \u2014 the fork's contribution is now only the guard-test file, kept as a regression tripwire against upstream refactors reintroducing queue drops. 2026-07-25 sweep: upstream_ref PR #52844 is authored by teknium1 fixing third-party issue #46621 (reporter otopba) \u2014 NOT a fork submission, so this is upstream parallel invention (D3 converge), not D2 absorption of our work. Lifecycle kept 'absorbed' because upstream's implementation is canonical and ours is retired; the ref documents where the behavior now lives, not our authorship.",
   "lifecycle": "absorbed",
   "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/52844",
   "absorbed_date": "2026-06-26"
@@ -172,5 +172,23 @@
   "lifecycle": "upstream-intended",
   "upstream_ref": null,
   "absorbed_date": null
+ },
+ {
+  "feature": "compute-host turn isolation (supervisor, delta/control protocol, synthetic heavy turn, AC-4 certify harness)",
+  "tests": [
+   "tests/tui_gateway/test_iso_certify_seam.py",
+   "tests/tui_gateway/test_compute_host.py",
+   "tests/tui_gateway/test_compute_host_phase1.py"
+  ],
+  "paths": [
+   "tui_gateway/compute_host.py",
+   "tui_gateway/host_supervisor.py",
+   "tui_gateway/synthetic_turn.py",
+   "scripts/iso-certify.py"
+  ],
+  "why": "Fork-authored dashboard turn-isolation feature (fork 2026-07-05/07-12). Upstream re-authored and merged it as PR #65895 (commit 7d27a31ce, 2026-07-16) carrying Co-authored-by: Kyzcreig; our PR #63096 was closed as superseded the same day. Upstream's copy is now CANONICAL per D2 — resolve future conflicts on upstream base and re-thread only verified deltas. NOTE: absorption is NOT visible via `gh pr list --state merged` (no Kyzcreig PR is merged upstream); the signal is a maintainer-authored PR carrying a Co-authored-by trailer.",
+  "lifecycle": "absorbed",
+  "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/65895",
+  "absorbed_date": "2026-07-16"
  }
 ]
