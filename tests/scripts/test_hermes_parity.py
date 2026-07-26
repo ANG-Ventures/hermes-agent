@@ -411,6 +411,83 @@ def test_lint_manifest_path_nodeid_and_vacuous_floor(tmp_path: Path) -> None:
     assert lint_manifest.lint_manifest(repo, base=base, fork_ref="fork-main", touched_paths={"fork_only.py"}, vacuous_ok=True).ok
 
 
+def _write_fork_manifest(repo: Path, entries: list[dict[str, object]]) -> Path:
+    manifest = repo / "docs" / "sync" / "fork-features.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(json.dumps(entries), encoding="utf-8")
+    return manifest
+
+
+def _schema_feature(
+    feature: str,
+    lifecycle: str,
+    *,
+    upstream_ref: str | None = None,
+    absorbed_date: str | None = None,
+) -> dict[str, object]:
+    return {
+        "feature": feature,
+        "tests": [],
+        "paths": [],
+        "why": "contract",
+        "lifecycle": lifecycle,
+        "upstream_ref": upstream_ref,
+        "absorbed_date": absorbed_date,
+    }
+
+
+def test_lint_manifest_accepts_schema_v2_lifecycles(tmp_path: Path) -> None:
+    _write_fork_manifest(tmp_path, [
+        _schema_feature("queued upstream feature", "upstream-intended"),
+        _schema_feature("private fork feature", "fork-permanent"),
+        _schema_feature(
+            "absorbed feature",
+            "absorbed",
+            upstream_ref="https://github.com/NousResearch/hermes-agent/pull/1",
+            absorbed_date="2026-07-24",
+        ),
+    ])
+
+    assert lint_manifest.lint_manifest(tmp_path).ok
+
+
+def test_lint_manifest_rejects_invalid_lifecycle(tmp_path: Path) -> None:
+    _write_fork_manifest(tmp_path, [_schema_feature("retired feature", "retired")])
+
+    result = lint_manifest.lint_manifest(tmp_path)
+
+    assert not result.ok
+    assert any("invalid lifecycle" in error and "retired" in error for error in result.errors)
+
+
+def test_lint_manifest_requires_upstream_ref_for_absorbed_entry(tmp_path: Path) -> None:
+    _write_fork_manifest(tmp_path, [
+        _schema_feature(
+            "absorbed without provenance",
+            "absorbed",
+            absorbed_date="2026-07-24",
+        )
+    ])
+
+    result = lint_manifest.lint_manifest(tmp_path)
+
+    assert not result.ok
+    assert any("absorbed" in error and "requires upstream_ref" in error for error in result.errors)
+
+
+def test_load_manifest_defaults_legacy_lifecycle_to_fork_permanent(tmp_path: Path) -> None:
+    legacy = _schema_feature("legacy feature", "fork-permanent")
+    for field in ("lifecycle", "upstream_ref", "absorbed_date"):
+        legacy.pop(field)
+    manifest = _write_fork_manifest(tmp_path, [legacy])
+
+    feature = forkdelta.load_manifest(manifest)[0]
+
+    assert feature.lifecycle == "fork-permanent"
+    assert feature.upstream_ref is None
+    assert feature.absorbed_date is None
+
+
 def test_catchup_selects_closure_tests_and_reports_coverage_map(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     (repo / "app").mkdir()
