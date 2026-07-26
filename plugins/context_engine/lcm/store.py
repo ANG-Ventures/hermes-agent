@@ -304,23 +304,42 @@ class MessageStore:
                 value TEXT
             );
         """)
-        self._ensure_storage_columns()
+        # Init ordering is load-bearing, both ways (2026-07-25 incident):
+        #  1. ADD the search_content column first (bare ALTER; fires no
+        #     triggers) — the FTS rebuild below reads it from `messages`,
+        #     so a never-migrated DB needs the column to exist.
+        #  2. THEN repair/verify the FTS table + triggers, BEFORE any UPDATE
+        #     that can fire them — on a drifted messages_fts (old `content`
+        #     virtual-table column under new `search_content` triggers) the
+        #     backfill UPDATE raises and kills engine construction before
+        #     the self-heal ever runs (live fleet: every session silently
+        #     fell back to the built-in compressor).
+        #  3. Only then run the backfill UPDATE over legacy NULL rows.
+        self._ensure_search_content_column()
         ensure_external_content_fts(
             self._conn,
             build_message_fts_spec(),
         )
+        self._backfill_search_content()
         run_versioned_migrations(self._conn)
         self._ensure_source_column()
         self._conn.commit()
         ensure_lcm_file_permissions(self.db_path)
 
-    def _ensure_storage_columns(self) -> None:
+    def _ensure_search_content_column(self) -> None:
+        """Add the ``search_content`` column if missing (split from the
+        backfill so the FTS self-heal can run between them — see init)."""
         assert self._conn is not None
         columns = {
             row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
         }
         if "search_content" not in columns:
             self._conn.execute("ALTER TABLE messages ADD COLUMN search_content TEXT")
+
+    def _backfill_search_content(self) -> None:
+        """Backfill NULL ``search_content`` rows. Runs AFTER the FTS self-heal
+        because these UPDATEs fire ``msg_fts_update``."""
+        assert self._conn is not None
         rows = self._conn.execute(
             "SELECT store_id, content FROM messages WHERE search_content IS NULL"
         ).fetchall()
@@ -334,6 +353,15 @@ class MessageStore:
                 "UPDATE messages SET search_content = ? WHERE store_id = ?",
                 (search_content, store_id),
             )
+
+    def _ensure_storage_columns(self) -> None:
+        """Back-compat shim: column-add + backfill in one call (old order).
+
+        Init no longer calls this (it needs the FTS self-heal between the two
+        halves); kept for any external caller.
+        """
+        self._ensure_search_content_column()
+        self._backfill_search_content()
 
     def _ensure_source_column(self) -> None:
         columns = {

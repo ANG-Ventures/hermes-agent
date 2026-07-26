@@ -15234,21 +15234,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # when configured. Lets users verify STT quality in real-time,
                 # while allowing quiet STT for users who only want the agent to
                 # receive the transcription.
-                if _successful_transcripts and self._should_echo_stt_transcripts():
-                    _echo_adapter = self._adapter_for_source(source)
-                    _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
-                    if _echo_adapter:
-                        for _tx in _successful_transcripts:
-                            try:
-                                await _echo_adapter.send(
-                                    source.chat_id,
-                                    f'🎙️ "{_tx}"',
-                                    metadata=_echo_meta,
-                                )
-                            except Exception as _echo_exc:
-                                logger.debug(
-                                    "Transcript echo failed (non-fatal): %s", _echo_exc,
-                                )
+                #
+                # Route through the shared once-helper rather than sending
+                # inline: a voice message that interrupted a running turn was
+                # already transcribed AND echoed by the busy/interrupt path,
+                # and reaches this preprocessing step a second time when the
+                # pending event drains. Sending directly here bypassed every
+                # dedupe guard and posted the same transcript twice.
+                await self._echo_pending_stt_transcripts_once(
+                    event,
+                    self._adapter_for_source(source),
+                    source,
+                    _successful_transcripts,
+                    metadata=self._thread_metadata_for_source(
+                        source, self._reply_anchor_for_event(event)
+                    ),
+                )
                 # NOTE: Previously, when transcription failed (e.g. no STT
                 # provider configured), the gateway also emitted a hardcoded
                 # English notice via `_stt_adapter.send()`. That bypassed the
@@ -21054,6 +21055,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         setattr(event, "_gateway_pending_stt_transcripts", list(successful_transcripts))
         return enriched_text, successful_transcripts
 
+    def _stt_echo_dedupe_key(self, event, source) -> Optional[str]:
+        """Build a message-scoped key for transcript-echo deduplication.
+
+        The per-event ``_gateway_pending_stt_echo_sent`` flag only dedupes
+        within ONE Python object.  A single platform voice message can reach
+        the echo helper as two DISTINCT ``MessageEvent`` objects — the
+        busy/interrupt path echoes the inbound object, while the drain path
+        later prepares the pending-slot object (which
+        ``merge_pending_message_event`` may have replaced, and whose cached
+        STT attrs ``_invalidate_pending_stt_cache`` deliberately clears).
+        The result was the same transcript posted twice for one voice note.
+
+        Key on the durable identity of the audio instead: the platform
+        message id when present, else the concrete media paths (the same
+        downloaded file backs every copy of the event).
+        """
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        message_id = str(getattr(event, "message_id", "") or "")
+        if message_id:
+            return f"{chat_id}:mid:{message_id}"
+        try:
+            audio_paths = self._pending_event_audio_paths(event)
+        except Exception:
+            audio_paths = []
+        if audio_paths:
+            return f"{chat_id}:audio:" + "|".join(sorted(str(p) for p in audio_paths))
+        return None
+
+    def _stt_echo_already_sent(self, key: Optional[str]) -> bool:
+        """Return True when this message's transcript echo already went out."""
+        if not key:
+            return False
+        sent = getattr(self, "_stt_echo_sent_keys", None)
+        return bool(sent and key in sent)
+
+    def _mark_stt_echo_sent(self, key: Optional[str]) -> None:
+        """Record a delivered transcript echo in a bounded LRU of keys."""
+        if not key:
+            return
+        sent = getattr(self, "_stt_echo_sent_keys", None)
+        if sent is None:
+            sent = OrderedDict()
+            self._stt_echo_sent_keys = sent
+        sent[key] = True
+        sent.move_to_end(key)
+        while len(sent) > self._STT_ECHO_KEY_CACHE_MAX:
+            sent.popitem(last=False)
+
     async def _echo_pending_stt_transcripts_once(
         self,
         event,
@@ -21072,7 +21121,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             or getattr(event, "_gateway_pending_stt_echo_sent", False)
         ):
             return
+        dedupe_key = self._stt_echo_dedupe_key(event, source)
+        if self._stt_echo_already_sent(dedupe_key):
+            logger.debug(
+                "%s echo suppressed — already sent for this message (%s)",
+                log_context,
+                dedupe_key,
+            )
+            setattr(event, "_gateway_pending_stt_echo_sent", True)
+            return
         setattr(event, "_gateway_pending_stt_echo_sent", True)
+        self._mark_stt_echo_sent(dedupe_key)
         for tx in transcripts:
             try:
                 await adapter.send(
@@ -22035,6 +22094,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         logger.debug("Process watcher ended: %s", session_id)
 
     _MAX_INTERRUPT_DEPTH = 3  # Cap recursive interrupt handling (#816)
+
+    # Bound the message-scoped STT transcript-echo dedupe LRU. Entries are
+    # tiny (one string key per voice message) and only need to outlive the
+    # interrupt -> drain hand-off for a given message, so a small cap is
+    # plenty while keeping the runner's memory flat on long-lived gateways.
+    _STT_ECHO_KEY_CACHE_MAX = 256
 
     # Config keys whose values MUST invalidate the gateway's cached agent
     # when they change.  The agent bakes these into its compressor / context

@@ -55,16 +55,46 @@ def test_gateway_runner_uses_stt_echo_transcripts_flag():
 
 
 def test_all_gateway_transcript_echo_sends_are_gated():
+    """Every 🎙️ echo site must sit behind the stt_echo_transcripts gate.
+
+    Checked structurally (the gate appears anywhere in the ENCLOSING
+    function, resolved via the AST) rather than within a fixed line
+    window: the guard is a property of the function, and a window-based
+    check breaks whenever unrelated logic is added between the gate and
+    the send.
+    """
+    import ast
+
     source = Path(__file__).resolve().parents[2] / "gateway" / "run.py"
-    lines = source.read_text().splitlines()
+    text = source.read_text()
+    lines = text.splitlines()
 
     echo_send_lines = [
-        index
+        index + 1  # 1-based, to match AST line numbers
         for index, line in enumerate(lines)
         if "f'🎙️" in line or 'f"🎙️' in line
     ]
 
     assert echo_send_lines
-    for index in echo_send_lines:
-        context = "\n".join(lines[max(0, index - 12): index + 1])
-        assert "_should_echo_stt_transcripts()" in context
+
+    tree = ast.parse(text)
+    functions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+    for lineno in echo_send_lines:
+        enclosing = [
+            fn
+            for fn in functions
+            if fn.lineno <= lineno <= (fn.end_lineno or fn.lineno)
+        ]
+        assert enclosing, f"no enclosing function for transcript echo on line {lineno}"
+        # Innermost enclosing function wins.
+        fn = max(enclosing, key=lambda f: f.lineno)
+        body = ast.get_source_segment(text, fn) or ""
+        assert "_should_echo_stt_transcripts()" in body, (
+            f"transcript echo on line {lineno} (in {fn.name}) is not gated by "
+            "_should_echo_stt_transcripts()"
+        )
