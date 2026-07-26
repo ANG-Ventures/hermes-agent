@@ -2418,6 +2418,13 @@ DEFAULT_CONFIG = {
                                        # delegation units. New async dispatches beyond the cap
                                        # fall back to synchronous execution. Floor of 1, no ceiling.
                                        # (Replaces the deprecated max_async_children.)
+        # When a background delegation's owner process exits AFTER its consolidated
+        # result was already delivered to the parent surface, the leftover row is
+        # pure bookkeeping — nothing was lost. True (default) settles it silently;
+        # False re-enters it in the conversation as an informational record.
+        # Genuinely-lost delegations (children still unaccounted) ALWAYS re-enter
+        # the conversation regardless of this setting.
+        "suppress_delivered_owner_exit_tombstones": True,
         # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
         # and _get_orchestrator_enabled).  Floored at 1, no upper ceiling —
         # raise deliberately, each level multiplies API cost.
