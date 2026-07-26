@@ -83,7 +83,7 @@ def test_frontend_polled_rpc_is_pool_routed(server, method):
     )
 
 
-def test_dispatch_inline_rpc_does_not_block_under_gil_pressure(server):
+def test_dispatch_inline_rpc_does_not_block_under_gil_pressure(server, monkeypatch):
     """A slow inline-turned-long handler must not prevent a concurrent fast
     handler from completing. This is the core invariant: dispatch() must
     return immediately for _LONG_HANDLERS so the WS read loop stays free.
@@ -98,8 +98,8 @@ def test_dispatch_inline_rpc_does_not_block_under_gil_pressure(server):
         released.wait(timeout=5)
         return server._ok(rid, {"sessions": []})
 
-    server._methods["session.list"] = slow_session_list
-    server._methods["fast.check"] = lambda rid, params: server._ok(rid, {"ok": True})
+    monkeypatch.setitem(server._methods, "session.list", slow_session_list)
+    monkeypatch.setitem(server._methods, "fast.check", lambda rid, params: server._ok(rid, {"ok": True}))
 
     t0 = time.monotonic()
     # session.list is in _LONG_HANDLERS → dispatch returns None immediately
@@ -118,7 +118,7 @@ def test_dispatch_inline_rpc_does_not_block_under_gil_pressure(server):
     released.set()
 
 
-def test_dispatch_pet_info_does_not_block_prompt_submit(server):
+def test_dispatch_pet_info_does_not_block_prompt_submit(server, monkeypatch):
     """pet.info (polled every few seconds by the Desktop petdex) must not
     block prompt.submit. Before the fix, pet.info ran inline and a slow
     pet.info under GIL pressure delayed prompt.submit until the 120s RPC
@@ -130,8 +130,8 @@ def test_dispatch_pet_info_does_not_block_prompt_submit(server):
         released.wait(timeout=5)
         return server._ok(rid, {"pet": "cat"})
 
-    server._methods["pet.info"] = slow_pet_info
-    server._methods["prompt.submit"] = lambda rid, params: server._ok(rid, {"status": "streaming"})
+    monkeypatch.setitem(server._methods, "pet.info", slow_pet_info)
+    monkeypatch.setitem(server._methods, "prompt.submit", lambda rid, params: server._ok(rid, {"status": "streaming"}))
 
     t0 = time.monotonic()
     assert server.dispatch({"id": "pet", "method": "pet.info", "params": {}}) is None

@@ -1980,19 +1980,19 @@ def test_command_dispatch_awaits_async_plugin_handler(server):
 # ── dispatch(): pool routing for long handlers (#12546) ──────────────
 
 
-def test_dispatch_runs_short_handlers_inline(server):
+def test_dispatch_runs_short_handlers_inline(server, monkeypatch):
     """Non-long handlers return their response synchronously from dispatch()."""
-    server._methods["fast.ping"] = lambda rid, params: server._ok(rid, {"pong": True})
+    monkeypatch.setitem(server._methods, "fast.ping", lambda rid, params: server._ok(rid, {"pong": True}))
 
     resp = server.dispatch({"id": "r1", "method": "fast.ping", "params": {}})
 
     assert resp == {"jsonrpc": "2.0", "id": "r1", "result": {"pong": True}}
 
 
-def test_dispatch_offloads_long_handlers_and_emits_via_stdout(capture):
+def test_dispatch_offloads_long_handlers_and_emits_via_stdout(capture, monkeypatch):
     """Long handlers run on the pool and write their response via write_json."""
     server, buf = capture
-    server._methods["slash.exec"] = lambda rid, params: server._ok(rid, {"output": "hi"})
+    monkeypatch.setitem(server._methods, "slash.exec", lambda rid, params: server._ok(rid, {"output": "hi"}))
 
     resp = server.dispatch({"id": "r2", "method": "slash.exec", "params": {}})
     assert resp is None
@@ -2006,11 +2006,11 @@ def test_dispatch_offloads_long_handlers_and_emits_via_stdout(capture):
     assert written == {"jsonrpc": "2.0", "id": "r2", "result": {"output": "hi"}}
 
 
-def test_dispatch_long_handler_does_not_block_fast_handler(server):
+def test_dispatch_long_handler_does_not_block_fast_handler(server, monkeypatch):
     """A slow long handler must not prevent a concurrent fast handler from completing."""
     released = threading.Event()
-    server._methods["slash.exec"] = lambda rid, params: (released.wait(timeout=5), server._ok(rid, {"done": True}))[1]
-    server._methods["fast.ping"] = lambda rid, params: server._ok(rid, {"pong": True})
+    monkeypatch.setitem(server._methods, "slash.exec", lambda rid, params: (released.wait(timeout=5), server._ok(rid, {"done": True}))[1])
+    monkeypatch.setitem(server._methods, "fast.ping", lambda rid, params: server._ok(rid, {"pong": True}))
 
     t0 = time.monotonic()
     assert server.dispatch({"id": "slow", "method": "slash.exec", "params": {}}) is None
@@ -2024,7 +2024,7 @@ def test_dispatch_long_handler_does_not_block_fast_handler(server):
     released.set()
 
 
-def test_dispatch_session_compress_does_not_block_fast_handler(server):
+def test_dispatch_session_compress_does_not_block_fast_handler(server, monkeypatch):
     """Manual TUI compaction can take minutes, so it must not block the RPC loop."""
     released = threading.Event()
 
@@ -2032,8 +2032,8 @@ def test_dispatch_session_compress_does_not_block_fast_handler(server):
         released.wait(timeout=5)
         return server._ok(rid, {"done": True})
 
-    server._methods["session.compress"] = slow_compress
-    server._methods["fast.ping"] = lambda rid, params: server._ok(rid, {"pong": True})
+    monkeypatch.setitem(server._methods, "session.compress", slow_compress)
+    monkeypatch.setitem(server._methods, "fast.ping", lambda rid, params: server._ok(rid, {"pong": True}))
 
     t0 = time.monotonic()
     assert server.dispatch({"id": "slow", "method": "session.compress", "params": {}}) is None
@@ -2047,14 +2047,14 @@ def test_dispatch_session_compress_does_not_block_fast_handler(server):
     released.set()
 
 
-def test_dispatch_long_handler_exception_produces_error_response(capture):
+def test_dispatch_long_handler_exception_produces_error_response(capture, monkeypatch):
     """An exception inside a pool-dispatched handler still yields a JSON-RPC error."""
     server, buf = capture
 
     def boom(rid, params):
         raise RuntimeError("kaboom")
 
-    server._methods["slash.exec"] = boom
+    monkeypatch.setitem(server._methods, "slash.exec", boom)
 
     server.dispatch({"id": "r3", "method": "slash.exec", "params": {}})
 
@@ -2069,9 +2069,9 @@ def test_dispatch_long_handler_exception_produces_error_response(capture):
     assert "kaboom" in written["error"]["message"]
 
 
-def test_dispatch_unknown_long_method_still_goes_inline(server):
+def test_dispatch_unknown_long_method_still_goes_inline(server, monkeypatch):
     """Method name not in _LONG_HANDLERS takes the sync path even if handler is slow."""
-    server._methods["some.method"] = lambda rid, params: server._ok(rid, {"ok": True})
+    monkeypatch.setitem(server._methods, "some.method", lambda rid, params: server._ok(rid, {"ok": True}))
 
     resp = server.dispatch({"id": "r4", "method": "some.method", "params": {}})
 
@@ -2089,7 +2089,7 @@ def test_completion_handlers_are_pool_routed(completion_method, server):
 
 
 @pytest.mark.parametrize("completion_method", ["complete.path", "complete.slash"])
-def test_slow_completion_does_not_block_fast_handler(completion_method, server):
+def test_slow_completion_does_not_block_fast_handler(completion_method, server, monkeypatch):
     """A slow completion RPC must not block a concurrent fast handler (#21123)."""
     released = threading.Event()
 
@@ -2097,8 +2097,8 @@ def test_slow_completion_does_not_block_fast_handler(completion_method, server):
         released.wait(timeout=5)
         return server._ok(rid, {"items": []})
 
-    server._methods[completion_method] = slow_completion
-    server._methods["fast.ping"] = lambda rid, params: server._ok(rid, {"pong": True})
+    monkeypatch.setitem(server._methods, completion_method, slow_completion)
+    monkeypatch.setitem(server._methods, "fast.ping", lambda rid, params: server._ok(rid, {"pong": True}))
 
     t0 = time.monotonic()
     assert server.dispatch({"id": "slow", "method": completion_method, "params": {}}) is None
