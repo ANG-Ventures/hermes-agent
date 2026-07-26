@@ -62,7 +62,12 @@ def _send_with_gateway(card_text: str, platform: str, chat_id: str) -> bool:
 
 
 def _notify_script() -> Path:
-    return Path.home() / ".hermes" / "skills" / "devops" / "scheduler" / "scripts" / "notify.py"
+    # Resolve under the active HERMES_HOME (profile/hermetic-aware), not the raw
+    # real home — a bare Path.home()/".hermes" reaches into prod skills under a
+    # hermetic or alternate-profile run. See 2026-07-24 WAL incident / t_43d5c42d.
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "skills" / "devops" / "scheduler" / "scripts" / "notify.py"
 
 
 def _send_with_notify(card_text: str, profile: str) -> None:
