@@ -3268,6 +3268,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # Class-level defaults so partial construction in tests doesn't
     # blow up on attribute access.
     _running_agents_ts: Dict[str, float] = {}
+    # Sessions whose in-flight turn itself requested the gateway restart
+    # (see request_restart / _resume_reason_for_shutdown_mark).
+    _session_initiated_restart: Dict[str, bool] = {}
     _busy_input_mode: str = "interrupt"
     _busy_text_mode: str = "interrupt"
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
@@ -3422,6 +3425,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Key: session_key, Value: AIAgent instance
         self._running_agents: Dict[str, Any] = {}
         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
+        # session_key -> True when THAT session's turn asked for the restart.
+        self._session_initiated_restart: Dict[str, bool] = {}
         self._active_session_leases: Dict[str, Any] = {}
         # Per-SESSION_ID turn lease (#64934): serializes the
         # [load history → run → flush] region when two ROUTING KEYS resolve
@@ -7364,6 +7369,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
         if self._restart_task_started:
             return False
+        # Record WHICH session asked for this restart.  The drain-mark below
+        # runs much later, on the shutdown path, with no reference to the
+        # originating turn — without this breadcrumb it cannot tell the turn
+        # that CAUSED the restart apart from an innocent bystander that merely
+        # happened to be running, and marks both auto-resumable.
+        try:
+            from gateway.session_context import get_session_env
+
+            session_key = get_session_env("HERMES_SESSION_KEY", "")
+            if session_key:
+                self._session_initiated_restart[session_key] = True
+        except Exception:
+            pass
         self._restart_requested = True
         self._restart_detached = detached
         self._restart_via_service = via_service
@@ -7401,6 +7419,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _AUTO_RESUME_REASONS = frozenset(
         {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
     )
+
+    # Drain-mark reason for a session whose interrupted turn was ITSELF
+    # initiating the restart.  Deliberately NOT in _AUTO_RESUME_REASONS: the
+    # turn already did what it was asked to do (restart the gateway), so
+    # replaying it just re-fires the restart.  The session keeps its
+    # transcript and resume_pending flag, so a real user message still
+    # continues it — only the *automatic* replay is suppressed.
+    _RESTART_CONSUMED_REASON = "restart_consumed"
+
+    def _resume_reason_for_shutdown_mark(self, session_key: str) -> str:
+        """Pick the drain-mark reason for ``session_key``.
+
+        A turn that asked for the restart must not be auto-replayed after it:
+        the replay re-runs the same work, re-fires the restart, and the
+        gateway cascades (each iteration also emitting a shutdown banner).
+        Innocent bystander turns — merely running when someone else's restart
+        landed — keep their normal auto-resume reason.
+
+        The initiator is identified two ways, because the in-memory flag does
+        not survive the restart it caused:
+
+        1. ``_session_initiated_restart`` — set by ``request_restart`` in THIS
+           process.
+        2. the durable session entry's existing ``restart_consumed`` reason —
+           so a relapse on a later boot cannot overwrite the mark back to an
+           auto-resume reason and simply resume the cascade one boot later.
+        """
+        if getattr(self, "_session_initiated_restart", {}).get(session_key):
+            return self._RESTART_CONSUMED_REASON
+        try:
+            entry = self.session_store._entries.get(session_key)
+            if (
+                entry is not None
+                and getattr(entry, "resume_reason", None)
+                == self._RESTART_CONSUMED_REASON
+            ):
+                return self._RESTART_CONSUMED_REASON
+        except Exception:
+            pass
+        return "restart_timeout" if self._restart_requested else "shutdown_timeout"
 
     async def _run_startup_resume_event(
         self,
@@ -9610,7 +9668,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     await self.async_session_store.mark_resume_pending(
                         _sk,
-                        "restart_timeout" if self._restart_requested else "shutdown_timeout",
+                        self._resume_reason_for_shutdown_mark(_sk),
                     )
                     _pre_drain_keys.append(_sk)
                 except Exception as _e:
@@ -9681,14 +9739,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # _interrupt_running_agents() does: their agent hasn't
                 # started yet, there's nothing to interrupt, and the
                 # session shouldn't carry a misleading resume flag.
-                _resume_reason = (
-                    "restart_timeout" if self._restart_requested else "shutdown_timeout"
-                )
                 for _sk, _agent in list(self._running_agents.items()):
                     if _agent is _AGENT_PENDING_SENTINEL:
                         continue
                     try:
-                        await self.async_session_store.mark_resume_pending(_sk, _resume_reason)
+                        await self.async_session_store.mark_resume_pending(
+                            _sk, self._resume_reason_for_shutdown_mark(_sk)
+                        )
                     except Exception as _e:
                         logger.debug(
                             "mark_resume_pending failed for %s: %s",
@@ -14057,6 +14114,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the restart-interruption system note.
             if session_key and _should_clear_resume_pending_after_turn(agent_result):
                 self._clear_restart_failure_count(session_key)
+                # A turn that completed cleanly is forward progress: drop the
+                # restart-initiator breadcrumb so a LATER, unrelated restart
+                # while this session happens to be running is marked normally
+                # and still auto-resumes.  Without this the session would lose
+                # its replay permanently after one /restart.
+                try:
+                    self._session_initiated_restart.pop(session_key, None)
+                except Exception:
+                    pass
                 try:
                     await self.async_session_store.clear_resume_pending(session_key)
                 except Exception as _e:
