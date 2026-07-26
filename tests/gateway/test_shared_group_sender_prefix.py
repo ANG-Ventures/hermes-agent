@@ -195,3 +195,37 @@ async def test_preprocess_slack_shared_thread_without_user_id_keeps_name_only():
     )
 
     assert result == "[Alice] hello"
+
+
+@pytest.mark.asyncio
+async def test_slack_internal_event_gets_no_author_mention():
+    """Sibling call path: the Slack author-mention variant of the same prefix.
+
+    Salvaged from the wave3b worktree (2026-07-26): the Telegram prefix cases
+    were covered here, but Slack formats the sender as a <@user_id> mention via
+    a different adapter path -- an internal synthetic event must not get one.
+    """
+    runner = _make_runner(
+        GatewayConfig(
+            platforms={Platform.SLACK: PlatformConfig(enabled=True, token="fake")},
+        )
+    )
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C123",
+        chat_name="team-channel",
+        chat_type="group",
+        user_id="U123",
+        user_name="Alice",
+        thread_id="171.000",
+    )
+    event = MessageEvent(text="continue", source=source, internal=True)
+
+    result = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[],
+    )
+
+    assert result == "continue"
+    assert "U123" not in result
