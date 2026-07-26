@@ -8,7 +8,10 @@
    "tools/approval.py",
    "gateway/session_context.py"
   ],
-  "why": "Cron subagents must inherit approval gating from session ContextVars instead of ambient process environment."
+  "why": "Cron subagents must inherit approval gating from session ContextVars instead of ambient process environment.",
+  "lifecycle": "fork-permanent",
+  "upstream_ref": null,
+  "absorbed_date": null
  },
  {
   "feature": "systemd restart exits 0, darwin/launchd exits 75",
@@ -19,7 +22,10 @@
   "paths": [
    "gateway/run.py"
   ],
-  "why": "Supervisor-specific restart exit contracts prevent restart loops and preserve launchd's intentional nonzero restart path. NOT converged: upstream (2026-07 40dbfa0e3) exits 75 unconditionally and relies on RestartForceExitStatus=75 in the unit file; the fork branches systemd\u21920 / launchd\u219275 instead. Checked 2026-07-16 retirement audit: keep the fork branch."
+  "why": "Supervisor-specific restart exit contracts prevent restart loops and preserve launchd's intentional nonzero restart path. NOT converged: upstream (2026-07 40dbfa0e3) exits 75 unconditionally and relies on RestartForceExitStatus=75 in the unit file; the fork branches systemd\u21920 / launchd\u219275 instead. Checked 2026-07-16 retirement audit: keep the fork branch.",
+  "lifecycle": "fork-permanent",
+  "upstream_ref": null,
+  "absorbed_date": null
  },
  {
   "feature": "hygiene compaction announces in-chat on success",
@@ -34,7 +40,10 @@
    "agent/fork_ext/compaction_ext.py",
    "tests/golden/compaction_ext/"
   ],
-  "why": "Successful hygiene compaction must be visible in the originating chat without exposing misleading raw message counts."
+  "why": "Successful hygiene compaction must be visible in the originating chat without exposing misleading raw message counts.",
+  "lifecycle": "upstream-intended",
+  "upstream_ref": null,
+  "absorbed_date": null
  },
  {
   "feature": "messaging + moa toolsets present",
@@ -48,7 +57,10 @@
    "tools/send_message_tool.py",
    "tools/mixture_of_agents_tool.py"
   ],
-  "why": "The fork intentionally exposes agent-callable messaging and MoA toolsets that upstream does not ship."
+  "why": "The fork intentionally exposes agent-callable messaging and MoA toolsets that upstream does not ship.",
+  "lifecycle": "fork-permanent",
+  "upstream_ref": null,
+  "absorbed_date": null
  },
  {
   "feature": "telegram polling never drops pending updates on recovery",
@@ -61,7 +73,10 @@
    "plugins/platforms/telegram/*.py",
    "tests/gateway/test_telegram_restart_parity.py"
   ],
-  "why": "Recovery paths must keep Telegram pending updates; only cold bootstrap may drop stale backlog. CONVERGED in adapter code (2026-07-16 audit: zero fork delta on the drop_pending path) \u2014 the fork's contribution is now only the guard-test file, kept as a regression tripwire against upstream refactors reintroducing queue drops."
+  "why": "Recovery paths must keep Telegram pending updates; only cold bootstrap may drop stale backlog. CONVERGED in adapter code (2026-07-16 audit: zero fork delta on the drop_pending path) \u2014 the fork's contribution is now only the guard-test file, kept as a regression tripwire against upstream refactors reintroducing queue drops. 2026-07-25 sweep: upstream_ref PR #52844 is authored by teknium1 fixing third-party issue #46621 (reporter otopba) \u2014 NOT a fork submission, so this is upstream parallel invention (D3 converge), not D2 absorption of our work. Lifecycle kept 'absorbed' because upstream's implementation is canonical and ours is retired; the ref documents where the behavior now lives, not our authorship.",
+  "lifecycle": "absorbed",
+  "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/52844",
+  "absorbed_date": "2026-06-26"
  },
  {
   "feature": "cron scheduler per-job reasoning and script timeout helpers",
@@ -74,7 +89,10 @@
    "cron/fork_ext/scheduler_ext.py",
    "tests/golden/scheduler_ext/"
   ],
-  "why": "Cron jobs intentionally support per-job reasoning overrides and a bounded script-timeout resolution chain; the extracted fork helper must keep both behaviors byte-identical."
+  "why": "Cron jobs intentionally support per-job reasoning overrides and a bounded script-timeout resolution chain; the extracted fork helper must keep both behaviors byte-identical.",
+  "lifecycle": "upstream-intended",
+  "upstream_ref": null,
+  "absorbed_date": null
  },
  {
   "feature": "relay-pool session affinity and lane headers",
@@ -85,7 +103,10 @@
    "agent/fork_ext/relay_headers.py",
    "tests/golden/relay_headers/"
   ],
-  "why": "Claude API proxy pool requests must keep per-session affinity and classify interactive versus background relay lanes without stamping third-party providers."
+  "why": "Claude API proxy pool requests must keep per-session affinity and classify interactive versus background relay lanes without stamping third-party providers.",
+  "lifecycle": "fork-permanent",
+  "upstream_ref": null,
+  "absorbed_date": null
  },
  {
   "feature": "gateway restart failure count entry codec",
@@ -99,7 +120,10 @@
    "gateway/fork_ext/restart_codec.py",
    "tests/golden/restart_codec/"
   ],
-  "why": "Restart-loop failure counts must continue decoding legacy scalar entries and structured replay-breaker state byte-identically after extraction."
+  "why": "Restart-loop failure counts must continue decoding legacy scalar entries and structured replay-breaker state byte-identically after extraction.",
+  "lifecycle": "upstream-intended",
+  "upstream_ref": null,
+  "absorbed_date": null
  },
  {
   "feature": "gateway configured and persisted route identity helpers",
@@ -112,7 +136,10 @@
    "gateway/fork_ext/route_identity.py",
    "tests/golden/route_identity/"
   ],
-  "why": "Gateway session routing must preserve credential-free configured identity parsing and fail-closed persisted route lookup semantics after extraction."
+  "why": "Gateway session routing must preserve credential-free configured identity parsing and fail-closed persisted route lookup semantics after extraction.",
+  "lifecycle": "upstream-intended",
+  "upstream_ref": null,
+  "absorbed_date": null
  },
  {
   "feature": "tool-search unwrap scope gate and delegate code_execution inheritance exemption",
@@ -126,7 +153,10 @@
    "agent/fork_ext/tool_gate.py",
    "tests/golden/tool_gate/"
   ],
-  "why": "Tool-search bridge calls must be scoped to the session's granted deferrable tools, and inherited subagent toolsets must keep the fork's code_execution exemption while stripping blocked delegation surfaces."
+  "why": "Tool-search bridge calls must be scoped to the session's granted deferrable tools, and inherited subagent toolsets must keep the fork's code_execution exemption while stripping blocked delegation surfaces.",
+  "lifecycle": "upstream-intended",
+  "upstream_ref": null,
+  "absorbed_date": null
  },
  {
   "feature": "state pure fork helpers preserve denorm gate and platform session search",
@@ -138,6 +168,27 @@
    "hermes_state_ext.py",
    "tests/golden/state_ext/"
   ],
-  "why": "Fork-owned pure state helpers must keep the config-only session-list denorm gate and cross-platform session title search aliases byte-identical while reducing inline fork logic in hermes_state.py."
+  "why": "Fork-owned pure state helpers must keep the config-only session-list denorm gate and cross-platform session title search aliases byte-identical while reducing inline fork logic in hermes_state.py.",
+  "lifecycle": "upstream-intended",
+  "upstream_ref": null,
+  "absorbed_date": null
+ },
+ {
+  "feature": "compute-host turn isolation (supervisor, delta/control protocol, synthetic heavy turn, AC-4 certify harness)",
+  "tests": [
+   "tests/tui_gateway/test_iso_certify_seam.py",
+   "tests/tui_gateway/test_compute_host.py",
+   "tests/tui_gateway/test_compute_host_phase1.py"
+  ],
+  "paths": [
+   "tui_gateway/compute_host.py",
+   "tui_gateway/host_supervisor.py",
+   "tui_gateway/synthetic_turn.py",
+   "scripts/iso-certify.py"
+  ],
+  "why": "Fork-authored dashboard turn-isolation feature (fork 2026-07-05/07-12). Upstream re-authored and merged it as PR #65895 (commit 7d27a31ce, 2026-07-16) carrying Co-authored-by: Kyzcreig; our PR #63096 was closed as superseded the same day. Upstream's copy is now CANONICAL per D2 — resolve future conflicts on upstream base and re-thread only verified deltas. NOTE: absorption is NOT visible via `gh pr list --state merged` (no Kyzcreig PR is merged upstream); the signal is a maintainer-authored PR carrying a Co-authored-by trailer.",
+  "lifecycle": "absorbed",
+  "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/65895",
+  "absorbed_date": "2026-07-16"
  }
 ]
