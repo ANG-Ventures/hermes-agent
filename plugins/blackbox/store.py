@@ -7,6 +7,7 @@ import logging
 import sqlite3
 import time
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -113,6 +114,20 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY,
             value TEXT
+        );
+
+        -- New-model pricing sentinel ledger (card t_2e382a4b). One row per
+        -- (model, provider) that recorded an unpriced turn while absent from
+        -- the pricing snapshot. The PRIMARY KEY *is* the dedup: the sentinel
+        -- uses INSERT OR IGNORE and treats rowcount == 1 as "first sighting,
+        -- alert now", so the alert fires exactly once per model no matter how
+        -- many unpriced turns follow.
+        CREATE TABLE IF NOT EXISTS seen_unpriced_models (
+            model TEXT,
+            provider TEXT,
+            first_seen TEXT,
+            alerted_at TEXT,
+            PRIMARY KEY(model, provider)
         );
 
         CREATE INDEX IF NOT EXISTS idx_blackbox_turns_chat_end
@@ -350,6 +365,71 @@ def mark_alerted(turn_id: str) -> bool:
             (turn_id,),
         )
         return cur.rowcount == 1
+
+
+# ---------------------------------------------------------------------------
+# New-model pricing sentinel ledger (card t_2e382a4b).
+#
+# The store holds NO rate table (INV-1) and makes NO pricing decision here — it
+# only records that the caller (plugins.blackbox.sentinel) judged a turn to be
+# unpriced for a model absent from the pricing snapshot. The (model, provider)
+# PRIMARY KEY is the dedup mechanism: `note_unpriced_model` returns True ONLY
+# on the transition from unseen → seen, which is what gates the one-shot alert.
+# ---------------------------------------------------------------------------
+
+
+def note_unpriced_model(model: str, provider: str, *, first_seen: str | None = None) -> bool:
+    """Record a first sighting of an unpriced model. True iff it was NEW.
+
+    Uses ``INSERT OR IGNORE`` so a repeat sighting is a cheap no-op and can
+    never overwrite the original ``first_seen`` / ``alerted_at``. The boolean
+    return is the exactly-once alert gate, mirroring ``mark_alerted``.
+    """
+    stamp = first_seen or _iso_now()
+    with _connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO seen_unpriced_models (
+                model, provider, first_seen, alerted_at
+            ) VALUES (?, ?, ?, NULL)
+            """,
+            (str(model or ""), str(provider or ""), stamp),
+        )
+        return cur.rowcount == 1
+
+
+def mark_unpriced_alerted(model: str, provider: str, *, alerted_at: str | None = None) -> bool:
+    """Stamp ``alerted_at`` after a sentinel alert is successfully delivered.
+
+    Only stamps a row whose ``alerted_at`` is still NULL, so a retry or an
+    out-of-band writer can't rewrite the original notification time.
+    """
+    stamp = alerted_at or _iso_now()
+    with _connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE seen_unpriced_models SET alerted_at = ?
+            WHERE model = ? AND provider = ? AND alerted_at IS NULL
+            """,
+            (stamp, str(model or ""), str(provider or "")),
+        )
+        return cur.rowcount == 1
+
+
+def list_unpriced_models() -> list[dict[str, Any]]:
+    """All ledger rows, oldest sighting first (operator/diagnostic read)."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT model, provider, first_seen, alerted_at
+            FROM seen_unpriced_models ORDER BY first_seen ASC, model ASC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 # ---------------------------------------------------------------------------

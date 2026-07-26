@@ -415,6 +415,25 @@ def _on_session_end(
 
         store.insert_turn(record)
 
+        # New-model pricing sentinel (card t_2e382a4b). Runs AFTER the turn is
+        # durably stored and is wrapped end-to-end in its own try/except with a
+        # fire-and-forget alert thread, so it can neither lose telemetry nor add
+        # latency to the turn. The extra guard here is belt-and-braces: even an
+        # ImportError (module missing on a partially-deployed tree) must not
+        # reach the retention sweep / alert path below.
+        try:
+            from plugins.blackbox import sentinel
+
+            sentinel.observe_turn(
+                record.model,
+                record.provider,
+                record.cost_status,
+                record.cost_usd,
+                base_url=kwargs.get("base_url"),
+            )
+        except Exception:
+            logger.warning("blackbox pricing sentinel dispatch failed", exc_info=True)
+
         # Retention sweep — prune turns older than retention_days. sweep() is
         # self-throttling (a 'last_sweep_date' sentinel makes it a no-op after
         # the first call each UTC day), so calling it every turn costs one
