@@ -1308,7 +1308,11 @@ class TestConvertMessages:
         _, result = convert_messages_to_anthropic(messages)
         assert result[0]["role"] == "user"
         assert isinstance(result[0]["content"], list)
-        assert result[0]["content"] == [{"type": "text", "text": "(empty message)"}]
+        # Contract: exactly one non-whitespace placeholder text block (the
+        # literal wording is unimportant; blank text 400s the request).
+        assert len(result[0]["content"]) == 1
+        blk = result[0]["content"][0]
+        assert blk["type"] == "text" and blk["text"].strip() != ""
 
     def test_leading_assistant_after_compaction_gets_user_turn_prepended(self):
         """The adapter backstops compactors that emit a leading assistant summary."""
@@ -1322,7 +1326,13 @@ class TestConvertMessages:
 
         assert system == "You are helpful."
         assert result[0]["role"] == "user"
-        assert result[0]["content"] == [{"type": "text", "text": " "}]
+        # The synthetic turn must carry NON-WHITESPACE text: the Messages
+        # input schema rejects blank text blocks, and this turn is
+        # re-prepended on EVERY conversion — a whitespace placeholder makes
+        # the whole session a deterministic 400 (2026-07-25 incident).
+        lead_blocks = result[0]["content"]
+        assert isinstance(lead_blocks, list) and lead_blocks[0]["type"] == "text"
+        assert lead_blocks[0]["text"].strip() != ""
         assert result[1]["role"] == "assistant"
         assert any(
             m["role"] == "assistant" and "Context compaction summary" in str(m["content"])
@@ -1346,7 +1356,9 @@ class TestConvertMessages:
 
         assert system is None
         assert result[0]["role"] == "user"
-        assert result[0]["content"] == [{"type": "text", "text": " "}]
+        lead = result[0]["content"]
+        assert isinstance(lead, list) and lead[0]["type"] == "text"
+        assert lead[0]["text"].strip() != ""  # non-whitespace or the API 400s
         assert result[1]["role"] == "assistant"
         assert "Context compaction summary" in str(result[1]["content"])
 

@@ -146,6 +146,85 @@ def test_half_migrated_db_opens_and_writes(tmp_path):
     assert _insert_and_search(db, "HALF_TOKEN") is True
 
 
+def _build_inverse_half_migrated_db(db_path: str) -> None:
+    """2026-07-25 fleet shape: triggers ALREADY on search_content, but the FTS
+    virtual table still declares the old `content` column — and a legacy row
+    with NULL search_content is present.
+
+    This shape is the nastiest because the breakage fires during
+    ``_ensure_storage_columns()``'s backfill UPDATE (via msg_fts_update),
+    i.e. BEFORE the FTS self-heal if init ordering is wrong. The live fleet
+    hit exactly this: engine construction died, every session silently fell
+    back to the built-in compressor, and the degraded compressor emitted a
+    whitespace-only text block that 400'd across the whole provider chain.
+    """
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE messages (
+            store_id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, source TEXT DEFAULT '',
+            role TEXT NOT NULL, content TEXT, tool_call_id TEXT, tool_calls TEXT,
+            tool_name TEXT, timestamp REAL NOT NULL, token_estimate INTEGER DEFAULT 0,
+            pinned INTEGER DEFAULT 0, search_content TEXT
+        );
+        CREATE VIRTUAL TABLE messages_fts USING fts5(
+            content, content="messages", content_rowid="store_id"
+        );
+        -- Legacy NULL-search_content row inserted BEFORE the renamed triggers
+        -- exist (mirrors real history: the row predates the trigger rename).
+        -- Forces the backfill UPDATE to run (and fire msg_fts_update) at init.
+        INSERT INTO messages (session_id, role, content, timestamp, search_content)
+            VALUES ('legacy', 'user', 'legacy body', 1.0, NULL);
+        CREATE TRIGGER msg_fts_insert AFTER INSERT ON messages BEGIN
+          INSERT INTO messages_fts(rowid, search_content)
+            VALUES (new.store_id, new.search_content);
+        END;
+        CREATE TRIGGER msg_fts_delete AFTER DELETE ON messages BEGIN
+          INSERT INTO messages_fts(messages_fts, rowid, search_content)
+            VALUES('delete', old.store_id, old.search_content);
+        END;
+        CREATE TRIGGER msg_fts_update AFTER UPDATE OF search_content ON messages BEGIN
+          INSERT INTO messages_fts(messages_fts, rowid, search_content)
+            VALUES('delete', old.store_id, old.search_content);
+          INSERT INTO messages_fts(rowid, search_content)
+            VALUES (new.store_id, new.search_content);
+        END;
+        CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_inverse_half_migrated_db_opens_and_writes(tmp_path):
+    """FTS table on `content` + triggers on `search_content` + a NULL
+    backfill row must self-repair on open (2026-07-25 incident shape).
+
+    Regression-locks the init ORDER: the FTS self-heal must run before the
+    storage-column backfill UPDATE, otherwise construction raises
+    `table messages_fts has no column named search_content` and the engine
+    never comes up.
+    """
+    db = str(tmp_path / "inverse.db")
+    _build_inverse_half_migrated_db(db)
+
+    # sanity: the drifted shape is what we think it is
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    fts_cols = {r[1] for r in conn.execute("PRAGMA table_info(messages_fts)")}
+    conn.close()
+    assert fts_cols == {"content"}
+
+    # The genuine startup path. Must not raise.
+    MessageStore(db)
+
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    fts_cols = {r[1] for r in conn.execute("PRAGMA table_info(messages_fts)")}
+    conn.close()
+    assert fts_cols == {"search_content"}  # rebuilt to spec
+    assert _insert_trigger_column(db) == "search_content"
+    assert _insert_and_search(db, "INVERSE_TOKEN") is True
+
+
 def test_never_migrated_db_opens_and_writes(tmp_path):
     """A never-migrated (daedalus-shape) DB must migrate on open and accept writes."""
     db = str(tmp_path / "never.db")
