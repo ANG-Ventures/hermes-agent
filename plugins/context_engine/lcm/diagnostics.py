@@ -26,7 +26,12 @@ def state_db_path_for_engine(engine: Any) -> Path:
                     f"hermes_home {hermes_home} resolves to {resolved} which is not within allowed base {allowed_base}"
                 )
         return resolved
-    db_path = Path(getattr(engine._store, "db_path", Path.home() / ".hermes" / "lcm.db"))
+    # Default must resolve under the active HERMES_HOME, not the raw real home —
+    # a bare Path.home()/".hermes" derives a PROD state.db path under hermetic
+    # runs (same freeze class as the 2026-07-24 incident / t_43d5c42d).
+    from hermes_constants import get_hermes_home
+
+    db_path = Path(getattr(engine._store, "db_path", get_hermes_home() / "lcm.db"))
     return db_path.parent / "state.db"
 
 

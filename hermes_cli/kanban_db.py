@@ -9265,6 +9265,19 @@ def _default_spawn(
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
         pass
+    # Hermeticity anchor (card t_43d5c42d / 2026-07-24 WAL incident). Export a
+    # correct HERMES_REAL_HOME (and apply the HOME contract) BEFORE spawning,
+    # exactly as every other subprocess spawn does (tools/environments/local.py).
+    # We intentionally do NOT override HERMES_HOME with a tempdir here: a
+    # dispatcher worker is a real production agent that must persist to the
+    # profile's real state.db. But if the worker's TASK invokes the test suite,
+    # tests/conftest.py re-hermeticizes with its own temp HERMES_HOME and its
+    # DEFAULT_DB_PATH canary compares the resolved path against
+    # HERMES_REAL_HOME. Without this export the canary falls back to
+    # Path.home()/".hermes", which is wrong under container / profile-home /
+    # custom-HOME layouts. Setting the anchor keeps that canary honest.
+    from hermes_constants import apply_subprocess_home_env
+    apply_subprocess_home_env(env)
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
