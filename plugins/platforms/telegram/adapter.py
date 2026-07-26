@@ -6356,7 +6356,11 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         script_name, extra_args, success_label, is_state_verb = entry
 
-        script_path = _Path.home() / ".hermes" / "scripts" / "gmail-triage" / script_name
+        from hermes_constants import get_hermes_home
+
+        # Resolve under the active HERMES_HOME so per-profile / hermetic runs
+        # don't exec a script from the raw real home (t_43d5c42d).
+        script_path = get_hermes_home() / "scripts" / "gmail-triage" / script_name
         if not script_path.exists():
             await query.answer(text=f"❌ {script_name} missing")
             logger.error("[%s] gmail-triage script missing: %s", self.name, script_path)
