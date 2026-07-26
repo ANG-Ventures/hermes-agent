@@ -274,6 +274,52 @@ def test_delivered_and_lost_tombstones_are_never_the_same_message(tmp_path):
     assert lost["child_states"] and delivered["child_states"]
 
 
+def test_reaper_never_downgrades_a_delivered_row_at_either_knob_setting(tmp_path):
+    """A delivered row must never be re-enqueued for delivery — knob-independent.
+
+    Delivery is tracked on ``delivery_state``, orthogonal to ``state``. Any
+    recovery path keying only on ``state`` can flip an already-delivered row
+    back to ``pending``, and ``restore_undelivered_completions()`` will then
+    re-deliver a result the conversation already has. Suppression must not be
+    what protects this: it has to hold with the knob OFF too, which is exactly
+    the branch that writes a fresh tombstone.
+    """
+    for suppress in ("true", "false"):
+        (tmp_path / "config.yaml").write_text(
+            f"delegation:\n  suppress_delivered_owner_exit_tombstones: {suppress}\n"
+        )
+        for index in range(3):
+            delegation_id = f"deleg_{suppress}_{index}"
+            _dispatch(delegation_id, ["g"])
+            with ad._DB_LOCK, ad._transaction() as conn:
+                conn.execute(
+                    "UPDATE async_delegations SET state=?, delivery_state='delivered', "
+                    "result_json=? WHERE delegation_id=?",
+                    (
+                        "running" if index % 2 == 0 else "finalizing",
+                        json.dumps({"results": [{"status": "completed", "goal": "g"}]}),
+                        delegation_id,
+                    ),
+                )
+            _kill_owner(delegation_id)
+
+        for _ in range(3):
+            ad.recover_abandoned_delegations()
+
+        with ad._DB_LOCK, ad._transaction() as conn:
+            downgraded = conn.execute(
+                "SELECT COUNT(*) FROM async_delegations "
+                "WHERE delivery_state='pending' AND delegation_id LIKE ?",
+                (f"deleg_{suppress}_%",),
+            ).fetchone()[0]
+        assert downgraded == 0, f"delivered rows downgraded with suppress={suppress}"
+
+        # And nothing already-delivered is ever handed back for redelivery.
+        assert not [
+            did for did in _restored_ids() if did.startswith(f"deleg_{suppress}_")
+        ]
+
+
 def test_suppression_knob_defaults_to_config_default():
     """The knob is a real documented config surface, not a bare literal."""
     from hermes_cli.config import DEFAULT_CONFIG

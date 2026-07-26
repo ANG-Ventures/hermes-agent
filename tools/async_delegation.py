@@ -518,7 +518,9 @@ def recover_abandoned_delegations() -> int:
             }
             conn.execute(
                 """UPDATE async_delegations SET state=?, completed_at=?,
-                   updated_at=?, event_json=?, result_json=?, delivery_state='pending'
+                   updated_at=?, event_json=?, result_json=?,
+                   delivery_state=CASE WHEN delivery_state='delivered'
+                                       THEN 'delivered' ELSE 'pending' END
                    WHERE delegation_id=?""",
                 (tombstone["status"], now, now, json.dumps(event),
                  json.dumps(result), delegation_id),
