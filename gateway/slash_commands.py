@@ -3871,13 +3871,20 @@ class GatewaySlashCommandsMixin:
                 if persist:
                     # ``--global`` lane (upstream scoping): the persisted
                     # agent.service_tier default applies to the configured
-                    # gateway model, so gate on that model's fast support
-                    # rather than the current session route.
+                    # gateway route, so gate on that route rather than the
+                    # current session route.
                     from gateway.run import _resolve_gateway_model
-                    from hermes_cli.models import model_supports_fast_mode
-                    if not model_supports_fast_mode(
-                        _resolve_gateway_model(user_config)
-                    ):
+                    from hermes_cli.models import (
+                        resolve_fast_mode_capability_for_configured_route,
+                    )
+                    _, global_provider, global_api_mode = (
+                        self._configured_route_identity(user_config)
+                    )
+                    if not resolve_fast_mode_capability_for_configured_route(
+                        model=_resolve_gateway_model(user_config),
+                        provider=global_provider,
+                        api_mode=global_api_mode,
+                    ).supported:
                         return t("gateway.fast.not_supported")
                 else:
                     if persisted_preference and preference_unavailable:
@@ -3930,17 +3937,24 @@ class GatewaySlashCommandsMixin:
         if not args or args == "status":
             # Interactive picker on platforms that support it (parity with the
             # /model + /reasoning pickers). Gated on the configured gateway
-            # model's fast support; falls through to the text status card when
+            # route's fast support; falls through to the text status card when
             # the platform has no picker or the send fails. Session-scoped by
             # default; `/fast --global` persists agent.service_tier.
             from gateway.run import _resolve_gateway_model
-            from hermes_cli.models import model_supports_fast_mode
+            from hermes_cli.models import (
+                resolve_fast_mode_capability_for_configured_route,
+            )
 
             _fast_supported = False
             try:
-                _fast_supported = model_supports_fast_mode(
-                    _resolve_gateway_model(user_config)
+                _, _cfg_provider, _cfg_api_mode = self._configured_route_identity(
+                    user_config
                 )
+                _fast_supported = resolve_fast_mode_capability_for_configured_route(
+                    model=_resolve_gateway_model(user_config),
+                    provider=_cfg_provider,
+                    api_mode=_cfg_api_mode,
+                ).supported
             except Exception:
                 _fast_supported = False
 
