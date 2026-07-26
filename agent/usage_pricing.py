@@ -1759,6 +1759,55 @@ def get_pricing_entry(
     return _lookup_official_docs_pricing(route)
 
 
+def is_known_model(
+    model_name: str,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> bool:
+    """True when this (model, provider) resolves to a rate we can price OFFLINE.
+
+    Public, cheap, network-free membership probe over the static pricing
+    snapshot — the supported way to ask "do we have a rate for this model?"
+    without reaching into the private ``_OFFICIAL_DOCS_PRICING`` table. Added
+    for the new-model pricing sentinel (card t_2e382a4b), which fires the
+    instant a turn records with an unknown cost for a model we have never
+    priced.
+
+    Deliberately narrow, in both directions:
+
+    * It answers only from the STATIC tiers — the official-docs snapshot (with
+      its Anthropic dot/date normalization and the M1 vendor fallback) plus the
+      ``subscription_included`` $0 route. It never touches a live catalog
+      (``official_models_api``) or a ``/models`` endpoint, so it makes **no
+      network call** and is safe on the turn-record hot path.
+    * A live-catalog route (openrouter/nous/custom endpoint) therefore returns
+      ``True``: those routes are priced by a dynamic catalog rather than by a
+      snapshot entry, so a missing rate there is a catalog-availability
+      problem, not a "we forgot to add the new model's rate" problem. The
+      sentinel exists for the latter; alerting on the former would be noise on
+      every transient catalog miss.
+
+    Returns ``False`` only for a route that is meant to be priced from the
+    snapshot but has no entry at any tier — i.e. exactly the new-model gap.
+    """
+    try:
+        route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
+    except Exception:
+        # Never let a probe raise into a caller on the record path.
+        return True
+    if route.billing_mode == "subscription_included":
+        return True
+    # Dynamic-catalog and endpoint-metadata routes are out of scope (see above).
+    if route.billing_mode not in {"official_docs_snapshot", "unknown"}:
+        return True
+    if route.provider == "openrouter" or route.base_url:
+        return True
+    try:
+        return _lookup_official_docs_pricing(route) is not None
+    except Exception:
+        return True
+
+
 def normalize_usage(
     response_usage: Any,
     *,
