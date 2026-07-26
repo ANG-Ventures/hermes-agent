@@ -2458,7 +2458,16 @@ def _ensure_leading_user_turn(result: List[Dict[str, Any]]) -> None:
     (convert_messages_to_converse).
     """
     if result and result[0].get("role") != "user":
-        result.insert(0, {"role": "user", "content": [{"type": "text", "text": " "}]})
+        # The placeholder must be NON-WHITESPACE: the Messages input schema
+        # rejects blank text blocks ("text content blocks must contain
+        # non-whitespace text"), so a " " here turns EVERY subsequent call in
+        # the session into a deterministic 400 that fans across the whole
+        # fallback chain (2026-07-25 incident — the wedge survived restarts
+        # because this synthetic turn is re-prepended on every conversion).
+        result.insert(
+            0,
+            {"role": "user", "content": [{"type": "text", "text": _EMPTY_TEXT_PLACEHOLDER}]},
+        )
 
 
 def convert_messages_to_anthropic(
