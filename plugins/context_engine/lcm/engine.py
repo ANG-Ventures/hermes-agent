@@ -4114,7 +4114,15 @@ class LCMEngine(ContextEngine):
             serialized = self._serialize_messages(messages)
             output_path = self._config.extraction_output_path
             if not output_path:
-                base = self._hermes_home or os.path.expanduser("~/.hermes")
+                # ``hermes_home`` defaults to "" on the constructor, so this
+                # fallback is reachable and WRITES — a bare expanduser here
+                # escapes to the real home under hermetic / alternate-profile
+                # runs (t_43d5c42d). Same resolution order as _resolve_db_path.
+                base = self._hermes_home or os.environ.get("HERMES_HOME")
+                if not base:
+                    from hermes_constants import get_hermes_home
+
+                    base = str(get_hermes_home())
                 output_path = os.path.join(base, "lcm-extractions")
             extraction_model = self._config.extraction_model or self._config.summary_model
             extract_before_compaction(
