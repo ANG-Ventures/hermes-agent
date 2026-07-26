@@ -17,6 +17,9 @@ class _CapturingSessionDB:
         self.rows.append({"role": role, "content": content})
         return len(self.rows)
 
+    def recompute_effective_last_active(self, _session_id):
+        pass
+
 
 def _agent_with_capturing_db():
     agent = AIAgent.__new__(AIAgent)
