@@ -460,7 +460,16 @@ class LCMEngine(ContextEngine):
             return Path(self._config.database_path)
         if hermes_home:
             return Path(hermes_home) / "lcm.db"
-        return Path.home() / ".hermes" / "lcm.db"
+        # Final fallback must respect a redirected HERMES_HOME — a bare
+        # Path.home()/".hermes" opens the PROD lcm.db under hermetic runs
+        # (same freeze class as the 2026-07-24 DEFAULT_DB_PATH incident /
+        # t_43d5c42d). config.py in this package already uses this form.
+        env_home = os.environ.get("HERMES_HOME")
+        if env_home:
+            return Path(env_home) / "lcm.db"
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home() / "lcm.db"
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
