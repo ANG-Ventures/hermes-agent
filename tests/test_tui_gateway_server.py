@@ -1,3 +1,4 @@
+import inspect
 import json
 import os
 import subprocess
@@ -10,6 +11,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
+from _pytest.outcomes import Failed
 
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_cli.active_sessions import active_session_registry_snapshot
@@ -6356,6 +6358,60 @@ def test_session_compress_returns_compute_host_history(monkeypatch):
     }
 
 
+def _bind_to_real_signature(name, impl):
+    """Return ``impl`` wrapped so it accepts EXACTLY what the real ``server.<name>``
+    accepts — no more.
+
+    A stub written ``def send_control(*args, **kwargs)`` absorbs every keyword,
+    so a test asserting "the route forwards ``timeout=120.0``" keeps passing even
+    after the live helper loses its ``timeout`` parameter. That is not
+    hypothetical: it is exactly how the 5019 break
+    (``_send_compute_host_control() got an unexpected keyword argument
+    'timeout'``) shipped green — every isolated ``/compress`` died in production
+    while this file stayed green.
+
+    Binding to the REAL signature is what makes the drift observable, but the
+    bind alone is not enough. The production call sites wrap the helper in
+    ``except Exception: return _err(rid, 5019, ...)``, so a ``TypeError`` from a
+    correctly-bound stub would be swallowed by the code under test and the route
+    would just return an error dict — a green test again, one indirection later.
+    So the mismatch is reported with ``pytest.fail``, whose ``Failed`` derives
+    from ``BaseException`` (NOT ``Exception``) and therefore travels straight
+    through the route's ``except Exception`` guard to the test runner.
+    """
+    real = getattr(server, name)
+    signature = inspect.signature(real)
+
+    def _bound(*args, **kwargs):
+        try:
+            signature.bind(*args, **kwargs)
+        except TypeError as exc:
+            pytest.fail(
+                f"call site does not match the real server.{name}{signature}: {exc}"
+            )
+        return impl(*args, **kwargs)
+
+    return _bound
+
+
+def test_send_compute_host_control_stub_binding_is_not_vacuous():
+    """Guard the guard: prove ``_bind_to_real_signature`` actually rejects drift.
+
+    Without this, a regression that made the helper permissive again would be
+    invisible — every test using it would simply go quiet-green, which is the
+    original bug class one level up.
+    """
+    bound = _bind_to_real_signature("_send_compute_host_control", lambda *a, **k: None)
+
+    # A kwarg the real signature does not define must fail, loudly.
+    with pytest.raises(BaseException) as excinfo:
+        bound("sid", route_name="session.compress", definitely_not_a_real_kwarg=1)
+    assert isinstance(excinfo.value, Failed), type(excinfo.value)
+
+    # ...and it must NOT be catchable by the production `except Exception` guard.
+    assert not isinstance(excinfo.value, Exception)
+
+
 def test_session_compress_forwards_120_second_budget_to_compute_host(monkeypatch):
     session = _session(agent=None, _compute_host_active=True)
     server._sessions["sid"] = session
@@ -6374,7 +6430,11 @@ def test_session_compress_forwards_120_second_budget_to_compute_host(monkeypatch
         }
 
     monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
-    monkeypatch.setattr(server, "_send_compute_host_control", send_control)
+    monkeypatch.setattr(
+        server,
+        "_send_compute_host_control",
+        _bind_to_real_signature("_send_compute_host_control", send_control),
+    )
 
     try:
         resp = server.handle_request(
@@ -11447,7 +11507,11 @@ def test_session_save_proxies_to_compute_host_history(monkeypatch):
         return {"type": "control.ack", "result": {"file": "/tmp/host-save.json"}}
 
     monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
-    monkeypatch.setattr(server, "_send_compute_host_control", send_control)
+    monkeypatch.setattr(
+        server,
+        "_send_compute_host_control",
+        _bind_to_real_signature("_send_compute_host_control", send_control),
+    )
     try:
         resp = server._methods["session.save"]("1", {"session_id": sid})
     finally:
