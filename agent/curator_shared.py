@@ -165,8 +165,22 @@ def shared_pass_lock(shared_root: Optional[Path] = None):
 
 def git_precheck_shared(
     shared_root: Optional[Path] = None,
+    scope_paths: Optional[Iterable[Path]] = None,
 ) -> Tuple[bool, str, List[str]]:
-    """Clean-tree gate. Returns (ok, reason, dirty_paths)."""
+    """Clean-tree gate. Returns (ok, reason, dirty_paths).
+
+    When *scope_paths* is given, only dirt **under those paths** blocks the
+    pass: a live agent home churns constantly (cron state, memories, sibling
+    skills), so requiring the whole skills-shared/ tree to be clean makes the
+    gate fail almost always for dirt the curator will never touch. With a
+    scope, in-scope dirt still hard-fails (reason "dirty working tree",
+    dirty=the in-scope paths), while out-of-scope dirt passes with reason
+    "clean (out-of-scope dirt ignored)" and dirty=the ignored paths — callers
+    MUST thread that list into ``commit_shared(precheck_dirty=...)`` so the
+    pre-commit drift-abort doesn't fire on paths that were already dirty at
+    precheck time. If any scope path cannot be resolved inside the repo, the
+    gate falls back to the conservative whole-tree behavior.
+    """
     root = shared_root or _shared_root()
     if not root.is_dir():
         return False, "no skills-shared/ tree", []
@@ -176,6 +190,27 @@ def git_precheck_shared(
     dirty = _porcelain_shared(repo, root)
     if dirty is None:
         return False, "git status failed", []
+    if dirty and scope_paths is not None:
+        repo_resolved = repo.resolve()
+        scoped_rel: Optional[List[str]] = []
+        for sp in scope_paths:
+            try:
+                scoped_rel.append(
+                    str(Path(sp).resolve(strict=False).relative_to(repo_resolved))
+                )
+            except ValueError:
+                # A scope path outside the repo -> fall back to the
+                # conservative whole-tree gate rather than guessing.
+                scoped_rel = None
+                break
+        if scoped_rel:
+            def _in_scope(p: str) -> bool:
+                return any(p == s or p.startswith(s + "/") for s in scoped_rel)
+
+            in_scope = [p for p in dirty if _in_scope(p)]
+            if in_scope:
+                return False, "dirty working tree", in_scope
+            return True, "clean (out-of-scope dirt ignored)", dirty
     if dirty:
         return False, "dirty working tree", dirty
     return True, "clean", []
@@ -476,11 +511,19 @@ def archive_shared_skill(
         if not acquired:
             return False, "lock contention (another curator holds shared lock)", []
         
-        ok, reason, dirty = git_precheck_shared(root)
+        # Scope the clean-tree gate to the paths this archive will touch:
+        # the skill dir itself and the group's .archive/ destination. Dirt
+        # elsewhere in the shared tree (sibling skills, unrelated fleet churn)
+        # is recorded and threaded into the commit drift-allowance instead of
+        # blocking the archive (2026-07-25: whole-tree gate failed ~always on
+        # a live agent home).
+        group_pre = rel.parts[0]
+        scope = [skill_dir, root / group_pre / ".archive"]
+        ok, reason, dirty = git_precheck_shared(root, scope_paths=scope)
         if not ok and reason == "dirty working tree":
             recovered, why = attempt_crash_recovery(root)
             if recovered:
-                ok, reason, dirty = git_precheck_shared(root)
+                ok, reason, dirty = git_precheck_shared(root, scope_paths=scope)
         if not ok:
             return False, f"precheck failed ({reason})", []
         

@@ -103,6 +103,14 @@ async def test_restart_command_uses_detached_without_systemd(tmp_path, monkeypat
     """Without systemd, /restart uses the detached subprocess approach."""
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.delenv("INVOCATION_ID", raising=False)
+    monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
+    monkeypatch.delenv("HERMES_S6_SUPERVISED_CHILD", raising=False)
+    monkeypatch.delenv("HERMES_GATEWAY_EXTERNAL_SUPERVISOR", raising=False)
+    # Hermeticity: a containerized CI runner's /.dockerenv would flip the
+    # routing to via_service=True regardless of the env markers under test.
+    monkeypatch.setattr(
+        "gateway.restart.is_container_restart_context", lambda: False
+    )
 
     runner, _adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
@@ -663,6 +671,27 @@ async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_
         "⚠️ Gateway shutting down — Your current task will be interrupted.",
         metadata={"thread_id": "topic-7"},
     )
+
+
+@pytest.mark.asyncio
+async def test_shutdown_notifications_are_fully_muted_when_flag_disabled():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="active-42", chat_type="group", thread_id="topic-7")
+    session_key = build_session_key(source)
+
+    runner.config.platforms[Platform.TELEGRAM].gateway_restart_notification = False
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+    runner._running_agents[session_key] = object()
+    runner.session_store._entries[session_key] = MagicMock(origin=source)
+    adapter.send = AsyncMock()
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    adapter.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio

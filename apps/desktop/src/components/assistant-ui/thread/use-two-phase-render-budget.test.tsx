@@ -7,12 +7,7 @@
 import { act, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import {
-  RAISE_STEP,
-  RENDER_BUDGET,
-  SWITCH_RENDER_BUDGET,
-  useTwoPhaseRenderBudget
-} from './use-two-phase-render-budget'
+import { RAISE_STEP, RENDER_BUDGET, SWITCH_RENDER_BUDGET, useTwoPhaseRenderBudget } from './use-two-phase-render-budget'
 
 type IdleWindow = Window & {
   cancelIdleCallback?: (handle: number) => void

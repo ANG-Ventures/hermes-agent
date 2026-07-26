@@ -68,10 +68,13 @@ function SlashHarness({
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
 }) {
   const activeSessionIdRef: MutableRefObject<string | null> = { current: SESSION_ID }
+  const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: SESSION_ID }
 
   const runSlash = useSlashCommand({
     activeSessionIdRef,
+    selectedStoredSessionIdRef,
     appendSessionTextMessage: vi.fn(),
+    updateSessionState: vi.fn(),
     branchCurrentSession: async () => true,
     busyRef: { current: false },
     copy: en.desktop,

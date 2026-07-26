@@ -1,11 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import {
-  type DroppedFile,
-  extractDroppedFiles,
-  HERMES_PATHS_MIME,
-  partitionDroppedFiles
-} from './use-composer-actions'
+import { type DroppedFile, extractDroppedFiles, HERMES_PATHS_MIME, partitionDroppedFiles } from './use-composer-actions'
 
 // A Finder/Explorer drop carries a native File handle; an in-app drag (project
 // tree, gutter line ref) is path-only. The split decides whether a drop becomes

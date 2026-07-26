@@ -32,6 +32,10 @@ import threading
 from typing import Any
 
 from tui_gateway import server
+from hermes_cli.session_db_heavy_gate import (
+    SessionDBHeavyReadBusy,
+    session_db_heavy_read_slot,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -102,6 +106,10 @@ class WSTransport:
         self._pending_tokens: list[str] = []
         self._token_flush_handle: asyncio.TimerHandle | None = None
         self._token_flush_armed = False
+        # Buffer mutation is protected by the thread lock above; actual socket
+        # writes need an async boundary because several batches can be queued on
+        # the owning loop while it recovers from a stall.
+        self._send_lock = asyncio.Lock()
 
     @staticmethod
     def _is_streaming_frame(obj: dict) -> bool:
@@ -211,36 +219,35 @@ class WSTransport:
         if self._closed:
             return False
         # Flush any buffered streamed tokens ahead of this frame (RPC response /
-        # control frame) so it can't overtake the tokens that preceded it.
+        # control frame) as ONE serialized batch. Sending them in two lock
+        # acquisitions would let a later batch slip between the pending tokens
+        # and the frame that drained them.
         with self._token_lock:
-            pending = self._pending_tokens
+            batch = self._pending_tokens
             self._pending_tokens = []
-        if pending:
-            await self._safe_send_many(pending)
-        await self._safe_send(json.dumps(obj, ensure_ascii=False))
+            batch.append(json.dumps(obj, ensure_ascii=False))
+        await self._safe_send_many(batch)
         return not self._closed
 
-    async def _safe_send(self, line: str) -> None:
-        try:
-            await self._ws.send_text(line)
-        except Exception as exc:
-            self._closed = True
-            _log.warning(
-                "ws send failed peer=%s error_type=%s error=%s",
-                self._peer, type(exc).__name__, exc,
-            )
-
     async def _safe_send_many(self, lines: list[str]) -> None:
-        """Send a batch of pre-serialized frames in order on the loop thread."""
-        try:
-            for line in lines:
-                await self._ws.send_text(line)
-        except Exception as exc:
-            self._closed = True
-            _log.warning(
-                "ws send failed peer=%s error_type=%s error=%s",
-                self._peer, type(exc).__name__, exc,
-            )
+        """Send one indivisible batch of pre-serialized frames in wire order."""
+        async with self._send_lock:
+            if self._closed:
+                return
+            try:
+                for line in lines:
+                    if self._closed:
+                        return
+                    await self._ws.send_text(line)
+            except Exception as exc:
+                # Latch while still holding the writer lock so queued batches
+                # observe the failure before they get a chance to touch the
+                # socket.
+                self._closed = True
+                _log.warning(
+                    "ws send failed peer=%s error_type=%s error=%s",
+                    self._peer, type(exc).__name__, exc,
+                )
 
     def close(self) -> None:
         self._closed = True
@@ -278,6 +285,28 @@ def _disable_nagle(ws: Any) -> None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     except Exception as exc:  # pragma: no cover - best-effort tuning
         _log.debug("ws TCP_NODELAY skip: %s", exc)
+
+
+async def _dispatch_ws_request(req: Any, transport: WSTransport | None) -> dict | None:
+    """Dispatch one WS JSON-RPC request.
+
+    Heavy SessionDB list scans queue on the event loop before they occupy a
+    worker thread. For those methods we bypass ``server.dispatch`` because it
+    would only schedule the long-handler pool job and return, releasing the gate
+    before the actual DB read finished.
+    """
+    req_id = req.get("id") if isinstance(req, dict) else None
+    req_method = req.get("method") if isinstance(req, dict) else None
+    if server.is_session_db_heavy_method(req_method):
+        try:
+            async with session_db_heavy_read_slot(
+                surface="ws",
+                operation=str(req_method),
+            ):
+                return await asyncio.to_thread(server.handle_request_bound, req, transport)
+        except SessionDBHeavyReadBusy as exc:
+            return server.backend_busy_error(req_id, exc)
+    return await asyncio.to_thread(server.dispatch, req, transport)
 
 
 async def handle_ws(ws: Any) -> None:
@@ -326,6 +355,12 @@ async def handle_ws(ws: Any) -> None:
                 },
             }
         )
+        if ready_ok:
+            # Live-apply skins Hermes activates mid-conversation.
+            server._ensure_skin_watcher()
+            # Track this peer for session-less global broadcasts (skin.changed
+            # from the background watcher) — write_json can't route those.
+            server.register_live_transport(transport)
         if not ready_ok:
             disconnect_reason = "ready_send_failed"
             send_failures += 1
@@ -385,7 +420,7 @@ async def handle_ws(ws: Any) -> None:
             req_id = req.get("id") if isinstance(req, dict) else None
             req_method = req.get("method") if isinstance(req, dict) else None
             try:
-                resp = await asyncio.to_thread(server.dispatch, req, transport)
+                resp = await _dispatch_ws_request(req, transport)
             except Exception:
                 dispatch_crashes += 1
                 _log.exception(
@@ -426,6 +461,7 @@ async def handle_ws(ws: Any) -> None:
         reaped_sessions = 0
         detached_sessions = 0
         if transport is not None:
+            server.unregister_live_transport(transport)
             transport.close()
 
             # Reap sessions this transport owned (close_on_disconnect sidecar

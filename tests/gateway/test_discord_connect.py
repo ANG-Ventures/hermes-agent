@@ -1257,3 +1257,37 @@ async def test_free_response_inline_other_bot_mention_reaches_platform_event(mon
     assert event.source.chat_type == "group"
     assert event.source.message_id == "460"
     await adapter.disconnect()
+
+
+# ============================================================================
+# #31049: unconfigured platform skips reconnection (non-retryable fatal error)
+# ============================================================================
+
+class TestDiscordUnconfiguredNonRetryable:
+    """Verify that missing dependency/token sets a non-retryable fatal error
+    so the gateway does not queue the platform for background reconnection."""
+
+    @pytest.mark.asyncio
+    async def test_no_discord_lib_sets_non_retryable_fatal(self, monkeypatch):
+        """connect() with discord.py unavailable → non-retryable fatal error."""
+        _ensure_discord_mock()
+        adapter = DiscordAdapter(PlatformConfig(enabled=True, token="fake"))
+        # Simulate discord.py not installed
+        monkeypatch.setattr(discord_platform, "DISCORD_AVAILABLE", False)
+        result = await adapter.connect()
+        assert result is False
+        assert adapter.has_fatal_error is True
+        assert adapter.fatal_error_retryable is False
+        assert adapter.fatal_error_code == "missing_dependency"
+
+    @pytest.mark.asyncio
+    async def test_no_bot_token_sets_non_retryable_fatal(self, monkeypatch):
+        """connect() with empty token → non-retryable fatal error."""
+        _ensure_discord_mock()
+        monkeypatch.setattr(discord_platform, "DISCORD_AVAILABLE", True)
+        adapter = DiscordAdapter(PlatformConfig(enabled=True, token=""))
+        result = await adapter.connect()
+        assert result is False
+        assert adapter.has_fatal_error is True
+        assert adapter.fatal_error_retryable is False
+        assert adapter.fatal_error_code == "missing_credentials"

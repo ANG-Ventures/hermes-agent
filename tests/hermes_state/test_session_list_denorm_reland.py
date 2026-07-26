@@ -2,6 +2,7 @@ import ast
 import json
 import os
 import shutil
+import textwrap
 from pathlib import Path
 from typing import Dict
 from unittest.mock import patch
@@ -99,6 +100,25 @@ def _normalized(rows):
     return json.loads(json.dumps(rows, sort_keys=True, default=str))
 
 
+def _assert_denorm_matches_oracle(db: SessionDB, expected_ids: list[str]) -> None:
+    got = db.list_sessions_rich(order_by_last_active=True, limit=10)
+    oracle = db.list_sessions_rich(
+        order_by_last_active=True,
+        limit=10,
+        _force_cte_oracle=True,
+    )
+    assert _normalized(got) == _normalized(oracle)
+    assert [row["id"] for row in got] == expected_ids
+
+
+def _assert_reopened_denorm_matches_oracle(db_path: Path, expected_ids: list[str]) -> None:
+    reopened = SessionDB(db_path=db_path)
+    try:
+        _assert_denorm_matches_oracle(reopened, expected_ids)
+    finally:
+        reopened.close()
+
+
 def test_dashboard_session_list_denorm_default_is_false_config_only():
     assert DEFAULT_CONFIG["dashboard"]["session_list_denorm"] is False
     assert isinstance(DEFAULT_CONFIG["dashboard"]["session_list_denorm"], bool)
@@ -153,6 +173,129 @@ def test_flag_on_denorm_path_matches_cte_oracle_byte_for_byte(tmp_path):
             assert _normalized(got) == _normalized(oracle), kwargs
     finally:
         db.close()
+
+
+def test_prune_orphan_recomputes_denorm_and_survives_reopen(tmp_path):
+    _write_dashboard_flag(True)
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    try:
+        db.create_session("prune-parent", source="prune-target")
+        db.end_session("prune-parent", "compression")
+        db.create_session(
+            "prune-child",
+            source="cli",
+            parent_session_id="prune-parent",
+        )
+        db.append_message(
+            "prune-child",
+            role="user",
+            content="fresh continuation",
+            timestamp=5000.0,
+        )
+        _seed_session(db, "prune-rival", started_at=100.0, message_ts=4000.0)
+
+        assert db.prune_sessions(older_than_days=None, source="prune-target") == 1
+        prune_child = db.get_session("prune-child")
+        assert prune_child is not None
+        assert prune_child["parent_session_id"] is None
+        _assert_denorm_matches_oracle(db, ["prune-child", "prune-rival"])
+        assert db.get_meta(hermes_state._EFFECTIVE_LAST_ACTIVE_BACKFILL_META_KEY) == (
+            hermes_state._EFFECTIVE_LAST_ACTIVE_BACKFILL_VERSION
+        )
+    finally:
+        db.close()
+
+    _assert_reopened_denorm_matches_oracle(
+        db_path,
+        ["prune-child", "prune-rival"],
+    )
+
+
+def test_delete_empty_orphan_recomputes_denorm_and_survives_reopen(tmp_path):
+    _write_dashboard_flag(True)
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    try:
+        db.create_session("empty-parent", source="cli")
+        db.end_session("empty-parent", "compression")
+        db.create_session(
+            "empty-child",
+            source="cli",
+            parent_session_id="empty-parent",
+        )
+        db.append_message(
+            "empty-child",
+            role="user",
+            content="fresh continuation",
+            timestamp=5000.0,
+        )
+        _seed_session(db, "empty-rival", started_at=100.0, message_ts=4000.0)
+
+        assert db.delete_empty_sessions() == 1
+        empty_child = db.get_session("empty-child")
+        assert empty_child is not None
+        assert empty_child["parent_session_id"] is None
+        _assert_denorm_matches_oracle(db, ["empty-child", "empty-rival"])
+        assert db.get_meta(hermes_state._EFFECTIVE_LAST_ACTIVE_BACKFILL_META_KEY) == (
+            hermes_state._EFFECTIVE_LAST_ACTIVE_BACKFILL_VERSION
+        )
+    finally:
+        db.close()
+
+    _assert_reopened_denorm_matches_oracle(
+        db_path,
+        ["empty-child", "empty-rival"],
+    )
+
+
+def test_import_parent_wiring_recomputes_denorm_and_survives_reopen(tmp_path):
+    _write_dashboard_flag(True)
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    try:
+        _seed_session(db, "import-rival", started_at=100.0, message_ts=4000.0)
+        result = db.import_sessions(
+            [
+                {
+                    "id": "import-parent",
+                    "source": "cli",
+                    "started_at": 1000.0,
+                    "ended_at": 1100.0,
+                    "end_reason": "compression",
+                    "messages": [
+                        {"role": "user", "content": "old root", "timestamp": 1000.0}
+                    ],
+                },
+                {
+                    "id": "import-child",
+                    "source": "cli",
+                    "parent_session_id": "import-parent",
+                    "started_at": 1200.0,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "fresh continuation",
+                            "timestamp": 5000.0,
+                        }
+                    ],
+                },
+            ]
+        )
+
+        assert result["ok"] is True
+        assert result["imported"] == 2
+        _assert_denorm_matches_oracle(db, ["import-child", "import-rival"])
+        assert db.get_meta(hermes_state._EFFECTIVE_LAST_ACTIVE_BACKFILL_META_KEY) == (
+            hermes_state._EFFECTIVE_LAST_ACTIVE_BACKFILL_VERSION
+        )
+    finally:
+        db.close()
+
+    _assert_reopened_denorm_matches_oracle(
+        db_path,
+        ["import-child", "import-rival"],
+    )
 
 
 def test_backfill_version_is_strictly_newer_than_every_shipped_marker():
@@ -324,6 +467,54 @@ def _sessiondb_method_sources() -> Dict[str, str]:
     }
 
 
+def _sql_literal_text(node: ast.AST) -> str:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        return "".join(_sql_literal_text(value) for value in node.values)
+    if isinstance(node, ast.FormattedValue):
+        return "{}"
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _sql_literal_text(node.left) + _sql_literal_text(node.right)
+    return ""
+
+
+def _parent_session_id_writer_count(source: str) -> int:
+    tree = ast.parse(textwrap.dedent(source))
+    count = 0
+    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+        if not isinstance(call.func, ast.Attribute) or call.func.attr not in {
+            "execute",
+            "executescript",
+        }:
+            continue
+        if not call.args:
+            continue
+        sql = " ".join(_sql_literal_text(call.args[0]).lower().split())
+        for update_marker in ("update sessions set", "do update set"):
+            _, marker, assignments = sql.partition(update_marker)
+            assignments = assignments.split(" where ", 1)[0]
+            if marker and "parent_session_id =" in assignments:
+                count += 1
+                break
+    return count
+
+
+def _call_count(source: str, function_name: str) -> int:
+    tree = ast.parse(textwrap.dedent(source))
+    count = 0
+    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+        if isinstance(call.func, ast.Name):
+            called_name = call.func.id
+        elif isinstance(call.func, ast.Attribute):
+            called_name = call.func.attr
+        else:
+            continue
+        if called_name == function_name or called_name.startswith(f"{function_name}_"):
+            count += 1
+    return count
+
+
 def test_every_sessiondb_message_insert_path_is_effective_last_active_adjacent():
     all_functions = _function_sources_by_qualname(Path(hermes_state.__file__))
     insert_functions = {
@@ -362,6 +553,41 @@ def test_every_sessiondb_message_insert_path_is_effective_last_active_adjacent()
         if "_recompute_effective_last_active_for_session" not in methods[name]
     ]
     assert missing_recompute == []
+
+
+def test_every_parent_session_id_writer_is_effective_last_active_adjacent():
+    all_functions = _function_sources_by_qualname(Path(hermes_state.__file__))
+    writer_functions = {
+        name: (src, _parent_session_id_writer_count(src))
+        for name, src in all_functions.items()
+        if _parent_session_id_writer_count(src)
+    }
+    assert writer_functions, "source contract must see production parent_session_id writers"
+
+    offenders = [
+        name
+        for name, (src, writer_count) in writer_functions.items()
+        if _call_count(src, "_recompute_effective_last_active") < writer_count
+        and not (
+            name == "_delete_delegate_children"
+            and "orphaned_child_ids.extend" in src
+        )
+    ]
+    assert offenders == []
+
+    delegate_delete_callers = {
+        name: src
+        for name, src in all_functions.items()
+        if name != "_delete_delegate_children"
+        and _call_count(src, "_delete_delegate_children")
+    }
+    assert delegate_delete_callers, "source contract must see delegate-delete callers"
+    assert [
+        name
+        for name, src in delegate_delete_callers.items()
+        if _call_count(src, "_recompute_effective_last_active")
+        < _call_count(src, "_delete_delegate_children")
+    ] == []
 
 
 def test_update_session_meta_visibility_flip_matches_cte_oracle(tmp_path):

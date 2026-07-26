@@ -403,7 +403,11 @@ const DirectiveImage: FC<{ id: string; label: string }> = ({ id, label }) => {
 
     // Remote gateway: the image lives on the gateway's disk, not ours — fetch
     // it over the authenticated API. Local: read it straight off this disk.
-    const load = window.hermesDesktop ? (isRemoteGateway() ? gatewayMediaDataUrl(id) : readDesktopFileDataUrl(id)) : null
+    const load = window.hermesDesktop
+      ? isRemoteGateway()
+        ? gatewayMediaDataUrl(id)
+        : readDesktopFileDataUrl(id)
+      : null
 
     void Promise.resolve(load)
       .then(url => alive && url && setSrc(url))

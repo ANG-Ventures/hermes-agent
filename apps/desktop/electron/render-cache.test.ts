@@ -17,12 +17,7 @@ import path from 'node:path'
 
 import { test } from 'vitest'
 
-import {
-  MAX_TRANSCRIPT_FILES,
-  RENDER_CACHE_SCHEMA,
-  RenderCache,
-  sessionIdFromTranscriptFile
-} from './render-cache.ts'
+import { MAX_TRANSCRIPT_FILES, RENDER_CACHE_SCHEMA, RenderCache, sessionIdFromTranscriptFile } from './render-cache.ts'
 
 function tmpDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'render-cache-test-'))
@@ -207,10 +202,7 @@ test('sweepAgainstLiveSessions culls orphans and reports the count (boot sweep, 
   cache.flush()
   const culled = cache.sweepAgainstLiveSessions(['alive-1', 'alive-2'])
   assert.equal(culled, 2)
-  assert.deepEqual(
-    fs.readdirSync(dir).sort(),
-    ['transcript-alive-1.json', 'transcript-alive-2.json']
-  )
+  assert.deepEqual(fs.readdirSync(dir).sort(), ['transcript-alive-1.json', 'transcript-alive-2.json'])
 })
 
 test('sweep on an empty/missing dir is a no-op, never throws', () => {

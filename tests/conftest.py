@@ -277,6 +277,10 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_DISPATCH_IN_GATEWAY",
     "HERMES_TENANT",
+    # Honcho host selection changes which nested config block wins. A local
+    # shell override leaked "myhost" into the full suite and flipped 20
+    # otherwise-unrelated config tests away from the default "hermes" host.
+    "HERMES_HONCHO_HOST",
     # Dashboard OAuth auth gate (PR #30156). When set, the bundled
     # dashboard-auth `nous` plugin auto-registers itself on plugin discovery,
     # which is triggered by any `/api/status` call. That leaks a provider
@@ -376,7 +380,13 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     # Force-clear on every test setup so the leak can't happen.
     "SLACK_REQUIRE_MENTION",
     "SLACK_STRICT_MENTION",
+    "SLACK_THREAD_REQUIRE_MENTION",
+    "SLACK_IGNORE_OTHER_USER_MENTIONS",
+    "SLACK_REQUIRE_MENTION_CHANNELS",
     "SLACK_FREE_RESPONSE_CHANNELS",
+    "SLACK_ALLOWED_CHANNELS",
+    "SLACK_IGNORED_CHANNELS",
+    "SLACK_DISABLE_DMS",
     "SLACK_ALLOW_BOTS",
     "SLACK_REACTIONS",
     "DISCORD_REQUIRE_MENTION",
@@ -405,6 +415,13 @@ def _hermetic_environment(tmp_path, monkeypatch):
     for name in _HERMES_BEHAVIORAL_VARS:
         monkeypatch.delenv(name, raising=False)
 
+    # Honcho's fallback host/config resolution legitimately reads the user's
+    # global ~/.honcho/config.json. Keep HOME stable (subprocess tests depend
+    # on it), but pin the host so ordinary tests cannot inherit a developer's
+    # defaultHost and silently select the wrong nested config block. Tests of
+    # custom host resolution override/delete this explicitly.
+    monkeypatch.setenv("HERMES_HONCHO_HOST", "hermes")
+
     # 3. Redirect HERMES_HOME to a per-test tempdir. Code that reads
     #    ``~/.hermes/*`` via ``get_hermes_home()`` now gets the tempdir.
     #
@@ -422,6 +439,20 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
+
+    # 3a-GUARD (2026-07-24 WAL incident): hermeticity canary — after the
+    # redirect, the resolved state.db path must live under the sandbox. If it
+    # resolves to the REAL production path, some import froze the location
+    # before the redirect (the DEFAULT_DB_PATH class of bug) — hard-fail the
+    # test rather than silently letting the suite contend on prod WAL.
+    import hermes_state as _hs_guard
+    _resolved = _hs_guard.DEFAULT_DB_PATH
+    _real_home = Path(os.environ.get("HERMES_REAL_HOME", str(Path.home() / ".hermes")))
+    if _resolved == _real_home / "state.db":
+        raise RuntimeError(
+            f"HERMETICITY VIOLATION: state.db resolved to PRODUCTION path {_resolved} "
+            "despite HERMES_HOME redirect. See 2026-07-24 incident / t_43d5c42d."
+        )
 
     # 3b. Strip any root-logger file handler pointing OUTSIDE the test sandbox.
     #     hermes_logging.setup_logging() attaches a RotatingFileHandler at

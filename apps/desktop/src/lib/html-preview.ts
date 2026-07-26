@@ -1,6 +1,6 @@
 export const HTML_PREVIEW_CSP = [
   "default-src 'none'",
-  "img-src data: blob:",
+  'img-src data: blob:',
   "style-src 'unsafe-inline'",
   'font-src data:',
   'media-src data: blob:',

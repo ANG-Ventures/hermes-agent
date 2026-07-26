@@ -6,7 +6,14 @@ import { $connection } from '@/store/session'
 import { mediaSrc } from './markdown-text'
 
 describe('mediaSrc', () => {
-  const api = vi.fn(async () => ({ data_url: 'data:image/png;base64,cmVtb3Rl' }))
+  const api = vi.fn(async ({ path }: { path: string }) => {
+    if (path.startsWith('/api/fs/read-data-url?')) {
+      return { dataUrl: 'data:image/png;base64,cmVtb3Rl' }
+    }
+
+    throw new Error(`unexpected path ${path}`)
+  })
+
   const readFileDataUrl = vi.fn(async () => 'data:image/png;base64,bG9jYWw=')
 
   beforeEach(() => {
@@ -39,11 +46,11 @@ describe('mediaSrc', () => {
     expect(readFileDataUrl).not.toHaveBeenCalled()
   })
 
-  it('fetches remote images through authenticated gateway media API', async () => {
+  it('fetches remote images through the desktop fs bridge', async () => {
     $connection.set({ mode: 'remote', profile: 'mbp' } as never)
 
     await expect(mediaSrc('/tmp/a image.png')).resolves.toBe('data:image/png;base64,cmVtb3Rl')
-    expect(api).toHaveBeenCalledWith({ path: '/api/media?path=%2Ftmp%2Fa%20image.png', profile: 'mbp' })
+    expect(api).toHaveBeenCalledWith({ path: '/api/fs/read-data-url?path=%2Ftmp%2Fa%20image.png', profile: 'mbp' })
     expect(readFileDataUrl).not.toHaveBeenCalled()
   })
 })
@@ -262,6 +269,77 @@ describe('preprocessMarkdown', () => {
 
     expect(output).toContain('$$5x = 10$$')
     expect(output).not.toContain('\\$')
+  })
+
+  it('keeps numeric inline math intact instead of escaping it as currency', () => {
+    const input = ['- The observed outcome might be $4$', '- Because $4\\in A$, event $A$ occurred'].join('\n')
+
+    expect(preprocessMarkdown(input)).toBe(input)
+  })
+
+  it.each(['$4$', '$2/3$', '$5x=10$', '$4xy$', '$10kg$'])('preserves balanced numeric inline math: %s', input => {
+    expect(preprocessMarkdown(input)).toBe(input)
+  })
+
+  it('does not mistake a numeric formula closer for a later price opener', () => {
+    expect(preprocessMarkdown('Probability is $2/3$ and fee is $7.')).toBe('Probability is $2/3$ and fee is \\$7.')
+    expect(preprocessMarkdown('$4$ and $10')).toBe('$4$ and \\$10')
+  })
+
+  it('keeps escaping currency ranges instead of treating them as inline math', () => {
+    expect(preprocessMarkdown('$5-$10')).toBe('\\$5-\\$10')
+    expect(preprocessMarkdown('$5 and $x$')).toBe('\\$5 and $x$')
+    expect(preprocessMarkdown('Costs $5 + tax; formula is $x$.')).toBe('Costs \\$5 + tax; formula is $x$.')
+    expect(preprocessMarkdown('Costs $5 = base rate; formula is $x$.')).toBe('Costs \\$5 = base rate; formula is $x$.')
+  })
+
+  it.each([
+    ['Costs $5; delta is $-x$.', 'Costs \\$5; delta is $-x$.'],
+    ['Costs $5; result is $(x+1)$.', 'Costs \\$5; result is $(x+1)$.'],
+    ['Costs $5; set is $[1,2]$.', 'Costs \\$5; set is $[1,2]$.']
+  ])('escapes a price before a later complete math span: %s', (input, expected) => {
+    expect(preprocessMarkdown(input)).toBe(expected)
+  })
+
+  it('keeps the existing currency escaping semantics', () => {
+    expect(preprocessMarkdown('$1,299 total')).toBe('\\$1,299 total')
+    expect(preprocessMarkdown('already \\$5')).toBe('already \\$5')
+    expect(preprocessMarkdown('\\\\$5')).toBe('\\\\\\$5')
+  })
+
+  it('escapes a price while preserving numeric math later in the same sentence', () => {
+    const input = 'Costs $5; outcome is $4\\in A$.'
+
+    expect(preprocessMarkdown(input)).toBe('Costs \\$5; outcome is $4\\in A$.')
+  })
+
+  it('normalizes multiline bracket display math with delimiter-only lines', () => {
+    const input = [
+      'Correct.',
+      '',
+      'Both paths reach the same intersection:',
+      '',
+      '\\[',
+      'P(B)\\cdot P(A\\mid B)',
+      '=',
+      'P(A)\\cdot P(B\\mid A)',
+      '\\]',
+      '',
+      'Now isolate $P(A\\mid B)$.'
+    ].join('\n')
+
+    const output = preprocessMarkdown(input)
+
+    expect(output).toContain('$$\nP(B)\\cdot P(A\\mid B)\n=\nP(A)\\cdot P(B\\mid A)\n$$')
+    expect(output).not.toContain('$$P(B)')
+  })
+
+  it('keeps display math inside its markdown container', () => {
+    const listInput = ['- \\[', '  P(A)', '  =', '  P(B)', '  \\]'].join('\n')
+    const listOutput = ['- $$', '  P(A)', '  =', '  P(B)', '  $$'].join('\n')
+
+    expect(preprocessMarkdown(listInput)).toBe(listOutput)
+    expect(preprocessMarkdown(['> \\[', '> P(A)', '>  \\]'].join('\n'))).toBe(['> $$', '> P(A)', '>  $$'].join('\n'))
   })
 
   it('rewrites double-backslash bracket math to dollar delimiters', () => {

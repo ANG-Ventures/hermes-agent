@@ -236,3 +236,17 @@ def test_recap_paths_survive_gateway_bare_path_detector():
         "recap file path must live inside an inline-code span so the gateway "
         "bare-path auto-attach detector skips it"
     )
+
+
+def test_escape_sequences_sanitized_in_previews():
+    """Recap previews must not carry raw terminal escapes (codex#31494 class)."""
+    msgs = [
+        _user("please \x1b[2J\x1b]0;pwned\x07 do the thing"),
+        _assistant("done \x9b31m with it\x07"),
+    ]
+    out = build_recap(msgs)
+    assert "\x1b" not in out
+    assert "\x9b" not in out
+    assert "\x07" not in out
+    assert "do the thing" in out
+    assert "with it" in out

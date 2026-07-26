@@ -618,6 +618,10 @@ class CopilotACPClient:
         _subproc_env = _build_subprocess_env()
         _subproc_env.update(_claude_relay_env_patch(self._acp_command, self._acp_args))
         try:
+            # Hide the console the CLI child would otherwise flash on Windows
+            # (#56747). Hide-only — stdio pipes stay intact for the ACP wire.
+            from hermes_cli._subprocess_compat import windows_hide_flags
+
             proc = subprocess.Popen(
                 [self._acp_command] + self._acp_args,
                 stdin=subprocess.PIPE,
@@ -627,6 +631,7 @@ class CopilotACPClient:
                 bufsize=1,
                 cwd=self._acp_cwd,
                 env=_subproc_env,
+                creationflags=windows_hide_flags(),
             )
         except FileNotFoundError as exc:
             raise RuntimeError(

@@ -47,7 +47,6 @@ describe('readCachedTranscript (switch-paint)', () => {
 
   it('fail-open: missing bridge, missing method, rejecting IPC are all misses', async () => {
     expect(await readCachedTranscript('s1')).toBeNull() // no hermesDesktop at all
-
     ;(window as any).hermesDesktop = { renderCache: {} } // no readTranscript method
     expect(await readCachedTranscript('s1')).toBeNull()
 

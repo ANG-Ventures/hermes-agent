@@ -139,7 +139,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # Configuration
     CommandDef("config", "Show current configuration", "Configuration",
                cli_only=True),
-    CommandDef("model", "Switch model (persists by default)", "Configuration",
+    CommandDef("model", "Switch model (session-scoped; --global to persist)", "Configuration",
                args_hint="[model] [--provider name] [--global|--session] [--refresh]"),
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",
                "Configuration", aliases=("codex_runtime",),
@@ -149,6 +149,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[name]"),
     CommandDef("statusbar", "Toggle the context/model status bar", "Configuration",
                cli_only=True, aliases=("sb",)),
+    CommandDef("battery", "Toggle a color-coded battery indicator in the status bar",
+               "Configuration", cli_only=True, args_hint="[on|off|status]",
+               subcommands=("on", "off", "status")),
     CommandDef("timestamps", "Toggle [HH:MM] timestamps on messages and /history", "Configuration",
                cli_only=True, args_hint="[on|off|status]",
                subcommands=("on", "off", "status"), aliases=("ts",)),
@@ -161,11 +164,11 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("yolo", "Toggle YOLO mode (skip all dangerous command approvals)",
                "Configuration"),
     CommandDef("reasoning", "Manage reasoning effort and display", "Configuration",
-               args_hint="[level|show|hide|full|clamp]",
-               subcommands=("none", *VALID_REASONING_EFFORTS, "show", "hide", "on", "off", "full", "clamp")),
+               args_hint="[level|show|hide|full|clamp] [--global]",
+               subcommands=("none", *VALID_REASONING_EFFORTS, "show", "hide", "on", "off", "full", "clamp", "--global")),
     CommandDef("fast", "Toggle fast mode — OpenAI Priority Processing / Anthropic Fast Mode (Normal/Fast)", "Configuration",
-               args_hint="[normal|fast|status]",
-               subcommands=("normal", "fast", "status", "on", "off")),
+               args_hint="[normal|fast|status] [--global]",
+               subcommands=("normal", "fast", "status", "on", "off", "--global")),
     CommandDef("skin", "Show or change the display skin/theme", "Configuration",
                cli_only=True, args_hint="[name]"),
     CommandDef("indicator", "Pick the TUI busy-indicator style", "Configuration",
@@ -238,9 +241,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True),
     CommandDef("usage", "Show token usage and rate limits; `reset` redeems a banked Codex limit reset", "Info",
                args_hint="[reset [--force]]"),
-    CommandDef("credits", "Show Nous credit balance and top up", "Info"),
-    CommandDef("billing", "Manage Nous terminal billing — buy credits, auto-reload, limits", "Info",
-               cli_only=True),
+    CommandDef("subscription", "View your Nous plan and change it in the browser", "Info",
+               cli_only=True, aliases=("upgrade",)),
+    CommandDef("topup", "Show your Nous balance and manage billing on the portal", "Info"),
     CommandDef("insights", "Show usage insights and analytics", "Info",
                args_hint="[days]"),
     CommandDef("platforms", "Show gateway/messaging platform status", "Info",
@@ -1172,9 +1175,9 @@ _SLACK_PRIORITY_CANONICALS = ("debug",)
 # surface (CLI, TUI, Telegram, Discord). Keep this list TIGHT and intentional —
 # the telegram-parity test reads it so an entry here is a deliberate
 # "Slack-via-/hermes" decision, not a silent clamp.
-#   - credits: the billing/top-up surface; reached via /hermes credits on Slack.
+#   - topup: the billing/balance surface; reached via /hermes topup on Slack.
+#     (the rehaul folded the old /credits + /billing surfaces into /topup.)
 #   - version: low-frequency diagnostics; reached via /hermes version on Slack.
-#   - billing: the terminal-billing surface (buy/auto-reload/limit); /hermes billing.
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - boomerang: power-user subagent-dispatch command; routed via /hermes
@@ -1184,7 +1187,7 @@ _SLACK_PRIORITY_CANONICALS = ("debug",)
 #   - merge: niche session-management command (fold this session's summary into
 #     another); reached via /hermes merge on Slack so it doesn't displace a
 #     higher-frequency native slash at the 50-command cap. Native everywhere else.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "version", "billing", "moa", "boomerang", "debug", "merge"})
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "version", "moa", "boomerang", "debug", "merge"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

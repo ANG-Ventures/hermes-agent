@@ -146,6 +146,14 @@ class TestSupportsSystemdServicesWSL:
         monkeypatch.setattr(gateway, "is_termux", lambda: False)
         monkeypatch.setattr(gateway.shutil, "which", lambda _name: "/usr/bin/systemctl")
         monkeypatch.setattr(gateway, "is_wsl", lambda: False)
+        # Hermeticity: the probe also consults shutil.which("systemctl") and
+        # is_container() — on a containerized CI runner the real answers
+        # (no systemctl, in-container) fail the native-Linux contract under
+        # test. Pin both so the test asserts the BRANCH, not the host.
+        monkeypatch.setattr(
+            gateway.shutil, "which", lambda _name: "/usr/bin/systemctl"
+        )
+        monkeypatch.setattr(gateway, "is_container", lambda: False)
         assert gateway.supports_systemd_services() is True
 
     def test_termux_still_excluded(self, monkeypatch):

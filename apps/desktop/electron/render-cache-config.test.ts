@@ -39,14 +39,7 @@ test('falsy variants disable', () => {
 })
 
 test('enabled under a DIFFERENT block does not count', () => {
-  const yaml = [
-    'other:',
-    '  render_cache:',
-    '    enabled: false',
-    'desktop:',
-    '  something_else: 1',
-    ''
-  ].join('\n')
+  const yaml = ['other:', '  render_cache:', '    enabled: false', 'desktop:', '  something_else: 1', ''].join('\n')
 
   assert.equal(parseRenderCacheEnabled(yaml), true)
 })
@@ -83,9 +76,6 @@ test('readRenderCacheEnabled reads HERMES_HOME/config.yaml and fails open', () =
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rc-config-test-'))
   // no config.yaml at all → ON
   assert.equal(readRenderCacheEnabled(home), true)
-  fs.writeFileSync(
-    path.join(home, 'config.yaml'),
-    'desktop:\n  render_cache:\n    enabled: false\n'
-  )
+  fs.writeFileSync(path.join(home, 'config.yaml'), 'desktop:\n  render_cache:\n    enabled: false\n')
   assert.equal(readRenderCacheEnabled(home), false)
 })
