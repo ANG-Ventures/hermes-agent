@@ -2137,6 +2137,7 @@ DEFAULT_CONFIG = {
             "poll_interval": 2.5,
             "refocus_debounce": 1.0,
         },
+        "heavy_read_max_concurrency": 2,
         # Hide the token/cost analytics surfaces (Analytics page, token bars and
         # cost figures on the Models page) by default.  The numbers shown there
         # are a local debug estimate: they only count successful main-agent
