@@ -12,6 +12,8 @@ from . import gitops
 
 
 DEFAULT_MANIFEST = Path("docs/sync/fork-features.json")
+LIFECYCLES = frozenset({"upstream-intended", "fork-permanent", "absorbed"})
+LEGACY_LIFECYCLE = "fork-permanent"
 
 
 @dataclass(frozen=True)
@@ -20,6 +22,9 @@ class ForkFeature:
     tests: tuple[str, ...]
     paths: tuple[str, ...]
     why: str
+    lifecycle: str = LEGACY_LIFECYCLE
+    upstream_ref: str | None = None
+    absorbed_date: str | None = None
 
 
 @dataclass(frozen=True)
@@ -37,12 +42,17 @@ def load_manifest(path: Path) -> list[ForkFeature]:
         raw = json.load(fh)
     features: list[ForkFeature] = []
     for entry in raw:
+        upstream_ref = entry.get("upstream_ref")
+        absorbed_date = entry.get("absorbed_date")
         features.append(
             ForkFeature(
                 feature=str(entry["feature"]),
                 tests=tuple(str(item) for item in entry.get("tests", [])),
                 paths=tuple(str(item) for item in entry.get("paths", [])),
                 why=str(entry.get("why", "")),
+                lifecycle=str(entry.get("lifecycle", LEGACY_LIFECYCLE)),
+                upstream_ref=str(upstream_ref) if upstream_ref is not None else None,
+                absorbed_date=str(absorbed_date) if absorbed_date is not None else None,
             )
         )
     return features
@@ -98,6 +108,9 @@ def manifest_as_jsonable(features: list[ForkFeature]) -> list[dict[str, Any]]:
             "tests": list(feature.tests),
             "paths": list(feature.paths),
             "why": feature.why,
+            "lifecycle": feature.lifecycle,
+            "upstream_ref": feature.upstream_ref,
+            "absorbed_date": feature.absorbed_date,
         }
         for feature in features
     ]

@@ -122,7 +122,24 @@ async def main() -> int:
         if len(sys.argv) > 4:
             sid = sys.argv[4]
         else:
-            sdb = sqlite3.connect(os.path.expanduser("~/.hermes/state.db"))
+            # Resolve state.db under the active HERMES_HOME, never the raw real
+            # home — a bare expanduser("~/.hermes/state.db") is the precise
+            # WAL-contention footgun the 2026-07-24 incident is about if this
+            # probe is ever invoked in a suite/CI context (t_43d5c42d). Also
+            # hard-refuse under pytest so it can't open prod state.db mid-suite.
+            if os.environ.get("PYTEST_CURRENT_TEST"):
+                print("FATAL: livesync-rc1-probe must not open state.db under pytest")
+                return 1
+            try:
+                from hermes_constants import get_hermes_home
+
+                _state_db = str(get_hermes_home() / "state.db")
+            except Exception:
+                _state_db = os.path.join(
+                    os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"),
+                    "state.db",
+                )
+            sdb = sqlite3.connect(_state_db)
             pick = sdb.execute(
                 "SELECT m.session_id, COUNT(*) c FROM messages m "
                 "JOIN sessions s ON s.id = m.session_id "
