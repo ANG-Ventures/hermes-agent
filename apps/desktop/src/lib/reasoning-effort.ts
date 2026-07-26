@@ -10,6 +10,15 @@ export type ReasoningEffort = (typeof REASONING_EFFORTS)[number]
 /** The scale plus the off state — the full set a config value may hold. */
 export const REASONING_EFFORT_VALUES = ['none', ...REASONING_EFFORTS] as const
 
+/** Thinking-display modes `/reasoning` accepts alongside the effort levels.
+ *  These control how reasoning is *rendered*, not how much of it runs, so they
+ *  are deliberately disjoint from the effort ladder above. */
+export const REASONING_DISPLAY_VALUES = ['show', 'hide', 'full', 'clamp'] as const
+
+/** Everything `/reasoning <arg>` accepts, derived from both ladders so the
+ *  help text can never drift from what the command actually takes. */
+export const REASONING_COMMAND_HELP = [...REASONING_EFFORT_VALUES, ...REASONING_DISPLAY_VALUES].join('|')
+
 /** Hermes' built-in level when neither the surface nor the profile config
  *  specifies one (mirrors the backend's own fallback). */
 export const DEFAULT_REASONING_EFFORT: ReasoningEffort = 'medium'

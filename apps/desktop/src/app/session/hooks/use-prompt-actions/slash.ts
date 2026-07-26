@@ -14,6 +14,11 @@ import {
   resolveDesktopCommand
 } from '@/lib/desktop-slash-commands'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
+import {
+  DEFAULT_REASONING_EFFORT,
+  isReasoningEffort,
+  REASONING_COMMAND_HELP
+} from '@/lib/reasoning-effort'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { openCommandPalettePage } from '@/store/command-palette'
 import { setComposerDraft } from '@/store/composer'
@@ -27,6 +32,7 @@ import {
   $sessions,
   $yoloActive,
   resolveComposerSessionKey,
+  setCurrentReasoningEffort,
   setCurrentUsage,
   setModelPickerOpen,
   setSessionPickerOpen,
@@ -547,6 +553,59 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
           } finally {
             compressInFlightRef.current.delete(sessionId)
+          }
+        },
+        // /reasoning shows or sets this session's reasoning effort / thinking
+        // display via the gateway's session-scoped `config.get`/`config.set`
+        // for the `reasoning` key — the same RPC pair the model-edit submenu
+        // already uses, so the two surfaces cannot disagree. An effort level
+        // also updates the composer's effort store so the pill reflects the
+        // change immediately instead of waiting for the next state push.
+        reasoning: async ctx => {
+          const resolved = await withSlashOutput(ctx)
+
+          if (!resolved) {
+            return
+          }
+
+          const { render, sessionId } = resolved
+          const arg = ctx.arg.trim().toLowerCase()
+
+          try {
+            if (!arg) {
+              const current = await requestGateway<{ display?: string; value?: string }>('config.get', {
+                key: 'reasoning',
+                session_id: sessionId
+              })
+
+              render(
+                copy.reasoning.status(
+                  current.value || DEFAULT_REASONING_EFFORT,
+                  current.display || 'show',
+                  REASONING_COMMAND_HELP
+                )
+              )
+
+              return
+            }
+
+            const applied = await requestGateway<{ value?: string }>('config.set', {
+              key: 'reasoning',
+              session_id: sessionId,
+              value: arg
+            })
+
+            const value = applied.value || arg
+
+            // An effort level moves the pill; a display mode does not.
+            if (isReasoningEffort(value)) {
+              setCurrentReasoningEffort(value)
+              render(copy.reasoning.effortSet(value))
+            } else {
+              render(copy.reasoning.displaySet(value))
+            }
+          } catch (err) {
+            render(`${copy.reasoning.failed}: ${err instanceof Error ? err.message : String(err)}`)
           }
         },
         // /yolo maps to the status-bar YOLO control — a per-session approval

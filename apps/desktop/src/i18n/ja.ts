@@ -2667,6 +2667,12 @@ export const ja = defineLocale({
     desktopCommands: 'デスクトップコマンド',
     skillCommandsAvailable: count => `${count} 件のスキルコマンドが利用可能です。`,
     warningLine: message => `警告: ${message}`,
+    reasoning: {
+      displaySet: value => `推論表示を ${value} に設定しました`,
+      effortSet: value => `推論レベルを ${value} に設定しました`,
+      failed: '推論設定を更新できませんでした',
+      status: (effort, display, help) => `推論レベル ${effort}、表示 ${display} — /reasoning <${help}>`
+    },
     yoloArmed: 'このチャットでは YOLO が有効になっています',
     yoloOff: 'YOLO オフ',
     yoloSystem: active => `このセッションの YOLO ${active ? 'オン' : 'オフ'}`,

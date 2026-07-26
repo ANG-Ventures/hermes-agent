@@ -2941,6 +2941,12 @@ export const zh: Translations = {
     desktopCommands: '桌面端命令',
     skillCommandsAvailable: count => `${count} 个技能命令可用。`,
     warningLine: message => `警告：${message}`,
+    reasoning: {
+      displaySet: value => `推理显示已设为 ${value}`,
+      effortSet: value => `推理强度已设为 ${value}`,
+      failed: '无法更新推理设置',
+      status: (effort, display, help) => `推理强度 ${effort}、显示 ${display} — /reasoning <${help}>`
+    },
     yoloArmed: '此对话已启用 YOLO',
     yoloOff: 'YOLO 已关闭',
     yoloSystem: active => `此会话 YOLO ${active ? '已开启' : '已关闭'}`,

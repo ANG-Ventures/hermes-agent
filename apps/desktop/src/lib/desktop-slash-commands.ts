@@ -39,6 +39,7 @@ export type DesktopActionId =
   | 'new'
   | 'pet'
   | 'profile'
+  | 'reasoning'
   | 'skin'
   | 'title'
   | 'yolo'
@@ -224,6 +225,11 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
     surface: action('hatch')
   },
   { name: '/queue', description: 'Queue a prompt for the next turn', aliases: ['/q'], surface: exec() },
+  {
+    name: '/reasoning',
+    description: 'Show or set this session reasoning effort / thinking display',
+    surface: action('reasoning')
+  },
   { name: '/retry', description: 'Retry the last user message', surface: exec() },
   { name: '/rollback', description: 'List or restore filesystem checkpoints', surface: exec() },
   {
@@ -286,7 +292,7 @@ const NO_DESKTOP_SURFACE: Record<DesktopUnavailableReason, readonly string[]> = 
   ],
   messaging: ['/approve', '/deny'],
   settings: ['/skills', '/pets'],
-  advanced: ['/curator', '/fast', '/insights', '/kanban', '/reasoning', '/voice']
+  advanced: ['/curator', '/fast', '/insights', '/kanban', '/voice']
 }
 
 const ALL_SPECS: readonly DesktopCommandSpec[] = [

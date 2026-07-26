@@ -2560,6 +2560,12 @@ export const zhHant = defineLocale({
     desktopCommands: '桌面端指令',
     skillCommandsAvailable: count => `${count} 個技能指令可用。`,
     warningLine: message => `警告：${message}`,
+    reasoning: {
+      displaySet: value => `推理顯示已設為 ${value}`,
+      effortSet: value => `推理強度已設為 ${value}`,
+      failed: '無法更新推理設定',
+      status: (effort, display, help) => `推理強度 ${effort}、顯示 ${display} — /reasoning <${help}>`
+    },
     yoloArmed: '此聊天已啟用 YOLO',
     yoloOff: 'YOLO 已關閉',
     yoloSystem: active => `此工作階段 YOLO ${active ? '已開啟' : '已關閉'}`,

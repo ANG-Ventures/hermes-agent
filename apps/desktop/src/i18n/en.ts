@@ -2782,6 +2782,12 @@ export const en: Translations = {
     desktopCommands: 'Desktop commands',
     skillCommandsAvailable: count => `${count} skill commands available.`,
     warningLine: message => `warning: ${message}`,
+    reasoning: {
+      displaySet: value => `Reasoning display set to ${value}`,
+      effortSet: value => `Reasoning effort set to ${value}`,
+      failed: 'Could not update reasoning',
+      status: (effort, display, help) => `Reasoning effort ${effort}, display ${display} — /reasoning <${help}>`
+    },
     yoloArmed: 'YOLO armed for this chat',
     yoloOff: 'YOLO off',
     yoloSystem: active => `YOLO ${active ? 'on' : 'off'} for this session`,

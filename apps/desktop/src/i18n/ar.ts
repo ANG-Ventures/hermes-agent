@@ -2480,6 +2480,12 @@ export const ar = defineLocale({
     desktopCommands: 'أوامر سطح المكتب',
     skillCommandsAvailable: count => `${count} أمر مهارة متاح`,
     warningLine: message => `تحذير: ${message}`,
+    reasoning: {
+      displaySet: value => `تم ضبط عرض التفكير على ${value}`,
+      effortSet: value => `تم ضبط مستوى التفكير على ${value}`,
+      failed: 'تعذر تحديث التفكير',
+      status: (effort, display, help) => `مستوى التفكير ${effort}، العرض ${display} — /reasoning <${help}>`
+    },
     yoloArmed: 'YOLO مفعل',
     yoloOff: 'YOLO معطل',
     yoloSystem: active => (active ? 'YOLO مفعل للنظام' : 'YOLO معطل للنظام'),

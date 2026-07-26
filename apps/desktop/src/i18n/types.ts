@@ -2346,6 +2346,12 @@ export interface Translations {
     desktopCommands: string
     skillCommandsAvailable: (count: number) => string
     warningLine: (message: string) => string
+    reasoning: {
+      displaySet: (value: string) => string
+      effortSet: (value: string) => string
+      failed: string
+      status: (effort: string, display: string, help: string) => string
+    }
     yoloArmed: string
     yoloOff: string
     yoloSystem: (active: boolean) => string
