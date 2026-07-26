@@ -1466,7 +1466,38 @@ _SENSITIVE_BARE_FILE_NAMES = frozenset({
 })
 _SENSITIVE_BARE_FILE_SUFFIXES = (".pem", ".key", ".p12", ".pfx")
 _SENSITIVE_BARE_FILE_PREFIXES = ("id_rsa", "id_ed25519", ".env")
-_SENSITIVE_BARE_FILE_SUBSTRINGS = ("secret", "credential", "token", "password")
+# Sensitive *words* are matched as whole filename components (split on dots,
+# dashes, underscores and spaces), never as bare substrings, and only on
+# extensions that can plausibly HOLD a credential. A raw substring test rejects
+# legitimate artifacts whose names merely contain one of these words --
+# ``tokenization.json``, ``tokenizer.json`` -- and applying it to binary render
+# formats rejects ``token_counts.png`` / ``secret-santa.pdf``, which are charts
+# and documents, not credential stores.
+_SENSITIVE_BARE_FILE_WORDS = frozenset({
+    "secret", "secrets",
+    "credential", "credentials",
+    "token", "tokens",
+    "password", "passwords",
+})
+
+# Extensions the word heuristic applies to: text/config formats that can
+# actually contain a secret. Binary render/artifact formats (images, video,
+# audio, pdf, office, archives) are exempt -- a chart named
+# ``token_counts.png`` is not a credential. Name-, prefix- and suffix-based
+# rules (``.env*``, ``id_rsa*``, ``*.pem``, ``*.key``, ``.hermes/``) are NOT
+# scoped this way and still apply to every extension.
+_SENSITIVE_WORD_SCOPED_EXTS = frozenset({
+    ".json", ".txt", ".yaml", ".yml", ".xml", ".toml", ".ini", ".conf",
+    ".cfg", ".csv", ".tsv", ".log", ".md", ".env", ".properties", ".sh",
+})
+
+# Filename component separators: dots, dashes, underscores and spaces.
+_FILENAME_COMPONENT_RE = re.compile(r"[.\-_ ]+")
+
+
+def _sensitive_name_components(name: str) -> set:
+    """Split a filename into lowercase word components for exact matching."""
+    return {part for part in _FILENAME_COMPONENT_RE.split(name) if part}
 
 
 def _is_sensitive_bare_local_file_path(path: str) -> bool:
@@ -1488,7 +1519,11 @@ def _is_sensitive_bare_local_file_path(path: str) -> bool:
         return True
     if name.startswith(_SENSITIVE_BARE_FILE_PREFIXES):
         return True
-    return any(marker in name for marker in _SENSITIVE_BARE_FILE_SUBSTRINGS)
+    _, _, ext = name.rpartition(".")
+    if ext and f".{ext}" not in _SENSITIVE_WORD_SCOPED_EXTS:
+        # Binary render/artifact format -- word heuristic does not apply.
+        return False
+    return bool(_sensitive_name_components(name) & _SENSITIVE_BARE_FILE_WORDS)
 
 # Regex alternation fragment of bare extensions (no leading dot), e.g.
 # ``png|jpe?g|...``. ``jpe?g`` collapses jpg/jpeg into one branch. Sorted
