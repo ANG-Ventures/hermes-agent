@@ -1671,6 +1671,12 @@ def _submit_prompt_to_compute_host(rid: str, sid: str, session: dict, text: Any)
         _compute_host_inflight_turns[sid] = dict(frame)
 
     def _complete(done: dict) -> None:
+        # submit_turn reports a synchronous pipe failure through the callback
+        # before re-raising. Leave the parent session untouched so prompt.submit
+        # can fail open to the historical in-process path without emitting a
+        # duplicate terminal error.
+        if done.get("reason") == "send_failed":
+            return
         _on_compute_host_turn_done(rid, sid, session, done)
 
     try:
@@ -1695,6 +1701,7 @@ def _send_compute_host_control(
     command: str = "",
     payload: dict | None = None,
     wait: bool = True,
+    timeout: float = 30.0,
 ) -> dict:
     frame = dict(payload or {})
     frame.setdefault("type", "control")
@@ -1704,6 +1711,7 @@ def _send_compute_host_control(
         route_name=route_name,
         payload=frame,
         wait=wait,
+        timeout=timeout,
     )
 
 
