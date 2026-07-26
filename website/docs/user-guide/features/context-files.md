@@ -121,7 +121,7 @@ In addition to the cwd-based `AGENTS.md` (project context), Hermes also loads an
 
 **Why both?**
 
-- **`HERMES_HOME/AGENTS.md`** = baseline policy that follows you everywhere (CLI sessions, Telegram/Discord gateway, cron jobs, subagents, any cwd).
+- **`HERMES_HOME/AGENTS.md`** = baseline policy that follows you everywhere the project-context builder runs — CLI, TUI, desktop, and the Telegram/Discord/Slack gateway — regardless of cwd.
 - **cwd `AGENTS.md`** = project-specific context (architecture, conventions, repo-local quirks). Loaded when you run Hermes inside that project.
 
 When both exist they coexist: home AGENTS.md is appended **first**, then the cwd project context is appended after, so the project file can override or extend home rules. The cwd-based progressive subdirectory discovery still works for the project tree.
@@ -132,6 +132,14 @@ When both exist they coexist: home AGENTS.md is appended **first**, then the cwd
 - **AGENTS.md** → workflow rules, policies, procedures (*how* the agent operates)
 
 If you find yourself writing imperative procedural rules in SOUL.md, move them to `~/.hermes/AGENTS.md` to keep identity and policy cleanly separated.
+
+:::caution Not loaded for subagents or workdir-less cron jobs
+Delegated subagents run with `skip_context_files=True` (`tools/delegate_tool.py`), and
+cron jobs configured without a `workdir` do the same (`cron/scheduler.py`), which makes
+`agent/system_prompt.py` skip the context-file builder entirely. Neither surface receives
+`HERMES_HOME/AGENTS.md`. Use `SOUL.md` for policy that must reach a subagent, or give the
+cron job an explicit `workdir`.
+:::
 
 ## .cursorrules
 

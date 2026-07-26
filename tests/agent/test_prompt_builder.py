@@ -5,6 +5,7 @@ import importlib
 import logging
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -599,6 +600,118 @@ class TestBuildContextFilesPrompt:
         )
         result = build_context_files_prompt(cwd=str(tmp_path))
         assert "BLOCKED" in result
+
+    # --- cwd == HERMES_HOME dedupe (reported in production by
+    # --- @birkschmithuesen on #23331) ---
+
+    def test_home_agents_md_injected_once_when_cwd_is_hermes_home(
+        self, tmp_path, monkeypatch
+    ):
+        """cwd == HERMES_HOME must not double-inject the same AGENTS.md.
+
+        The local CLI backend leaves TERMINAL_CWD unset, so
+        resolve_context_cwd() returns None and build_context_files_prompt
+        falls back to os.getcwd(). A user launching the CLI from their
+        HERMES_HOME therefore hits this path.
+        """
+        hermes_home = tmp_path / "hermes_home"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        (hermes_home / "AGENTS.md").write_text(
+            "HOME_POLICY_MARKER", encoding="utf-8"
+        )
+        result = build_context_files_prompt(cwd=str(hermes_home))
+        assert result.count("HOME_POLICY_MARKER") == 1
+
+    def test_cwd_is_hermes_home_does_not_fall_through_to_claude_md(
+        self, tmp_path, monkeypatch
+    ):
+        """Skipping only _load_agents_md would inject CLAUDE.md instead.
+
+        Before this feature existed, a HERMES_HOME AGENTS.md won the cwd
+        or-chain and CLAUDE.md never loaded. De-duplicating by skipping just
+        the AGENTS.md rung would let the chain fall through and inject a file
+        that previously did not load — a behaviour change, not a fix.
+        """
+        hermes_home = tmp_path / "hermes_home"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        (hermes_home / "AGENTS.md").write_text(
+            "HOME_POLICY_MARKER", encoding="utf-8"
+        )
+        (hermes_home / "CLAUDE.md").write_text(
+            "CLAUDE_MARKER", encoding="utf-8"
+        )
+        result = build_context_files_prompt(cwd=str(hermes_home))
+        assert result.count("HOME_POLICY_MARKER") == 1
+        assert "CLAUDE_MARKER" not in result
+
+    def test_cwd_chain_still_runs_when_no_home_agents_md(
+        self, tmp_path, monkeypatch
+    ):
+        """With no home AGENTS.md there is nothing to dedupe: chain runs."""
+        hermes_home = tmp_path / "hermes_home"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        (hermes_home / "CLAUDE.md").write_text(
+            "CLAUDE_MARKER", encoding="utf-8"
+        )
+        result = build_context_files_prompt(cwd=str(hermes_home))
+        assert "CLAUDE_MARKER" in result
+
+    def test_cwd_is_hermes_home_still_loads_hermes_md(
+        self, tmp_path, monkeypatch
+    ):
+        """.hermes.md OUTRANKS AGENTS.md, so the dedupe must not drop it.
+
+        Blanking the whole cwd chain would silently stop loading a
+        HERMES.md that loaded at this cwd before the feature existed.
+        """
+        hermes_home = tmp_path / "hermes_home"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        (hermes_home / "AGENTS.md").write_text(
+            "HOME_POLICY_MARKER", encoding="utf-8"
+        )
+        (hermes_home / "HERMES.md").write_text(
+            "HERMES_MD_MARKER", encoding="utf-8"
+        )
+        result = build_context_files_prompt(cwd=str(hermes_home))
+        assert result.count("HOME_POLICY_MARKER") == 1
+        assert "HERMES_MD_MARKER" in result
+
+    def test_dedupe_survives_non_identical_path_spelling(
+        self, tmp_path, monkeypatch
+    ):
+        """The identity check must not rely on resolved-string equality.
+
+        ``Path.resolve()`` resolves symlinks but does NOT normalise case, so
+        on a case-insensitive volume (the macOS/Windows default) the very same
+        directory can be reached by a path whose resolved string compares
+        unequal to HERMES_HOME. A plain ``==`` then misses the match and the
+        home AGENTS.md is injected twice — the duplication this guard exists
+        to prevent. ``os.path.samefile`` compares st_dev/st_ino and catches it.
+        The macOS firmlink case (``/tmp`` vs ``/private/tmp``) behaves the same
+        way; case is simply the portable way to reproduce it.
+        """
+        hermes_home = tmp_path / "HermesHomeCase"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        (hermes_home / "AGENTS.md").write_text(
+            "HOME_POLICY_MARKER", encoding="utf-8"
+        )
+
+        alias = tmp_path / "hermeshomecase"
+        if not alias.is_dir():
+            pytest.skip("case-sensitive filesystem: variant path is not the same dir")
+
+        # Preconditions: same inode, but resolved strings differ — without the
+        # samefile fallback this test would be vacuous.
+        assert os.path.samefile(str(alias), str(hermes_home))
+        assert Path(alias).resolve() != Path(hermes_home).resolve()
+
+        result = build_context_files_prompt(cwd=str(alias))
+        assert result.count("HOME_POLICY_MARKER") == 1
 
     def test_home_agents_md_loaded_with_soul_md(self, tmp_path, monkeypatch):
         """Both SOUL.md and AGENTS.md from HERMES_HOME load together."""

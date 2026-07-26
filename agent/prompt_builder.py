@@ -2370,13 +2370,42 @@ def build_context_files_prompt(
         )
         project_context = ""
     else:
-        # Priority-based project context: first match wins
-        project_context = (
-            _load_hermes_md(cwd_path, context_length)
-            or _load_agents_md(cwd_path, context_length)
-            or _load_claude_md(cwd_path, context_length)
-            or _load_cursorrules(cwd_path, context_length)
-        )
+        # When cwd IS HERMES_HOME and the home AGENTS.md was already injected
+        # above, the cwd chain would re-inject that same file (double-injection,
+        # reported in production by @birkschmithuesen on #23331 — ~20k chars
+        # duplicated). Skipping only ``_load_agents_md`` is NOT sufficient: the
+        # or-chain then falls through to ``_load_claude_md`` and injects a
+        # CLAUDE.md that would never have loaded before this feature, because
+        # AGENTS.md used to win the chain. So we terminate the chain at the
+        # AGENTS.md rung instead of merely skipping it.
+        #
+        # ``.hermes.md``/``HERMES.md`` still runs: it OUTRANKS AGENTS.md, it is
+        # a different file (no duplication), and it loaded at this cwd before
+        # the feature existed. Blanking the whole chain would silently drop it.
+        #
+        # Identity is checked by path equality first, then ``os.path.samefile``
+        # as a fallback: a plain ``==`` compares resolved strings and misses
+        # the same directory reached via a macOS firmlink or spelled with
+        # different case on a case-insensitive volume, which would re-introduce
+        # the duplication this guard exists to prevent.
+        cwd_is_hermes_home = False
+        if home_agents:
+            try:
+                home_path = get_hermes_home().resolve()
+                cwd_is_hermes_home = cwd_path == home_path or os.path.samefile(
+                    cwd_path, home_path
+                )
+            except (OSError, ValueError):
+                cwd_is_hermes_home = False
+
+        project_context = _load_hermes_md(cwd_path, context_length)
+        if not project_context and not cwd_is_hermes_home:
+            # Priority-based project context: first match wins
+            project_context = (
+                _load_agents_md(cwd_path, context_length)
+                or _load_claude_md(cwd_path, context_length)
+                or _load_cursorrules(cwd_path, context_length)
+            )
     if project_context:
         sections.append(project_context)
 
