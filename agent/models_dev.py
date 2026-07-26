@@ -393,6 +393,75 @@ def _extract_context(entry: Dict[str, Any]) -> Optional[int]:
     return None
 
 
+def _extract_cost(entry: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    """Extract the per-million-token USD cost block from a models.dev entry.
+
+    models.dev publishes cost already in per-million-token USD (unlike the
+    OpenRouter models API, which is per-token), shaped as::
+
+        {"input": 5, "output": 25, "cache_read": 0.5, "cache_write": 6.25}
+
+    Only the flat base-tier rates are read. Entries may also carry a ``tiers``
+    / ``context_over_200k`` block for long-context surcharges; those are
+    deliberately ignored so this returns the same flat shape the curated
+    snapshot uses.
+
+    Returns a dict holding only the keys actually present, or None when the
+    entry publishes neither an input nor an output rate (unpriced model).
+    """
+    if not isinstance(entry, dict):
+        return None
+    cost = entry.get("cost")
+    if not isinstance(cost, dict):
+        return None
+
+    def _num(key: str) -> Optional[float]:
+        value = cost.get(key)
+        # bool is an int subclass — reject it explicitly.
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)) and value >= 0:
+            return float(value)
+        return None
+
+    input_cost = _num("input")
+    output_cost = _num("output")
+    if input_cost is None and output_cost is None:
+        return None
+
+    result: Dict[str, float] = {}
+    if input_cost is not None:
+        result["input"] = input_cost
+    if output_cost is not None:
+        result["output"] = output_cost
+    cache_read = _num("cache_read")
+    if cache_read is not None:
+        result["cache_read"] = cache_read
+    cache_write = _num("cache_write")
+    if cache_write is not None:
+        result["cache_write"] = cache_write
+    return result
+
+
+def lookup_models_dev_pricing(provider: str, model: str) -> Optional[Dict[str, float]]:
+    """Look up per-million USD pricing for a provider+model in models.dev.
+
+    Cost-dimension twin of :func:`lookup_models_dev_context`. Resolution is
+    provider-scoped on purpose: a provider absent from
+    ``PROVIDER_TO_MODELS_DEV`` (``custom``, ``local``, ``unknown``) yields
+    None rather than falling back to a cross-provider id scan, so a
+    self-hosted model that happens to share an id with a hosted one is never
+    billed at the hosted vendor's rate.
+    """
+    models = _get_provider_models(provider)
+    if models is None:
+        return None
+    entry = _find_model_entry(models, model)
+    if entry is None:
+        return None
+    return _extract_cost(entry)
+
+
 # ---------------------------------------------------------------------------
 # Model capability metadata
 # ---------------------------------------------------------------------------

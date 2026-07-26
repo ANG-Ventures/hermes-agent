@@ -1030,6 +1030,108 @@ def _openrouter_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
     )
 
 
+# --- External (dynamic-catalog) pricing sources ------------------------------
+#
+# The curated ``_OFFICIAL_DOCS_PRICING`` snapshot above is hand-maintained, so
+# every newly launched model records unpriced turns until someone edits the
+# table. An external catalog closes that window automatically. Which catalog
+# is used is configurable (``config.yaml`` -> ``pricing.external_source``),
+# defaulting to models.dev — the git-backed registry that already powers this
+# repo's context-window and capability resolution and publishes per-million
+# cost including cache tiers.
+#
+# The curated snapshot ALWAYS wins over any external source (see
+# ``get_pricing_entry``): it encodes deliberate corrections a live catalog
+# can't know, most importantly standing list price rather than a temporary
+# launch-intro rate.
+
+_VALID_PRICING_SOURCES = ("models_dev", "openrouter")
+_DEFAULT_PRICING_SOURCE = "models_dev"
+
+
+def _pricing_source_order() -> tuple[str, ...]:
+    """Resolve the external pricing-source preference order from config.yaml.
+
+    Reads ``pricing.external_source`` (default ``models_dev``). Returns the
+    configured primary first, then the remaining valid source(s) as automatic
+    fallback so a model missing from the primary catalog still resolves. An
+    unrecognized or missing value degrades to the default order — pricing
+    resolution must never raise into a turn.
+    """
+    primary = _DEFAULT_PRICING_SOURCE
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        pricing_cfg = (load_config_readonly() or {}).get("pricing")
+        if isinstance(pricing_cfg, dict):
+            candidate = pricing_cfg.get("external_source")
+            if isinstance(candidate, str):
+                candidate = candidate.strip().lower()
+                if candidate in _VALID_PRICING_SOURCES:
+                    primary = candidate
+    except Exception:
+        primary = _DEFAULT_PRICING_SOURCE
+    return (primary, *[s for s in _VALID_PRICING_SOURCES if s != primary])
+
+
+def _models_dev_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
+    """Build a :class:`PricingEntry` from the models.dev registry cost block.
+
+    models.dev stores cost already in per-million USD, so — unlike the
+    OpenRouter path — no per-token conversion is applied. Lookup is
+    provider-scoped (see ``agent.models_dev.lookup_models_dev_pricing``), so an
+    unmapped provider resolves to None instead of guessing a vendor rate.
+    """
+    from agent.models_dev import lookup_models_dev_pricing
+
+    cost = lookup_models_dev_pricing(route.provider, route.model)
+    if not cost:
+        return None
+    input_cost = _to_decimal(cost.get("input"))
+    output_cost = _to_decimal(cost.get("output"))
+    if input_cost is None and output_cost is None:
+        return None
+    return PricingEntry(
+        input_cost_per_million=input_cost,
+        output_cost_per_million=output_cost,
+        cache_read_cost_per_million=_to_decimal(cost.get("cache_read")),
+        cache_write_cost_per_million=_to_decimal(cost.get("cache_write")),
+        request_cost=None,
+        source="provider_models_api",
+        source_url="https://models.dev/api.json",
+        pricing_version="models-dev-api",
+        fetched_at=_UTC_NOW(),
+    )
+
+
+# Dispatch table: pricing-source name -> entry builder.
+_PRICING_SOURCE_BUILDERS = {
+    "models_dev": _models_dev_pricing_entry,
+    "openrouter": _openrouter_pricing_entry,
+}
+
+
+def _external_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
+    """Price a route from the configured external catalog(s).
+
+    Tries the config-selected primary source (default models.dev), then the
+    other valid source as fallback. Never raises: a catalog fetch failure
+    degrades to the next source and finally to None (unpriced), exactly as
+    before this indirection existed.
+    """
+    for source in _pricing_source_order():
+        builder = _PRICING_SOURCE_BUILDERS.get(source)
+        if builder is None:
+            continue
+        try:
+            entry = builder(route)
+        except Exception:
+            entry = None
+        if entry is not None:
+            return entry
+    return None
+
+
 def _pricing_entry_from_metadata(
     metadata: Dict[str, Dict[str, Any]],
     model_id: str,
@@ -1091,7 +1193,10 @@ def get_pricing_entry(
             pricing_version="included-route",
         )
     if route.provider == "openrouter":
-        return _openrouter_pricing_entry(route)
+        # OpenRouter's own models API is the billing vendor's rate card for
+        # this route, so it stays primary; the configured external catalog is
+        # consulted only when OpenRouter has no entry for the id.
+        return _openrouter_pricing_entry(route) or _external_pricing_entry(route)
     if route.base_url:
         entry = _pricing_entry_from_metadata(
             fetch_endpoint_model_metadata(route.base_url, api_key=api_key or ""),
@@ -1101,7 +1206,12 @@ def get_pricing_entry(
         )
         if entry:
             return entry
-    return _lookup_official_docs_pricing(route)
+    # The curated snapshot wins whenever it has the model: it encodes
+    # deliberate corrections a live catalog can't know. Only on a miss — a
+    # model launched since the snapshot was last hand-edited — do we consult
+    # the configured external catalog, so a new model records real cost
+    # instead of "n/a" until someone updates the table.
+    return _lookup_official_docs_pricing(route) or _external_pricing_entry(route)
 
 
 def normalize_usage(
