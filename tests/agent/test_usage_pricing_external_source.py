@@ -442,3 +442,141 @@ def test_selecting_openrouter_makes_it_the_primary_for_a_snapshot_miss(
     assert entry is not None
     assert entry.pricing_version == "openrouter-models-api"
     assert entry.input_cost_per_million == Decimal("3.000000")
+
+
+# ---------------------------------------------------------------------------
+# Provider scoping of the external catalogs (the billing-vendor guarantee)
+# ---------------------------------------------------------------------------
+#
+# ``lookup_models_dev_pricing`` documents that a self-hosted model sharing an
+# id with a hosted one is never billed at the hosted vendor's rate. The
+# OpenRouter catalog resolves by BARE MODEL ID with no provider scoping, so
+# that guarantee only holds if unidentified-vendor routes refuse every
+# external catalog. These tests pin exactly that.
+
+
+@pytest.fixture
+def openrouter_catalog_knows_glm5(monkeypatch):
+    """OpenRouter publishes a hosted 'glm-5' at $0.95/M input."""
+    monkeypatch.setattr(
+        usage_pricing,
+        "fetch_model_metadata",
+        lambda: {
+            "glm-5": {"pricing": {"prompt": "0.00000095", "completion": "0.0000038"}}
+        },
+    )
+    # raising=False so this fixture also applies against a tree where the
+    # cache-only accessor does not exist yet — that keeps the RED proof
+    # behavioural (a wrong PRICE) instead of a fixture-setup error.
+    monkeypatch.setattr(
+        usage_pricing,
+        "cached_model_metadata",
+        lambda: {
+            "glm-5": {"pricing": {"prompt": "0.00000095", "completion": "0.0000038"}}
+        },
+        raising=False,
+    )
+
+
+@pytest.mark.parametrize("provider", [None, "unknown", "custom", "local"])
+def test_an_unidentified_billing_vendor_is_never_priced_from_a_hosted_catalog(
+    provider, seeded_models_dev, default_source_order, openrouter_catalog_knows_glm5
+):
+    """The core guarantee: no identified vendor => no external catalog at all.
+
+    A self-hosted 'glm-5' must not be billed at OpenRouter's hosted rate just
+    because the id collides. Unpriced is the correct answer — a wrong price is
+    silently attributed to the user's spend, while 'n/a' is visible.
+    """
+    route = usage_pricing.resolve_billing_route("glm-5", provider=provider)
+    assert route.billing_mode == "unknown", "precondition: vendor unidentified"
+
+    assert usage_pricing._external_pricing_entry(route) is None
+    assert get_pricing_entry("glm-5", provider=provider) is None
+    assert usage_pricing.has_known_pricing("glm-5", provider) is False
+
+
+def test_the_bare_id_scan_still_finds_the_model_it_is_refused_for(
+    openrouter_catalog_knows_glm5,
+):
+    """Control: the refusal is the guard, not an empty catalog.
+
+    Without this, the test above would pass vacuously if the OpenRouter stub
+    simply had no 'glm-5'.
+    """
+    route = usage_pricing.resolve_billing_route("glm-5", provider="unknown")
+    entry = usage_pricing._openrouter_pricing_entry(route)
+
+    assert entry is not None, "the bare-id scan does match; the guard is what refuses"
+    assert entry.input_cost_per_million == Decimal("0.950000")
+
+
+def test_an_identified_vendor_still_reaches_the_external_catalog(
+    seeded_models_dev, default_source_order
+):
+    """The guard must not disable the feature for legitimate routes."""
+    seeded_models_dev(
+        {"anthropic": {"models": {"claude-brand-new-1": {"cost": {"input": 3, "output": 15}}}}}
+    )
+    entry = get_pricing_entry("claude-brand-new-1", provider="anthropic")
+
+    assert entry is not None
+    assert entry.input_cost_per_million == Decimal("3")
+
+
+def test_openrouter_routes_keep_their_own_bare_id_lookup(openrouter_catalog_knows_glm5):
+    """On an OpenRouter route the flat id space IS the correct namespace."""
+    entry = get_pricing_entry("glm-5", provider="openrouter")
+
+    assert entry is not None
+    assert entry.input_cost_per_million == Decimal("0.950000")
+
+
+# ---------------------------------------------------------------------------
+# has_known_pricing is a pure predicate — no network from a display loop
+# ---------------------------------------------------------------------------
+
+
+def test_has_known_pricing_makes_no_outbound_connection(monkeypatch):
+    """It runs per-row in display loops; a blocking fetch there is a defect."""
+    import socket
+
+    import agent.model_metadata as model_metadata
+    import agent.models_dev as models_dev
+
+    # Cold caches, so only a network call could produce an answer.
+    monkeypatch.setattr(model_metadata, "_model_metadata_cache", {})
+    monkeypatch.setattr(model_metadata, "_model_metadata_cache_time", 0)
+    monkeypatch.setattr(model_metadata, "_load_model_metadata_disk_cache", dict)
+    monkeypatch.setattr(model_metadata, "_model_metadata_disk_cache_age_seconds", lambda: None)
+    monkeypatch.setattr(models_dev, "_models_dev_cache", {})
+    monkeypatch.setattr(models_dev, "_models_dev_cache_time", 0)
+    monkeypatch.setattr(models_dev, "_load_disk_cache", dict)
+
+    attempts = []
+
+    def _refuse(self, address):
+        attempts.append(address)
+        raise AssertionError(f"has_known_pricing opened a connection to {address}")
+
+    monkeypatch.setattr(socket.socket, "connect", _refuse)
+
+    for model, provider in [
+        ("glm-5", None),
+        ("gpt-4o", "openai"),
+        ("some-model", "openrouter"),
+        ("another", "anthropic"),
+    ]:
+        usage_pricing.has_known_pricing(model, provider)
+
+    assert attempts == []
+
+
+def test_has_known_pricing_still_answers_true_from_a_warm_cache(
+    seeded_models_dev, default_source_order
+):
+    """Cache-only must not mean always-False for catalog-priced models."""
+    seeded_models_dev(
+        {"anthropic": {"models": {"claude-cached-1": {"cost": {"input": 3, "output": 15}}}}}
+    )
+    assert usage_pricing.has_known_pricing("claude-cached-1", "anthropic") is True
