@@ -189,6 +189,7 @@ def test_gateway_run_agent_codex_path_handles_internal_401_refresh(monkeypatch):
     assert result["final_response"] == "Recovered via refresh"
     assert _Codex401ThenSuccessAgent.refresh_attempts == 1
     assert _Codex401ThenSuccessAgent.last_init["provider"] == "openai-codex"
+    assert _Codex401ThenSuccessAgent.last_init["api_mode"] == "codex_responses"
 
 
 class _RetryCaptureAgent(run_agent.AIAgent):
