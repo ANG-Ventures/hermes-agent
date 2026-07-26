@@ -1308,7 +1308,11 @@ class TestConvertMessages:
         _, result = convert_messages_to_anthropic(messages)
         assert result[0]["role"] == "user"
         assert isinstance(result[0]["content"], list)
-        assert result[0]["content"] == [{"type": "text", "text": "(empty message)"}]
+        # Contract: exactly one non-whitespace placeholder text block (the
+        # literal wording is unimportant; blank text 400s the request).
+        assert len(result[0]["content"]) == 1
+        blk = result[0]["content"][0]
+        assert blk["type"] == "text" and blk["text"].strip() != ""
 
     def test_leading_assistant_after_compaction_gets_user_turn_prepended(self):
         """The adapter backstops compactors that emit a leading assistant summary."""

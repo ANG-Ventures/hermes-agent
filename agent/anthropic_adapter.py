@@ -1847,8 +1847,23 @@ def _convert_content_to_anthropic(content: Any) -> Any:
     converted = []
     for part in content:
         block = _convert_content_part_to_anthropic(part)
-        if block is not None:
-            converted.append(block)
+        if block is None:
+            continue
+        # Drop whitespace-only text blocks: the Messages input schema rejects
+        # them ("text content blocks must contain non-whitespace text"), and
+        # ONE blank block anywhere 400s the whole request (2026-07-25
+        # incident class). Other block types pass through untouched.
+        if (
+            block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+            and block["text"].strip() == ""
+        ):
+            continue
+        converted.append(block)
+    if not converted and content:
+        # Every part was blank/dropped — emit a placeholder rather than an
+        # empty content array (also rejected by the input schema).
+        converted = [{"type": "text", "text": _EMPTY_TEXT_PLACEHOLDER}]
     return converted
 
 
