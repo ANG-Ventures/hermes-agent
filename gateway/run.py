@@ -14180,6 +14180,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
+                    # Session-scoped /reasoning wins over config; resolve it
+                    # here so the footer reports what the session actually ran.
+                    reasoning_config=self._resolve_session_reasoning_config(
+                        source=source, model=agent_result.get("model") or ""
+                    ),
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)

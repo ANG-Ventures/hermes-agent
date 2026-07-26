@@ -346,7 +346,7 @@ def test_resolve_defaults_off_empty_config():
     cfg = resolve_footer_config({}, "telegram")
     assert cfg == {
         "enabled": False,
-        "fields": ["provider_model", "context_full", "reasoning", "cwd"],
+        "fields": ["model", "context_pct", "cwd"],
     }
 
 
@@ -354,7 +354,7 @@ def test_resolve_global_enable():
     user = {"display": {"runtime_footer": {"enabled": True}}}
     cfg = resolve_footer_config(user, "telegram")
     assert cfg["enabled"] is True
-    assert cfg["fields"] == ["provider_model", "context_full", "reasoning", "cwd"]
+    assert cfg["fields"] == ["model", "context_pct", "cwd"]
 
 
 def test_resolve_platform_override_wins():
@@ -383,7 +383,7 @@ def test_resolve_platform_can_add_fields_only():
     }
     tg = resolve_footer_config(user, "telegram")
     assert tg["enabled"] is True
-    assert tg["fields"] == ["provider_model", "context_full", "reasoning", "cwd"]
+    assert tg["fields"] == ["model", "context_pct", "cwd"]
     dc = resolve_footer_config(user, "discord")
     assert dc["enabled"] is True
     assert dc["fields"] == ["context_pct"]
@@ -454,3 +454,148 @@ def test_build_footer_no_data_returns_empty_even_when_enabled():
     # With no TERMINAL_CWD env either
     if not os.environ.get("TERMINAL_CWD"):
         assert out == ""
+
+
+# ---------------------------------------------------------------------------
+# Byte-stability: the DEFAULT footer must render identically to pre-change main
+#
+# The three fields added here (provider_model, context_full, reasoning) are
+# opt-in — they are NOT in _DEFAULT_FIELDS.  A user who never touches
+# `display.runtime_footer.fields` must see the exact same bytes as before, so
+# no long-lived conversation's rendered text shifts under them.
+# ---------------------------------------------------------------------------
+
+# Frozen expectations captured from the pre-change implementation.
+_LEGACY_DEFAULT_FIELDS = ["model", "context_pct", "cwd"]
+
+
+def test_default_fields_unchanged():
+    """The default field set is exactly the pre-change one."""
+    from gateway.runtime_footer import _DEFAULT_FIELDS
+
+    assert list(_DEFAULT_FIELDS) == _LEGACY_DEFAULT_FIELDS
+
+
+def test_resolve_footer_config_default_fields_unchanged():
+    """An untouched config still resolves to the legacy default field set."""
+    assert resolve_footer_config({}, "telegram")["fields"] == _LEGACY_DEFAULT_FIELDS
+    assert resolve_footer_config(
+        {"display": {"runtime_footer": {"enabled": True}}}, "discord"
+    )["fields"] == _LEGACY_DEFAULT_FIELDS
+
+
+@pytest.mark.parametrize(
+    "model,tokens,window,cwd,expected",
+    [
+        ("openai/gpt-5.4", 50_247, 1_000_000, "/var/data", "gpt-5.4 · 5% · /var/data"),
+        ("claude-opus-4-8", 68_000, 100_000, "/var/data", "claude-opus-4-8 · 68% · /var/data"),
+        ("m", 0, None, "/var/data", "m · /var/data"),
+        ("", 10, 100, "/var/data", "10% · /var/data"),
+        ("m", 10, 100, "", "m · 10%"),
+    ],
+)
+def test_default_footer_renders_byte_identically(
+    monkeypatch, model, tokens, window, cwd, expected
+):
+    """Default-config footer output is byte-for-byte the pre-change string.
+
+    These expectations were produced by the implementation BEFORE the
+    provider_model/context_full/reasoning fields existed.  If any of them
+    shifts, an existing user's footer text changed — which this PR promises
+    it does not.
+    """
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    out = format_runtime_footer(
+        model=model,
+        context_tokens=tokens,
+        context_length=window,
+        cwd=cwd,
+        # NOTE: fields deliberately NOT passed — exercises the default.
+    )
+    assert out == expected
+
+
+def test_default_build_footer_line_ignores_new_data(monkeypatch):
+    """Supplying provider/reasoning changes nothing under the default fields."""
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    user = {
+        "display": {"runtime_footer": {"enabled": True}},
+        "agent": {"reasoning_effort": "xhigh"},
+    }
+    common = dict(
+        user_config=user,
+        platform_key="discord",
+        model="openai/gpt-5.4",
+        context_tokens=50_247,
+        context_length=1_000_000,
+        cwd="/var/data",
+    )
+    baseline = build_footer_line(**common)
+    enriched = build_footer_line(
+        **common, provider="claude-bridge-f3", reasoning="xhigh"
+    )
+    assert baseline == "gpt-5.4 · 5% · /var/data"
+    assert enriched == baseline
+
+
+# ---------------------------------------------------------------------------
+# reasoning — session-scoped override (review follow-up)
+# ---------------------------------------------------------------------------
+
+def test_reasoning_uses_caller_session_resolved_config():
+    """A session-scoped /reasoning override wins over the global config value.
+
+    gateway/run.py resolves the session's effective reasoning config and hands
+    it to build_footer_line; the footer must report THAT, not the stale global.
+    """
+    out = build_footer_line(
+        user_config={
+            "display": {"runtime_footer": {"enabled": True, "fields": ["reasoning"]}},
+            "agent": {"reasoning_effort": "low"},  # global says low
+        },
+        platform_key="discord",
+        model="claude-opus-4-8",
+        context_tokens=0, context_length=None,
+        cwd="",
+        # session said xhigh
+        reasoning_config={"enabled": True, "effort": "xhigh"},
+    )
+    assert out == "r:xhigh"
+
+
+def test_reasoning_session_disabled_renders_none():
+    """A session that disabled thinking reports `r:none`, not the global level."""
+    out = build_footer_line(
+        user_config={
+            "display": {"runtime_footer": {"enabled": True, "fields": ["reasoning"]}},
+            "agent": {"reasoning_effort": "high"},
+        },
+        platform_key="discord",
+        model="m",
+        context_tokens=0, context_length=None,
+        cwd="",
+        reasoning_config={"enabled": False},
+    )
+    assert out == "r:none"
+
+
+def test_reasoning_honors_per_model_override():
+    """Config resolution routes through resolve_reasoning_config.
+
+    `agent.reasoning_overrides.<model>` must beat the global effort, matching
+    what the agent itself runs.
+    """
+    out = build_footer_line(
+        user_config={
+            "display": {"runtime_footer": {"enabled": True, "fields": ["reasoning"]}},
+            "agent": {
+                "reasoning_effort": "low",
+                "reasoning_overrides": {"claude-opus-4-8": "xhigh"},
+            },
+        },
+        platform_key="discord",
+        model="claude-opus-4-8",
+        context_tokens=0, context_length=None,
+        cwd="",
+    )
+    assert out == "r:xhigh"

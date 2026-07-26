@@ -1589,21 +1589,40 @@ Tool progress requires a gateway adapter that can display progress updates safel
 
 ### Runtime-metadata footer (gateway only)
 
-When `display.runtime_footer.enabled: true`, Hermes appends a small runtime-context footer to the **final** message of each gateway turn. The current footer can show the model, context-window percentage, and current working directory. Off by default; opt in per-gateway if your team wants every reply to include this provenance.
+When `display.runtime_footer.enabled: true`, Hermes appends a small runtime-context footer to the **final** message of each gateway turn. Off by default; opt in per-gateway if your team wants every reply to include this provenance.
 
 ```yaml
 display:
   runtime_footer:
     enabled: true
-    fields: ["model", "context_pct", "cwd"]   # supported fields: model, context_pct, cwd
+    fields: ["model", "context_pct", "cwd"]   # order shown; drop any to hide
 ```
+
+Supported fields:
+
+| Field | Renders | Example |
+| --- | --- | --- |
+| `model` | Bare model id, vendor prefix dropped | `gpt-5.4` |
+| `provider_model` | `provider/model` — useful behind bridges/proxies/failover, where the same model is served by different providers | `claude-bridge-f3/claude-opus-4-8` |
+| `context_pct` | Last-call context occupancy as a percent | `5%` |
+| `context_full` | `used/window (pct)`, both humanized | `50.2k/1M (5%)` |
+| `reasoning` | Effective reasoning-effort level, `r:<level>` (honors a session-scoped `/reasoning`) | `r:xhigh` |
+| `cwd` | Home-relative working directory | `~` |
+
+The default field set is `["model", "context_pct", "cwd"]`. The other fields are opt-in — add them to `fields` to use them. Fields whose data is unavailable are skipped silently rather than rendering an empty slot.
 
 The `/footer` slash command toggles this at runtime in any session.
 
 Example footer appended to a Telegram/Discord/Slack reply:
 
 ```
-— claude-opus-4.7 · 12 tool calls · 2m 14s · $0.042
+gpt-5.4 · 5% · ~/projects/hermes
+```
+
+With `fields: [provider_model, context_full, reasoning, cwd]`:
+
+```
+claude-bridge-f3/claude-opus-4-8 · 50.2k/1M (5%) · r:xhigh · ~
 ```
 
 Only the **final** message of a turn gets the footer; interim updates stay clean.

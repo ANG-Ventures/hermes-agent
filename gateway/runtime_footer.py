@@ -1,17 +1,19 @@
 """Gateway runtime-metadata footer.
 
-Renders a compact footer showing runtime state (provider/model, context
-footprint, cwd) and appends it to the FINAL message of an agent turn when
-enabled.  Off by default to keep replies minimal.
+Renders a compact footer showing runtime state (model, context %, cwd) and
+appends it to the FINAL message of an agent turn when enabled.  Off by default
+to keep replies minimal.
 
 Config (``~/.hermes/config.yaml``)::
 
     display:
       runtime_footer:
-        enabled: true                            # off by default
-        fields: [provider_model, context_full, reasoning, cwd]   # order shown; drop any to hide
+        enabled: true                       # off by default
+        fields: [model, context_pct, cwd]   # order shown; drop any to hide
 
-Available fields:
+Available fields (the default set is unchanged — ``model``, ``context_pct``,
+``cwd`` — so an existing footer renders byte-identically; the new fields are
+opt-in via ``fields``):
     model           — bare model id, vendor prefix dropped (``claude-opus-4-8``)
     provider_model  — ``provider/model`` (``claude-bridge-f3/claude-opus-4-8``)
     context_pct     — last-call occupancy as a percent (``5%``)
@@ -36,7 +38,7 @@ from __future__ import annotations
 import os
 from typing import Any, Iterable, Optional
 
-_DEFAULT_FIELDS: tuple[str, ...] = ("provider_model", "context_full", "reasoning", "cwd")
+_DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " \u00b7 "
 
 
@@ -66,9 +68,9 @@ def _split_provider_model(
 ) -> tuple[str, str]:
     """Resolve a clean ``(provider, model)`` pair.
 
-    Mirrors the blackbox-inspect ``/context`` logic: when ``provider`` is unset
-    but ``model`` carries a ``provider/model`` prefix, split it so the footer
-    reads cleanly (``provider/model``, not ``unset/a/b``).
+    When ``provider`` is unset but ``model`` carries a ``provider/model``
+    prefix, split it so the footer reads cleanly (``provider/model``, not
+    ``unset/a/b``).
 
     When the ``model`` ALREADY carries a ``provider/`` prefix, that embedded
     prefix wins and any separately-supplied ``provider`` is ignored — this
@@ -85,11 +87,7 @@ def _split_provider_model(
 
 
 def _humanize_tok(n: Any) -> str:
-    """Token count -> compact string (``50k``, ``1.5k``, ``1M``, ``1.0M``).
-
-    Byte-identical to the blackbox-inspect plugin's ``_humanize_tok`` so the
-    footer and ``/context`` agree on formatting.
-    """
+    """Token count -> compact string (``50k``, ``1.5k``, ``1M``, ``1.0M``)."""
     try:
         n = int(n or 0)
     except (TypeError, ValueError):
@@ -192,16 +190,44 @@ def format_runtime_footer(
     return _SEP.join(parts)
 
 
-def _reasoning_from_config(user_config: dict[str, Any] | None) -> str:
-    """Read ``agent.reasoning_effort`` from the user config (the canonical source
-    `/reasoning <level>` writes to). Empty string when unset."""
+def _reasoning_label(reasoning_config: Any) -> str:
+    """Render a parsed reasoning-config dict as a footer label.
+
+    Accepts the dict shape produced by
+    :func:`hermes_constants.parse_reasoning_effort` — ``{"enabled": True,
+    "effort": "<level>"}`` or ``{"enabled": False}``.  Returns the bare level
+    (``xhigh``), ``none`` when thinking is explicitly disabled, or ``""`` when
+    unset (caller drops the field).
+    """
+    if not isinstance(reasoning_config, dict):
+        return ""
+    if not reasoning_config.get("enabled", True):
+        return "none"
+    return str(reasoning_config.get("effort", "") or "").strip()
+
+
+def _reasoning_from_config(
+    user_config: dict[str, Any] | None, model: Optional[str] = None
+) -> str:
+    """Resolve the effective reasoning level for *model* from *user_config*.
+
+    Routes through the shared chokepoint
+    :func:`hermes_constants.resolve_reasoning_config` so the footer honors
+    per-model overrides (``agent.reasoning_overrides``) and the YAML-boolean
+    "disabled" spelling exactly as the agent does, rather than re-reading
+    ``agent.reasoning_effort`` raw.
+
+    Session-scoped ``/reasoning`` overrides are resolved by the CALLER (they
+    always win) and passed to :func:`build_footer_line` as ``reasoning_config``.
+    """
     try:
-        agent_cfg = (user_config or {}).get("agent") or {}
-        if isinstance(agent_cfg, dict):
-            return str(agent_cfg.get("reasoning_effort", "") or "").strip()
+        from hermes_constants import resolve_reasoning_config
+
+        return _reasoning_label(
+            resolve_reasoning_config(user_config or {}, model or "")
+        )
     except Exception:
-        pass
-    return ""
+        return ""
 
 
 def build_footer_line(
@@ -214,20 +240,31 @@ def build_footer_line(
     cwd: Optional[str] = None,
     provider: Optional[str] = None,
     reasoning: Optional[str] = None,
+    reasoning_config: Any = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
     Returns the footer text (empty string when disabled or no data).  Callers
     append this to the final response themselves, preserving a single blank
     line of separation.
+
+    ``reasoning_config`` is the caller's ALREADY-RESOLVED reasoning config for
+    this session (gateway/run.py's ``_resolve_session_reasoning_config``, which
+    honors a session-scoped ``/reasoning <level>``).  Passing it keeps the
+    footer in step with what the session actually runs; without it the footer
+    falls back to the config-level resolution, which can be stale for a session
+    that set a session-scoped override.
     """
     cfg = resolve_footer_config(user_config, platform_key)
     if not cfg.get("enabled"):
         return ""
-    # Reasoning effort comes from config (agent.reasoning_effort); caller may
-    # override with a live value if it ever has one.
+    # Reasoning: prefer an explicit label, then the caller's session-resolved
+    # config, then config-level resolution for this model.
     if reasoning is None:
-        reasoning = _reasoning_from_config(user_config)
+        if reasoning_config is not None:
+            reasoning = _reasoning_label(reasoning_config)
+        else:
+            reasoning = _reasoning_from_config(user_config, model)
     return format_runtime_footer(
         model=model,
         context_tokens=context_tokens,
