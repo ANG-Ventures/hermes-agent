@@ -2,6 +2,7 @@ import ast
 import json
 import os
 import shutil
+import sqlite3
 import textwrap
 from pathlib import Path
 from typing import Dict
@@ -117,6 +118,16 @@ def _assert_reopened_denorm_matches_oracle(db_path: Path, expected_ids: list[str
         _assert_denorm_matches_oracle(reopened, expected_ids)
     finally:
         reopened.close()
+
+
+def _canonical_bytes(rows):
+    """Stable RPC-equivalent bytes for real-copy contract comparisons."""
+    return json.dumps(
+        rows,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
 
 
 def test_dashboard_session_list_denorm_default_is_false_config_only():
@@ -434,6 +445,198 @@ class TestGatewayFlushMaintainsEffectiveLastActive:
                 "live-gateway-new-session",
                 "older-than-live",
             ]
+        finally:
+            db.close()
+
+    @pytest.mark.parametrize("per_row_maintenance", [False, True])
+    def test_batch_flush_recomputes_compression_root_once(
+        self, tmp_path, monkeypatch, per_row_maintenance
+    ):
+        db = _make_db(tmp_path)
+        try:
+            _seed_compression_chain(db)
+            agent = self._make_agent(db, "compressed-tip")
+            if not per_row_maintenance:
+                db._execute_write(
+                    lambda conn: conn.execute(
+                        "UPDATE sessions SET effective_last_active = -1 WHERE id = ?",
+                        ("compressed-root",),
+                    )
+                )
+                # Isolate the batch-level contract in one case; the other keeps
+                # append_message's per-row maintenance enabled to prove composition.
+                monkeypatch.setattr(
+                    db,
+                    "_bump_effective_last_active_for_message",
+                    lambda *_args, **_kwargs: None,
+                )
+            recompute_calls = []
+            recompute = db.recompute_effective_last_active
+
+            def _track_recompute(session_id):
+                recompute_calls.append(session_id)
+                recompute(session_id)
+
+            monkeypatch.setattr(db, "recompute_effective_last_active", _track_recompute)
+
+            agent._flush_messages_to_session_db(
+                [
+                    {"role": "user", "content": "batch user", "timestamp": 700.0},
+                    {"role": "assistant", "content": "batch reply", "timestamp": 800.0},
+                ],
+                conversation_history=[],
+            )
+
+            assert recompute_calls == ["compressed-tip"]
+            assert db._conn is not None
+            stored_root = db._conn.execute(
+                "SELECT effective_last_active FROM sessions WHERE id = ?",
+                ("compressed-root",),
+            ).fetchone()[0]
+            assert stored_root == 800.0
+        finally:
+            db.close()
+
+    def test_batch_flush_skips_recompute_when_all_rows_are_suppressed(
+        self, tmp_path, monkeypatch
+    ):
+        db = _make_db(tmp_path)
+        try:
+            agent = self._make_agent(db, "suppressed-flush")
+            setattr(agent, "_persist_superseded", True)
+            recompute_calls = []
+            monkeypatch.setattr(
+                db,
+                "recompute_effective_last_active",
+                lambda session_id: recompute_calls.append(session_id),
+            )
+
+            agent._flush_messages_to_session_db(
+                [{"role": "assistant", "content": "late zombie reply"}],
+                conversation_history=[],
+            )
+
+            assert recompute_calls == []
+            assert db.get_messages("suppressed-flush") == []
+        finally:
+            db.close()
+
+    def test_batch_recompute_failure_does_not_mask_successful_flush(
+        self, tmp_path, monkeypatch
+    ):
+        db = _make_db(tmp_path)
+        try:
+            agent = self._make_agent(db, "recompute-failure")
+
+            def _raise_recompute(_session_id):
+                raise RuntimeError("recompute failed")
+
+            monkeypatch.setattr(
+                db,
+                "recompute_effective_last_active",
+                _raise_recompute,
+            )
+            messages = [{"role": "user", "content": "durable user turn"}]
+
+            agent._flush_messages_to_session_db(messages, conversation_history=[])
+
+            assert len(db.get_messages("recompute-failure")) == 1
+            assert agent._last_flushed_db_idx == 1
+            assert agent._flushed_db_message_ids == set()
+        finally:
+            db.close()
+
+    def test_multi_session_turn_flushes_keep_denorm_order_in_lockstep(self, tmp_path):
+        """Real agent flushes must maintain the indexed session-list ordering.
+
+        The final turn reproduces the production regression: a session created
+        today has a deliberately stale denormalized value immediately before its
+        first flush, but its newest persisted message must still put it at #1.
+        """
+        _write_dashboard_flag(True)
+        db = _make_db(tmp_path)
+        now = 1_800_000_000.0
+        started_at = {
+            "old-project": now - 3 * 86_400,
+            "recent-project": now - 3_600,
+            "side-chat": now - 2 * 86_400,
+            "today-rank-one": now - 300,
+        }
+        turns = [
+            ("old-project", now - 5_000, "old-project"),
+            ("recent-project", now - 4_000, "recent-project"),
+            ("old-project", now - 3_000, "old-project"),
+            ("side-chat", now - 3_500, "old-project"),
+            ("recent-project", now - 2_000, "recent-project"),
+            ("old-project", now - 1_500, "old-project"),
+            ("side-chat", now - 1_000, "side-chat"),
+            ("today-rank-one", now - 10, "today-rank-one"),
+        ]
+        agents = {}
+        transcripts = {}
+        turn_counts = {}
+
+        try:
+            for turn_number, (session_id, timestamp, expected_first) in enumerate(
+                turns, start=1
+            ):
+                if session_id not in agents:
+                    agents[session_id] = self._make_agent(db, session_id)
+                    agents[session_id]._ensure_db_session()
+                    transcripts[session_id] = []
+                    turn_counts[session_id] = 0
+                    _set_started_at(db, session_id, started_at[session_id])
+
+                if session_id == "today-rank-one":
+                    stale_value = now - 30 * 86_400
+                    db._execute_write(
+                        lambda conn: conn.execute(
+                            "UPDATE sessions SET effective_last_active = ? WHERE id = ?",
+                            (stale_value, session_id),
+                        )
+                    )
+                    assert db.expected_effective_last_active(session_id) == started_at[session_id]
+
+                turn_counts[session_id] += 1
+                transcript = transcripts[session_id]
+                transcript.extend(
+                    [
+                        {
+                            "role": "user",
+                            "content": f"turn {turn_number} user",
+                            "timestamp": timestamp,
+                        },
+                        {
+                            "role": "assistant",
+                            "content": f"turn {turn_number} assistant",
+                            "timestamp": timestamp + 0.5,
+                        },
+                    ]
+                )
+
+                agents[session_id]._flush_messages_to_session_db(
+                    transcript, conversation_history=[]
+                )
+
+                assert len(db.get_messages(session_id)) == 2 * turn_counts[session_id]
+                got = db.list_sessions_rich(order_by_last_active=True, limit=10)
+                oracle = db.list_sessions_rich(
+                    order_by_last_active=True,
+                    limit=10,
+                    _force_cte_oracle=True,
+                )
+                assert _normalized(got) == _normalized(oracle), f"after turn {turn_number}"
+                assert got[0]["id"] == expected_first
+
+            final_rows = db.list_sessions_rich(order_by_last_active=True, limit=10)
+            assert final_rows[0]["id"] == "today-rank-one"
+            assert final_rows[0]["last_active"] == now - 9.5
+            assert db._conn is not None
+            stored = db._conn.execute(
+                "SELECT effective_last_active FROM sessions WHERE id = ?",
+                ("today-rank-one",),
+            ).fetchone()[0]
+            assert stored == now - 9.5
         finally:
             db.close()
 
@@ -790,11 +993,13 @@ def test_real_copy_denorm_listing_matches_cte_oracle(tmp_path):
     _write_dashboard_flag(True)
     src = Path(os.environ["SESSION_LIST_REAL_COPY_DB"])
     dst = tmp_path / "real-copy-state.db"
-    shutil.copy2(src, dst)
-    for suffix in ("-wal", "-shm"):
-        sidecar = src.with_name(src.name + suffix)
-        if sidecar.exists():
-            shutil.copy2(sidecar, dst.with_name(dst.name + suffix))
+    source_conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+    destination_conn = sqlite3.connect(dst)
+    try:
+        source_conn.backup(destination_conn)
+    finally:
+        destination_conn.close()
+        source_conn.close()
 
     db = SessionDB(db_path=dst)
     try:
@@ -808,14 +1013,20 @@ def test_real_copy_denorm_listing_matches_cte_oracle(tmp_path):
         sample_id = sample[0]["id"]
         sample_source = sample[0]["source"]
         cases = [
-            {"order_by_last_active": True, "limit": 200},
-            {"order_by_last_active": True, "limit": 200, "include_archived": True},
-            {"order_by_last_active": True, "limit": 200, "id_query": sample_id},
-            {"order_by_last_active": True, "limit": 200, "source": sample_source},
+            {"order_by_last_active": True, "limit": 400},
+            {"order_by_last_active": True, "limit": 400, "include_archived": True},
+            {"order_by_last_active": True, "limit": 400, "archived_only": True},
+            {"order_by_last_active": True, "limit": 400, "id_query": sample_id},
+            {"order_by_last_active": True, "limit": 400, "source": sample_source},
+            {
+                "order_by_last_active": True,
+                "limit": 400,
+                "exclude_sources": ["tool"],
+            },
         ]
         for kwargs in cases:
-            assert _normalized(db.list_sessions_rich(**kwargs)) == _normalized(
+            assert _canonical_bytes(db.list_sessions_rich(**kwargs)) == _canonical_bytes(
                 db.list_sessions_rich(_force_cte_oracle=True, **kwargs)
-            )
+            ), kwargs
     finally:
         db.close()
