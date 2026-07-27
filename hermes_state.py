@@ -2327,7 +2327,6 @@ class SessionDB:
                 WHERE parent.end_reason = 'compression'
                   AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL
                   AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL
-                  AND COALESCE(child.source, '') != 'tool'
             )
             SELECT id FROM ancestors ORDER BY depth DESC LIMIT 1
             """,
@@ -2357,7 +2356,6 @@ class SessionDB:
                 WHERE parent.end_reason = 'compression'
                   AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL
                   AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL
-                  AND COALESCE(child.source, '') != 'tool'
             )
             SELECT MAX(COALESCE(
                 (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = chain.cur_id),
@@ -2478,7 +2476,6 @@ class SessionDB:
                 WHERE parent.end_reason = 'compression'
                   AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
                   AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
-                  AND COALESCE(child.source, '') != 'tool'
             ),
             chain_max AS (
                 SELECT root_id,
@@ -2749,7 +2746,16 @@ class SessionDB:
         trigger activation): re-index any row near the boundary that the
         index is missing. docsize has one row per indexed doc, so the
         anti-join is exact and runs on a narrow id range.
+
+        The trigram half of the sweep is gated on ``self._trigram_available``
+        for the same reason ``fts_rebuild_step()`` gates its backfill INSERT:
+        when ``session_store.trigram_fts`` is false (or the SQLite build has
+        no trigram tokenizer), ``__init__`` drops ``messages_fts_trigram``,
+        so an unconditional INSERT raises ``no such table`` and aborts the
+        whole rebuild — taking ``optimize_fts_storage()`` down with it.
         """
+        include_trigram = self._trigram_available
+
         def _do(conn):
             hw_row = conn.execute(
                 "SELECT value FROM state_meta WHERE key = 'fts_rebuild_high_water'"
@@ -2766,14 +2772,15 @@ class SessionDB:
                     "AND NOT EXISTS (SELECT 1 FROM messages_fts_docsize d WHERE d.id = m.id)",
                     (lo, hi),
                 )
-                conn.execute(
-                    "INSERT INTO messages_fts_trigram(rowid, content, tool_name, tool_calls) "
-                    "SELECT m.id, m.content, m.tool_name, m.tool_calls "
-                    "FROM messages m "
-                    "WHERE m.id > ? AND m.id <= ? AND m.role <> 'tool' "
-                    "AND NOT EXISTS (SELECT 1 FROM messages_fts_trigram_docsize d WHERE d.id = m.id)",
-                    (lo, hi),
-                )
+                if include_trigram:
+                    conn.execute(
+                        "INSERT INTO messages_fts_trigram(rowid, content, tool_name, tool_calls) "
+                        "SELECT m.id, m.content, m.tool_name, m.tool_calls "
+                        "FROM messages m "
+                        "WHERE m.id > ? AND m.id <= ? AND m.role <> 'tool' "
+                        "AND NOT EXISTS (SELECT 1 FROM messages_fts_trigram_docsize d WHERE d.id = m.id)",
+                        (lo, hi),
+                    )
             conn.execute(
                 "DELETE FROM state_meta WHERE key IN "
                 "('fts_rebuild_high_water', 'fts_rebuild_progress')"
@@ -6695,7 +6702,6 @@ class SessionDB:
                     WHERE parent.end_reason = 'compression'
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
-                      AND COALESCE(child.source, '') != 'tool'
                 ),
                 chain_max AS (
                     SELECT
@@ -10126,6 +10132,7 @@ class SessionDB:
                 "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
                 (session_id,),
             )
+            self._recompute_effective_last_active_for_session(conn, session_id)
         self._execute_write(_do)
 
     @staticmethod

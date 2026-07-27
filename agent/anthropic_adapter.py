@@ -1847,8 +1847,23 @@ def _convert_content_to_anthropic(content: Any) -> Any:
     converted = []
     for part in content:
         block = _convert_content_part_to_anthropic(part)
-        if block is not None:
-            converted.append(block)
+        if block is None:
+            continue
+        # Drop whitespace-only text blocks: the Messages input schema rejects
+        # them ("text content blocks must contain non-whitespace text"), and
+        # ONE blank block anywhere 400s the whole request (2026-07-25
+        # incident class). Other block types pass through untouched.
+        if (
+            block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+            and block["text"].strip() == ""
+        ):
+            continue
+        converted.append(block)
+    if not converted and content:
+        # Every part was blank/dropped — emit a placeholder rather than an
+        # empty content array (also rejected by the input schema).
+        converted = [{"type": "text", "text": _EMPTY_TEXT_PLACEHOLDER}]
     return converted
 
 
@@ -2458,7 +2473,16 @@ def _ensure_leading_user_turn(result: List[Dict[str, Any]]) -> None:
     (convert_messages_to_converse).
     """
     if result and result[0].get("role") != "user":
-        result.insert(0, {"role": "user", "content": [{"type": "text", "text": " "}]})
+        # The placeholder must be NON-WHITESPACE: the Messages input schema
+        # rejects blank text blocks ("text content blocks must contain
+        # non-whitespace text"), so a " " here turns EVERY subsequent call in
+        # the session into a deterministic 400 that fans across the whole
+        # fallback chain (2026-07-25 incident — the wedge survived restarts
+        # because this synthetic turn is re-prepended on every conversion).
+        result.insert(
+            0,
+            {"role": "user", "content": [{"type": "text", "text": _EMPTY_TEXT_PLACEHOLDER}]},
+        )
 
 
 def convert_messages_to_anthropic(

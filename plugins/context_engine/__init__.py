@@ -208,7 +208,12 @@ def _load_engine_from_dir_locked(engine_dir: Path) -> Optional["ContextEngine"]:
             if collector.engine:
                 return collector.engine
         except Exception as e:
-            logger.debug("register() failed for %s: %s", name, e)
+            # WARNING, not debug: a failed engine construction silently
+            # downgrades every session to the built-in compressor, and the
+            # only breadcrumb is this log line (2026-07-25: an lcm.db FTS
+            # schema drift killed construction and the real exception was
+            # invisible at debug level).
+            logger.warning("register() failed for %s: %s", name, e, exc_info=True)
 
     # Fallback: find a ContextEngine subclass and instantiate it
     from agent.context_engine import ContextEngine

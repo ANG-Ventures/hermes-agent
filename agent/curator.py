@@ -1642,14 +1642,23 @@ def _run_shared_pass(dry_run: bool, threshold_kb: int) -> Dict[str, Any]:
             report["skipped"] = "lock contention (another curator holds the shared lock)"
             return report
 
-        ok, reason, dirty = curator_shared.git_precheck_shared()
+        # Scope the clean-tree gate to the candidate skill dirs this pass may
+        # touch — dirt elsewhere in the shared tree (sibling skills, live
+        # fleet churn) is recorded and threaded into the commit
+        # drift-allowance instead of blocking the whole pass (2026-07-25:
+        # the whole-tree gate failed ~always on a live agent home).
+        ok, reason, precheck_ignored = curator_shared.git_precheck_shared(
+            scope_paths=candidates
+        )
         if not ok and reason == "dirty working tree":
             # Crash recovery: a cleanly-acquired lock over a dirty tree is
             # the staleness signal (fcntl auto-releases on holder death).
             recovered, why = curator_shared.attempt_crash_recovery()
             report["recovery"] = why
             if recovered:
-                ok, reason, dirty = curator_shared.git_precheck_shared()
+                ok, reason, precheck_ignored = curator_shared.git_precheck_shared(
+                    scope_paths=candidates
+                )
         if not ok:
             report["skipped"] = f"precheck failed ({reason})"
             return report
@@ -1716,6 +1725,9 @@ def _run_shared_pass(dry_run: bool, threshold_kb: int) -> Dict[str, Any]:
                 f"split {len(report['split'])} oversized shared skill(s): "
                 + ", ".join(report["split"]),
                 written,
+                # Out-of-scope dirt observed (and deliberately ignored) at
+                # precheck time must not trip the pre-commit drift-abort.
+                precheck_dirty=precheck_ignored,
             )
             report["commit"] = msg if ok else None
             if not ok:

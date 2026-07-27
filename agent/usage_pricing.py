@@ -442,7 +442,13 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     # cache read 0.1x input, cache write 1.25x input). Subscription relays
     # (claude-apr/-bpr/-api-proxy/-bridge) price NOTIONAL via
     # is_notional_anthropic_provider(); this entry supplies the rate.
-    # Source: https://openrouter.ai/anthropic/claude-fable-5
+    # Rates confirmed by Anthropic's official model page: "$10 per million
+    # input tokens and $50 per million output tokens, with the existing 90%
+    # input token discount for prompt caching" — the 90% caching discount is
+    # exactly the cache_read = 0.1x input below. Numbers UNCHANGED from the
+    # prior OpenRouter-sourced entry; this is a provenance upgrade only
+    # (openrouter.ai/anthropic/claude-fable-5 agrees at $10/$50).
+    # Source: https://www.anthropic.com/claude/fable
     (
         "anthropic",
         "claude-fable-5",
@@ -452,8 +458,8 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         cache_read_cost_per_million=Decimal("1.00"),
         cache_write_cost_per_million=Decimal("12.50"),
         source="official_docs_snapshot",
-        source_url="https://openrouter.ai/anthropic/claude-fable-5",
-        pricing_version="anthropic-pricing-2026-06",
+        source_url="https://www.anthropic.com/claude/fable",
+        pricing_version="anthropic-pricing-2026-07",
     ),
     # ── Anthropic Claude Sonnet 5 ────────────────────────────────────────
     # Launched 2026-06-30. Introductory pricing ($2/$10 per MTok) runs
@@ -1757,6 +1763,55 @@ def get_pricing_entry(
         if entry:
             return entry
     return _lookup_official_docs_pricing(route)
+
+
+def is_known_model(
+    model_name: str,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> bool:
+    """True when this (model, provider) resolves to a rate we can price OFFLINE.
+
+    Public, cheap, network-free membership probe over the static pricing
+    snapshot — the supported way to ask "do we have a rate for this model?"
+    without reaching into the private ``_OFFICIAL_DOCS_PRICING`` table. Added
+    for the new-model pricing sentinel (card t_2e382a4b), which fires the
+    instant a turn records with an unknown cost for a model we have never
+    priced.
+
+    Deliberately narrow, in both directions:
+
+    * It answers only from the STATIC tiers — the official-docs snapshot (with
+      its Anthropic dot/date normalization and the M1 vendor fallback) plus the
+      ``subscription_included`` $0 route. It never touches a live catalog
+      (``official_models_api``) or a ``/models`` endpoint, so it makes **no
+      network call** and is safe on the turn-record hot path.
+    * A live-catalog route (openrouter/nous/custom endpoint) therefore returns
+      ``True``: those routes are priced by a dynamic catalog rather than by a
+      snapshot entry, so a missing rate there is a catalog-availability
+      problem, not a "we forgot to add the new model's rate" problem. The
+      sentinel exists for the latter; alerting on the former would be noise on
+      every transient catalog miss.
+
+    Returns ``False`` only for a route that is meant to be priced from the
+    snapshot but has no entry at any tier — i.e. exactly the new-model gap.
+    """
+    try:
+        route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
+    except Exception:
+        # Never let a probe raise into a caller on the record path.
+        return True
+    if route.billing_mode == "subscription_included":
+        return True
+    # Dynamic-catalog and endpoint-metadata routes are out of scope (see above).
+    if route.billing_mode not in {"official_docs_snapshot", "unknown"}:
+        return True
+    if route.provider == "openrouter" or route.base_url:
+        return True
+    try:
+        return _lookup_official_docs_pricing(route) is not None
+    except Exception:
+        return True
 
 
 def normalize_usage(
