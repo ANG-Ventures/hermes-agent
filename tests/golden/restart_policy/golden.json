@@ -1,0 +1,500 @@
+{
+  "09bb7bbb1befed27fc20674779aeafdf04bec8b42c77af5a1a3ed292eb25cdba": {
+    "input": {
+      "kind": "restart_loop_threshold",
+      "name": "restart threshold clamps high",
+      "value": "101"
+    },
+    "name": "restart threshold clamps high",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 100
+    }
+  },
+  "0eaccc2aade07b94a8813fa090cfa586f178fac2b3cca2bbf74df5c74b703723": {
+    "input": {
+      "agent_cfg": {
+        "gateway_auto_continue_freshness": 3600,
+        "gateway_notify_interval": 60,
+        "gateway_startup_restore_drain_timeout": 30,
+        "gateway_timeout": 600,
+        "gateway_timeout_warning": 420,
+        "max_turns": 50,
+        "restart_drain_timeout": 45,
+        "restart_initiated_ttl_secs": 600,
+        "restart_loop_threshold": 3,
+        "restart_loop_window_secs": 300,
+        "resume_flag_stale_clear": true,
+        "resume_interrupted_turns": "auto"
+      },
+      "kind": "bridge_agent_config_to_env",
+      "name": "config bridge writes configured keys and preserves mapping",
+      "pre_env": {
+        "HERMES_MAX_ITERATIONS": "99"
+      }
+    },
+    "name": "config bridge writes configured keys and preserves mapping",
+    "output": {
+      "db": [],
+      "env": {
+        "HERMES_AGENT_NOTIFY_INTERVAL": "60",
+        "HERMES_AGENT_TIMEOUT": "600",
+        "HERMES_AGENT_TIMEOUT_WARNING": "420",
+        "HERMES_AUTO_CONTINUE_FRESHNESS": "3600",
+        "HERMES_MAX_ITERATIONS": "50",
+        "HERMES_RESTART_DRAIN_TIMEOUT": "45",
+        "HERMES_RESTART_INITIATED_TTL_SECS": "600",
+        "HERMES_RESTART_LOOP_THRESHOLD": "3",
+        "HERMES_RESTART_LOOP_WINDOW_SECS": "300",
+        "HERMES_RESUME_FLAG_STALE_CLEAR": "True",
+        "HERMES_RESUME_INTERRUPTED_TURNS": "auto",
+        "HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT": "30"
+      },
+      "messages": [],
+      "return": null
+    }
+  },
+  "0f0b0b53fd38e7bfb67e8daeba277aeaceb4dc2b0e926443e5a67772b62158ca": {
+    "input": {
+      "kind": "restart_loop_threshold",
+      "name": "restart threshold clamps low",
+      "value": "0"
+    },
+    "name": "restart threshold clamps low",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 1
+    }
+  },
+  "2269f4a323255ee64fcf2a64ec08ea1d9f1618de2c0937050f778e9c53297b93": {
+    "input": {
+      "agent_cfg": "not-a-dict",
+      "kind": "bridge_agent_config_to_env",
+      "name": "config bridge ignores malformed config",
+      "pre_env": {
+        "HERMES_RESTART_LOOP_THRESHOLD": "8"
+      }
+    },
+    "name": "config bridge ignores malformed config",
+    "output": {
+      "db": [],
+      "env": {
+        "HERMES_AGENT_NOTIFY_INTERVAL": null,
+        "HERMES_AGENT_TIMEOUT": null,
+        "HERMES_AGENT_TIMEOUT_WARNING": null,
+        "HERMES_AUTO_CONTINUE_FRESHNESS": null,
+        "HERMES_MAX_ITERATIONS": null,
+        "HERMES_RESTART_DRAIN_TIMEOUT": null,
+        "HERMES_RESTART_INITIATED_TTL_SECS": null,
+        "HERMES_RESTART_LOOP_THRESHOLD": "8",
+        "HERMES_RESTART_LOOP_WINDOW_SECS": null,
+        "HERMES_RESUME_FLAG_STALE_CLEAR": null,
+        "HERMES_RESUME_INTERRUPTED_TURNS": null,
+        "HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT": null
+      },
+      "messages": [],
+      "return": null
+    }
+  },
+  "228770378cdfbc5f2faa3a862ed1172449ce67328ba1ec52beb175ee3a49953c": {
+    "input": {
+      "kind": "restart_initiated_filename",
+      "name": "restart breadcrumb filename session key",
+      "session_key": "telegram:chat-123"
+    },
+    "name": "restart breadcrumb filename session key",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": "8c8dda4f"
+    }
+  },
+  "2e16cc3bcf59b43d910bbc23a0ed264a604bdd64cc5d00b727a01bac56b0ccec": {
+    "input": {
+      "kind": "restart_initiated_ttl_secs",
+      "name": "restart breadcrumb ttl configured",
+      "value": "240"
+    },
+    "name": "restart breadcrumb ttl configured",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 240.0
+    }
+  },
+  "34201d6bb0cdb8f58129ec3aa7ebf52065bb75eac7e0cb13361c8ff9d967d541": {
+    "input": {
+      "kind": "startup_restore_drain_timeout_secs",
+      "name": "startup restore timeout default",
+      "value": null
+    },
+    "name": "startup restore timeout default",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 30.0
+    }
+  },
+  "3a435bff7c4bd6d29191cdf846d15b25afdadacbd33bfb47283167cf5d8614d2": {
+    "input": {
+      "kind": "restart_initiated_ttl_secs",
+      "name": "restart breadcrumb ttl clamps low",
+      "value": "1"
+    },
+    "name": "restart breadcrumb ttl clamps low",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 60.0
+    }
+  },
+  "4977e8b2a2bff9d62ab140ac4733fcb7d7b07ae3cb0ca1bc73445dac265fe5e8": {
+    "input": {
+      "kind": "restart_loop_window_secs",
+      "name": "restart window default",
+      "value": null
+    },
+    "name": "restart window default",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 300.0
+    }
+  },
+  "548484abb34df70264a4525bffb57035af3c60a2be677b3c1d2506e465a9d4be": {
+    "input": {
+      "kind": "restart_loop_window_secs",
+      "name": "restart window configured",
+      "value": "12.5"
+    },
+    "name": "restart window configured",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 12.5
+    }
+  },
+  "66e87b7ac68c9f755cb5616d0ad7a67c20057ce8332684e0f06c534bbc3b512c": {
+    "input": {
+      "kind": "restart_loop_threshold",
+      "name": "restart threshold configured",
+      "value": "7"
+    },
+    "name": "restart threshold configured",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 7
+    }
+  },
+  "6bdfe6cbbc0ec19deb6da62353b817ec91afc69f2a1943cf1a2b2482918e659b": {
+    "input": {
+      "command": "python3 ~/.hermes/skills/safe-restart.py --handoff x",
+      "kind": "command_invokes_safe_restart",
+      "name": "safe restart detector accepts direct execution"
+    },
+    "name": "safe restart detector accepts direct execution",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": true
+    }
+  },
+  "75d86608691a02db6eebe53c409b3224a76474cfb657647d7381fe35113af9f7": {
+    "input": {
+      "command": "",
+      "kind": "command_invokes_safe_restart",
+      "name": "safe restart detector rejects empty command"
+    },
+    "name": "safe restart detector rejects empty command",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": false
+    }
+  },
+  "76b5f2da1d3e0f6d7733bf274dde5f0dc69522877f0b47afe261c8131829e231": {
+    "input": {
+      "kind": "restart_loop_window_secs",
+      "name": "restart window malformed",
+      "value": "bad"
+    },
+    "name": "restart window malformed",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 300.0
+    }
+  },
+  "79aa0ed5f68b0439616073235b8c896db253bc7e3f6dbb04f26f5f72beb7dc09": {
+    "input": {
+      "kind": "startup_restore_drain_timeout_secs",
+      "name": "startup restore timeout configured",
+      "value": "17.5"
+    },
+    "name": "startup restore timeout configured",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 17.5
+    }
+  },
+  "7bdae24dc347b3bca01c875bb7e452d22ec6c5a4f8dcd49e52ee204fc3a63d54": {
+    "input": {
+      "command": "cat ~/.hermes/skills/safe-restart.py",
+      "kind": "command_invokes_safe_restart",
+      "name": "safe restart detector rejects inspection"
+    },
+    "name": "safe restart detector rejects inspection",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": false
+    }
+  },
+  "7e509c00d2416addde30398820294a62c471bd19811152f041b5ffa6c34dc1d4": {
+    "input": {
+      "kind": "startup_restore_drain_timeout_secs",
+      "name": "startup restore timeout malformed",
+      "value": "bad"
+    },
+    "name": "startup restore timeout malformed",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 30.0
+    }
+  },
+  "8224a31d1526b5f75f8b32e0f22a30c06eea36ad8e057e226444e91760a9a565": {
+    "input": {
+      "kind": "restart_loop_threshold",
+      "name": "restart threshold malformed",
+      "value": "bad"
+    },
+    "name": "restart threshold malformed",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 3
+    }
+  },
+  "8677142cbbd7bfb21575804b5642516930e66ba909345ae3a3435853e6988eea": {
+    "input": {
+      "kind": "startup_restore_drain_timeout_secs",
+      "name": "startup restore timeout opt out",
+      "value": "-1"
+    },
+    "name": "startup restore timeout opt out",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": -1.0
+    }
+  },
+  "a272deb68af6eb1b660313ce2e370e35ae7a9c115e1c9066e4d3221959b95b01": {
+    "input": {
+      "command": "safe-restart.py",
+      "force_empty_tokens": true,
+      "kind": "command_invokes_safe_restart",
+      "name": "safe restart detector rejects empty tokenization"
+    },
+    "name": "safe restart detector rejects empty tokenization",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": false
+    }
+  },
+  "ab307cbc581d5e8f263385224b7d489a2921935ad01c6d1dc628c8cd251dc68f": {
+    "input": {
+      "kind": "restart_initiated_ttl_secs",
+      "name": "restart breadcrumb ttl clamps high",
+      "value": "90000"
+    },
+    "name": "restart breadcrumb ttl clamps high",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 86400.0
+    }
+  },
+  "abca99e3f5f264c93cb1e8ca66922641ae6ed3a60ac3ecca06121194ddb225cc": {
+    "input": {
+      "command": "python3 safe-restart.py 'unterminated",
+      "kind": "command_invokes_safe_restart",
+      "name": "safe restart detector tolerates malformed quotes"
+    },
+    "name": "safe restart detector tolerates malformed quotes",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": true
+    }
+  },
+  "abeb9d70c20caa3ddf994a830b01f049660289c589317f8c82827c8ca0e94631": {
+    "input": {
+      "kind": "restart_initiated_ttl_secs",
+      "name": "restart breadcrumb ttl default",
+      "value": null
+    },
+    "name": "restart breadcrumb ttl default",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 600.0
+    }
+  },
+  "b16c0cf1048a5579684c58c9077e4853e0b2e9d46e4b628cb2a975ec4c7d63e2": {
+    "input": {
+      "kind": "restart_loop_threshold",
+      "name": "restart threshold default",
+      "value": null
+    },
+    "name": "restart threshold default",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 3
+    }
+  },
+  "ba2fc735c962b7766cf675eb51ad27383ccdadd8809662c4670eb6b303cf4b1e": {
+    "input": {
+      "kind": "restart_loop_window_secs",
+      "name": "restart window clamps low",
+      "value": "0"
+    },
+    "name": "restart window clamps low",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 1.0
+    }
+  },
+  "ca520043ccad953e3c150871507c508a36336fc2d96cf7b951381b237db56586": {
+    "input": {
+      "agent_cfg": {
+        "max_turns": 42
+      },
+      "kind": "bridge_agent_config_to_env",
+      "name": "config bridge leaves absent keys untouched",
+      "pre_env": {
+        "HERMES_RESTART_LOOP_THRESHOLD": "9"
+      }
+    },
+    "name": "config bridge leaves absent keys untouched",
+    "output": {
+      "db": [],
+      "env": {
+        "HERMES_AGENT_NOTIFY_INTERVAL": null,
+        "HERMES_AGENT_TIMEOUT": null,
+        "HERMES_AGENT_TIMEOUT_WARNING": null,
+        "HERMES_AUTO_CONTINUE_FRESHNESS": null,
+        "HERMES_MAX_ITERATIONS": "42",
+        "HERMES_RESTART_DRAIN_TIMEOUT": null,
+        "HERMES_RESTART_INITIATED_TTL_SECS": null,
+        "HERMES_RESTART_LOOP_THRESHOLD": "9",
+        "HERMES_RESTART_LOOP_WINDOW_SECS": null,
+        "HERMES_RESUME_FLAG_STALE_CLEAR": null,
+        "HERMES_RESUME_INTERRUPTED_TURNS": null,
+        "HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT": null
+      },
+      "messages": [],
+      "return": null
+    }
+  },
+  "e2922903c829aa5a9bcf16b3778846adc383d826d85508f4052c7f3c8417a22f": {
+    "input": {
+      "kind": "restart_initiated_ttl_secs",
+      "name": "restart breadcrumb ttl malformed",
+      "value": "bad"
+    },
+    "name": "restart breadcrumb ttl malformed",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 600.0
+    }
+  },
+  "e6050c0a3c50481845f9b6cc831408f74dce3fcee6cfeb510da63c89f981e8a6": {
+    "input": {
+      "kind": "restart_loop_window_secs",
+      "name": "restart window clamps high",
+      "value": "90000"
+    },
+    "name": "restart window clamps high",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 86400.0
+    }
+  },
+  "eec2e8c8058457b851ad84ebd1bae2499f17a784b197fd516c38a1aa539022d8": {
+    "input": {
+      "command": "grep x safe-restart.py && python3 safe-restart.py --profile default",
+      "kind": "command_invokes_safe_restart",
+      "name": "safe restart detector scans chained segments"
+    },
+    "name": "safe restart detector scans chained segments",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": true
+    }
+  },
+  "f4807a0ba0ccf38a6ed3754d64574f1f54ccc9ff1736fc7dd7fbf4863703b856": {
+    "input": {
+      "kind": "restart_initiated_filename",
+      "name": "restart breadcrumb filename empty key",
+      "session_key": ""
+    },
+    "name": "restart breadcrumb filename empty key",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": "e3b0c442"
+    }
+  },
+  "fe3228ffdb22b44cbc1f49cc14e3b54d0a9c714bc6c49b905467f462cba74e7e": {
+    "input": {
+      "command": "echo hello && python3 safe-restart.py",
+      "kind": "command_invokes_safe_restart",
+      "name": "safe restart detector skips unrelated chain segment"
+    },
+    "name": "safe restart detector skips unrelated chain segment",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": true
+    }
+  }
+}
