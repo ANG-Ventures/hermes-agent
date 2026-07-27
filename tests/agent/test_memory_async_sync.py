@@ -69,15 +69,19 @@ class _SlowProvider(MemoryProvider):
 def test_sync_all_does_not_block_on_slow_provider():
     """The crux of the fix: a slow provider must NOT stall the caller."""
     mgr = MemoryManager()
-    mgr.add_provider(_SlowProvider(delay=2.0))
+    provider = _SlowProvider(delay=10.0)
+    mgr.add_provider(provider)
 
-    t0 = time.time()
     mgr.sync_all("hi", "hey", session_id="s1")
     mgr.queue_prefetch_all("hi", session_id="s1")
-    elapsed = time.time() - t0
 
-    # Provider blocks 2s per call inline; off-thread dispatch returns ~instantly.
-    assert elapsed < 0.5, f"turn-completion path blocked {elapsed:.2f}s"
+    # Positive witness (replaces `elapsed < 0.5`): the provider sets
+    # sync_done/prefetch_done only AFTER its 10s sleep, so if either call
+    # had run inline the flag would already be True here.  Both unset ==
+    # both were dispatched off-thread.  Load cannot flip this; only an
+    # inline regression can.
+    assert not provider.sync_done, "sync_all ran sync_turn inline"
+    assert not provider.prefetch_done, "queue_prefetch_all ran queue_prefetch inline"
 
 
 def test_background_work_still_completes():

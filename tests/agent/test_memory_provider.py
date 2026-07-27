@@ -101,12 +101,18 @@ class BlockingPrefetchProvider(FakeMemoryProvider):
         super().__init__(name=name)
         self.started = threading.Event()
         self.release = threading.Event()
+        # Ordering witness: set only when prefetch() actually returns, so a
+        # test can assert the manager did NOT wait for this provider.
+        self.returned = threading.Event()
 
     def prefetch(self, query, *, session_id=""):
-        self.prefetch_queries.append(query)
-        self.started.set()
-        self.release.wait(timeout=5.0)
-        return self._prefetch_result
+        try:
+            self.prefetch_queries.append(query)
+            self.started.set()
+            self.release.wait(timeout=30.0)
+            return self._prefetch_result
+        finally:
+            self.returned.set()
 
 
 # ---------------------------------------------------------------------------
@@ -425,26 +431,34 @@ class TestMemoryManager:
         mgr.add_provider(builtin)
         mgr.add_provider(external)
 
-        started = time.monotonic()
         result = mgr.prefetch_all("query")
-        elapsed = time.monotonic() - started
 
+        # Ordering witness (replaces `elapsed < 0.5`): the stuck provider is
+        # still parked inside prefetch() when prefetch_all returns, so the
+        # 0.01s external timeout provably fired instead of waiting it out.
+        # A 500ms ceiling against a 10ms configured timeout was measuring
+        # thread startup, not the skip.
         assert result == "builtin memory"
-        assert elapsed < 0.5
-        assert external.started.wait(timeout=1.0)
+        assert not external.returned.is_set(), (
+            "prefetch_all waited for the stuck external provider"
+        )
+        assert external.started.wait(timeout=10.0)
         assert external.prefetch_queries == ["query"]
 
-        started = time.monotonic()
         result = mgr.prefetch_all("query 2")
-        elapsed = time.monotonic() - started
 
+        # Second call: the provider is STILL parked from call 1, proving the
+        # manager did not re-enter or join it (replaces `elapsed < 0.2`).
         assert result == "builtin memory"
-        assert elapsed < 0.2
+        assert not external.returned.is_set()
         assert external.prefetch_queries == ["query"]
 
         external.release.set()
 
-        deadline = time.monotonic() + 1.0
+        # Bounded poll on real thread state (correct shape already); the
+        # deadline is widened from 1s to 10s so it guards a hang rather than
+        # racing the scheduler on a loaded box.
+        deadline = time.monotonic() + 10.0
         while (
             external.name in mgr._external_prefetch_threads
             and mgr._external_prefetch_threads[external.name].is_alive()

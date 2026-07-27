@@ -145,11 +145,15 @@ class TestSyncMode:
             "deliver": "local",
         }
 
-        barrier = threading.Barrier(2, timeout=5)
+        barrier = threading.Barrier(2, timeout=10)
+        job_returned = threading.Event()
 
         def slow_run(j, *, defer_agent_teardown=None):
-            barrier.wait()  # blocks until test thread also waits
-            return True, "out", "resp", None
+            try:
+                barrier.wait()  # blocks until test thread also waits
+                return True, "out", "resp", None
+            finally:
+                job_returned.set()
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
         monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
@@ -158,16 +162,18 @@ class TestSyncMode:
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
 
-        start = time.monotonic()
         n = sched.tick(verbose=False, sync=False)  # opt-in: non-blocking
-        elapsed = time.monotonic() - start
 
         assert n == 1  # optimistic count
-        assert elapsed < 1.0  # returned immediately, didn't wait for slow_run
+        # Ordering witness (replaces `elapsed < 1.0`): the job is provably
+        # still parked at the barrier — which only the test thread can
+        # release — when tick() returns.  The barrier was already the real
+        # witness; the stopwatch was redundant risk.
+        assert not job_returned.is_set(), "tick(sync=False) waited for slow_run"
 
         # Let the job finish so cleanup works.
         barrier.wait()
-        time.sleep(0.1)
+        assert job_returned.wait(timeout=10)
         sched._shutdown_parallel_pool()
 
 
@@ -199,11 +205,15 @@ class TestSequentialPool:
             "workdir": str(tmp_path),  # makes it sequential
         }
 
-        barrier = threading.Barrier(2, timeout=5)
+        barrier = threading.Barrier(2, timeout=10)
+        job_returned = threading.Event()
 
         def slow_run(j, *, defer_agent_teardown=None):
-            barrier.wait()
-            return True, "out", "resp", None
+            try:
+                barrier.wait()
+                return True, "out", "resp", None
+            finally:
+                job_returned.set()
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
         monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
@@ -212,15 +222,16 @@ class TestSequentialPool:
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
 
-        start = time.monotonic()
         n = sched.tick(verbose=False, sync=False)
-        elapsed = time.monotonic() - start
 
         assert n == 1  # optimistic count
-        assert elapsed < 1.0  # did NOT block on the slow workdir job
+        # Ordering witness (replaces `elapsed < 1.0`): the workdir job is
+        # still parked at the barrier when tick() returns, so it provably
+        # did NOT run inline in the ticker thread.
+        assert not job_returned.is_set(), "tick(sync=False) blocked on the workdir job"
 
         barrier.wait()
-        time.sleep(0.1)
+        assert job_returned.wait(timeout=10)
         sched._shutdown_parallel_pool()
 
     def test_sequential_running_guard_prevents_double_dispatch(self, tmp_path, monkeypatch):

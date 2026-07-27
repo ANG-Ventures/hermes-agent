@@ -2418,16 +2418,26 @@ class TestInstallPathSafety:
 
 
 class _FakeSource(SkillSource):
-    def __init__(self, sid: str, sleep: float = 0.0, results=None):
+    def __init__(self, sid: str, sleep: float = 0.0, results=None, gate=None):
         self._sid = sid
         self._sleep = sleep
         self._results = results or []
+        # Optional (release_event, returned_event) pair so a test can hold the
+        # source open and assert deterministically that the caller did not
+        # wait for it, instead of timing the call.
+        self._gate = gate
 
     def source_id(self) -> str:
         return self._sid
 
     def search(self, query: str, limit: int = 10) -> List[SkillMeta]:
-        if self._sleep:
+        if self._gate is not None:
+            release, returned = self._gate
+            try:
+                release.wait(timeout=30)
+            finally:
+                returned.set()
+        elif self._sleep:
             time.sleep(self._sleep)
         return list(self._results)
 
@@ -2449,26 +2459,42 @@ class TestParallelSearchSourcesTimeout:
         )
 
     def test_slow_source_does_not_block_caller(self):
-        """A source sleeping well past overall_timeout must not stall the
+        """A source held open well past overall_timeout must not stall the
         return. Before the fix the executor's `with` block waited on the slow
         worker (~5s); now the call returns promptly and reports the source as
         timed out."""
+        import threading
+
+        release_slow = threading.Event()
+        slow_returned = threading.Event()
+
         fast = _FakeSource("fast", sleep=0.0, results=[self._meta("fast")])
-        slow = _FakeSource("slow", sleep=5.0, results=[self._meta("slow")])
-
-        start = time.monotonic()
-        all_results, source_counts, timed_out_ids = parallel_search_sources(
-            [fast, slow], query="q", overall_timeout=0.3,
+        slow = _FakeSource(
+            "slow", results=[self._meta("slow")],
+            gate=(release_slow, slow_returned),
         )
-        elapsed = time.monotonic() - start
 
-        # Must return long before the slow source's 5s sleep finishes.
-        assert elapsed < 2.0, f"call blocked for {elapsed:.2f}s (timeout not honoured)"
-        assert "slow" in timed_out_ids
-        # Fast source still delivered its result and is not flagged timed out.
-        assert source_counts.get("fast") == 1
-        assert "fast" not in timed_out_ids
-        assert any(r.source == "fast" for r in all_results)
+        try:
+            all_results, source_counts, timed_out_ids = parallel_search_sources(
+                [fast, slow], query="q", overall_timeout=0.3,
+            )
+
+            # Ordering witness (replaces `elapsed < 2.0`): the slow source is
+            # still held open when parallel_search_sources returns, so the
+            # executor provably did not wait on it.  The old bound sat between
+            # a 0.3s timeout and a 5s sleep — only ~6.7x headroom on the very
+            # teardown path being regression-tested.
+            assert not slow_returned.is_set(), (
+                "caller waited for the slow source (overall_timeout not honoured)"
+            )
+            assert "slow" in timed_out_ids
+            # Fast source still delivered its result and is not flagged timed out.
+            assert source_counts.get("fast") == 1
+            assert "fast" not in timed_out_ids
+            assert any(r.source == "fast" for r in all_results)
+        finally:
+            release_slow.set()
+            slow_returned.wait(timeout=10)
 
     def test_all_fast_sources_complete_without_timeout(self):
         """Happy path: when every source finishes within budget, none are
