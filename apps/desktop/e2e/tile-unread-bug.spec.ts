@@ -34,11 +34,11 @@ function sessionRow(page: import('@playwright/test').Page, text: string) {
   return page.locator('[data-slot="sidebar"] button').filter({ hasText: text }).first()
 }
 
-/** Common setup: start a turn with a sleep 5 bg process + subagent, wait for
+/** Common setup: start a turn with a long bg process + subagent, wait for
  *  the turn to complete, then switch to a new session so the first session is
  *  no longer $selectedStoredSessionId (required before opening a tile). */
 async function startTurnAndSwitchAway(page: import('@playwright/test').Page) {
-  // Send E2E_SIDEBAR_CROSS — starts a turn with sleep 5 + subagent.
+  // Send E2E_SIDEBAR_CROSS — starts a turn with a long bg sleep + subagent.
   const composer = page.locator('[contenteditable="true"]').first()
   await composer.waitFor({ state: 'visible', timeout: 10_000 })
   await composer.click()
@@ -67,7 +67,8 @@ async function startTurnAndSwitchAway(page: import('@playwright/test').Page) {
     { timeout: 90_000 },
   )
 
-  // The background dot should still be visible (sleep 5 hasn't finished).
+  // The background dot should still be visible: the mock sleeps 30s
+  // (SIDEBAR_CROSS_BG_SLEEP_SECONDS), far longer than any turn latency.
   const bgDuringTurn = await page.locator(`[aria-label="${BG_DOT_LABEL}"]`).count()
   expect(bgDuringTurn, 'background dot should still be visible after turn completes').toBeGreaterThan(0)
 
@@ -77,12 +78,21 @@ async function startTurnAndSwitchAway(page: import('@playwright/test').Page) {
   await page.waitForTimeout(2000)
 }
 
-/** Wait for the background process to finish (sleep 5 + auto-dismiss). */
+/**
+ * Wait for the background process to finish and its dot to auto-dismiss.
+ *
+ * Budget must exceed the mock's background sleep (SIDEBAR_CROSS_BG_SLEEP_SECONDS,
+ * 30s as of 2026-07-27) PLUS SUCCESS_LINGER_MS (4s) plus scheduling slack.
+ * This is a HANG-GUARD, not a timing assertion: it asserts the dot eventually
+ * disappears, and a ceiling well above the real duration fails only on a genuine
+ * regression. (Keeping it at 30s while the sleep became 30s would have made THIS
+ * a race in turn -- the exact bug we are fixing, relocated.)
+ */
 async function waitForBgProcessToFinish(page: import('@playwright/test').Page) {
   await expect
     .poll(
       () => page.locator(`[aria-label="${BG_DOT_LABEL}"]`).count(),
-      { timeout: 30_000, message: 'background dot should disappear after process finishes' },
+      { timeout: 60_000, message: 'background dot should disappear after process finishes' },
     )
     .toBe(0)
 }
