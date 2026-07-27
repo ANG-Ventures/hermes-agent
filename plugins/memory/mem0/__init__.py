@@ -1621,7 +1621,15 @@ class Mem0MemoryProvider(MemoryProvider):
                         keyword_search=self._keyword_search, top_k=5)
                     self._observe_rerank_response(response, requested=_pf_rerank)
                     results = self._drop_forgotten(self._unwrap_results(response))
-                    _floor_outcome = "no_results"
+                    # `floor_outcome` reports GATE B's verdict specifically. Only claim
+                    # "no_results" when the SEARCH itself came back empty; otherwise leave it
+                    # "not_run" so a later gate either overwrites it or it honestly reports that
+                    # Gate B never executed. Previously this was unconditionally initialized to
+                    # "no_results", so when L2 emptied `results` Gate B was skipped and the stale
+                    # initializer survived — making every full-L2-drop indistinguishable from a
+                    # genuinely empty search, and rendering any downstream "did recall have
+                    # candidates?" check undecidable.
+                    _floor_outcome = "no_results" if not results else "not_run"
                     _injected = 0
                     # L2 RERANK GATE (PRIMARY, spec 2026-07-07): the cross-encoder's per-row
                     # rerank_score SEPARATES on-topic (+2..+5) from off-topic junk (-6..-11)
@@ -1665,7 +1673,12 @@ class Mem0MemoryProvider(MemoryProvider):
                     # Final "what recall actually injected this turn" line — fires on EVERY
                     # substantive turn (past Gate A), regardless of whether Gate B ran, was
                     # disabled, or exact-token-bypassed. `injected` is the number of memory lines
-                    # placed in front of the model; `floor_outcome` says which path decided it.
+                    # placed in front of the model. `floor_outcome` reports GATE B's verdict ONLY
+                    # ("no_results" = search returned nothing; "not_run" = an earlier gate emptied
+                    # the candidates so Gate B was skipped) — it does NOT summarize the whole
+                    # pipeline. To judge WHY a turn injected nothing, read `rr_outcome` and the
+                    # `mem0.prefetch_rerank` line's scores; `floor_outcome` alone cannot
+                    # distinguish "nothing matched" from "L2 rejected everything".
                     # No memory text (privacy). This is the top-level recall observability row.
                     logger.info(
                         "mem0.prefetch injected=%d floor_outcome=%s rr_outcome=%s gap_outcome=%s rerank=%s exact=%s q=%s",
