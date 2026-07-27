@@ -1502,8 +1502,15 @@ DEFAULT_CONFIG = {
                                       # tool iteration. 0 = commit any non-zero prune.
         "hygiene_hard_message_limit": 400,  # gateway session-hygiene force-compress threshold by message count
         "hygiene_threshold": 0.85,    # gateway session-hygiene token threshold (fraction of window); higher than compression.threshold (pre-turn backstop)
-        "hygiene_timeout_seconds": 30,  # max seconds gateway waits for pre-agent hygiene compression
+        "hygiene_timeout_seconds": None,  # max seconds gateway waits for pre-agent hygiene compression.
+                                      # None/unset = derive from auxiliary.compression.timeout
+                                      # (floor 30s, cap 900s) so the outer wall-clock guard is never
+                                      # TIGHTER than the inner LLM deadline it wraps. Set a number to
+                                      # pin it explicitly (honoured verbatim).
         "hygiene_failure_cooldown_seconds": 300,  # skip repeated failed hygiene attempts for this session
+        "hygiene_failure_alert_after": 3,  # after N consecutive hygiene-compression failures, escalate
+                                      # the user-facing warning (a session that can never compress
+                                      # grows unboundedly). 0 disables the escalation.
         "protect_first_n": 3,         # non-system head messages always preserved
                                       # verbatim, in ADDITION to the system prompt
                                       # (which is always implicitly protected). Set to

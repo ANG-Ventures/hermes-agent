@@ -16085,6 +16085,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _hyg_hard_msg_limit = 400  # fork fleet default (matches config.py)
             _hyg_timeout_seconds = 30.0
             _hyg_failure_cooldown_seconds = 300.0
+            _hyg_failure_alert_after = 3
             _hyg_config_context_length = None
             _hyg_provider = None
             _hyg_base_url = None
@@ -16141,14 +16142,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_threshold_pct = _parsed_thr
                             except (TypeError, ValueError):
                                 pass
-                        _raw_timeout = _comp_cfg.get("hygiene_timeout_seconds")
-                        if _raw_timeout is not None:
-                            try:
-                                _parsed = float(_raw_timeout)
-                                if _parsed > 0:
-                                    _hyg_timeout_seconds = _parsed
-                            except (TypeError, ValueError):
-                                pass
+                        # The outer wall-clock guard must never be TIGHTER than
+                        # the inner LLM deadline it wraps.  The summariser call
+                        # inside _compress_context gets
+                        # auxiliary.compression.timeout (default 300s, with a
+                        # 300s floor applied by the auxiliary client for the
+                        # compression task); a 30s outer guard therefore killed
+                        # every summary that legitimately needed longer —
+                        # guaranteed failure on large transcripts, not a safety
+                        # net.  An explicit hygiene_timeout_seconds still wins
+                        # verbatim.
+                        try:
+                            from agent.hygiene_timeout import (
+                                resolve_hygiene_timeout_seconds,
+                            )
+
+                            _hyg_timeout_seconds, _ = resolve_hygiene_timeout_seconds(
+                                _comp_cfg,
+                                _hyg_data.get("auxiliary"),
+                                default=_hyg_timeout_seconds,
+                            )
+                        except Exception:
+                            # Never let deadline resolution break hygiene.
+                            _raw_timeout = _comp_cfg.get("hygiene_timeout_seconds")
+                            if _raw_timeout is not None:
+                                try:
+                                    _parsed = float(_raw_timeout)
+                                    if _parsed > 0:
+                                        _hyg_timeout_seconds = _parsed
+                                except (TypeError, ValueError):
+                                    pass
                         _raw_cooldown = _comp_cfg.get("hygiene_failure_cooldown_seconds")
                         if _raw_cooldown is not None:
                             try:
@@ -16157,6 +16180,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_failure_cooldown_seconds = _parsed
                             except (TypeError, ValueError):
                                 pass
+                        try:
+                            from agent.hygiene_timeout import (
+                                resolve_failure_alert_after,
+                            )
+
+                            _hyg_failure_alert_after = resolve_failure_alert_after(
+                                _comp_cfg
+                            )
+                        except Exception:
+                            pass
 
                 _hyg_configured_model = _hyg_model
                 _hyg_configured_provider = _hyg_provider
@@ -16413,12 +16446,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 self._hygiene_compression_failure_cooldowns[
                                                     session_entry.session_id
                                                 ] = time.time() + _hyg_failure_cooldown_seconds
+                                            _hyg_streak = self._record_hygiene_compression_failure(
+                                                session_entry.session_id
+                                            )
                                             logger.warning(
                                                 "Session hygiene compression for session %s "
-                                                "timed out after %.1fs; continuing without "
-                                                "compression",
+                                                "timed out after %.1fs (consecutive failures: "
+                                                "%d); continuing without compression",
                                                 session_entry.session_id,
                                                 _hyg_timeout_seconds,
+                                                _hyg_streak,
                                             )
                                             _timeout_msg = (
                                                 "⚠️ Context compression timed out "
@@ -16428,6 +16465,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 "a clean session, or check your "
                                                 "auxiliary.compression model configuration."
                                             )
+                                            # A session that can never compress grows
+                                            # until it overflows the window. Per-occurrence
+                                            # this is benign; as a STREAK it is not, so
+                                            # stop whispering.
+                                            try:
+                                                from agent.hygiene_timeout import (
+                                                    format_repeated_failure_alert,
+                                                    should_alert_loudly,
+                                                )
+
+                                                if should_alert_loudly(
+                                                    _hyg_streak, _hyg_failure_alert_after
+                                                ):
+                                                    _timeout_msg = format_repeated_failure_alert(
+                                                        _hyg_streak,
+                                                        _hyg_timeout_seconds,
+                                                        message_count=_msg_count,
+                                                        approx_tokens=_approx_tokens,
+                                                    )
+                                                    logger.error(
+                                                        "Session hygiene compression has failed "
+                                                        "%d consecutive times for session %s "
+                                                        "(%d msgs, ~%d tokens) — the transcript "
+                                                        "is growing unboundedly. Raise "
+                                                        "compression.hygiene_timeout_seconds or "
+                                                        "check auxiliary.compression health.",
+                                                        _hyg_streak,
+                                                        session_entry.session_id,
+                                                        _msg_count,
+                                                        _approx_tokens,
+                                                    )
+                                            except Exception:
+                                                pass
                                             try:
                                                 _adapter = self._adapter_for_source(source)
                                                 if _adapter and source.chat_id:
@@ -16512,6 +16582,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _msg_count, _new_count,
                                             f"{_approx_tokens:,}", f"{_new_tokens:,}",
                                         )
+                                        self._clear_hygiene_compression_failures(
+                                            session_entry.session_id
+                                        )
                                     elif (not _hyg_aborted) and _hyg_in_place:
                                         # archive_and_compact() already persisted the
                                         # compacted transcript inside _compress_context.
@@ -16527,6 +16600,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             "~%s → ~%s tokens",
                                             _msg_count, _new_count,
                                             f"{_approx_tokens:,}", f"{_new_tokens:,}",
+                                        )
+                                        self._clear_hygiene_compression_failures(
+                                            session_entry.session_id
                                         )
                                     else:
                                         # No rewrite happened — transcript preserved
@@ -16595,6 +16671,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             self._hygiene_compression_failure_cooldowns[
                                                 session_entry.session_id
                                             ] = time.time() + _hyg_failure_cooldown_seconds
+                                        _hyg_streak = self._record_hygiene_compression_failure(
+                                            session_entry.session_id
+                                        )
                                         _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
                                         # Force-redact: provider exception text
                                         # may contain credentials; this message
@@ -19824,6 +19903,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return cfg if isinstance(cfg, dict) else {}
         except Exception:
             return {}
+
+    def _record_hygiene_compression_failure(self, session_id: str) -> int:
+        """Bump and return the consecutive hygiene-compression failure streak.
+
+        Per-occurrence a hygiene failure is benign (nothing is dropped), but a
+        session that can NEVER compress grows until it overflows the model
+        window.  The streak is what makes that visible; it is cleared by
+        :meth:`_clear_hygiene_compression_failures` on any real compaction.
+        """
+        streaks = getattr(self, "_hygiene_compression_failure_streaks", None)
+        if streaks is None:
+            streaks = {}
+            self._hygiene_compression_failure_streaks = streaks
+        streaks[session_id] = int(streaks.get(session_id, 0)) + 1
+        return streaks[session_id]
+
+    def _clear_hygiene_compression_failures(self, session_id: str) -> None:
+        """Reset the streak after a compaction that actually shrank the session."""
+        streaks = getattr(self, "_hygiene_compression_failure_streaks", None)
+        if isinstance(streaks, dict):
+            streaks.pop(session_id, None)
 
     async def _announce_hygiene_compaction(
         self,
