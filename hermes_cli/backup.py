@@ -101,6 +101,26 @@ _EXCLUDED_PARENT_CHILD = (
     ("managed", "user-data"),           # browser/managed/user-data — Chromium automation profile
 )
 
+# Path-anchored GLOB excludes: an ancestor sequence with wildcard components.
+# Each entry is a tuple of path components where ``None`` matches any single
+# component. Unlike _EXCLUDED_PARENT_CHILD (a fixed adjacent pair), this expresses
+# "<fixed>/<fixed>/<anything>/<fixed>" shapes.
+#
+# kanban/boards/<board-slug>/workspaces/ holds EPHEMERAL per-task scratch checkouts
+# (git clones, .venv, node_modules, caches) that the kanban runtime creates and
+# REAPS as tasks finish. They are large (multi-GB) and regenerable, and because
+# they are reaped concurrently a backup walking them races the reaper: os.walk
+# enumerates a file, the workspace is torn down, and the read fails — one
+# "[Errno 2] No such file or directory" warning per file, thousands per run, all
+# benign but drowning the real warnings in the log.
+#
+# The QUICK tier already treats these as regenerable (see the "/workspaces/" skip
+# in the state-snapshot walker); this brings the FULL tier in line so both tiers
+# agree on what a board restore needs: the board DBs + metadata, not the scratch.
+_EXCLUDED_PATH_GLOBS = (
+    ("kanban", "boards", None, "workspaces"),   # ephemeral per-task scratch checkouts
+)
+
 # Directory-NAME prefixes to skip anywhere in the tree. Browser-automation debug
 # profiles (browser-access / CDP) are transient junk: they hold dozens of Chrome
 # SQLite DBs (first_party_sets.db, History, Cookies, …) that a LIVE Chrome keeps
@@ -259,6 +279,26 @@ def _iter_external_files(base: Path) -> List[Path]:
     return files
 
 
+def _matches_path_glob(parts: tuple[str, ...]) -> bool:
+    """Return True if *parts* has an ANCESTOR sequence matching _EXCLUDED_PATH_GLOBS.
+
+    ``None`` in a pattern is a single-component wildcard. Only ancestor
+    components (``parts[:-1]``) are tested so a regular file whose own name
+    happens to equal the pattern's last component is never excluded — the same
+    ancestor-only discipline used for _EXCLUDED_DIR_PREFIXES.
+    """
+    ancestors = parts[:-1]
+    for pattern in _EXCLUDED_PATH_GLOBS:
+        n = len(pattern)
+        for i in range(len(ancestors) - n + 1):
+            if all(
+                pat is None or ancestors[i + j] == pat
+                for j, pat in enumerate(pattern)
+            ):
+                return True
+    return False
+
+
 def _should_exclude(rel_path: Path) -> bool:
     """Return True if *rel_path* (relative to hermes root) should be skipped."""
     parts = rel_path.parts
@@ -290,6 +330,13 @@ def _should_exclude(rel_path: Path) -> bool:
         for i in range(len(parts) - 1):
             if parts[i] == parent and parts[i + 1] == child:
                 return True
+
+    # Path-anchored GLOB excludes (see _EXCLUDED_PATH_GLOBS): match an ancestor
+    # SEQUENCE where ``None`` is a single-component wildcard. Only ancestor
+    # components are considered, so a FILE whose name coincides with the final
+    # component is never dropped by this rule.
+    if _matches_path_glob(parts):
+        return True
 
     name = rel_path.name
 
@@ -443,6 +490,12 @@ def run_backup(args) -> None:
             d for d in dirnames
             if (d not in _EXCLUDED_DIRS or (d == "hermes-agent" and not is_root))
             and not d.startswith(_EXCLUDED_DIR_PREFIXES)
+            # Prune path-anchored globs (e.g. kanban/boards/*/workspaces) HERE so
+            # os.walk never DESCENDS into them. Filtering only at the file level
+            # would still enumerate the subtree — which is the actual bug: the
+            # kanban reaper deletes those workspaces concurrently, so every
+            # enumerated-then-vanished file raises a benign ENOENT warning.
+            and not _matches_path_glob((*(rel_dir / d).parts, "_"))
         ]
         for removed in set(orig_dirnames) - set(dirnames):
             skipped_dirs.add(str(rel_dir / removed))
@@ -1315,11 +1368,13 @@ def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
     try:
         for dirpath, dirnames, filenames in os.walk(hermes_root, followlinks=False):
             dp = Path(dirpath)
+            rel_dir_full = dp.relative_to(hermes_root)
             # Prune excluded directories in-place so os.walk doesn't descend
             dirnames[:] = [
                 d for d in dirnames
                 if d not in _EXCLUDED_DIRS
                 and not d.startswith(_EXCLUDED_DIR_PREFIXES)
+                and not _matches_path_glob((*(rel_dir_full / d).parts, "_"))
             ]
 
             for fname in filenames:

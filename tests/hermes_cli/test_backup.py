@@ -130,6 +130,38 @@ class TestShouldExclude:
         assert not _should_exclude(Path("workspace/my-notes/swiftui-docs/cheatsheet.md"))
         assert not _should_exclude(Path("swiftui-docs/random-user-file.md"))
 
+    def test_excludes_kanban_board_workspaces(self):
+        """kanban/boards/<slug>/workspaces/ holds EPHEMERAL per-task scratch
+        checkouts that the kanban runtime reaps as tasks finish. A full backup
+        walking them races the reaper: os.walk enumerates a file, the workspace
+        is torn down, the read fails — thousands of benign
+        "[Errno 2] No such file or directory" warnings per run that drown the
+        real ones. They are also large and fully regenerable, and the QUICK tier
+        already skips them, so the FULL tier must agree.
+
+        SCOPED via a path glob (kanban/boards/*/workspaces) so the board
+        databases + metadata — the things a board restore actually needs — and
+        any coincidental user dir named "workspaces" are all preserved.
+        """
+        from hermes_cli.backup import _should_exclude
+        # ephemeral scratch under any board slug → excluded
+        assert _should_exclude(
+            Path("kanban/boards/parity-doctrine/workspaces/t_2a6fd40c/.venv/x.py")
+        )
+        assert _should_exclude(
+            Path("kanban/boards/media-homelab/workspaces/t_v3multilane/repo/a.txt")
+        )
+        # 🔴 the board DB + metadata MUST survive — they are the restore payload
+        assert not _should_exclude(Path("kanban/boards/parity-doctrine/kanban.db"))
+        assert not _should_exclude(Path("kanban/boards/parity-doctrine/meta.json"))
+        assert not _should_exclude(Path("kanban.db"))
+        # 🔴 a coincidental user dir named "workspaces" elsewhere IS preserved
+        assert not _should_exclude(Path("skills/x/workspaces/note.md"))
+        # the glob needs the board-slug component; boards/workspaces is not a match
+        assert not _should_exclude(Path("kanban/boards/workspaces/a.txt"))
+        # a FILE literally named "workspaces" is not a directory — keep it
+        assert not _should_exclude(Path("kanban/boards/slug/workspaces"))
+
     def test_excludes_sqlite_sidecars(self):
         """SQLite WAL/SHM/journal sidecars must not ship alongside the
         safe-copied .db — pairing a fresh snapshot with stale sidecar state
