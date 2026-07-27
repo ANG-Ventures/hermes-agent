@@ -818,6 +818,91 @@ class TestLowercaseDottedConfigKeys:
         assert redact_sensitive_text(text) == text
 
 
+class TestCfgDottedRePerformance:
+    """_CFG_DOTTED_RE must not backtrack catastrophically.
+
+    The original pattern nested a quantifier — ``(?:[A-Za-z0-9_\\-]+\\.)+`` — in
+    front of a dot-inclusive character class. A long dotted token with no secret
+    word (minified JS, a base64-ish blob, a dotted module path) could be split
+    into segments exponentially many ways, and ``re`` retried every split at
+    every start offset. Measured on an 80 KB input: ~151 s for a single
+    ``sub()``, which dominated the wall-clock of the CI test slice that redacts
+    large captured output.
+
+    These are hard timing bounds, generous by ~2 orders of magnitude against the
+    fixed implementation (80 KB in ~0.007 s) so they cannot flake on a loaded CI
+    runner, while still failing loudly if the nested quantifier ever returns.
+    """
+
+    # One long dotted run, no secret word, no '=' — the pathological shape.
+    ADVERSARIAL = ".".join(["abcdefgh"] * 900)  # ~8 KB
+
+    def test_long_dotted_run_is_fast(self):
+        import time
+
+        from agent.redact import _CFG_DOTTED_RE
+
+        start = time.perf_counter()
+        _CFG_DOTTED_RE.sub("X", self.ADVERSARIAL)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 2.0, f"_CFG_DOTTED_RE took {elapsed:.1f}s on 8KB input"
+
+    def test_scaling_is_not_exponential(self):
+        """Doubling the input must not blow up the runtime.
+
+        Under the old pattern this ratio was ~10x per doubling; linear scanning
+        keeps it near 2x. The bound of 6x tolerates constant-factor noise while
+        still catching super-quadratic behaviour.
+        """
+        import time
+
+        from agent.redact import _CFG_DOTTED_RE
+
+        def timed(segments: int) -> float:
+            text = ".".join(["abcdefgh"] * segments)
+            start = time.perf_counter()
+            _CFG_DOTTED_RE.sub("X", text)
+            return time.perf_counter() - start
+
+        small = timed(500)
+        large = timed(1000)
+        # Guard against a divide-by-zero on a very fast machine.
+        assert large < max(small * 6.0, 0.5)
+
+    def test_redact_sensitive_text_handles_large_dotted_input(self):
+        """End-to-end: the public entrypoint must stay responsive."""
+        import time
+
+        text = "\n".join([".".join(["abcdefgh"] * 60) for _ in range(120)])
+        start = time.perf_counter()
+        redact_sensitive_text(text, force=True)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 5.0, f"redact_sensitive_text took {elapsed:.1f}s"
+
+    def test_semantics_preserved_on_dotted_corpus(self):
+        """Match parity: the fix must not change what gets redacted."""
+        must_redact = [
+            ("spring.datasource.password=Sup3rS3cret", "Sup3rS3cret"),
+            ("app.api.key=ak_live_998877", "ak_live_998877"),
+            ("a.b.c.d.e.token=tok_abc123", "tok_abc123"),
+            ("my.secret.thing=val9876", "val9876"),
+            ("auth.credential=cred_xyz789", "cred_xyz789"),
+            ("x.api-key=hunter2value", "hunter2value"),
+        ]
+        for text, secret in must_redact:
+            result = redact_sensitive_text(text, force=True)
+            assert secret not in result, f"leaked from {text!r}"
+
+        must_not_change = [
+            "server.port=8080",
+            "logging.level.root=INFO",
+            "a.b.c.d.e.f=plainvalue",
+            "module.submodule.function=identity",
+        ]
+        for text in must_not_change:
+            assert redact_sensitive_text(text, force=True) == text, text
+
+
 class TestXaiToken:
     KEY = "xai-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstu"
 
