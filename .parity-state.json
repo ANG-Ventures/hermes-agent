@@ -1,4 +1,16 @@
 {
+  "baseline_advances": [
+    {
+      "from": "37fa0a353104ec949eba441937e9985e32ceb661",
+      "reason": "51247296b docs-only doctrine (file already staged) + 371f3aec1 #418 denorm (source lines verified in staged hermes_state.py by fold-analysis; test file brought across, 20 passed/1 skipped by orchestrator). Real `git merge fork/main` runs right after the merge commit (MERGE_HEAD blocks it before).",
+      "to": "371f3aec1ec16685db2984af92e5f0d8456a344b"
+    },
+    {
+      "from": "371f3aec1ec16685db2984af92e5f0d8456a344b",
+      "reason": "b51d659dc #419 claude-opus-5 pricing+catalogs (Ace-authored 11:06 PT). NOT yet in staged tree - touches usage_pricing.py/models.py/model-catalog.json which the merge also rewrote. This is a REAL fold: the actual git merge fork/main runs immediately after the merge commit is cut (MERGE_HEAD forbids a second concurrent merge before then). Conflicts, if any, resolved in that fold commit, not hidden here.",
+      "to": "b51d659dc08a1d5f578ba32743c188c1e6daf818"
+    }
+  ],
   "branch": "sync/upstream-2026-07-23",
   "buckets": {
     "arch_split": 6,
@@ -9,8 +21,1331 @@
   },
   "created": "2026-07-24T02:01:07.444307+00:00",
   "fork": "fork/main",
-  "fork_main_at_start": "37fa0a353104ec949eba441937e9985e32ceb661",
-  "gates": {},
+  "fork_main_at_start": "b51d659dc08a1d5f578ba32743c188c1e6daf818",
+  "forkdelta_acks": [
+    {
+      "at": "2026-07-24T08:30:51.293865+00:00",
+      "path": ".github/actions/detect-changes/action.yml",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:51.317837+00:00",
+      "path": ".github/workflows/ci.yml",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:51.416660+00:00",
+      "path": ".github/workflows/lint.yml",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:51.437961+00:00",
+      "path": ".github/workflows/tests.yml",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:51.459476+00:00",
+      "path": ".gitignore",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:51.572536+00:00",
+      "path": ".parity-state.json",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:51.599295+00:00",
+      "path": "acp_adapter/session.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:51.713759+00:00",
+      "path": "acp_adapter/tools.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:51.738788+00:00",
+      "path": "agent/agent_init.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:51.865242+00:00",
+      "path": "agent/agent_runtime_helpers.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:51.893950+00:00",
+      "path": "agent/anthropic_adapter.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:52.012929+00:00",
+      "path": "agent/auxiliary_client.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:52.038021+00:00",
+      "path": "agent/chat_completion_helpers.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:52.152659+00:00",
+      "path": "agent/codex_runtime.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:52.182052+00:00",
+      "path": "agent/context_compressor.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:52.247751+00:00",
+      "path": "agent/context_engine.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:52.277220+00:00",
+      "path": "agent/conversation_compression.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:52.399667+00:00",
+      "path": "agent/conversation_loop.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:52.422208+00:00",
+      "path": "agent/copilot_acp_client.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:52.570130+00:00",
+      "path": "agent/display.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:52.598060+00:00",
+      "path": "agent/error_classifier.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:52.639875+00:00",
+      "path": "agent/image_routing.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:52.686763+00:00",
+      "path": "agent/manual_compression_feedback.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:52.714564+00:00",
+      "path": "agent/memory_manager.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:52.782605+00:00",
+      "path": "agent/moa_loop.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:52.814258+00:00",
+      "path": "agent/model_metadata.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:52.874294+00:00",
+      "path": "agent/prompt_builder.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:52.900829+00:00",
+      "path": "agent/redact.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:53.019509+00:00",
+      "path": "agent/runtime_cwd.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:53.047859+00:00",
+      "path": "agent/skill_utils.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:53.155729+00:00",
+      "path": "agent/system_prompt.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:53.183028+00:00",
+      "path": "agent/tool_executor.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:53.234029+00:00",
+      "path": "agent/transports/chat_completions.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:53.268444+00:00",
+      "path": "agent/transports/codex.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:53.295573+00:00",
+      "path": "agent/turn_context.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:53.401296+00:00",
+      "path": "agent/turn_finalizer.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:53.424385+00:00",
+      "path": "agent/usage_pricing.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:53.475744+00:00",
+      "path": "agent/verification_evidence.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:53.502206+00:00",
+      "path": "apps/desktop/electron/backend-probes.test.ts",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:53.523074+00:00",
+      "path": "apps/desktop/electron/bootstrap-runner.test.ts",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:53.570199+00:00",
+      "path": "apps/desktop/electron/connection-config.test.ts",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:53.655910+00:00",
+      "path": "apps/desktop/electron/git-review-ops.test.ts",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:53.727812+00:00",
+      "path": "apps/desktop/electron/git-review-ops.ts",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:53.753086+00:00",
+      "path": "apps/desktop/electron/preload.ts",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:53.834485+00:00",
+      "path": "apps/desktop/electron/session-windows.test.ts",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:53.894478+00:00",
+      "path": "apps/desktop/src/app/chat/right-rail/preview-file.tsx",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:53.938155+00:00",
+      "path": "apps/desktop/src/app/chat/right-rail/preview-pane.tsx",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:53.985860+00:00",
+      "path": "apps/desktop/src/app/chat/sidebar/session-row.tsx",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:54.012660+00:00",
+      "path": "apps/desktop/src/app/chat/sidebar/sessions-section.tsx",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:54.119726+00:00",
+      "path": "apps/desktop/src/app/command-center/index.tsx",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:54.147861+00:00",
+      "path": "apps/desktop/src/app/contrib/hooks/use-background-sync.ts",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:54.220577+00:00",
+      "path": "apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:54.248123+00:00",
+      "path": "apps/desktop/src/app/gateway/hooks/use-gateway-request.ts",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:54.407748+00:00",
+      "path": "apps/desktop/src/app/session/hooks/use-hermes-config.test.ts",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:54.429380+00:00",
+      "path": "apps/desktop/src/app/session/hooks/use-hermes-config.ts",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:54.500765+00:00",
+      "path": "apps/desktop/src/app/session/hooks/use-message-stream/index.ts",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:54.656000+00:00",
+      "path": "apps/desktop/src/app/session/hooks/use-model-controls.test.tsx",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:54.681278+00:00",
+      "path": "apps/desktop/src/app/session/hooks/use-model-controls.ts",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:54.740954+00:00",
+      "path": "apps/desktop/src/app/session/hooks/use-preview-routing.test.tsx",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:54.764788+00:00",
+      "path": "apps/desktop/src/app/session/hooks/use-prompt-actions/slash.ts",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:54.863375+00:00",
+      "path": "apps/desktop/src/app/session/hooks/use-session-actions/index.ts",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:54.901168+00:00",
+      "path": "apps/desktop/src/app/session/hooks/use-session-list-actions.ts",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:54.927890+00:00",
+      "path": "apps/desktop/src/app/session/hooks/use-session-state-cache.ts",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:54.993867+00:00",
+      "path": "apps/desktop/src/app/settings/helpers.test.ts",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:55.018936+00:00",
+      "path": "apps/desktop/src/app/shell/model-edit-submenu.test.tsx",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:55.170636+00:00",
+      "path": "apps/desktop/src/components/assistant-ui/markdown-text.test.ts",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:55.196642+00:00",
+      "path": "apps/desktop/src/components/assistant-ui/markdown-text.tsx",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:55.312587+00:00",
+      "path": "apps/desktop/src/components/assistant-ui/thread/assistant-message.tsx",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:55.332768+00:00",
+      "path": "apps/desktop/src/components/assistant-ui/thread/list.tsx",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:55.355606+00:00",
+      "path": "apps/desktop/src/global.d.ts",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:55.514456+00:00",
+      "path": "apps/desktop/src/hermes.ts",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:55.537329+00:00",
+      "path": "apps/desktop/src/i18n/en.ts",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:55.606563+00:00",
+      "path": "apps/desktop/src/i18n/types.ts",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:55.634069+00:00",
+      "path": "apps/desktop/src/i18n/zh.ts",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:55.724958+00:00",
+      "path": "apps/desktop/src/lib/chat-messages.ts",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:55.849258+00:00",
+      "path": "apps/desktop/src/lib/chat-runtime.ts",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:55.874844+00:00",
+      "path": "apps/desktop/src/lib/desktop-fs.test.ts",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:55.942092+00:00",
+      "path": "apps/desktop/src/lib/desktop-fs.ts",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:55.969907+00:00",
+      "path": "apps/desktop/src/lib/desktop-slash-commands.test.ts",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:56.083795+00:00",
+      "path": "apps/desktop/src/lib/desktop-slash-commands.ts",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:56.111771+00:00",
+      "path": "apps/desktop/src/lib/media.remote.test.ts",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:56.227143+00:00",
+      "path": "apps/desktop/src/lib/media.ts",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:56.253657+00:00",
+      "path": "apps/desktop/src/store/layout.ts",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:56.326839+00:00",
+      "path": "apps/desktop/src/store/projects.test.ts",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:56.350756+00:00",
+      "path": "apps/desktop/src/store/projects.ts",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:56.371357+00:00",
+      "path": "apps/desktop/src/store/session.ts",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:56.485906+00:00",
+      "path": "apps/desktop/src/types/hermes.ts",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:56.507244+00:00",
+      "path": "apps/desktop/vite.config.ts",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:56.618051+00:00",
+      "path": "cli-config.yaml.example",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:56.652535+00:00",
+      "path": "cli.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:56.768866+00:00",
+      "path": "cron/jobs.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:56.792074+00:00",
+      "path": "cron/scheduler.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:56.840924+00:00",
+      "path": "docs/session-lifecycle.md",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:56.882823+00:00",
+      "path": "docs/sync/review/conflict-buckets.md",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:56.907470+00:00",
+      "path": "gates.jsonl",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:56.975076+00:00",
+      "path": "gateway/channel_directory.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:57.003629+00:00",
+      "path": "gateway/config.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:57.069264+00:00",
+      "path": "gateway/kanban_watchers.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:57.091659+00:00",
+      "path": "gateway/platforms/api_server.py",
+      "reason": "Auto-merge fork-delta. Lost nested _port_is_available(): upstream #10297 (documented in staged tests/gateway/test_api_server_bind_guard.py L157-160) deliberately removed the 127.0.0.1 pre-probe in favor of direct bind. Intentional upstream convergence, test present & green."
+    },
+    {
+      "at": "2026-07-24T08:30:57.167217+00:00",
+      "path": "gateway/platforms/base.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:57.191302+00:00",
+      "path": "gateway/platforms/webhook.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:57.216299+00:00",
+      "path": "gateway/session.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:57.239929+00:00",
+      "path": "gateway/slash_commands.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:57.304118+00:00",
+      "path": "gateway/status.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:57.325774+00:00",
+      "path": "hermes_cli/auth.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:57.384910+00:00",
+      "path": "hermes_cli/backup.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:57.411802+00:00",
+      "path": "hermes_cli/banner.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:57.431511+00:00",
+      "path": "hermes_cli/browser_connect.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:57.490606+00:00",
+      "path": "hermes_cli/cli_agent_setup_mixin.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:57.510959+00:00",
+      "path": "hermes_cli/cli_commands_mixin.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:57.531305+00:00",
+      "path": "hermes_cli/commands.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:57.594134+00:00",
+      "path": "hermes_cli/config.py",
+      "reason": "RESOLUTION-LEDGER.md worker3 \u00a7config.py (4 hunks, U/B). Lost is_uv_tool_install/is_unsupported_install_method/format_unsupported_install_warning: upstream ALSO dropped them (sanctioned brew/PyPI packaging removal, skill #68217); their tests deleted in the 39-file D set (test_uv_tool_update.py, test_banner_pip_update.py); zero remaining callers in staged tree (verified git grep)."
+    },
+    {
+      "at": "2026-07-24T08:30:57.617110+00:00",
+      "path": "hermes_cli/cron.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:57.722035+00:00",
+      "path": "hermes_cli/doctor.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:57.792156+00:00",
+      "path": "hermes_cli/gateway.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:57.815421+00:00",
+      "path": "hermes_cli/inventory.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:57.879841+00:00",
+      "path": "hermes_cli/kanban.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:57.906059+00:00",
+      "path": "hermes_cli/kanban_db.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:57.972785+00:00",
+      "path": "hermes_cli/model_switch.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:57.996744+00:00",
+      "path": "hermes_cli/models.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:58.064380+00:00",
+      "path": "hermes_cli/providers.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:58.090746+00:00",
+      "path": "hermes_cli/session_recap.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:58.160167+00:00",
+      "path": "hermes_cli/skin_engine.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:58.188135+00:00",
+      "path": "hermes_cli/subcommands/cron.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:58.258505+00:00",
+      "path": "hermes_cli/tips.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:58.281885+00:00",
+      "path": "hermes_cli/tools_config.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:58.305344+00:00",
+      "path": "hermes_cli/web_server.py",
+      "reason": "RESOLUTION-LEDGER.md worker3 \u00a7web_server.py (11 hunks, B/UP converge on upstream to_thread). Lost _update_declared_provider_config/_dashboard_console_context etc. relocated to _declared_provider_payload (present staged L5636); DeclaredMemoryProvider + is_truthy_value fork imports preserved (L101/L105). AST source-contract test PASSES vs merged tree."
+    },
+    {
+      "at": "2026-07-24T08:30:58.328783+00:00",
+      "path": "hermes_constants.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:58.350102+00:00",
+      "path": "hermes_state.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:59.243706+00:00",
+      "path": "model_tools.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:59.265386+00:00",
+      "path": "package-lock.json",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:59.330994+00:00",
+      "path": "plugins/kanban/dashboard/dist/index.js",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:59.351175+00:00",
+      "path": "plugins/platforms/discord/adapter.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:59.417248+00:00",
+      "path": "pyproject.toml",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:59.440203+00:00",
+      "path": "run_agent.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:59.470096+00:00",
+      "path": "scripts/ci/classify_changes.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:59.698302+00:00",
+      "path": "scripts/iso-certify.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:59.721034+00:00",
+      "path": "scripts/release.py",
+      "reason": "RESOLUTION-LEDGER.md L46: adopted upstream directory-based contributor arch, dropped fork ACP_REGISTRY refs (acp_registry/ deleted upstream, staged D). build_release_artifacts/_update_acp_registry_versions removed with the sanctioned upstream brew/PyPI+ACP packaging removal (skill: upstream #68217). 5 fork author entries preserved in LEGACY_AUTHOR_MAP."
+    },
+    {
+      "at": "2026-07-24T08:30:59.774643+00:00",
+      "path": "scripts/run_tests_parallel.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:30:59.819471+00:00",
+      "path": "tests/agent/test_anthropic_adapter.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:59.894429+00:00",
+      "path": "tests/agent/test_codex_ttfb_watchdog.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:59.923581+00:00",
+      "path": "tests/agent/test_context_compressor.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:30:59.989321+00:00",
+      "path": "tests/agent/test_credential_pool_routing.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:00.012293+00:00",
+      "path": "tests/agent/test_error_classifier.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:00.037020+00:00",
+      "path": "tests/agent/test_i18n.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:00.106622+00:00",
+      "path": "tests/agent/test_image_routing.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:00.157929+00:00",
+      "path": "tests/agent/test_manual_compression_feedback.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:00.252100+00:00",
+      "path": "tests/agent/test_memory_provider.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:00.278378+00:00",
+      "path": "tests/agent/test_model_metadata.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:31:00.305523+00:00",
+      "path": "tests/agent/test_redact.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:00.327234+00:00",
+      "path": "tests/agent/test_usage_pricing.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:00.390286+00:00",
+      "path": "tests/agent/test_verification_evidence.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:00.412976+00:00",
+      "path": "tests/agent/transports/test_chat_completions.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:00.473005+00:00",
+      "path": "tests/ci/test_classify_changes.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:00.495055+00:00",
+      "path": "tests/cli/test_cli_browser_connect.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:00.517801+00:00",
+      "path": "tests/cli/test_fast_command.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:00.585343+00:00",
+      "path": "tests/conftest.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:00.608510+00:00",
+      "path": "tests/cron/test_codex_execution_paths.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:00.684045+00:00",
+      "path": "tests/cron/test_cron_script.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:00.731960+00:00",
+      "path": "tests/cron/test_scheduler.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:00.753487+00:00",
+      "path": "tests/gateway/test_background_command.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:00.810110+00:00",
+      "path": "tests/gateway/test_completion_delivery.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:00.828601+00:00",
+      "path": "tests/gateway/test_compress_command.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:00.851164+00:00",
+      "path": "tests/gateway/test_discord_connect.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:00.921203+00:00",
+      "path": "tests/gateway/test_fast_command.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:00.953107+00:00",
+      "path": "tests/gateway/test_gateway_shutdown.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:00.975633+00:00",
+      "path": "tests/gateway/test_model_command_flat_string_config.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:01.004797+00:00",
+      "path": "tests/gateway/test_model_picker_persist.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:01.109434+00:00",
+      "path": "tests/gateway/test_profile_resolution.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:01.136465+00:00",
+      "path": "tests/gateway/test_restart_resume_pending.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:01.199479+00:00",
+      "path": "tests/gateway/test_run_progress_topics.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:01.224050+00:00",
+      "path": "tests/gateway/test_session_api.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:01.253389+00:00",
+      "path": "tests/gateway/test_session_hygiene.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:01.278196+00:00",
+      "path": "tests/gateway/test_session_info.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:01.312178+00:00",
+      "path": "tests/gateway/test_session_reset_notify.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:01.354219+00:00",
+      "path": "tests/gateway/test_shared_group_sender_prefix.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:01.374889+00:00",
+      "path": "tests/gateway/test_status.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:01.416424+00:00",
+      "path": "tests/gateway/test_status_command.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:01.453983+00:00",
+      "path": "tests/gateway/test_stream_consumer.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:01.480508+00:00",
+      "path": "tests/gateway/test_telegram_conflict.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:01.592751+00:00",
+      "path": "tests/gateway/test_telegram_network_reconnect.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:01.611726+00:00",
+      "path": "tests/gateway/test_telegram_noise_filter.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:01.634349+00:00",
+      "path": "tests/hermes_cli/test_backup.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:01.689847+00:00",
+      "path": "tests/hermes_cli/test_config.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:01.730697+00:00",
+      "path": "tests/hermes_cli/test_config_validation.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:01.788317+00:00",
+      "path": "tests/hermes_cli/test_gateway_service.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:01.813604+00:00",
+      "path": "tests/hermes_cli/test_inventory.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:01.933603+00:00",
+      "path": "tests/hermes_cli/test_list_picker_providers.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:01.962430+00:00",
+      "path": "tests/hermes_cli/test_model_switch_custom_providers.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:02.067995+00:00",
+      "path": "tests/hermes_cli/test_runtime_provider_resolution.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:02.093999+00:00",
+      "path": "tests/hermes_cli/test_session_recap.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:02.133606+00:00",
+      "path": "tests/hermes_cli/test_update_check.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:02.222799+00:00",
+      "path": "tests/hermes_cli/test_web_server.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:02.249575+00:00",
+      "path": "tests/hermes_cli/test_web_server_cron_profiles.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:02.313408+00:00",
+      "path": "tests/honcho_plugin/test_session.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:02.335362+00:00",
+      "path": "tests/run_agent/test_413_compression.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:02.368601+00:00",
+      "path": "tests/run_agent/test_codex_xai_oauth_recovery.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:02.454431+00:00",
+      "path": "tests/run_agent/test_credential_pool_interrupt.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:02.474664+00:00",
+      "path": "tests/run_agent/test_partial_stream_finish_reason.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:02.495165+00:00",
+      "path": "tests/run_agent/test_run_agent_codex_responses.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:02.563016+00:00",
+      "path": "tests/run_agent/test_run_agent_conversation.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:02.608212+00:00",
+      "path": "tests/test_hermes_constants.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:02.628826+00:00",
+      "path": "tests/test_hermes_state.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:02.679850+00:00",
+      "path": "tests/test_live_system_guard_self_test.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:02.706740+00:00",
+      "path": "tests/test_packaging_metadata.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:02.725613+00:00",
+      "path": "tests/test_run_tests_parallel.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:02.778126+00:00",
+      "path": "tests/test_tui_gateway_server.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:02.802172+00:00",
+      "path": "tests/test_web_server.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:02.822800+00:00",
+      "path": "tests/test_web_server_sessiondb_eventloop.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:31:02.882341+00:00",
+      "path": "tests/tools/test_async_delegation.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:02.904762+00:00",
+      "path": "tests/tools/test_delegate.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:02.924845+00:00",
+      "path": "tests/tools/test_kanban_tools.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:02.997387+00:00",
+      "path": "tests/tools/test_mcp_cancelled_error_propagation.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:03.028767+00:00",
+      "path": "tests/tools/test_send_message_tool.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:03.135500+00:00",
+      "path": "tests/tools/test_skill_manager_tool.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:03.165101+00:00",
+      "path": "tests/tools/test_url_safety.py",
+      "reason": "Conflict file resolved, not itemized in ledger; reviewed this pass. Fork-only symbol-loss scan (py AST + TS regex) shows only upstream-converged renames (SessionStatusDot, migrateWorkspaceCollapsedIds, refreshCronSessions retained), no unexplained drop. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:03.192265+00:00",
+      "path": "tests/tui_gateway/test_compute_host_phase1.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:31:03.217311+00:00",
+      "path": "tests/tui_gateway/test_iso_certify_seam.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:31:03.282107+00:00",
+      "path": "tests/tui_gateway/test_protocol.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:03.301391+00:00",
+      "path": "tools/async_delegation.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:31:03.361116+00:00",
+      "path": "tools/delegate_tool.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:31:03.382379+00:00",
+      "path": "tools/kanban_tools.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:31:03.408040+00:00",
+      "path": "tools/mcp_tool.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:03.477155+00:00",
+      "path": "tools/process_registry.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:03.504415+00:00",
+      "path": "tools/skill_manager_tool.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:03.578512+00:00",
+      "path": "tools/url_safety.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:03.615968+00:00",
+      "path": "tools/vision_tools.py",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:03.714222+00:00",
+      "path": "tui_gateway/compute_host.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:31:03.741466+00:00",
+      "path": "tui_gateway/host_supervisor.py",
+      "reason": "Conflict file resolved per RESOLUTION-LEDGER.md itemized entry; reconciliation reviewed. Behavioral parity: fullsuite-final-delta-classification.md ZERO merge regressions (~35,093 tests)."
+    },
+    {
+      "at": "2026-07-24T08:31:03.798372+00:00",
+      "path": "tui_gateway/server.py",
+      "reason": "Conflict file (48 hunks) resolved; fork behavior PRESENT (no silent drop). traps-stage finding: merge left 9 byte-IDENTICAL duplicate module-level defs (_format_live_* etc., L15076-block re-copied at L16766; fork=1/upstream=1->staged=2) \u2014 runtime-benign (identical shadow) but real dead-code, REPORTED LOUDLY in FORKDELTA-REVIEW.md for orchestrator cleanup, NOT a fork-feature loss. Fullsuite 0 regressions."
+    },
+    {
+      "at": "2026-07-24T08:31:03.823732+00:00",
+      "path": "website/docs/user-guide/configuration.md",
+      "reason": "Clean git 3-way auto-merge of fork-delta (NOT a conflict file); non-overlapping sides preserved by construction, no side picked. Fork-only DEF/CLASS AST scan clean. Fullsuite 0 merge regressions."
+    },
+    {
+      "at": "2026-07-24T09:07:54.985589+00:00",
+      "path": "locales/af.yaml",
+      "reason": "Locale file changed by merge (took upstream reasoning superset). \u26a0\ufe0f CORRECTION: the merge ALSO dropped fork-only keys reset.preferences_preserved + reset.model_preference_unavailable from the reset: block in ALL 16 locales (ledger L25 'NO fork-only keys' claim was WRONG \u2014 it only checked gateway.branch/merge). Staged prod gateway/slash_commands.py L425/L429 still call t() on these keys \u2192 raw-key render \u2192 REAL FINDING #3 in FORKDELTA-REVIEW.md (fork-feature test test_manual_reset_sticky_route.py, manifest #9, catches it: 4 fails). Path acked (the .yaml change itself is legit); the DROP is reported LOUDLY and left for orchestrator to re-add the keys."
+    },
+    {
+      "at": "2026-07-24T09:07:55.062326+00:00",
+      "path": "locales/de.yaml",
+      "reason": "Locale file changed by merge (took upstream reasoning superset). \u26a0\ufe0f CORRECTION: the merge ALSO dropped fork-only keys reset.preferences_preserved + reset.model_preference_unavailable from the reset: block in ALL 16 locales (ledger L25 'NO fork-only keys' claim was WRONG \u2014 it only checked gateway.branch/merge). Staged prod gateway/slash_commands.py L425/L429 still call t() on these keys \u2192 raw-key render \u2192 REAL FINDING #3 in FORKDELTA-REVIEW.md (fork-feature test test_manual_reset_sticky_route.py, manifest #9, catches it: 4 fails). Path acked (the .yaml change itself is legit); the DROP is reported LOUDLY and left for orchestrator to re-add the keys."
+    },
+    {
+      "at": "2026-07-24T09:07:55.252152+00:00",
+      "path": "locales/en.yaml",
+      "reason": "Locale file changed by merge (took upstream reasoning superset). \u26a0\ufe0f CORRECTION: the merge ALSO dropped fork-only keys reset.preferences_preserved + reset.model_preference_unavailable from the reset: block in ALL 16 locales (ledger L25 'NO fork-only keys' claim was WRONG \u2014 it only checked gateway.branch/merge). Staged prod gateway/slash_commands.py L425/L429 still call t() on these keys \u2192 raw-key render \u2192 REAL FINDING #3 in FORKDELTA-REVIEW.md (fork-feature test test_manual_reset_sticky_route.py, manifest #9, catches it: 4 fails). Path acked (the .yaml change itself is legit); the DROP is reported LOUDLY and left for orchestrator to re-add the keys."
+    },
+    {
+      "at": "2026-07-24T09:07:55.348648+00:00",
+      "path": "locales/es.yaml",
+      "reason": "Locale file changed by merge (took upstream reasoning superset). \u26a0\ufe0f CORRECTION: the merge ALSO dropped fork-only keys reset.preferences_preserved + reset.model_preference_unavailable from the reset: block in ALL 16 locales (ledger L25 'NO fork-only keys' claim was WRONG \u2014 it only checked gateway.branch/merge). Staged prod gateway/slash_commands.py L425/L429 still call t() on these keys \u2192 raw-key render \u2192 REAL FINDING #3 in FORKDELTA-REVIEW.md (fork-feature test test_manual_reset_sticky_route.py, manifest #9, catches it: 4 fails). Path acked (the .yaml change itself is legit); the DROP is reported LOUDLY and left for orchestrator to re-add the keys."
+    },
+    {
+      "at": "2026-07-24T09:07:55.449533+00:00",
+      "path": "locales/fr.yaml",
+      "reason": "Locale file changed by merge (took upstream reasoning superset). \u26a0\ufe0f CORRECTION: the merge ALSO dropped fork-only keys reset.preferences_preserved + reset.model_preference_unavailable from the reset: block in ALL 16 locales (ledger L25 'NO fork-only keys' claim was WRONG \u2014 it only checked gateway.branch/merge). Staged prod gateway/slash_commands.py L425/L429 still call t() on these keys \u2192 raw-key render \u2192 REAL FINDING #3 in FORKDELTA-REVIEW.md (fork-feature test test_manual_reset_sticky_route.py, manifest #9, catches it: 4 fails). Path acked (the .yaml change itself is legit); the DROP is reported LOUDLY and left for orchestrator to re-add the keys."
+    },
+    {
+      "at": "2026-07-24T09:07:55.581620+00:00",
+      "path": "locales/ga.yaml",
+      "reason": "Locale file changed by merge (took upstream reasoning superset). \u26a0\ufe0f CORRECTION: the merge ALSO dropped fork-only keys reset.preferences_preserved + reset.model_preference_unavailable from the reset: block in ALL 16 locales (ledger L25 'NO fork-only keys' claim was WRONG \u2014 it only checked gateway.branch/merge). Staged prod gateway/slash_commands.py L425/L429 still call t() on these keys \u2192 raw-key render \u2192 REAL FINDING #3 in FORKDELTA-REVIEW.md (fork-feature test test_manual_reset_sticky_route.py, manifest #9, catches it: 4 fails). Path acked (the .yaml change itself is legit); the DROP is reported LOUDLY and left for orchestrator to re-add the keys."
+    },
+    {
+      "at": "2026-07-24T09:07:55.609449+00:00",
+      "path": "locales/hu.yaml",
+      "reason": "Locale file changed by merge (took upstream reasoning superset). \u26a0\ufe0f CORRECTION: the merge ALSO dropped fork-only keys reset.preferences_preserved + reset.model_preference_unavailable from the reset: block in ALL 16 locales (ledger L25 'NO fork-only keys' claim was WRONG \u2014 it only checked gateway.branch/merge). Staged prod gateway/slash_commands.py L425/L429 still call t() on these keys \u2192 raw-key render \u2192 REAL FINDING #3 in FORKDELTA-REVIEW.md (fork-feature test test_manual_reset_sticky_route.py, manifest #9, catches it: 4 fails). Path acked (the .yaml change itself is legit); the DROP is reported LOUDLY and left for orchestrator to re-add the keys."
+    },
+    {
+      "at": "2026-07-24T09:07:55.822239+00:00",
+      "path": "locales/it.yaml",
+      "reason": "Locale file changed by merge (took upstream reasoning superset). \u26a0\ufe0f CORRECTION: the merge ALSO dropped fork-only keys reset.preferences_preserved + reset.model_preference_unavailable from the reset: block in ALL 16 locales (ledger L25 'NO fork-only keys' claim was WRONG \u2014 it only checked gateway.branch/merge). Staged prod gateway/slash_commands.py L425/L429 still call t() on these keys \u2192 raw-key render \u2192 REAL FINDING #3 in FORKDELTA-REVIEW.md (fork-feature test test_manual_reset_sticky_route.py, manifest #9, catches it: 4 fails). Path acked (the .yaml change itself is legit); the DROP is reported LOUDLY and left for orchestrator to re-add the keys."
+    },
+    {
+      "at": "2026-07-24T09:07:55.849862+00:00",
+      "path": "locales/ja.yaml",
+      "reason": "Locale file changed by merge (took upstream reasoning superset). \u26a0\ufe0f CORRECTION: the merge ALSO dropped fork-only keys reset.preferences_preserved + reset.model_preference_unavailable from the reset: block in ALL 16 locales (ledger L25 'NO fork-only keys' claim was WRONG \u2014 it only checked gateway.branch/merge). Staged prod gateway/slash_commands.py L425/L429 still call t() on these keys \u2192 raw-key render \u2192 REAL FINDING #3 in FORKDELTA-REVIEW.md (fork-feature test test_manual_reset_sticky_route.py, manifest #9, catches it: 4 fails). Path acked (the .yaml change itself is legit); the DROP is reported LOUDLY and left for orchestrator to re-add the keys."
+    },
+    {
+      "at": "2026-07-24T09:07:56.106663+00:00",
+      "path": "locales/ko.yaml",
+      "reason": "Locale file changed by merge (took upstream reasoning superset). \u26a0\ufe0f CORRECTION: the merge ALSO dropped fork-only keys reset.preferences_preserved + reset.model_preference_unavailable from the reset: block in ALL 16 locales (ledger L25 'NO fork-only keys' claim was WRONG \u2014 it only checked gateway.branch/merge). Staged prod gateway/slash_commands.py L425/L429 still call t() on these keys \u2192 raw-key render \u2192 REAL FINDING #3 in FORKDELTA-REVIEW.md (fork-feature test test_manual_reset_sticky_route.py, manifest #9, catches it: 4 fails). Path acked (the .yaml change itself is legit); the DROP is reported LOUDLY and left for orchestrator to re-add the keys."
+    },
+    {
+      "at": "2026-07-24T09:07:56.135200+00:00",
+      "path": "locales/pt.yaml",
+      "reason": "Locale file changed by merge (took upstream reasoning superset). \u26a0\ufe0f CORRECTION: the merge ALSO dropped fork-only keys reset.preferences_preserved + reset.model_preference_unavailable from the reset: block in ALL 16 locales (ledger L25 'NO fork-only keys' claim was WRONG \u2014 it only checked gateway.branch/merge). Staged prod gateway/slash_commands.py L425/L429 still call t() on these keys \u2192 raw-key render \u2192 REAL FINDING #3 in FORKDELTA-REVIEW.md (fork-feature test test_manual_reset_sticky_route.py, manifest #9, catches it: 4 fails). Path acked (the .yaml change itself is legit); the DROP is reported LOUDLY and left for orchestrator to re-add the keys."
+    },
+    {
+      "at": "2026-07-24T09:07:56.337998+00:00",
+      "path": "locales/ru.yaml",
+      "reason": "Locale file changed by merge (took upstream reasoning superset). \u26a0\ufe0f CORRECTION: the merge ALSO dropped fork-only keys reset.preferences_preserved + reset.model_preference_unavailable from the reset: block in ALL 16 locales (ledger L25 'NO fork-only keys' claim was WRONG \u2014 it only checked gateway.branch/merge). Staged prod gateway/slash_commands.py L425/L429 still call t() on these keys \u2192 raw-key render \u2192 REAL FINDING #3 in FORKDELTA-REVIEW.md (fork-feature test test_manual_reset_sticky_route.py, manifest #9, catches it: 4 fails). Path acked (the .yaml change itself is legit); the DROP is reported LOUDLY and left for orchestrator to re-add the keys."
+    },
+    {
+      "at": "2026-07-24T09:07:56.369176+00:00",
+      "path": "locales/tr.yaml",
+      "reason": "Locale file changed by merge (took upstream reasoning superset). \u26a0\ufe0f CORRECTION: the merge ALSO dropped fork-only keys reset.preferences_preserved + reset.model_preference_unavailable from the reset: block in ALL 16 locales (ledger L25 'NO fork-only keys' claim was WRONG \u2014 it only checked gateway.branch/merge). Staged prod gateway/slash_commands.py L425/L429 still call t() on these keys \u2192 raw-key render \u2192 REAL FINDING #3 in FORKDELTA-REVIEW.md (fork-feature test test_manual_reset_sticky_route.py, manifest #9, catches it: 4 fails). Path acked (the .yaml change itself is legit); the DROP is reported LOUDLY and left for orchestrator to re-add the keys."
+    },
+    {
+      "at": "2026-07-24T09:07:56.544224+00:00",
+      "path": "locales/uk.yaml",
+      "reason": "Locale file changed by merge (took upstream reasoning superset). \u26a0\ufe0f CORRECTION: the merge ALSO dropped fork-only keys reset.preferences_preserved + reset.model_preference_unavailable from the reset: block in ALL 16 locales (ledger L25 'NO fork-only keys' claim was WRONG \u2014 it only checked gateway.branch/merge). Staged prod gateway/slash_commands.py L425/L429 still call t() on these keys \u2192 raw-key render \u2192 REAL FINDING #3 in FORKDELTA-REVIEW.md (fork-feature test test_manual_reset_sticky_route.py, manifest #9, catches it: 4 fails). Path acked (the .yaml change itself is legit); the DROP is reported LOUDLY and left for orchestrator to re-add the keys."
+    },
+    {
+      "at": "2026-07-24T09:07:56.595570+00:00",
+      "path": "locales/zh-hant.yaml",
+      "reason": "Locale file changed by merge (took upstream reasoning superset). \u26a0\ufe0f CORRECTION: the merge ALSO dropped fork-only keys reset.preferences_preserved + reset.model_preference_unavailable from the reset: block in ALL 16 locales (ledger L25 'NO fork-only keys' claim was WRONG \u2014 it only checked gateway.branch/merge). Staged prod gateway/slash_commands.py L425/L429 still call t() on these keys \u2192 raw-key render \u2192 REAL FINDING #3 in FORKDELTA-REVIEW.md (fork-feature test test_manual_reset_sticky_route.py, manifest #9, catches it: 4 fails). Path acked (the .yaml change itself is legit); the DROP is reported LOUDLY and left for orchestrator to re-add the keys."
+    },
+    {
+      "at": "2026-07-24T09:07:56.660075+00:00",
+      "path": "locales/zh.yaml",
+      "reason": "Locale file changed by merge (took upstream reasoning superset). \u26a0\ufe0f CORRECTION: the merge ALSO dropped fork-only keys reset.preferences_preserved + reset.model_preference_unavailable from the reset: block in ALL 16 locales (ledger L25 'NO fork-only keys' claim was WRONG \u2014 it only checked gateway.branch/merge). Staged prod gateway/slash_commands.py L425/L429 still call t() on these keys \u2192 raw-key render \u2192 REAL FINDING #3 in FORKDELTA-REVIEW.md (fork-feature test test_manual_reset_sticky_route.py, manifest #9, catches it: 4 fails). Path acked (the .yaml change itself is legit); the DROP is reported LOUDLY and left for orchestrator to re-add the keys."
+    },
+    {
+      "at": "2026-07-24T09:08:08.063567+00:00",
+      "path": "tests/hermes_cli/test_gateway.py",
+      "reason": "Stale fork test replaced with upstream superset at a7a696ba59e0 (patches _exit_after_graceful_shutdown, the contract the merged code adopted). FORKDELTA-REVIEW held this path out until fixed; fix verified 2026-07-24: 57/57 pass under venv pytest -p no:randomly. Reviewer: Apollo (orchestrator)."
+    },
+    {
+      "at": "2026-07-24T17:25:18.748051+00:00",
+      "path": ".gitleaks.toml",
+      "reason": "Orchestrator: 7 path-scoped allowlist entries for upstream-added fake fixtures; CI-faithful scan verified merge-introduced findings=0 (12 residual are in files unchanged by merge, present on fork/main today; see /tmp/parity-gitleaks-preflight.md + FORKDELTA-REVIEW)"
+    },
+    {
+      "at": "2026-07-24T17:25:18.860031+00:00",
+      "path": "apps/desktop/src/app/chat/hooks/use-session-changes.test.ts",
+      "reason": "Desktop vitest lane: harness adapts for fork architecture; full desktop suite 2960 passed / 0 failed + tsc --noEmit clean, verified by orchestrator"
+    },
+    {
+      "at": "2026-07-24T17:25:18.877625+00:00",
+      "path": "apps/desktop/src/app/session/hooks/use-prompt-actions/reasoning-parity.integration.test.tsx",
+      "reason": "Desktop vitest lane: harness adapts for fork architecture; full desktop suite 2960 passed / 0 failed + tsc --noEmit clean, verified by orchestrator"
+    },
+    {
+      "at": "2026-07-24T17:25:18.987005+00:00",
+      "path": "docs/sync/fork-parity-doctrine.md",
+      "reason": "Docs-only: Momus-approved parity doctrine (fork PR #417 merged on fork/main); zero code"
+    },
+    {
+      "at": "2026-07-24T17:25:19.096031+00:00",
+      "path": "plugins/context_engine/lcm/engine.py",
+      "reason": "Hermeticity fix: HERMES_HOME-aware _resolve_db_path fallback; LCM suite 268 passed hermetically (worker verified, orchestrator spot-checked)"
+    },
+    {
+      "at": "2026-07-24T17:25:19.206930+00:00",
+      "path": "tests/agent/test_stream_surrogate_splicer.py",
+      "reason": "Fix-pass lane C: stale test doubles/AST source-test converged to #67142 per-request anthropic client rebuild (D3); 12/12 + 28/28 green per log-C"
+    },
+    {
+      "at": "2026-07-24T17:25:19.223873+00:00",
+      "path": "tests/run_agent/test_run_agent_streaming.py",
+      "reason": "Fix-pass lane C: stale test doubles/AST source-test converged to #67142 per-request anthropic client rebuild (D3); 12/12 + 28/28 green per log-C"
+    },
+    {
+      "at": "2026-07-24T17:25:19.332529+00:00",
+      "path": "tests/hermes_state/test_session_list_denorm_reland.py",
+      "reason": "Fold: #418's test file brought across from fork/main 371f3aec1; 20 passed/1 skipped on staged tree, run by orchestrator"
+    },
+    {
+      "at": "2026-07-24T17:25:19.443548+00:00",
+      "path": "tests/run_agent/test_run_agent_providers.py",
+      "reason": "Fix-pass cluster 1: stale doubles updated to try_refresh_matching/entries contract (merged code already carried it); 94 passed"
+    }
+  ],
+  "gates": {
+    "imports": {
+      "at": "2026-07-24T19:27:35.242916+00:00",
+      "detail": "0 compile failure(s)",
+      "ok": true,
+      "repro": "python3.11 -m py_compile $(git ls-files '*.py')",
+      "tree_sha": "c9e4fa800d5dacd7c4fbed5475cf8e2b6550f642"
+    },
+    "manifest+forkdelta": {
+      "at": "2026-07-24T19:29:01.282765+00:00",
+      "detail": "6 covered, 2 uncovered, 257 acknowledged path(s), 0 lint error(s)",
+      "ok": false,
+      "repro": "python3.11 -m hermes_parity gates --stage manifest+forkdelta",
+      "tree_sha": "c9e4fa800d5dacd7c4fbed5475cf8e2b6550f642"
+    },
+    "markers": {
+      "at": "2026-07-24T19:27:30.307002+00:00",
+      "detail": "0 marker line(s)",
+      "ok": true,
+      "repro": "git grep -nE '^(<<<<<<<|=======|>>>>>>>)' && git diff --diff-filter=U",
+      "tree_sha": "c9e4fa800d5dacd7c4fbed5475cf8e2b6550f642"
+    },
+    "tests": {
+      "at": "2026-07-24T17:28:06.260381+00:00",
+      "detail": "SKIPPED (no corpus; run scripts/run_tests.sh for the full suite)",
+      "ok": false,
+      "repro": "scripts/run_tests.sh",
+      "tree_sha": "c9e4fa800d5dacd7c4fbed5475cf8e2b6550f642"
+    },
+    "traps": {
+      "at": "2026-07-24T19:28:21.184946+00:00",
+      "detail": "3544 unbound + 39 merge-trap issue(s)",
+      "ok": true,
+      "repro": "python3.11 -m hermes_parity gates --stage traps --strict",
+      "tree_sha": "c9e4fa800d5dacd7c4fbed5475cf8e2b6550f642"
+    }
+  },
   "merge_base": "e0240d7bf7ce0d665417d45de0bfa9a65cb0ab48",
   "remote": "origin",
   "rollback": {
