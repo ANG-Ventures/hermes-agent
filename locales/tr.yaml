@@ -97,6 +97,7 @@ gateway:
     full_request_no_fixed: after excludes system prompt + tool schemas (no resident agent to measure them); next live turn will show the full size.
     full_request_real: 'Full request size: {before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; before = last live request, after = estimate of next)'
     full_request_unchanged: 'Full request size: {before} tokens (unchanged — next turn resends the same context)'
+    in_progress: '⏳ ~{count:,} mesaj sıkıştırılıyor… büyük bir oturum birkaç dakika sürebilir. Bittiğinde sonucu buraya göndereceğim.'
     no_provider: Yapılandırılmış sağlayıcı yok — sıkıştırılamıyor.
     not_enough: Sıkıştırmak için yeterli konuşma yok (en az 4 mesaj gerekli).
     nothing_to_do: Henüz sıkıştırılacak bir şey yok (transkript hâlâ tamamen korunan bağlam).

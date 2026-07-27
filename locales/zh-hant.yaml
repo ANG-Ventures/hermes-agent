@@ -97,6 +97,7 @@ gateway:
     full_request_no_fixed: after excludes system prompt + tool schemas (no resident agent to measure them); next live turn will show the full size.
     full_request_real: 'Full request size: {before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; before = last live request, after = estimate of next)'
     full_request_unchanged: 'Full request size: {before} tokens (unchanged — next turn resends the same context)'
+    in_progress: '⏳ 正在壓縮約 {count:,} 則訊息… 大型工作階段可能需要幾分鐘。完成後我會把結果貼在這裡。'
     no_provider: 未設定提供方 — 無法壓縮。
     not_enough: 對話內容不足，無法壓縮（至少需要 4 則訊息）。
     nothing_to_do: 目前沒有可壓縮的內容（對話記錄仍全部為受保護的上下文）。

@@ -1190,3 +1190,83 @@ async def test_compress_command_surfaces_lock_skip():
     assert "Compression already in progress" in result
     assert "pid=99999" in result
     assert "No changes from compression" not in result
+
+
+def _make_large_history(n: int):
+    """n alternating rows — used to cross the progress-ack size threshold."""
+    rows = []
+    for i in range(n):
+        role = "user" if i % 2 == 0 else "assistant"
+        rows.append({"role": role, "content": f"msg {i}"})
+    return rows
+
+
+def _wire_ack_adapter(runner):
+    """Attach a mock adapter + metadata helper so the interim ack has a send path."""
+    from unittest.mock import AsyncMock
+
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    runner._adapter_for_source = MagicMock(return_value=adapter)
+    runner._thread_metadata_for_source = MagicMock(return_value=None)
+    return adapter
+
+
+def _ack_agent(history):
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.session_id = "sess-1"
+    agent_instance._compress_context.return_value = (list(history), "")
+    agent_instance._compression_skipped_due_to_lock = False
+    return agent_instance
+
+
+@pytest.mark.asyncio
+async def test_compress_sends_progress_ack_for_large_session():
+    """A session at/above the threshold gets an interim '⏳ compressing…' ack
+    BEFORE the blocking compress, so a slow compress isn't mistaken for a hang."""
+    from gateway.slash_commands import _COMPRESS_PROGRESS_ACK_MIN_MESSAGES
+
+    history = _make_large_history(_COMPRESS_PROGRESS_ACK_MIN_MESSAGES)
+    runner = _make_runner(history)
+    adapter = _wire_ack_adapter(runner)
+    agent_instance = _ack_agent(history)
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "k"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_request_tokens_rough", return_value=500),
+    ):
+        await runner._handle_compress_command(_make_event())
+
+    adapter.send.assert_awaited_once()
+    sent_text = adapter.send.await_args.args[1]
+    # the count is interpolated and the wording reads as in-progress, not done
+    assert "Compressing" in sent_text
+    assert str(_COMPRESS_PROGRESS_ACK_MIN_MESSAGES) in sent_text.replace(",", "")
+
+
+@pytest.mark.asyncio
+async def test_compress_stays_silent_for_small_session():
+    """Below the threshold a compress finishes fast — no ack noise."""
+    from gateway.slash_commands import _COMPRESS_PROGRESS_ACK_MIN_MESSAGES
+
+    history = _make_large_history(_COMPRESS_PROGRESS_ACK_MIN_MESSAGES - 1)
+    runner = _make_runner(history)
+    adapter = _wire_ack_adapter(runner)
+    agent_instance = _ack_agent(history)
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "k"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_request_tokens_rough", return_value=500),
+    ):
+        await runner._handle_compress_command(_make_event())
+
+    adapter.send.assert_not_awaited()

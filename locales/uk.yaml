@@ -97,6 +97,7 @@ gateway:
     full_request_no_fixed: after excludes system prompt + tool schemas (no resident agent to measure them); next live turn will show the full size.
     full_request_real: 'Full request size: {before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; before = last live request, after = estimate of next)'
     full_request_unchanged: 'Full request size: {before} tokens (unchanged — next turn resends the same context)'
+    in_progress: '⏳ Стиснення ~{count:,} повідомлень… великий сеанс може зайняти кілька хвилин. Я опублікую результат тут, коли завершу.'
     no_provider: Постачальника не налаштовано — неможливо стиснути.
     not_enough: Недостатньо розмови для стиснення (потрібно щонайменше 4 повідомлення).
     nothing_to_do: Поки що немає що стискати (стенограма все ще є повністю захищеним контекстом).

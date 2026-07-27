@@ -97,6 +97,7 @@ gateway:
     full_request_no_fixed: after excludes system prompt + tool schemas (no resident agent to measure them); next live turn will show the full size.
     full_request_real: 'Full request size: {before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; before = last live request, after = estimate of next)'
     full_request_unchanged: 'Full request size: {before} tokens (unchanged — next turn resends the same context)'
+    in_progress: '⏳ Сжатие ~{count:,} сообщений… большая сессия может занять несколько минут. Я опубликую результат здесь, когда закончу.'
     no_provider: Провайдер не настроен — сжатие невозможно.
     not_enough: Недостаточно беседы для сжатия (нужно минимум 4 сообщения).
     nothing_to_do: Пока нечего сжимать (стенограмма всё ещё полностью является защищённым контекстом).
