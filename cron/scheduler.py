@@ -654,7 +654,7 @@ def terminate_running_scripts(reason: str = "") -> int:
                 proc.terminate()
             else:
                 try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)  # windows-footgun: ok — guarded by the sys.platform check above
                 except (ProcessLookupError, PermissionError):
                     # Group already gone, or we somehow don't own it — fall
                     # back to the direct child rather than skipping entirely.
