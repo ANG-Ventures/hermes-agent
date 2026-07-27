@@ -1,0 +1,63 @@
+{
+  "cases": [
+    {"name": "restart threshold default", "kind": "restart_loop_threshold", "value": null},
+    {"name": "restart threshold malformed", "kind": "restart_loop_threshold", "value": "bad"},
+    {"name": "restart threshold clamps low", "kind": "restart_loop_threshold", "value": "0"},
+    {"name": "restart threshold clamps high", "kind": "restart_loop_threshold", "value": "101"},
+    {"name": "restart threshold configured", "kind": "restart_loop_threshold", "value": "7"},
+    {"name": "restart window default", "kind": "restart_loop_window_secs", "value": null},
+    {"name": "restart window malformed", "kind": "restart_loop_window_secs", "value": "bad"},
+    {"name": "restart window clamps low", "kind": "restart_loop_window_secs", "value": "0"},
+    {"name": "restart window clamps high", "kind": "restart_loop_window_secs", "value": "90000"},
+    {"name": "restart window configured", "kind": "restart_loop_window_secs", "value": "12.5"},
+    {"name": "restart breadcrumb ttl default", "kind": "restart_initiated_ttl_secs", "value": null},
+    {"name": "restart breadcrumb ttl malformed", "kind": "restart_initiated_ttl_secs", "value": "bad"},
+    {"name": "restart breadcrumb ttl clamps low", "kind": "restart_initiated_ttl_secs", "value": "1"},
+    {"name": "restart breadcrumb ttl clamps high", "kind": "restart_initiated_ttl_secs", "value": "90000"},
+    {"name": "restart breadcrumb ttl configured", "kind": "restart_initiated_ttl_secs", "value": "240"},
+    {"name": "startup restore timeout default", "kind": "startup_restore_drain_timeout_secs", "value": null},
+    {"name": "startup restore timeout malformed", "kind": "startup_restore_drain_timeout_secs", "value": "bad"},
+    {"name": "startup restore timeout opt out", "kind": "startup_restore_drain_timeout_secs", "value": "-1"},
+    {"name": "startup restore timeout configured", "kind": "startup_restore_drain_timeout_secs", "value": "17.5"},
+    {
+      "name": "config bridge writes configured keys and preserves mapping",
+      "kind": "bridge_agent_config_to_env",
+      "agent_cfg": {
+        "max_turns": 50,
+        "gateway_timeout": 600,
+        "gateway_timeout_warning": 420,
+        "gateway_notify_interval": 60,
+        "restart_drain_timeout": 45,
+        "gateway_auto_continue_freshness": 3600,
+        "resume_flag_stale_clear": true,
+        "resume_interrupted_turns": "auto",
+        "gateway_startup_restore_drain_timeout": 30,
+        "restart_loop_threshold": 3,
+        "restart_loop_window_secs": 300,
+        "restart_initiated_ttl_secs": 600
+      },
+      "pre_env": {"HERMES_MAX_ITERATIONS": "99"}
+    },
+    {
+      "name": "config bridge leaves absent keys untouched",
+      "kind": "bridge_agent_config_to_env",
+      "agent_cfg": {"max_turns": 42},
+      "pre_env": {"HERMES_RESTART_LOOP_THRESHOLD": "9"}
+    },
+    {
+      "name": "config bridge ignores malformed config",
+      "kind": "bridge_agent_config_to_env",
+      "agent_cfg": "not-a-dict",
+      "pre_env": {"HERMES_RESTART_LOOP_THRESHOLD": "8"}
+    },
+    {"name": "safe restart detector rejects empty command", "kind": "command_invokes_safe_restart", "command": ""},
+    {"name": "safe restart detector skips unrelated chain segment", "kind": "command_invokes_safe_restart", "command": "echo hello && python3 safe-restart.py"},
+    {"name": "safe restart detector rejects empty tokenization", "kind": "command_invokes_safe_restart", "command": "safe-restart.py", "force_empty_tokens": true},
+    {"name": "safe restart detector rejects inspection", "kind": "command_invokes_safe_restart", "command": "cat ~/.hermes/skills/safe-restart.py"},
+    {"name": "safe restart detector accepts direct execution", "kind": "command_invokes_safe_restart", "command": "python3 ~/.hermes/skills/safe-restart.py --handoff x"},
+    {"name": "safe restart detector scans chained segments", "kind": "command_invokes_safe_restart", "command": "grep x safe-restart.py && python3 safe-restart.py --profile default"},
+    {"name": "safe restart detector tolerates malformed quotes", "kind": "command_invokes_safe_restart", "command": "python3 safe-restart.py 'unterminated"},
+    {"name": "restart breadcrumb filename empty key", "kind": "restart_initiated_filename", "session_key": ""},
+    {"name": "restart breadcrumb filename session key", "kind": "restart_initiated_filename", "session_key": "telegram:chat-123"}
+  ]
+}

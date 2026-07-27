@@ -126,6 +126,23 @@
   "absorbed_date": null
  },
  {
+  "feature": "gateway restart policy, config bridge, and initiator breadcrumb helpers",
+  "tests": [
+   "tests/gateway/test_fork_ext_restart_policy.py",
+   "tests/gateway/test_restart_cascade.py",
+   "tests/gateway/test_auto_continue_interrupted_turns.py",
+   "tests/gateway/test_reboot_resume_reason.py"
+  ],
+  "paths": [
+   "gateway/fork_ext/restart_policy.py",
+   "tests/golden/restart_policy/"
+  ],
+  "why": "Gateway restart thresholds, startup config-to-env bridging, safe-restart command detection, and per-session initiator breadcrumb naming must remain byte-identical after extraction from the upstream-churned gateway runner.",
+  "lifecycle": "upstream-intended",
+  "upstream_ref": null,
+  "absorbed_date": null
+ },
+ {
   "feature": "gateway configured and persisted route identity helpers",
   "tests": [
    "tests/gateway/test_fast_command.py",

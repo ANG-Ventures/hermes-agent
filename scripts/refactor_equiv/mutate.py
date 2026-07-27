@@ -283,6 +283,49 @@ def route_identity_mutations() -> list[Mutation]:
     ]
 
 
+def restart_policy_mutations() -> list[Mutation]:
+    """Mutations over restart policy scalar, env, classifier, and ID outputs.
+
+    The extracted module emits no messages and performs no DB writes. Its
+    observable output classes are scalar policy values, environment writes,
+    safe-restart command classification, and breadcrumb identifiers.
+    """
+    return [
+        Mutation(
+            "return-value: remove restart threshold lower clamp",
+            lambda p: replace_once(
+                p,
+                "return max(1, min(value, 100))",
+                "return min(value, 100)",
+            ),
+        ),
+        Mutation(
+            "environment-write: redirect config bridge output",
+            lambda p: replace_once(
+                p,
+                "os.environ[_env_var] = str(agent_cfg[_cfg_key])",
+                'os.environ[f"{_env_var}_MUTATED"] = str(agent_cfg[_cfg_key])',
+            ),
+        ),
+        Mutation(
+            "branch-classification: treat inspection as execution",
+            lambda p: replace_once(
+                p,
+                "if first in _SAFE_RESTART_INSPECTION_VERBS:",
+                "if False and first in _SAFE_RESTART_INSPECTION_VERBS:",
+            ),
+        ),
+        Mutation(
+            "identifier-output: shorten restart breadcrumb hash",
+            lambda p: replace_once(
+                p,
+                'return hashlib.sha256((session_key or "").encode("utf-8")).hexdigest()[:8]',
+                'return hashlib.sha256((session_key or "").encode("utf-8")).hexdigest()[:7]',
+            ),
+        ),
+    ]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--module", required=True)
@@ -303,6 +346,8 @@ def main(argv: list[str] | None = None) -> int:
         mutations = restart_codec_mutations()
     elif module.endswith("route_identity.py"):
         mutations = route_identity_mutations()
+    elif module.endswith("restart_policy.py"):
+        mutations = restart_policy_mutations()
     else:
         mutations = []
     if not mutations:

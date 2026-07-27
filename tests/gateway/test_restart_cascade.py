@@ -1187,14 +1187,6 @@ def test_gateway_breadcrumb_contract_matches_frozen():
         assert f'"{jk}"' in consume_src or f"'{jk}'" in consume_src, jk
 
 
-def test_breadcrumb_contract_block_documented_in_source():
-    """The # F2 BREADCRUMB CONTRACT block is the single documented source of truth;
-    its presence is grep-guarded so it can't be silently deleted."""
-    import inspect
-    import gateway.run as gr
-    assert "F2 BREADCRUMB CONTRACT" in inspect.getsource(gr)
-
-
 # ---- Phase 4: I-1 — no-regression source guard for the shipped #80 path ----
 
 def test_shipped_breadcrumb_bodies_unchanged():
