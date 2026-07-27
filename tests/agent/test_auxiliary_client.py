@@ -3,6 +3,7 @@
 import base64
 import json
 import logging
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -5191,11 +5192,26 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert response.choices[0].message.content == "summary"
 
     def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
+        # Ordering witness, not a stopwatch: the stream yields 5 events and
+        # sets ``exhausted`` in a finally only if it is drained to completion.
+        # The adapter must abandon it mid-flight on the total-timeout, so the
+        # witness stays UNSET.  (The old `elapsed < 0.14` bound sat BELOW the
+        # fixture's own 5 x 0.03 = 0.15s of injected sleep, so it could only
+        # pass by luck -- it measured the scheduler, not the abort.)
+        emitted: list[int] = []
+        exhausted = threading.Event()
+
         class _SlowAliveCreateStream:
             def __iter__(self):
-                for _ in range(5):
+                for i in range(5):
                     time.sleep(0.03)
+                    emitted.append(i)
                     yield SimpleNamespace(type="response.in_progress")
+                # Set ONLY on natural exhaustion.  Deliberately not a
+                # ``finally``: an abandoned generator gets GeneratorExit
+                # thrown in at the yield, which would run a finally and
+                # make the witness fire on the very path it must detect.
+                exhausted.set()
 
             def close(self): pass
 
@@ -5206,14 +5222,19 @@ class TestCodexAuxiliaryAdapterTimeout:
         fake_client = SimpleNamespace(responses=FakeResponses(), close=lambda: None)
         adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
 
-        started = time.monotonic()
         with pytest.raises(TimeoutError):
             adapter.create(
                 messages=[{"role": "user", "content": "summarize this"}],
                 timeout=0.05,
             )
 
-        assert time.monotonic() - started < 0.14
+        assert not exhausted.is_set(), (
+            "adapter drained the whole stream instead of aborting on timeout"
+        )
+        assert len(emitted) < 5, (
+            f"adapter consumed every event ({len(emitted)}/5) -- the total "
+            f"timeout did not abort the still-emitting stream"
+        )
 
 
 class TestCodexAuxiliaryToolMessageConversion:

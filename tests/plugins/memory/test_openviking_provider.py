@@ -2845,31 +2845,36 @@ def test_on_session_switch_does_not_block_caller_on_slow_drain():
     provider = _make_provider_with_session("old-sid", turn_count=2)
 
     drain_entered = threading.Event()
+    drain_returned = threading.Event()
     release_drain = threading.Event()
 
     def slow_drain(sid, timeout):
-        drain_entered.set()
-        # Simulate a writer that takes a long time to drain.
-        release_drain.wait(timeout=10.0)
-        return True
+        try:
+            drain_entered.set()
+            # Simulate a writer that takes a long time to drain.
+            release_drain.wait(timeout=30.0)
+            return True
+        finally:
+            drain_returned.set()
 
     provider._drain_writers = slow_drain
 
-    start = time.monotonic()
     provider.on_session_switch("new-sid")
-    elapsed = time.monotonic() - start
 
-    # The caller returned promptly with state already rotated, even though the
-    # drain is still parked on the finalizer thread.
-    assert elapsed < 1.0, f"on_session_switch blocked the caller for {elapsed:.2f}s"
+    # Ordering witness (replaces `elapsed < 1.0`): the drain is still parked
+    # on the finalizer thread when on_session_switch returns, so the caller
+    # provably did not run it.  Load only makes the finalizer slower.
+    assert not drain_returned.is_set(), (
+        "on_session_switch ran the old-session drain on the caller's thread"
+    )
     assert provider._session_id == "new-sid"
     assert provider._turn_count == 0
-    assert drain_entered.wait(timeout=2.0), "finalizer never started draining"
+    assert drain_entered.wait(timeout=10.0), "finalizer never started draining"
     # No commit yet — drain is still blocked off-thread.
     provider._client.post.assert_not_called()
     # Let the finalizer finish so it doesn't leak past the test.
     release_drain.set()
-    assert provider._drain_finalizers(timeout=5.0)
+    assert provider._drain_finalizers(timeout=10.0)
     provider._client.post.assert_called_once_with(
         "/api/v1/sessions/old-sid/commit",
         {"keep_recent_count": 0},

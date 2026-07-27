@@ -1328,6 +1328,14 @@ class TestBaseContextSummary:
         import time
 
         release = threading.Event()
+        thread_returned = threading.Event()
+
+        def _parked_prefetch():
+            try:
+                release.wait(timeout=10)
+            finally:
+                thread_returned.set()
+
         provider = HonchoMemoryProvider()
         provider._manager = MagicMock()
         provider._manager.pop_context_result.return_value = {}
@@ -1338,18 +1346,23 @@ class TestBaseContextSummary:
         provider._turn_count = 2
         provider._last_dialectic_turn = 1
         provider._prefetch_thread = threading.Thread(
-            target=lambda: release.wait(timeout=5), daemon=True
+            target=_parked_prefetch, daemon=True
         )
         provider._prefetch_thread.start()
         provider._prefetch_thread_started_at = time.monotonic()
 
         try:
-            started = time.perf_counter()
             assert provider.prefetch("follow-up question") == ""
-            assert time.perf_counter() - started < 0.2
+            # Ordering witness (replaces `perf_counter() - started < 0.2`):
+            # the in-flight prefetch thread is still parked when prefetch()
+            # returns, so turn 2 provably did not join it.  A regression that
+            # waits makes this Event set before the assert; load cannot.
+            assert not thread_returned.is_set(), (
+                "prefetch() waited on the in-flight dialectic thread"
+            )
         finally:
             release.set()
-            provider._prefetch_thread.join(timeout=1)
+            provider._prefetch_thread.join(timeout=5)
 
 
 class TestDialecticDepth:

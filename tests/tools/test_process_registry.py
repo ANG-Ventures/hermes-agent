@@ -385,8 +385,28 @@ class TestOrphanedPipeReconciliation:
         s = _make_session(sid="proc_wait_event", output="done")
         registry._running[s.id] = s
 
+        # Instrument the completion Event: record whether each wait() woke
+        # because the event fired (True) or because the poll tick expired
+        # (False).  This asserts the PREDICATE the old `elapsed < 0.9` bound
+        # was proxying for -- "we did not take the poll path" -- instead of
+        # its latency proxy, which sat only 0.9s under the 1s tick it guards
+        # and could expire under load with nothing wrong in wait().
+        entered_wait = threading.Event()
+        wait_results: list[bool] = []
+        real_wait = s._completion_event.wait
+
+        def recording_wait(timeout=None):
+            entered_wait.set()
+            woke_on_event = real_wait(timeout=timeout)
+            wait_results.append(bool(woke_on_event))
+            return woke_on_event
+
+        s._completion_event.wait = recording_wait
+
         def finish_later():
-            time.sleep(0.05)
+            # Deterministic handoff: finish the session only once wait() is
+            # actually parked on the completion event (no fixed sleep).
+            entered_wait.wait(timeout=10)
             s.exited = True
             s.exit_code = 0
             with patch.object(registry, "_write_checkpoint"):
@@ -394,16 +414,20 @@ class TestOrphanedPipeReconciliation:
 
         t = threading.Thread(target=finish_later)
         t.start()
-        start = time.monotonic()
         try:
             result = registry.wait(s.id, timeout=5)
         finally:
-            t.join(timeout=1)
-        elapsed = time.monotonic() - start
+            t.join(timeout=10)
 
         assert result["status"] == "exited", result
         assert result["exit_code"] == 0
-        assert elapsed < 0.9  # must stay under the old 1s poll tick being regression-tested, f"wait() should wake on completion; took {elapsed:.3f}s"
+        assert wait_results, (
+            "wait() never blocked on the completion event -- it took the poll path"
+        )
+        assert all(wait_results), (
+            f"wait() woke from a poll-tick timeout instead of the completion "
+            f"event (wait results: {wait_results})"
+        )
 
 
 # =========================================================================

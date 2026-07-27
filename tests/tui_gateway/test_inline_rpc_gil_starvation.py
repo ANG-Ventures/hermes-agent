@@ -93,26 +93,33 @@ def test_dispatch_inline_rpc_does_not_block_under_gil_pressure(server, monkeypat
     (mimicking setup.runtime_check).
     """
     released = threading.Event()
+    slow_returned = threading.Event()
 
     def slow_session_list(rid, params):
-        released.wait(timeout=5)
-        return server._ok(rid, {"sessions": []})
+        try:
+            released.wait(timeout=30)
+            return server._ok(rid, {"sessions": []})
+        finally:
+            slow_returned.set()
 
     monkeypatch.setitem(server._methods, "session.list", slow_session_list)
     monkeypatch.setitem(server._methods, "fast.check", lambda rid, params: server._ok(rid, {"ok": True}))
 
-    t0 = time.monotonic()
     # session.list is in _LONG_HANDLERS → dispatch returns None immediately
     assert server.dispatch({"id": "slow", "method": "session.list", "params": {}}) is None
 
     # fast.check is inline → dispatch runs it synchronously and returns the result
     fast_resp = server.dispatch({"id": "fast", "method": "fast.check", "params": {}})
-    fast_elapsed = time.monotonic() - t0
 
     assert fast_resp["result"] == {"ok": True}
-    assert fast_elapsed < 2.0, (
-        f"fast handler blocked for {fast_elapsed:.2f}s behind slow session.list — "
-        f"the WS read loop would stall, causing false 'needs setup' (#50005)."
+    # Ordering witness (replaces `fast_elapsed < 2.0`): the slow handler is
+    # still parked when the fast one has already answered, i.e. fast.check
+    # overtook it.  This test deliberately induces GIL pressure, which makes
+    # its own stopwatch the least trustworthy instrument in the repo — the
+    # overtake, not the duration, is the #50005 contract.
+    assert not slow_returned.is_set(), (
+        "fast handler was serialized behind the slow session.list — "
+        "the WS read loop would stall, causing false 'needs setup' (#50005)."
     )
 
     released.set()
@@ -125,25 +132,31 @@ def test_dispatch_pet_info_does_not_block_prompt_submit(server, monkeypatch):
     timeout fired (#50005).
     """
     released = threading.Event()
+    pet_info_returned = threading.Event()
 
     def slow_pet_info(rid, params):
-        released.wait(timeout=5)
-        return server._ok(rid, {"pet": "cat"})
+        try:
+            released.wait(timeout=30)
+            return server._ok(rid, {"pet": "cat"})
+        finally:
+            pet_info_returned.set()
 
     monkeypatch.setitem(server._methods, "pet.info", slow_pet_info)
     monkeypatch.setitem(server._methods, "prompt.submit", lambda rid, params: server._ok(rid, {"status": "streaming"}))
 
-    t0 = time.monotonic()
     assert server.dispatch({"id": "pet", "method": "pet.info", "params": {}}) is None
 
     # prompt.submit is inline (it spawns its own thread) — should return immediately
     resp = server.dispatch({"id": "prompt", "method": "prompt.submit", "params": {}})
-    elapsed = time.monotonic() - t0
 
     assert resp["result"] == {"status": "streaming"}
-    assert elapsed < 2.0, (
-        f"prompt.submit blocked for {elapsed:.2f}s behind slow pet.info — "
-        f"the user's message would appear stuck under GIL pressure (#50005)."
+    # Ordering witness (replaces `elapsed < 2.0`): pet.info is still parked
+    # when prompt.submit has already answered — prompt.submit overtook it.
+    # That overtake IS the #50005 contract; the duration was only a proxy,
+    # and an unreliable one in a test that induces GIL pressure on purpose.
+    assert not pet_info_returned.is_set(), (
+        "prompt.submit was serialized behind the slow pet.info — "
+        "the user's message would appear stuck under GIL pressure (#50005)."
     )
 
     released.set()

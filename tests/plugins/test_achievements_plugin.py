@@ -186,36 +186,43 @@ def test_evaluate_all_first_run_returns_pending_and_starts_background_scan(plugi
     # Wrap _run_scan_and_update_cache so we can release it on demand,
     # simulating a slow cold scan without actually waiting.
     scan_started = threading.Event()
+    scan_returned = threading.Event()
     allow_scan_finish = threading.Event()
     original_run = plugin_api._run_scan_and_update_cache
 
     def gated_run(*args, **kwargs):
-        scan_started.set()
-        allow_scan_finish.wait(timeout=5)
-        original_run(*args, **kwargs)
+        try:
+            scan_started.set()
+            allow_scan_finish.wait(timeout=30)
+            original_run(*args, **kwargs)
+        finally:
+            scan_returned.set()
 
     plugin_api._run_scan_and_update_cache = gated_run
 
-    t0 = time.time()
     result = plugin_api.evaluate_all()
-    elapsed = time.time() - t0
 
-    # Immediate return — should not block waiting for the scan.
-    assert elapsed < 1.0, f"evaluate_all blocked for {elapsed:.2f}s on first run"
+    # Ordering witness (replaces `elapsed < 1.0`): the cold scan is still
+    # parked inside gated_run when evaluate_all returns, so the dashboard
+    # request path provably did not block on it.  A regression that runs the
+    # scan inline sets this Event before the assert; machine load cannot.
+    assert not scan_returned.is_set(), (
+        "evaluate_all blocked on the cold scan instead of returning pending"
+    )
     assert result["scan_meta"]["mode"] == "pending"
     assert result["unlocked_count"] == 0
     # Catalog still rendered so UI has something to draw.
     assert result["total_count"] >= 60
 
     # Background scan is running.
-    assert scan_started.wait(timeout=2), "background scan did not start"
+    assert scan_started.wait(timeout=10), "background scan did not start"
 
     # Let the scan complete, then a second call returns real data.
     allow_scan_finish.set()
     # Wait for thread to finish.
     thread = plugin_api._BACKGROUND_SCAN_THREAD
     assert thread is not None
-    thread.join(timeout=5)
+    thread.join(timeout=10)
     assert not thread.is_alive()
 
     second = plugin_api.evaluate_all()
@@ -228,7 +235,7 @@ def test_evaluate_all_stale_cache_serves_stale_and_refreshes_in_background(plugi
     the stale data immediately and kicks a background refresh. Users don't
     stare at a loading spinner every time TTL expires.
     """
-    fake_db = _FakeSessionDB(session_count=10, scan_delay=2.0)
+    fake_db = _FakeSessionDB(session_count=10)
     _install_fake_session_db(plugin_api, fake_db)
     stale_generated_at = int(time.time()) - plugin_api.SNAPSHOT_TTL_SECONDS - 60
     stale_payload = {
@@ -245,17 +252,39 @@ def test_evaluate_all_stale_cache_serves_stale_and_refreshes_in_background(plugi
     }
     plugin_api.save_snapshot(stale_payload)
 
-    t0 = time.time()
-    result = plugin_api.evaluate_all()
-    elapsed = time.time() - t0
+    # Gate the background refresh so it is provably still in flight when
+    # evaluate_all returns (replaces the `scan_delay=2.0` + `elapsed < 1.0`
+    # stopwatch, which timed a thread spawn against a fixed sleep).
+    refresh_started = threading.Event()
+    refresh_returned = threading.Event()
+    allow_refresh_finish = threading.Event()
+    original_run = plugin_api._run_scan_and_update_cache
 
-    assert elapsed < 1.0, f"evaluate_all blocked for {elapsed:.2f}s serving stale data"
+    def gated_run(*args, **kwargs):
+        try:
+            refresh_started.set()
+            allow_refresh_finish.wait(timeout=30)
+            original_run(*args, **kwargs)
+        finally:
+            refresh_returned.set()
+
+    plugin_api._run_scan_and_update_cache = gated_run
+
+    result = plugin_api.evaluate_all()
+
+    # Ordering witness: the refresh is still parked when evaluate_all
+    # returns, so the stale payload was served without waiting on it.
+    assert not refresh_returned.is_set(), (
+        "evaluate_all blocked on the background refresh instead of serving stale"
+    )
     assert result["generated_at"] == stale_generated_at
 
-    # Background scan should be running or have completed.
+    # Background scan should be running.
+    assert refresh_started.wait(timeout=10), "background refresh did not start"
+    allow_refresh_finish.set()
     thread = plugin_api._BACKGROUND_SCAN_THREAD
     assert thread is not None
-    thread.join(timeout=5)
+    thread.join(timeout=10)
 
     fresh = plugin_api.evaluate_all()
     assert fresh["generated_at"] >= stale_generated_at

@@ -124,25 +124,34 @@ def test_busy_steer_mode_falls_back_to_queue_when_rejected(monkeypatch):
 def test_busy_interrupt_does_not_hold_history_lock_or_delay_queue(monkeypatch):
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
     interrupt_started = threading.Event()
+    interrupt_returned = threading.Event()
     release_interrupt = threading.Event()
 
     def blocking_interrupt():
-        interrupt_started.set()
-        release_interrupt.wait(timeout=2)
+        try:
+            interrupt_started.set()
+            release_interrupt.wait(timeout=10)
+        finally:
+            interrupt_returned.set()
 
     session = _session(
         agent=types.SimpleNamespace(interrupt=blocking_interrupt),
         running=True,
     )
 
-    started = time.monotonic()
     resp = server._handle_busy_submit("r1", "sid", session, "keep this", "ws-1")
 
     assert resp["result"]["status"] == "queued"
-    assert time.monotonic() - started < 0.25
+    # Ordering witness (replaces `elapsed < 0.25`): the interrupt worker is
+    # still parked inside agent.interrupt() when the handler returns, so the
+    # handler provably did not run it inline.  Load can only make the worker
+    # slower, never make this flip.
+    assert not interrupt_returned.is_set(), (
+        "_handle_busy_submit blocked on the slow interrupt()"
+    )
     assert session["queued_prompt"]["text"] == "keep this"
-    assert interrupt_started.wait(timeout=1)
-    assert session["history_lock"].acquire(timeout=0.25)
+    assert interrupt_started.wait(timeout=10)
+    assert session["history_lock"].acquire(timeout=10)
     session["history_lock"].release()
     release_interrupt.set()
 

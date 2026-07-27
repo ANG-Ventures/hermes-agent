@@ -313,7 +313,6 @@ def test_dispatch_is_fire_and_forget_daemon_thread():
     """The REAL dispatcher must not block the caller: a slow alert returns
     immediately and runs on a daemon thread."""
     import threading
-    import time
 
     started = threading.Event()
     release = threading.Event()
@@ -321,17 +320,18 @@ def test_dispatch_is_fire_and_forget_daemon_thread():
 
     def _slow_alert(model, _provider):
         started.set()
-        release.wait(5)
+        release.wait(10)
         seen.append(model)
-        return False  # skip the store write; we only care about timing
+        return False  # skip the store write; we only care about ordering
 
-    t0 = time.monotonic()
     sentinel._dispatch_alert("m", "p", _slow_alert)
-    elapsed = time.monotonic() - t0
 
-    assert elapsed < 0.5, "dispatch blocked the caller"
-    assert started.wait(5), "alert thread never ran"
-    assert seen == []  # still blocked → proof it ran concurrently
+    # Ordering witness (replaces `elapsed < 0.5`): the alert is still parked
+    # on `release` and has recorded nothing, so the dispatcher provably did
+    # not run it inline.  `seen == []` + `started.wait(10)` is strictly
+    # stronger than the stopwatch and immune to machine load.
+    assert started.wait(10), "alert thread never ran"
+    assert seen == [], "dispatch blocked the caller until the alert finished"
     release.set()
 
 
