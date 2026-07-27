@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -574,6 +575,101 @@ _running_lock = threading.Lock()
 # plausible-looking final response from truncated output — can never
 # overwrite the interrupted status with a false "ok" (#60432).
 _interrupted_job_ids: set = set()
+
+# ---------------------------------------------------------------------------
+# Shutdown-drain cancellation for in-flight SCRIPT jobs.
+#
+# ``GatewayRunner._drain_active_agents`` already WAITS on in-flight cron work
+# (via ``get_running_job_ids`` below, #60432) — but the cancellation half was
+# missing: ``_interrupt_running_agents`` only touches ``self._running_agents``,
+# and ``mark_running_jobs_interrupted`` is pure bookkeeping. A ``no_agent``
+# script runs under a blocking ``subprocess.run(..., timeout=script_timeout)``
+# whose default ceiling is 3600s — twenty times the 180s drain — so the drain
+# could only ever wait out its full deadline and then force-kill.
+#
+# These two primitives give the drain something to actually signal:
+#   * ``_shutdown_event``      — "stop starting new script work"
+#   * ``_active_script_procs`` — live Popen handles it can terminate
+# ---------------------------------------------------------------------------
+_shutdown_event = threading.Event()
+# Keyed by id() rather than a set: a Popen-like object is not guaranteed to be
+# hashable (test doubles routinely are not), and a registry that can only hold
+# hashable handles would silently fail closed on exactly the objects we most
+# need to track.
+_active_script_procs: dict = {}
+_script_procs_lock = threading.Lock()
+
+
+def signal_shutdown(reason: str = "") -> None:
+    """Tell the scheduler to stop STARTING new script work.
+
+    Called by the gateway shutdown path before the drain begins so a job the
+    ticker dispatches mid-drain cannot hand the drain brand-new long-running
+    work to wait on.
+    """
+    _shutdown_event.set()
+    if reason:
+        logger.info("Cron scheduler shutdown signalled: %s", reason)
+
+
+def clear_shutdown() -> None:
+    """Reset the shutdown signal (test seam; also safe on a fresh boot)."""
+    _shutdown_event.clear()
+
+
+def is_shutting_down() -> bool:
+    """Whether the scheduler has been told to stop starting script work."""
+    return _shutdown_event.is_set()
+
+
+def terminate_running_scripts(reason: str = "") -> int:
+    """Terminate every in-flight cron SCRIPT subprocess. Returns the count.
+
+    This is the cancellation half the drain was missing. It signals the whole
+    process GROUP, not just the direct child, because a cron script is run as
+    ``bash script.sh`` and the real work is usually a grandchild (rsync, ssh,
+    a python job). Two things break if you only signal the direct child:
+
+      1. bash running a foreground child does not act on SIGTERM until that
+         child exits — so a ``sleep``/``rsync`` keeps the script alive anyway;
+      2. the grandchild inherits the stdout/stderr pipes, so ``communicate()``
+         would block until IT exits even if bash were gone.
+
+    Signalling the group closes both. ``_run_job_script`` starts each script in
+    its own session (``start_new_session=True``), so the group is exactly this
+    job's process tree — never the gateway's own.
+
+    Deliberately SIGTERM (not SIGKILL) so scripts run their own traps; the
+    gateway's existing ``process_registry.kill_all()`` remains the force-kill
+    backstop. Best-effort and exception-safe — a shutdown path must never raise.
+    """
+    with _script_procs_lock:
+        procs = list(_active_script_procs.values())
+    terminated = 0
+    for proc in procs:
+        try:
+            if proc.poll() is not None:
+                continue
+            if sys.platform == "win32":
+                proc.terminate()
+            else:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)  # windows-footgun: ok — guarded by the sys.platform check above
+                except (ProcessLookupError, PermissionError):
+                    # Group already gone, or we somehow don't own it — fall
+                    # back to the direct child rather than skipping entirely.
+                    proc.terminate()
+            terminated += 1
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("Failed terminating cron script subprocess: %s", e)
+    if terminated:
+        logger.warning(
+            "Terminated %d in-flight cron script(s)%s",
+            terminated,
+            f": {reason}" if reason else "",
+        )
+    return terminated
+
 
 
 def get_running_job_ids() -> "frozenset[str]":
@@ -2440,6 +2536,14 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     if not path.is_file():
         return False, f"Script path is not a file: {path}"
 
+    # Refuse to START new script work once the gateway has begun draining.
+    # Without this the ticker can dispatch a fresh long-running script a second
+    # before SIGTERM and hand the drain brand-new work to wait out.
+    if is_shutting_down():
+        return False, (
+            f"Skipped: cron scheduler is shutting down (not starting {path.name})"
+        )
+
     script_timeout = scheduler_ext.get_script_timeout(_SCRIPT_TIMEOUT, _DEFAULT_SCRIPT_TIMEOUT, load_config=load_config, logger=logger)
 
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
@@ -2480,17 +2584,40 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             }
         env = _sanitize_subprocess_env(os.environ.copy())
         env.update(env_overlay)
-        result = subprocess.run(
+        # Popen + communicate() rather than subprocess.run() so the handle is
+        # registered and the shutdown drain can actually TERMINATE this script
+        # (see terminate_running_scripts). subprocess.run() gives the caller no
+        # handle, which is why an in-flight script used to be uncancellable and
+        # the gateway drain could only wait out its full deadline.
+        proc = subprocess.Popen(
             argv,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=script_timeout,
             cwd=str(path.parent),
             env=env,
+            # Own session/process-group so the shutdown drain can signal the
+            # script's WHOLE tree (bash + its grandchildren) without ever
+            # touching the gateway's own group. See terminate_running_scripts.
+            start_new_session=(sys.platform != "win32"),
             **popen_kwargs,
         )
-        stdout = (result.stdout or "").strip()
-        stderr = (result.stderr or "").strip()
+        _proc_key = id(proc)
+        with _script_procs_lock:
+            _active_script_procs[_proc_key] = proc
+        try:
+            try:
+                raw_out, raw_err = proc.communicate(timeout=script_timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+                raise
+            returncode = proc.returncode
+        finally:
+            with _script_procs_lock:
+                _active_script_procs.pop(_proc_key, None)
+        stdout = (raw_out or "").strip()
+        stderr = (raw_err or "").strip()
 
         # Redact secrets from both stdout and stderr before any return path.
         try:
@@ -2502,8 +2629,8 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             stdout = "[REDACTED - redaction failed]"
             stderr = "[REDACTED - redaction failed]"
 
-        if result.returncode != 0:
-            parts = [f"Script exited with code {result.returncode}"]
+        if returncode != 0:
+            parts = [f"Script exited with code {returncode}"]
             if stderr:
                 parts.append(f"stderr:\n{stderr}")
             if stdout:

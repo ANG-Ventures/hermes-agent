@@ -12189,6 +12189,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _cron_at_start = self._active_cron_job_count()
             _api_at_start = self._active_api_run_count()
             _drain_started_at = time.monotonic()
+            # Tell the cron scheduler to stop STARTING new script work before
+            # the drain begins — otherwise the ticker can dispatch a fresh
+            # long-running script mid-drain and hand us new work to wait out.
+            try:
+                from cron.scheduler import signal_shutdown
+                signal_shutdown("gateway shutdown drain")
+            except Exception as _e:
+                logger.debug("cron signal_shutdown failed: %s", _e)
             active_agents, timed_out = await self._drain_active_agents(timeout)
             logger.info(
                 "Shutdown phase: drain done at +%.2fs (drain took %.2fs, "
@@ -12248,6 +12256,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._active_cron_job_count(),
                     self._active_api_run_count(),
                 )
+                # Terminate in-flight cron SCRIPTS. The drain WAITS on them
+                # (_active_cron_job_count) but nothing could ever CANCEL them:
+                # _interrupt_running_agents only covers self._running_agents,
+                # and mark_running_jobs_interrupted (below, after kill_all) is
+                # bookkeeping only. A no_agent script runs under a blocking
+                # subprocess whose default ceiling is 3600s, so the drain could
+                # only ever wait out its full deadline. SIGTERM here lets the
+                # script run its own traps; kill_all() stays the backstop.
+                try:
+                    from cron.scheduler import terminate_running_scripts
+                    terminate_running_scripts("gateway drain timeout")
+                except Exception as _e:
+                    logger.debug("terminate_running_scripts failed: %s", _e)
                 # Mark forcibly-interrupted sessions as resume_pending BEFORE
                 # interrupting the agents.  This preserves each session's
                 # session_id + transcript so the next message on the same
