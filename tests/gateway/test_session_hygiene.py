@@ -698,6 +698,7 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
     worker_started = threading.Event()
+    worker_returned = threading.Event()
     release_worker = threading.Event()
     cleanup_done = threading.Event()
     fake_db = MagicMock()
@@ -722,19 +723,25 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
             self, messages, *_args, commit_fence=None, **_kwargs
         ):
             worker_started.set()
-            assert release_worker.wait(timeout=2)
-            if commit_fence is not None and not commit_fence.begin_commit():
-                return (messages, None)
             try:
-                self._session_db.archive_and_compact(
-                    self.session_id,
-                    [{"role": "assistant", "content": "too late"}],
-                )
-                self._last_compaction_in_place = True
-                return ([{"role": "assistant", "content": "too late"}], None)
+                assert release_worker.wait(timeout=30)
+                if commit_fence is not None and not commit_fence.begin_commit():
+                    return (messages, None)
+                try:
+                    self._session_db.archive_and_compact(
+                        self.session_id,
+                        [{"role": "assistant", "content": "too late"}],
+                    )
+                    self._last_compaction_in_place = True
+                    return ([{"role": "assistant", "content": "too late"}], None)
+                finally:
+                    if commit_fence is not None:
+                        commit_fence.finish_commit()
             finally:
-                if commit_fence is not None:
-                    commit_fence.finish_commit()
+                # Set on EVERY exit path (including the blocking wait giving
+                # up), so the witness below cannot be silently defeated by the
+                # worker failing instead of returning normally.
+                worker_returned.set()
 
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = SlowCompressAgent
@@ -806,17 +813,35 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
         message_id="1",
     )
 
-    started = time.monotonic()
     result = await runner._handle_message(event)
-    elapsed = time.monotonic() - started
 
     assert result == "ok"
-    # Loose wall-clock bound per flake policy: this asserts the handler did
-    # NOT block on the hygiene-compression timeout path (which would take
-    # multiple seconds), not a precise latency. 0.15s missed by ~1-8ms on
-    # busy CI shards twice on 2026-07-23.
-    assert elapsed < 2.0
-    assert worker_started.is_set()
+    # DETERMINISTIC concurrency witness — replaces `assert elapsed < 2.0`.
+    #
+    # The old form timed `_handle_message` and required the total to come in
+    # under 2.0s. That made the OS scheduler and unrelated fixed setup part of
+    # the assertion: profiling this exact test shows ~1.5s of the measured
+    # window is `agent.models_dev.fetch_models_dev` -> `_save_disk_cache` ->
+    # `atomic_json_write` (~600k json encoder calls), i.e. one-time provider
+    # metadata cache work that has NOTHING to do with the hygiene timeout path
+    # being protected. The bound was silently measuring setup cost, so the
+    # measured window ranged 1.40s-2.39s run to run on an idle box and the 2.0s
+    # threshold sat INSIDE that distribution. It failed 2026-07-25 at
+    # 2.005265276999978 -- five milliseconds -- and blocked the merge queue.
+    #
+    # The real contract is an ORDERING one: the handler must return WITHOUT
+    # waiting for the hygiene compression worker. Assert that directly. The
+    # worker is still parked on `release_worker` (only set below), so if the
+    # timeout wiring is ever removed and the handler awaits the future instead,
+    # the worker can only be reached after it returns -- `worker_returned` would
+    # be set here and this fails. No wall-clock constant, immune to machine load
+    # and to setup cost, and strictly stronger than the bound it replaces.
+    assert worker_started.is_set(), "hygiene worker never started"
+    assert not worker_returned.is_set(), (
+        "handler blocked on the hygiene compression worker: the worker had "
+        "already returned by the time _handle_message did, so the turn was "
+        "gated on compression instead of continuing past the timeout"
+    )
     assert runner._run_agent.await_count == 1
     assert runner._hygiene_compression_failure_cooldowns["sess-timeout"] > time.time()
     timeout_warnings = [s for s in adapter.sent if "Context compression timed out" in s["content"]]
@@ -825,7 +850,10 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     SlowCompressAgent.last_instance.close.assert_not_called()
 
     release_worker.set()
-    await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=2)
+    # Hang-guard, NOT a performance claim: the worker was just released and we
+    # only need it to eventually finish. Generous so a loaded runner can never
+    # turn teardown into a false red.
+    await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=30)
 
     # The late worker observed cancellation at the commit fence, so it never
     # mutated the live session after the new turn began. Cleanup still ran once

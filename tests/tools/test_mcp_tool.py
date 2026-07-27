@@ -1647,31 +1647,55 @@ class TestShutdown:
         """Multiple servers are shut down in parallel via asyncio.gather."""
         import tools.mcp_tool as mcp_mod
         from tools.mcp_tool import shutdown_mcp_servers, _servers
-        import time
+        import threading
 
         _servers.clear()
 
-        # 3 servers each taking 1s to shut down
-        for i in range(3):
+        # Concurrency is proven by construction, not by measuring elapsed time.
+        #
+        # The old form gave each server a 1s sleep and asserted the total came
+        # in under 2.5s ("parallel: ~1s, not ~3s"). That makes the scheduler
+        # part of the assertion — under a loaded CI box the inequality can flip
+        # with nothing wrong in the code under test — and the margin silently
+        # absorbs any fixed setup added ahead of dispatch.
+        #
+        # A barrier asserts the invariant directly: all THREE shutdowns must be
+        # in flight AT THE SAME TIME before any is allowed to complete. If
+        # shutdown ever goes serial the first one waits for partners that never
+        # arrive, the barrier breaks on its timeout, and the test fails.
+        N_SERVERS = 3
+        rendezvous = threading.Barrier(N_SERVERS)
+        overlapped = threading.Event()
+        entered: list[str] = []
+
+        for i in range(N_SERVERS):
             mock_server = MagicMock()
-            mock_server.name = f"srv_{i}"
-            async def slow_shutdown():
-                await asyncio.sleep(1)
+            name = f"srv_{i}"
+            mock_server.name = name
+
+            async def slow_shutdown(_name=name):
+                entered.append(_name)
+                # Generous vs real scheduling latency, finite so a serial
+                # regression fails fast instead of hanging the suite.
+                await asyncio.to_thread(rendezvous.wait, 10)
+                overlapped.set()
+
             mock_server.shutdown = slow_shutdown
-            _servers[f"srv_{i}"] = mock_server
+            _servers[name] = mock_server
 
         mcp_mod._ensure_mcp_loop()
         try:
-            start = time.monotonic()
             shutdown_mcp_servers()
-            elapsed = time.monotonic() - start
         finally:
             mcp_mod._mcp_loop = None
             mcp_mod._mcp_thread = None
 
         assert len(_servers) == 0
-        # Parallel: ~1s, not ~3s. Allow some margin.
-        assert elapsed < 2.5, f"Shutdown took {elapsed:.1f}s, expected ~1s (parallel)"
+        # The barrier only clears when all three shutdowns are in flight together.
+        assert overlapped.is_set(), (
+            f"server shutdowns never overlapped — ran serially (entered: {entered})"
+        )
+        assert len(entered) == N_SERVERS, f"expected {N_SERVERS} shutdowns, got {entered}"
 
 
 # ---------------------------------------------------------------------------
