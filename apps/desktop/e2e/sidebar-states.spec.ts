@@ -142,7 +142,7 @@ test.describe('sidebar states — subagent and background dot coexist', () => {
       { timeout: 15_000 },
     )
 
-    // The background process (sleep 5) should show a "Background task
+    // The long background process should show a "Background task
     // running" dot while the subagent is also running.
     await expect
       .poll(
@@ -161,10 +161,18 @@ test.describe('sidebar states — subagent and background dot coexist', () => {
       { timeout: 90_000 },
     )
 
-    // After the turn + auto-dismiss, the background dot should be gone.
-    await page.waitForTimeout(8000)
-    const bgCount = await page.locator(`[aria-label="${BG_DOT_LABEL}"]`).count()
-    expect(bgCount, 'background dot should be gone after process exits').toBe(0)
+    // After the process exits and auto-dismiss fires, the background dot
+    // should be gone. Poll for the transition instead of sleeping a fixed
+    // interval: the mock's background sleep is 30s (SIDEBAR_CROSS_BG_SLEEP_
+    // SECONDS) plus SUCCESS_LINGER_MS, so a bare waitForTimeout(8000) would
+    // assert before dismissal and fail deterministically. Polling asserts the
+    // STATE (dot gone) rather than a duration.
+    await expect
+      .poll(
+        () => page.locator(`[aria-label="${BG_DOT_LABEL}"]`).count(),
+        { timeout: 60_000, message: 'background dot should be gone after process exits' },
+      )
+      .toBe(0)
   })
 })
 
@@ -190,7 +198,7 @@ test.describe('sidebar states — cross-session dot transition', () => {
   test('background dot transitions to finished when viewing another session', async () => {
     const page = fixture.page
 
-    // Start a turn with a long background process (sleep 5).
+    // Start a turn with a long background process.
     const composer = page.locator('[contenteditable="true"]').first()
     await composer.waitFor({ state: 'visible', timeout: 10_000 })
     await composer.click()
@@ -212,8 +220,9 @@ test.describe('sidebar states — cross-session dot transition', () => {
       { timeout: 90_000 },
     )
 
-    // The background dot should still be visible (sleep 5 hasn't finished yet,
-    // or auto-dismiss hasn't fired).
+    // The background dot should still be visible: the mock's background
+    // process sleeps SIDEBAR_CROSS_BG_SLEEP_SECONDS (30s), which dwarfs the
+    // turn latency, so this is a state check rather than a stopwatch race.
     const bgDuringTurn = await page.locator(`[aria-label="${BG_DOT_LABEL}"]`).count()
     expect(bgDuringTurn, 'background dot should still be visible after turn completes').toBeGreaterThan(0)
 
@@ -225,12 +234,13 @@ test.describe('sidebar states — cross-session dot transition', () => {
     await page.locator('button:has-text("New session")').first().click()
     await page.waitForTimeout(2000)
 
-    // Now wait for the background process to finish (sleep 5 + auto-dismiss).
-    // The session A dot should transition away from "background running".
+    // Now wait for the background process to finish and auto-dismiss.
+    // Budget must exceed SIDEBAR_CROSS_BG_SLEEP_SECONDS (30s) + linger; a 30s
+    // ceiling here would race the sleep itself (2026-07-27).
     await expect
       .poll(
         () => page.locator(`[aria-label="${BG_DOT_LABEL}"]`).count(),
-        { timeout: 30_000, message: 'background dot should disappear after process finishes' },
+        { timeout: 60_000, message: 'background dot should disappear after process finishes' },
       )
       .toBe(0)
 

@@ -167,11 +167,25 @@ const SIDEBAR_SCRIPT: ScriptedTurn[] = [
 
 // ─── Sidebar cross-session script ──────────────────────────────────────
 //
-// E2E_SIDEBAR_CROSS trigger uses a longer background process (sleep 5) so
-// the "background running" dot is visible long enough for the test to:
+// E2E_SIDEBAR_CROSS trigger uses a long background process so the
+// "background running" dot is visible long enough for the test to:
 //   1. See the background dot while the subagent runs.
 //   2. Open a different session and see session A's dot transition to
 //      "finished unread" when the background process completes.
+//
+// SLEEP LENGTH IS LOAD-BEARING (2026-07-27). It was `sleep 5`, which made
+// tile-unread-bug.spec.ts a WALL-CLOCK RACE: that spec asserts the dot is
+// still present *after* awaiting the final answer, so the whole turn had to
+// finish inside sleep(5) + SUCCESS_LINGER_MS(4s) ≈ 9s of headroom. Measured
+// on CI: passing runs clustered at 12.0-12.5s total, failing runs at
+// 7.5-10.3s -- i.e. the assertion was reading the OS scheduler, not the
+// product. ~2-3s of extra runner latency closed the window and the dot
+// auto-dismissed before the assertion ran (~2-3% of runs; it red a
+// Python-test-only PR on 2026-07-27 and cost a merge-train investigation).
+//
+// 30s dwarfs any plausible mocked-turn latency while keeping the assertion's
+// meaning identical. Do NOT lower it back toward the turn duration.
+const SIDEBAR_CROSS_BG_SLEEP_SECONDS = 30
 
 const SIDEBAR_CROSS_SCRIPT: ScriptedTurn[] = [
   {
@@ -180,7 +194,7 @@ const SIDEBAR_CROSS_SCRIPT: ScriptedTurn[] = [
       {
         name: 'terminal',
         args: {
-          command: 'echo "long bg output" && sleep 5 && echo "finished"',
+          command: `echo "long bg output" && sleep ${SIDEBAR_CROSS_BG_SLEEP_SECONDS} && echo "finished"`,
           background: true,
           notify_on_complete: true,
         },
@@ -756,8 +770,16 @@ export const SIDEBAR_CROSS_TEXTS = {
   interimText: SIDEBAR_CROSS_SCRIPT[0].text,
   /** The final answer text. */
   finalText: SIDEBAR_CROSS_SCRIPT[SIDEBAR_CROSS_SCRIPT.length - 1].text,
-  /** The longer background process command (sleep 5). */
-  bgCommand: 'echo "long bg output" && sleep 5 && echo "finished"',
+  /**
+   * The long background process command.
+   *
+   * DERIVED from SIDEBAR_CROSS_SCRIPT rather than re-stated, so it cannot
+   * drift from the command the mock actually runs. It was a duplicated
+   * `sleep 5` literal; when the real sleep changed to 30s (2026-07-27) a
+   * hardcoded copy here would have silently described the wrong behavior.
+   */
+  bgCommand: (SIDEBAR_CROSS_SCRIPT[0].toolCalls?.[0]?.args as { command?: string } | undefined)
+    ?.command as string,
   /** The subagent's goal. */
   subagentGoal: 'Analyze cross-session state',
 } as const
