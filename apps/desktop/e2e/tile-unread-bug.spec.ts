@@ -28,6 +28,26 @@ import { SIDEBAR_CROSS_TEXTS, restartMockServer } from './mock-server'
 const UNREAD_DOT_LABEL = 'Finished — unread'
 /** Background-running dot aria-label. */
 const BG_DOT_LABEL = 'Background task running'
+/** Session-running dot aria-label — the state the unread dot succeeds. */
+const RUNNING_DOT_LABEL = 'Session running'
+
+/**
+ * The sidebar row's "open as a tab" chord.
+ *
+ * `session-row.tsx` accepts `metaKey || ctrlKey`, but on macOS a ctrl-click is
+ * a RIGHT-click: the browser fires `contextmenu` and the `onClick` handler
+ * never runs, so a hardcoded `Control` opens no tab at all and the test
+ * silently degrades into "session is merely deselected". Pick the modifier
+ * that actually reaches the handler on the host platform so the spec exercises
+ * the tab path on macOS as well as on the Linux CI runner.
+ *
+ * DIVERGENCE, stated not hidden: CI (Linux) only ever exercises the Control
+ * branch and a macOS dev box only the Meta branch. That is correct -- the two
+ * chords genuinely differ by OS -- but it does mean neither environment covers
+ * both. The product handler accepts `metaKey || ctrlKey`, so both branches land
+ * on the same code path once the event reaches it.
+ */
+const TAB_OPEN_MODIFIER = process.platform === 'darwin' ? 'Meta' : 'Control'
 
 /** Locate a session's sidebar row by its preview text. */
 function sessionRow(page: import('@playwright/test').Page, text: string) {
@@ -97,6 +117,54 @@ async function waitForBgProcessToFinish(page: import('@playwright/test').Page) {
     .toBe(0)
 }
 
+/** Stored-session ids of every session tab currently in a tree tab strip. */
+async function tileTabIds(page: import('@playwright/test').Page): Promise<string[]> {
+  return page.evaluate(() =>
+    Array.from(document.querySelectorAll('[data-tree-tab^="session-tile:"]'))
+      .map(el => el.getAttribute('data-tree-tab') ?? '')
+      .filter(Boolean),
+  )
+}
+
+/**
+ * Wait until session A's row leaves the RUNNING state.
+ *
+ * WHY THIS EXISTS (the bug this spec kept hitting, root-caused 2026-07-27):
+ * the unread flag is written by the `busy: true -> false` LLM-turn transition
+ * (`session-states.ts` handleTransition). The background dot is a DIFFERENT,
+ * independent signal, driven by the gateway's process registry. When the bg
+ * process completes, the app must (a) drop the process from the registry and
+ * (b) deliver the notify_on_complete follow-up turn, whose OWN busy edge is
+ * what actually sets unread. Those two land in either order.
+ *
+ * `waitForBgProcessToFinish` only observes (a). Measured locally, (b) trails it
+ * by ~0.5s about half the time -- so an assertion fired straight after (a) read
+ * the sidebar mid-turn, while the row still showed "Session running", and saw
+ * zero unread dots. That is a WALL-CLOCK RACE in the wait, not a product bug:
+ * polling for the dot proves it, since the same run goes green ~500ms later
+ * with no product change.
+ *
+ * Waiting for the running dot to clear observes the transition that OWNS the
+ * unread flag, so the subsequent assertion reads a settled state. It does NOT
+ * assert unread itself, so it cannot make the unread assertion pass vacuously.
+ *
+ * The ceiling is deliberately TIGHT (not the 60s used for the bg-process wait).
+ * By the time this runs, the bg process has already exited, so the only thing
+ * outstanding is the short follow-up turn -- measured at 129-383ms locally.
+ * A generous ceiling here would turn "the turn never settles" into a slow,
+ * illegible timeout that looks like the unread assertion's problem; 15s is ~40x
+ * the observed duration, so it still cannot flake, but a genuine
+ * never-settles regression fails fast and points at the right step.
+ */
+async function waitForTurnToSettle(page: import('@playwright/test').Page) {
+  await expect
+    .poll(
+      () => page.locator(`[aria-label="${RUNNING_DOT_LABEL}"]`).count(),
+      { timeout: 15_000, message: 'session-running dot should clear once the follow-up turn ends' },
+    )
+    .toBe(0)
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // Test 1: TAB (not visible) — unread dot IS correct (PASSES)
 // ────────────────────────────────────────────────────────────────────────
@@ -126,19 +194,51 @@ test.describe('sidebar states — tab (hidden) unread is correct', () => {
 
     // ⌃-click opens the session as a TAB (center dock = stacked, not visible
     // unless it's the active tab). The session is NOT on screen.
+    // The tab must actually be created by THIS click before we assert anything
+    // about it -- a modifier that never reached the onClick handler would
+    // otherwise let this test quietly assert the "merely deselected" case
+    // instead of the tab case. The tree's TAB STRIP is the right surface to
+    // check: a stacked tab that isn't fronted renders its tab but NOT its pane
+    // body, so the tab element (`data-tree-tab="session-tile:<id>"`,
+    // tree-group.tsx) is the only proof the tile exists AND is hidden.
+    //
+    // Snapshot the tab ids FIRST and require a NEW one to appear. A bare
+    // "count > 0" would be satisfied by any pre-existing session tab (today
+    // there are none, but that is a fixture detail this assertion should not
+    // silently depend on) and could pass at t=0 having proven nothing.
+    const tabIdsBefore = await tileTabIds(page)
+
     const row = sessionRow(page, SIDEBAR_CROSS_TEXTS.finalText)
-    await row.click({ modifiers: ['Control'] })
-    await page.waitForTimeout(2000)
+    await row.click({ modifiers: [TAB_OPEN_MODIFIER] })
+
+    await expect
+      .poll(
+        async () => (await tileTabIds(page)).filter(id => !tabIdsBefore.includes(id)).length,
+        { timeout: 15_000, message: 'the ⌘/⌃-click should have opened the session as a NEW tab' },
+      )
+      .toBeGreaterThan(0)
 
     // Evidence: the tab is open but the session is not visible on screen.
     await page.screenshot({ path: 'test-results/tile-bug-tab-opened.png' })
 
     await waitForBgProcessToFinish(page)
+    // The bg dot going away does NOT mean the unread-owning turn has ended.
+    await waitForTurnToSettle(page)
 
     // A tab that's not the active tab IS hidden — the unread dot is correct.
     // The user is NOT looking at it, so marking it "unread" is right.
-    const unreadCount = await page.locator(`[aria-label="${UNREAD_DOT_LABEL}"]`).count()
-    expect(unreadCount, 'hidden tab should be marked unread').toBeGreaterThan(0)
+    //
+    // POLL, don't sample. The unread flag is set by an event-driven store
+    // transition, so a bare `.count()` reads whatever frame happens to be
+    // painted. The sibling cross-session spec in sidebar-states.spec.ts already
+    // polls this exact assertion for the same reason; this one was left as a
+    // one-shot read and was the last remaining sampler in the file.
+    await expect
+      .poll(
+        () => page.locator(`[aria-label="${UNREAD_DOT_LABEL}"]`).count(),
+        { timeout: 30_000, message: 'hidden tab should be marked unread' },
+      )
+      .toBeGreaterThan(0)
 
     await page.screenshot({ path: 'test-results/tile-bug-tab-unread-correct.png' })
   })
