@@ -7,6 +7,7 @@ Both fail OPEN to today's behavior on any error; both stamp a greppable outcome.
 """
 
 import json
+import logging
 import math
 
 import pytest
@@ -270,6 +271,74 @@ def test_gate_b_drain_all_clears_prefetch_result(monkeypatch, tmp_path):
         _t.sleep(0.05)
     # The stale block MUST have been cleared (drain-all → inject nothing).
     assert p._prefetch_result == "", f"stale block leaked: {p._prefetch_result!r}"
+
+
+def test_floor_outcome_not_no_results_when_search_returned_candidates(
+    monkeypatch, tmp_path, caplog
+):
+    """`floor_outcome=no_results` must mean the SEARCH came back empty — never "an earlier
+    gate emptied the candidates".
+
+    Regression (2026-07-26): `_floor_outcome` was unconditionally initialized to "no_results"
+    before any gate ran, and is only overwritten inside `if results:` by Gate B. So when the
+    L2 rerank gate dropped every candidate, Gate B was skipped and the stale initializer
+    survived — making a full-L2-drop indistinguishable in the logs from a genuinely empty
+    search. That made any downstream "did recall actually have candidates?" check undecidable
+    (it silently killed the mem0 daily digest's zero-inject anomaly detector, which could
+    never fire). Here the search DOES return a candidate and L2 rejects it on a negative
+    rerank_score, so the emitted line must NOT claim no_results.
+    """
+    p = _provider(monkeypatch, tmp_path)
+    _write_floor_cfg(tmp_path, {"enabled": False})
+    monkeypatch.setattr(p, "_rerank_gate_enabled", lambda: True)
+    monkeypatch.setattr(p, "_rerank_gate_min", lambda: 0.0)
+    monkeypatch.setattr(p, "_get_client", lambda: type("C", (), {
+        "search": lambda self, **kw: {
+            "results": [{"memory": "off-topic", "score": 1.0, "rerank_score": -9.4}]}})())
+    monkeypatch.setattr(p, "_drop_forgotten", lambda x: x)
+    monkeypatch.setattr(p, "_unwrap_results", lambda x: x.get("results", x))
+    monkeypatch.setattr(p, "_read_filters", lambda: {})
+    caplog.set_level(logging.INFO)
+    p.queue_prefetch("what temperature is the guest room", session_id="s")
+    import time as _t
+    for _ in range(50):
+        fut = getattr(p, "_prefetch_future", None)
+        if fut and fut.done():
+            break
+        _t.sleep(0.05)
+    line = next((r.getMessage() for r in caplog.records
+                 if "mem0.prefetch injected=" in r.getMessage()), None)
+    assert line is not None, "no mem0.prefetch observability line emitted"
+    # L2 rejected the only candidate, so nothing was injected...
+    assert "injected=0" in line
+    assert "rr_outcome=rr_kept_0_of_1" in line
+    # ...but the search DID return one — the line must not claim otherwise.
+    assert "floor_outcome=no_results" not in line, (
+        f"stale initializer leaked: a full-L2-drop is being reported as an empty search: {line}")
+
+
+def test_floor_outcome_is_no_results_when_search_truly_empty(monkeypatch, tmp_path, caplog):
+    """The honest case still reports no_results: the search itself returned nothing."""
+    p = _provider(monkeypatch, tmp_path)
+    _write_floor_cfg(tmp_path, {"enabled": False})
+    monkeypatch.setattr(p, "_get_client", lambda: type("C", (), {
+        "search": lambda self, **kw: {"results": []}})())
+    monkeypatch.setattr(p, "_drop_forgotten", lambda x: x)
+    monkeypatch.setattr(p, "_unwrap_results", lambda x: x.get("results", x))
+    monkeypatch.setattr(p, "_read_filters", lambda: {})
+    caplog.set_level(logging.INFO)
+    p.queue_prefetch("what temperature is the guest room", session_id="s")
+    import time as _t
+    for _ in range(50):
+        fut = getattr(p, "_prefetch_future", None)
+        if fut and fut.done():
+            break
+        _t.sleep(0.05)
+    line = next((r.getMessage() for r in caplog.records
+                 if "mem0.prefetch injected=" in r.getMessage()), None)
+    assert line is not None, "no mem0.prefetch observability line emitted"
+    assert "injected=0" in line
+    assert "floor_outcome=no_results" in line
 
 
 # ---------------------------------------------------------------------------
