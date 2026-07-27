@@ -352,13 +352,17 @@ def test_malformed_success_metadata_enters_incident_state(tmp_path):
 
 def test_production_observe_does_not_block_on_alert_or_duplicate_pages(tmp_path):
     entered = threading.Event()
+    alert_returned = threading.Event()
     release = threading.Event()
     pages = []
 
     def blocking_alert(message):
         pages.append(message)
         entered.set()
-        release.wait(1)
+        try:
+            release.wait(30)
+        finally:
+            alert_returned.set()
 
     manager = RerankIncidentManager(
         state_path=tmp_path / "state.json",
@@ -367,18 +371,32 @@ def test_production_observe_does_not_block_on_alert_or_duplicate_pages(tmp_path)
         alert_fn=blocking_alert,
     )
     manager.observe({"status": "failure", "failure_class": "timeout", "effective_arm": "off"})
-    assert entered.wait(0.5)
+    assert entered.wait(30)
 
-    started = time.monotonic()
     with ThreadPoolExecutor(max_workers=16) as callers:
         list(callers.map(
             manager.observe,
             [{"status": "failure", "failure_class": "timeout", "effective_arm": "off"}] * 32,
         ))
-    elapsed = time.monotonic() - started
+    # DETERMINISTIC non-blocking witness — replaces `assert elapsed < 0.1`.
+    #
+    # The old form asserted 32 observes across 16 threads finished in under
+    # 100ms. That makes the OS scheduler part of the assertion: thread-pool
+    # startup alone can eat that budget on a loaded CI box, so the inequality
+    # flips with nothing wrong in the code under test.
+    #
+    # The real contract is that `observe` does not block on the alert. Assert
+    # that directly: the alert callback is STILL PARKED inside `release.wait`
+    # and has not returned (`alert_returned` unset). If `observe` ever became
+    # synchronous on the alert path, it could only have returned after the
+    # alert returned, so `alert_returned` would be set here and this fails.
+    # No wall-clock constant, immune to machine load.
+    assert not alert_returned.is_set(), (
+        "observe() blocked on the alert callback: the alert had already "
+        "returned by the time the 32 observes completed"
+    )
     release.set()
 
-    assert elapsed < 0.1
     assert manager.wait_idle()
     assert len(pages) == 1
 
