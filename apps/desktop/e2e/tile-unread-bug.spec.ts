@@ -40,6 +40,12 @@ const RUNNING_DOT_LABEL = 'Session running'
  * silently degrades into "session is merely deselected". Pick the modifier
  * that actually reaches the handler on the host platform so the spec exercises
  * the tab path on macOS as well as on the Linux CI runner.
+ *
+ * DIVERGENCE, stated not hidden: CI (Linux) only ever exercises the Control
+ * branch and a macOS dev box only the Meta branch. That is correct -- the two
+ * chords genuinely differ by OS -- but it does mean neither environment covers
+ * both. The product handler accepts `metaKey || ctrlKey`, so both branches land
+ * on the same code path once the event reaches it.
  */
 const TAB_OPEN_MODIFIER = process.platform === 'darwin' ? 'Meta' : 'Control'
 
@@ -111,6 +117,15 @@ async function waitForBgProcessToFinish(page: import('@playwright/test').Page) {
     .toBe(0)
 }
 
+/** Stored-session ids of every session tab currently in a tree tab strip. */
+async function tileTabIds(page: import('@playwright/test').Page): Promise<string[]> {
+  return page.evaluate(() =>
+    Array.from(document.querySelectorAll('[data-tree-tab^="session-tile:"]'))
+      .map(el => el.getAttribute('data-tree-tab') ?? '')
+      .filter(Boolean),
+  )
+}
+
 /**
  * Wait until session A's row leaves the RUNNING state.
  *
@@ -130,16 +145,22 @@ async function waitForBgProcessToFinish(page: import('@playwright/test').Page) {
  * with no product change.
  *
  * Waiting for the running dot to clear observes the transition that OWNS the
- * unread flag, so the subsequent assertion reads a settled state. It is a
- * hang-guard with a ceiling far above the real duration -- it fails only if the
- * turn genuinely never terminates, and it does NOT assert unread itself, so it
- * cannot make the unread assertion pass vacuously.
+ * unread flag, so the subsequent assertion reads a settled state. It does NOT
+ * assert unread itself, so it cannot make the unread assertion pass vacuously.
+ *
+ * The ceiling is deliberately TIGHT (not the 60s used for the bg-process wait).
+ * By the time this runs, the bg process has already exited, so the only thing
+ * outstanding is the short follow-up turn -- measured at 129-383ms locally.
+ * A generous ceiling here would turn "the turn never settles" into a slow,
+ * illegible timeout that looks like the unread assertion's problem; 15s is ~40x
+ * the observed duration, so it still cannot flake, but a genuine
+ * never-settles regression fails fast and points at the right step.
  */
 async function waitForTurnToSettle(page: import('@playwright/test').Page) {
   await expect
     .poll(
       () => page.locator(`[aria-label="${RUNNING_DOT_LABEL}"]`).count(),
-      { timeout: 60_000, message: 'session-running dot should clear once the follow-up turn ends' },
+      { timeout: 15_000, message: 'session-running dot should clear once the follow-up turn ends' },
     )
     .toBe(0)
 }
@@ -173,20 +194,27 @@ test.describe('sidebar states — tab (hidden) unread is correct', () => {
 
     // ⌃-click opens the session as a TAB (center dock = stacked, not visible
     // unless it's the active tab). The session is NOT on screen.
+    // The tab must actually be created by THIS click before we assert anything
+    // about it -- a modifier that never reached the onClick handler would
+    // otherwise let this test quietly assert the "merely deselected" case
+    // instead of the tab case. The tree's TAB STRIP is the right surface to
+    // check: a stacked tab that isn't fronted renders its tab but NOT its pane
+    // body, so the tab element (`data-tree-tab="session-tile:<id>"`,
+    // tree-group.tsx) is the only proof the tile exists AND is hidden.
+    //
+    // Snapshot the tab ids FIRST and require a NEW one to appear. A bare
+    // "count > 0" would be satisfied by any pre-existing session tab (today
+    // there are none, but that is a fixture detail this assertion should not
+    // silently depend on) and could pass at t=0 having proven nothing.
+    const tabIdsBefore = await tileTabIds(page)
+
     const row = sessionRow(page, SIDEBAR_CROSS_TEXTS.finalText)
     await row.click({ modifiers: [TAB_OPEN_MODIFIER] })
 
-    // The tab must actually exist before we assert anything about it -- a
-    // modifier that never reached the onClick handler would otherwise let this
-    // test quietly assert the "merely deselected" case instead of the tab case.
-    // The tree's TAB STRIP is the right surface to check: a stacked tab that
-    // isn't fronted renders its tab but NOT its pane body, so the tab element
-    // (`data-tree-tab="session-tile:<id>"`, tree-group.tsx) is the only proof
-    // the tile exists AND is hidden.
     await expect
       .poll(
-        () => page.locator('[data-tree-tab^="session-tile:"]').count(),
-        { timeout: 15_000, message: 'the ⌘/⌃-click should have opened the session as a tab' },
+        async () => (await tileTabIds(page)).filter(id => !tabIdsBefore.includes(id)).length,
+        { timeout: 15_000, message: 'the ⌘/⌃-click should have opened the session as a NEW tab' },
       )
       .toBeGreaterThan(0)
 
