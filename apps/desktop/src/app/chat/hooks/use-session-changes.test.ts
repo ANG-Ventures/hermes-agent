@@ -203,6 +203,7 @@ describe('useSessionChanges B1', () => {
       if (call[0] !== 'session.changes') {
         continue
       }
+
       expect((call[1] as { session_id: string }).session_id).toBe(STORED_SID)
       expect((call[1] as { session_id: string }).session_id).not.toBe(SID)
     }
