@@ -21,6 +21,7 @@ class TurnRecord:
     turn_id: str                                   # "turn_" + ULID
     parent_turn_id: Optional[str] = None           # set for subagents; None at top level
     is_subagent: bool = False
+    depth: Optional[int] = None                    # 0=parent, 1=child, 2=grandchild, ...
     ts_start: float = 0.0
     ts_end: float = 0.0
     profile: str = ""                              # agent identity, e.g. "aegis"
@@ -79,6 +80,11 @@ class TurnRecord:
     alerted: bool = False
     user_text: str = ""
     final_text: str = ""
+    # CLI correlation (Phase 3: ccusage ↔ Hermes correlation).
+    # Populated only for turns that spawn a CLI subprocess (Codex, Claude Code, etc.).
+    # Enables deduplication: ccusage records with this invocation_id are already
+    # counted in turns.db and should not be double-counted in the ccusage panel.
+    cli_invocation_id: Optional[str] = None
     # Not persisted on the main row — written to the side table:
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)  # {name,args_preview,result_preview}
 
