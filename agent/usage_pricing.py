@@ -164,6 +164,42 @@ def is_notional_xai_provider(provider_name: Optional[str]) -> bool:
     return bool(p) and p in NOTIONAL_XAI_PROVIDERS
 
 
+# A delegated subagent dispatched at an explicit ``delegation.base_url`` records
+# its provider as the custom-provider POOL KEY (``custom:<name>``) when the
+# endpoint is a REGISTERED ``custom_providers`` entry — see
+# ``_resolve_delegation_credentials`` in tools/delegate_tool.py. ``<name>`` IS
+# the registry name of the backend the lane fronts, so a lane registered against
+# a notional relay (e.g. ``custom:claude-apr``, ``custom:claude-apx-7``) is the
+# same notional backend wearing a lane label. Without this, those turns hit the
+# ``{"custom", "local"}`` branch below and price as billing_mode="unknown" —
+# exactly the Week-30 audit gap (14 Opus turns, $166.70 notional, unpriced).
+#
+# DRY: this resolves the lane name and re-asks the EXISTING predicates. It does
+# NOT re-list any provider, so a new notional lane (a new -apx-N, a new bridge)
+# is covered automatically the moment its predicate covers the bare name.
+# A lane that does NOT resolve notional (custom:together.ai, custom:my-local)
+# is left untouched and keeps its current unknown/custom routing.
+def _resolve_notional_custom_lane(provider_name: str) -> Optional[str]:
+    """Return the bare backend name for a notional ``custom:<name>`` lane.
+
+    ``None`` when the provider is not a custom lane, or when the lane's
+    registered name is not a known notional backend (leave it alone).
+    """
+    if not provider_name.startswith("custom:"):
+        return None
+    lane = provider_name.split(":", 1)[1].strip().lower()
+    if not lane:
+        return None
+    if (
+        is_notional_anthropic_provider(lane)
+        or is_notional_xai_provider(lane)
+        or is_notional_subscription_bridge(lane)
+        or lane in NOTIONAL_OPENROUTER_PROVIDERS
+    ):
+        return lane
+    return None
+
+
 # Notional pricing for ChatGPT-subscription Codex providers (openai-codex).
 # Marginal cash cost is $0 (covered by a flat ChatGPT subscription), but for
 # fleet cost *visibility* we price these at OpenRouter's live catalog rates for
@@ -1243,6 +1279,15 @@ def resolve_billing_route(
         if inferred_provider in {"anthropic", "openai", "google"}:
             provider_name = inferred_provider
             model = bare_model
+
+    # Unwrap a delegated custom LANE (``custom:<name>``) whose registered name is
+    # a known notional backend down to that bare backend name, so every notional
+    # branch below applies to it unchanged. Purely an alias step — a lane that is
+    # not notional (custom:together.ai, custom:my-local-server) is left as-is and
+    # still falls through to the {"custom", "local"} branch at the bottom.
+    _notional_lane = _resolve_notional_custom_lane(provider_name)
+    if _notional_lane:
+        provider_name = _notional_lane
 
     # Notional pricing for local subscription proxies/bridges that front the
     # Anthropic API (Claude Code OAuth billing, tailnet failovers, etc.). The

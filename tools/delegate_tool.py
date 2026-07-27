@@ -3762,7 +3762,15 @@ def _resolve_child_credential_pool(
     # Custom endpoints: distinguish by endpoint identity, not the bare "custom"
     # provider string. Two custom runtimes are only interchangeable when they
     # resolve to the same custom:<name> pool key.
-    if effective_provider == "custom":
+    # ``custom:<name>`` is the lane-attributed form of the same custom runtime
+    # (stamped by _resolve_delegation_credentials for a REGISTERED endpoint so
+    # the turn ledger records which relay was used). It must resolve to exactly
+    # the same pool as bare ``custom`` — the branch already keys on the endpoint
+    # identity derived from base_url, not on the provider string — so accept
+    # both spellings here. Without this the attributed lane would skip the
+    # endpoint-identity branch and fall through to load_pool("custom:<name>"),
+    # losing the parent-pool sharing that keeps rotation/cooldown synchronized.
+    if effective_provider == "custom" or effective_provider.startswith("custom:"):
         try:
             from agent.credential_pool import get_custom_provider_pool_key, load_pool
 
@@ -3780,7 +3788,10 @@ def _resolve_child_credential_pool(
             )
             if (
                 parent_pool is not None
-                and parent_provider == "custom"
+                and (
+                    parent_provider == "custom"
+                    or parent_provider.startswith("custom:")
+                )
                 and parent_key is not None
                 and parent_key == child_key
             ):
@@ -3884,6 +3895,33 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         elif "api.kimi.com/coding" in base_lower:
             provider = "custom"
             api_mode = "anthropic_messages"
+
+        # Lane attribution: a raw delegation.base_url collapses every custom
+        # endpoint to bare "custom", so the blackbox turn ledger cannot tell
+        # which relay a turn actually used AND agent.usage_pricing has no
+        # predicate for bare "custom" (turns land at billing_mode="unknown").
+        # When the endpoint is a REGISTERED custom_providers entry we already
+        # compute its identity for credential-pool routing above
+        # (get_custom_provider_pool_key -> "custom:<name>"); reuse that exact
+        # resolver so the recorded provider names the lane.
+        #
+        # Labeling only: the pool key is derived from base_url, not from this
+        # string, and _resolve_child_credential_pool accepts both spellings, so
+        # which pool is leased is unchanged. An UNREGISTERED base_url yields
+        # None and keeps bare "custom" — there is genuinely no lane name.
+        if provider == "custom":
+            try:
+                from agent.credential_pool import get_custom_provider_pool_key
+
+                _lane_key = get_custom_provider_pool_key(configured_base_url)
+                if _lane_key:
+                    provider = _lane_key
+            except Exception as exc:
+                logger.debug(
+                    "Could not resolve custom provider lane for '%s': %s",
+                    configured_base_url,
+                    exc,
+                )
 
         # Explicit delegation.api_mode in config always wins. Lets users force
         # a transport for non-standard endpoints the URL heuristic can't detect.

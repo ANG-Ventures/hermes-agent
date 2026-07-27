@@ -1286,6 +1286,99 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         creds = _resolve_delegation_credentials(cfg, parent)
         self.assertEqual(creds["api_mode"], "anthropic_messages")
 
+    def test_registered_custom_endpoint_stamps_lane_name(self):
+        """AC1: a REGISTERED custom endpoint records provider='custom:<name>'
+        so the turn ledger names the lane instead of collapsing to 'custom'."""
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "model": "claude-opus-5",
+            "base_url": "https://relay-a.example.com/v1",
+            "api_key": "relay-key",
+        }
+        with patch(
+            "agent.credential_pool.get_custom_provider_pool_key",
+            return_value="custom:claude-apr",
+        ):
+            creds = _resolve_delegation_credentials(cfg, parent)
+        self.assertEqual(creds["provider"], "custom:claude-apr")
+        # Endpoint/credential fields are untouched — labeling only.
+        self.assertEqual(creds["base_url"], "https://relay-a.example.com/v1")
+        self.assertEqual(creds["api_key"], "relay-key")
+
+    def test_unregistered_base_url_keeps_bare_custom(self):
+        """AC2: an unregistered raw base_url has no lane name, so the provider
+        stays bare 'custom' (no regression on the pool-key-None branch)."""
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "model": "qwen2.5-coder",
+            "base_url": "https://raw-unregistered.example.com/v1",
+            "api_key": "raw-key",
+        }
+        with patch(
+            "agent.credential_pool.get_custom_provider_pool_key",
+            return_value=None,
+        ):
+            creds = _resolve_delegation_credentials(cfg, parent)
+        self.assertEqual(creds["provider"], "custom")
+
+    def test_lane_label_does_not_change_which_pool_is_leased(self):
+        """The custom:<name> label must not alter credential-pool routing:
+        _resolve_child_credential_pool keys on the base_url-derived pool key,
+        so the labeled and bare spellings lease the SAME pool."""
+        def fake_key(base_url, provider_name=None):
+            return {
+                "https://relay-a.example.com/v1": "custom:claude-apr",
+            }.get(base_url)
+
+        results = []
+        for label in ("custom", "custom:claude-apr"):
+            parent = _make_mock_parent(depth=0)
+            parent.provider = label
+            parent.base_url = "https://relay-a.example.com/v1"
+            parent._credential_pool = MagicMock(name="relay_a_pool")
+            with patch(
+                "agent.credential_pool.get_custom_provider_pool_key",
+                side_effect=fake_key,
+            ):
+                results.append(
+                    (
+                        _resolve_child_credential_pool(
+                            label, parent, "https://relay-a.example.com/v1"
+                        ),
+                        parent._credential_pool,
+                    )
+                )
+        # Both spellings share the parent's pool for the same endpoint.
+        for resolved, parent_pool in results:
+            self.assertIs(resolved, parent_pool)
+
+    def test_lane_label_still_isolates_different_endpoints(self):
+        """A labeled lane on a DIFFERENT endpoint must still not inherit the
+        parent's pool (issue #7833 isolation preserved under the new label)."""
+        parent = _make_mock_parent(depth=0)
+        parent.provider = "custom:endpoint-a"
+        parent.base_url = "https://endpoint-a.example.com/v1"
+        parent._credential_pool = MagicMock(name="parent_a_pool")
+
+        child_pool = MagicMock(name="endpoint_b_pool")
+        child_pool.has_credentials.return_value = True
+
+        def fake_key(base_url, provider_name=None):
+            return {
+                "https://endpoint-a.example.com/v1": "custom:endpoint-a",
+                "https://endpoint-b.example.com/v1": "custom:endpoint-b",
+            }.get(base_url)
+
+        with patch("agent.credential_pool.get_custom_provider_pool_key", side_effect=fake_key), \
+             patch("agent.credential_pool.load_pool", return_value=child_pool) as load_mock:
+            result = _resolve_child_credential_pool(
+                "custom:endpoint-b", parent, "https://endpoint-b.example.com/v1"
+            )
+
+        load_mock.assert_called_once_with("custom:endpoint-b")
+        self.assertIs(result, child_pool)
+        self.assertIsNot(result, parent._credential_pool)
+
     def test_direct_endpoint_returns_none_api_key_when_not_configured(self):
         # When base_url is set without api_key, api_key should be None so
         # _build_child_agent inherits the parent's key (effective_api_key = override or parent).

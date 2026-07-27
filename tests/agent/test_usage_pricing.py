@@ -1421,3 +1421,104 @@ def test_deepseek_v4_flash_estimate_usage_cost():
     assert result.amount_usd is not None
     # 1M input × $0.14/M + 500K output × $0.28/M = $0.14 + $0.14 = $0.28
     assert float(result.amount_usd) == 0.28
+
+
+# ── Delegated custom-lane attribution (custom:<name>) ────────────────────────
+# A subagent dispatched at a REGISTERED delegation.base_url records its provider
+# as the custom-provider pool key (``custom:<name>``) so the turn ledger names
+# the relay. When ``<name>`` is a known notional backend the lane must price
+# NOTIONAL, not fall through to billing_mode="unknown" (the Week-30 audit gap:
+# 14 Opus subagent turns, $166.70 notional, recorded unpriced).
+
+def test_custom_lane_notional_anthropic_relay_routes_to_anthropic():
+    """AC3: custom:<notional-anthropic-relay> prices at official Anthropic rates."""
+    route = resolve_billing_route("claude-opus-5", provider="custom:claude-apr")
+    assert route.provider == "anthropic"
+    assert route.billing_mode == "official_docs_snapshot"
+
+
+def test_custom_lane_notional_failover_family_covered_by_pattern():
+    """The numbered -apx-N/-bpx-N failover family is matched by the SAME
+    pattern predicate, so a new lane needs no code change here."""
+    for lane in ("custom:claude-apx-7", "custom:claude-bpx-12"):
+        route = resolve_billing_route("claude-opus-5", provider=lane)
+        assert route.provider == "anthropic", lane
+        assert route.billing_mode == "official_docs_snapshot", lane
+
+
+def test_custom_lane_notional_xai_relay_routes_to_xai():
+    """Lane unwrapping re-asks every existing notional predicate, not just the
+    Anthropic one — a custom: lane over xai-oauth routes to the xai vendor."""
+    route = resolve_billing_route("grok-4.5", provider="custom:xai-oauth")
+    assert route.provider == "xai"
+    assert route.billing_mode == "official_docs_snapshot"
+
+
+def test_custom_lane_notional_cost_status_is_not_unknown():
+    """AC3 (the symptom): a notional custom lane produces a priced turn with a
+    cost_status that is NOT "unknown".
+
+    Uses the gemini-bridge lane and its bridge-only ALIAS ``gemini-flash``
+    deliberately. For a vendor-NAMED model id (claude-opus-5, grok-4.5) the M1
+    last-resort vendor fallback rescues pricing even with the lane
+    classification reverted, which would make this assertion vacuous. The
+    alias names no vendor M1 can infer and is only resolvable by unwrapping
+    the lane to its registered backend — so "unknown" here is caused solely by
+    the missing classification. Mutation-proof: revert the lane unwrap in
+    resolve_billing_route and this test goes RED with status == "unknown".
+    """
+    result = estimate_usage_cost(
+        "gemini-flash",
+        CanonicalUsage(input_tokens=1_000_000, output_tokens=100_000),
+        provider="custom:gemini-bridge",
+    )
+    assert result.status != "unknown"
+    assert result.status == "estimated"
+    assert result.amount_usd is not None
+    assert result.amount_usd > 0
+
+
+def test_custom_lane_notional_matches_bare_backend_pricing():
+    """Invariant (not a snapshot): the lane-labeled turn must cost EXACTLY what
+    the same turn costs under the bare backend name. Ties the two spellings
+    together so a future rate change can never diverge them."""
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=100_000)
+    lane = estimate_usage_cost("claude-opus-5", usage, provider="custom:claude-apr")
+    bare = estimate_usage_cost("claude-opus-5", usage, provider="claude-apr")
+    assert lane.amount_usd == bare.amount_usd
+    assert lane.status == bare.status
+
+
+def test_non_notional_custom_lane_still_unknown():
+    """A registered but NON-notional lane (a real metered vendor behind a
+    custom endpoint) is left alone — it must not be silently priced $0."""
+    route = resolve_billing_route("some-model", provider="custom:together.ai")
+    assert route.billing_mode == "unknown"
+
+
+def test_bare_custom_provider_unchanged():
+    """AC2 at the pricing layer: bare "custom" keeps its existing routing."""
+    route = resolve_billing_route("some-model", provider="custom")
+    assert route.provider == "custom"
+    assert route.billing_mode == "unknown"
+
+
+def test_custom_lane_classification_imports_predicates_not_a_second_list():
+    """AC4 (DRY): the lane classifier must delegate to the EXISTING predicates.
+    Behavioral proof — extending the single source at runtime immediately
+    covers the corresponding custom: lane, which is only possible if no second
+    copy of the provider list exists."""
+    from agent import usage_pricing as up
+
+    fake = "totally-new-notional-relay"
+    assert up._resolve_notional_custom_lane(f"custom:{fake}") is None
+    original = up.NOTIONAL_ANTHROPIC_PROVIDERS
+    try:
+        up.NOTIONAL_ANTHROPIC_PROVIDERS = frozenset(original | {fake})
+        # The lane classifier sees the new member with no change of its own.
+        assert up._resolve_notional_custom_lane(f"custom:{fake}") == fake
+        assert up.resolve_billing_route(
+            "claude-opus-5", provider=f"custom:{fake}"
+        ).provider == "anthropic"
+    finally:
+        up.NOTIONAL_ANTHROPIC_PROVIDERS = original
