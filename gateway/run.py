@@ -12292,6 +12292,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _sk for _sk in _pre_drain_keys
                     if _sk not in self._running_agents
                 }
+                # ...and release their pre-drain resume_pending hedge, exactly
+                # as the clean-drain branch above does.  That hedge is marked
+                # for EVERY running session before the drain so a crash can't
+                # lose in-flight work; a session that then FINISHED its turn
+                # was never interrupted, so leaving the flag set is a lie about
+                # its state.  It is not a harmless stale bit: the reason
+                # stamped here ("shutdown_timeout") is in _AUTO_RESUME_REASONS,
+                # so startup auto-resume wakes the session and re-prompts the
+                # user about work that already completed.  Only the sessions
+                # still resident at this point were genuinely interrupted and
+                # must keep the flag.
+                for _sk in _drained_clean_keys:
+                    try:
+                        await self.async_session_store.clear_resume_pending(_sk)
+                    except Exception as _e:
+                        logger.debug(
+                            "clear_resume_pending after timed-out drain failed "
+                            "for %s: %s",
+                            _sk, _e,
+                        )
                 for _sk, _agent in list(self._running_agents.items()):
                     if _agent is _AGENT_PENDING_SENTINEL:
                         continue

@@ -234,3 +234,69 @@ async def test_three_clean_restarts_do_not_suspend(teardown_runner):
     runner.session_store._entries = {sk: mock_entry}
     assert runner._suspend_stuck_loop_sessions() == 0
     assert mock_entry.suspended is False
+
+
+# ---------------------------------------------------------------------------
+# resume_pending hygiene on a TIMED-OUT drain (sibling false-resume regression)
+# ---------------------------------------------------------------------------
+
+
+async def _run_stop_partial_drain(runner, *, running_at_start, finish_keys):
+    """Drive stop() with a TIMED-OUT drain in which *finish_keys* complete.
+
+    This is the live mixed shape the clean/timed-out fixtures above can't
+    express: the drain deadline expires while SOME sessions are still running,
+    but others finished their turn inside the window.  The finishers are
+    ``_drained_clean_keys`` — they were pre-drain marked resume_pending as a
+    crash hedge, and that hedge must be released because they were never
+    actually interrupted.
+    """
+    runner._running_agents = dict(running_at_start)
+    snapshot = dict(running_at_start)
+
+    async def _fake_drain(timeout):
+        for _sk in finish_keys:
+            runner._running_agents.pop(_sk, None)
+        return snapshot, True  # deadline expired with stragglers resident
+
+    runner._drain_active_agents = _fake_drain
+    runner._stop_task = None
+    await runner.stop()
+
+
+@pytest.mark.asyncio
+async def test_timed_out_drain_clears_resume_pending_for_finishers(teardown_runner):
+    """A session that FINISHED during a timed-out drain must not stay flagged.
+
+    Regression: the clean-drain branch released the pre-drain resume_pending
+    hedge, but the timed-out branch computed ``_drained_clean_keys`` and used it
+    ONLY for stuck-loop counts — never clearing the flag.  A bystander session
+    that completed its turn kept ``resume_pending=True`` with reason
+    ``shutdown_timeout``, which IS in ``_AUTO_RESUME_REASONS``, so startup
+    auto-resume woke it and re-prompted the user about work that was never
+    interrupted.
+    """
+    runner, home = teardown_runner
+    sk_finished = _register_session(runner, "finisher")
+    sk_stuck = _register_session(runner, "straggler")
+
+    await _run_stop_partial_drain(
+        runner,
+        running_at_start={sk_finished: _make_agent(), sk_stuck: _make_agent()},
+        finish_keys={sk_finished},
+    )
+
+    finished = runner.session_store._entries[sk_finished]
+    stuck = runner.session_store._entries[sk_stuck]
+
+    assert finished.resume_pending is False, (
+        "session that COMPLETED during the timed-out drain kept resume_pending "
+        f"(reason={finished.resume_reason!r}) — startup auto-resume will "
+        "falsely re-prompt it"
+    )
+    # The genuinely-interrupted straggler MUST keep its flag: this is the
+    # negative control that proves the fix didn't blanket-clear everything.
+    assert stuck.resume_pending is True, (
+        "genuinely-interrupted session lost its resume_pending flag — "
+        "its in-flight work would be silently dropped"
+    )
