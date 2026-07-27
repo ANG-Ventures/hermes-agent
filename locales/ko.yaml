@@ -97,6 +97,7 @@ gateway:
     full_request_no_fixed: after excludes system prompt + tool schemas (no resident agent to measure them); next live turn will show the full size.
     full_request_real: 'Full request size: {before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; before = last live request, after = estimate of next)'
     full_request_unchanged: 'Full request size: {before} tokens (unchanged — next turn resends the same context)'
+    in_progress: '⏳ ~{count:,}개의 메시지를 압축하는 중… 큰 세션은 몇 분 걸릴 수 있습니다. 완료되면 여기에 결과를 게시하겠습니다.'
     no_provider: 구성된 제공자가 없습니다 -- 압축할 수 없습니다.
     not_enough: 압축할 대화가 충분하지 않습니다 (최소 4개의 메시지가 필요합니다).
     nothing_to_do: 아직 압축할 내용이 없습니다 (대화 내용이 모두 보호된 컨텍스트입니다).

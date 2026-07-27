@@ -56,6 +56,15 @@ logger = logging.getLogger("gateway.run")
 # its worker thread. (#35994)
 _RESET_CLEANUP_TIMEOUT_S = 30.0
 
+# /compress transcript-row count above which an interim "⏳ compressing…" ack is
+# sent before the blocking compression. Below this a compress finishes fast
+# enough that an ack is just noise. A large tool-heavy session (hundreds of
+# rows) can take minutes of chunked auxiliary summarization, during which the
+# only signal to the user is the final result — so the ack disambiguates
+# "working" from "hung". Chosen conservatively: well above a trivial chat but
+# below the sessions that actually go slow.
+_COMPRESS_PROGRESS_ACK_MIN_MESSAGES = 200
+
 
 def _model_switch_skew_guard() -> Optional[str]:
     """Refuse a model switch when the gateway is running stale code.
@@ -4236,6 +4245,29 @@ class GatewaySlashCommandsMixin:
                 example = t("gateway.footer.example_line", preview=preview)
         return t("gateway.footer.saved", state=state, example=example)
 
+    async def _send_compress_progress_ack(self, source, message_count: int) -> None:
+        """Best-effort interim "compressing…" ack for a large /compress.
+
+        Fire-and-forget: a failed ack must never break the compress, so every
+        failure is swallowed (mirrors _send_startup_restore_ack). Resolves the
+        live adapter and thread metadata exactly like _send_goal_status_notice.
+        """
+        try:
+            adapter = self._adapter_for_source(source)
+            if adapter is None:
+                return
+            try:
+                metadata = self._thread_metadata_for_source(source)
+            except Exception:
+                metadata = None
+            await adapter.send(
+                source.chat_id,
+                t("gateway.compress.in_progress", count=message_count),
+                metadata=metadata,
+            )
+        except Exception:
+            logger.debug("compress progress ack send failed", exc_info=True)
+
     async def _handle_compress_command(self, event: MessageEvent) -> str:
         """Handle /compress command -- manually compress conversation context.
 
@@ -4461,6 +4493,17 @@ class GatewaySlashCommandsMixin:
                 compressor = tmp_agent.context_compressor
                 if not compressor.has_content_to_compress(head):
                     return t("gateway.compress.nothing_to_do")
+
+                # Interim progress ack for a large session. /compress blocks on the
+                # run_in_executor below (a big session can take many minutes of
+                # chunked auxiliary summarization); the handler's return value is the
+                # ONLY signal the user gets, so without this a long compress is
+                # indistinguishable from a hang. Best-effort and fire-and-forget:
+                # mirror _send_startup_restore_ack — a failed ack must never break
+                # the compress. Gated on transcript size so trivial (fast) compresses
+                # stay quiet instead of emitting noise.
+                if len(history) >= _COMPRESS_PROGRESS_ACK_MIN_MESSAGES:
+                    await self._send_compress_progress_ack(source, len(history))
 
                 loop = asyncio.get_running_loop()
                 compressed, _ = await loop.run_in_executor(

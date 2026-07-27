@@ -97,6 +97,7 @@ gateway:
     full_request_no_fixed: after excludes system prompt + tool schemas (no resident agent to measure them); next live turn will show the full size.
     full_request_real: 'Full request size: {before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; before = last live request, after = estimate of next)'
     full_request_unchanged: 'Full request size: {before} tokens (unchanged — next turn resends the same context)'
+    in_progress: '⏳ Comprimindo ~{count:,} mensagens… uma sessão grande pode levar alguns minutos. Vou publicar o resultado aqui quando terminar.'
     no_provider: Nenhum fornecedor configurado — não é possível comprimir.
     not_enough: Não há conversa suficiente para comprimir (são necessárias pelo menos 4 mensagens).
     nothing_to_do: Ainda não há nada para comprimir (a transcrição continua a ser todo o contexto protegido).

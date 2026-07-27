@@ -97,6 +97,7 @@ gateway:
     full_request_no_fixed: after excludes system prompt + tool schemas (no resident agent to measure them); next live turn will show the full size.
     full_request_real: 'Full request size: {before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; before = last live request, after = estimate of next)'
     full_request_unchanged: 'Full request size: {before} tokens (unchanged — next turn resends the same context)'
+    in_progress: '⏳ Besig om ~{count:,} boodskappe saam te pers… ''n groot sessie kan ''n paar minute neem. Ek plaas die resultaat hier sodra dit klaar is.'
     no_provider: Geen verskaffer opgestel nie -- kan nie saampers nie.
     not_enough: Nie genoeg gesprek om saam te pers nie (ten minste 4 boodskappe nodig).
     nothing_to_do: Niks om saam te pers nie (die transkripsie is steeds heeltemal beskermde konteks).

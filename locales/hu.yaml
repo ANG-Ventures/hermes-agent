@@ -97,6 +97,7 @@ gateway:
     full_request_no_fixed: after excludes system prompt + tool schemas (no resident agent to measure them); next live turn will show the full size.
     full_request_real: 'Full request size: {before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; before = last live request, after = estimate of next)'
     full_request_unchanged: 'Full request size: {before} tokens (unchanged — next turn resends the same context)'
+    in_progress: '⏳ ~{count:,} üzenet tömörítése… egy nagy munkamenet néhány percig is eltarthat. Az eredményt itt teszem közzé, ha kész.'
     no_provider: Nincs konfigurált szolgáltató — nem lehet tömöríteni.
     not_enough: Nincs elég beszélgetés a tömörítéshez (legalább 4 üzenet kell).
     nothing_to_do: Még nincs mit tömöríteni (a teljes átirat még védett kontextus).

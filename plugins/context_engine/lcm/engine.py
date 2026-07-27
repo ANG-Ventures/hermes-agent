@@ -402,6 +402,7 @@ class LCMEngine(ContextEngine):
         )
         self._last_overflow_recovery_failed = False
         self._last_condensation_suppressed_reason = ""
+        self._last_condensations = []
         self._last_compression_status = "idle"
         self._last_compression_noop_reason = ""
         self._degraded = False
@@ -1081,6 +1082,11 @@ class LCMEngine(ContextEngine):
         leaf_compacted_this_turn = False
         dropped_replayed_scaffold_messages = False
         leaf_passes = 0
+        # Per-event node accounting for the compaction summary line: snapshot the
+        # session's DAG node count BEFORE this event so the log can report how many
+        # nodes THIS compress built (delta), not just the lifetime total — the
+        # lifetime figure alone misleads (a 22-day session shows 63 while building 3).
+        nodes_before = len(self._dag.get_session_nodes(self._session_id))
         critical_budget_pressure = self._critical_budget_pressure_reached(
             observed_tokens=observed_prompt_tokens,
             messages=working_messages,
@@ -1375,8 +1381,24 @@ class LCMEngine(ContextEngine):
         self._ingest_cursor = len(compressed)
         self._ingest_cursor_needs_reconcile = False
 
+        # Per-event node accounting: nodes THIS compress built = current total minus
+        # the pre-event snapshot. The lifetime total is kept in parens because it was
+        # the only figure the old line reported and it silently misled debugging (a
+        # long-lived session shows a large total while a single event builds a few).
+        nodes_after = len(self._dag.get_session_nodes(self._session_id))
+        nodes_built = max(0, nodes_after - nodes_before)
+        condensations = getattr(self, "_last_condensations", None) or []
+        cascade_note = ""
+        if condensations:
+            # e.g. " condense=[d0→d1,d1→d2]" — the multi-level cascade is the dominant
+            # driver of a slow compress (each level is its own summarization pass);
+            # surfacing it inline turns "why was this slow" into one grep.
+            cascade_note = " condense=[%s]" % ",".join(
+                "d%d\u2192d%d" % (frm, to) for frm, to in condensations
+            )
         logger.info(
-            "LCM compaction #%d: %d messages → %d (%d leaf pass%s, %d→%d tokens, %d DAG nodes%s)",
+            "LCM compaction #%d: %d messages → %d (%d leaf pass%s, %d→%d tokens, "
+            "+%d nodes built (%d total)%s%s)",
             self.compression_count,
             len(messages),
             len(compressed),
@@ -1384,7 +1406,9 @@ class LCMEngine(ContextEngine):
             "es" if leaf_passes != 1 else "",
             count_messages_tokens(messages),
             count_messages_tokens(compressed),
-            len(self._dag.get_session_nodes(self._session_id)),
+            nodes_built,
+            nodes_after,
+            cascade_note,
             ", forced overflow recovery" if force_overflow else "",
         )
 
@@ -2148,6 +2172,7 @@ class LCMEngine(ContextEngine):
         self._context_probe_persistable = False
         self._last_overflow_recovery_failed = False
         self._last_condensation_suppressed_reason = ""
+        self._last_condensations = []
         self._last_compression_status = "idle"
         self._last_compression_noop_reason = ""
         self._degraded = False
@@ -4576,6 +4601,10 @@ class LCMEngine(ContextEngine):
     ) -> None:
         """Check if any depth level has enough nodes for condensation."""
         self._last_condensation_suppressed_reason = ""
+        # Per-event condensation ledger for the compaction summary line: each entry
+        # is (from_depth, to_depth) for a condensation that fired THIS call. Reset
+        # here so the compaction log reports only this event's cascade.
+        self._last_condensations = []
 
         max_depth = self._config.incremental_max_depth
         if max_depth == 0:
@@ -4647,6 +4676,7 @@ class LCMEngine(ContextEngine):
             )
             self._dag.add_node(node)
             condensed_any = True
+            self._last_condensations.append((depth, depth + 1))
 
             logger.info(
                 "LCM condensation: d%d × %d → d%d (L%d, %d→%d tokens)",

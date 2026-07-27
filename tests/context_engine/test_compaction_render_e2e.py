@@ -134,6 +134,51 @@ def test_render_harness_does_not_touch_live_lcm_db(tmp_path):
     assert before == after, "render harness must not touch the live lcm.db"
 
 
+def test_per_event_node_accounting_and_condensation_ledger(tmp_path):
+    """The compaction summary line reports PER-EVENT node work, not lifetime totals.
+
+    Regression guard for the debugging trap where the log line reported only the
+    lifetime DAG node count (a 22-day session showed 63 while a single compress
+    built 3), and the multi-level condensation cascade — the dominant driver of a
+    slow compress — was not surfaced on the summary line at all. This asserts the
+    two per-event signals the enriched line reads:
+      • nodes built this event = post-count − pre-count (a positive delta)
+      • self._last_condensations lists each (from_depth → to_depth) that fired
+
+    fanin=2 + a 3-deep max makes a cascade fire deterministically offline (no LLM).
+    """
+    eng = _make_engine(tmp_path)
+    try:
+        # Drive several compress events so the DAG accumulates enough leaves to
+        # cross the fanin=2 condensation threshold and cascade at least one level.
+        saw_condensation = False
+        for _ in range(6):
+            nodes_before = len(eng._dag.get_session_nodes(eng._session_id))
+            eng.compress(_tool_heavy_turn(40), current_tokens=10**9)
+            if eng._last_compression_status != "compacted":
+                continue
+            nodes_after = len(eng._dag.get_session_nodes(eng._session_id))
+            # per-event delta is well-defined and non-negative
+            assert nodes_after >= nodes_before
+            # _last_condensations is always a list, reset per event (never leaks a
+            # prior event's cascade), and each entry is a (from, to=from+1) pair
+            assert isinstance(eng._last_condensations, list)
+            for frm, to in eng._last_condensations:
+                assert to == frm + 1
+            if eng._last_condensations:
+                saw_condensation = True
+                # a condensation that fired MUST be reflected in the node delta
+                # (each condensation adds exactly one parent node)
+                assert nodes_after - nodes_before >= len(eng._last_condensations)
+        # the whole point of fanin=2 over 6 heavy events: prove the cascade path
+        # actually engaged at least once (else this test is vacuous)
+        assert saw_condensation, "no condensation fired — test would be vacuous"
+    finally:
+        fn = getattr(eng, "shutdown", None)
+        if callable(fn):
+            fn()
+
+
 def test_too_small_input_does_not_falsely_assert_granular(tmp_path):
     """A message list below the fold threshold must NOT produce a compacted status
     (guards the test from a false-green where nothing actually folded)."""

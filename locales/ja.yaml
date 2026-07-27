@@ -97,6 +97,7 @@ gateway:
     full_request_no_fixed: after excludes system prompt + tool schemas (no resident agent to measure them); next live turn will show the full size.
     full_request_real: 'Full request size: {before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; before = last live request, after = estimate of next)'
     full_request_unchanged: 'Full request size: {before} tokens (unchanged — next turn resends the same context)'
+    in_progress: '⏳ ~{count:,} 件のメッセージを圧縮しています… 大きなセッションは数分かかることがあります。完了したらここに結果を投稿します。'
     no_provider: プロバイダーが構成されていません — 圧縮できません。
     not_enough: 圧縮するための会話が不十分です (少なくとも 4 件のメッセージが必要)。
     nothing_to_do: まだ圧縮するものがありません (トランスクリプトはすべて保護されたコンテキストのままです)。

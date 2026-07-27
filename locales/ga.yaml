@@ -97,6 +97,7 @@ gateway:
     full_request_no_fixed: after excludes system prompt + tool schemas (no resident agent to measure them); next live turn will show the full size.
     full_request_real: 'Full request size: {before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; before = last live request, after = estimate of next)'
     full_request_unchanged: 'Full request size: {before} tokens (unchanged — next turn resends the same context)'
+    in_progress: '⏳ Ag comhbhrú ~{count:,} teachtaireacht… féadann seisiún mór cúpla nóiméad a thógáil. Cuirfidh mé an toradh anseo nuair a bheidh sé déanta.'
     no_provider: Níl aon soláthraí cumraithe — ní féidir dlúthú.
     not_enough: Níl go leor comhrá le dlúthú (teastaíonn 4 theachtaireacht ar a laghad).
     nothing_to_do: Níl aon rud le dlúthú fós (tá an traschríbhinn fós uile mar chomhthéacs cosanta).
