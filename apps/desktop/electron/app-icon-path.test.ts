@@ -51,12 +51,12 @@ test('APP_ICON_PATHS prefers the asar.unpacked copy over in-asar paths', () => {
 
   const entries = block[1]
     .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line.startsWith('path.join('))
+    .map(line => line.trim())
+    .filter(line => line.startsWith('path.join('))
 
   assert.ok(entries.length > 0, 'APP_ICON_PATHS has no path.join() candidates')
 
-  const unpackedIndex = entries.findIndex((entry) => entry.includes('unpackedPathFor('))
+  const unpackedIndex = entries.findIndex(entry => entry.includes('unpackedPathFor('))
   assert.notEqual(
     unpackedIndex,
     -1,
@@ -94,10 +94,11 @@ test('dist/ is unpacked from the asar so the icon candidate exists on disk', () 
   const pkg = JSON.parse(fs.readFileSync(DESKTOP_PKG, 'utf-8')) as {
     build?: { asarUnpack?: string[] }
   }
+
   const asarUnpack = pkg.build?.asarUnpack ?? []
 
   assert.ok(
-    asarUnpack.some((pattern) => pattern.startsWith('dist/')),
+    asarUnpack.some(pattern => pattern.startsWith('dist/')),
     'build.asarUnpack must unpack dist/** — the APP_ICON_PATHS unpacked ' +
       'candidate resolves to <app.asar.unpacked>/dist/apple-touch-icon.png, ' +
       `which only exists if dist is unpacked. Got: ${JSON.stringify(asarUnpack)}`
