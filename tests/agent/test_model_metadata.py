@@ -324,6 +324,61 @@ class TestDefaultContextLengths:
                     f"{model_id}: expected {expected_ctx}, got {actual}"
                 )
 
+    def test_claude_frontier_models_never_fall_through_to_the_200k_catchall(self):
+        """Every current Claude frontier id must resolve to its real 1M window.
+
+        REGRESSION (2026-07-31): ``claude-opus-5`` shipped and was never added to
+        DEFAULT_CONTEXT_LENGTHS. Every generation-5 sibling (sonnet-5, fable-5,
+        mythos-5) was listed, so the omission was invisible -- opus-5 silently hit
+        the ``"claude": 200000`` legacy catch-all and resolved at a FIFTH of its
+        real window, capping compaction mid-conversation with no error anywhere.
+
+        This asserts the RULE ("a frontier Claude id must never land on the legacy
+        catch-all"), so the next rollout that forgets an id fails here instead of
+        silently under-reporting context in production. The catch-all itself is
+        still correct for genuine legacy Claude 3.x ids, which is asserted too.
+        """
+        from agent.model_metadata import get_model_context_length
+        from unittest.mock import patch as mock_patch
+
+        frontier = [
+            "claude-opus-5",
+            "claude-opus-5-fast",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-mythos-5",
+        ]
+        for model_id in frontier:
+            resolved = next(
+                (
+                    length
+                    for key, length in sorted(
+                        DEFAULT_CONTEXT_LENGTHS.items(),
+                        key=lambda x: len(x[0]),
+                        reverse=True,
+                    )
+                    if key in model_id
+                ),
+                None,
+            )
+            assert resolved == 1_000_000, (
+                f"{model_id} resolved to {resolved} via the hardcoded catalog; a "
+                f"frontier Claude model must be 1M, not the legacy 200K catch-all"
+            )
+
+        with mock_patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
+             mock_patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+             mock_patch("agent.model_metadata.get_cached_context_length", return_value=None):
+            for model_id in frontier:
+                actual = get_model_context_length(model_id)
+                assert actual == 1_000_000, (
+                    f"{model_id}: expected 1000000, got {actual}"
+                )
+            # The legacy catch-all must still apply to genuine Claude 3.x ids --
+            # this fix must not blanket-promote every "claude" string to 1M.
+            assert get_model_context_length("claude-3-opus-20240229") == 200000
+
+
     def test_glm_52_context_1m(self):
         """GLM-5.2 must resolve to 1M, not the generic GLM fallback of 202K.
 
