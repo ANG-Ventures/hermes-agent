@@ -437,10 +437,18 @@ class TestSensitivePathCheck:
         # _check_sensitive_path treats as a sensitive system prefix -- that
         # branch fires before the Hermes-config check, masking the config-block
         # message these tests assert. Use a non-sensitive tmp subdir instead.
-        import os
+        # Yield so the directory is always removed, even on failure.
+        import pathlib
+        import shutil
         import tempfile
-        d = os.path.realpath(tempfile.mkdtemp(prefix="hermes_cfgtest_", dir="/tmp"))
-        return __import__("pathlib").Path(d)
+        d = pathlib.Path(
+            os.path.realpath(tempfile.mkdtemp(prefix="hermes_cfgtest_", dir="/tmp"))
+        )
+        try:
+            yield d
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
 
     def test_hermes_config_blocked_for_write_file(self, safe_dir, monkeypatch):
         fake_config = safe_dir / "config.yaml"
@@ -628,17 +636,30 @@ class TestSilentFileMisplacementE2E:
     makes the resolved path correct.
     """
 
-    def test_relative_write_after_env_cleanup_lands_in_user_cwd(self, monkeypatch):
-        import tempfile
-        import tools.terminal_tool as tt
-        import tools.file_tools as ft
-
+    @pytest.fixture
+    def safe_base_dir(self):
         # macOS pytest tmp_path is under /private/var/folders, which
         # _check_sensitive_path blocks -- a relative write resolved against a
         # cwd there is refused before it lands. Use a non-sensitive base dir.
-        tmp_path = __import__("pathlib").Path(
+        # Yield so the directory is always removed, even on failure.
+        import pathlib
+        import shutil
+        import tempfile
+        d = pathlib.Path(
             os.path.realpath(tempfile.mkdtemp(prefix="hermes_cwdtest_", dir="/tmp"))
         )
+        try:
+            yield d
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_relative_write_after_env_cleanup_lands_in_user_cwd(
+        self, safe_base_dir, monkeypatch
+    ):
+        import tools.terminal_tool as tt
+        import tools.file_tools as ft
+
+        tmp_path = safe_base_dir
         project = tmp_path / "project"
         config_default = tmp_path / "config_default"
         project.mkdir()
