@@ -269,6 +269,79 @@ def _is_synthetic_assistant_noise(content: str) -> bool:
     return normalized in _SYNTHETIC_ASSISTANT_NOISE or bracketless in _SYNTHETIC_ASSISTANT_NOISE
 
 
+def _is_codex_interim(msg: Dict[str, Any]) -> bool:
+    """A Codex Responses interim assistant turn.
+
+    These legitimately keep multiple consecutive incomplete assistant turns in
+    history, each carrying its own encrypted continuation state
+    (``codex_reasoning_items`` / ``codex_message_items``) that must replay
+    verbatim. Merging them corrupts the Responses replay chain — so the
+    adjacent-assistant merge exempts them, exactly as the gateway's
+    ``repair_message_sequence`` (agent/agent_runtime_helpers.py) does.
+    """
+    return bool(
+        msg.get("codex_reasoning_items")
+        or msg.get("codex_message_items")
+        or msg.get("finish_reason") == "incomplete"
+    )
+
+
+def _merge_adjacent_assistant_messages(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Merge consecutive assistant messages into one (alternation repair).
+
+    LCM's active-context assembly strips ``tool_calls`` off assistant turns and
+    drops their ``tool`` results to shed token-heavy scaffolding. That leaves
+    the narration rows that used to be separated by tool results sitting
+    adjacent — a strict-alternation violation (``assistant`` followed by
+    ``assistant``) that every downstream load then has to repair, and that
+    inflates the persisted ``message_count`` above the count the model actually
+    replays. Collapse them here, at the single active-context funnel, so the
+    emitted (and persisted) context is alternation-clean by construction.
+
+    Mirrors ``repair_message_sequence`` Pass 0 in the gateway: union tool_calls
+    (order-preserving), concatenate plain-text content, carry the first
+    non-empty ``reasoning_content``, and exempt Codex Responses interim turns.
+    The raw store and DAG are untouched (this operates only on the active
+    replay list), so recovery granularity is preserved.
+    """
+    collapsed: List[Dict[str, Any]] = []
+    for msg in messages:
+        if (
+            collapsed
+            and isinstance(msg, dict)
+            and msg.get("role") == "assistant"
+            and isinstance(collapsed[-1], dict)
+            and collapsed[-1].get("role") == "assistant"
+            and not _is_codex_interim(msg)
+            and not _is_codex_interim(collapsed[-1])
+        ):
+            prev = dict(collapsed[-1])
+            prev_calls = list(prev.get("tool_calls") or [])
+            new_calls = list(msg.get("tool_calls") or [])
+            if new_calls:
+                prev["tool_calls"] = prev_calls + new_calls
+            elif prev_calls:
+                prev["tool_calls"] = prev_calls
+            prev_content = prev.get("content")
+            new_content = msg.get("content")
+            if isinstance(prev_content, str) and isinstance(new_content, str):
+                prev["content"] = "\n".join(
+                    part
+                    for part in (prev_content.strip(), new_content.strip())
+                    if part
+                )
+            elif not prev_content and new_content is not None:
+                prev["content"] = new_content
+            if not prev.get("reasoning_content") and msg.get("reasoning_content"):
+                prev["reasoning_content"] = msg["reasoning_content"]
+            collapsed[-1] = prev
+            continue
+        collapsed.append(msg)
+    return collapsed
+
+
 class LCMEngine(ContextEngine):
     """Lossless Context Management engine.
 
@@ -4483,10 +4556,14 @@ class LCMEngine(ContextEngine):
                 stripped_assistant_messages,
             )
 
-        return self._sanitize_tool_pairs(
+        paired = self._sanitize_tool_pairs(
             cleaned,
             insert_missing_tool_stubs=insert_missing_tool_stubs,
         )
+        # Merge any assistant rows left adjacent once tool rows were dropped —
+        # emit an alternation-clean active context so downstream loads don't
+        # have to repair it and the persisted message_count matches replay.
+        return _merge_adjacent_assistant_messages(paired)
 
     def _sanitize_tool_pairs(
         self,
