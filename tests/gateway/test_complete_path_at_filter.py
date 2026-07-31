@@ -40,7 +40,7 @@ def _items(word: str):
 
 
 @pytest.fixture(autouse=True)
-def _reset_fuzzy_cache(monkeypatch, tmp_path):
+def _reset_fuzzy_cache(monkeypatch):
     # Each test walks a fresh tmp dir; clear the cached listing so prior
     # roots can't leak through the TTL window.
     server._fuzzy_cache.clear()
