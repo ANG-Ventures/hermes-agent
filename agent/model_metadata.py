@@ -307,6 +307,13 @@ DEFAULT_CONTEXT_LENGTHS = {
     "claude-fable-5": 1000000,
     "claude-fable": 1000000,
     "claude-sonnet-5": 1000000,
+    # Claude Opus 5 (1M context) — released 2026-07-23. Was MISSING here until
+    # 2026-07-31: every generation-5 sibling was listed but opus-5 was not, so it
+    # fell through to the `"claude": 200000` catch-all below and silently resolved
+    # at a FIFTH of its real window. Keep each new frontier id in this block the
+    # moment it ships; the catch-all is for legacy Claude 3.x only.
+    # (Substring match: this key also covers "claude-opus-5-fast", also 1M.)
+    "claude-opus-5": 1000000,
     "claude-opus-4-8": 1000000,
     "claude-opus-4.8": 1000000,
     "claude-opus-4-7": 1000000,
