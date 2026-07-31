@@ -162,4 +162,3 @@ class TestSplitToolDiagnostics:
             f"legitimate match was discarded as a diagnostic: {diagnostics!r}"
         )
         assert diagnostics.strip() == ""
-
