@@ -2809,10 +2809,14 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
         if kb.get_task(conn, args.task_id) is None:
             print(f"no such task: {args.task_id}", file=sys.stderr)
             return 1
+        # NOTE (fork parity, 2026-08-06): fork main's add_notify_sub predates
+        # the upstream chat_type param (11cffc4d5 adapted #80564 but missed
+        # dropping the kwarg at this call site — it was a guaranteed
+        # TypeError). --chat-type stays accepted for CLI interface parity;
+        # the enrichment reconnects at the next upstream->fork parity merge.
         kb.add_notify_sub(
             conn, task_id=args.task_id,
             platform=args.platform, chat_id=args.chat_id,
-            chat_type=args.chat_type,
             thread_id=args.thread_id, user_id=args.user_id,
             notifier_profile=args.notifier_profile or _profile_author(),
         )
