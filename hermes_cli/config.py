@@ -1609,6 +1609,15 @@ DEFAULT_CONFIG = {
         # behaviour — e.g. for a profile that prefers explicit
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
+        # Auto-subscribe the originating chat when ``hermes kanban create``
+        # is run from the CLI *inside an agent session* (the gateway bridges
+        # HERMES_SESSION_PLATFORM / HERMES_SESSION_CHAT_ID into terminal
+        # subprocess envs). Default False: auto-subscribing every CLI call
+        # was over-eager (PR #19718, reverted in #19721) because scripts and
+        # cron jobs also drive the CLI. With no session identity present the
+        # CLI create stays silent regardless of this knob, so enabling it
+        # only affects agent-session creates that have a delivery channel.
+        "cli_auto_subscribe": False,
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).

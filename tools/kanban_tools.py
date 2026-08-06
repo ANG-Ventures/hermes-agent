@@ -41,46 +41,6 @@ from hermes_cli.config import cfg_get, load_config
 logger = logging.getLogger(__name__)
 
 
-def _current_session_id() -> Optional[str]:
-    """Resolve the active session id contextvar-first, os.environ fallback.
-
-    In the GATEWAY (concurrent sessions in one process) the per-turn contextvar
-    is the only correct source — the process-global os.environ HERMES_SESSION_ID
-    can be clobbered by a concurrent session (the v3-latch bug class). In a
-    dispatcher-spawned WORKER subprocess (single process, no bound contextvar)
-    get_session_env falls through to that process's correct os.environ value.
-
-    🔴 Empty-contextvar fallthrough — GATED on ``not _HERMES_GATEWAY``: some
-    non-gateway callers bind the contextvar to "" (e.g. ACP binds
-    ``set_session_vars(session_key=session_id)`` which leaves the session_id
-    contextvar at its "" default while writing the real id to os.environ). A ""
-    contextvar is NOT _UNSET, so get_session_env returns "" and would NOT fall
-    through. We treat an empty contextvar value as "not bound" and consult
-    os.environ — but ONLY outside the gateway. Inside the gateway,
-    ``clear_session_vars`` deliberately sets "" to *suppress* the os.environ
-    fallback (so a cleared post-turn read returns None, never a stale/clobbered
-    global), and the per-turn contextvar is authoritative — so we never fall
-    through there. This mirrors ``set_current_session_id``'s own
-    ``not _HERMES_GATEWAY`` guard and preserves both contracts. Returns None
-    when neither has a value.
-    """
-    try:
-        from gateway.session_context import get_session_env
-        val = get_session_env("HERMES_SESSION_ID")
-        if val:
-            return val
-        # Empty/unset contextvar. Outside the gateway (ACP/CLI/worker — single
-        # process, os.environ authoritative) fall through to os.environ. Inside
-        # the gateway, "" means cleared-and-fallback-suppressed → return None
-        # (the per-turn contextvar is the only correct source; a "" here is
-        # never a missing bind because _set_session_env binds session_id).
-        if os.environ.get("_HERMES_GATEWAY") == "1":
-            return None
-        return os.environ.get("HERMES_SESSION_ID") or None
-    except Exception:
-        return os.environ.get("HERMES_SESSION_ID") or None
-
-
 # ---------------------------------------------------------------------------
 # Gating
 # ---------------------------------------------------------------------------
@@ -109,6 +69,17 @@ def _is_delegated_child_context() -> bool:
         return is_delegated_child_context()
     except Exception:
         return False
+
+
+def _is_dispatcher_owned_worker() -> bool:
+    """False for delegate_task children AND for cron jobs fired in-process from
+    a worker — i.e. whenever HERMES_KANBAN_* is present but not ours."""
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        return is_dispatcher_owned_worker_context()
+    except Exception:
+        return True
 
 
 def _reject_delegated_child_mutation(tool_name: str) -> Optional[str]:
@@ -143,7 +114,7 @@ def _check_kanban_mode() -> bool:
     """
     if _is_delegated_child_context():
         return False
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker():
         return True
     return _profile_has_kanban_toolset()
 
@@ -159,7 +130,7 @@ def _check_kanban_orchestrator_mode() -> bool:
     """
     if _is_delegated_child_context():
         return False
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker():
         return False
     return _profile_has_kanban_toolset()
 
@@ -173,6 +144,10 @@ def _default_task_id(arg: Optional[str]) -> Optional[str]:
     if arg:
         return arg
     if _is_delegated_child_context():
+        return None
+    if not _is_dispatcher_owned_worker():
+        # A cron job fired in-process from a worker must never inherit the
+        # worker's task id as an implicit default.
         return None
     env_tid = os.environ.get("HERMES_KANBAN_TASK")
     return env_tid or None
@@ -197,7 +172,7 @@ def _stamp_worker_session_metadata(
     """Add trusted worker session id metadata for this worker's own task."""
     if os.environ.get("HERMES_KANBAN_TASK") != task_id:
         return metadata
-    session_id = _current_session_id()
+    session_id = os.environ.get("HERMES_SESSION_ID")
     if not session_id:
         return metadata
     stamped = dict(metadata or {})
@@ -357,6 +332,85 @@ def heartbeat_current_worker_from_env() -> bool:
         return True
     except Exception:
         logger.debug("auto-heartbeat: bridge failed", exc_info=True)
+        return False
+
+
+# Live operator-note injection: poll the worker's task for new comments and
+# fold them into the running agent via the OUT-OF-BAND steer channel, so a user
+# can "talk to" a running kanban task without the block → comment → unblock
+# dance (or a restart). Rate-limited on its own (tighter than the 60s heartbeat
+# so notes land within a few seconds), watermarked per task id.
+_COMMENT_POLL_MIN_INTERVAL_SECONDS = 6.0
+_comment_poll_last_attempt: float = 0.0
+# task_id -> highest comment id already seen (seeded on first poll so history
+# already present in build_worker_context isn't re-injected).
+_comment_watermark: dict[str, int] = {}
+
+
+def inject_new_comments_from_env(agent: Any) -> bool:
+    """Fold new operator comments on the current worker's task into ``agent``.
+
+    Best-effort and self-gating: no-op unless this process is a kanban worker
+    (``HERMES_KANBAN_TASK`` set) and ``agent`` exposes ``steer``. Returns True
+    if a steer was injected, else False. Never raises into the agent loop.
+
+    The first poll only *seeds* the watermark to the newest existing comment —
+    those are already in the worker's context — so only comments added after
+    the run started are injected. The worker's own authored comments (matched
+    by ``HERMES_PROFILE``) are skipped to avoid echoing itself.
+    """
+    tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not tid or agent is None or not hasattr(agent, "steer"):
+        return False
+    global _comment_poll_last_attempt
+    import time as _time
+    now = _time.monotonic()
+    if (now - _comment_poll_last_attempt) < _COMMENT_POLL_MIN_INTERVAL_SECONDS:
+        return False
+    _comment_poll_last_attempt = now
+
+    seen = _comment_watermark.get(tid)
+    try:
+        kb, conn = _connect()
+        try:
+            rows = kb.list_comments_after(conn, tid, after_id=seen or 0)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception:
+        logger.debug("comment-inject: bridge failed", exc_info=True)
+        return False
+
+    if seen is None:
+        # First poll for this task: seed past the existing thread, inject nothing.
+        _comment_watermark[tid] = max((c.id for c in rows), default=0)
+        return False
+    if not rows:
+        return False
+
+    # Advance the watermark past everything we just read (including our own
+    # notes) so nothing is re-injected next poll.
+    _comment_watermark[tid] = max(c.id for c in rows)
+
+    own = (os.environ.get("HERMES_PROFILE") or "").strip()
+    fresh = [c for c in rows if (c.author or "").strip() != own and (c.body or "").strip()]
+    if not fresh:
+        return False
+
+    lines = [f"- {c.author or 'operator'}: {c.body.strip()}" for c in fresh]
+    note = (
+        "New note"
+        + ("s" if len(fresh) > 1 else "")
+        + " on your kanban task from the operator (delivered mid-run). "
+        + "Take it into account for the work you're doing right now:\n"
+        + "\n".join(lines)
+    )
+    try:
+        return bool(agent.steer(note))
+    except Exception:
+        logger.debug("comment-inject: steer failed", exc_info=True)
         return False
 
 
@@ -1182,14 +1236,13 @@ def _handle_create(args: dict, **kw) -> str:
     # Prefer the request-scoped api_server origin binding: HERMES_SESSION_ID
     # is clobbered with a subagent's internal id whenever a child agent is
     # constructed in-process (agent_init calls set_current_session_id), which
-    # would stamp — and later wake — the wrong session. Then the fork's
-    # gateway-aware contextvar resolver, then the raw env fallback.
+    # would stamp — and later wake — the wrong session.
     from tools.async_delegation import _current_origin_session_id
 
     session_id = (
         args.get("session_id")
         or _current_origin_session_id()
-        or _current_session_id()
+        or os.environ.get("HERMES_SESSION_ID")
     )
     priority = args.get("priority")
     # Resolve workspace. Workspace sharing is always explicit: omitted fields
@@ -1225,17 +1278,7 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
-    # Fork arg name `model_override` is the surviving contract (tests +
-    # schema); also accept upstream's `model` alias. Upstream added
-    # `provider` support (persisted as provider_override).
-    model_override = args.get("model_override")
-    if model_override is None:
-        model_override = args.get("model")
-    if model_override is not None and not isinstance(model_override, str):
-        return tool_error(
-            f"model_override must be a model name string, got "
-            f"{type(model_override).__name__}"
-        )
+    model_override = args.get("model")
     provider_override = args.get("provider")
     if provider_override and not model_override:
         return tool_error("'provider' requires 'model' to be set as well")
@@ -1323,10 +1366,10 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
     Subscription paths:
 
-    - **Gateway** (telegram/discord/slack/etc): ``HERMES_SESSION_PLATFORM``
-      and ``HERMES_SESSION_CHAT_ID`` are set in ContextVars by the
-      messaging gateway before agent dispatch. The notification poller
-      already keys off these, so we just register a row.
+    - **Gateway** (telegram/discord/slack/etc): ``HERMES_SESSION_PLATFORM``,
+      ``HERMES_SESSION_CHAT_ID``, and ``HERMES_SESSION_CHAT_TYPE`` are set in
+      ContextVars by the messaging gateway before agent dispatch. The
+      notification poller already keys off these, so we just register a row.
 
     - **TUI** (herm desktop / herm TUI): the platform/chat_id ContextVars
       are intentionally cleared (TUI is a single-channel local UI, not
@@ -1354,6 +1397,30 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         # user-friendly behaviour that mirrors the pre-gate implementation.
         pass
 
+    return subscribe_calling_session(conn, task_id)
+
+
+def subscribe_calling_session(
+    conn: Any, task_id: str, *, require_platform_identity: bool = False
+) -> bool:
+    """Resolve the calling session's delivery identity and write a notify sub.
+
+    Shared by the agent-tool auto-subscribe path (:func:`_maybe_auto_subscribe`,
+    gated by ``kanban.auto_subscribe_on_create``) and the CLI create path
+    (``hermes kanban create``, gated by ``kanban.cli_auto_subscribe`` in
+    ``hermes_cli.kanban._cmd_create``). Identity is read through
+    ``gateway.session_context.get_session_env`` so an explicitly cleared
+    session context ("" ContextVar) suppresses a stale ``os.environ``
+    mirror instead of subscribing a foreign chat.
+
+    ``require_platform_identity=True`` (the CLI path) accepts only a full
+    gateway identity (platform + chat id) and skips the TUI
+    ``HERMES_SESSION_KEY`` fallback below: a bare CLI/cron/script create
+    has no delivery channel and must stay silent (#19718).
+
+    Returns True if a subscription row was written; any exception is
+    logged at WARNING and swallowed (returns False).
+    """
     platform = ""
     chat_id = ""
     try:
@@ -1361,6 +1428,8 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         platform = get_session_env("HERMES_SESSION_PLATFORM", "")
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
         if not platform or not chat_id:
+            if require_platform_identity:
+                return False
             # TUI / desktop fallback: platform/chat_id ContextVars are
             # cleared for TUI sessions, but the parent process exports
             # HERMES_SESSION_KEY into the subprocess env. Treat that
@@ -1384,13 +1453,42 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             chat_id = session_key
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
+        chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
+        message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
         notifier_profile = (
             get_session_env("HERMES_SESSION_PROFILE", "")
             or os.environ.get("HERMES_PROFILE")
         )
+        if not notifier_profile:
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                notifier_profile = get_active_profile_name() or "default"
+            except Exception:
+                notifier_profile = "default"
+        delivery_metadata: dict[str, Any] = {}
+        if thread_id:
+            delivery_metadata["thread_id"] = thread_id
+        if chat_type:
+            delivery_metadata["chat_type"] = chat_type
+        if (
+            platform.lower() == "telegram"
+            and thread_id
+            and (chat_type or "").lower() in {"dm", "direct", "private"}
+        ):
+            delivery_metadata["telegram_dm_topic_reply_fallback"] = True
+            if str(thread_id) not in {"", "1"}:
+                delivery_metadata["direct_messages_topic_id"] = str(thread_id)
+            if message_id:
+                delivery_metadata["telegram_reply_to_message_id"] = str(message_id)
 
         # Lazy-import to keep the module-level dependency light
         from hermes_cli import kanban_db as _kb
+        # NOTE (fork parity, 2026-08-06): fork main's add_notify_sub predates
+        # the upstream chat_type / delivery_metadata params (config_defaults
+        # extraction + notify-sub enrichment are upstream-only until the next
+        # parity merge). Pass only the params this fork's signature accepts;
+        # the enrichment is additive and its absence just omits optional
+        # delivery metadata, never the subscription row itself.
         _kb.add_notify_sub(
             conn, task_id=task_id,
             platform=platform, chat_id=chat_id,
@@ -1400,7 +1498,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         return True
     except Exception as _exc:
         logger.warning(
-            "_maybe_auto_subscribe failed: %r (platform=%r key_set=%r)",
+            "subscribe_calling_session failed: %r (platform=%r key_set=%r)",
             _exc, platform, bool(chat_id),
         )
         return False
@@ -1978,17 +2076,6 @@ KANBAN_CREATE_SCHEMA = {
                     "task, ['github-code-review'] for a reviewer task. "
                     "The names must match skills installed on the "
                     "assignee's profile."
-                ),
-            },
-            "model_override": {
-                "type": "string",
-                "description": (
-                    "Per-task model override. Pins the dispatched worker "
-                    "to this model (passed as `hermes -m MODEL`) instead "
-                    "of the assignee profile's default model. Use this to "
-                    "run one task on a stronger/cheaper model without "
-                    "cloning a whole profile. Omit to use the profile "
-                    "default."
                 ),
             },
             "goal_mode": {
