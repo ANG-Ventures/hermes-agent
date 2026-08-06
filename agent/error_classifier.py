@@ -34,6 +34,14 @@ class FailoverReason(enum.Enum):
     # Upstream model rate-limited (aggregator 429) — fallback to a different
     # model, NOT credential rotation. The user's key is healthy.
     upstream_rate_limit = "upstream_rate_limit"
+    # Local multi-sub pool relay (claude-apr/-bpr) has NO un-capped box left —
+    # every subscription in the pool is quota-throttled for its window. The
+    # keys are healthy; the SUBS are exhausted. Fall back to a different model,
+    # never rotate a credential. Distinct from overloaded (a provider-server
+    # busy signal) and from the unknown transport floor so the failover line
+    # reads honestly ("sub pool capped") instead of "provider overloaded" /
+    # "connection issue".
+    pool_exhausted = "pool_exhausted"
 
     # Server-side
     overloaded = "overloaded"            # 503/529 — provider overloaded, backoff
@@ -196,6 +204,20 @@ _OVERLOADED_PATTERNS = [
     "currently overloaded",
     "at capacity",
     "over capacity",
+]
+
+# Local multi-sub POOL-RELAY exhaustion: our claude-apr/-bpr pool daemons front
+# N subscription boxes and return 503 {"error":"no eligible sub"} when EVERY box
+# is quota-capped for its current window. Semantically this is an upstream-
+# capacity exhaustion (the user's keys are healthy — the SUBS are throttled), so
+# it must render an honest "sub pool capped" label and fall back to a different
+# model, NEVER rotate a credential. Two surfaces produced two WRONG labels before
+# this: with the 503 code extractable it hit the overloaded bucket ("provider
+# overloaded"); with the code only in the message text it fell through to the
+# unknown floor ("connection issue"). Match the body string directly so BOTH
+# paths classify identically regardless of whether the status code survives.
+_POOL_EXHAUSTED_PATTERNS = [
+    "no eligible sub",
 ]
 
 # Usage-limit patterns that need disambiguation (could be billing OR rate_limit)
@@ -712,6 +734,22 @@ def classify_api_error(
         return _result(
             FailoverReason.content_policy_blocked,
             retryable=False,
+            should_fallback=True,
+        )
+
+    # Local multi-sub pool-relay exhaustion (claude-apr/-bpr: "no eligible sub").
+    # Checked HERE, before status-code classification, because the same error
+    # reaches the classifier two ways — with the 503 code extractable (which
+    # would hit the overloaded bucket → "provider overloaded") and with the code
+    # only embedded in the message text (which would fall through to the unknown
+    # floor → "connection issue"). Matching the body string first makes BOTH
+    # surfaces classify identically and honestly. Keys are healthy; the subs are
+    # quota-capped — fall back to a different model, never rotate a credential.
+    if any(p in error_msg for p in _POOL_EXHAUSTED_PATTERNS):
+        return _result(
+            FailoverReason.pool_exhausted,
+            retryable=True,
+            should_rotate_credential=False,
             should_fallback=True,
         )
 
