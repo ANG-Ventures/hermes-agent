@@ -7,7 +7,7 @@ on:
 jobs:
   workspaces:
     name: List npm workspaces
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
     timeout-minutes: 20
     outputs:
       checks: ${{ steps.set-matrix.outputs.checks }}
@@ -51,7 +51,7 @@ jobs:
   check:
     name: ${{ matrix.package }} / ${{ matrix.script }}
     needs: workspaces
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
     timeout-minutes: 20
     strategy:
       matrix:

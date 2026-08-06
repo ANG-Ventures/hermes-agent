@@ -28,7 +28,7 @@ concurrency:
 jobs:
   generate:
     name: "Generate slices"
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -59,7 +59,7 @@ jobs:
   test:
     name: Run tests ${{ matrix.slice.name }}
     needs: generate
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -151,7 +151,7 @@ jobs:
   save-durations:
     needs: test
     if: needs.test.result == 'success' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
     timeout-minutes: 10
     steps:
       - name: Download all slice durations
@@ -199,7 +199,7 @@ jobs:
           key: test-durations-${{ github.run_id }}
 
   e2e:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     steps:
       - name: Checkout code
