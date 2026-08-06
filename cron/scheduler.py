@@ -3975,6 +3975,12 @@ def run_job(
                 job_id, _mcp_exc,
             )
 
+        # Keep execution identity separate from delivery routing: these fields
+        # label the cron job in telemetry; origin/targets still drive delivery.
+        _cron_chat_id = str(job_id or "").strip()
+        _cron_job_name = str(job.get("name") or "").strip()
+        _cron_chat_label = _cron_job_name or _cron_chat_id
+        _cron_chat_name = f"cron / {_cron_chat_label}" if _cron_chat_label else ""
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -4005,6 +4011,8 @@ def run_job(
             load_soul_identity=True,
             skip_memory=True,  # Cron system prompts would corrupt user representations
             platform="cron",
+            chat_id=_cron_chat_id or "",
+            chat_name=_cron_chat_name or "",
             session_id=_cron_session_id,
             session_db=_session_db,
         )

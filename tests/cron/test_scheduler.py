@@ -1570,6 +1570,45 @@ class TestRunJobSessionPersistence:
             mock_agent_cls = entered[-1]  # the AIAgent patch
             yield fake_db, mock_agent_cls
 
+    @pytest.mark.parametrize(
+        ("job_name", "expected_chat_name"),
+        [
+            ("  Morning digest  ", "cron / Morning digest"),
+            ("", "cron / digest-job"),
+            ("   ", "cron / digest-job"),
+        ],
+    )
+    def test_run_job_passes_job_identity_to_agent(
+        self, tmp_path, job_name, expected_chat_name
+    ):
+        job = {
+            "id": "digest-job",
+            "name": job_name,
+            "prompt": "hello",
+        }
+        with self._run_job_patches(tmp_path) as (_fake_db, mock_agent_cls):
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["chat_id"] == "digest-job"
+        assert kwargs["chat_name"] == expected_chat_name
+
+    @pytest.mark.parametrize("job_id", ["", "   "])
+    def test_run_job_leaves_chat_identity_empty_without_job_name_or_id(
+        self, tmp_path, job_id
+    ):
+        job = {
+            "id": job_id,
+            "name": "",
+            "prompt": "hello",
+        }
+        with self._run_job_patches(tmp_path) as (_fake_db, mock_agent_cls):
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["chat_id"] == ""
+        assert kwargs["chat_name"] == ""
+
     def test_run_job_passes_enabled_toolsets_to_agent(self, tmp_path):
         job = {
             "id": "toolset-job",
