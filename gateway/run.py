@@ -25288,6 +25288,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Bridge sync status_callback → async adapter.send for context pressure
         _status_adapter = self._adapter_for_source(source)
         _status_chat_id = source.chat_id
+
+        def _current_status_adapter() -> Any:
+            """Late-bind the status/side-channel adapter at SEND time.
+
+            The adapter object snapshotted at turn start can be REPLACED
+            mid-turn by the platform reconnect watcher (e.g. a Discord ws
+            ``ack_stale`` → ``self.adapters[platform]`` now holds a NEW
+            adapter object). Sends through the stale object are silently
+            dropped — the 2026-08-05 incident where a `🔄 Model fallback
+            (safety refusal)` announce was generated 80s after a Discord
+            reconnect and never reached the channel. ``_adapter_for_source``
+            re-resolves from the live registry (a stale transport ref no
+            longer matches and falls through to the live lookup), so calling
+            it per-send always yields the current adapter. Falls back to the
+            turn-start snapshot if live resolution fails (platform offline
+            mid-reconnect), preserving prior behavior.
+            """
+            try:
+                _live = self._adapter_for_source(source)
+            except Exception:
+                _live = None
+            return _live or _status_adapter
         if source.platform == Platform.FEISHU and source.thread_id and event_message_id:
             # Feishu topics only keep messages inside the topic when they are
             # sent via the reply API with reply_in_thread=true. Status/interim,
@@ -25311,7 +25333,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ) if _progress_thread_id else None
 
         def _status_callback_sync(event_type: str, message: str) -> None:
-            if not _status_adapter or not _run_still_current():
+            _adp = _current_status_adapter()
+            if not _adp or not _run_still_current():
                 return
             prepared_message = _prepare_gateway_status_message(
                 source.platform,
@@ -25327,7 +25350,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return
             _fut = safe_schedule_threadsafe(
-                _send_or_update_status_coro(_status_adapter, _status_chat_id, event_type, prepared_message, _status_thread_metadata),
+                _send_or_update_status_coro(_adp, _status_chat_id, event_type, prepared_message, _status_thread_metadata),
                 _loop_for_step,
                 logger=logger,
                 log_message=f"status_callback ({event_type}) scheduling error",
@@ -25520,10 +25543,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else:
                         _stream_consumer.on_commentary(display_text)
                     return
-                if already_streamed or not _status_adapter or not str(display_text or "").strip():
+                if already_streamed or not str(display_text or "").strip():
+                    return
+                _adp = _current_status_adapter()
+                if not _adp:
                     return
                 safe_schedule_threadsafe(
-                    _status_adapter.send(
+                    _adp.send(
                         _status_chat_id,
                         display_text,
                         metadata=_status_thread_metadata,
@@ -25836,7 +25862,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # clear). The clear callback is a no-op: a sent platform message
             # can't be cleanly retracted, and the band already fired once.
             def _notice_callback_sync(notice) -> None:
-                if not _status_adapter or not _run_still_current():
+                if not _current_status_adapter() or not _run_still_current():
                     return
                 try:
                     line = render_notice_line(notice)
@@ -25872,10 +25898,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _bg_review_pending_lock = threading.Lock()
 
             def _deliver_bg_review_message(message: str) -> None:
-                if not _status_adapter or not _run_still_current():
+                _adp = _current_status_adapter()
+                if not _adp or not _run_still_current():
                     return
                 safe_schedule_threadsafe(
-                    _status_adapter.send(
+                    _adp.send(
                         _status_chat_id,
                         message,
                         metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
@@ -25895,7 +25922,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Background review delivery — send "💾 Memory updated" etc. to user
             def _bg_review_send(message: str) -> None:
-                if not _status_adapter or not _run_still_current():
+                if not _current_status_adapter() or not _run_still_current():
                     return
                 if not _bg_review_release.is_set():
                     with _bg_review_pending_lock:
@@ -25942,7 +25969,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from tools import clarify_gateway as _clarify_mod
                 import uuid as _uuid
 
-                if not _status_adapter:
+                _adp = _current_status_adapter()
+                if not _adp:
                     return ""
 
                 clarify_id = _uuid.uuid4().hex[:10]
@@ -25958,7 +25986,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # an "Other" response on platforms that disable input while
                 # typing is active (Slack Assistant API).
                 try:
-                    _status_adapter.pause_typing_for_chat(_status_chat_id)
+                    _adp.pause_typing_for_chat(_status_chat_id)
                 except Exception:
                     pass
 
@@ -25983,7 +26011,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 send_ok = False
                 fut = safe_schedule_threadsafe(
-                    _status_adapter.send_clarify(
+                    _adp.send_clarify(
                         chat_id=_status_chat_id,
                         question=question,
                         choices=list(choices) if choices else None,
@@ -26109,7 +26137,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # is active.  The approval message send auto-clears the Slack
                 # status; pausing prevents _keep_typing from re-setting it.
                 # Typing resumes in _handle_approve_command/_handle_deny_command.
-                _status_adapter.pause_typing_for_chat(_status_chat_id)
+                _adp = _current_status_adapter()
+                _adp.pause_typing_for_chat(_status_chat_id)
 
                 cmd = approval_data.get("command", "")
                 desc = approval_data.get("description", "dangerous command")
@@ -26125,10 +26154,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Prefer button-based approval when the adapter supports it.
                 # Check the *class* for the method, not the instance — avoids
                 # false positives from MagicMock auto-attribute creation in tests.
-                if getattr(type(_status_adapter), "send_exec_approval", None) is not None:
+                if getattr(type(_adp), "send_exec_approval", None) is not None:
                     try:
                         _approval_fut = safe_schedule_threadsafe(
-                            _status_adapter.send_exec_approval(
+                            _adp.send_exec_approval(
                                 chat_id=_status_chat_id,
                                 command=cmd,
                                 session_key=_approval_session_key,
@@ -26160,7 +26189,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # typed prefix so Slack/Matrix users are told the form they
                 # can actually type (`!approve`) — typed "/" is blocked in
                 # Slack threads and reserved by Matrix clients.
-                _p = getattr(_status_adapter, "typed_command_prefix", "/")
+                _p = getattr(_adp, "typed_command_prefix", "/")
                 msg = _format_exec_approval_fallback(
                     cmd,
                     desc,
@@ -26171,7 +26200,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 try:
                     _approval_send_fut = safe_schedule_threadsafe(
-                        _status_adapter.send(
+                        _adp.send(
                             _status_chat_id,
                             msg,
                             metadata=_status_thread_metadata,

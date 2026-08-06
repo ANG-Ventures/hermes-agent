@@ -829,10 +829,12 @@ class TestFallbackReasoningEffort:
         # Chokepoint resolution: the fallback model's per-model override wins.
         assert agent.reasoning_config == {"enabled": True, "effort": "low"}
 
-    def test_absent_key_and_no_override_resolves_global(self):
-        """Absent per-entry key + no per-model override → the chokepoint
-        resolves the GLOBAL effort (same value or not, it comes from config
-        rather than being frozen to whatever was active)."""
+    def test_absent_key_and_no_override_keeps_session_effort(self):
+        """Absent per-entry key + no per-model override → the session's
+        CURRENT effort survives untouched. Re-resolving the global default
+        here clobbered live session overrides (/reasoning xhigh → medium on
+        every failover) — the 2026-08-05 demotion bug. The global default is
+        only ever applied at session setup, never re-imposed by failover."""
         agent = _make_agent(
             fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
         )
@@ -844,7 +846,7 @@ class TestFallbackReasoningEffort:
                 patch("hermes_cli.config.load_config", return_value=fake_config):
             agent._try_activate_fallback()
 
-        assert agent.reasoning_config == {"enabled": True, "effort": "medium"}
+        assert agent.reasoning_config == {"enabled": True, "effort": "high"}
 
     def test_absent_key_none_resolution_keeps_session_override(self):
         """Chokepoint returning None (nothing configured in the FILE) must NOT

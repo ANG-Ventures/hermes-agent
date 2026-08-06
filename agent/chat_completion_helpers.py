@@ -2353,30 +2353,39 @@ def try_activate_fallback(
                     fb_provider, fb_model, _fb_reasoning_effort, _re_exc,
                 )
         else:
-            # No per-entry override → layer on upstream's shared chokepoint
-            # (#21256 upstream shape): re-resolve for the FALLBACK model from
-            # config (per-model ``agent.reasoning_overrides`` > global
-            # ``agent.reasoning_effort``; YAML boolean False = disabled).
-            # Failure keeps the current effort — never break the swap. This
-            # replaces the fork's old keep-current-only behavior so a
-            # model-keyed override applies to fallback tiers too; the fork's
-            # per-entry key above still wins when present (upstream cannot
-            # express per-provider-tier efforts for the same model).
+            # No per-entry override → apply ONLY a per-MODEL override
+            # (``agent.reasoning_overrides``) for the fallback model. The
+            # GLOBAL ``agent.reasoning_effort`` default is deliberately NOT
+            # re-applied here: the session's live reasoning_config already
+            # reflects the global default when the user never overrode it,
+            # and re-resolving the global would CLOBBER a live session
+            # override (/reasoning xhigh) down to the config default on
+            # every failover — the 2026-08-05 xhigh→medium demotion bug.
+            # A per-model override is a deliberate, model-specific directive
+            # and still wins (upstream #21256 intent); absence of any
+            # override keeps the session's current effort untouched.
+            # Failure keeps the current effort — never break the swap.
             try:
                 from hermes_cli.config import load_config
-                from hermes_constants import resolve_reasoning_config
+                from hermes_constants import resolve_per_model_reasoning_effort
 
-                _resolved = resolve_reasoning_config(load_config() or {}, fb_model)
-                # None = nothing configured in the file (no per-model override,
-                # no global reasoning_effort) — NOT a directive to clear. Keep
-                # the current config so a session-level override (/reasoning
-                # high) survives fallback activation. A file-level "disabled"
-                # returns {"enabled": False}, not None, so explicit off still
-                # applies.
+                _cfg = load_config() or {}
+                _agent_cfg = _cfg.get("agent") if isinstance(_cfg, dict) else {}
+                _overrides = (
+                    _agent_cfg.get("reasoning_overrides")
+                    if isinstance(_agent_cfg, dict) else None
+                ) or {}
+                _resolved = resolve_per_model_reasoning_effort(
+                    fb_model, _overrides
+                )
+                # None = no per-model override for the fallback model — keep
+                # the session's current config (session overrides and the
+                # already-in-effect global default both survive unchanged).
                 if _resolved is not None:
                     agent.reasoning_config = _resolved
                     logger.info(
-                        "Fallback %s/%s: reasoning_config resolved via chokepoint: %s",
+                        "Fallback %s/%s: reasoning_config resolved via "
+                        "per-model override: %s",
                         fb_provider, fb_model, _resolved,
                     )
             except Exception as _reasoning_err:  # noqa: BLE001
@@ -2591,11 +2600,18 @@ def try_activate_fallback(
                 getattr(agent, "context_compressor", None), "context_length", None
             )
             # Effort labels: OLD = the primary effort snapshotted before the
-            # per-entry override; NEW = the fallback entry's effort, blank-
-            # inherited → normalized to the primary's label so an inherited
-            # failover renders no (effort) suffix.
+            # override application; NEW = the agent's ACTUAL post-swap
+            # reasoning_config (reflects the per-entry override, a per-model
+            # override, or the untouched session config). Reading the live
+            # config instead of just the per-entry field keeps the announce
+            # and the audit sink HONEST — the 2026-08-05 incident logged
+            # "@xhigh -> @xhigh" while the agent actually ran medium because
+            # only the (absent) per-entry field was consulted.
             _old_eff = _effort_label(_old_reasoning_config)
-            _new_eff = _effort_label(_fb_reasoning_effort) or _old_eff
+            _new_eff = (
+                _effort_label(getattr(agent, "reasoning_config", None))
+                or _old_eff
+            )
             # Durable audit sink — always, gate-independent, dedupe-independent.
             _append_route_change(
                 "failover", old_provider, old_model, fb_provider, fb_model,
