@@ -26,7 +26,6 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
-from hermes_cli.profiles import get_active_profile_name
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +133,9 @@ def _parse_branch_flag(value: Optional[str]) -> Optional[str]:
     return branch
 
 
-def _check_dispatcher_presence() -> tuple[bool, str]:
+def _check_dispatcher_presence(
+    hermes_home: Optional[Path] = None,
+) -> tuple[bool, str]:
     """Return ``(running, message)``.
 
     - ``running=True``: a gateway is alive for this HERMES_HOME and its
@@ -149,15 +150,35 @@ def _check_dispatcher_presence() -> tuple[bool, str]:
     Defensive against import failures and config-read errors — if the
     probe itself errors, we return ``(True, "")`` so we don't spam
     false warnings (better to miss a warning than to cry wolf).
+
+    ``hermes_home`` scopes the probe to a named profile's directory. The
+    dashboard plugin API passes it because the dashboard backend process can
+    be running under a different HERMES_HOME than the profile the request
+    targets, which otherwise produced a "no gateway is running" warning
+    against a perfectly healthy profile gateway (#71211). CLI callers leave
+    it ``None`` and keep the existing process-level behavior.
     """
     try:
-        from gateway.status import get_running_pid  # type: ignore
+        from gateway.status import resolve_gateway_liveness  # type: ignore
     except Exception:
         return (True, "")  # can't probe — silent
     try:
-        pid = get_running_pid()
+        # Same shared ladder the dashboard status endpoints use, so a
+        # PID-file-less (launch-service-managed) or cross-container gateway
+        # is not misreported as absent. use_cache=False: this is a one-shot
+        # CLI/create-time probe, not a polling loop, and it must observe the
+        # gateway's state right now rather than a cached snapshot.
+        liveness = resolve_gateway_liveness(
+            profile_dir=hermes_home, use_cache=False
+        )
     except Exception:
         return (True, "")  # probe errored — silent
+    if liveness.probe_error:
+        # The resolver swallows per-rung failures so status endpoints never
+        # 500. This caller must still fail OPEN: an unreadable probe means
+        # "can't tell", not "no gateway", and warning on it cries wolf.
+        return (True, "")
+    pid = liveness.pid
 
     # Even if the gateway is up, dispatch_in_gateway may be off.
     try:
@@ -587,7 +608,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_edit.add_argument("task_id")
     p_edit.add_argument(
         "--result",
-        default=None,
+        required=True,
         help="Backfilled task result text for a done task",
     )
     p_edit.add_argument(
@@ -599,22 +620,6 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--metadata",
         default=None,
         help="JSON dict of structured facts to store on the latest completed run.",
-    )
-    p_edit.add_argument(
-        "--model",
-        default=None,
-        dest="model_override",
-        metavar="MODEL",
-        help="Set the per-task model override (passed to the worker as "
-             "`hermes -m MODEL`). Omitting --model leaves the existing "
-             "override untouched; use --clear-model to remove it.",
-    )
-    p_edit.add_argument(
-        "--clear-model",
-        action="store_true",
-        dest="clear_model",
-        help="Clear the per-task model override (revert to the assignee "
-             "profile default). Mutually exclusive with --model.",
     )
 
     p_block = sub.add_parser("block", help="Mark one or more tasks blocked")
@@ -765,6 +770,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_nsub.add_argument("task_id")
     p_nsub.add_argument("--platform", required=True)
     p_nsub.add_argument("--chat-id", required=True)
+    p_nsub.add_argument("--chat-type", default="", help="dm / group / channel (used by wake routing)")
     p_nsub.add_argument("--thread-id", default=None)
     p_nsub.add_argument("--user-id", default=None)
     p_nsub.add_argument(
@@ -1466,6 +1472,35 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
+def _maybe_cli_auto_subscribe(conn, task_id: str) -> bool:
+    """Subscribe the originating chat to ``task_id`` when configured.
+
+    Gated by ``kanban.cli_auto_subscribe`` (default False). ``hermes kanban
+    create`` deliberately does not auto-subscribe by default — subscribing
+    every CLI call was reverted upstream (#19718 / #19721) because scripts
+    and cron jobs also drive the CLI. When the knob is on, only a create
+    carrying a full gateway session identity (HERMES_SESSION_PLATFORM +
+    HERMES_SESSION_CHAT_ID, read via the stale-safe
+    ``gateway.session_context.get_session_env``) subscribes; bare CLI /
+    cron / script creates stay silent regardless of the knob.
+
+    Returns True when a subscription row was written. Never raises — a
+    notification bookkeeping failure must not fail the create.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        if not cfg_get(load_config(), "kanban", "cli_auto_subscribe", default=False):
+            return False
+        from tools.kanban_tools import subscribe_calling_session
+
+        return subscribe_calling_session(
+            conn, task_id, require_platform_identity=True
+        )
+    except Exception:
+        return False
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
@@ -1515,10 +1550,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
+        auto_subscribed = _maybe_cli_auto_subscribe(conn, task_id)
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        if auto_subscribed:
+            print(
+                "Subscribed the calling session for finish notifications "
+                "(kanban.cli_auto_subscribe)."
+            )
 
         # Warn when the task would sit in `ready` because no dispatcher is
         # present. Only warn on ready+assigned tasks — triage/todo are
@@ -1823,23 +1864,13 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
             conn, args.task_id,
             reason=getattr(args, "reason", None),
         )
-        task = kb.get_task(conn, args.task_id) if ok else None
     if not ok:
         print(
             f"cannot reclaim {args.task_id} (not running or unknown id)",
             file=sys.stderr,
         )
         return 1
-    status = task.status if task else None
-    if status in ("blocked", "triage", "scheduled"):
-        # A reclaim releases the claim; it does not promote. Say so, or the
-        # operator assumes the card is queued and waits for a worker forever.
-        print(
-            f"Reclaimed {args.task_id} (status held at {status!r} — "
-            f"run 'hermes kanban unblock {args.task_id}' to re-queue it)"
-        )
-    else:
-        print(f"Reclaimed {args.task_id}" + (f" ({status})" if status else ""))
+    print(f"Reclaimed {args.task_id}")
     return 0
 
 
@@ -2242,60 +2273,21 @@ def _cmd_edit(args: argparse.Namespace) -> int:
         except (ValueError, json.JSONDecodeError) as exc:
             print(f"kanban: --metadata: {exc}", file=sys.stderr)
             return 2
-
-    model_override = getattr(args, "model_override", None)
-    clear_model = bool(getattr(args, "clear_model", False))
-    if model_override is not None and clear_model:
-        print(
-            "kanban: --model and --clear-model are mutually exclusive",
-            file=sys.stderr,
-        )
-        return 2
-
-    # The result-backfill edit is only attempted when --result is given;
-    # --model / --clear-model are independent edits that apply to any task.
-    do_result = getattr(args, "result", None) is not None
-    do_model = model_override is not None or clear_model
-
-    if not do_result and not do_model:
-        print(
-            "kanban: nothing to edit (pass --result, --model, or --clear-model)",
-            file=sys.stderr,
-        )
-        return 2
-
-    rc = 0
     with kb.connect_closing() as conn:
-        if do_model:
-            # --clear-model writes NULL; --model X writes X literally. The
-            # None sentinel ("--model omitted") never reaches here.
-            new_model = None if clear_model else model_override
-            affected = kb.set_task_model(conn, args.task_id, new_model)
-            if affected == 0:
-                print(
-                    f"cannot set model on {args.task_id} (unknown id)",
-                    file=sys.stderr,
-                )
-                return 1
-            if clear_model:
-                print(f"Cleared model override on {args.task_id}")
-            else:
-                print(f"Set model override on {args.task_id}: {new_model}")
-        if do_result:
-            if not kb.edit_completed_task_result(
-                conn,
-                args.task_id,
-                result=args.result,
-                summary=getattr(args, "summary", None),
-                metadata=metadata,
-            ):
-                print(
-                    f"cannot edit {args.task_id} (unknown id or task is not done)",
-                    file=sys.stderr,
-                )
-                return 1
-            print(f"Edited {args.task_id}")
-    return rc
+        if not kb.edit_completed_task_result(
+            conn,
+            args.task_id,
+            result=args.result,
+            summary=getattr(args, "summary", None),
+            metadata=metadata,
+        ):
+            print(
+                f"cannot edit {args.task_id} (unknown id or task is not done)",
+                file=sys.stderr,
+            )
+            return 1
+    print(f"Edited {args.task_id}")
+    return 0
 
 
 def _cmd_block(args: argparse.Namespace) -> int:
@@ -2524,6 +2516,18 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
+        # Spawned cards nobody is watching will finish silently — surface
+        # that at the point of confusion (every dispatch run) instead of
+        # relying on the operator remembering to notify-subscribe. Computed
+        # regardless of kanban.cli_auto_subscribe; best-effort so a
+        # notification bookkeeping failure never fails the dispatch.
+        spawned_unwatched: list[str] = []
+        for _tid, _who, _ws in res.spawned:
+            try:
+                if not kb.list_notify_subs(conn, _tid):
+                    spawned_unwatched.append(_tid)
+            except Exception:
+                pass
     if getattr(args, "json", False):
         print(json.dumps({
             "reclaimed": res.reclaimed,
@@ -2536,6 +2540,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "workspace": ws}
                 for (tid, who, ws) in res.spawned
             ],
+            "spawned_unwatched": spawned_unwatched,
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
             "skipped_per_profile_capped": [
@@ -2543,10 +2548,6 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
-            "respawn_guarded": [
-                {"task_id": tid, "reason": reason}
-                for (tid, reason) in res.respawn_guarded
-            ],
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -2567,6 +2568,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
+    if spawned_unwatched:
+        print(
+            f"{len(spawned_unwatched)} spawned card(s) have no notify "
+            "subscription — finishes will be silent "
+            "(kanban.cli_auto_subscribe or notify-subscribe)"
+        )
     if res.auto_assigned_default:
         print(
             f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "
@@ -2584,9 +2591,6 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
-    if res.respawn_guarded:
-        for tid, reason in res.respawn_guarded:
-            print(f"Deferred (respawn guard {reason}): {tid}")
     return 0
 
 
@@ -2808,6 +2812,7 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
         kb.add_notify_sub(
             conn, task_id=args.task_id,
             platform=args.platform, chat_id=args.chat_id,
+            chat_type=args.chat_type,
             thread_id=args.thread_id, user_id=args.user_id,
             notifier_profile=args.notifier_profile or _profile_author(),
         )
