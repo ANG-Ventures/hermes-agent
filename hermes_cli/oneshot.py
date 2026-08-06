@@ -407,6 +407,14 @@ def _run_agent(
         # gateway sessions.
         _fb = get_fallback_chain(cfg)
 
+        kanban_task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        kanban_board = (os.environ.get("HERMES_KANBAN_BOARD") or "").strip()
+        kanban_chat_name = (
+            " / ".join(part for part in ("kanban", kanban_board, kanban_task) if part)
+            if kanban_task
+            else ""
+        )
+
         agent = AIAgent(
             api_key=runtime.get("api_key"),
             base_url=runtime.get("base_url"),
@@ -417,6 +425,8 @@ def _run_agent(
             enabled_toolsets=toolsets_list,
             quiet_mode=True,
             platform="cli",
+            chat_id=kanban_task or "",
+            chat_name=kanban_chat_name or "",
             session_db=session_db,
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,
