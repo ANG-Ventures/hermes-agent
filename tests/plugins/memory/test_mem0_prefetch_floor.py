@@ -146,8 +146,10 @@ def test_gate_b_telemetry_logs_cosine_distribution(monkeypatch, tmp_path, caplog
     assert cmax >= cmin
     cos_list = _re.search(r"cos=([0-9.,]+)", line).group(1).split(",")
     assert len(cos_list) == 2, f"expected 2 per-candidate cosines, got {cos_list}"
-    # no memory TEXT leaks into the telemetry (privacy) — only a query hash
-    assert "near1" not in line and "junk1" not in line and "substantive query" not in line
+    # memory ROW text must not leak; QUERY text is logged in full via qtext=
+    # (owner ruling 2026-08-06 — hash-only made near-miss triage undecidable).
+    assert "near1" not in line and "junk1" not in line
+    assert "qtext=substantive query" in line
 
 
 def test_gate_b_saturated_score_does_not_save_low_cosine(monkeypatch, tmp_path):
@@ -481,8 +483,9 @@ def test_rerank_gate_telemetry_logs_distribution(monkeypatch, tmp_path, caplog):
     assert line
     for field in ("rr_max=", "rr_min=", "rr=", "min="):
         assert field in line, f"missing {field}: {line}"
-    # no memory text leaks (privacy) — only scores + query hash
-    assert "substantive query" not in line and " a " not in line
+    # memory ROW text must not leak; query text is logged in full via qtext=
+    assert " a " not in line.split("qtext=")[0]
+    assert "qtext=substantive query" in line
 
 
 def test_rerank_gap_default_off_is_inert(monkeypatch, tmp_path):
@@ -521,3 +524,32 @@ def test_rerank_gap_negative_config_clamped_not_fail_closed(monkeypatch, tmp_pat
     # clamped to 6.0 → top=5.0, keep >= -1.0: all three survive, nothing wrongly dropped.
     assert [r["memory"] for r in kept] == ["top", "near", "far"]
     assert outcome == "gap_kept_3_of_3"
+
+
+# ---------------------------------------------------------------------------
+# qtext= full-query telemetry (owner ruling 2026-08-06): near-miss triage was
+# undecidable from the hash alone on a single-user system, so telemetry lines
+# now carry the full query text, whitespace-flattened to keep line parsers safe.
+# ---------------------------------------------------------------------------
+
+def test_query_text_flattens_whitespace(monkeypatch, tmp_path):
+    p = _provider(monkeypatch, tmp_path)
+    assert p._prefetch_query_text("what is\nmy   DNS\tsetup") == "what is my DNS setup"
+    assert p._prefetch_query_text(None) == "-"
+    assert p._prefetch_query_text("   ") == "-"
+
+
+def test_rerank_telemetry_carries_full_query_text(monkeypatch, tmp_path, caplog):
+    import logging
+    p = _provider(monkeypatch, tmp_path)
+    _write_cfg_block(tmp_path, "prefetch_rerank_gate", {"enabled": True, "min_rerank": 0.0})
+    results = [{"memory": "m1", "rerank_score": -0.18},
+               {"memory": "m2", "rerank_score": -7.4}]
+    caplog.set_level(logging.INFO)
+    kept, outcome = p._apply_rerank_gate("which query\nwas near miss", results)
+    assert kept == [] and outcome == "rr_kept_0_of_2"
+    line = next((r.getMessage() for r in caplog.records
+                 if "prefetch_rerank outcome=kept_0_of_2" in r.getMessage()), "")
+    assert "qtext=which query was near miss" in line
+    # the stable hash stays alongside for dedup
+    assert " q=" + p._prefetch_query_hash("which query\nwas near miss") in line

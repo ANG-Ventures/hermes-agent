@@ -898,6 +898,17 @@ class Mem0MemoryProvider(MemoryProvider):
         except Exception:
             return "-"
 
+    @staticmethod
+    def _prefetch_query_text(text) -> str:
+        """Full query text for telemetry lines, flattened to one line (newlines/whitespace
+        collapsed so the digest's line-oriented parsers keep working). Owner ruling 2026-08-06:
+        this is a single-user local system — near-miss triage was undecidable from the hash
+        alone, so the query content is logged in full. The hash stays alongside for dedup."""
+        try:
+            return " ".join(str(text or "").split()) or "-"
+        except Exception:
+            return "-"
+
     def _prefetch_specificity_gated(self, query) -> bool:
         """GATE A (INV-7): True → this turn is pure acknowledgment/filler, inject nothing.
         Wrapped fail-open: any error → NOT gated (treat as substantive)."""
@@ -970,17 +981,18 @@ class Mem0MemoryProvider(MemoryProvider):
             scored = [(r, self._dedup_cos(qv, cv)) for r, cv in zip(results, vecs[1:])]
             kept = [r for r, c in scored if c >= floor]
             cosines = sorted((round(c, 3) for _, c in scored), reverse=True)
-            # min/median/max over ALL candidates + how many cleared the floor. No memory TEXT
-            # is logged (privacy) — only the scalar cosines and counts.
+            # min/median/max over ALL candidates + how many cleared the floor. The query text is
+            # logged in full (qtext=, single-user system); memory ROW text is still not logged.
             cmax = cosines[0] if cosines else 0.0
             cmin = cosines[-1] if cosines else 0.0
             cmed = cosines[len(cosines) // 2] if cosines else 0.0
             logger.info(
                 "mem0.prefetch_floor outcome=ran_kept_%d_of_%d floor=%.2f "
-                "cos_max=%.3f cos_med=%.3f cos_min=%.3f cos=%s q=%s",
+                "cos_max=%.3f cos_med=%.3f cos_min=%.3f cos=%s q=%s qtext=%s",
                 len(kept), len(results), floor, cmax, cmed, cmin,
                 ",".join(f"{c:.3f}" for c in cosines),
                 self._prefetch_query_hash(query),
+                self._prefetch_query_text(query),
             )
             return kept, f"ran_kept_{len(kept)}_of_{len(results)}"
         except Exception as e:
@@ -1045,10 +1057,11 @@ class Mem0MemoryProvider(MemoryProvider):
             ordered = sorted(scores, reverse=True)
             logger.info(
                 "mem0.prefetch_rerank outcome=kept_%d_of_%d min=%.2f "
-                "rr_max=%.2f rr_min=%.2f rr=%s q=%s",
+                "rr_max=%.2f rr_min=%.2f rr=%s q=%s qtext=%s",
                 len(kept), len(results), floor, ordered[0], ordered[-1],
                 ",".join(f"{s:.2f}" for s in ordered),
                 self._prefetch_query_hash(query),
+                self._prefetch_query_text(query),
             )
             return kept, f"rr_kept_{len(kept)}_of_{len(results)}"
         except Exception as e:
@@ -1086,8 +1099,9 @@ class Mem0MemoryProvider(MemoryProvider):
                 scores.append(float(rs))
             top = max(scores)
             kept = [r for r, s in zip(results, scores) if (top - s) <= gap]
-            logger.info("mem0.prefetch_gap outcome=kept_%d_of_%d gap=%.1f top=%.2f q=%s",
-                        len(kept), len(results), gap, top, self._prefetch_query_hash(query))
+            logger.info("mem0.prefetch_gap outcome=kept_%d_of_%d gap=%.1f top=%.2f q=%s qtext=%s",
+                        len(kept), len(results), gap, top, self._prefetch_query_hash(query),
+                        self._prefetch_query_text(query))
             return kept, f"gap_kept_{len(kept)}_of_{len(results)}"
         except Exception as e:
             logger.info("mem0.prefetch_gap outcome=failed_open reason=exc:%s of=%d",
@@ -1593,8 +1607,9 @@ class Mem0MemoryProvider(MemoryProvider):
                 # can't separate the junk from on-topic; query specificity can). Fail-open:
                 # _prefetch_specificity_gated swallows any error → not gated.
                 if self._prefetch_specificity_gated(run_query):
-                    logger.info("mem0.prefetch_floor outcome=gated_specificity n_content=0 q=%s",
-                                self._prefetch_query_hash(run_query))
+                    logger.info("mem0.prefetch_floor outcome=gated_specificity n_content=0 q=%s qtext=%s",
+                                self._prefetch_query_hash(run_query),
+                                self._prefetch_query_text(run_query))
                     with self._prefetch_lock:
                         if epoch == self._prefetch_epoch:
                             self._prefetch_result = ""   # inject nothing (D-4)
@@ -1679,12 +1694,13 @@ class Mem0MemoryProvider(MemoryProvider):
                     # pipeline. To judge WHY a turn injected nothing, read `rr_outcome` and the
                     # `mem0.prefetch_rerank` line's scores; `floor_outcome` alone cannot
                     # distinguish "nothing matched" from "L2 rejected everything".
-                    # No memory text (privacy). This is the top-level recall observability row.
+                    # Query text logged in full (qtext=); memory ROW text is not. Top-level recall row.
                     logger.info(
-                        "mem0.prefetch injected=%d floor_outcome=%s rr_outcome=%s gap_outcome=%s rerank=%s exact=%s q=%s",
+                        "mem0.prefetch injected=%d floor_outcome=%s rr_outcome=%s gap_outcome=%s rerank=%s exact=%s q=%s qtext=%s",
                         _injected, _floor_outcome, _rr_outcome, _gap_outcome, _pf_rerank,
                         self._is_exact_token_query(run_query),
                         self._prefetch_query_hash(run_query),
+                        self._prefetch_query_text(run_query),
                     )
                     self._record_success()
             except Exception as e:
