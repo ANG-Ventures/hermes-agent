@@ -239,6 +239,21 @@ class TestSystemdServiceRefresh:
 
         monkeypatch.setattr("gateway.run.start_gateway", fake_start_gateway)
 
+        # run_gateway() ends in _hard_exit_after_gateway_teardown() -> os._exit(),
+        # which bypasses pytest entirely: the runner dies mid-file with exit 0 and
+        # NO summary line, so every test after this one silently never runs and CI
+        # still reports success. Measured 2026-08-06: this class collects 9 tests
+        # but only 6 execute — the two tmpdir-safety guards below (which exist to
+        # stop a pytest tmpdir being baked into a REAL user systemd unit) were
+        # among the dark ones. Stub the hard-exit so the process survives.
+        # The exit helper is a CLOSURE inside run_gateway() (unpatchable from
+        # outside), but it delegates to gateway.run._exit_after_graceful_shutdown
+        # -- that IS the patchable seam.
+        hard_exits: list[int] = []
+        monkeypatch.setattr(
+            "gateway.run._exit_after_graceful_shutdown", hard_exits.append
+        )
+
         gateway_cli.run_gateway()
 
         assert unit_path.read_text(encoding="utf-8") == "new unit\n"
