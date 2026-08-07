@@ -30,6 +30,7 @@ from typing import Optional
 
 from gateway.session_context import declare_stateless_channel
 from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.kanban_identity import resolve_kanban_worker_chat_identity
 
 
 def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
@@ -407,13 +408,7 @@ def _run_agent(
         # gateway sessions.
         _fb = get_fallback_chain(cfg)
 
-        kanban_task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-        kanban_board = (os.environ.get("HERMES_KANBAN_BOARD") or "").strip()
-        kanban_chat_name = (
-            " / ".join(part for part in ("kanban", kanban_board, kanban_task) if part)
-            if kanban_task
-            else ""
-        )
+        kanban_chat_id, kanban_chat_name = resolve_kanban_worker_chat_identity()
 
         agent = AIAgent(
             api_key=runtime.get("api_key"),
@@ -425,8 +420,8 @@ def _run_agent(
             enabled_toolsets=toolsets_list,
             quiet_mode=True,
             platform="cli",
-            chat_id=kanban_task or "",
-            chat_name=kanban_chat_name or "",
+            chat_id=kanban_chat_id,
+            chat_name=kanban_chat_name,
             session_db=session_db,
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,

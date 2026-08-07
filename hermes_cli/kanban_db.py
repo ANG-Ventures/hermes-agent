@@ -46,10 +46,10 @@ overrides still work:
 * ``HERMES_KANBAN_HOME`` — pin the umbrella root that anchors kanban
   paths. Useful for tests and unusual deployments.
 
-The dispatcher injects ``HERMES_KANBAN_DB``,
-``HERMES_KANBAN_WORKSPACES_ROOT``, and ``HERMES_KANBAN_BOARD`` into
-worker subprocess env so workers converge on the exact DB the
-dispatcher used to claim their task — even under unusual symlink or
+The dispatcher injects ``HERMES_KANBAN_TASK``, ``HERMES_KANBAN_DB``,
+``HERMES_KANBAN_WORKSPACES_ROOT``, and ``HERMES_KANBAN_BOARD`` into worker
+subprocess env so workers retain their task identity and converge on the exact
+DB the dispatcher used to claim their task — even under unusual symlink or
 Docker layouts.
 
 Schema is intentionally small: tasks, task_links, task_comments,
