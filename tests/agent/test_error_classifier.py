@@ -53,7 +53,7 @@ class TestFailoverReason:
     def test_enum_members_exist(self):
         expected = {
             "auth", "auth_permanent", "billing", "rate_limit",
-            "upstream_rate_limit",
+            "upstream_rate_limit", "pool_exhausted",
             "overloaded", "server_error", "timeout",
             "ssl_cert_verification",
             "context_overflow", "payload_too_large", "image_too_large",
@@ -282,6 +282,40 @@ class TestClassifyApiError:
         assert result.retryable is False
         assert result.should_rotate_credential is True
         assert result.should_fallback is True
+
+    # ── Local multi-sub pool-relay exhaustion ("no eligible sub") ──
+
+    def test_pool_no_eligible_sub_with_503_status(self):
+        """claude-apr/-bpr 503 {"error":"no eligible sub"} = every sub in the
+        pool is quota-capped. Must classify pool_exhausted (NOT overloaded),
+        fall back to a different model, and never rotate a credential."""
+        e = MockAPIError('{"error":"no eligible sub"}', status_code=503)
+        result = classify_api_error(e, provider="claude-bpr", model="claude-fable-5")
+        assert result.reason == FailoverReason.pool_exhausted
+        assert result.should_rotate_credential is False
+        assert result.should_fallback is True
+        assert result.retryable is True
+
+    def test_pool_no_eligible_sub_status_only_in_message(self):
+        """SAME error with the status only in the message text (no extractable
+        status_code) must classify IDENTICALLY — before this fix it fell through
+        to the unknown floor and rendered the misleading 'connection issue'
+        label, while the code-present path rendered 'provider overloaded'."""
+        e = MockAPIError('HTTP 503: {"error":"no eligible sub"}', status_code=None)
+        result = classify_api_error(e, provider="claude-apr", model="claude-fable-5")
+        assert result.reason == FailoverReason.pool_exhausted
+        assert result.should_rotate_credential is False
+        assert result.should_fallback is True
+
+    def test_pool_upstream_unreachable_stays_overloaded(self):
+        """Negative control: the pool's OTHER 503 (a box is network-unreachable,
+        not quota-capped) must remain overloaded — 'no eligible sub' is the only
+        string that means the whole pool is throttled."""
+        e = MockAPIError(
+            '{"error":"pool: upstream unreachable on every box"}', status_code=503
+        )
+        result = classify_api_error(e, provider="claude-bpr", model="x")
+        assert result.reason == FailoverReason.overloaded
 
     def test_non_xai_403_generic_billing_code_remains_auth(self):
         """Do not broaden generic providers' historical structured-403 behavior."""

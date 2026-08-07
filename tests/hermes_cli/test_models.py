@@ -70,6 +70,21 @@ class TestFetchOpenRouterModels:
                 return b'{"data":[{"id":"anthropic/claude-opus-4.8","pricing":{"prompt":"0.000015","completion":"0.000075"}},{"id":"qwen/qwen3.7-max","pricing":{"prompt":"0.000000325","completion":"0.00000195"}},{"id":"nvidia/nemotron-3-super-120b-a12b:free","pricing":{"prompt":"0","completion":"0"}}]}'
 
         monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
+        # Pin the curated list. Without this the function calls
+        # get_curated_openrouter_models(), which reads the REMOTE catalog
+        # manifest (network + on-disk TTL cache). That manifest is the filter
+        # applied to the live payload, so whether this test passes depended on
+        # whichever model ids the hosted manifest happened to carry — it has
+        # `anthropic/claude-opus-4.8` but not `qwen/qwen3.7-max`, so the test
+        # passed offline (in-repo fallback) and failed in CI (fresh manifest).
+        monkeypatch.setattr(
+            "hermes_cli.model_catalog.get_curated_openrouter_models",
+            lambda: [
+                ("anthropic/claude-opus-4.8", ""),
+                ("qwen/qwen3.7-max", ""),
+                ("nvidia/nemotron-3-super-120b-a12b:free", ""),
+            ],
+        )
         with patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()):
             models = fetch_openrouter_models(force_refresh=True)
 
@@ -167,6 +182,16 @@ class TestFetchOpenRouterModels:
                 )
 
         monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
+        # Same hermeticity pin as test_live_fetch_recomputes_free_tags: the
+        # curated manifest is a live remote/disk-cached filter, so leaving it
+        # unmocked made this assertion depend on the hosted catalog's contents.
+        monkeypatch.setattr(
+            "hermes_cli.model_catalog.get_curated_openrouter_models",
+            lambda: [
+                ("anthropic/claude-opus-4.8", ""),
+                ("qwen/qwen3.7-max", ""),
+            ],
+        )
         with patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()):
             models = fetch_openrouter_models(force_refresh=True)
 
