@@ -568,6 +568,40 @@ def _isolate_hermes_home(_hermetic_environment):
     return None
 
 
+@pytest.fixture(autouse=True)
+def _isolate_session_contextvars():
+    """Reset every gateway session ContextVar to ``_UNSET`` around each test.
+
+    ``gateway.session_context.clear_session_vars`` intentionally leaves the
+    ``_VAR_MAP`` contextvars bound to ``""`` ("explicitly cleared" — it
+    suppresses the ``os.environ`` fallback in ``get_session_env``; correct
+    production semantics). But contextvars are process-global for the pytest
+    main thread, so in any single-process multi-file run a test file that
+    exercises set/clear (e.g. tests/tools/test_kanban_session_attribution.py)
+    leaks the ``""`` bindings across the file boundary, shadowing later
+    tests' ``monkeypatch.setenv("HERMES_SESSION_*", ...)`` identities — the
+    test_create_subscribes_gateway_session ordering failure. The canonical
+    per-file-subprocess runner hides this; plain ``pytest tests/tools/``,
+    ``-p randomly``, or a CI re-slice exposes it.
+
+    Setup binds the whole family to ``_UNSET`` (the fresh-process state every
+    test expects); teardown restores the pre-test bindings via the reset
+    tokens. Uses the production ``reset_session_vars``/``restore_session_vars``
+    helpers so the covered set can never drift from ``_VAR_MAP`` (they also
+    cover ``_SESSION_ASYNC_DELIVERY`` and the runtime-cwd contextvar, which
+    live outside the map). Do NOT special-case individual var names here —
+    a partial reset is the falsified fix (a leaked ``""`` in any unlisted
+    var still poisons downstream tests).
+
+    Regression guard: tests/tools/test_session_contextvar_isolation.py.
+    """
+    import gateway.session_context as sc
+
+    tokens = sc.reset_session_vars()
+    yield
+    sc.restore_session_vars(tokens)
+
+
 # ── Module-level state reset — replaced by per-file process isolation ──────
 #
 # Each test FILE runs in a freshly-spawned ``python -m pytest <file>``
