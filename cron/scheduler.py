@@ -4422,7 +4422,19 @@ def _process_one_job(job: dict, *, verbose: bool = True, adapters=None, loop=Non
     ``run_job_now`` (synchronous single-job execution for ``cron run --wait``).
     Returns a structured result dict; callers that only need a truthiness
     signal can read ``result["processed"]``.
+
+    Execution-ledger bookkeeping: the built-in ticker creates the ``executions``
+    row (``create_execution(..., source="builtin")``) and passes its id on the
+    job dict as ``execution_id``. THIS body must advance that row to ``running``
+    and close it, exactly as the external-provider body (``run_one_job``) does.
+    It previously did neither, so every ticker-fired job left its row stranded at
+    ``claimed`` forever — the job itself ran fine and wrote its output, but the
+    ledger never recorded it, and the next scheduler restart swept the whole
+    backlog to ``unknown`` ("owner exited before a durable terminal state").
+    That produced 948 phantom ``unknown`` rows and zero ``completed`` ones,
+    making a perfectly healthy scheduler read as if it were crash-looping.
     """
+    execution_id = job.get("execution_id")
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -4437,6 +4449,12 @@ def _process_one_job(job: dict, *, verbose: bool = True, adapters=None, loop=Non
                 "Job '%s': one-shot dispatch limit reached — skipping",
                 job.get("name", job["id"]),
             )
+            if execution_id:
+                finish_execution(
+                    execution_id,
+                    success=False,
+                    error="Dispatch claim rejected; execution was not started.",
+                )
             return {
                 "processed": True,
                 "success": True,
@@ -4446,6 +4464,11 @@ def _process_one_job(job: dict, *, verbose: bool = True, adapters=None, loop=Non
                 "delivery_error": None,
                 "output_file": None,
             }
+
+        # The attempt becomes ``running`` immediately before the actual run,
+        # mirroring run_one_job. Without this the row stays ``claimed`` forever.
+        if execution_id:
+            mark_execution_running(execution_id)
 
         success, output, final_response, error = run_job(job)
 
@@ -4497,6 +4520,8 @@ def _process_one_job(job: dict, *, verbose: bool = True, adapters=None, loop=Non
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        if execution_id:
+            finish_execution(execution_id, success=success, error=error)
         return {
             "processed": True,
             "success": success,
@@ -4510,6 +4535,8 @@ def _process_one_job(job: dict, *, verbose: bool = True, adapters=None, loop=Non
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
         mark_job_run(job["id"], False, str(e))
+        if execution_id:
+            finish_execution(execution_id, success=False, error=str(e))
         return {
             "processed": False,
             "success": False,
