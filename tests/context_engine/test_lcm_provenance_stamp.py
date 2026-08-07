@@ -21,6 +21,14 @@ def _engine():
     e._session_stateless = False
     e.compression_count = 0
     e._pending_context_anchor_messages = None
+    # This stub bypasses __init__ (LCMEngine.__new__), so every attribute the
+    # code under test reads must be set here by hand. v0.21.0-rc2's
+    # _matches_ignore_message_patterns() reads _compiled_ignore_message_patterns,
+    # which __init__ populates via compile_message_patterns() — absent here, the
+    # assembly path raises AttributeError. Empty tuple == "no ignore patterns",
+    # which is the behaviour these provenance-stamp tests assume.
+    e._compiled_ignore_message_patterns = ()
+    e._current_compress_store_ids_by_message_id = {}
 
     class _DAG:
         def get_session_nodes(self, sid):
