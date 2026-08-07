@@ -34,7 +34,7 @@ concurrency:
 jobs:
   diff:
     name: package-lock.json semantic diff
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
     timeout-minutes: 5
     outputs:
       changed: ${{ steps.diff.outputs.changed }}
