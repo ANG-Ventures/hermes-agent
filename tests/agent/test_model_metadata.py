@@ -261,6 +261,55 @@ class TestDefaultContextLengths:
                     f"{model_id}: expected {expected_ctx}, got {actual}"
                 )
 
+    def test_anthropic_1m_models_resolve_to_1m_via_fallback_table(self):
+        """The 1M-context Anthropic models must resolve to 1,000,000 via the
+        DEFAULT_CONTEXT_LENGTHS fallback table, NOT the ``"claude": 200000``
+        catch-all.
+
+        This is the load-bearing invariant for the whole Mac Studio fleet: the
+        Claude models are served over OAuth through the local claude-api-proxy
+        / claude-bridge providers, so steps 2-6 of get_model_context_length()
+        (custom /models, API-key /v1/models, OpenRouter) all no-op and
+        resolution lands on the fallback table. If a ``git pull`` reverts the
+        opus/sonnet/fable rows in agent/model_metadata.py, every one of those
+        models silently falls through to the ``"claude": 200000`` catch-all —
+        a 5x under-count that drops the compression trigger from ~800k to
+        ~160k tokens and truncates history mid-conversation across every agent.
+        A bare table assertion (not a change-detector: 200000 vs 1000000 is a
+        behavior boundary, not a snapshot) makes that revert loud.
+
+        haiku-4-5 is deliberately NOT in this list — its real window is 200k,
+        so it correctly resolves via the catch-all and must stay there.
+        """
+        from agent.model_metadata import get_model_context_length
+        from unittest.mock import patch as mock_patch
+
+        # Force fall-through to DEFAULT_CONTEXT_LENGTHS: no cache, no provider
+        # metadata, no cross-provider registry hit.
+        with mock_patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             mock_patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
+             mock_patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+             mock_patch("agent.models_dev.lookup_models_dev_context", return_value=None):
+            one_m = (
+                "claude-opus-5",
+                "claude-sonnet-5",
+                "claude-fable-5",
+                "claude-mythos-5",
+            )
+            for model_id in one_m:
+                actual = get_model_context_length(model_id)
+                assert actual == 1_000_000, (
+                    f"{model_id}: expected 1000000 (1M window), got {actual}. "
+                    f"If this is 200000 the DEFAULT_CONTEXT_LENGTHS row was "
+                    f"reverted and the model fell through to the 'claude' "
+                    f"catch-all — re-add the bare-id row."
+                )
+            # Negative control: haiku's real window IS 200k; it must NOT be
+            # accidentally promoted to 1M by a too-broad rule.
+            assert get_model_context_length("claude-haiku-4-5") == 200000, (
+                "claude-haiku-4-5 should resolve to its real 200k window, not 1M"
+            )
+
     def test_xai_oauth_grok_build_uses_xai_models_dev_context(self):
         """xAI OAuth should share the xAI provider metadata path.
 
