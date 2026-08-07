@@ -56,9 +56,17 @@ FORK CODE DROPPED AS SUPERSEDED BY UPSTREAM (verified, not guessed):
     scaffold (never promote derived context as current intent) — strictly more conservative, and it
     closes a re-injection hole where a carried block's untrusted <active_memory> body was replayed.
 
-License: cleared for private fork use per PRD-6 LCM Context Engine Activation lines 4-6 and
-invariant I-7. Upstream NOW SHIPS A LICENSE FILE as of v0.21.0-rc2 (added since v0.16.2) — re-check
-its terms before any public redistribution.
+License: MIT (SPDX: MIT), Copyright (c) 2026 Stephen Schoettler.
+  VERIFIED 2026-07-25 via GitHub API: github.com/stephenschoettler/hermes-lcm carries a root
+  LICENSE file, added 2026-06-26 in commit f7ae61ffa ("docs: add community health files") —
+  TWELVE DAYS AFTER our then-vendored commit 03b74f84 (2026-06-14), which is why the original
+  staging note said there was no LICENSE. That note is STALE and superseded.
+  Redistribution is therefore PERMITTED under MIT terms (attribution + licence text retained).
+  Also cleared for private fork use per PRD-6 LCM Context Engine Activation lines 4-6 and
+  invariant I-7.
+  Prior text, for the record: "upstream staging noted no LICENSE file, so public redistribution
+  remains blocked unless a license grant is added." — that statement was correct when written
+  and is now factually wrong; do not reinstate it.
 
 Acceptance evidence (2026-08-06):
   - The deployed fork ships NO tests/, so upstream's own suite is the acceptance gate.
