@@ -500,6 +500,16 @@ hermes kanban create "format generated files" \
 
 Accepted levels are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`. `none` is a stored override that disables reasoning; it does not mean “clear.” Omit the option or tool argument (or pass an empty tool value) to store `null` and inherit the assignee profile's default. Invalid values fail task creation instead of silently inheriting. `hermes kanban show <task-id>` and the JSON forms of `create`, `list`, and `show` expose the stored `reasoning_effort`; text output displays `inherit` for `null`.
 
+Change the depth on an existing task with `set-model` — it takes effect on the next dispatch:
+
+```bash
+hermes kanban set-model t_abcd --effort xhigh
+hermes kanban set-model t_abcd --effort none     # thinking OFF (a real level, not a clear)
+hermes kanban set-model t_abcd --clear-effort    # back to the profile's own setting
+```
+
+The dispatcher spawns the worker with `--reasoning <level>`, which overrides the profile's `agent.reasoning_effort` for that run only. The two knobs are deliberately independent: `set-model <id> --effort xhigh` leaves an existing model override untouched, and clearing the model (`set-model <id> none`) never resets the effort.
+
 ### Lifecycle plugin hooks
 
 Board transitions fire [plugin hooks](/user-guide/features/hooks#plugin-hooks): `kanban_task_claimed`, `kanban_task_completed`, and `kanban_task_blocked`, each carrying `task_id` and `profile_name`. Hooks fire **after** the board DB change commits, so callbacks always see durable state. Note the process split: `kanban_task_claimed` fires in the **dispatcher** process, while `kanban_task_completed`/`kanban_task_blocked` fire in the **worker** process — register the hook in the dispatcher profile to observe every transition centrally.

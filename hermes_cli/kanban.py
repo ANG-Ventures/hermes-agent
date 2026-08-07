@@ -370,11 +370,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "--model.")
     p_create.add_argument(
         "--reasoning",
+        "--effort",
         default=None,
         dest="reasoning_effort",
         metavar="LEVEL",
         help="Pin the worker's reasoning effort for this task (none, minimal, "
-             "low, medium, high, xhigh, max, or ultra). Omit to inherit the "
+             "low, medium, high, xhigh, max, or ultra). 'none' disables "
+             "thinking. Independent of --model; omit to inherit the "
              "assignee profile default.",
     )
     p_create.add_argument("--goal", action="store_true", dest="goal_mode",
@@ -475,10 +477,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_assign.add_argument("task_id")
     p_assign.add_argument("profile", help="Profile name (or 'none' to unassign)")
 
-    # --- set-model (per-task model/provider override) ---
+    # --- set-model (per-task model/provider/effort override) ---
     p_set_model = sub.add_parser(
         "set-model",
-        help="Set or clear a task's model/provider override "
+        help="Set or clear a task's model/provider/effort override "
              "(takes effect on the next dispatch)",
     )
     p_set_model.add_argument("task_id")
@@ -490,6 +492,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--provider", default=None,
         help="Provider the model belongs to (worker is spawned with "
              "--provider <name>). Cleared together with the model.",
+    )
+    _effort_group = p_set_model.add_mutually_exclusive_group()
+    _effort_group.add_argument(
+        "--effort", default=None, dest="reasoning_effort", metavar="LEVEL",
+        help="Per-task reasoning effort (worker is spawned with "
+             "--reasoning <level>). 'none' is a real level — thinking "
+             "off. Independent of the model: with --effort alone the "
+             "model override is left untouched, and clearing the model "
+             "never resets the effort.",
+    )
+    _effort_group.add_argument(
+        "--clear-effort", action="store_true", dest="clear_effort",
+        help="Clear the per-task reasoning effort — the worker falls back "
+             "to its profile's own agent.reasoning_effort.",
     )
 
     # --- reclaim / reassign (recovery) ---
@@ -1854,22 +1870,64 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     if model is not None and model.lower() in {"none", "-", "null", ""}:
         model = None
     provider = getattr(args, "provider", None)
+    effort = getattr(args, "reasoning_effort", None)
+    clear_effort = bool(getattr(args, "clear_effort", False))
+    # The two knobs are independent: with --effort/--clear-effort and no
+    # positional model, the model override is left untouched (absent means
+    # "unchanged" here, not "clear"). Without either effort flag the
+    # historical contract holds — a missing or 'none' positional clears the
+    # model/provider override.
+    touch_model = args.model is not None or (effort is None and not clear_effort)
+    if provider and not touch_model:
+        print("kanban: --provider requires a model", file=sys.stderr)
+        return 2
+    if effort is not None:
+        # Validate BEFORE any write so `set-model <id> <model> --effort typo`
+        # can't half-apply (model committed, effort rejected).
+        if not str(effort).strip():
+            print(
+                "kanban: --effort needs a level (use --clear-effort to unset)",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            effort = kb.normalize_reasoning_effort(effort)
+        except ValueError as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 2
     try:
         with kb.connect_closing() as conn:
-            ok = kb.set_model_override(conn, args.task_id, model, provider=provider)
+            if touch_model:
+                ok = kb.set_model_override(
+                    conn, args.task_id, model, provider=provider,
+                )
+                if not ok:
+                    print(f"no such task: {args.task_id}", file=sys.stderr)
+                    return 1
+            if effort is not None or clear_effort:
+                ok = kb.set_reasoning_effort(
+                    conn, args.task_id, None if clear_effort else effort,
+                )
+                if not ok:
+                    print(f"no such task: {args.task_id}", file=sys.stderr)
+                    return 1
     except (ValueError, RuntimeError) as exc:
         print(f"kanban: {exc}", file=sys.stderr)
         return 2
-    if not ok:
-        print(f"no such task: {args.task_id}", file=sys.stderr)
-        return 1
-    if model:
-        label = f"{provider}:{model}" if provider else model
-        print(f"Set model override on {args.task_id}: {label} "
+    if touch_model:
+        if model:
+            label = f"{provider}:{model}" if provider else model
+            print(f"Set model override on {args.task_id}: {label} "
+                  "(applies on next dispatch)")
+        else:
+            print(f"Cleared model override on {args.task_id} "
+                  "(worker uses its profile default)")
+    if clear_effort:
+        print(f"Cleared reasoning effort on {args.task_id} "
+              "(worker uses its profile's agent.reasoning_effort)")
+    elif effort is not None:
+        print(f"Set reasoning effort on {args.task_id}: {effort} "
               "(applies on next dispatch)")
-    else:
-        print(f"Cleared model override on {args.task_id} "
-              "(worker uses its profile default)")
     return 0
 
 
