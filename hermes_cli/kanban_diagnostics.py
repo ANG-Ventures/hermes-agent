@@ -698,13 +698,23 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
             consecutive += 1
             if last_err is None:
                 last_err = _task_field(r, "error")
-        elif outcome in {"completed", "reclaimed"}:
-            # A success (or manual reclaim) breaks the streak.
+        elif outcome in {"completed", "reclaimed", "blocked"}:
+            # A clean termination breaks the streak. ``completed``/``reclaimed``
+            # are obvious; ``blocked`` counts too because a worker that reaches
+            # ``kanban_block`` demonstrably SPAWNED and RAN its logic to a
+            # deliberate stop — that disproves the "keeps crashing mid-run"
+            # hypothesis this rule exists to catch. Without this, a card that
+            # crashed N times and then RECOVERED to a clean block kept paging
+            # CRITICAL forever, because the trailing scan counted crashes ACROSS
+            # the intervening clean ``blocked`` runs (2026-08-07: t_c348a9f0, a
+            # 692-commit parity merge that crashed 4x on a bad model_override,
+            # then ran clean and blocked — yet paged CRITICAL every diagnostics
+            # tick). A genuinely-still-broken card re-crashes on its next
+            # attempt and the banner re-fires; a recovered one stays quiet.
             break
         else:
-            # Other outcomes (timed_out, blocked, spawn_failed, gave_up)
-            # aren't crash signals — don't count them, but they also
-            # don't break the crash streak.
+            # Other outcomes (timed_out, spawn_failed, gave_up) aren't crash
+            # signals — don't count them, but they also don't break the streak.
             continue
     if consecutive < threshold:
         return []
