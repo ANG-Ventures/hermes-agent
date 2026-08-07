@@ -210,6 +210,32 @@ def _dots_to_hyphens(model_name: str) -> str:
     return model_name.replace(".", "-")
 
 
+def _is_anthropic_model_name(model_name: str) -> bool:
+    """Whether a BARE model id names an Anthropic (Claude) model.
+
+    The dots->hyphens rewrite encodes Anthropic's own naming convention, so it
+    may only be applied to Anthropic model ids. This matters because the
+    Anthropic-WIRE relay providers (``claude-apr``, ``claude-apx-*``,
+    ``claude-proxy*``, ``claude-api-proxy*``) are injected into
+    ``_DOT_TO_HYPHEN_PROVIDERS`` at runtime: they speak the Anthropic wire
+    format but front a pool that ALSO serves non-Claude models. Keying the
+    rewrite on the provider alone rewrote ``gpt-5.6-sol`` to ``gpt-5-6-sol``
+    and produced ``HTTP 404: model: gpt-5-6-sol`` (live, 2026-08-07).
+
+    Examples::
+
+        >>> _is_anthropic_model_name("claude-sonnet-4.6")
+        True
+        >>> _is_anthropic_model_name("Claude-Opus-5")
+        True
+        >>> _is_anthropic_model_name("gpt-5.6-sol")
+        False
+        >>> _is_anthropic_model_name("")
+        False
+    """
+    return (model_name or "").strip().lower().startswith("claude")
+
+
 def _normalize_provider_alias(provider_name: str) -> str:
     """Resolve provider aliases to Hermes' canonical ids."""
     raw = (provider_name or "").strip().lower()
@@ -440,6 +466,18 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
     if provider in _DOT_TO_HYPHEN_PROVIDERS:
         bare = _strip_matching_provider_prefix(name, provider)
         if "/" in bare:
+            return bare
+        # Dots->hyphens is an ANTHROPIC MODEL-NAMING rule (marketing
+        # ``claude-sonnet-4.6`` vs native ``claude-sonnet-4-6``), so it must be
+        # gated on the MODEL, not only the provider. Anthropic-WIRE relay
+        # providers (claude-apr / claude-apx-* / claude-proxy* — injected into
+        # this set at runtime) front a pool that also serves NON-Claude models;
+        # mangling those dots produces a model id the upstream has never heard
+        # of. Live 2026-08-07: a cron pinned model=gpt-5.6-sol on
+        # provider=claude-apr was rewritten to ``gpt-5-6-sol`` and every tick
+        # died with ``HTTP 404: model: gpt-5-6-sol``. Non-Claude names pass
+        # through untouched; Claude names keep the existing behavior exactly.
+        if not _is_anthropic_model_name(bare):
             return bare
         return _dots_to_hyphens(bare)
 
