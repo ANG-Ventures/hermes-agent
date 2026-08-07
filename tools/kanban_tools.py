@@ -41,6 +41,46 @@ from hermes_cli.config import cfg_get, load_config
 logger = logging.getLogger(__name__)
 
 
+def _current_session_id() -> Optional[str]:
+    """Resolve the active session id contextvar-first, os.environ fallback.
+
+    In the GATEWAY (concurrent sessions in one process) the per-turn contextvar
+    is the only correct source — the process-global os.environ HERMES_SESSION_ID
+    can be clobbered by a concurrent session (the v3-latch bug class). In a
+    dispatcher-spawned WORKER subprocess (single process, no bound contextvar)
+    get_session_env falls through to that process's correct os.environ value.
+
+    🔴 Empty-contextvar fallthrough — GATED on ``not _HERMES_GATEWAY``: some
+    non-gateway callers bind the contextvar to "" (e.g. ACP binds
+    ``set_session_vars(session_key=session_id)`` which leaves the session_id
+    contextvar at its "" default while writing the real id to os.environ). A ""
+    contextvar is NOT _UNSET, so get_session_env returns "" and would NOT fall
+    through. We treat an empty contextvar value as "not bound" and consult
+    os.environ — but ONLY outside the gateway. Inside the gateway,
+    ``clear_session_vars`` deliberately sets "" to *suppress* the os.environ
+    fallback (so a cleared post-turn read returns None, never a stale/clobbered
+    global), and the per-turn contextvar is authoritative — so we never fall
+    through there. This mirrors ``set_current_session_id``'s own
+    ``not _HERMES_GATEWAY`` guard and preserves both contracts. Returns None
+    when neither has a value.
+    """
+    try:
+        from gateway.session_context import get_session_env
+        val = get_session_env("HERMES_SESSION_ID")
+        if val:
+            return val
+        # Empty/unset contextvar. Outside the gateway (ACP/CLI/worker — single
+        # process, os.environ authoritative) fall through to os.environ. Inside
+        # the gateway, "" means cleared-and-fallback-suppressed → return None
+        # (the per-turn contextvar is the only correct source; a "" here is
+        # never a missing bind because _set_session_env binds session_id).
+        if os.environ.get("_HERMES_GATEWAY") == "1":
+            return None
+        return os.environ.get("HERMES_SESSION_ID") or None
+    except Exception:
+        return os.environ.get("HERMES_SESSION_ID") or None
+
+
 # ---------------------------------------------------------------------------
 # Gating
 # ---------------------------------------------------------------------------
@@ -172,7 +212,7 @@ def _stamp_worker_session_metadata(
     """Add trusted worker session id metadata for this worker's own task."""
     if os.environ.get("HERMES_KANBAN_TASK") != task_id:
         return metadata
-    session_id = os.environ.get("HERMES_SESSION_ID")
+    session_id = _current_session_id()
     if not session_id:
         return metadata
     stamped = dict(metadata or {})
@@ -1236,13 +1276,14 @@ def _handle_create(args: dict, **kw) -> str:
     # Prefer the request-scoped api_server origin binding: HERMES_SESSION_ID
     # is clobbered with a subagent's internal id whenever a child agent is
     # constructed in-process (agent_init calls set_current_session_id), which
-    # would stamp — and later wake — the wrong session.
+    # would stamp — and later wake — the wrong session. Then the fork's
+    # gateway-aware contextvar resolver, then the raw env fallback.
     from tools.async_delegation import _current_origin_session_id
 
     session_id = (
         args.get("session_id")
         or _current_origin_session_id()
-        or os.environ.get("HERMES_SESSION_ID")
+        or _current_session_id()
     )
     priority = args.get("priority")
     # Resolve workspace. Workspace sharing is always explicit: omitted fields
@@ -1278,7 +1319,17 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
-    model_override = args.get("model")
+    # Fork arg name `model_override` is the surviving contract (tests +
+    # schema); also accept upstream's `model` alias. Upstream added
+    # `provider` support (persisted as provider_override).
+    model_override = args.get("model_override")
+    if model_override is None:
+        model_override = args.get("model")
+    if model_override is not None and not isinstance(model_override, str):
+        return tool_error(
+            f"model_override must be a model name string, got "
+            f"{type(model_override).__name__}"
+        )
     provider_override = args.get("provider")
     if provider_override and not model_override:
         return tool_error("'provider' requires 'model' to be set as well")
@@ -2101,13 +2152,24 @@ KANBAN_CREATE_SCHEMA = {
                     "true. Defaults to the goal-engine default (20)."
                 ),
             },
+            "model_override": {
+                "type": "string",
+                "description": (
+                    "Per-task model override. Pins the dispatched worker "
+                    "to this model (passed as `hermes -m MODEL`) instead "
+                    "of the assignee profile's default model. Use this to "
+                    "run one task on a stronger/cheaper model without "
+                    "cloning a whole profile. Omit to use the profile "
+                    "default."
+                ),
+            },
             "model": {
                 "type": "string",
                 "description": (
                     "Pin the dispatched worker to this model instead of "
                     "the assignee profile's configured model. Use the "
                     "exact model name the target provider expects. Omit "
-                    "to use the profile default."
+                    "to use the profile default. Alias of 'model_override'."
                 ),
             },
             "provider": {
