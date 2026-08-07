@@ -55,6 +55,34 @@ from cron.fork_ext import scheduler_ext
 logger = logging.getLogger(__name__)
 
 
+def _coerce_job_model(value):
+    """Flatten a job's ``model`` field to the plain string form, or None.
+
+    A job's ``model`` is normally a string, but jobs written by older schemas
+    (or edited by hand) can carry the structured form
+    ``{"model": "gpt-5.6-sol", "provider": "openai-codex"}``.
+
+    That dict is TRUTHY, which broke model resolution in two places:
+      * ``model = job.get("model") or os.getenv(...)`` accepted the dict, then
+        the ``isinstance(model, str)`` guard rejected it and raised "has no
+        model configured" while quoting a model that was plainly present;
+      * the ``if not job.get("model")`` config-fallback gate saw a truthy value
+        and skipped config.yaml entirely, so the error also claimed
+        ``model.default`` was missing when it was set.
+    A sibling site (``model_snapshot`` drift) called ``.strip()`` on it and
+    raised ``AttributeError: 'dict' object has no attribute 'strip'``.
+
+    Returns the stripped string, or None when there is no usable model.
+    """
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, dict):
+        inner = value.get("model") or value.get("name") or value.get("default")
+        if isinstance(inner, str):
+            return inner.strip() or None
+    return None
+
+
 # Transient provider-capacity / rate-limit / timeout failures. These are NOT a
 # real job defect: the requested backend was momentarily unavailable (the Claude
 # sub relay had no un-capped subscription to route to, a rate/usage limit was
@@ -3640,7 +3668,17 @@ def run_job(
         # value is intentionally re-read from storage every tick so a
         # ``cronjob action=update model=...`` after a failed run takes effect
         # on the next tick — there is no in-memory cache.
-        model = job.get("model") or os.getenv("HERMES_MODEL") or ""
+        # A job's ``model`` is normally a string, but jobs written by older
+        # schemas (or edited by hand) can carry the structured form
+        # ``{"model": "...", "provider": "..."}``. That dict is TRUTHY, so it
+        # silently satisfied both ``job.get("model") or ...`` here and the
+        # ``if not job.get("model")`` config-fallback gate below — the job then
+        # failed the ``isinstance(model, str)`` guard and reported "no model
+        # configured" while quoting a model that was plainly present, and
+        # config.yaml was never consulted. Flatten to the string form first so
+        # every downstream check sees what it expects.
+        _job_model = _coerce_job_model(job.get("model"))
+        model = _job_model or os.getenv("HERMES_MODEL") or ""
 
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
@@ -3664,7 +3702,7 @@ def run_job(
                 # Coerce null/missing to {} so a falsy default never
                 # clobbers an already-resolved env value with ``None``.
                 _model_cfg = _cfg.get("model") or {}
-                if not job.get("model"):
+                if not _job_model:
                     if isinstance(_model_cfg, str):
                         model = _model_cfg
                     elif isinstance(_model_cfg, dict):
@@ -3865,7 +3903,7 @@ def run_job(
                     f"provider '{_provider_snapshot}' -> '{_current_provider}'"
                 )
         _model_snapshot = (job.get("model_snapshot") or "").strip().lower()
-        if _model_snapshot and not (job.get("model") or "").strip():
+        if _model_snapshot and not (_coerce_job_model(job.get("model")) or ""):
             _current_model = str(primary_model_for_drift or "").strip().lower()
             if _current_model and _current_model != _model_snapshot:
                 _drift.append(
