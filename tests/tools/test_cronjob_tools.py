@@ -566,7 +566,7 @@ class TestUnifiedCronjobTool:
         assert updated["job"]["skill"] is None
 
     def test_create_normalizes_list_form_deliver(self):
-        """deliver=['telegram'] (list) is stored as the string 'telegram'.
+        """deliver=['telegram:12345'] (list) is stored as that string.
 
         Regression for #17139: MCP clients / scripts sometimes pass ``deliver``
         as an array.  Prior to the fix, ``['telegram']`` was written verbatim
@@ -581,15 +581,15 @@ class TestUnifiedCronjobTool:
                 action="create",
                 prompt="Daily briefing",
                 schedule="every 1h",
-                deliver=["telegram"],
+                deliver=["telegram:12345"],
             )
         )
         assert created["success"] is True
         stored = get_job(created["job_id"])
-        assert stored["deliver"] == "telegram"
+        assert stored["deliver"] == "telegram:12345"
 
     def test_create_normalizes_multi_element_list_deliver(self):
-        """deliver=['telegram', 'discord'] is stored as 'telegram,discord'."""
+        """deliver=['telegram:...', 'discord:...'] is stored comma-joined."""
         from cron.jobs import get_job
 
         created = json.loads(
@@ -597,15 +597,15 @@ class TestUnifiedCronjobTool:
                 action="create",
                 prompt="Daily briefing",
                 schedule="every 1h",
-                deliver=["telegram", "discord"],
+                deliver=["telegram:12345", "discord:67890"],
             )
         )
         assert created["success"] is True
         stored = get_job(created["job_id"])
-        assert stored["deliver"] == "telegram,discord"
+        assert stored["deliver"] == "telegram:12345,discord:67890"
 
     def test_update_normalizes_list_form_deliver(self):
-        """update with deliver=['telegram'] stores the canonical string."""
+        """update with a list deliver stores the canonical joined string."""
         from cron.jobs import get_job
 
         created = json.loads(
@@ -615,12 +615,12 @@ class TestUnifiedCronjobTool:
             cronjob(
                 action="update",
                 job_id=created["job_id"],
-                deliver=["telegram"],
+                deliver=["telegram:12345"],
             )
         )
         assert updated["success"] is True
         stored = get_job(created["job_id"])
-        assert stored["deliver"] == "telegram"
+        assert stored["deliver"] == "telegram:12345"
 
 
 # =========================================================================
@@ -939,3 +939,96 @@ class TestOriginSubHourlyAdmission:
     def test_disabled_origin_subhourly_allowed(self):
         # A paused/disabled job can't pollute; don't block it.
         assert self._err("origin", "every 10m", enabled=False) is None
+
+
+# =========================================================================
+# Bare-platform deliver on a recurring job (Rule #4a)
+#
+# `deliver="discord"` resolves to the HOME channel for any job without a
+# captured origin -- and origin is only stamped when the job is created from
+# inside a live chat session. So a monitor created programmatically, or from a
+# thread, silently ships its output to the home channel instead of where the
+# author meant. Documented as cron Rule #4a after biting three times
+# (2026-07-11 x2, 2026-07-23); a fourth recurrence (2026-08-07) motivated
+# turning the rule into a create-time refusal, mirroring the origin/sub-hourly
+# admission check above.
+# =========================================================================
+class TestBarePlatformDeliverAdmission:
+    def _err(self, deliver, schedule_str, enabled=True, origin=None):
+        return _creation_admission_error({
+            "deliver": deliver,
+            "enabled": enabled,
+            "schedule": parse_schedule(schedule_str),
+            "origin": origin,
+        })
+
+    # ---- allowed: an origin on the SAME platform is unambiguous ----
+    def test_bare_platform_with_matching_origin_allowed(self):
+        # Created from a live Discord chat: "discord" resolves to that chat,
+        # which is what the author meant. Nothing to refuse.
+        assert self._err(
+            "discord", "every 2h",
+            origin={"platform": "discord", "chat_id": "123"},
+        ) is None
+
+    def test_bare_platform_with_different_origin_refused(self):
+        # Origin is Telegram but deliver says "discord" -> no same-platform
+        # origin to resolve to, so it still falls back to the home channel.
+        assert self._err(
+            "discord", "every 2h",
+            origin={"platform": "telegram", "chat_id": "123"},
+        ) is not None
+
+    # ---- refused: ambiguous bare platform on a recurring job ----
+    def test_bare_discord_recurring_refused(self):
+        err = self._err("discord", "every 2h")
+        assert err is not None
+        assert "home channel" in err.lower()
+
+    def test_bare_telegram_recurring_refused(self):
+        assert self._err("telegram", "0 9 * * *") is not None
+
+    def test_error_names_the_three_explicit_alternatives(self):
+        err = self._err("discord", "every 2h")
+        # The message must be actionable: name origin AND the explicit form.
+        assert "origin" in err
+        assert "discord:" in err
+
+    def test_case_and_whitespace_insensitive(self):
+        assert self._err("  DISCORD  ", "every 2h") is not None
+
+    # ---- allowed: every explicit spelling still works ----
+    def test_explicit_channel_allowed(self):
+        assert self._err("discord:1480525090331561984", "every 2h") is None
+
+    def test_origin_allowed_at_hourly_or_slower(self):
+        assert self._err("origin", "every 2h") is None
+
+    def test_local_allowed(self):
+        assert self._err("local", "every 2h") is None
+
+    # ---- allowed: shapes the rule deliberately does not govern ----
+    def test_one_shot_allowed(self):
+        # A one-shot fires while the author is still present; home-channel
+        # delivery is a visible annoyance, not a silent long-term misroute.
+        assert self._err("discord", "2030-01-01T09:00:00-08:00") is None
+
+    def test_disabled_job_allowed(self):
+        assert self._err("discord", "every 2h", enabled=False) is None
+
+    def test_empty_deliver_allowed(self):
+        assert self._err("", "every 2h") is None
+        assert self._err(None, "every 2h") is None
+
+    # ---- the pre-existing origin rule must still hold (no regression) ----
+    def test_origin_subhourly_still_refused(self):
+        err = self._err("origin", "every 10m")
+        assert err is not None
+        assert "session" in err.lower()
+
+    # ---- multi-target deliver: refuse if ANY part is bare ----
+    def test_multi_target_with_bare_part_refused(self):
+        assert self._err("discord:123,telegram", "every 2h") is not None
+
+    def test_multi_target_all_explicit_allowed(self):
+        assert self._err("discord:123,telegram:456", "every 2h") is None
