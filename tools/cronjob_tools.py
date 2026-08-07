@@ -489,6 +489,13 @@ def _creation_admission_warnings(job: Dict[str, Any]) -> List[str]:
 # every 10m) only AFTER creation via the daily lint, 2026-07-18.
 _ORIGIN_SUBHOURLY_FLOOR_SECONDS = 3600
 
+# Bare platform names that resolve to the HOME channel rather than the caller's
+# conversation. Refused on recurring jobs (Rule #4a) in favour of an explicit
+# "<platform>:<chat_id>", "origin", or "local".
+_BARE_PLATFORM_DELIVER_VALUES = frozenset({
+    "discord", "telegram", "slack", "signal", "whatsapp", "imessage", "matrix",
+})
+
 
 def _cron_minute_field_min_gap_seconds(minute: str) -> Optional[int]:
     """Smallest gap between consecutive fires (seconds) for a 5-field cron's
@@ -570,16 +577,53 @@ def _creation_admission_error(job: Dict[str, Any]) -> Optional[str]:
     """Return a hard-block error string for a cron shape that must be refused at
     create/update time, or None if the job is admissible.
 
-    Currently a single rule: deliver=origin on a sub-hourly recurring job
-    (Rule #5 I1). Session-pollution every <1h is never a deliberate choice, so
-    this blocks the create rather than warning after the fact.
+    Two rules, both about delivery going somewhere the author did not intend:
+
+    * deliver=origin on a sub-hourly recurring job (Rule #5 I1) --
+      session-pollution every <1h is never a deliberate choice.
+    * a BARE platform deliver ("discord"/"telegram") on a recurring job
+      (Rule #4a) -- it resolves to the HOME channel for any job without a
+      captured origin, and origin is only stamped when the job is created
+      from inside a live chat session. The spelling reads like "this chat"
+      and silently means "the home channel", so it is refused in favour of an
+      explicit target.
     """
-    if (job.get("deliver") or "").strip().lower() != "origin":
-        return None
     if not job.get("enabled", True):
         return None
     schedule = job.get("schedule") or {}
     if schedule.get("kind") == "once":
+        return None
+
+    deliver = (job.get("deliver") or "").strip()
+
+    # --- Rule #4a: bare platform on a recurring job with no origin ---
+    # With an origin captured (created from a live chat on the same platform),
+    # a bare platform correctly resolves to that conversation -- unambiguous,
+    # so it is allowed. Without one there is nothing to resolve to and it
+    # silently falls back to the home channel; that is the misroute.
+    origin = job.get("origin") or {}
+    origin_platform = str((origin or {}).get("platform") or "").strip().lower()
+    bare_parts = [
+        part.strip()
+        for part in deliver.split(",")
+        if part.strip()
+        and part.strip().lower() in _BARE_PLATFORM_DELIVER_VALUES
+        and part.strip().lower() != origin_platform
+    ]
+    if bare_parts:
+        bare = bare_parts[0].lower()
+        return (
+            f"deliver='{bare}' on a recurring job resolves to the HOME channel, "
+            "not the conversation you are in -- a job only remembers an origin "
+            "when it is created from inside a live chat session. Name the "
+            "target explicitly:\n"
+            "  deliver='origin'          -> this conversation (hourly-or-slower)\n"
+            f"  deliver='{bare}:<chat_id>'  -> a specific channel (ops/monitor output)\n"
+            "  deliver='local'           -> file only, no message\n"
+            "(cron Rule #4a)"
+        )
+
+    if deliver.lower() != "origin":
         return None
     secs = _schedule_interval_seconds(schedule)
     if secs is not None and secs < _ORIGIN_SUBHOURLY_FLOOR_SECONDS:
@@ -1101,6 +1145,7 @@ def cronjob(
                 "deliver": _normalize_deliver_param(deliver),
                 "enabled": True,
                 "schedule": parse_schedule(schedule),
+                "origin": _origin_from_env(),
             }
             _admission_error = _creation_admission_error(_preview_job)
             if _admission_error:
