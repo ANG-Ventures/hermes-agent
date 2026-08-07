@@ -19,6 +19,46 @@ def _store(tmp_path):
     return SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
 
 
+
+def _resolve_safe_restart_script():
+    """Locate the real safe-restart.py for the no-mock E2E seam.
+
+    🔴 TWO independent reasons this used to skip GREEN on the exact machine where
+    it is meaningful (both found 2026-08-06 during a deploy closeout):
+
+    1. The path was hardcoded to ``skills-shared/general/``; the skill tree was
+       later regrouped ``general/`` -> ``hermes-harness/``, so ``exists()`` went
+       False and four load-bearing tests silently stopped running.
+    2. ``tests/conftest.py`` redirects BOTH ``HOME`` and ``HERMES_HOME`` to a
+       per-test tempdir for hermeticity, so ANY env-derived lookup resolves into
+       an empty sandbox. ``HERMES_REAL_HOME`` is force-cleared there too, on
+       purpose, so it is not an escape hatch either.
+
+    So resolve from ``pwd`` (the repo checkout, which is real on disk and not
+    sandboxed) up to its ``.hermes`` root, and search the known skill groups.
+    A skip still happens on a machine that genuinely lacks the script (CI) —
+    which is correct — but no longer on the machine that has it.
+    """
+    import os as _o
+
+    roots = []
+    # The repo lives at <hermes_root>/[runtime/]hermes-agent — walk up to find
+    # a sibling skills-shared/. Path-based, so the HOME sandbox cannot hide it.
+    here = _o.path.dirname(_o.path.abspath(__file__))
+    while here != _o.path.dirname(here):
+        if _o.path.isdir(_o.path.join(here, "skills-shared")):
+            roots.append(here)
+        here = _o.path.dirname(here)
+
+    rel = _o.path.join("safe-gateway-restart", "scripts", "safe-restart.py")
+    for root in roots:
+        for group in ("hermes-harness", "general"):
+            cand = _o.path.join(root, "skills-shared", group, rel)
+            if _o.path.exists(cand):
+                return cand
+    return None
+
+
 def _runner(tmp_path, monkeypatch):
     monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
     runner, adapter = make_restart_runner()
@@ -821,11 +861,8 @@ def test_roundtrip_real_script_writes_breadcrumb_gate_marks(tmp_path, monkeypatc
     import subprocess
     import sys
 
-    script = (
-        "/Users/alexgierczyk/.hermes/skills-shared/general/"
-        "safe-gateway-restart/scripts/safe-restart.py"
-    )
-    if not _os.path.exists(script):
+    script = _resolve_safe_restart_script()
+    if script is None:
         pytest.skip("safe-restart.py skill script not present")
 
     monkeypatch.setenv("HERMES_RESTART_LOOP_THRESHOLD", "3")
@@ -864,11 +901,8 @@ def test_roundtrip_script_boot_id_matches_real_producer(tmp_path, monkeypatch):
     import subprocess
     import sys
 
-    script = (
-        "/Users/alexgierczyk/.hermes/skills-shared/general/"
-        "safe-gateway-restart/scripts/safe-restart.py"
-    )
-    if not _os.path.exists(script):
+    script = _resolve_safe_restart_script()
+    if script is None:
         pytest.skip("safe-restart.py skill script not present")
 
     import gateway.status as status
@@ -898,11 +932,8 @@ def test_roundtrip_script_dead_pid_writes_no_breadcrumb(tmp_path, monkeypatch):
     import subprocess
     import sys
 
-    script = (
-        "/Users/alexgierczyk/.hermes/skills-shared/general/"
-        "safe-gateway-restart/scripts/safe-restart.py"
-    )
-    if not _os.path.exists(script):
+    script = _resolve_safe_restart_script()
+    if script is None:
         pytest.skip("safe-restart.py skill script not present")
 
     runner, _adapter = _runner(tmp_path, monkeypatch)
@@ -931,11 +962,8 @@ def test_no_spawn_without_write_flag_plants_no_breadcrumb(tmp_path, monkeypatch)
     import subprocess
     import sys
 
-    script = (
-        "/Users/alexgierczyk/.hermes/skills-shared/general/"
-        "safe-gateway-restart/scripts/safe-restart.py"
-    )
-    if not _os.path.exists(script):
+    script = _resolve_safe_restart_script()
+    if script is None:
         pytest.skip("safe-restart.py skill script not present")
 
     runner, _adapter = _runner(tmp_path, monkeypatch)
