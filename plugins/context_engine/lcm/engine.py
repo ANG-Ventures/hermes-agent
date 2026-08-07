@@ -1854,20 +1854,27 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                  memory_context: str = "") -> List[Dict[str, Any]]:
         """Main compaction entry point with fail-open degraded handling.
 
-        Fork override: delegate the actual compaction to the upstream
-        CompactionMixin implementation (which owns the evolved leaf/condense/
-        assembly pipeline and terminal-status semantics), and wrap it in the
-        fork's fail-open handling so a compression failure degrades gracefully
-        instead of crashing the turn. ``memory_context`` is part of the host
-        ContextEngine ABC contract; LCM builds its own lossless handoff, so it
-        is accepted for signature parity and intentionally ignored.
+        Fork override: run the fork's own lossless compaction body
+        (``_compress_lossless``) and wrap it in fail-open handling so a
+        compression failure degrades gracefully instead of crashing the turn.
+
+        NOTE: this deliberately calls ``self._compress_lossless(...)`` and NOT
+        ``super().compress(...)``. An earlier merge routed this through the
+        CompactionMixin, which (a) bypassed the fork's ``_compress_lossless``
+        entirely — defeating the ``LCMFailOpenRecoveryError`` re-raise contract
+        that test_lcm_qa_adversarial monkeypatches ``_compress_lossless`` to
+        exercise — and (b) is unnecessary: the re-vendor's fix is the
+        discriminating *gate* (``should_compress_preflight`` in CompactionMixin),
+        which is a separate method and is unaffected by how execution delegates.
+        ``force`` and ``memory_context`` are part of the ContextEngine ABC
+        contract; LCM has no engine-owned cooldown and builds its own lossless
+        handoff, so both are accepted for signature parity and ignored.
         """
         try:
-            compressed = super().compress(
+            compressed = self._compress_lossless(
                 messages,
                 current_tokens=current_tokens,
                 focus_topic=focus_topic,
-                force=force,
             )
         except LCMFailOpenRecoveryError:
             raise
@@ -4537,25 +4544,29 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return self.carry_over_new_session_context(old_session_id, new_session_id)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        # Bare function schemas: the host (agent_init) normalizes and wraps them
-        # in {"type":"function","function":...} itself, and explicitly SKIPS
-        # already-wrapped entries as nameless (#47707).
+        # WRAPPED OpenAI tool entries — the fork's contract, asserted by
+        # tests/context_engine/test_lcm_fork_load.py and test_lcm_qa_adversarial.py.
+        # An earlier change (a) made these bare on the wrong theory that the host
+        # "skips already-wrapped entries as nameless (#47707)" — but
+        # agent/memory_manager.normalize_tool_schema explicitly UNWRAPS an
+        # already-wrapped entry — and (b) expanded the advertised set from the
+        # fork's deliberate SEVEN to fifteen by pulling in upstream recall
+        # variants. Both are reverted: the fork exposes exactly these seven
+        # (AGENTS.md: keep the model tool schema narrow — every tool ships on
+        # every API call). The re-vendor's job was the compaction gate, not tool
+        # surface. handle_tool_call may still dispatch more (advertising fewer
+        # than are dispatched is the safe direction); plugin.yaml matches these.
         return [
-            LCM_GREP,
-            LCM_RECALL,
-            LCM_QUERY_STATE,
-            LCM_COMPUTE,
-            LCM_COMPILE_EVIDENCE,
-            LCM_EVIDENCE_PACK,
-            LCM_RETRIEVE,
-            LCM_RECENT,
-            LCM_LOAD_SESSION,
-            LCM_DESCRIBE,
-            LCM_EXPAND,
-            LCM_EXPAND_QUERY,
-            LCM_STATUS,
-            LCM_INSPECT,
-            LCM_DOCTOR,
+            {"type": "function", "function": schema}
+            for schema in (
+                LCM_GREP,
+                LCM_LOAD_SESSION,
+                LCM_DESCRIBE,
+                LCM_EXPAND,
+                LCM_EXPAND_QUERY,
+                LCM_STATUS,
+                LCM_DOCTOR,
+            )
         ]
 
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs) -> str:
@@ -4991,7 +5002,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
 
     def _matches_ignore_message_patterns(self, msg: Dict[str, Any], *, stored_row: bool = False) -> bool:
-        if not self._compiled_ignore_message_patterns:
+        # ``getattr`` self-heal, not ``self._compiled_...`` directly: test
+        # runners construct the engine via ``object.__new__(LCMEngine)`` (no
+        # ``__init__``), and _latest_user_context_anchor calls this on the
+        # assembly path — so a bare attribute read raises AttributeError and
+        # takes down context assembly for every such caller.
+        if not getattr(self, "_compiled_ignore_message_patterns", None):
             return False
         content = msg.get("content")
         text = (
@@ -5041,7 +5057,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         has_externalized_placeholder = self._content_has_externalized_placeholder_ref(content)
         mapped_from_active_placeholder = False
         if store_id is None:
-            store_id = self._current_compress_store_ids_by_message_id.get(id(msg))
+            # getattr self-heal — same reason as _matches_ignore_message_patterns:
+            # reachable from the assembly path on engines built without __init__.
+            store_id = (
+                getattr(self, "_current_compress_store_ids_by_message_id", None) or {}
+            ).get(id(msg))
             mapped_from_active_placeholder = has_externalized_placeholder and store_id is not None
         if store_id is None:
             return False
@@ -5619,20 +5639,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # tail-only delta), drop the leading run of new_messages that already
         # exists as the stored tail. Gating on scaffold evidence preserves the
         # deliberate dup-over-loss guarantee for anchorless deltas.
-        # UPSTREAM 0.21 SUPERSEDES THE FORK'S OVERLAP GUARD.
-        # The fork carried `_compacted_replay_stored_tail_overlap` to drop the
-        # leading run of new_messages that already existed as the durable stored
-        # tail after a compacted replay. Upstream's ReconcileMixin now implements
-        # the same scaffold-evidence + stored-tail-run logic in
-        # `_find_reconciled_cursor_for_store_tail` (reconcile.py:421-501) — and
-        # it absorbed the fork's Greptile #107 refinements (the mixin version is
-        # a strict superset). Running BOTH double-counts: the cursor reconcile
-        # already consumed the durable tail, then the fork guard skipped the rows
-        # again, so a genuinely-new turn that coincidentally repeats the stored
-        # tail was DROPPED — breaking the dup-over-loss guarantee the guard was
-        # written to protect (5 TestEngineABC restart-persist regressions).
-        # The reconcile path is now the single owner.
-        overlap = 0
+        # FORK GUARD RETAINED (not superseded). An earlier merge hard-disabled
+        # this (`overlap = 0`) believing ReconcileMixin's
+        # `_find_reconciled_cursor_for_store_tail` fully subsumed it. It does
+        # NOT: the fork's four dup-on-replay tests (test_dup_on_replay_fix) fail
+        # without this guard, because the mixin reconcile handles the cursor
+        # advance but a scaffold-head + already-stored fresh-tail replay still
+        # re-ingests the tail as duplicates when the reconcile only skipped the
+        # scaffold head (no durable rows consumed). The double-count the merge
+        # worried about is avoided the way the fork always did it: SUPPRESS the
+        # guard only when the reconcile already consumed the durable tail
+        # (`reconcile_consumed_durable_tail`, computed above). Gating on scaffold
+        # evidence preserves the dup-over-loss guarantee for anchorless deltas.
+        overlap = (
+            0
+            if reconcile_consumed_durable_tail
+            else self._compacted_replay_stored_tail_overlap(
+                new_messages, original_new_messages, replay_messages
+            )
+        )
         if overlap > 0:
             self._record_ingest_reconciliation(
                 action="skipped overlap",

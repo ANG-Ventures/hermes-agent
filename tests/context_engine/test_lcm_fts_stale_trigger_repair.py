@@ -63,6 +63,11 @@ CREATE TRIGGER msg_fts_update AFTER UPDATE OF content ON messages BEGIN
     VALUES('delete', old.store_id, old.content);
   INSERT INTO messages_fts(rowid, content) VALUES (new.store_id, new.content);
 END;
+CREATE TRIGGER msg_search_content_default AFTER INSERT ON messages
+  WHEN new.search_content IS NULL AND new.content IS NOT NULL
+  BEGIN
+    UPDATE messages SET search_content = new.content WHERE store_id = new.store_id;
+END;
 """
 
 

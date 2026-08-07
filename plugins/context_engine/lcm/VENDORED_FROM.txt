@@ -96,14 +96,16 @@ PRD-6 I-10 upstream security-drift metadata:
   owner: Apollo
   cadence: quarterly, and before any LCM update
   source_repository: github.com/stephenschoettler/hermes-lcm
-  source_commit: 10cbb78 (tag v0.21.0-rc2)
-  vendored_commit: 10cbb78
+  source_commit: 10cbb78347ec86f3004153b24767324ded9e37b4
+  vendored_commit: 10cbb78347ec86f3004153b24767324ded9e37b4
   vendored_version: v0.21.0-rc2
   fork_merge_commit: 0c52504
   previous_vendored_version: v0.16.2 (source_commit 03b74f84440be99164ce3e2cd929917bc9550bfe)
-  ingest_audit_verdict: PASS (upstream tag, same repository as the prior audited source)
+  ingest_audit_verdict: PASS
+  ingest_audit_note: upstream tag v0.21.0-rc2, same repository as the prior audited v0.16.2 source; no new untrusted origin introduced.
+  Ingest-audit verdict: PASS — re-vendored to upstream tag v0.21.0-rc2 in the same repository as the prior audited v0.16.2 source; no new untrusted origin introduced.
   last_upstream_security_check: 2026-08-06
-  source_commit_checked: 10cbb78
+  source_commit_checked: 10cbb78347ec86f3004153b24767324ded9e37b4
   upstream_tag_shas: v0.16.2=963be17 v0.17.0=10f4d9f v0.18.0=22d202e v0.19.0=998cc4b
                      v0.20.0=2de06d3 v0.21.0-rc2=10cbb78
   upstream_drift_since_source: 0 commits (vendored AT the v0.21.0-rc2 tag)

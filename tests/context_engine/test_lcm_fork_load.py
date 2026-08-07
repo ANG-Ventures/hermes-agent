@@ -71,16 +71,25 @@ def test_lcm_provenance_records_required_metadata():
 
     required_fragments = [
         "github.com/stephenschoettler/hermes-lcm",
-        "03b74f84440be99164ce3e2cd929917bc9550bfe",
-        "v0.16.2",
+        # Re-vendored v0.16.2 -> v0.21.0-rc2 on 2026-08-06. These were pinned to
+        # the v0.16.2 drop's SHA/dates/drift-count; they are now legitimately
+        # different. The invariant this test protects is that provenance records
+        # a source repo, a pinned source commit, an audit verdict, a license
+        # status and the drift-metadata block — NOT one frozen vendor drop.
+        "10cbb78",
+        "v0.21.0-rc2",
         "Ingest-audit verdict: PASS",
-        "License: cleared for private fork use",
+        # Was "License: cleared for private fork use"; a concurrent commit
+        # (docs(lcm): record the VERIFIED MIT license) replaced the stale
+        # "cleared for private fork use" note with the actual upstream license
+        # now that v0.21.0-rc2 ships a LICENSE file. Assert the verified value.
+        "License: MIT",
         "PRD-6 I-10 upstream security-drift metadata",
-        "last_upstream_security_check: 2026-06-16",
+        "last_upstream_security_check: 2026-08-06",
         "checked_by: Apollo",
-        "checked_upstream_head: a744da693febf689f78fcb24ade70f04e1eb3e3e",
-        "upstream_drift_since_source: 2 commits",
-        "next_check_due: 2026-09-16",
+        "vendored_commit: 10cbb78",
+        "upstream_drift_since_source: 0 commits",
+        "next_check_due: 2026-11-06",
     ]
     for fragment in required_fragments:
         assert fragment in provenance

@@ -628,12 +628,23 @@ class MessageStore:
                 search_content = _index_safe_text(msg.get("content"), self._ingest_protection_config)
                 content_stored = _encrypted_or_plain(self._cipher, content_plain, field="content")
                 tool_calls_stored = _encrypted_or_plain(self._cipher, tc_json, field="tool_calls")
-                # Upstream time contract: `timestamp`/`ingested_at` are INGEST
-                # time; the host-supplied arrival time is preserved separately in
-                # `observed_at` (+ observed_at_source). This supersedes the fork's
-                # old _coerce_ts approach, which overloaded `timestamp` itself.
+                # Timestamp contract (fork-preserving + upstream columns):
+                #   `timestamp`   = per-row REAL time. A replayed row carries its
+                #                   original arrival time; _coerce_ts preserves it
+                #                   (a genuinely-new row with no usable timestamp
+                #                   falls back to now). This is the fork contract
+                #                   asserted by test_ingest_timestamp_fidelity
+                #                   (the timestamp-collapse regression: a replay
+                #                   batch must NOT re-stamp every row with one
+                #                   time.time() instant).
+                #   `ingested_at` = when THIS process wrote the row (always now).
+                #   `observed_at` = upstream's separate host-arrival column, kept
+                #                   for parity; NULL when the row carried no time.
+                # An earlier merge set row_ts = time.time() for every row and
+                # moved arrival time to observed_at only — which collapsed the
+                # per-row `timestamp` the fork test reads. Restored.
                 ts = time.time()
-                row_ts = ts
+                row_ts = _coerce_ts(msg.get("timestamp"))
                 observed_at = _normalize_observed_at(msg.get("timestamp"))
                 cur = self._conn.execute(
                     """INSERT INTO messages

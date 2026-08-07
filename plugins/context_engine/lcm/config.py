@@ -542,9 +542,11 @@ class LCMConfig:
     # 0 = derive from target_ratio × threshold_tokens; >0 = explicit budget.
     fresh_tail_token_budget: int = 0
     # Hard cap on the derived/explicit budget (guards 1M-window models).
-    # Default 0 = disabled/derive (upstream semantics); the fleet sets a real
-    # cap (e.g. 60_000) via config.yaml / LCM_FRESH_TAIL_MAX_TOKENS.
-    fresh_tail_max_tokens: int = 0
+    # Fork default 60_000 (NOT upstream's minimal 0): the fork ships a real
+    # working cap so the token-budgeted fresh tail is bounded out of the box,
+    # asserted by test_lcm_fresh_tail_token_budget::TestConfigPlumbing.
+    # An earlier merge took upstream's `= 0` here; restored to the fork value.
+    fresh_tail_max_tokens: int = 60_000
     # Fleet-standard kept-tail ratio, sourced from compression.target_ratio
     # (config.yaml) exactly like skew_floor — the LCM engine is a process-global
     # singleton, so this is read ONCE at construction (Greptile #111 discipline).
