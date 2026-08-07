@@ -18,6 +18,8 @@ import sys
 
 from rich.markup import escape as _escape
 
+from hermes_cli.kanban_identity import resolve_kanban_worker_chat_identity
+
 
 class CLIAgentSetupMixin:
     """Agent construction + session-resume display methods for ``HermesCLI``."""
@@ -362,6 +364,7 @@ class CLIAgentSetupMixin:
                 "credential_pool": getattr(self, "_credential_pool", None),
             }
             effective_model = model_override or self.model
+            kanban_chat_id, kanban_chat_name = resolve_kanban_worker_chat_identity()
             self.agent = AIAgent(
                 model=effective_model,
                 api_key=runtime.get("api_key"),
@@ -393,6 +396,8 @@ class CLIAgentSetupMixin:
                 openrouter_min_coding_score=self._openrouter_min_coding_score,
                 session_id=self.session_id,
                 platform="cli",
+                chat_id=kanban_chat_id,
+                chat_name=kanban_chat_name,
                 session_db=self._session_db,
                 clarify_callback=self._clarify_callback,
                 reasoning_callback=self._current_reasoning_callback(),
