@@ -506,6 +506,14 @@ def _terminal_payload(record: dict[str, Any], result: dict[str, Any], status: st
         "attempt_id": record.get("attempt", {}).get("attempt_id"),
         "attempt_generation": record.get("attempt", {}).get("generation"),
         "redispatch_count": record.get("attempt", {}).get("redispatch_count", 0),
+        # Did this attempt ever reach an executor? mark_submitted stamps
+        # submitted_at as the first thing the worker does, before invoking the
+        # runner, so None proves the runner never ran. Without this, a tombstone
+        # for an owner that died mid-flight (real work lost, redispatch
+        # warranted) is indistinguishable from one for an attempt that never
+        # started (nothing lost, bookkeeping only) — and identical-looking
+        # tombstones train operators to ignore all of them.
+        "died_before_start": record.get("attempt", {}).get("submitted_at") is None,
         "session_key": route.get("session_key", ""),
         "origin_ui_session_id": route.get("origin_ui_session_id", ""),
         # Raw api_server wake target — see the route note in
@@ -762,7 +770,13 @@ def is_boot_id_alive(boot_id: str) -> bool:
     return _gateway_boot_is_alive(boot_id)
 
 
-def _restart_payload(record: dict[str, Any], interrupted_at: float, restarted_at: float) -> dict[str, Any]:
+def _restart_payload(
+    record: dict[str, Any],
+    interrupted_at: float,
+    restarted_at: float,
+    *,
+    died_before_start: bool,
+) -> dict[str, Any]:
     route = record.get("route") or {}
     tasks = (record.get("source") or {}).get("tasks") or []
     goals = [str(task.get("goal") or "") for task in tasks if isinstance(task, dict)]
@@ -772,6 +786,10 @@ def _restart_payload(record: dict[str, Any], interrupted_at: float, restarted_at
         "attempt_id": record["attempt"]["attempt_id"],
         "attempt_generation": record["attempt"]["generation"],
         "redispatch_count": record["attempt"]["redispatch_count"],
+        # Describes the SUPERSEDED attempt, not the replacement. The caller must
+        # capture it before claiming rewrites attempt.submitted_at to None,
+        # otherwise every restart notice would claim died_before_start=True.
+        "died_before_start": died_before_start,
         "interrupted_at": interrupted_at,
         "restarted_at": restarted_at,
         "session_key": route.get("session_key", ""),
@@ -929,6 +947,10 @@ def claim_recoveries(
                 continue
             generation = int(attempt.get("generation") or 0) + 1
             interrupted_at = float(attempt.get("started_at") or record.get("updated_at") or now)
+            # Capture BEFORE the attempt.update() below resets submitted_at to
+            # None for the replacement attempt — the notice describes the attempt
+            # being superseded.
+            died_before_start = attempt.get("submitted_at") is None
             for event in record.get("outbox", []):
                 if (
                     isinstance(event, dict)
@@ -951,7 +973,9 @@ def claim_recoveries(
             })
             record["state"] = "running"
             record["updated_at"] = now
-            payload = _restart_payload(record, interrupted_at, now)
+            payload = _restart_payload(
+                record, interrupted_at, now, died_before_start=died_before_start
+            )
             event_id = f"{delegation_id}:restart:g{generation}"
             payload["event_id"] = event_id
             record.setdefault("outbox", []).append({
