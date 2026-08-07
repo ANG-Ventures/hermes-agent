@@ -2217,6 +2217,35 @@ def test_parse_github_pr_url_accepts_canonical_and_rejects_non_github():
     ) is None
 
 
+def test_parse_github_pr_url_survives_json_embedded_quotes():
+    """A PR URL inside a JSON handback must still parse.
+
+    Workers post structured handbacks like ``"pr": "https://.../pull/3",`` and
+    the guard's URL regex captures the trailing ``",``. Before 2026-08-07 the
+    parser stripped ``.,;:!?)]}>`` but NOT quotes, so the URL returned None —
+    and ``check_respawn_guard`` treats unparseable as "assume open", which
+    fail-closed to ``active_pr`` permanently even after the PR had merged. A
+    real task sat undispatchable across repeated dispatch ticks because of it.
+    """
+    expected = ("Kyzcreig/ace-media-homelab", 3)
+    # exactly what the URL regex captures out of a JSON line
+    assert kb._parse_github_pr_url(
+        'https://github.com/Kyzcreig/ace-media-homelab/pull/3",'
+    ) == expected
+    # and the single-quoted / plain-quoted variants
+    assert kb._parse_github_pr_url(
+        "https://github.com/Kyzcreig/ace-media-homelab/pull/3'"
+    ) == expected
+    assert kb._parse_github_pr_url(
+        'https://github.com/Kyzcreig/ace-media-homelab/pull/3"'
+    ) == expected
+    # a genuinely malformed URL must STILL be rejected (the guard's
+    # fail-closed behavior is correct when it cannot identify the PR)
+    assert kb._parse_github_pr_url(
+        'https://github.com/Kyzcreig/ace-media-homelab/pull/"'
+    ) is None
+
+
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [
