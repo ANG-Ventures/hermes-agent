@@ -8,19 +8,24 @@ recoverable through the LCM inspection and expansion tools.
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 import json
 import logging
+import math
 import os
 import re
+import stat
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, BinaryIO, Dict
 
 DEFAULT_LARGE_OUTPUT_DIRNAME = "lcm-large-outputs"
 _EXTERNALIZED_REF_RE = re.compile(
     r"\[(?:Externalized|GC'd externalized) (?:tool output|payload):.*?;\s*ref=([^;\]\s]+)\]"
 )
+_EXTERNALIZED_SEARCH_HEADER_BYTES = 64 * 1024
+_EXTERNALIZED_SEARCH_TAIL_BYTES = 64 * 1024
 
 
 def _placeholder_metadata(value: Any) -> str:
@@ -43,6 +48,12 @@ def _safe_stub(value: str, fallback: str) -> str:
 
 def _content_digest_prefix(content: str) -> str:
     return hashlib.sha256((content or "").encode("utf-8")).hexdigest()[:12]
+
+
+def _preview_sha256(preview_prefix: Any) -> str:
+    if not preview_prefix:
+        return ""
+    return hashlib.sha256(str(preview_prefix).encode("utf-8")).hexdigest()
 
 
 def _fsync_directory(path: Path) -> None:
@@ -68,6 +79,22 @@ def _missing_directory_components(path: Path) -> list[Path]:
     return list(reversed(missing))
 
 
+_WARNED_EXTERNALIZATION_PATHS: set[str] = set()
+
+
+def _warn_externalization_path_outside_base(path: Path, allowed_base: Path) -> None:
+    key = str(path)
+    if key in _WARNED_EXTERNALIZATION_PATHS:
+        return
+    _WARNED_EXTERNALIZATION_PATHS.add(key)
+    logger.warning(
+        "LCM externalized-payload path %s is outside the hermes_home base %s; "
+        "set LCM_HERMES_BASE_DIR to enforce strict containment",
+        path,
+        allowed_base,
+    )
+
+
 def get_large_output_storage_dir(config, hermes_home: str = "", *, create: bool) -> Path:
     configured = getattr(config, "large_output_externalization_path", "") or ""
     if configured:
@@ -80,6 +107,16 @@ def get_large_output_storage_dir(config, hermes_home: str = "", *, create: bool)
                 path.relative_to(allowed_base)
             except ValueError:
                 raise ValueError(f"Path {path} is not within allowed base {allowed_base}")
+        elif hermes_home:
+            # No explicit base configured: hermes_home is the natural default
+            # containment root. A configured path may legitimately point to
+            # another volume, so warn (once) rather than break a running
+            # deployment; set LCM_HERMES_BASE_DIR to enforce strictly.
+            allowed_base = Path(hermes_home).expanduser().resolve()
+            try:
+                path.relative_to(allowed_base)
+            except ValueError:
+                _warn_externalization_path_outside_base(path, allowed_base)
     else:
         base = Path(hermes_home).expanduser().resolve() if hermes_home else Path("~/.hermes").expanduser().resolve()
         path = base / DEFAULT_LARGE_OUTPUT_DIRNAME
@@ -127,6 +164,357 @@ def _write_externalized_payload(path: Path, payload: Dict[str, Any]) -> None:
     finally:
         if fd >= 0:
             os.close(fd)
+
+
+def _replace_externalized_payload(path: Path, payload: Dict[str, Any]) -> None:
+    tmp_path = path.with_name(f"{path.name}.{time.time_ns():x}.tmp")
+    try:
+        _write_externalized_payload(tmp_path, payload)
+        tmp_path.replace(path)
+        _fsync_directory(path.parent)
+    except OSError:
+        _unlink_partial_payload(tmp_path)
+        raise
+
+
+def _persisted_output_marker_entry_from_metadata(metadata: Dict[str, Any] | None) -> Dict[str, Any] | None:
+    if not metadata:
+        return None
+    source_path = metadata.get("persisted_output_source_path")
+    expected_chars = metadata.get("persisted_output_expected_chars")
+    preview_sha256 = metadata.get("persisted_output_preview_sha256") or _preview_sha256(
+        metadata.get("persisted_output_preview_prefix")
+    )
+    redacted_preview_sha256 = metadata.get("persisted_output_redacted_preview_sha256")
+    file_size = metadata.get("persisted_output_file_size")
+    file_mtime_ns = metadata.get("persisted_output_file_mtime_ns")
+    file_ctime_ns = metadata.get("persisted_output_file_ctime_ns")
+
+    if source_path is None or expected_chars is None:
+        return None
+    try:
+        expected_chars = int(expected_chars)
+    except (TypeError, ValueError):
+        return None
+    source_path = str(source_path)
+    if not source_path:
+        return None
+    entry = {
+        "source_path": source_path,
+        "expected_chars": expected_chars,
+    }
+    if preview_sha256:
+        entry["preview_sha256"] = str(preview_sha256)
+    if redacted_preview_sha256:
+        entry["redacted_preview_sha256"] = str(redacted_preview_sha256)
+    if file_size is not None:
+        try:
+            entry["file_size"] = int(file_size)
+        except (TypeError, ValueError):
+            pass
+    if file_mtime_ns is not None:
+        try:
+            entry["file_mtime_ns"] = int(file_mtime_ns)
+        except (TypeError, ValueError):
+            pass
+    if file_ctime_ns is not None:
+        try:
+            entry["file_ctime_ns"] = int(file_ctime_ns)
+        except (TypeError, ValueError):
+            pass
+    return entry
+
+
+def _persisted_output_marker_entries(
+    payload: Dict[str, Any],
+    *,
+    include_legacy_preview_prefix: bool = False,
+) -> list[Dict[str, Any]]:
+    entries: list[Dict[str, Any]] = []
+    seen: set[tuple[str, int, str, str, int | None, int | None, int | None]] = set()
+    try:
+        from .ingest_protection import _has_lossy_sensitive_redaction
+    except Exception:
+        _has_lossy_sensitive_redaction = None  # type: ignore[assignment]
+    payload_content_has_lossy_redaction = bool(
+        _has_lossy_sensitive_redaction
+        and _has_lossy_sensitive_redaction(str(payload.get("content") or ""))
+    )
+
+    def add(
+        source_path: Any,
+        expected_chars: Any,
+        preview_prefix: Any = None,
+        preview_sha256: Any = None,
+        redacted_preview_sha256: Any = None,
+        file_size: Any = None,
+        file_mtime_ns: Any = None,
+        file_ctime_ns: Any = None,
+    ) -> None:
+        if source_path is None or expected_chars is None:
+            return
+        try:
+            chars = int(expected_chars)
+        except (TypeError, ValueError):
+            return
+        source = str(source_path)
+        if not source:
+            return
+        preview_digest = "" if payload_content_has_lossy_redaction else str(preview_sha256 or "")
+        if not preview_digest and preview_prefix and not payload_content_has_lossy_redaction:
+            preview_digest = _preview_sha256(preview_prefix)
+        redacted_preview_digest = str(redacted_preview_sha256 or "")
+        try:
+            size = int(file_size) if file_size is not None else None
+        except (TypeError, ValueError):
+            size = None
+        try:
+            mtime_ns = int(file_mtime_ns) if file_mtime_ns is not None else None
+        except (TypeError, ValueError):
+            mtime_ns = None
+        try:
+            ctime_ns = int(file_ctime_ns) if file_ctime_ns is not None else None
+        except (TypeError, ValueError):
+            ctime_ns = None
+        key = (source, chars, preview_digest, redacted_preview_digest, size, mtime_ns, ctime_ns)
+        if key in seen:
+            return
+        seen.add(key)
+        entry = {"source_path": source, "expected_chars": chars}
+        if preview_digest:
+            entry["preview_sha256"] = preview_digest
+        if redacted_preview_digest:
+            entry["redacted_preview_sha256"] = redacted_preview_digest
+        if size is not None:
+            entry["file_size"] = size
+        if mtime_ns is not None:
+            entry["file_mtime_ns"] = mtime_ns
+        if ctime_ns is not None:
+            entry["file_ctime_ns"] = ctime_ns
+        if include_legacy_preview_prefix and preview_prefix:
+            entry["legacy_preview_prefix"] = str(preview_prefix)
+        entries.append(entry)
+
+    add(
+        payload.get("persisted_output_source_path"),
+        payload.get("persisted_output_expected_chars"),
+        payload.get("persisted_output_preview_prefix"),
+        payload.get("persisted_output_preview_sha256"),
+        payload.get("persisted_output_redacted_preview_sha256"),
+        payload.get("persisted_output_file_size"),
+        payload.get("persisted_output_file_mtime_ns"),
+        payload.get("persisted_output_file_ctime_ns"),
+    )
+    markers = payload.get("persisted_output_markers")
+    if isinstance(markers, list):
+        for marker in markers:
+            if not isinstance(marker, dict):
+                continue
+            add(
+                marker.get("source_path"),
+                marker.get("expected_chars"),
+                marker.get("preview_prefix"),
+                marker.get("preview_sha256"),
+                marker.get("redacted_preview_sha256"),
+                marker.get("file_size"),
+                marker.get("file_mtime_ns"),
+                marker.get("file_ctime_ns"),
+            )
+    return entries
+
+
+def _safe_persisted_output_metadata(metadata: Dict[str, Any] | None) -> Dict[str, Any]:
+    marker = _persisted_output_marker_entry_from_metadata(metadata)
+    if marker is None:
+        return {}
+    safe = {
+        "persisted_output_source_path": marker["source_path"],
+        "persisted_output_expected_chars": marker["expected_chars"],
+    }
+    if marker.get("preview_sha256"):
+        safe["persisted_output_preview_sha256"] = marker["preview_sha256"]
+    if marker.get("redacted_preview_sha256"):
+        safe["persisted_output_redacted_preview_sha256"] = marker["redacted_preview_sha256"]
+    if marker.get("file_size") is not None:
+        safe["persisted_output_file_size"] = marker["file_size"]
+    if marker.get("file_mtime_ns") is not None:
+        safe["persisted_output_file_mtime_ns"] = marker["file_mtime_ns"]
+    if marker.get("file_ctime_ns") is not None:
+        safe["persisted_output_file_ctime_ns"] = marker["file_ctime_ns"]
+    return safe
+
+
+def _redacted_legacy_preview_sha256(marker: Dict[str, Any], config) -> str:
+    legacy_preview_prefix = marker.get("legacy_preview_prefix")
+    if not legacy_preview_prefix:
+        return ""
+    try:
+        from .ingest_protection import _has_lossy_sensitive_redaction, redact_sensitive_value
+    except Exception:
+        return ""
+    redacted_preview = redact_sensitive_value(
+        str(legacy_preview_prefix),
+        config,
+        parse_json_strings=False,
+    )
+    if _has_lossy_sensitive_redaction(str(redacted_preview)):
+        return ""
+    return _preview_sha256(redacted_preview)
+
+
+def _persisted_output_marker_matches_preview_digest(
+    marker: Dict[str, Any],
+    preview_sha256: str,
+    *,
+    config,
+    allow_redacted_preview_match: bool = True,
+) -> bool:
+    if not preview_sha256:
+        return False
+    if preview_sha256 == str(marker.get("preview_sha256") or ""):
+        return True
+    if not allow_redacted_preview_match:
+        return False
+    if preview_sha256 == str(marker.get("redacted_preview_sha256") or ""):
+        return True
+    return preview_sha256 == _redacted_legacy_preview_sha256(marker, config)
+
+
+def _marker_file_not_newer_than_payload(marker: Dict[str, Any], payload: Dict[str, Any]) -> bool:
+    """Return true when a live marker file still matches the durable payload era."""
+    source_path = marker.get("source_path")
+    created_at = payload.get("created_at")
+    if not source_path or created_at is None:
+        return False
+    try:
+        current_stat = Path(str(source_path)).stat()
+        marker_size = marker.get("file_size")
+        marker_mtime_ns = marker.get("file_mtime_ns")
+        marker_ctime_ns = marker.get("file_ctime_ns")
+        if marker_size is None or marker_mtime_ns is None or marker_ctime_ns is None:
+            return False
+        return (
+            int(current_stat.st_size) == int(marker_size)
+            and int(current_stat.st_mtime_ns) == int(marker_mtime_ns)
+            and int(current_stat.st_ctime_ns) == int(marker_ctime_ns)
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _sanitize_persisted_output_marker_metadata(payload: Dict[str, Any]) -> bool:
+    """Remove legacy raw persisted-output previews from durable metadata.
+
+    Older payloads stored marker preview text as ``preview_prefix``. That preview
+    is enough to leak secrets when the recovered content itself has been
+    redacted, so durable metadata now stores only SHA-256 proofs. This helper is
+    intentionally tolerant of old payloads and rewrites them opportunistically
+    when they are touched again.
+    """
+    changed = False
+    try:
+        from .ingest_protection import _has_lossy_sensitive_redaction
+    except Exception:
+        _has_lossy_sensitive_redaction = None  # type: ignore[assignment]
+    payload_content_has_lossy_redaction = bool(
+        _has_lossy_sensitive_redaction
+        and _has_lossy_sensitive_redaction(str(payload.get("content") or ""))
+    )
+    entries = _persisted_output_marker_entries(payload)
+
+    if "persisted_output_preview_prefix" in payload:
+        payload.pop("persisted_output_preview_prefix", None)
+        changed = True
+
+    marker_list = payload.get("persisted_output_markers")
+    if entries and marker_list != entries:
+        payload["persisted_output_markers"] = entries
+        changed = True
+
+    first_digest = next((entry.get("preview_sha256") for entry in entries if entry.get("preview_sha256")), "")
+    if first_digest and payload.get("persisted_output_preview_sha256") != first_digest:
+        payload["persisted_output_preview_sha256"] = first_digest
+        changed = True
+    elif not first_digest and payload_content_has_lossy_redaction and "persisted_output_preview_sha256" in payload:
+        payload.pop("persisted_output_preview_sha256", None)
+        changed = True
+
+    first_redacted_digest = next(
+        (entry.get("redacted_preview_sha256") for entry in entries if entry.get("redacted_preview_sha256")),
+        "",
+    )
+    if first_redacted_digest and payload.get("persisted_output_redacted_preview_sha256") != first_redacted_digest:
+        payload["persisted_output_redacted_preview_sha256"] = first_redacted_digest
+        changed = True
+
+    first_file_size = next((entry.get("file_size") for entry in entries if entry.get("file_size") is not None), None)
+    if first_file_size is not None and payload.get("persisted_output_file_size") != first_file_size:
+        payload["persisted_output_file_size"] = first_file_size
+        changed = True
+
+    first_file_mtime_ns = next((entry.get("file_mtime_ns") for entry in entries if entry.get("file_mtime_ns") is not None), None)
+    if first_file_mtime_ns is not None and payload.get("persisted_output_file_mtime_ns") != first_file_mtime_ns:
+        payload["persisted_output_file_mtime_ns"] = first_file_mtime_ns
+        changed = True
+
+    first_file_ctime_ns = next((entry.get("file_ctime_ns") for entry in entries if entry.get("file_ctime_ns") is not None), None)
+    if first_file_ctime_ns is not None and payload.get("persisted_output_file_ctime_ns") != first_file_ctime_ns:
+        payload["persisted_output_file_ctime_ns"] = first_file_ctime_ns
+        changed = True
+
+    return changed
+
+
+def _merge_persisted_output_marker_metadata(payload: Dict[str, Any], metadata: Dict[str, Any] | None) -> bool:
+    changed = _sanitize_persisted_output_marker_metadata(payload)
+    marker = _persisted_output_marker_entry_from_metadata(metadata)
+    if marker is not None:
+        try:
+            from .ingest_protection import _has_lossy_sensitive_redaction
+        except Exception:
+            _has_lossy_sensitive_redaction = None  # type: ignore[assignment]
+        if _has_lossy_sensitive_redaction and _has_lossy_sensitive_redaction(str(payload.get("content") or "")):
+            marker.pop("preview_sha256", None)
+    if marker is None:
+        return changed
+    entries = _persisted_output_marker_entries(payload)
+    key = (
+        marker["source_path"],
+        marker["expected_chars"],
+        marker.get("preview_sha256", ""),
+        marker.get("redacted_preview_sha256", ""),
+        marker.get("file_size"),
+        marker.get("file_mtime_ns"),
+        marker.get("file_ctime_ns"),
+    )
+    if any(
+        (
+            entry["source_path"],
+            entry["expected_chars"],
+            entry.get("preview_sha256", ""),
+            entry.get("redacted_preview_sha256", ""),
+            entry.get("file_size"),
+            entry.get("file_mtime_ns"),
+            entry.get("file_ctime_ns"),
+        ) == key
+        for entry in entries
+    ):
+        return changed
+    entries.append(marker)
+    payload["persisted_output_markers"] = entries
+    payload.setdefault("persisted_output_source_path", marker["source_path"])
+    payload.setdefault("persisted_output_expected_chars", marker["expected_chars"])
+    if marker.get("preview_sha256"):
+        payload.setdefault("persisted_output_preview_sha256", marker["preview_sha256"])
+    if marker.get("redacted_preview_sha256"):
+        payload.setdefault("persisted_output_redacted_preview_sha256", marker["redacted_preview_sha256"])
+    if marker.get("file_size") is not None:
+        payload.setdefault("persisted_output_file_size", marker["file_size"])
+    if marker.get("file_mtime_ns") is not None:
+        payload.setdefault("persisted_output_file_mtime_ns", marker["file_mtime_ns"])
+    if marker.get("file_ctime_ns") is not None:
+        payload.setdefault("persisted_output_file_ctime_ns", marker["file_ctime_ns"])
+    return True
 
 
 def resolve_large_output_storage_dir(config, hermes_home: str = "") -> Path:
@@ -221,6 +609,288 @@ def load_externalized_payload(ref: str, *, config, hermes_home: str = "") -> Dic
     return summary
 
 
+def _decode_json_string_fragment(raw: bytes) -> str:
+    """Decode a possibly truncated JSON string without reading beyond its bound."""
+    candidate = raw
+    while candidate:
+        try:
+            value = json.loads(b'"' + candidate + b'"')
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            candidate = candidate[:-1]
+            continue
+        return value if isinstance(value, str) else ""
+    return ""
+
+
+def _numeric_json_field(data: bytes, field: str) -> int | float | None:
+    pattern = re.compile(rb'"' + re.escape(field.encode("ascii")) + rb'"\s*:\s*(-?[0-9]+(?:\.[0-9]+)?)')
+    match = pattern.search(data)
+    if match is None:
+        return None
+    text = match.group(1).decode("ascii")
+    try:
+        return float(text) if "." in text else int(text)
+    except ValueError:
+        return None
+
+
+def _normalized_content_size(value: int | float | None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None
+    try:
+        normalized = int(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return normalized if normalized >= 0 else None
+
+
+def _parse_top_level_json_string_fields_before_content(text: str) -> tuple[dict[str, str], int | None]:
+    decoder = json.JSONDecoder()
+    fields: dict[str, str] = {}
+    length = len(text)
+    index = 0
+
+    def skip_json_whitespace(pos: int) -> int:
+        while pos < length and text[pos] in " \t\n\r":
+            pos += 1
+        return pos
+
+    index = skip_json_whitespace(index)
+    if index >= length or text[index] != "{":
+        return fields, None
+    index += 1
+
+    while True:
+        index = skip_json_whitespace(index)
+        if index >= length or text[index] == "}":
+            return fields, None
+        if text[index] != '"':
+            return fields, None
+        try:
+            key, index = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            return fields, None
+        if not isinstance(key, str):
+            return fields, None
+        index = skip_json_whitespace(index)
+        if index >= length or text[index] != ":":
+            return fields, None
+        index += 1
+        index = skip_json_whitespace(index)
+        if key == "content":
+            return fields, index if index < length and text[index] == '"' else None
+        if index >= length:
+            return fields, None
+        try:
+            value, index = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            return fields, None
+        if isinstance(value, str):
+            fields[key] = value
+        elif key == "session_id":
+            fields.pop(key, None)
+        index = skip_json_whitespace(index)
+        if index >= length:
+            return fields, None
+        if text[index] == ",":
+            index += 1
+            continue
+        if text[index] == "}":
+            return fields, None
+        return fields, None
+
+
+def _inspect_top_level_json_string_fields_before_content(text: str) -> tuple[dict[str, str], bool]:
+    fields, content_quote_index = _parse_top_level_json_string_fields_before_content(text)
+    return fields, content_quote_index is not None
+
+
+def _read_externalized_payload_metadata_prefix_from_handle(
+    handle: BinaryIO,
+    *,
+    max_read_bytes: int,
+) -> tuple[str, dict[str, str], bool, bool]:
+    """Read through the opening quote of the top-level content string."""
+    prefix = bytearray()
+    text_parts: list[str] = []
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    prefix_truncated = False
+    read_limit = max(1, int(max_read_bytes))
+    fields: dict[str, str] = {}
+
+    while len(prefix) < read_limit:
+        chunk = handle.read(min(4096, read_limit - len(prefix)))
+        if not chunk:
+            break
+        prefix.extend(chunk)
+        try:
+            decoded = decoder.decode(chunk, final=False)
+        except UnicodeDecodeError as exc:
+            raise ValueError("invalid_payload") from exc
+        if decoded:
+            text_parts.append(decoded)
+        prefix_text = "".join(text_parts)
+        fields, content_quote_index = _parse_top_level_json_string_fields_before_content(prefix_text)
+        if content_quote_index is not None:
+            metadata_prefix_text = prefix_text[: content_quote_index + 1]
+            return metadata_prefix_text, fields, True, False
+
+    prefix_truncated = len(prefix) >= read_limit and bool(handle.read(1))
+    if not prefix_truncated:
+        try:
+            final_text = decoder.decode(b"", final=True)
+        except UnicodeDecodeError as exc:
+            raise ValueError("invalid_payload") from exc
+        if final_text:
+            text_parts.append(final_text)
+    return "".join(text_parts), fields, False, prefix_truncated
+
+
+def read_externalized_payload_metadata_prefix(
+    path: Path,
+    *,
+    max_read_bytes: int,
+) -> tuple[str, bool, bool]:
+    with path.open("rb") as handle:
+        prefix_text, _fields, content_key_seen, prefix_truncated = (
+            _read_externalized_payload_metadata_prefix_from_handle(
+                handle,
+                max_read_bytes=max_read_bytes,
+            )
+        )
+    return prefix_text, content_key_seen, prefix_truncated
+
+
+def read_externalized_payload_search_prefix(
+    ref: str,
+    *,
+    config,
+    hermes_home: str = "",
+    max_content_bytes: int = 512_000,
+) -> Dict[str, Any]:
+    """Read bounded metadata and the first bytes of one payload's content.
+
+    This deliberately does not deserialize the full sidecar. It reads at most a
+    small header, ``max_content_bytes`` from the JSON content string, and a
+    small tail for size metadata.
+    """
+    if (
+        not ref
+        or Path(ref).name != ref
+        or "/" in ref
+        or "\\" in ref
+        or not ref.endswith(".json")
+    ):
+        return {"status": "invalid_ref", "ref": ref}
+    storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
+    path = storage_dir / ref
+    try:
+        expected_stat = os.lstat(path)
+    except FileNotFoundError:
+        return {"status": "missing", "ref": ref}
+    except OSError:
+        return {"status": "unreadable", "ref": ref}
+    if stat.S_ISLNK(expected_stat.st_mode):
+        return {"status": "symlink", "ref": ref}
+    if not stat.S_ISREG(expected_stat.st_mode):
+        return {"status": "missing", "ref": ref}
+
+    content_limit = max(1, min(int(max_content_bytes), 512_000))
+    fd = -1
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_BINARY", 0)
+        fd = os.open(path, flags)
+        opened_stat = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or (opened_stat.st_dev, opened_stat.st_ino)
+            != (expected_stat.st_dev, expected_stat.st_ino)
+        ):
+            return {"status": "unreadable", "ref": ref}
+        file_size = opened_stat.st_size
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            metadata_prefix_text, metadata_fields, content_key_seen, _prefix_truncated = (
+                _read_externalized_payload_metadata_prefix_from_handle(
+                    handle,
+                    max_read_bytes=_EXTERNALIZED_SEARCH_HEADER_BYTES,
+                )
+            )
+            if not content_key_seen:
+                return {"status": "unsupported_payload", "ref": ref}
+            handle.seek(len(metadata_prefix_text.encode("utf-8")))
+            raw = bytearray()
+            escaped = False
+            closed = False
+            while len(raw) < content_limit:
+                chunk = handle.read(min(64 * 1024, content_limit - len(raw)))
+                if not chunk:
+                    break
+                for byte in chunk:
+                    if not escaped and byte == 0x22:
+                        closed = True
+                        break
+                    raw.append(byte)
+                    if escaped:
+                        escaped = False
+                    elif byte == 0x5C:
+                        escaped = True
+                if closed:
+                    break
+            handle.seek(max(0, file_size - _EXTERNALIZED_SEARCH_TAIL_BYTES))
+            tail = handle.read(_EXTERNALIZED_SEARCH_TAIL_BYTES)
+    except (OSError, ValueError):
+        return {"status": "unreadable", "ref": ref}
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+    content = _decode_json_string_fragment(bytes(raw))
+    original_bytes = _numeric_json_field(tail, "content_bytes")
+    original_chars = _numeric_json_field(tail, "content_chars")
+    created_at = _numeric_json_field(tail, "created_at")
+    try:
+        created_at_float = float(created_at or 0)
+    except (OverflowError, ValueError):
+        created_at_float = 0.0
+    if not math.isfinite(created_at_float):
+        created_at_float = 0.0
+    return {
+        "status": "ok",
+        "ref": ref,
+        "kind": metadata_fields.get("kind") or "tool_result",
+        "tool_call_id": metadata_fields.get("tool_call_id", ""),
+        "role": metadata_fields.get("role", ""),
+        "session_id": metadata_fields.get("session_id", ""),
+        "content": content,
+        "content_scanned_bytes": len(raw),
+        "original_content_bytes": _normalized_content_size(original_bytes),
+        "original_content_chars": _normalized_content_size(original_chars),
+        "created_at": created_at_float,
+        "scan_truncated": not closed,
+    }
+
+
+def externalized_tool_result_has_persisted_output_marker(ref: str, *, config, hermes_home: str = "") -> bool:
+    if not ref or Path(ref).name != ref:
+        return False
+    storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
+    if not storage_dir.exists() or not storage_dir.is_dir():
+        return False
+    path = storage_dir / ref
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if payload.get("kind", "tool_result") != "tool_result":
+        return False
+    return bool(_persisted_output_marker_entries(payload))
+
+
 def reassign_externalized_payloads(
     old_session_id: str,
     new_session_id: str,
@@ -306,6 +976,98 @@ def find_externalized_payload_for_message(
     return fallback_match
 
 
+def find_externalized_tool_result_content_for_call(
+    *,
+    tool_call_id: str,
+    session_id: str = "",
+    expected_chars: int | None = None,
+    persisted_output_source_path: str | None = None,
+    persisted_output_preview_sha256: str | None = None,
+    require_persisted_output_file_not_newer: bool = False,
+    allow_redacted_preview_match: bool = True,
+    require_missing_file_generation_metadata: bool = False,
+    persisted_output_file_size: int | None = None,
+    persisted_output_file_mtime_ns: int | None = None,
+    persisted_output_file_ctime_ns: int | None = None,
+    config,
+    hermes_home: str = "",
+) -> str | None:
+    """Return durable externalized tool-result content for a matching marker.
+
+    This is used only for replay identity recovery when Hermes' temporary
+    persisted-output file has already been cleaned up but LCM previously stored
+    the recovered full tool output durably. A reused tool-call id alone is not
+    sufficient proof; marker-specific metadata captured before redaction must
+    match when provided.
+    """
+    if not tool_call_id:
+        return None
+    if (expected_chars is not None or persisted_output_source_path) and not persisted_output_preview_sha256:
+        return None
+    storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
+    if not storage_dir.exists() or not storage_dir.is_dir():
+        return None
+    for path in sorted(storage_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if payload.get("kind", "tool_result") != "tool_result":
+            continue
+        if (payload.get("tool_call_id") or "") != tool_call_id:
+            continue
+        if session_id and (payload.get("session_id") or "") != session_id:
+            continue
+        payload_role = payload.get("role") or ""
+        if payload_role and payload_role != "tool":
+            continue
+        content = payload.get("content")
+        if not isinstance(content, str):
+            continue
+        if (
+            expected_chars is not None
+            or persisted_output_source_path
+            or persisted_output_preview_sha256
+            or require_persisted_output_file_not_newer
+        ):
+            marker_matches = False
+            for marker in _persisted_output_marker_entries(payload, include_legacy_preview_prefix=True):
+                if expected_chars is not None and marker.get("expected_chars") != expected_chars:
+                    continue
+                if persisted_output_source_path and marker.get("source_path") != persisted_output_source_path:
+                    continue
+                if require_missing_file_generation_metadata and (
+                    marker.get("file_size") is not None
+                    or marker.get("file_mtime_ns") is not None
+                    or marker.get("file_ctime_ns") is not None
+                ):
+                    continue
+                if persisted_output_file_size is not None and marker.get("file_size") != persisted_output_file_size:
+                    continue
+                if persisted_output_file_mtime_ns is not None and marker.get("file_mtime_ns") != persisted_output_file_mtime_ns:
+                    continue
+                if persisted_output_file_ctime_ns is not None and marker.get("file_ctime_ns") != persisted_output_file_ctime_ns:
+                    continue
+                if (
+                    persisted_output_preview_sha256
+                    and not _persisted_output_marker_matches_preview_digest(
+                        marker,
+                        persisted_output_preview_sha256,
+                        config=config,
+                        allow_redacted_preview_match=allow_redacted_preview_match,
+                    )
+                ):
+                    continue
+                if require_persisted_output_file_not_newer and not _marker_file_not_newer_than_payload(marker, payload):
+                    continue
+                marker_matches = True
+                break
+            if not marker_matches:
+                continue
+        return content
+    return None
+
+
 def externalize_ingest_payload(
     content: str,
     *,
@@ -367,6 +1129,7 @@ def maybe_externalize_tool_output(
     session_id: str = "",
     config,
     hermes_home: str = "",
+    force: bool = False,
 ) -> Dict[str, Any] | None:
     return maybe_externalize_payload(
         content,
@@ -376,6 +1139,7 @@ def maybe_externalize_tool_output(
         role="tool",
         config=config,
         hermes_home=hermes_home,
+        force=force,
     )
 
 
@@ -388,19 +1152,21 @@ def maybe_externalize_payload(
     role: str = "",
     config,
     hermes_home: str = "",
+    force: bool = False,
+    metadata: Dict[str, Any] | None = None,
 ) -> Dict[str, Any] | None:
-    """Externalize one oversized normalized payload if configured.
+    """Externalize one normalized payload if configured.
 
     Returns a dict with a compact placeholder and the durable JSON payload path,
-    or ``None`` when disabled, below threshold, or storage is unavailable. On
-    storage failure callers should keep the original content so there is no
-    silent data loss.
+    or ``None`` when disabled, below threshold and not forced, or storage is
+    unavailable. On storage failure callers should keep the original content so
+    there is no silent data loss.
     """
     if not getattr(config, "large_output_externalization_enabled", False):
         return None
 
     threshold = max(1, int(getattr(config, "large_output_externalization_threshold_chars", 0) or 0))
-    if not content or len(content) <= threshold:
+    if not content or (len(content) <= threshold and not force):
         return None
 
     try:
@@ -419,9 +1185,22 @@ def maybe_externalize_payload(
         hermes_home=hermes_home,
     )
     if existing is not None:
+        existing_path = storage_dir / existing["ref"]
+        existing_payload = None
+        if metadata:
+            try:
+                existing_payload = json.loads(existing_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing_payload = None
+            if existing_payload is not None and _merge_persisted_output_marker_metadata(existing_payload, metadata):
+                try:
+                    _replace_externalized_payload(existing_path, existing_payload)
+                    existing = _externalized_summary(existing_path, existing_payload)
+                except OSError as exc:
+                    logger.warning("Large payload metadata update skipped (non-blocking): %s", exc)
         return {
             "placeholder": _build_externalized_placeholder(existing),
-            "path": storage_dir / existing["ref"],
+            "path": existing_path,
             "payload": existing,
         }
 
@@ -449,6 +1228,9 @@ def maybe_externalize_payload(
         "content_bytes": len(content.encode("utf-8")),
         "created_at": time.time(),
     }
+    if metadata:
+        payload.update(_safe_persisted_output_metadata(metadata))
+        _merge_persisted_output_marker_metadata(payload, metadata)
     try:
         _write_externalized_payload(path, payload)
     except OSError as exc:

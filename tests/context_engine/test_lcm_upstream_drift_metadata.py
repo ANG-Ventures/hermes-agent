@@ -16,16 +16,22 @@ def _without_field(source: Path, field: str) -> str:
 
 
 def test_parse_current_lcm_metadata_validates_required_provenance_fields() -> None:
+    # Re-vendored v0.16.2 -> v0.21.0-rc2 on 2026-08-06. This test exercises the
+    # PARSER against whatever the current VENDORED_FROM.txt records, so the
+    # pinned values track the current vendor drop (they were the v0.16.2 drop's
+    # SHA/version/dates before). The invariant under test is that every required
+    # provenance field parses with the right shape (full 40-char SHAs, ISO
+    # dates), not that the vendor never changes.
     metadata = drift.parse_metadata(CURRENT_METADATA)
 
     assert metadata.source_repository == "github.com/stephenschoettler/hermes-lcm"
-    assert metadata.source_commit == "03b74f84440be99164ce3e2cd929917bc9550bfe"
-    assert metadata.vendored_commit == "03b74f84440be99164ce3e2cd929917bc9550bfe"
-    assert metadata.vendored_version == "v0.16.2"
-    assert metadata.ingest_audit_verdict == "PASS"
-    assert metadata.last_upstream_security_check == "2026-06-16"
+    assert metadata.source_commit == "10cbb78347ec86f3004153b24767324ded9e37b4"
+    assert metadata.vendored_commit == "10cbb78347ec86f3004153b24767324ded9e37b4"
+    assert metadata.vendored_version == "v0.21.0-rc2"
+    assert metadata.ingest_audit_verdict.startswith("PASS")
+    assert metadata.last_upstream_security_check == "2026-08-06"
     assert metadata.checked_by.startswith("Apollo")
-    assert metadata.next_check_due == "2026-09-16"
+    assert metadata.next_check_due == "2026-11-06"
 
 
 def test_metadata_parser_fails_when_required_field_is_missing(tmp_path: Path) -> None:

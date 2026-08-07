@@ -349,6 +349,11 @@ PREFLIGHT_COMPRESSION_STATUS_TEMPLATE = (
     "📦 Preflight compression: ~{tokens:,} tokens "
     ">= {threshold:,} threshold. This may take a moment."
 )
+ENGINE_PREFLIGHT_MAINTENANCE_STATUS_TEMPLATE = (
+    "📦 {engine} maintenance compaction: ~{tokens:,} tokens "
+    "(BELOW the {threshold:,} threshold) — the context engine requested this, "
+    "not token pressure. This may take a moment."
+)
 IDLE_COMPACTION_STATUS_TEMPLATE = (
     "💤 Resumed after {idle_seconds}s idle — compacting "
     "~{tokens:,} tokens before continuing."

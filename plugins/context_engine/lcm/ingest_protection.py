@@ -13,7 +13,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
+import stat
+import tempfile
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List
@@ -87,7 +90,16 @@ _DATA_URI_BASE64_RE = re.compile(
 )
 
 _BASE64_RUN_RE = re.compile(r"(?<![A-Za-z0-9+/=_-])([A-Za-z0-9+/=_-]{4096,})(?![A-Za-z0-9+/=_-])")
+# Line-wrapped base64 (MIME 76 / PEM 64 chars per line) never forms a single
+# 4096-char contiguous run, so _BASE64_RUN_RE misses it entirely. Match a block
+# of consecutive base64-alphabet lines; looks_like_long_base64 makes the final
+# call on the whitespace-compacted block.
+_WRAPPED_BASE64_MIN_LINE_CHARS = 40
+_WRAPPED_BASE64_MIN_TERMINAL_LINE_CHARS = 16
 _BASE64_ALPHABET_RE = re.compile(r"^[A-Za-z0-9+/=_\s-]+$")
+_BASE64_LINE_ALPHABET_RE = re.compile(r"^[A-Za-z0-9+/=_-]+$")
+_PRIVATE_KEY_BEGIN_RE = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE)
+_PRIVATE_KEY_END_RE = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE)
 _EXTERNALIZED_PLACEHOLDER_PREFIX = "[Externalized LCM ingest payload:"
 _QUARANTINED_ASSISTANT_KIND = "quarantined_assistant_output"
 _QUARANTINED_ASSISTANT_REASON = "high_repetition"
@@ -105,6 +117,31 @@ _INGEST_PLACEHOLDER_RE = re.compile(r"\[Externalized LCM ingest payload:.*?;\s*r
 _EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE = re.compile(
     r"\[(?:Externalized|GC'd externalized) (?:tool output|payload):.*?;\s*ref=([^;\]\s]+)\]"
 )
+_PERSISTED_OUTPUT_TAG = "<persisted-output>"
+_PERSISTED_OUTPUT_CLOSING_TAG = "</persisted-output>"
+_PERSISTED_OUTPUT_SAVED_TO_RE = re.compile(r"^Full output saved to:\s*(?P<path>.+?)\s*$", re.MULTILINE)
+_PERSISTED_OUTPUT_PREVIEW_RE = re.compile(
+    r"^Preview \(first \d+ chars\):\s*\r?\n(?P<preview>.*?)\r?\n</persisted-output>\s*$",
+    re.MULTILINE | re.DOTALL,
+)
+_PERSISTED_OUTPUT_CHAR_COUNT_RE = re.compile(r"too large\s*\((?P<count>[\d,]+)\s+characters\b", re.IGNORECASE)
+_PERSISTED_OUTPUT_INLINE_PREVIEW_SHA256_RE = re.compile(
+    r"\r?\n\[LCM persisted-output marker identity: preview_sha256=(?P<sha256>[0-9a-f]{64})\]"
+    r"(?:\r?\n\[LCM persisted-output file generation: size=\d+; mtime_ns=\d+; ctime_ns=\d+\])?"
+    r"\r?\n</persisted-output>\s*$"
+)
+_PERSISTED_OUTPUT_INLINE_GENERATION_RE = re.compile(
+    r"\r?\n\[LCM persisted-output file generation: size=(?P<size>\d+); mtime_ns=(?P<mtime_ns>\d+); ctime_ns=(?P<ctime_ns>\d+)\]\r?\n</persisted-output>\s*$"
+)
+_PERSISTED_OUTPUT_INLINE_METADATA_RE = re.compile(
+    r"\r?\n\[LCM persisted-output (?:file generation|marker identity):[^\r\n]*\]\s*$"
+)
+_UNRECOVERABLE_TRUNCATION_RE = re.compile(
+    r"\[Truncated:\s*tool response was [\d,]+ chars\.\s*Full output could not be saved to sandbox\.\]",
+    re.IGNORECASE,
+)
+_HERMES_RESULTS_DIRNAME = "hermes-results"
+_MAX_RECOVERED_PERSISTED_OUTPUT_BYTES = 64 * 1024 * 1024
 _SENSITIVE_PLACEHOLDER_PREFIX = "[LCM sensitive redaction:"
 _SENSITIVE_PATTERN_CATALOG: dict[str, re.Pattern[str]] = {
     "api_key": re.compile(
@@ -128,6 +165,12 @@ _SENSITIVE_PATTERN_CATALOG: dict[str, re.Pattern[str]] = {
         r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
         re.IGNORECASE | re.DOTALL,
     ),
+    # Fork-only catalog entries (5). An earlier merge took upstream's SMALLER
+    # 4-pattern catalog on the mistaken belief upstream's ingest_protection was a
+    # superset — it is not. These bare-token matchers (no key:value prefix
+    # required) are what the fork's redaction-corpus and storage-security tests
+    # exercise; without them a bare `sk-proj-...` / `op://...` / cookie / AWS /
+    # GitHub token flows UNREDACTED into summary_nodes and raw storage.
     "onepassword_ref": re.compile(
         r"op://[^\s\"'<>]+",
         re.IGNORECASE,
@@ -148,9 +191,458 @@ _SENSITIVE_PATTERN_CATALOG: dict[str, re.Pattern[str]] = {
     ),
 }
 
+# Sensitive redaction runs synchronously in the ingest path. The private_key
+# pattern (lazy `.*?` under DOTALL) rescans to end-of-string for every unmatched
+# BEGIN header, so a multi-MB payload with many headers and no END is O(n^2) and
+# can block a turn for minutes. Guard it: prefer the optional `regex` engine with
+# a match timeout (fail-open on timeout), and when `regex` is unavailable bound
+# the input length the stdlib DOTALL pattern is applied to.
+try:  # pragma: no cover - exercised when the optional dependency is absent
+    import regex as _regex_engine
+except Exception:  # pragma: no cover - keep the plugin importable in minimal installs
+    _regex_engine = None
+
+_SENSITIVE_MATCH_TIMEOUT_SECONDS = 1.0
+# Legitimate PEM keys are a few KB; above this a DOTALL rescan is the attack, not
+# a real key, so fail-open rather than block ingest.
+_SENSITIVE_STDLIB_MAX_CHARS = 262_144
+_BACKTRACKING_RISKY_SENSITIVE_PATTERNS = frozenset({"private_key"})
+_SENSITIVE_TIMEOUT_WARNED: set[str] = set()
+_SENSITIVE_STDLIB_SKIP_WARNED: set[str] = set()
+_SENSITIVE_REGEX_CATALOG: dict[str, Any] = {}
+
+
+def _regex_engine_flags(re_flags: int) -> int:
+    mapped = 0
+    if re_flags & re.IGNORECASE:
+        mapped |= _regex_engine.IGNORECASE
+    if re_flags & re.DOTALL:
+        mapped |= _regex_engine.DOTALL
+    if re_flags & re.MULTILINE:
+        mapped |= _regex_engine.MULTILINE
+    if re_flags & re.VERBOSE:
+        mapped |= _regex_engine.VERBOSE
+    return mapped
+
+
+def _regex_pattern_for(name: str) -> Any:
+    """Lazily compile the timeout-capable `regex` mirror of a catalog pattern."""
+    if _regex_engine is None:
+        return None
+    cached = _SENSITIVE_REGEX_CATALOG.get(name)
+    if cached is not None:
+        return cached
+    stdlib_pattern = _SENSITIVE_PATTERN_CATALOG[name]
+    compiled = _regex_engine.compile(
+        stdlib_pattern.pattern, _regex_engine_flags(stdlib_pattern.flags)
+    )
+    _SENSITIVE_REGEX_CATALOG[name] = compiled
+    return compiled
+
+
+def _apply_sensitive_pattern(name: str, repl, text: str) -> str:
+    """Substitute one sensitive pattern with a ReDoS-safe strategy.
+
+    Fails open (leaves the span unredacted) with a one-time warning rather than
+    blocking the ingest path on a pathological input.
+    """
+    # Only the private_key pattern (lazy `.*?` under DOTALL, which rescans to
+    # end-of-string per unmatched BEGIN header) is O(n^2) and needs a guard.
+    # The other patterns are character-class-bounded and linear, so they always
+    # run via stdlib and never fail open - a redaction bypass under CPU load
+    # would be a silent secret leak, so we restrict fail-open to the one
+    # pattern that genuinely requires it.
+    if name in _BACKTRACKING_RISKY_SENSITIVE_PATTERNS:
+        regex_pattern = _regex_pattern_for(name)
+        if regex_pattern is not None:
+            try:
+                return regex_pattern.sub(
+                    repl, text, timeout=_SENSITIVE_MATCH_TIMEOUT_SECONDS
+                )
+            except TimeoutError:
+                if name not in _SENSITIVE_TIMEOUT_WARNED:
+                    _SENSITIVE_TIMEOUT_WARNED.add(name)
+                    logger.warning(
+                        "LCM sensitive redaction %r timed out after %.3gs; leaving "
+                        "span unredacted for this input",
+                        name,
+                        _SENSITIVE_MATCH_TIMEOUT_SECONDS,
+                    )
+                return _redact_private_key_blocks(text)
+        elif name == "private_key":
+            return _redact_private_key_blocks(text)
+    return _SENSITIVE_PATTERN_CATALOG[name].sub(repl, text)
+
+
+
+
+def _redact_private_key_blocks(text: str) -> str:
+    """Redact PEM private-key blocks with a linear scanner.
+
+    This keeps large valid keys protected even when the optional ``regex``
+    package is unavailable, without running the stdlib DOTALL private-key
+    pattern over a pathological multi-MB input. Unmatched BEGIN headers are
+    left intact; there is no complete key block to redact.
+    """
+    if "private key-----" not in text.lower():
+        return text
+    parts: list[str] = []
+    cursor = 0
+    changed = False
+    while True:
+        begin = _PRIVATE_KEY_BEGIN_RE.search(text, cursor)
+        if begin is None:
+            parts.append(text[cursor:])
+            break
+        end = _PRIVATE_KEY_END_RE.search(text, begin.end())
+        if end is None:
+            parts.append(text[cursor:])
+            break
+        block_end = end.end()
+        secret = text[begin.start():block_end]
+        parts.append(text[cursor:begin.start()])
+        parts.append(_sensitive_placeholder("private_key", secret))
+        cursor = block_end
+        changed = True
+    return "".join(parts) if changed else text
+
+
+def _is_wrapped_base64_line(line: str) -> bool:
+    stripped = line.strip("\r\n")
+    return (
+        len(stripped) >= _WRAPPED_BASE64_MIN_LINE_CHARS
+        and _BASE64_LINE_ALPHABET_RE.fullmatch(stripped) is not None
+    )
+
+
+def _is_wrapped_base64_terminal_line(line: str) -> bool:
+    stripped = line.strip("\r\n")
+    return (
+        _WRAPPED_BASE64_MIN_TERMINAL_LINE_CHARS
+        <= len(stripped)
+        < _WRAPPED_BASE64_MIN_LINE_CHARS
+        and len(stripped) % 4 == 0
+        and _BASE64_LINE_ALPHABET_RE.fullmatch(stripped) is not None
+    )
+
+
+def _looks_like_hex_hash_inventory(payload: str) -> bool:
+    """Return True for newline inventories of hex digests, not base64 payloads."""
+    lines = [line.strip() for line in payload.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return False
+    digest_lengths = {40, 56, 64, 96, 128}
+    return all(
+        len(line) in digest_lengths and re.fullmatch(r"[0-9a-fA-F]+", line) is not None
+        for line in lines
+    )
+
+
+def _iter_wrapped_base64_blocks(text: str):
+    """Yield (start, end, payload) for line-wrapped base64 blocks.
+
+    Implemented as a line scanner instead of a wide regex so long
+    base64-alphabet single lines that are not actually wrapped do not trigger
+    repeated failed block matches.
+    """
+    offset = 0
+    block_start: int | None = None
+    block_parts: list[str] = []
+    block_end = 0
+
+    def finish_block():
+        nonlocal block_start, block_parts, block_end
+        if block_start is not None and block_parts:
+            payload = "".join(block_parts)
+            start, end = block_start, block_end
+            block_start = None
+            block_parts = []
+            block_end = 0
+            if not _looks_like_hex_hash_inventory(payload) and looks_like_long_base64(payload):
+                return (start, end, payload)
+        block_start = None
+        block_parts = []
+        block_end = 0
+        return None
+
+    for line in text.splitlines(keepends=True):
+        line_start = offset
+        offset += len(line)
+        if _is_wrapped_base64_line(line) or (
+            block_start is not None
+            and block_parts
+            and _is_wrapped_base64_terminal_line(line)
+        ):
+            if block_start is None:
+                block_start = line_start
+            block_parts.append(line)
+            block_end = offset
+            continue
+        block = finish_block()
+        if block is not None:
+            yield block
+    block = finish_block()
+    if block is not None:
+        yield block
+
+
+def _replace_wrapped_base64_blocks(text: str, replace) -> str:
+    chunks: list[str] = []
+    cursor = 0
+    changed = False
+    for start, end, payload in _iter_wrapped_base64_blocks(text):
+        chunks.append(text[cursor:start])
+        chunks.append(replace(payload))
+        cursor = end
+        changed = True
+    if not changed:
+        return text
+    chunks.append(text[cursor:])
+    return "".join(chunks)
+
 
 def is_externalized_ingest_placeholder(text: str) -> bool:
     return isinstance(text, str) and bool(_INGEST_PLACEHOLDER_RE.fullmatch(text.strip()))
+
+
+def _is_unrecoverable_tool_truncation_marker(text: str | None) -> bool:
+    return isinstance(text, str) and bool(_UNRECOVERABLE_TRUNCATION_RE.search(text))
+
+
+def _expected_persisted_output_chars(text: str | None) -> int | None:
+    if not isinstance(text, str):
+        return None
+    match = _PERSISTED_OUTPUT_CHAR_COUNT_RE.search(text)
+    if not match:
+        return None
+    try:
+        return int(match.group("count").replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _persisted_output_preview_prefix(text: str | None) -> str | None:
+    if not isinstance(text, str):
+        return None
+    match = _PERSISTED_OUTPUT_PREVIEW_RE.search(text.strip())
+    if not match:
+        return None
+    preview = match.group("preview")
+    if preview.endswith("\r\n..."):
+        preview = preview[: -len("\r\n...")]
+    elif preview.endswith("\n..."):
+        preview = preview[: -len("\n...")]
+    return preview
+
+
+def _persisted_output_preview_prefix_digest(text: str | None) -> str | None:
+    preview_prefix = _persisted_output_preview_prefix(text)
+    if not preview_prefix:
+        return None
+    return hashlib.sha256(
+        preview_prefix.encode("utf-8", errors="surrogatepass")
+    ).hexdigest()
+
+
+def _persisted_output_inline_preview_sha256(text: str | None) -> str | None:
+    if not isinstance(text, str):
+        return None
+    match = _PERSISTED_OUTPUT_INLINE_PREVIEW_SHA256_RE.search(text)
+    if not match:
+        return None
+    return match.group("sha256")
+
+
+def _inline_persisted_output_generation_metadata(text: str | None) -> dict[str, int] | None:
+    if not isinstance(text, str):
+        return None
+    match = _PERSISTED_OUTPUT_INLINE_GENERATION_RE.search(text)
+    if not match:
+        return None
+    try:
+        return {
+            "size": int(match.group("size")),
+            "mtime_ns": int(match.group("mtime_ns")),
+            "ctime_ns": int(match.group("ctime_ns")),
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+def _has_inline_persisted_output_generation_metadata(text: str | None) -> bool:
+    return _inline_persisted_output_generation_metadata(text) is not None
+
+
+def _persisted_output_marker_identity_digest(text: str | None) -> str | None:
+    return _persisted_output_inline_preview_sha256(text) or _persisted_output_preview_prefix_digest(text)
+
+
+def _has_lossy_sensitive_redaction(text: str | None) -> bool:
+    if not isinstance(text, str) or _SENSITIVE_PLACEHOLDER_PREFIX not in text:
+        return False
+    for match in re.finditer(r"\[LCM sensitive redaction: (?P<body>[^\]]+)\]", text):
+        body = match.group("body")
+        fields = {
+            key: value
+            for key, value in re.findall(r"([A-Za-z0-9_]+)=([^;]+)", body)
+        }
+        if fields.get("name") == "password_assignment" and "sha256" not in fields:
+            return True
+    return False
+
+
+def _persisted_output_saved_path(text: str | None) -> str | None:
+    if not isinstance(text, str):
+        return None
+    match = _PERSISTED_OUTPUT_SAVED_TO_RE.search(text.strip())
+    if not match:
+        return None
+    raw_path = match.group("path").strip()
+    if not raw_path or "\x00" in raw_path:
+        return None
+    return raw_path
+
+
+def _safe_temp_hermes_results_file(path: Path) -> Path | None:
+    if not path.is_absolute() or path.name in {"", ".", ".."}:
+        return None
+    parent = path.parent
+    if parent.name != _HERMES_RESULTS_DIRNAME:
+        return None
+    try:
+        expected_parent = (Path(tempfile.gettempdir()) / _HERMES_RESULTS_DIRNAME).resolve()
+        parent_is_valid_dir = parent.exists() and parent.is_dir() and not parent.is_symlink()
+        if not parent_is_valid_dir or parent.resolve() != expected_parent:
+            return None
+        return expected_parent / path.name
+    except OSError:
+        return None
+
+
+def _is_hermes_persisted_output_marker(text: str | None) -> bool:
+    if not isinstance(text, str):
+        return False
+    marker = text.strip()
+    return (
+        marker.startswith(_PERSISTED_OUTPUT_TAG)
+        and marker.endswith(_PERSISTED_OUTPUT_CLOSING_TAG)
+        and _expected_persisted_output_chars(marker) is not None
+        and _PERSISTED_OUTPUT_SAVED_TO_RE.search(marker) is not None
+    )
+
+
+def _stat_generation_metadata(stats: os.stat_result) -> dict[str, int]:
+    return {
+        "size": int(stats.st_size),
+        "mtime_ns": int(stats.st_mtime_ns),
+        "ctime_ns": int(stats.st_ctime_ns),
+    }
+
+
+def _read_regular_file_no_symlink(path: Path) -> tuple[str, dict[str, int]] | None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    fd: int | None = None
+    try:
+        lstat_result = os.lstat(str(path))
+        if not stat.S_ISREG(lstat_result.st_mode):
+            return None
+        if lstat_result.st_size > _MAX_RECOVERED_PERSISTED_OUTPUT_BYTES:
+            return None
+        fd = os.open(str(path), flags)
+        stats_before = os.fstat(fd)
+        if not stat.S_ISREG(stats_before.st_mode):
+            return None
+        if stats_before.st_size > _MAX_RECOVERED_PERSISTED_OUTPUT_BYTES:
+            return None
+        with os.fdopen(fd, "rb") as handle:
+            fd = None
+            raw = handle.read()
+            stats_after = os.fstat(handle.fileno())
+        if _stat_generation_metadata(stats_before) != _stat_generation_metadata(stats_after):
+            return None
+        return raw.decode("utf-8"), _stat_generation_metadata(stats_after)
+    except (OSError, UnicodeDecodeError):
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def recover_hermes_persisted_output_with_file_stat(text: str | None) -> tuple[str, dict[str, int]] | None:
+    """Recover Hermes host `<persisted-output>` content when the backing file is safe.
+
+    Recovery is intentionally conservative: the marker must include Hermes'
+    character count, the file path must be an absolute basename under a
+    `hermes-results` temp directory, the target must be a regular non-symlink
+    file, and the recovered character count must match the marker. If any check
+    fails, callers should keep the marker/preview instead of claiming lossless
+    recovery from an unsafe or stale file.
+    """
+    if not isinstance(text, str) or not _is_hermes_persisted_output_marker(text):
+        return None
+    expected_chars = _expected_persisted_output_chars(text)
+    if expected_chars is None:
+        return None
+    raw_path = _persisted_output_saved_path(text)
+    if raw_path is None:
+        return None
+    path = Path(raw_path)
+    safe_path = _safe_temp_hermes_results_file(path)
+    if safe_path is None:
+        return None
+    recovered_with_stat = _read_regular_file_no_symlink(safe_path)
+    if recovered_with_stat is None:
+        return None
+    recovered, file_stat = recovered_with_stat
+    if len(recovered) != expected_chars:
+        return None
+    preview_prefix = _persisted_output_preview_prefix(text)
+    if not preview_prefix or not recovered.startswith(preview_prefix):
+        return None
+    return recovered, file_stat
+
+
+def recover_hermes_persisted_output(text: str | None) -> str | None:
+    recovered_with_stat = recover_hermes_persisted_output_with_file_stat(text)
+    if recovered_with_stat is None:
+        return None
+    recovered, _file_stat = recovered_with_stat
+    return recovered
+
+
+def _add_inline_persisted_output_generation_metadata(text: str, file_stat: dict[str, int] | None) -> str:
+    if not file_stat or not isinstance(text, str) or "</persisted-output>" not in text:
+        return text
+    generation = (
+        "[LCM persisted-output file generation: "
+        f"size={file_stat['size']}; "
+        f"mtime_ns={file_stat['mtime_ns']}; "
+        f"ctime_ns={file_stat['ctime_ns']}]"
+    )
+    if generation in text:
+        return text
+    return text.replace("</persisted-output>", f"{generation}\n</persisted-output>", 1)
+
+
+def _add_inline_persisted_output_identity_metadata(text: str, preview_sha256: str | None) -> str:
+    if (
+        not isinstance(text, str)
+        or "</persisted-output>" not in text
+        or not isinstance(preview_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", preview_sha256)
+    ):
+        return text
+    if _has_lossy_sensitive_redaction(text) or _persisted_output_inline_preview_sha256(text):
+        return text
+    identity = f"[LCM persisted-output marker identity: preview_sha256={preview_sha256}]"
+    return text.replace("</persisted-output>", f"{identity}\n</persisted-output>", 1)
 
 
 def contains_data_uri_base64(text: str) -> bool:
@@ -160,7 +652,14 @@ def contains_data_uri_base64(text: str) -> bool:
 def contains_long_base64_run(text: str, *, min_chars: int = _GENERIC_BASE64_MIN_CHARS) -> bool:
     if not isinstance(text, str) or len(text) < min_chars:
         return False
-    return any(looks_like_long_base64(match.group(1), min_chars=min_chars) for match in _BASE64_RUN_RE.finditer(text))
+    if any(looks_like_long_base64(match.group(1), min_chars=min_chars) for match in _BASE64_RUN_RE.finditer(text)):
+        return True
+    # Also catch line-wrapped base64 blocks (MIME/PEM), which never form a
+    # single contiguous run.
+    return any(
+        looks_like_long_base64(payload, min_chars=min_chars)
+        for _start, _end, payload in _iter_wrapped_base64_blocks(text)
+    )
 
 
 def extract_ingest_externalized_refs(text: str) -> list[str]:
@@ -298,8 +797,11 @@ def redact_sensitive_text(text: str, config) -> str:
         return text
     protected = text
     for name in active_names:
-        pattern = _SENSITIVE_PATTERN_CATALOG[name]
-        protected = pattern.sub(lambda match, pattern_name=name: _redact_match(pattern_name, match), protected)
+        protected = _apply_sensitive_pattern(
+            name,
+            lambda match, pattern_name=name: _redact_match(pattern_name, match),
+            protected,
+        )
     return protected
 
 
@@ -559,8 +1061,12 @@ def looks_like_long_base64(text: str, *, min_chars: int = _GENERIC_BASE64_MIN_CH
         return False
     if not _BASE64_ALPHABET_RE.match(text):
         return False
-    base64_chars = sum(1 for ch in text if ch.isalnum() or ch in "+/=_-")
-    ratio = base64_chars / max(1, len(text))
+    # Compute the base64 density over the whitespace-stripped content, not the
+    # raw text: otherwise line-ending overhead sinks the ratio and canonical
+    # CRLF-wrapped MIME (76/78 = 0.974) and PEM (64/66 = 0.970) blocks fall
+    # below 0.98 and are wrongly left inline.
+    base64_chars = sum(1 for ch in compact if ch.isalnum() or ch in "+/=_-")
+    ratio = base64_chars / max(1, len(compact))
     if ratio < 0.98:
         return False
     # Require at least a bit of mixed alphabet so a long log line of one
@@ -632,7 +1138,21 @@ def _protect_payload_substrings(
             hermes_home=hermes_home,
         ) or payload
 
-    return _BASE64_RUN_RE.sub(replace_base64_run, protected)
+    protected = _BASE64_RUN_RE.sub(replace_base64_run, protected)
+
+    def replace_wrapped_base64(payload: str) -> str:
+        return _placeholder_for_payload(
+            payload,
+            role=role,
+            session_id=session_id,
+            field_path=field_path,
+            config=config,
+            hermes_home=hermes_home,
+        ) or payload
+
+    # Line-wrapped base64 (MIME/PEM) is not a single contiguous run; externalize
+    # it here too so it does not land inline in SQLite/FTS/WAL/backups.
+    return _replace_wrapped_base64_blocks(protected, replace_wrapped_base64)
 
 
 def _maybe_parse_json_string(text: str) -> Any | None:
@@ -845,20 +1365,102 @@ def protect_message_for_ingest(
     """
     msg = dict(message or {})
     role = str(msg.get("role") or "unknown")
+    raw_content = msg.get("content")
+    raw_normalized_content = normalize_content_value(raw_content)
     original_content = redact_sensitive_value(
-        msg.get("content"),
+        raw_content,
         config,
         parse_json_strings=False,
     )
     normalized_content = normalize_content_value(original_content)
+    recovered_with_stat = recover_hermes_persisted_output_with_file_stat(raw_normalized_content) if role == "tool" else None
+    recovered_file_stat = None
+    recovered_externalized = None
+    if recovered_with_stat is not None:
+        recovered_persisted_output, recovered_file_stat = recovered_with_stat
+        recovered_content = redact_sensitive_value(
+            recovered_persisted_output,
+            config,
+            parse_json_strings=False,
+        )
+        normalized_recovered_content = normalize_content_value(recovered_content)
+        if normalized_recovered_content:
+            persisted_output_source_path = _persisted_output_saved_path(raw_normalized_content)
+            persisted_output_preview_sha256 = _persisted_output_preview_prefix_digest(raw_normalized_content)
+            if _has_lossy_sensitive_redaction(normalized_content):
+                persisted_output_preview_sha256 = None
+            persisted_output_metadata = {
+                "persisted_output_source_path": persisted_output_source_path,
+                "persisted_output_expected_chars": _expected_persisted_output_chars(raw_normalized_content),
+                "persisted_output_redacted_preview_sha256": _persisted_output_preview_prefix_digest(normalized_content),
+                "persisted_output_file_size": recovered_file_stat["size"],
+                "persisted_output_file_mtime_ns": recovered_file_stat["mtime_ns"],
+                "persisted_output_file_ctime_ns": recovered_file_stat["ctime_ns"],
+            }
+            if persisted_output_preview_sha256:
+                persisted_output_metadata["persisted_output_preview_sha256"] = persisted_output_preview_sha256
+            recovered_externalized = maybe_externalize_payload(
+                normalized_recovered_content,
+                kind="tool_result",
+                tool_call_id=str(msg.get("tool_call_id") or ""),
+                session_id=session_id,
+                role=role,
+                config=config,
+                hermes_home=hermes_home,
+                force=True,
+                metadata=persisted_output_metadata,
+            )
+
+    # A host-side truncation marker without durable recovered storage is not
+    # lossless. Keep the marker/preview visible inline instead of hiding it
+    # behind an LCM externalized-payload ref that would look recoverable.
+    preserve_truncation_marker_inline = (
+        role == "tool"
+        and recovered_externalized is None
+        and isinstance(normalized_content, str)
+        and (
+            _is_hermes_persisted_output_marker(normalized_content)
+            or _is_unrecoverable_tool_truncation_marker(normalized_content)
+        )
+    )
 
     # Preserve the pre-existing opt-in large-output behavior on message content.
     # The always-on storage-boundary sanitizer below is a narrower safety net for
     # inline media/base64 substrings, including cases below the generic threshold
     # or when generic externalization is disabled.
     if normalized_content:
-        if is_externalized_ingest_placeholder(normalized_content) or is_externalized_placeholder(normalized_content):
+        if recovered_externalized:
+            msg["content"] = recovered_externalized["placeholder"]
+        elif (
+            is_externalized_ingest_placeholder(normalized_content)
+            or is_externalized_placeholder(normalized_content)
+        ):
             msg["content"] = original_content
+        elif preserve_truncation_marker_inline:
+            protected_content = _protect_value(
+                original_content,
+                role=role,
+                session_id=session_id,
+                field_path="content",
+                config=config,
+                hermes_home=hermes_home,
+                parse_json_strings=False,
+            )
+            if (
+                role == "tool"
+                and not bool(getattr(config, "large_output_externalization_enabled", True))
+                and _is_hermes_persisted_output_marker(raw_normalized_content)
+            ):
+                protected_content = _add_inline_persisted_output_identity_metadata(
+                    normalize_content_value(protected_content) or "",
+                    _persisted_output_marker_identity_digest(raw_normalized_content),
+                )
+            if recovered_with_stat is not None and _is_hermes_persisted_output_marker(normalized_content):
+                protected_content = _add_inline_persisted_output_generation_metadata(
+                    normalize_content_value(protected_content) or "",
+                    recovered_file_stat,
+                )
+            msg["content"] = protected_content
         else:
             reason = (
                 assistant_output_quarantine_reason(normalized_content)
@@ -1075,13 +1677,16 @@ def _is_escaped_placeholder_example(text: str, start: int) -> bool:
 
 
 def _is_quoted_placeholder_example(text: str, start: int) -> bool:
-    if not _is_inside_token_quote_span(text, start, '"'):
-        return False
-    quote = text.rfind('"', 0, start)
-    if quote < 0:
-        return False
-    context = text[max(0, quote - 80):quote]
-    return _looks_like_example_quote_context(context)
+    for quote_token in ('"', "'"):
+        if not _is_inside_token_quote_span(text, start, quote_token):
+            continue
+        quote = text.rfind(quote_token, 0, start)
+        if quote < 0:
+            continue
+        context = text[max(0, quote - 80):quote]
+        if _looks_like_example_quote_context(context):
+            return True
+    return False
 
 
 def _looks_like_json_container_string(text: str) -> bool:
@@ -1131,13 +1736,13 @@ def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) 
     if is_externalized_ingest_placeholder(stripped) or is_externalized_placeholder(stripped):
         return extract_all_externalized_payload_refs(stripped)
     if field == "tool_calls":
-        refs: list[str] = []
+        refs = _extract_unescaped_externalized_payload_refs(value, ignore_quoted_spans=True)
         parsed = _maybe_parse_json_string(value)
         if parsed is None:
             return refs
         for argument in _walk_tool_call_argument_values(parsed):
             if isinstance(argument, str):
-                _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(argument))
+                _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(argument, ignore_quoted_spans=True))
                 parsed_argument = _maybe_parse_json_string(argument)
                 if parsed_argument is not None:
                     for nested in _walk_string_values(parsed_argument):
