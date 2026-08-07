@@ -272,6 +272,40 @@ def test_repeated_crashes_escalates_on_many_crashes():
     assert diags[0].severity == "critical"
 
 
+def test_repeated_crashes_breaks_on_recovery_to_blocked():
+    # 2026-08-07 regression (t_c348a9f0): a card crashed several times, then
+    # RECOVERED — its worker ran clean and called kanban_block. Because the most
+    # recent outcome is a deliberate ``blocked`` (worker spawned + ran to a
+    # clean stop), the crash streak is broken and the card must NOT keep paging
+    # CRITICAL. A block is a clean termination for THIS rule, same as completed.
+    task = _task(status="triage", assignee="recovered")
+    runs = [
+        _run(outcome="crashed", run_id=1, error="bad model_override"),
+        _run(outcome="crashed", run_id=2, error="bad model_override"),
+        _run(outcome="crashed", run_id=3, error="bad model_override"),
+        _run(outcome="crashed", run_id=4, error="bad model_override"),
+        _run(outcome="blocked", run_id=5),
+    ]
+    assert kd.compute_task_diagnostics(task, [], runs) == []
+
+
+def test_repeated_crashes_still_fires_when_blocked_is_older_than_new_crashes():
+    # The break is TRAILING-only: a clean block that is NOT the most recent
+    # outcome must not suppress a fresh crash streak after it. Card recovered
+    # (blocked), was retried, and crashed again -> still a real incident.
+    task = _task(status="triage", assignee="regressed")
+    runs = [
+        _run(outcome="crashed", run_id=1),
+        _run(outcome="blocked", run_id=2),
+        _run(outcome="crashed", run_id=3, error="OOM"),
+        _run(outcome="crashed", run_id=4, error="OOM"),
+    ]
+    diags = kd.compute_task_diagnostics(task, [], runs)
+    assert len(diags) == 1
+    assert diags[0].kind == "repeated_crashes"
+    assert diags[0].data["consecutive_crashes"] == 2
+
+
 def test_failure_rules_exempt_terminal_statuses():
     # A manual done (dashboard drag) ends no run, so the trailing crash
     # streak survives in run history — but done means done: neither
