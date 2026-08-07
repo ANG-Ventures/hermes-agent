@@ -133,9 +133,7 @@ def _parse_branch_flag(value: Optional[str]) -> Optional[str]:
     return branch
 
 
-def _check_dispatcher_presence(
-    hermes_home: Optional[Path] = None,
-) -> tuple[bool, str]:
+def _check_dispatcher_presence() -> tuple[bool, str]:
     """Return ``(running, message)``.
 
     - ``running=True``: a gateway is alive for this HERMES_HOME and its
@@ -151,34 +149,23 @@ def _check_dispatcher_presence(
     probe itself errors, we return ``(True, "")`` so we don't spam
     false warnings (better to miss a warning than to cry wolf).
 
-    ``hermes_home`` scopes the probe to a named profile's directory. The
-    dashboard plugin API passes it because the dashboard backend process can
-    be running under a different HERMES_HOME than the profile the request
-    targets, which otherwise produced a "no gateway is running" warning
-    against a perfectly healthy profile gateway (#71211). CLI callers leave
-    it ``None`` and keep the existing process-level behavior.
+    NOTE (fork parity, 2026-08-06): upstream's version takes a
+    ``hermes_home`` param and probes via the ``resolve_gateway_liveness``
+    ladder — a symbol this fork's ``gateway.status`` does not have yet.
+    Commit 11cffc4d5 carried the upstream body across anyway, which made
+    the import fail on every call and the probe permanently silent (the
+    no-gateway / dispatch-off warnings never fired). Restored to the
+    fork's ``get_running_pid`` probe; the liveness-ladder enrichment
+    returns at the next upstream->fork parity merge.
     """
     try:
-        from gateway.status import resolve_gateway_liveness  # type: ignore
+        from gateway.status import get_running_pid  # type: ignore
     except Exception:
         return (True, "")  # can't probe — silent
     try:
-        # Same shared ladder the dashboard status endpoints use, so a
-        # PID-file-less (launch-service-managed) or cross-container gateway
-        # is not misreported as absent. use_cache=False: this is a one-shot
-        # CLI/create-time probe, not a polling loop, and it must observe the
-        # gateway's state right now rather than a cached snapshot.
-        liveness = resolve_gateway_liveness(
-            profile_dir=hermes_home, use_cache=False
-        )
+        pid = get_running_pid()
     except Exception:
         return (True, "")  # probe errored — silent
-    if liveness.probe_error:
-        # The resolver swallows per-rung failures so status endpoints never
-        # 500. This caller must still fail OPEN: an unreadable probe means
-        # "can't tell", not "no gateway", and warning on it cries wolf.
-        return (True, "")
-    pid = liveness.pid
 
     # Even if the gateway is up, dispatch_in_gateway may be off.
     try:
@@ -608,7 +595,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_edit.add_argument("task_id")
     p_edit.add_argument(
         "--result",
-        required=True,
+        default=None,
         help="Backfilled task result text for a done task",
     )
     p_edit.add_argument(
@@ -620,6 +607,22 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--metadata",
         default=None,
         help="JSON dict of structured facts to store on the latest completed run.",
+    )
+    p_edit.add_argument(
+        "--model",
+        default=None,
+        dest="model_override",
+        metavar="MODEL",
+        help="Set the per-task model override (passed to the worker as "
+             "`hermes -m MODEL`). Omitting --model leaves the existing "
+             "override untouched; use --clear-model to remove it.",
+    )
+    p_edit.add_argument(
+        "--clear-model",
+        action="store_true",
+        dest="clear_model",
+        help="Clear the per-task model override (revert to the assignee "
+             "profile default). Mutually exclusive with --model.",
     )
 
     p_block = sub.add_parser("block", help="Mark one or more tasks blocked")
@@ -1864,13 +1867,23 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
             conn, args.task_id,
             reason=getattr(args, "reason", None),
         )
+        task = kb.get_task(conn, args.task_id) if ok else None
     if not ok:
         print(
             f"cannot reclaim {args.task_id} (not running or unknown id)",
             file=sys.stderr,
         )
         return 1
-    print(f"Reclaimed {args.task_id}")
+    status = task.status if task else None
+    if status in ("blocked", "triage", "scheduled"):
+        # A reclaim releases the claim; it does not promote. Say so, or the
+        # operator assumes the card is queued and waits for a worker forever.
+        print(
+            f"Reclaimed {args.task_id} (status held at {status!r} — "
+            f"run 'hermes kanban unblock {args.task_id}' to re-queue it)"
+        )
+    else:
+        print(f"Reclaimed {args.task_id}" + (f" ({status})" if status else ""))
     return 0
 
 
@@ -2273,21 +2286,60 @@ def _cmd_edit(args: argparse.Namespace) -> int:
         except (ValueError, json.JSONDecodeError) as exc:
             print(f"kanban: --metadata: {exc}", file=sys.stderr)
             return 2
+
+    model_override = getattr(args, "model_override", None)
+    clear_model = bool(getattr(args, "clear_model", False))
+    if model_override is not None and clear_model:
+        print(
+            "kanban: --model and --clear-model are mutually exclusive",
+            file=sys.stderr,
+        )
+        return 2
+
+    # The result-backfill edit is only attempted when --result is given;
+    # --model / --clear-model are independent edits that apply to any task.
+    do_result = getattr(args, "result", None) is not None
+    do_model = model_override is not None or clear_model
+
+    if not do_result and not do_model:
+        print(
+            "kanban: nothing to edit (pass --result, --model, or --clear-model)",
+            file=sys.stderr,
+        )
+        return 2
+
+    rc = 0
     with kb.connect_closing() as conn:
-        if not kb.edit_completed_task_result(
-            conn,
-            args.task_id,
-            result=args.result,
-            summary=getattr(args, "summary", None),
-            metadata=metadata,
-        ):
-            print(
-                f"cannot edit {args.task_id} (unknown id or task is not done)",
-                file=sys.stderr,
-            )
-            return 1
-    print(f"Edited {args.task_id}")
-    return 0
+        if do_model:
+            # --clear-model writes NULL; --model X writes X literally. The
+            # None sentinel ("--model omitted") never reaches here.
+            new_model = None if clear_model else model_override
+            affected = kb.set_task_model(conn, args.task_id, new_model)
+            if affected == 0:
+                print(
+                    f"cannot set model on {args.task_id} (unknown id)",
+                    file=sys.stderr,
+                )
+                return 1
+            if clear_model:
+                print(f"Cleared model override on {args.task_id}")
+            else:
+                print(f"Set model override on {args.task_id}: {new_model}")
+        if do_result:
+            if not kb.edit_completed_task_result(
+                conn,
+                args.task_id,
+                result=args.result,
+                summary=getattr(args, "summary", None),
+                metadata=metadata,
+            ):
+                print(
+                    f"cannot edit {args.task_id} (unknown id or task is not done)",
+                    file=sys.stderr,
+                )
+                return 1
+            print(f"Edited {args.task_id}")
+    return rc
 
 
 def _cmd_block(args: argparse.Namespace) -> int:
@@ -2547,6 +2599,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "respawn_guarded": [
+                {"task_id": tid, "reason": reason}
+                for (tid, reason) in res.respawn_guarded
+            ],
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
         return 0
@@ -2586,6 +2642,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             print(
                 f"Deferred ({who} at per-profile cap, {current} running): {tid}"
             )
+    if res.respawn_guarded:
+        for tid, reason in res.respawn_guarded:
+            print(f"Deferred (respawn guard {reason}): {tid}")
     if res.skipped_nonspawnable:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
@@ -2809,10 +2868,14 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
         if kb.get_task(conn, args.task_id) is None:
             print(f"no such task: {args.task_id}", file=sys.stderr)
             return 1
+        # NOTE (fork parity, 2026-08-06): fork main's add_notify_sub predates
+        # the upstream chat_type param (11cffc4d5 adapted #80564 but missed
+        # dropping the kwarg at this call site — it was a guaranteed
+        # TypeError). --chat-type stays accepted for CLI interface parity;
+        # the enrichment reconnects at the next upstream->fork parity merge.
         kb.add_notify_sub(
             conn, task_id=args.task_id,
             platform=args.platform, chat_id=args.chat_id,
-            chat_type=args.chat_type,
             thread_id=args.thread_id, user_id=args.user_id,
             notifier_profile=args.notifier_profile or _profile_author(),
         )

@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 import urllib.error
 import urllib.request
@@ -124,6 +125,14 @@ def _cache_path() -> Path:
 
 def _fetch_manifest(url: str, timeout: float) -> dict[str, Any] | None:
     """HTTP GET the manifest URL and return a parsed dict, or None on failure."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        # Test-hermeticity gate: never hit the live catalog from a test run.
+        # Unit tests that exercise catalog behavior patch this function
+        # directly; everything else must fall back to the in-repo model
+        # lists instead of silently depending on whatever the deployed
+        # manifest contains that day (which reddened tests/hermes_cli/
+        # test_models.py when the manifest dropped a fixture id).
+        return None
     try:
         req = urllib.request.Request(
             url,
