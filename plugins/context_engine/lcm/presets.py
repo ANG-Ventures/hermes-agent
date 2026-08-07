@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field as dataclass_field
 import os
 from typing import Any, Mapping
+
+from .config import ENV_FIELD_SPECS
 
 
 @dataclass(frozen=True)
@@ -21,9 +23,9 @@ class LCMPreset:
     policy_path: str
     policy_version: str
     runtime_env: Mapping[str, Any]
-    unsupported_runtime_fields: Mapping[str, Any] = field(default_factory=dict)
+    unsupported_runtime_fields: Mapping[str, Any] = dataclass_field(default_factory=dict)
     applies_to: tuple[str, ...] = ()
-    provenance: Mapping[str, Any] = field(default_factory=dict)
+    provenance: Mapping[str, Any] = dataclass_field(default_factory=dict)
     notes: str = ""
 
     @property
@@ -31,21 +33,19 @@ class LCMPreset:
         return f"{self.name}@{self.policy_version}"
 
 
-_FIELD_ENV = {
-    "context_threshold": "LCM_CONTEXT_THRESHOLD",
-    "fresh_tail_count": "LCM_FRESH_TAIL_COUNT",
-    "leaf_chunk_tokens": "LCM_LEAF_CHUNK_TOKENS",
-    "condensation_fanin": "LCM_CONDENSATION_FANIN",
-    "incremental_max_depth": "LCM_INCREMENTAL_MAX_DEPTH",
-}
-
-_FIELD_PARSERS = {
-    "context_threshold": float,
-    "fresh_tail_count": int,
-    "leaf_chunk_tokens": int,
-    "condensation_fanin": int,
-    "incremental_max_depth": int,
-}
+# Fields a runtime preset may override. Their env var and parse type come from
+# the shared config field spec (config.ENV_FIELD_SPECS) so the mapping is not
+# duplicated between config parsing and preset dry-run.
+_PRESET_FIELDS = (
+    "context_threshold",
+    "fresh_tail_count",
+    "leaf_chunk_tokens",
+    "condensation_fanin",
+    "incremental_max_depth",
+)
+_ENV_SPEC_BY_FIELD = {spec.name: spec for spec in ENV_FIELD_SPECS}
+_FIELD_ENV = {name: _ENV_SPEC_BY_FIELD[name].env_key for name in _PRESET_FIELDS}
+_FIELD_PARSERS = {name: _ENV_SPEC_BY_FIELD[name].py_type for name in _PRESET_FIELDS}
 
 _CODEX_GPT_LONG_CONTEXT = LCMPreset(
     name="codex_gpt_long_context",
@@ -68,15 +68,25 @@ _CODEX_GPT_LONG_CONTEXT = LCMPreset(
     ),
     provenance={
         "benchmark_version": "2",
-        "fixture_suite": ["codex_pressure_probe:42:4:1000"],
+        "fixture_suite": [
+            "long_history_canaries",
+            "repeated_compaction_chatter",
+            "summary_timeout_probe",
+            "summary_refusal_probe",
+            "scrubbed_operator_coding_tool_heavy",
+            "scrubbed_operator_chatter_repeated_compaction",
+            "codex_pressure_probe:42:4:1000",
+            "spark_pressure_probe:42:4:1000",
+        ],
         "metric_summary": {
-            "score": 92.5,
-            "baseline_score": 72.5,
+            "score": 92.941,
+            "baseline_score": 82.941,
             "retrieval_canary_recall": 1.0,
-            "baseline_repeated_compaction_risk_count": 1,
+            "baseline_repeated_compaction_risk_count": 4,
             "candidate_repeated_compaction_risk_count": 0,
+            "candidate_min_post_compaction_headroom_tokens": 89_288,
         },
-        "evidence": "Merged #194 pressure smoke, benchmark-only candidate policy.",
+        "evidence": "Fresh-main deterministic suite with scrubbed operator-shape replays; aggregate export omits raw transcript content.",
     },
     notes=(
         "Benchmark-only candidate until the preset surface matures. "
@@ -105,17 +115,26 @@ _CODEX_SPARK_CONTEXT = LCMPreset(
     ),
     provenance={
         "benchmark_version": "2",
-        "fixture_suite": ["spark_pressure_probe:42:4:1000"],
+        "fixture_suite": [
+            "long_history_canaries",
+            "repeated_compaction_chatter",
+            "summary_timeout_probe",
+            "summary_refusal_probe",
+            "scrubbed_operator_coding_tool_heavy",
+            "scrubbed_operator_chatter_repeated_compaction",
+            "codex_pressure_probe:42:4:1000",
+            "spark_pressure_probe:42:4:1000",
+        ],
         "metric_summary": {
-            "score": 92.5,
-            "baseline_score": 72.5,
+            "score": 92.941,
+            "baseline_score": 82.941,
             "retrieval_canary_recall": 1.0,
-            "baseline_repeated_compaction_risk_count": 1,
+            "baseline_repeated_compaction_risk_count": 4,
             "candidate_repeated_compaction_risk_count": 0,
-            "candidate_min_post_compaction_headroom_tokens": 39_704,
-            "candidate_prompt_tokens_after": 56_296,
+            "candidate_min_post_compaction_headroom_tokens": 26_432,
+            "candidate_prompt_tokens_after": 69_568,
         },
-        "evidence": "Deterministic 128k pressure replay; 16-message tail avoided repeated compaction risk with 39,704 token headroom.",
+        "evidence": "Fresh-main deterministic suite with scrubbed operator-shape replays; Spark min headroom stayed above 25k while avoiding repeated-compaction risk.",
     },
     notes=(
         "Benchmark-only candidate for the 128k Codex Spark route. "
@@ -178,11 +197,54 @@ def _current_config_value(config: Any, field: str) -> Any:
     return getattr(config, field, "(unknown)")
 
 
+def preset_match_confidence(engine: Any, preset: LCMPreset | None = None) -> str:
+    """Return an honest confidence label for the dry-run recommendation."""
+
+    if preset is None:
+        return "none"
+    provider = str(getattr(engine, "provider", "") or "").strip().lower()
+    model = str(getattr(engine, "model", "") or "").strip().lower()
+    is_spark_route = "gpt-5.3-codex-spark" in model
+    if preset.name == "codex_spark_context":
+        if provider == "openai-codex" and is_spark_route:
+            return "benchmark-backed-route"
+        return "context-only"
+    if provider == "openai-codex" and not is_spark_route and ("codex" in model or "gpt-5" in model):
+        return "benchmark-backed-route"
+    return "context-only"
+
+
+def preset_confidence_reasons(engine: Any, preset: LCMPreset | None, reason: str) -> list[str]:
+    """Return concise operator-facing reasons for the confidence label."""
+
+    if preset is None:
+        return [reason]
+    provider = str(getattr(engine, "provider", "") or "").strip() or "(unknown)"
+    model = str(getattr(engine, "model", "") or "").strip() or "(unknown)"
+    metric_summary = dict(preset.provenance.get("metric_summary") or {})
+    reasons = [
+        reason,
+        f"provider={provider}; model={model}",
+        (
+            "benchmark evidence: "
+            f"score={metric_summary.get('score', '(unknown)')}, "
+            f"retrieval_canary_recall={metric_summary.get('retrieval_canary_recall', '(unknown)')}, "
+            f"repeated_compaction_risk_count={metric_summary.get('candidate_repeated_compaction_risk_count', '(unknown)')}"
+        ),
+        "dry-run only; explicit parseable LCM_* operator overrides are preserved",
+    ]
+    if preset_match_confidence(engine, preset) == "context-only":
+        reasons.append("provider/model family was not verified by host metadata; operator must confirm fit before applying env changes")
+    return reasons
+
+
 def preset_env_diff(
     preset: LCMPreset,
     config: Any,
     *,
     environ: Mapping[str, str] | None = None,
+    runtime_context_threshold: float | None = None,
+    runtime_context_threshold_source: str = "",
 ) -> list[str]:
     """Render env-var changes a preset would suggest without applying them."""
 
@@ -202,6 +264,16 @@ def preset_env_diff(
                 f"{env_var}={value} "
                 f"(invalid current value {raw} ignored by runtime; runtime value {current})"
             )
+        elif (
+            field == "context_threshold"
+            and runtime_context_threshold_source == "codex_gpt55_autoraise"
+            and runtime_context_threshold is not None
+            and float(runtime_context_threshold) >= float(value)
+        ):
+            lines.append(
+                f"{env_var}: keep runtime auto-raised value {runtime_context_threshold:g} "
+                f"(preset {value})"
+            )
         else:
             lines.append(f"{env_var}={value}")
     return lines
@@ -212,6 +284,8 @@ def _preset_dry_run_delta(
     config: Any,
     *,
     environ: Mapping[str, str] | None = None,
+    runtime_context_threshold: float | None = None,
+    runtime_context_threshold_source: str = "",
 ) -> list[dict[str, Any]]:
     """Return structured preset dry-run actions without mutating runtime state."""
 
@@ -237,6 +311,19 @@ def _preset_dry_run_delta(
                 "action": "replace_invalid",
                 "invalid_value": env.get(env_var, ""),
                 "current_value": current,
+                "preset_value": preset_value,
+            })
+        elif (
+            field == "context_threshold"
+            and runtime_context_threshold_source == "codex_gpt55_autoraise"
+            and runtime_context_threshold is not None
+            and float(runtime_context_threshold) >= float(preset_value)
+        ):
+            delta.append({
+                "field": field,
+                "env": env_var,
+                "action": "keep_runtime_autoraised",
+                "current_value": runtime_context_threshold,
                 "preset_value": preset_value,
             })
         else:
@@ -288,7 +375,8 @@ def preset_status_payload(
         "read_only": True,
         "runtime_mutation": False,
         "reason": reason,
-        "match_confidence": "context-only" if preset is not None else "none",
+        "match_confidence": preset_match_confidence(engine, preset),
+        "confidence_reasons": preset_confidence_reasons(engine, preset, reason),
         "suggested_preset": None,
         "provenance": {},
         "explicit_overrides": explicit_payload,
@@ -309,7 +397,13 @@ def preset_status_payload(
         "notes": preset.notes,
     }
     payload["provenance"] = dict(preset.provenance)
-    payload["dry_run_delta"] = _preset_dry_run_delta(preset, config, environ=env)
+    payload["dry_run_delta"] = _preset_dry_run_delta(
+        preset,
+        config,
+        environ=env,
+        runtime_context_threshold=getattr(engine, "context_threshold", None),
+        runtime_context_threshold_source=getattr(engine, "_context_threshold_source", ""),
+    )
     return payload
 
 

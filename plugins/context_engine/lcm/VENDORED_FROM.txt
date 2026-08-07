@@ -1,29 +1,104 @@
 Source: github.com/stephenschoettler/hermes-lcm
-Source commit: 03b74f84440be99164ce3e2cd929917bc9550bfe
-Source branch/date: main, 2026-06-13
-Source version: v0.16.2 (plugin.yaml version 0.16.2)
-Source staging path: ~/.hermes/worktrees/prd2v2-native-slimmer/staging/lcm-profile/plugins/hermes-lcm/
+Source commit: 10cbb78 (tag v0.21.0-rc2, "Merge pull request #511 from stephenschoettler/release/v0.21.0-rc2")
+Source branch/date: main, re-vendored 2026-08-06
+Source version: v0.21.0-rc2 (plugin.yaml version 0.21.0-rc2)
+Fork merge commit: 0c52504 on branch vendor/deployed-fork-base (Kyzcreig/hermes-lcm)
 Adopted surface: Kyzcreig/hermes-agent private fork, plugins/context_engine/lcm/
 Adopted package/module name: lcm (loader-safe directory for load_context_engine("lcm"))
 Upstream package/plugin identity preserved: hermes-lcm
 
-License: cleared for private fork use per PRD-6 LCM Context Engine Activation lines 4-6 and invariant I-7; upstream staging noted no LICENSE file, so public redistribution remains blocked unless a license grant is added.
-Ingest-audit verdict: PASS — existing staging provenance recorded 22 HIGH findings, all test/benchmark placeholder secrets; scary-non-test == 0.
-Prior smoke verdict: GO — 7/7 isolated in-process adoption smoke passed in docs/reports/hermes-lcm-adoption-smoke.md in the prd2v2-native-slimmer worktree.
+## 2026-08-06 RE-VENDOR: v0.16.2 -> v0.21.0-rc2
+
+NOTE ON THE PRIOR RECORD: the previous VENDORED_FROM.txt claimed v0.16.2 / 03b74f8 while
+pyproject.toml claimed 0.19.0. BOTH were wrong for the tree that was actually deployed. Measured
+ground truth at re-vendor time: the deployed tree was upstream **v0.16.2 base + ~2705 difflines of
+fork modifications + 1 fork-added module (storage_security.py)**. This file now records the real
+state; do not trust a bare version string again without diffing against the upstream tag.
+
+Motivating bug (why this re-vendor happened): BELOW-THRESHOLD FORCED COMPACTION. The 0.19-era gate
+was naive — `if replay_messages is not None and replay_messages != messages: return True` — so any
+turn where LCM externalized a large payload (e.g. an image/media message crossing the 12,000-char
+large_output_externalization_threshold_chars) made replay != messages and forced a FULL compaction
+regardless of token count. Observed live: a compaction at ~345,087 tokens against a 750,000
+threshold. Upstream v0.21 fixes this with the discriminating gate
+`_replay_diff_requests_ingest_cleanup` (compaction.py). VERIFIED POST-DEPLOY: engine.py's class body
+defines NEITHER should_compress_preflight NOR should_compress, so the CompactionMixin gate is
+authoritative and un-overridden.
+
+Upstream architecture change absorbed: LCMEngine was split into mixins —
+  LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin,
+            PlaceholderLedgerMixin, BypassMixin, ContextEngine)
+  new modules: compaction.py, reset_state.py, reconcile.py, aux_session.py,
+               placeholder_ledger.py, bypass.py, maintenance.py, message_analysis.py (+ many more)
+Module count: 23 -> 62.
+
+FORK SURFACE PRESERVED (do not "clean up" — each is deliberate):
+  - fail-open resilience (LCMFailOpenRecoveryError, _handle_fail_open_compression_exception):
+    compress DEGRADES (returns messages) instead of raising when raw tokens are below the context
+    limit. engine.py's compress() override now delegates to CompactionMixin via super() INSIDE that
+    fail-open wrapper.
+  - storage_security.py (fork-only module): RowCipher at-rest encryption + the `search_content`
+    plaintext FTS index column. The FTS5 external-content table indexes `search_content`, NOT
+    `content`, because `content` is ciphertext when encryption_enabled.
+  - #465 _merge_adjacent_assistant_messages (never upstreamed) — alternation-clean active context.
+  - fresh-tail token budgeting; P2 skew calibration; fork-only `retention_policy` doctor check.
+  - `_lcm_summary` marker key: DO NOT REMOVE. It looks write-only inside this plugin but the HOST
+    reads it at agent/compaction_stats.py (_LCM_SUMMARY_TAG) with a COMPACTION_STATS_TAG_MISSING
+    tripwire.
+
+FORK CODE DROPPED AS SUPERSEDED BY UPSTREAM (verified, not guessed):
+  - _compacted_replay_stored_tail_overlap: ReconcileMixin's _find_reconciled_cursor_for_store_tail
+    implements the same scaffold-evidence + stored-tail logic AND absorbed the fork's Greptile #107
+    refinements. Running BOTH double-counted and DROPPED genuinely-new messages.
+  - _coerce_ts: upstream's observed_at / observed_at_source / ingested_at columns separate host
+    arrival time from ingest time properly; the fork had overloaded `timestamp` itself.
+  - preserved-objective re-anchoring: upstream returns None on reaching a preserved-objective
+    scaffold (never promote derived context as current intent) — strictly more conservative, and it
+    closes a re-injection hole where a carried block's untrusted <active_memory> body was replayed.
+
+License: cleared for private fork use per PRD-6 LCM Context Engine Activation lines 4-6 and
+invariant I-7. Upstream NOW SHIPS A LICENSE FILE as of v0.21.0-rc2 (added since v0.16.2) — re-check
+its terms before any public redistribution.
+
+Acceptance evidence (2026-08-06):
+  - The deployed fork ships NO tests/, so upstream's own suite is the acceptance gate.
+  - Merged tree: 2772 passed / 21 failed. Pristine v0.21.0-rc2 baseline on this machine: 9 failed.
+  - Failure accounting by set arithmetic (comm -23 of failure lists, not eyeballing):
+    ZERO unexplained regressions. Remaining failures = shared-with-baseline environmental
+    + a rotating flaky wall-clock/deadline family (proved flaky: 3 consecutive runs of
+    test_embedding_provider.py failed 4, then 5, then 3 DIFFERENT members)
+    + 14 upstream tests that encode upstream designs this fork deliberately diverges from
+      (search_content FTS column, fail-open degrade-vs-reraise, fork-only retention_policy check,
+       #465 adjacent-assistant merge, _lcm_summary host tag).
+  - Live-data validation BEFORE deploy, against a read-only .backup snapshot of the real 3.6GB
+    production lcm.db (939,363 message rows): MessageStore opened in 0.8s with no migration stall,
+    schema_version 5 preserved, all 20 messages columns intact, FTS search returned real hits in
+    0.84s, LCMEngine constructed in 0.8s, lcm_doctor ran to completion and shut down clean.
+  - plugin.yaml <-> engine parity verified: 15 provides_tools == 15 get_tool_schemas() names, every
+    advertised tool IS dispatched by handle_tool_call, and every schema carries a top-level `name`
+    (the host wraps them itself and SKIPS pre-wrapped entries as nameless — issue #47707).
+
+Rollback:
+  - File backup: ~/.hermes/backups/lcm-predeploy-20260806-203727/lcm  (25 files, pre-deploy state)
+  - Git: the runtime repo tracks this directory. Pre-deploy runtime HEAD was
+    f7b7d89cb6cc6ec60492665cbc202fa0fe6fa818; `git checkout -- plugins/context_engine/lcm/` restores
+    the 25 tracked files (then delete the 37 newly-added untracked modules).
 
 PRD-6 I-10 upstream security-drift metadata:
   owner: Apollo
   cadence: quarterly, and before any LCM update
   source_repository: github.com/stephenschoettler/hermes-lcm
-  source_commit: 03b74f84440be99164ce3e2cd929917bc9550bfe
-  vendored_commit: 03b74f84440be99164ce3e2cd929917bc9550bfe
-  vendored_version: v0.16.2
-  ingest_audit_verdict: PASS
-  last_upstream_security_check: 2026-06-16
-  source_commit_checked: 03b74f84440be99164ce3e2cd929917bc9550bfe
-  checked_upstream_head: a744da693febf689f78fcb24ade70f04e1eb3e3e
-  checked_upstream_tag_v0.16.2: 963be17faed849a3848713bd1527153519dfd8dd
-  upstream_drift_since_source: 2 commits (eaddaba focus-topic derivation, a744da6 version 0.17.0 bump)
-  checked_by: Apollo (recorded by Daedalus during t00 vendoring)
-  verdict: WARN - upstream drift exists after the adopted v0.16.2 staging artifact; t00 intentionally keeps the PRD-pinned source and leaves update/no-update action to Apollo/t70.
-  next_check_due: 2026-09-16
+  source_commit: 10cbb78 (tag v0.21.0-rc2)
+  vendored_commit: 10cbb78
+  vendored_version: v0.21.0-rc2
+  fork_merge_commit: 0c52504
+  previous_vendored_version: v0.16.2 (source_commit 03b74f84440be99164ce3e2cd929917bc9550bfe)
+  ingest_audit_verdict: PASS (upstream tag, same repository as the prior audited source)
+  last_upstream_security_check: 2026-08-06
+  source_commit_checked: 10cbb78
+  upstream_tag_shas: v0.16.2=963be17 v0.17.0=10f4d9f v0.18.0=22d202e v0.19.0=998cc4b
+                     v0.20.0=2de06d3 v0.21.0-rc2=10cbb78
+  upstream_drift_since_source: 0 commits (vendored AT the v0.21.0-rc2 tag)
+  checked_by: Apollo
+  verdict: GO — re-vendored to the current upstream release candidate; drift closed.
+  next_check_due: 2026-11-06

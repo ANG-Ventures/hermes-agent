@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Mapping, Optional
 
 from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
+    ENGINE_PREFLIGHT_MAINTENANCE_STATUS_TEMPLATE,
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
@@ -1096,13 +1097,38 @@ def build_turn_context(
                     )
                     _wants_engine_preflight = False
             if _wants_engine_preflight:
+                _engine_name = getattr(
+                    _compressor, "name", type(_compressor).__name__
+                )
+                _engine_threshold = getattr(_compressor, "threshold_tokens", 0)
                 logger.info(
                     "Engine-driven preflight maintenance: %s requested "
                     "compress() at ~%s tokens (below %s threshold)",
-                    getattr(_compressor, "name", type(_compressor).__name__),
+                    _engine_name,
                     f"{_preflight_tokens:,}",
-                    f"{getattr(_compressor, 'threshold_tokens', 0):,}",
+                    f"{_engine_threshold:,}",
                 )
+                # Name the ARM that fired. Every other compaction path announces
+                # itself, so a below-threshold engine-driven compaction was the
+                # one event the user saw with no explanation — it reads as
+                # "why did it compact at 66%?". Say plainly that the engine
+                # asked, not token pressure.
+                _engine_preflight_status = automatic_compaction_status_message(
+                    _compressor,
+                    phase="engine_preflight_maintenance",
+                    default_message=(
+                        ENGINE_PREFLIGHT_MAINTENANCE_STATUS_TEMPLATE.format(
+                            engine=_engine_name,
+                            tokens=_preflight_tokens,
+                            threshold=_engine_threshold,
+                        )
+                    ),
+                    approx_tokens=_preflight_tokens,
+                    threshold_tokens=_engine_threshold,
+                    model=agent.model,
+                )
+                if _engine_preflight_status:
+                    agent._emit_status(_engine_preflight_status)
                 _engine_input = messages
                 messages, active_system_prompt = agent._compress_context(
                     messages, system_message, approx_tokens=_preflight_tokens,
