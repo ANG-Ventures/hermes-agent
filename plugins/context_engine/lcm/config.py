@@ -406,7 +406,6 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("deferred_maintenance_max_passes", "LCM_DEFERRED_MAINTENANCE_MAX_PASSES", int),
     _EnvFieldSpec("critical_budget_pressure_ratio", "LCM_CRITICAL_BUDGET_PRESSURE_RATIO", float),
     _EnvFieldSpec("threshold_full_sweep_enabled", "LCM_THRESHOLD_FULL_SWEEP_ENABLED", bool),
-    _EnvFieldSpec("maintenance_min_pressure_ratio", "LCM_MAINTENANCE_MIN_PRESSURE_RATIO", float),
     _EnvFieldSpec("summary_prefix_target_tokens", "LCM_SUMMARY_PREFIX_TARGET_TOKENS", int),
     _EnvFieldSpec("l2_budget_ratio", "LCM_L2_BUDGET_RATIO", float),
     _EnvFieldSpec("l3_truncate_tokens", "LCM_L3_TRUNCATE_TOKENS", int),
@@ -1012,6 +1011,12 @@ class LCMConfig:
         c.calibration_hard_frac = _float(
             "LCM_CALIBRATION_HARD_FRAC",
             _hermes_compression_float("calibration_hard_frac", c.calibration_hard_frac),
+        )
+        c.maintenance_min_pressure_ratio = _float(
+            "LCM_MAINTENANCE_MIN_PRESSURE_RATIO",
+            _hermes_compression_float(
+                "maintenance_min_pressure_ratio", c.maintenance_min_pressure_ratio
+            ),
         )
         # Upstream source-tracked summary_timeout_ms (computed default + provenance).
         c.summary_timeout_ms, source, warning = _parse_int_env_with_source(
