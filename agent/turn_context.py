@@ -745,6 +745,7 @@ def build_turn_context(
                 messages, active_system_prompt = agent._compress_context(
                     messages, system_message, approx_tokens=_idle_tokens,
                     task_id=effective_task_id,
+                    trigger_reason="idle_resume",
                 )
                 # ``_compress_context`` returns the INPUT list object when it
                 # skips (per-session lock held by another path, failure
@@ -1153,6 +1154,7 @@ def build_turn_context(
                 messages, active_system_prompt = agent._compress_context(
                     messages, system_message, approx_tokens=_preflight_tokens,
                     task_id=effective_task_id,
+                    trigger_reason="engine_preflight_maintenance",
                 )
                 # ``_compress_context`` returns the INPUT list object on every
                 # skip path (per-session lock held elsewhere, cooldown,

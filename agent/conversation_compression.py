@@ -1562,9 +1562,22 @@ def compress_context(
     # to tell this TRANSIENT, retryable failure apart from a genuine
     # nothing-to-compress no-op (both leave session_id unchanged). See #44794.
     persist_failed = False
+    # Attribution is load-bearing: a compaction whose cause is not recorded is a
+    # compaction nobody can explain later, which is exactly the class of bug that
+    # produced the 2026-08-07 "why did it compact at 46%?" incident. Every caller
+    # passes ``trigger_reason``; a missing one is a WIRING DEFECT in a new call
+    # site, so name it loudly in the log rather than letting it read as normal.
+    _trigger_label = (trigger_reason or "").strip() or "UNATTRIBUTED"
+    if _trigger_label == "UNATTRIBUTED":
+        logger.warning(
+            "context compression has no trigger_reason (session=%s) — a caller "
+            "is not passing one; every compaction must name its arm",
+            agent.session_id or "none",
+        )
     logger.info(
-        "context compression started: session=%s messages=%d tokens=~%s model=%s focus=%r",
-        agent.session_id or "none", _pre_msg_count,
+        "context compression started: session=%s trigger=%s messages=%d "
+        "tokens=~%s model=%s focus=%r",
+        agent.session_id or "none", _trigger_label, _pre_msg_count,
         f"{approx_tokens:,}" if approx_tokens else "unknown", agent.model,
         focus_topic,
     )
