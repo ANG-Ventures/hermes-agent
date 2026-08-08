@@ -610,15 +610,23 @@ class TestPrefetchServerRetainVisibility:
         provider._client = self._client_with_ops(["pending", "pending", "completed"])
         provider._client.arecall = AsyncMock(side_effect=_recall)
 
-        # fork-parity: the status poll is spaced by _RETAIN_OP_POLL_INTERVAL_S
-        # (0.5s in the runtime), so reaching the third "completed" status costs
-        # ~1.6s of real sleeping against the 5.0s join below — only ~3x margin.
-        # On a loaded CI runner (12 parallel workers) that margin is not enough
-        # and the join returns with the thread still sleeping, leaving
-        # order == [] (an ordering assertion failing for wall-clock reasons,
-        # not a behaviour regression). Collapse the poll spacing so the test
-        # measures the ORDER contract it names, not the scheduler.
+        # fork-parity: two independent wall-clock hazards made this test fail on
+        # CI's Linux runners (12 parallel workers) while passing on an idle mac:
+        #
+        #   1. The status poll is spaced by _RETAIN_OP_POLL_INTERVAL_S (0.5s in
+        #      the runtime), so reaching the third "completed" status costs ~1.6s
+        #      of real sleeping.
+        #   2. _wait_for_retains_drained is bounded by _prefetch_retain_drain_timeout,
+        #      which DEFAULTS TO 10.0s — twice the 5.0s join budget below. Under
+        #      load the prefetch thread can legitimately still be inside its own
+        #      (correct) wait when the join gives up, so the assertions then read
+        #      a thread that simply had not finished yet.
+        #
+        # Collapse the poll spacing AND bring the drain budget under the join so
+        # the test measures the ORDER contract it names rather than the scheduler.
+        # The runtime defaults are deliberately left alone — this is test pacing.
         provider._RETAIN_OP_POLL_INTERVAL_S = 0.001
+        provider._prefetch_retain_drain_timeout = 2.0
 
         provider.sync_turn("hello", "world")
         provider._retain_queue.join()

@@ -87,7 +87,16 @@ def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
         "else:\n"
         "    (results_dir / idx).write_text('OK', encoding='utf-8')\n"
         "    print('OK', flush=True)\n"
-        "    deadline = time.time() + 10\n"
+        # fork-parity: this inner budget must cover the DELAYED worker's 2.5s
+        # sleep plus six interpreter cold-starts. At 10s that leaves ~7.5s of
+        # real slack, which a loaded CI runner (12 parallel shards, each
+        # spawning its own subprocesses) exhausts: the winning worker raises
+        # 'timed out waiting for all workers', exits non-zero, and the parent's
+        # returncode assertion fails. Intermittent by nature -- it failed 3 of 4
+        # runs on this branch and passed the 4th. Widened to 30s; the invariant
+        # under test (exactly one OK) is unchanged and a genuine deadlock still
+        # fails, just later.
+        "    deadline = time.time() + 30\n"
         "    while len(list(results_dir.iterdir())) < worker_count:\n"
         "        if time.time() > deadline:\n"
         "            raise RuntimeError('timed out waiting for all workers to attempt acquire')\n"
@@ -123,7 +132,10 @@ def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
 
         outputs = []
         for worker in workers:
-            stdout, stderr = worker.communicate(timeout=10)
+            # fork-parity: sequential per-worker wait; the delayed worker
+            # alone burns 2.5s before it even attempts acquire. 10s is too
+            # tight under CI shard contention (see the inner deadline note).
+            stdout, stderr = worker.communicate(timeout=60)
             assert worker.returncode == 0, stderr
             outputs.append(stdout.strip())
     finally:
