@@ -116,6 +116,97 @@ def _compaction_reason_clause(
     return ""
 
 
+def _is_no_change_pass(
+    pre_messages: "int | None",
+    post_messages: "int | None",
+    pre_tokens: "int | None",
+    post_tokens: "int | None",
+) -> bool:
+    """Whether this pass folded nothing worth calling a compaction.
+
+    Fail-safe by construction: returns True ONLY when both axes are KNOWN and
+    both are flat. Anything unknown, ambiguous, or moving falls through to the
+    normal renderer — mislabeling real work as "nothing happened" is a worse
+    error than leaving the old headline in place.
+
+    Both axes are required. A pass can hold (or even grow) the message count
+    while genuinely shrinking tokens — folding N messages into one summary row
+    adds a row while removing most of the content — and that IS real work.
+    Only when neither axis moved is the "Context compacted" headline a lie.
+
+    The token side uses a 1% floor rather than strict equality because the
+    measured specimen shed 407 of 164,784 tokens (0.2%) purely from placeholder
+    substitution — nominal drift, not compaction.
+    """
+    try:
+        pre_m = int(pre_messages or 0)
+        post_m = int(post_messages or 0)
+        pre_t = int(pre_tokens or 0)
+        post_t = int(post_tokens or 0)
+    except (TypeError, ValueError):
+        return False
+    # Unknown on either axis => do not guess.
+    if pre_m <= 0 or post_m <= 0 or pre_t <= 0 or post_t <= 0:
+        return False
+    if post_m != pre_m:
+        # ANY change in the message count means the pass restructured the
+        # transcript: removal is obvious work, and growth is the summary-row
+        # signature (N messages folded into one summary appends a row). Only a
+        # byte-for-byte identical count can be a no-op. Being strict here also
+        # protects against call sites that pass the same post-compaction
+        # estimate for both token values, where the token axis reads flat for
+        # a pass that genuinely reduced context.
+        return False
+    if (pre_t - post_t) / pre_t > 0.01:
+        return False  # tokens dropped meaningfully — real work
+    return True
+
+
+def _format_no_change_close(
+    *,
+    engine_name: str,
+    pre_messages: "int | None",
+    post_messages: "int | None",
+    pre_tokens: "int | None",
+    post_tokens: "int | None",
+    status: "str | None" = None,
+) -> str:
+    """Close an ANNOUNCED pass that turned out to change nothing.
+
+    The pre-compaction banner fires before the work, so the user knows why the
+    turn paused. When the pass then produces no meaningful reduction the normal
+    stats renderer has nothing to report and returns None — which is honest
+    about not claiming a compaction, but leaves a "this may take a moment"
+    banner with no closing line. Measured 2026-08-08: 214 -> 214 messages in
+    171ms, and 4 of 21 compressions removed nothing.
+
+    Say so plainly instead. Announcing and then going silent is the confusing
+    outcome; announcing and then reporting "nothing to compact" is not.
+    """
+    try:
+        pre_m = int(pre_messages or 0)
+        post_m = int(post_messages or 0)
+    except (TypeError, ValueError):
+        pre_m = post_m = 0
+    engine = engine_name or "engine"
+    head = f"🗜️ {engine}: nothing to compact this pass"
+    if pre_m and post_m:
+        head += f"   ({pre_m} messages unchanged)" if pre_m == post_m else (
+            f"   ({pre_m} → {post_m} messages)"
+        )
+    detail = (
+        "   The pass ran and found no eligible backlog to fold, so context is "
+        "unchanged. No summary was generated and nothing was removed."
+    )
+    if status == "sanitized":
+        detail = (
+            "   The pass adopted a sanitized replay (an oversized payload was "
+            "moved to external storage) but folded no messages, so context is "
+            "otherwise unchanged."
+        )
+    return f"{head}\n{detail}"
+
+
 def _format_compaction_announce(
     engine_name: "str | None",
     status: "str | None",
@@ -157,6 +248,32 @@ def _format_compaction_announce(
             return None
         if not in_place and (not old_session_id or old_session_id == new_session_id):
             return None
+
+    # A pass that folded NOTHING must not claim "Context compacted". Measured
+    # 2026-08-08: a sanitize-only pass rendered
+    #   "🗜️ Context compacted: 214→214 messages · ~164K→~164K tokens"
+    # for a 171ms bookkeeping adoption that removed nothing — a false claim, and
+    # the repeat passes were then swallowed by the announce dedupe key, so the
+    # user saw a "this may take a moment" banner and never a closing line.
+    # Report the truth instead; the caller still gets exactly one line.
+    #
+    # AUTOMATIC passes only. Manual /compress has its own deliberate feedback
+    # path (manual_compression_feedback.py) and its own downstream contract —
+    # apps/desktop/e2e/session-compression-and-queue-stop.spec.ts asserts
+    # /Compressed|No changes from compression/ — so it is out of scope here.
+    # The reported bug was automatic maintenance passes narrating themselves
+    # dishonestly; widening past that would bend an unrelated contract.
+    if trigger_reason != "manual" and _is_no_change_pass(
+        old_messages, new_messages, pre_tokens, post_tokens
+    ):
+        return _format_no_change_close(
+            engine_name=engine_name or "engine",
+            pre_messages=old_messages,
+            post_messages=new_messages,
+            pre_tokens=pre_tokens,
+            post_tokens=post_tokens,
+            status=status,
+        )
 
     degraded = status in _DEGRADED_STATUSES
 
