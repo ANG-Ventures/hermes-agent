@@ -124,10 +124,15 @@ def _is_no_change_pass(
 ) -> bool:
     """Whether this pass folded nothing worth calling a compaction.
 
-    True when the message count did not drop AND tokens did not drop
-    meaningfully. Both axes are required: a pass can hold the message count
-    while genuinely shrinking tokens (tool-result pruning), and that IS real
-    work. Only when neither moved is the "Context compacted" headline a lie.
+    Fail-safe by construction: returns True ONLY when both axes are KNOWN and
+    both are flat. Anything unknown, ambiguous, or moving falls through to the
+    normal renderer — mislabeling real work as "nothing happened" is a worse
+    error than leaving the old headline in place.
+
+    Both axes are required. A pass can hold (or even grow) the message count
+    while genuinely shrinking tokens — folding N messages into one summary row
+    adds a row while removing most of the content — and that IS real work.
+    Only when neither axis moved is the "Context compacted" headline a lie.
 
     The token side uses a 1% floor rather than strict equality because the
     measured specimen shed 407 of 164,784 tokens (0.2%) purely from placeholder
@@ -140,11 +145,19 @@ def _is_no_change_pass(
         post_t = int(post_tokens or 0)
     except (TypeError, ValueError):
         return False
-    if pre_m <= 0 or post_m <= 0:
+    # Unknown on either axis => do not guess.
+    if pre_m <= 0 or post_m <= 0 or pre_t <= 0 or post_t <= 0:
         return False
-    if post_m < pre_m:
-        return False  # messages were removed — real work
-    if pre_t > 0 and post_t > 0 and (pre_t - post_t) / pre_t > 0.01:
+    if post_m != pre_m:
+        # ANY change in the message count means the pass restructured the
+        # transcript: removal is obvious work, and growth is the summary-row
+        # signature (N messages folded into one summary appends a row). Only a
+        # byte-for-byte identical count can be a no-op. Being strict here also
+        # protects against call sites that pass the same post-compaction
+        # estimate for both token values, where the token axis reads flat for
+        # a pass that genuinely reduced context.
+        return False
+    if (pre_t - post_t) / pre_t > 0.01:
         return False  # tokens dropped meaningfully — real work
     return True
 

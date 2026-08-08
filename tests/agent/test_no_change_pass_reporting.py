@@ -98,9 +98,13 @@ def test_the_measured_specimen_is_a_no_change_pass():
     assert _is_no_change_pass(214, 214, 164_784, 164_377) is True
 
 
-def test_growth_is_also_no_change():
-    """A pass that made things bigger certainly did not compact."""
-    assert _is_no_change_pass(214, 216, 164_784, 165_000) is True
+def test_message_growth_is_not_a_no_op():
+    """Growth is the summary-row signature (N folded into 1 appends a row).
+
+    Any change in the message count means the transcript was restructured, so
+    only an identical count can be a no-op.
+    """
+    assert _is_no_change_pass(214, 216, 164_784, 165_000) is False
 
 
 @pytest.mark.parametrize("pre_t,post_t,expected", [
@@ -117,6 +121,24 @@ def test_missing_counts_do_not_trigger_the_close():
     """Unknown counts must fall through to the normal renderer, not guess."""
     assert _is_no_change_pass(None, None, None, None) is False
     assert _is_no_change_pass(0, 0, 0, 0) is False
+
+
+def test_unknown_tokens_never_read_as_no_change():
+    """CI regression: 1 -> 2 messages with tokens absent is NOT a no-op.
+
+    Caught by tests/run_agent/test_413_compression.py. Folding messages into a
+    summary row can GROW the message count while shrinking content, so message
+    growth alone proves nothing. When the token axis is unknown the honest
+    answer is "I cannot tell" — fall through rather than claim nothing happened.
+    """
+    assert _is_no_change_pass(1, 2, None, None) is False
+    assert _is_no_change_pass(1, 2, 1_234, 0) is False
+    assert _is_no_change_pass(1, 2, 0, 509) is False
+
+
+def test_message_growth_with_a_token_drop_is_real_work():
+    """The summary-row signature: +1 message, big token reduction."""
+    assert _is_no_change_pass(1, 2, 1_234, 509) is False
 
 
 def test_garbage_counts_do_not_raise():
