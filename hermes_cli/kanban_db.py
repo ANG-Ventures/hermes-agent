@@ -134,6 +134,53 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# Link kinds on ``task_links``. A parent->child edge means one of two very
+# different things, and conflating them strands shipped work:
+#
+#   * ``blocks``       — a real dependency. The child cannot start until the
+#                        parent is done. This is the historical (and default)
+#                        meaning of every edge, so nothing silently un-gates.
+#   * ``derived-from`` — provenance only. The parent DISCOVERED or SPAWNED the
+#                        child (an audit, survey or investigation that filed
+#                        remediation work). The child is independently
+#                        dispatchable the moment it is defined and is NEVER
+#                        gated on the parent.
+#
+# The motivating incident (2026-08-08): a DEPLOY card was created as a child of
+# an "audit all 37 protocol fields" card to record where it came from. The audit
+# went to triage, so the deploy could never promote — a merged, green fix sat
+# undeployed because a research task had not finished. A DEPLOY must never be
+# gated on a DISCOVERY; the link was right, the edge type was wrong.
+LINK_KIND_BLOCKS = "blocks"
+LINK_KIND_DERIVED_FROM = "derived-from"
+VALID_LINK_KINDS = {LINK_KIND_BLOCKS, LINK_KIND_DERIVED_FROM}
+DEFAULT_LINK_KIND = LINK_KIND_BLOCKS
+
+
+def normalize_link_kind(kind: Optional[str]) -> str:
+    """Normalize a link kind, defaulting NULL/blank to ``blocks``.
+
+    Legacy rows predate the column and read back as NULL; they were created
+    under the gating semantics, so NULL must mean ``blocks``. Raises
+    ``ValueError`` on an unknown kind rather than silently degrading to a
+    non-gating edge.
+    """
+    if kind is None:
+        return DEFAULT_LINK_KIND
+    normalized = str(kind).strip().lower()
+    if not normalized:
+        return DEFAULT_LINK_KIND
+    # Accept the underscore spelling as an alias; the canonical stored form
+    # is the hyphenated one used by the CLI flag.
+    if normalized == "derived_from":
+        normalized = LINK_KIND_DERIVED_FROM
+    if normalized not in VALID_LINK_KINDS:
+        raise ValueError(
+            f"unknown link kind {kind!r}; expected one of "
+            f"{', '.join(sorted(VALID_LINK_KINDS))}"
+        )
+    return normalized
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -1310,6 +1357,13 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
     child_id   TEXT NOT NULL,
+    -- Edge semantics (VALID_LINK_KINDS). 'blocks' (the default) gates the
+    -- child on the parent finishing; 'derived-from' is provenance only and
+    -- never gates. Legacy rows are backfilled to 'blocks' by the additive
+    -- migration because they were created under gating semantics; every
+    -- scheduling query additionally COALESCEs NULL to 'blocks' so a
+    -- hand-edited DB can't silently un-gate a real dependency.
+    kind       TEXT NOT NULL DEFAULT 'blocks',
     PRIMARY KEY (parent_id, child_id)
 );
 
@@ -2484,6 +2538,30 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "run_id" not in ev_cols:
         _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
 
+    # task_links gained a ``kind`` column (blocks | derived-from). Every
+    # pre-existing edge was created under the single gating semantics, so the
+    # backfill must be 'blocks' — anything else would silently un-gate live
+    # dependencies. SQLite fills existing rows with the column DEFAULT on
+    # ``ADD COLUMN``, and the UPDATE covers a DB where the column was added
+    # without one. Guarded on table existence like ``kanban_notify_subs``
+    # below: this function also runs against partially-built schemas.
+    links_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_links'"
+    ).fetchone() is not None
+    if links_table_exists:
+        link_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_links)")
+        }
+        if "kind" not in link_cols:
+            _add_column_if_missing(
+                conn, "task_links", "kind",
+                f"kind TEXT NOT NULL DEFAULT '{DEFAULT_LINK_KIND}'",
+            )
+            conn.execute(
+                "UPDATE task_links SET kind = ? WHERE kind IS NULL OR kind = ''",
+                (DEFAULT_LINK_KIND,),
+            )
+
     # Same ordering rule as the additive ``tasks`` indexes above: create the
     # index after the additive column migration so legacy ``task_events``
     # tables don't fail during SCHEMA_SQL execution before ``run_id`` exists.
@@ -2874,6 +2952,7 @@ def create_task(
     tenant: Optional[str] = None,
     priority: int = 0,
     parents: Iterable[str] = (),
+    parents_kind: Optional[str] = None,
     triage: bool = False,
     idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None,
@@ -2897,6 +2976,12 @@ def create_task(
     If ``triage=True``, status is forced to ``triage`` regardless of
     parents — a specifier/triager is expected to promote the task to
     ``todo`` once the spec is fleshed out.
+
+    ``parents_kind`` sets the edge semantics for every parent link
+    (:data:`VALID_LINK_KINDS`, default ``blocks``). Pass
+    ``derived-from`` when the parent merely DISCOVERED this work — an
+    audit/survey/investigation filing remediation — so the new task is
+    independently dispatchable and never held on the parent finishing.
 
     If ``idempotency_key`` is provided and a non-archived task with the
     same key already exists, returns the existing task's id instead of
@@ -3041,6 +3126,9 @@ def create_task(
                 project_repo = str(project_obj.primary_path)
 
     parents = tuple(p for p in parents if p)
+    # Raise on a bad kind before any row is written, and resolve NULL to
+    # ``blocks`` so the status decision below reads one value.
+    parents_kind = normalize_link_kind(parents_kind)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -3146,14 +3234,17 @@ def create_task(
                         missing = _find_missing_parents(conn, parents)
                         if missing:
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-                        # If any parent is not yet done, we're todo.
-                        rows = conn.execute(
-                            "SELECT status FROM tasks WHERE id IN "
-                            "(" + ",".join("?" * len(parents)) + ")",
-                            parents,
-                        ).fetchall()
-                        if any(r["status"] != "done" for r in rows):
-                            task_status = "todo"
+                        # If any parent is not yet done, we're todo — but only
+                        # a 'blocks' edge gates. A 'derived-from' parent is
+                        # provenance, so the task stays immediately dispatchable.
+                        if parents_kind == LINK_KIND_BLOCKS:
+                            rows = conn.execute(
+                                "SELECT status FROM tasks WHERE id IN "
+                                "(" + ",".join("?" * len(parents)) + ")",
+                                parents,
+                            ).fetchall()
+                            if any(r["status"] != "done" for r in rows):
+                                task_status = "todo"
                 # Even in triage mode we still need to validate parent ids
                 # so the eventual link rows don't dangle.
                 if triage and parents:
@@ -3219,8 +3310,9 @@ def create_task(
                 )
                 for pid in parents:
                     conn.execute(
-                        "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
-                        (pid, task_id),
+                        "INSERT OR IGNORE INTO task_links "
+                        "(parent_id, child_id, kind) VALUES (?, ?, ?)",
+                        (pid, task_id, parents_kind),
                     )
                 _append_event(
                     conn,
@@ -3230,6 +3322,7 @@ def create_task(
                         "assignee": assignee,
                         "status": task_status,
                         "parents": list(parents),
+                        "parents_kind": parents_kind if parents else None,
                         "tenant": tenant,
                         "workspace_kind": workspace_kind,
                         "workspace_path": workspace_path,
@@ -3469,34 +3562,64 @@ def set_reasoning_effort(
 # Links
 # ---------------------------------------------------------------------------
 
-def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+def link_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    kind: Optional[str] = None,
+) -> None:
+    """Add a parent->child edge.
+
+    ``kind`` defaults to ``blocks`` (the historical behaviour): the child is
+    held in ``todo`` until the parent is ``done``. ``derived-from`` records
+    provenance WITHOUT gating — use it when a discovery task (audit, survey,
+    investigation) spawned the child, so remediation stays independently
+    dispatchable.
+
+    Re-linking an existing pair UPDATES its kind, so an edge created with the
+    wrong semantics can be corrected in place instead of unlink/relink.
+    """
+    kind = normalize_link_kind(kind)
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
         missing = _find_missing_parents(conn, [parent_id, child_id])
         if missing:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
+        # Cycle detection walks BOTH kinds: a provenance edge still describes
+        # the graph the dashboard renders, and an A->B->A loop there is a
+        # data-modelling error regardless of whether it can deadlock.
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(
                 f"linking {parent_id} -> {child_id} would create a cycle"
             )
         conn.execute(
-            "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
-            (parent_id, child_id),
+            "INSERT INTO task_links (parent_id, child_id, kind) VALUES (?, ?, ?) "
+            "ON CONFLICT(parent_id, child_id) DO UPDATE SET kind = excluded.kind",
+            (parent_id, child_id, kind),
         )
-        # If child was ready but parent is not yet done, demote child to todo.
-        parent_status = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (parent_id,)
-        ).fetchone()["status"]
-        if parent_status != "done":
-            conn.execute(
-                "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
-                (child_id,),
-            )
+        # Only a blocking edge demotes a ready child. A derived-from edge is
+        # provenance: the child stays dispatchable.
+        if kind == LINK_KIND_BLOCKS:
+            # If child was ready but parent is not yet done, demote child to todo.
+            parent_status = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (parent_id,)
+            ).fetchone()["status"]
+            if parent_status != "done":
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+                    (child_id,),
+                )
         _append_event(
             conn, child_id, "linked",
-            {"parent": parent_id, "child": child_id},
+            {"parent": parent_id, "child": child_id, "kind": kind},
         )
+    if kind != LINK_KIND_BLOCKS:
+        # Converting a blocking edge to provenance can release a child that
+        # was parked in ``todo`` solely because of it. Matches the contract of
+        # ``unlink_tasks``: don't make the operator wait for a dispatcher tick.
+        recompute_ready(conn)
 
 
 def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
@@ -3551,12 +3674,37 @@ def parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     return [r["parent_id"] for r in rows]
 
 
+def parent_links(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, str]]:
+    """Return ``(parent_id, kind)`` for every parent edge, ordered by id.
+
+    The companion to :func:`parent_ids` for callers that must distinguish a
+    gating ``blocks`` parent from a provenance-only ``derived-from`` one —
+    without it there is no way to observe an existing edge's semantics.
+    """
+    rows = conn.execute(
+        "SELECT parent_id, kind FROM task_links WHERE child_id = ? "
+        "ORDER BY parent_id",
+        (task_id,),
+    ).fetchall()
+    return [(r["parent_id"], normalize_link_kind(r["kind"])) for r in rows]
+
+
 def child_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     rows = conn.execute(
         "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
         (task_id,),
     ).fetchall()
     return [r["child_id"] for r in rows]
+
+
+def child_links(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, str]]:
+    """Return ``(child_id, kind)`` for every child edge, ordered by id."""
+    rows = conn.execute(
+        "SELECT child_id, kind FROM task_links WHERE parent_id = ? "
+        "ORDER BY child_id",
+        (task_id,),
+    ).fetchall()
+    return [(r["child_id"], normalize_link_kind(r["kind"])) for r in rows]
 
 
 def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Optional[str]]]:
@@ -4099,8 +4247,8 @@ def recompute_ready(
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
-                (task_id,),
+                "WHERE l.child_id = ? AND COALESCE(l.kind, ?) = ?",
+                (task_id, DEFAULT_LINK_KIND, LINK_KIND_BLOCKS),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
                 if cur_status == "blocked":
@@ -4166,8 +4314,9 @@ def claim_task(
         undone = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
-            (task_id,),
+            "WHERE l.child_id = ? AND COALESCE(l.kind, ?) = ? "
+            "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            (task_id, DEFAULT_LINK_KIND, LINK_KIND_BLOCKS),
         ).fetchone()
         if undone:
             conn.execute(
@@ -5806,8 +5955,8 @@ def promote_task(
         parents = conn.execute(
             "SELECT t.id, t.status FROM tasks t "
             "JOIN task_links l ON l.parent_id = t.id "
-            "WHERE l.child_id = ?",
-            (task_id,),
+            "WHERE l.child_id = ? AND COALESCE(l.kind, ?) = ?",
+            (task_id, DEFAULT_LINK_KIND, LINK_KIND_BLOCKS),
         ).fetchall()
         unsatisfied = [
             p["id"] for p in parents
@@ -5877,8 +6026,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         undone_parents = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
-            (task_id,),
+            "WHERE l.child_id = ? AND COALESCE(l.kind, ?) = ? "
+            "AND p.status != 'done' LIMIT 1",
+            (task_id, DEFAULT_LINK_KIND, LINK_KIND_BLOCKS),
         ).fetchone()
         new_status = "todo" if undone_parents else "ready"
         # NOTE: deliberately does NOT touch ``block_recurrences`` or

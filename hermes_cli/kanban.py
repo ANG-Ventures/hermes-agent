@@ -56,6 +56,19 @@ def _fmt_task_line(t: kb.Task) -> str:
     return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
 
 
+def _fmt_links(links: list[tuple[str, str]]) -> str:
+    """Render ``(id, kind)`` edges, annotating the non-gating ones.
+
+    A plain id means the default ``blocks`` edge (what every edge used to
+    be), so existing output is unchanged; a provenance edge is tagged so an
+    operator can see at a glance that it does NOT gate dispatch.
+    """
+    return ", ".join(
+        ident if kind == kb.LINK_KIND_BLOCKS else f"{ident} ({kind})"
+        for ident, kind in links
+    )
+
+
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     return {
         "id": t.id,
@@ -321,6 +334,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
+    p_create.add_argument(
+        "--parent-kind", default=kb.DEFAULT_LINK_KIND,
+        choices=sorted(kb.VALID_LINK_KINDS),
+        help=(
+            "Semantics for every --parent edge. 'blocks' (default) holds this "
+            "task until the parents are done; 'derived-from' records that a "
+            "parent discovered/spawned this work without gating it."
+        ),
+    )
     p_create.add_argument("--workspace", default="scratch",
                           help="scratch | worktree | worktree:<path> | dir:<path> "
                                "(default: scratch)")
@@ -563,6 +585,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_link = sub.add_parser("link", help="Add a parent->child dependency")
     p_link.add_argument("parent_id")
     p_link.add_argument("child_id")
+    p_link.add_argument(
+        "--kind", default=kb.DEFAULT_LINK_KIND,
+        choices=sorted(kb.VALID_LINK_KINDS),
+        help=(
+            "Edge semantics. 'blocks' (default) holds the child until the "
+            "parent is done. 'derived-from' records provenance only — the "
+            "parent discovered/spawned the child, which stays independently "
+            "dispatchable. A DEPLOY must never be gated on a DISCOVERY."
+        ),
+    )
     p_unlink = sub.add_parser("unlink", help="Remove a parent->child dependency")
     p_unlink.add_argument("parent_id")
     p_unlink.add_argument("child_id")
@@ -1567,6 +1599,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             tenant=args.tenant,
             priority=args.priority,
             parents=tuple(args.parent or ()),
+            parents_kind=getattr(args, "parent_kind", None),
             triage=bool(getattr(args, "triage", False)),
             idempotency_key=getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime,
@@ -1696,8 +1729,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
             return 1
         comments = kb.list_comments(conn, args.task_id)
         events = kb.list_events(conn, args.task_id)
-        parents = kb.parent_ids(conn, args.task_id)
-        children = kb.child_ids(conn, args.task_id)
+        parent_links = kb.parent_links(conn, args.task_id)
+        child_links = kb.child_links(conn, args.task_id)
+        parents = [pid for pid, _kind in parent_links]
+        children = [cid for cid, _kind in child_links]
         runs = kb.list_runs(conn, args.task_id, **rsk)
         # Workers hand off via ``task_runs.summary``; ``tasks.result`` is left NULL unless the caller explicitly passed
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
@@ -1710,6 +1745,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "latest_summary": latest_summary,
             "parents": parents,
             "children": children,
+            "parent_links": [
+                {"id": pid, "kind": kind} for pid, kind in parent_links
+            ],
+            "child_links": [
+                {"id": cid, "kind": kind} for cid, kind in child_links
+            ],
             "comments": [
                 {"author": c.author, "body": c.body, "created_at": c.created_at}
                 for c in comments
@@ -1806,9 +1847,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.completed_at:
         print(f"  completed: {_fmt_ts(task.completed_at)}")
     if parents:
-        print(f"  parents:   {', '.join(parents)}")
+        print(f"  parents:   {_fmt_links(parent_links)}")
     if children:
-        print(f"  children:  {', '.join(children)}")
+        print(f"  children:  {_fmt_links(child_links)}")
     if task.body:
         print()
         print("Body:")
@@ -2112,9 +2153,10 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
 
 
 def _cmd_link(args: argparse.Namespace) -> int:
+    kind = getattr(args, "kind", None) or kb.DEFAULT_LINK_KIND
     with kb.connect_closing() as conn:
-        kb.link_tasks(conn, args.parent_id, args.child_id)
-    print(f"Linked {args.parent_id} -> {args.child_id}")
+        kb.link_tasks(conn, args.parent_id, args.child_id, kind=kind)
+    print(f"Linked {args.parent_id} -> {args.child_id} ({kind})")
     return 0
 
 
