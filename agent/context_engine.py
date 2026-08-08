@@ -43,6 +43,13 @@ _MEMORY_CONTEXT_TRUNCATION_MARKER = "\n...[memory provider context truncated]...
 ENGINE_PREFLIGHT_MAINTENANCE_PHASE = "engine_preflight_maintenance"
 _BELOW_THRESHOLD_ANNOUNCE_KEY = "announce_below_threshold_compaction"
 
+# How far the provider's real prompt_tokens may exceed the local rough estimate
+# before it is worth a warning. The skew calibration clamps its ratio to <= 1.0
+# (never scale UP), so an under-counting estimate is otherwise recorded as a
+# clean ratio=1.000 and leaves no trace. 1.15 keeps ordinary estimator noise
+# quiet while catching the structural gaps (a measured session ran 1.38x).
+_UNDERCOUNT_WARN_RATIO = 1.15
+
 
 def _below_threshold_announce_enabled() -> bool:
     """Whether below-threshold compactions announce themselves (default True).
@@ -367,7 +374,23 @@ class ContextEngine(ABC):
         last_rough = getattr(self, "_last_rough_sent", 0)
         if real_prompt_tokens and real_prompt_tokens > 0 and last_rough > 0:
             self.rough_at_last_real = last_rough
-            ratio = min(1.0, real_prompt_tokens / last_rough)
+            raw_ratio = real_prompt_tokens / last_rough
+            ratio = min(1.0, raw_ratio)
+            # The clamp above is deliberate: never scale the estimate UP, because
+            # an over-eager scale-up compacts early and often. But it also means a
+            # session where the estimate UNDER-counts records a reassuring
+            # ratio=1.000 while the real prompt is materially larger than the
+            # number the threshold gate compared against — i.e. compaction fires
+            # LATE, in the direction of a provider overflow. That is exactly the
+            # case that must not stay invisible, so surface it separately from the
+            # (clamped) value the calibration uses.
+            if raw_ratio > _UNDERCOUNT_WARN_RATIO:
+                logger.warning(
+                    "COMPACTION_ESTIMATE_UNDERCOUNT rough=%d real=%d raw_ratio=%.3f "
+                    "(clamped to 1.000 for calibration) — the local estimate reads "
+                    "%.2fx LOW, so threshold compaction fires later than intended",
+                    last_rough, int(real_prompt_tokens), raw_ratio, raw_ratio,
+                )
             hist = getattr(self, "_recent_skews", None)
             if hist is None:
                 hist = []
