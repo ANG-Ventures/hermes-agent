@@ -651,8 +651,21 @@ def _run_agent_tool_execution_middleware(
                 return
             begin_execution(callback)
 
-        block_message = scope_block
+        # ── Block ladder ────────────────────────────────────────────────
+        # parity NOTE (upstream->fork merge 2026-08-08): the fork-only
+        # budget-grace gate (Guard D-core) used to live in each dispatcher.
+        # Upstream moved plugin/scope/guardrail blocking here, so the gate is
+        # re-grafted at the head of THIS ladder — the single choke point both
+        # dispatchers funnel through — rather than duplicated per path. It
+        # runs FIRST so an exhausted-budget turn is refused before any plugin
+        # hook or guardrail bookkeeping observes the call.
+        block_message = pre_tool_block_from_builtin_gate(
+            agent, function_name, scope_block
+        )
         block_error_type = "tool_scope_block"
+        if block_message is not None:
+            block_error_type = block_message["error_type"]
+            block_message = block_message["message"]
         if block_message is None:
             block_error_type = "plugin_block"
 
@@ -692,7 +705,18 @@ def _run_agent_tool_execution_middleware(
             _advance_start_order()
             state["blocked"] = True
             if block_message is not None:
-                result = json.dumps({"error": block_message}, ensure_ascii=False)
+                # parity NOTE (upstream->fork merge 2026-08-08): the fork's
+                # budget-grace refusal must carry the budget_grace_block
+                # metadata key (asserted by test_block_message_and_result_shape
+                # and test_grace_block_result_metadata_key_present_in_real_dispatch),
+                # so it uses the shared grace_block_result() rather than the
+                # generic {"error": ...} envelope every other block emits.
+                if block_error_type == "budget_grace_block":
+                    result = grace_block_result(function_name)
+                else:
+                    result = json.dumps(
+                        {"error": block_message}, ensure_ascii=False
+                    )
                 error_type = block_error_type
                 error_message = block_message
             else:
@@ -972,141 +996,26 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             )
             continue
 
-        # Reset nudge counters only for a structurally valid invocation.
-        if function_name == "memory":
-            agent._turns_since_memory = 0
-        elif function_name == "skill_manage":
-            agent._iters_since_skill = 0
-
         # Tool Search unwrap: expose the underlying tool to downstream hooks
         # while preserving the original transcript tool_call_id.
-        function_name, function_args, _ts_scope_block, _ts_scope_message = (
-            resolve_tool_search_unwrap(agent, function_name, function_args)
+        #
+        # parity NOTE (upstream->fork merge 2026-08-08): the fork used to run
+        # request middleware and the whole block ladder (grace gate, scope,
+        # plugin, guardrail) HERE, in the parse loop. Upstream relocated all of
+        # it into the shared dispatch choke point
+        # (_run_agent_tool_execution_middleware -> _authorized_dispatch), which
+        # both dispatchers already funnel through. Keeping both copies is what
+        # broke this merge: the fork ladder referenced a middleware_trace this
+        # loop no longer produces (UnboundLocalError) and appended a second
+        # entry per tool call. The fork-only budget-grace gate is re-grafted
+        # into that choke point instead of being duplicated back here.
+        function_name, function_args, _ts_scope_block = (
+            resolve_tool_search_unwrap(agent, function_name, function_args)[:3]
         )
 
         parsed_calls.append(
             (tool_call, function_name, function_args, [], None, _ts_scope_block)
         )
-
-        # ── Block evaluation (BEFORE checkpoint preflight) ───────────
-        # We must know whether the tool will execute before touching
-        # checkpoint state (dedup slot, real snapshots).
-        block_result = None
-        blocked_by_guardrail = False
-        _builtin_block = pre_tool_block_from_builtin_gate(agent, function_name, _ts_scope_message)
-        if _builtin_block is not None and _builtin_block["error_type"] == "budget_grace_block":
-            # Budget-grace turn: deny-by-default side-effect lockout (Guard
-            # D-core). Only the read-only allowlist may run; everything else —
-            # including unknown/future tools — is refused so a runaway worker
-            # cannot take a side-effecting action past its exhausted budget.
-            # Use the shared grace_block_result() so the model-visible JSON
-            # carries the budget_grace_block metadata key (the shape asserted in
-            # test_block_message_and_result_shape) — both dispatch paths emit the
-            # same structure. middleware_trace mirrors the sibling block paths.
-            _grace_msg = _builtin_block["message"]
-            block_result = grace_block_result(function_name)
-            _emit_terminal_post_tool_call(
-                agent,
-                function_name=function_name,
-                function_args=function_args,
-                result=block_result,
-                effective_task_id=effective_task_id,
-                tool_call_id=getattr(tool_call, "id", "") or "",
-                status="blocked",
-                error_type="budget_grace_block",
-                error_message=_grace_msg,
-                middleware_trace=list(middleware_trace),
-            )
-        elif _builtin_block is not None and _builtin_block["error_type"] == "tool_scope_block":
-            # Out-of-scope tool_call: reject before hooks/guardrails/dispatch.
-            block_result = _ts_scope_block
-            _emit_terminal_post_tool_call(
-                agent,
-                function_name=function_name,
-                function_args=function_args,
-                result=block_result,
-                effective_task_id=effective_task_id,
-                tool_call_id=getattr(tool_call, "id", "") or "",
-                status="blocked",
-                error_type="tool_scope_block",
-                error_message=_ts_scope_block,
-                middleware_trace=list(middleware_trace),
-            )
-        else:
-            try:
-                from hermes_cli.plugins import resolve_pre_tool_block
-                block_message = resolve_pre_tool_block(
-                    function_name,
-                    function_args,
-                    task_id=effective_task_id or "",
-                    session_id=getattr(agent, "session_id", "") or "",
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    middleware_trace=list(middleware_trace),
-                )
-            except Exception:
-                block_message = None
-
-            if block_message is not None:
-                block_result = json.dumps({"error": block_message}, ensure_ascii=False)
-                _emit_terminal_post_tool_call(
-                    agent,
-                    function_name=function_name,
-                    function_args=function_args,
-                    result=block_result,
-                    effective_task_id=effective_task_id,
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    status="blocked",
-                    error_type="plugin_block",
-                    error_message=block_message,
-                    middleware_trace=list(middleware_trace),
-                )
-            else:
-                guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
-                if not guardrail_decision.allows_execution:
-                    block_result = agent._guardrail_block_result(guardrail_decision)
-                    blocked_by_guardrail = True
-                    _emit_terminal_post_tool_call(
-                        agent,
-                        function_name=function_name,
-                        function_args=function_args,
-                        result=block_result,
-                        effective_task_id=effective_task_id,
-                        tool_call_id=getattr(tool_call, "id", "") or "",
-                        status="blocked",
-                        error_type="guardrail_block",
-                        error_message=getattr(guardrail_decision, "message", None) or "Tool blocked by guardrail policy",
-                        middleware_trace=list(middleware_trace),
-                    )
-
-        # ── Checkpoint preflight (only for tools that will execute) ──
-        if block_result is None:
-            # Checkpoint for file-mutating tools
-            if function_name in {"write_file", "patch"} and agent._checkpoint_mgr.enabled:
-                try:
-                    _ensure_file_checkpoint(
-                        agent,
-                        function_name,
-                        function_args,
-                        effective_task_id,
-                    )
-                except Exception:
-                    pass
-
-            # Checkpoint before destructive terminal commands
-            if function_name == "terminal" and agent._checkpoint_mgr.enabled:
-                try:
-                    cmd = function_args.get("command", "")
-                    if _is_destructive_command(cmd):
-                        cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
-                        agent._checkpoint_mgr.ensure_checkpoint(
-                            cwd, f"before terminal: {cmd[:60]}"
-                        )
-                except Exception:
-                    pass
-
-        parsed_calls.append((tool_call, function_name, function_args, middleware_trace, block_result, blocked_by_guardrail))
 
     # ── Logging / callbacks ──────────────────────────────────────────
     tool_names_str = ", ".join(name for _, name, _, _, _, _ in parsed_calls)
@@ -1930,166 +1839,19 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         middleware_trace: list[dict[str, Any]] = []
         _execution_blocked = False
         _execution_dispatched = False
-        function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
-            agent,
-            function_name=function_name,
-            function_args=function_args,
-            effective_task_id=effective_task_id,
-            tool_call_id=getattr(tool_call, "id", "") or "",
-        )
-
-        # Check plugin hooks for a block directive before executing.
-        _block_msg: Optional[str] = None
-        _block_error_type = "plugin_block"
-        _builtin_block = pre_tool_block_from_builtin_gate(agent, function_name, _ts_scope_block)
-        if _builtin_block is not None and _builtin_block["error_type"] == "budget_grace_block":
-            # Budget-grace turn: deny-by-default side-effect lockout (Guard
-            # D-core). Mirror of the concurrent path — only read-only tools run.
-            _block_msg = _builtin_block["message"]
-            _block_error_type = "budget_grace_block"
-        elif _builtin_block is not None and _builtin_block["error_type"] == "tool_scope_block":
-            _block_msg = _builtin_block["message"]
-            _block_error_type = "tool_scope_block"
-        else:
-            try:
-                from hermes_cli.plugins import resolve_pre_tool_block
-                _block_msg = resolve_pre_tool_block(
-                    function_name,
-                    function_args,
-                    task_id=effective_task_id or "",
-                    session_id=getattr(agent, "session_id", "") or "",
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    middleware_trace=list(middleware_trace),
-                )
-            except Exception:
-                pass
-
-        _guardrail_block_decision: ToolGuardrailDecision | None = None
-        if _block_msg is None:
-            guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
-            if not guardrail_decision.allows_execution:
-                _guardrail_block_decision = guardrail_decision
-
-        _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
-
-        if _execution_blocked:
-            # Tool blocked by plugin or guardrail policy — skip counters,
-            # callbacks, checkpointing, activity mutation, and real execution.
-            pass
-        # Reset nudge counters when the relevant tool is actually used
-        elif function_name == "memory":
-            agent._turns_since_memory = 0
-        elif function_name == "skill_manage":
-            agent._iters_since_skill = 0
-
-        if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
-            display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
-            args_str = json.dumps(display_args, ensure_ascii=False)
-            if agent.verbose_logging:
-                print(f"  📞 Tool {i}: {function_name}({list(display_args.keys())})")
-                print(agent._wrap_verbose("Args: ", json.dumps(display_args, indent=2, ensure_ascii=False)))
-            else:
-                args_preview = args_str[:agent.log_prefix_chars] + "..." if len(args_str) > agent.log_prefix_chars else args_str
-                print(f"  📞 Tool {i}: {function_name}({list(function_args.keys())}) - {args_preview}")
-
-        if not _execution_blocked:
-            agent._current_tool = function_name
-            agent._touch_activity(f"executing tool: {function_name}")
-
-        # Set activity callback for long-running tool execution (terminal
-        # commands, etc.) so the gateway's inactivity monitor doesn't kill
-        # the agent while a command is running.
-        if not _execution_blocked:
-            try:
-                from tools.environments.base import set_activity_callback
-                set_activity_callback(agent._touch_activity)
-            except Exception:
-                pass
-
-        if not _execution_blocked and agent.tool_progress_callback:
-            try:
-                display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
-                preview = _build_tool_preview(function_name, display_args)
-                agent.tool_progress_callback("tool.started", function_name, preview, display_args)
-            except Exception as cb_err:
-                logging.debug(f"Tool progress callback error: {cb_err}")
-
-        if not _execution_blocked and agent.tool_start_callback:
-            try:
-                display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
-                agent.tool_start_callback(tool_call.id, function_name, display_args)
-            except Exception as cb_err:
-                logging.debug(f"Tool start callback error: {cb_err}")
-
-        # Checkpoint: snapshot working dir before file-mutating tools
-        if not _execution_blocked and function_name in {"write_file", "patch"} and agent._checkpoint_mgr.enabled:
-            try:
-                _ensure_file_checkpoint(
-                    agent,
-                    function_name,
-                    function_args,
-                    effective_task_id,
-                )
-            except Exception:
-                pass  # never block tool execution
-
-        # Checkpoint before destructive terminal commands
-        if not _execution_blocked and function_name == "terminal" and agent._checkpoint_mgr.enabled:
-            try:
-                cmd = function_args.get("command", "")
-                if _is_destructive_command(cmd):
-                    cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
-                    agent._checkpoint_mgr.ensure_checkpoint(
-                        cwd, f"before terminal: {cmd[:60]}"
-                    )
-            except Exception:
-                pass  # never block tool execution
-
+        # parity NOTE (upstream->fork merge 2026-08-08): the fork ran the block
+        # ladder (grace gate / scope / plugin / guardrail) AND the user-visible
+        # + checkpoint preflight inline here. Upstream moved both into the
+        # shared dispatch choke point (_run_agent_tool_execution_middleware ->
+        # _authorized_dispatch / _begin_tool_execution) that every arm below
+        # already calls, so keeping this copy fired each callback and each
+        # checkpoint TWICE per tool (caught by
+        # test_sequential_tool_callbacks_fire_in_order). The fork-only
+        # budget-grace gate is re-grafted at the head of that shared ladder,
+        # so it still governs this path — see _authorized_dispatch.
         tool_start_time = time.time()
 
-        if _block_msg is not None:
-            # Tool blocked by plugin policy — return error without executing.
-            # The budget-grace block uses the shared grace_block_result() so its
-            # model-visible JSON carries the budget_grace_block metadata key
-            # (the shape asserted in test_block_message_and_result_shape) — the
-            # same structure the concurrent path emits.
-            if _block_error_type == "budget_grace_block":
-                function_result = grace_block_result(function_name)
-            else:
-                function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
-            tool_duration = 0.0
-            _emit_terminal_post_tool_call(
-                agent,
-                function_name=function_name,
-                function_args=function_args,
-                result=function_result,
-                effective_task_id=effective_task_id,
-                tool_call_id=getattr(tool_call, "id", "") or "",
-                status="blocked",
-                error_type=_block_error_type,
-                error_message=_block_msg,
-                middleware_trace=list(middleware_trace),
-            )
-        elif _guardrail_block_decision is not None:
-            # Tool blocked by tool-loop guardrail — synthesize exactly one
-            # tool result for the original tool_call_id without executing.
-            function_result = agent._guardrail_block_result(_guardrail_block_decision)
-            tool_duration = 0.0
-            _emit_terminal_post_tool_call(
-                agent,
-                function_name=function_name,
-                function_args=function_args,
-                result=function_result,
-                effective_task_id=effective_task_id,
-                tool_call_id=getattr(tool_call, "id", "") or "",
-                status="blocked",
-                error_type="guardrail_block",
-                error_message=getattr(_guardrail_block_decision, "message", None) or "Tool blocked by guardrail policy",
-                middleware_trace=list(middleware_trace),
-            )
-        elif function_name == "todo":
+        if function_name == "todo":
             def _execute(next_args: dict) -> Any:
                 from tools.todo_tool import todo_tool as _todo_tool
                 return _todo_tool(
