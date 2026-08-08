@@ -126,20 +126,6 @@ def test_tests_skipped_while_python_unchanged_passes():
             id="js-tests-frontend",
         ),
         pytest.param(
-            "e2e-desktop",
-            {"python": "true"},
-            {},
-            "detect.outputs.python == 'true' or detect.outputs.frontend == 'true'",
-            id="desktop-python",
-        ),
-        pytest.param(
-            "e2e-desktop",
-            {"frontend": "true"},
-            {},
-            "detect.outputs.python == 'true' or detect.outputs.frontend == 'true'",
-            id="desktop-frontend",
-        ),
-        pytest.param(
             "docs-site",
             {"site": "true"},
             {},
@@ -273,3 +259,67 @@ def test_main_preserves_compact_needs_json_shape(tmp_path, monkeypatch, capsys):
     expected = 'needs-json={"detect": "success", "tests": "skipped"}'
     assert capsys.readouterr().out.splitlines()[0] == expected
     assert output.read_text(encoding="utf-8") == expected + "\n"
+
+
+# ── e2e-desktop: intentionally disabled (upstream #76627) ────────────────────
+
+
+def test_e2e_desktop_may_skip_while_intentionally_disabled():
+    """The classifier must NOT require a job ci.yml deliberately disables.
+
+    ci.yml guards e2e-desktop with `false &&` because this branch takes
+    upstream's apps/desktop verbatim and inherits their broken Playwright
+    suite (#76627: the mock-backend Electron window never gets a title).
+    Requiring it here would fail the umbrella gate on a skip we chose.
+    """
+    assert evaluate_needs(_needs(results={"e2e-desktop": "skipped"})) == {}
+    assert (
+        evaluate_needs(
+            _needs(results={"e2e-desktop": "skipped"}, detect_outputs={"python": "true"})
+        )
+        == {}
+    )
+
+
+def test_e2e_desktop_failure_still_fails_the_gate():
+    """Exempt from 'must run' is NOT exempt from 'must not fail'.
+
+    If someone re-enables the job and it goes red, the umbrella must still
+    catch it -- the exemption only forgives `skipped`, never `failure`.
+    """
+    violations = evaluate_needs(_needs(results={"e2e-desktop": "failure"}))
+    assert set(violations) == {"e2e-desktop"}
+    assert "failure" in violations["e2e-desktop"]
+
+
+def test_e2e_desktop_exemption_matches_the_ci_yml_guard():
+    """Pin the exemption to the ACTUAL ci.yml guard so the two cannot drift.
+
+    The failure mode this prevents: upstream fixes #76627, someone deletes the
+    `false &&` in ci.yml, and the classifier exemption silently survives -- so
+    a genuinely-skipped required job stops being noticed again, which is the
+    exact hole #476 closed. If the guard is gone, the exemption must go too.
+    """
+    import re
+    from pathlib import Path
+
+    ci_yml = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml"
+    text = ci_yml.read_text(encoding="utf-8")
+
+    block = re.search(r"^  e2e-desktop:\n(?:.*\n)*?^    uses:", text, re.MULTILINE)
+    assert block, "could not locate the e2e-desktop job block in ci.yml"
+    disabled_in_ci = "false &&" in block.group(0)
+
+    exempt_in_classifier = (
+        evaluate_needs(
+            _needs(results={"e2e-desktop": "skipped"}, detect_outputs={"python": "true"})
+        )
+        == {}
+    )
+
+    assert disabled_in_ci == exempt_in_classifier, (
+        "ci.yml and evaluate_needs.py disagree about e2e-desktop: "
+        f"disabled_in_ci={disabled_in_ci} exempt_in_classifier={exempt_in_classifier}. "
+        "Re-enabling the job means deleting BOTH the `false &&` guard and the "
+        "classifier exemption."
+    )

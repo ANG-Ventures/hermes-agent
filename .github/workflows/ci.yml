@@ -106,21 +106,31 @@ jobs:
   e2e-desktop:
     name: Desktop E2E
     needs: detect
-    # fork-parity: upstream TEMPORARILY DISABLED this job on Aug 2 2026 with a
-    # `false &&` guard (their #76627 — the mock-backend Electron window never
-    # got a title after the Aug 1 engines/npm churn, so every spec failed
-    # regardless of the diff). That disable arrived here through the parity
-    # merge, but it is NOT true on this fork: `Desktop E2E / Playwright E2E
-    # (Linux)` concludes `success` on fork/main today (verified on runs
-    # 31280614721 and 31278775668).
+    # python_prod (not python): the Playwright suite exercises the built app
+    # + `hermes serve` backend, which never import anything under tests/.
     #
-    # Keeping upstream's guard would have skipped the job while
-    # scripts/ci/evaluate_needs.py (fork-only, from #476) still requires it to
-    # run — which is exactly the "classifier inconsistency" that failed the
-    # umbrella gate. Two correct halves, contradictory when merged. Restore the
-    # fork's condition rather than weakening the gate: a job that is required
-    # must actually run, and here it both runs and passes.
-    if: needs.detect.outputs.python == 'true' || needs.detect.outputs.frontend == 'true'
+    # ⛔ DISABLED — upstream's guard (their #76627: after the Aug 1 engines/npm
+    # churn the mock-backend Electron window never gets a title, so boot/chat/
+    # setup specs all fail identically regardless of the diff).
+    #
+    # fork-parity note: I briefly restored the fork's condition here because
+    # `Desktop E2E` concludes SUCCESS on fork/main (runs 31280614721 /
+    # 31278775668) — which looked like proof upstream's premise was false here.
+    # It was the wrong inference. fork/main still carries the FORK's desktop
+    # tree (17 specs); this branch retires that fork and takes upstream's
+    # apps/desktop verbatim (19 specs, byte-identical to upstream/main), so it
+    # inherits upstream's BROKEN suite too. Re-enabling reproduced their exact
+    # symptom and blew the 20-minute cap at 20m20s:
+    #   ✘ e2e/boot.spec.ts › window opens with Hermes title
+    #   ✘ e2e/boot.spec.ts › renderer mounts and shows DOM content
+    #   ✘ e2e/chat.spec.ts › send a message and receive a response
+    # Green on fork/main measured the fork's suite, not this one.
+    #
+    # This job is intentionally SKIPPED, and scripts/ci/evaluate_needs.py has a
+    # matching exemption so the skip is declared rather than silent (the #476
+    # rule is 'no required job vanishes unnoticed', not 'never skip').
+    # Re-enable together with upstream's #76627 fix.
+    if: ${{ false && (needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true') }}
     uses: ./.github/workflows/e2e-desktop.yml
 
   docs-site:
