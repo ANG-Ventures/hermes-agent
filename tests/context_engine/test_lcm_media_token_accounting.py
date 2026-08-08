@@ -6,10 +6,15 @@ drove a spurious below-threshold compaction. The payload's character length
 carries no pricing signal: providers bill by dimension, page, or duration.
 """
 import base64
+import math
+import struct
 
 import pytest
 
-from agent.model_metadata import estimate_messages_tokens_rough as HOST
+from agent.model_metadata import (
+    compose_request_breakdown,
+    estimate_messages_tokens_rough as HOST,
+)
 
 lcm_tokens = pytest.importorskip("plugins.context_engine.lcm.tokens")
 
@@ -27,6 +32,75 @@ def _no_injected_counter():
     lcm_tokens.set_messages_token_counter(None)
     yield
     lcm_tokens.set_messages_token_counter(prev)
+
+
+def _anthropic_pdf_part(page_count: int) -> dict:
+    """Small parseable PDF with both /Pages and leaf /Page objects."""
+    objects = [
+        b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n",
+        f"2 0 obj << /Type /Pages /Count {page_count} >> endobj\n".encode(),
+    ]
+    for index in range(page_count):
+        # Exercise both legal whitespace forms without letting /Pages count as
+        # a leaf page.
+        marker = b"/Type/Page" if index % 2 else b"/Type /Page"
+        objects.append(
+            f"{index + 3} 0 obj << ".encode()
+            + marker
+            + b" /Parent 2 0 R >> endobj\n"
+        )
+    pdf = b"%PDF-1.7\n" + b"".join(objects) + b"%%EOF\n"
+    return {
+        "type": "document",
+        "source": {
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": base64.b64encode(pdf).decode(),
+        },
+    }
+
+
+def _openai_wav_part(duration_seconds: int) -> dict:
+    sample_rate = 1_000
+    byte_rate = sample_rate  # mono, 8-bit PCM
+    fmt = struct.pack("<HHIIHH", 1, 1, sample_rate, byte_rate, 1, 8)
+    junk = b"abc"  # odd-sized chunk exercises RIFF padding
+    pcm = b"\x80" * (duration_seconds * byte_rate)
+    body = (
+        b"WAVE"
+        + b"JUNK" + struct.pack("<I", len(junk)) + junk + b"\x00"
+        + b"fmt " + struct.pack("<I", len(fmt)) + fmt
+        + b"data" + struct.pack("<I", len(pcm)) + pcm
+    )
+    wav = b"RIFF" + struct.pack("<I", len(body)) + body
+    return {
+        "type": "input_audio",
+        "input_audio": {
+            "format": "wav",
+            "data": base64.b64encode(wav).decode(),
+        },
+    }
+
+
+def _openai_mp3_part(frame_count: int) -> dict:
+    # MPEG-2 Layer III, 8 kbps, 22.05 kHz: 576 samples and 26 bytes/frame.
+    header = (
+        (0x7FF << 21)
+        | (0b10 << 19)
+        | (0b01 << 17)
+        | (1 << 16)
+        | (1 << 12)
+    ).to_bytes(4, "big")
+    frame = header + (b"\x00" * 22)
+    # Empty ID3v2 tag proves the parser skips container metadata before frames.
+    mp3 = b"ID3\x04\x00\x00\x00\x00\x00\x00" + (frame * frame_count)
+    return {
+        "type": "input_audio",
+        "input_audio": {
+            "format": "mp3",
+            "data": base64.b64encode(mp3).decode(),
+        },
+    }
 
 
 MEDIA_CASES = {
@@ -70,6 +144,12 @@ def test_lcm_does_not_bill_media_as_text(name):
 def test_host_does_not_bill_media_as_text(name):
     got = HOST(MEDIA_CASES[name])
     assert got < SANE_CEILING, f"{name}: host billed {got:,} tokens"
+
+
+@pytest.mark.parametrize("name", ["document_pdf", "audio"])
+def test_request_breakdown_does_not_double_bill_document_or_audio_base64(name):
+    got = compose_request_breakdown(MEDIA_CASES[name])["total_tokens"]
+    assert got < SANE_CEILING, f"{name}: request breakdown billed {got:,} tokens"
 
 
 @pytest.mark.parametrize("name", sorted(MEDIA_CASES))
@@ -123,6 +203,68 @@ def test_tool_calls_still_counted():
     msgs = [{"role": "assistant", "content": "", "tool_calls": [
         {"function": {"name": "search", "arguments": '{"q": "' + "x" * 400 + '"}'}}]}]
     assert lcm_tokens.count_messages_tokens(msgs) > 50
+
+
+def test_anthropic_pdf_cost_scales_per_page_and_excludes_pages_tree():
+    part = _anthropic_pdf_part(4)
+    message = {"role": "user", "content": [part]}
+    expected_media_tokens = 4 * 3_000
+
+    assert lcm_tokens.media_part_token_cost(part) == expected_media_tokens
+    assert expected_media_tokens <= lcm_tokens.count_message_tokens(message) < expected_media_tokens + 20
+    assert expected_media_tokens <= HOST([message]) < expected_media_tokens + 100
+    assert expected_media_tokens <= compose_request_breakdown([message])["history_tokens"] < expected_media_tokens + 100
+
+
+def test_unparseable_pdf_keeps_flat_document_fallback():
+    part = {
+        "type": "document",
+        "source": {
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": base64.b64encode(b"%PDF-1.7\nno page objects\n%%EOF").decode(),
+        },
+    }
+
+    assert lcm_tokens.media_part_token_cost(part) == 3_000
+
+
+def test_openai_wav_cost_uses_ten_tokens_per_second():
+    part = _openai_wav_part(duration_seconds=600)
+    message = {"role": "user", "content": [part]}
+    expected_media_tokens = 600 * 10
+
+    assert lcm_tokens.media_part_token_cost(part) == expected_media_tokens
+    assert expected_media_tokens <= lcm_tokens.count_message_tokens(message) < expected_media_tokens + 20
+    assert expected_media_tokens <= HOST([message]) < expected_media_tokens + 100
+    assert expected_media_tokens <= compose_request_breakdown([message])["history_tokens"] < expected_media_tokens + 100
+
+
+def test_openai_mp3_cost_uses_frame_duration_at_ten_tokens_per_second():
+    # Larger than the parser's 1 MiB inspection cap: duration must come from
+    # sampled frame metadata + container length, not a full payload decode.
+    frame_count = 60_000
+    part = _openai_mp3_part(frame_count)
+    message = {"role": "user", "content": [part]}
+    expected_media_tokens = math.ceil(frame_count * 576 / 22_050 * 10)
+
+    assert lcm_tokens.media_part_token_cost(part) == expected_media_tokens
+    assert expected_media_tokens <= lcm_tokens.count_message_tokens(message) < expected_media_tokens + 20
+    assert expected_media_tokens <= HOST([message]) < expected_media_tokens + 100
+    assert expected_media_tokens <= compose_request_breakdown([message])["history_tokens"] < expected_media_tokens + 100
+
+
+@pytest.mark.parametrize("audio_format", ["wav", "mp3"])
+def test_unparseable_audio_keeps_flat_audio_fallback(audio_format):
+    part = {
+        "type": "input_audio",
+        "input_audio": {
+            "format": audio_format,
+            "data": base64.b64encode(b"not an audio container").decode(),
+        },
+    }
+
+    assert lcm_tokens.media_part_token_cost(part) == 1_500
 
 
 # --- the injectable seam ----------------------------------------------------

@@ -8,6 +8,8 @@ import threading
 from functools import lru_cache
 from typing import Any, Callable, Dict, List, Optional
 
+from agent.media_token_accounting import media_part_token_cost
+
 from .message_content import normalize_content_value
 
 logger = logging.getLogger(__name__)
@@ -23,46 +25,10 @@ _CHARS_PER_TOKEN = 4
 # 1710x1518 PNG: char-counting gave 502,182 tokens vs Anthropic's actual
 # (w * h / 750) = 3,461 -- a 145x overestimate that drove spurious compaction.
 #
-# Providers price attachments by DIMENSION or PAGE, never by transport size, so
-# the payload's character length carries no pricing signal at all. Use a flat
-# per-part cost, which is the same model the host estimator uses.
-_IMAGE_PART_TOKENS = 1500
-# A PDF/document page costs roughly an image; we cannot cheaply count pages
-# without parsing, so bill a conservative multi-page default.
-_DOCUMENT_PART_TOKENS = 3000
-# Audio is billed per second of duration; the payload length is likewise not a
-# usable proxy. Flat, conservative.
-_AUDIO_PART_TOKENS = 1500
-
-_IMAGE_PART_TYPES = frozenset({"image", "image_url", "input_image"})
-_DOCUMENT_PART_TYPES = frozenset({"document", "input_file", "file"})
-_AUDIO_PART_TYPES = frozenset({"input_audio", "audio"})
-
-_MEDIA_PART_COSTS = tuple(
-    (types, cost)
-    for types, cost in (
-        (_IMAGE_PART_TYPES, _IMAGE_PART_TOKENS),
-        (_DOCUMENT_PART_TYPES, _DOCUMENT_PART_TOKENS),
-        (_AUDIO_PART_TYPES, _AUDIO_PART_TOKENS),
-    )
-)
-
-
-def media_part_token_cost(part: Any) -> int:
-    """Flat token cost for a multimodal content part, or 0 if it is not media.
-
-    Returns 0 for text parts and anything unrecognized, so callers can fall
-    through to normal character-based counting.
-    """
-    if not isinstance(part, dict):
-        return 0
-    part_type = part.get("type")
-    if not part_type:
-        return 0
-    for types, cost in _MEDIA_PART_COSTS:
-        if part_type in types:
-            return cost
-    return 0
+# Providers price attachments by dimension, page, or duration, never by
+# transport size. The host and built-in LCM paths share the same cheap parser so
+# their compaction decisions cannot silently drift. Parse failures preserve the
+# historical flat costs; see ``agent.media_token_accounting``.
 
 
 # Optional host-supplied replacement for ``count_messages_tokens``. A host that
@@ -254,10 +220,10 @@ def _split_media_from_content(content: Any) -> tuple[Any, int]:
 def count_message_tokens(msg: Dict[str, Any]) -> int:
     """Estimate tokens for a single OpenAI-format message.
 
-    Multimodal parts (images, documents, audio) are billed at a flat per-part
-    cost rather than by the character length of their base64 payload -- see
-    ``media_part_token_cost``. Counting the payload as text overestimated a real
-    screenshot by 145x and caused spurious compaction.
+    Multimodal parts are billed by provider dimensions/pages/duration rather
+    than by the character length of their base64 payload -- see
+    ``media_part_token_cost``. Counting the payload as text overestimated a
+    real screenshot by 145x and caused spurious compaction.
     """
     total = 4  # role + overhead
     content, media_tokens = _split_media_from_content(msg.get("content"))
