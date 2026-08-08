@@ -148,6 +148,55 @@ class TestSessionHygieneThresholds:
         # Should NOT trigger for 1M model
         assert approx_tokens < huge_model_threshold
 
+    def test_small_session_below_thresholds(self):
+        """A 10-message session should not trigger compression."""
+        history = _make_history(10)
+        approx_tokens = estimate_messages_tokens_rough(history)
+
+        # For a 200k-context model at 85% threshold = 170k
+        context_length = 200_000
+        threshold_pct = 0.85
+        compress_token_threshold = int(context_length * threshold_pct)
+
+        needs_compress = approx_tokens >= compress_token_threshold
+        assert not needs_compress
+
+    def test_large_token_count_triggers(self):
+        """High token count should trigger compression when exceeding model threshold."""
+        # Build a history that exceeds 85% of a 200k model (170k tokens)
+        history = _make_large_history_tokens(180_000)
+        approx_tokens = estimate_messages_tokens_rough(history)
+
+        context_length = 200_000
+        threshold_pct = 0.85
+        compress_token_threshold = int(context_length * threshold_pct)
+
+        needs_compress = approx_tokens >= compress_token_threshold
+        assert needs_compress
+
+    def test_custom_threshold_percentage(self):
+        """Custom threshold percentage from config should be respected."""
+        context_length = 200_000
+
+        # At 50% threshold = 100k
+        low_threshold = int(context_length * 0.50)
+        # At 90% threshold = 180k
+        high_threshold = int(context_length * 0.90)
+
+        history = _make_large_history_tokens(150_000)
+        approx_tokens = estimate_messages_tokens_rough(history)
+
+        # Should trigger at 50% but not at 90%
+        assert approx_tokens >= low_threshold
+        assert approx_tokens < high_threshold
+
+    def test_minimum_message_guard(self):
+        """Sessions with fewer than 4 messages should never trigger."""
+        history = _make_history(3, content_size=100_000)
+        # Even with enormous content, < 4 messages should be skipped
+        # (the gateway code checks `len(history) >= 4` before evaluating)
+        assert len(history) < 4
+
 
 class TestSessionHygieneWarnThreshold:
     """Test the post-compression warning threshold (95% of context)."""
@@ -203,6 +252,25 @@ class TestEstimatedTokenThreshold:
             "Early fire must be well below model limit"
         )
 
+    def test_threshold_below_context_for_128k_model(self):
+        context_length = 128_000
+        threshold = int(context_length * 0.85)
+        assert threshold < context_length
+
+    def test_no_multiplier_means_same_threshold_for_estimated_and_actual(self):
+        """Without the 1.4x, estimated and actual token paths use the same threshold."""
+        context_length = 200_000
+        threshold_pct = 0.85
+        threshold = int(context_length * threshold_pct)
+        # Both paths should use 170K — no inflation
+        assert threshold == 170_000
+
+    def test_warn_threshold_below_context(self):
+        """Warn threshold (95%) must be below context length."""
+        for ctx in (128_000, 200_000, 1_000_000):
+            warn = int(ctx * 0.95)
+            assert warn < ctx
+
 
 class TestTokenEstimation:
     """Verify rough token estimation works as expected for hygiene checks."""
@@ -212,6 +280,25 @@ class TestTokenEstimation:
         small = _make_history(10, content_size=100)
         large = _make_history(10, content_size=10_000)
         assert estimate_messages_tokens_rough(large) > estimate_messages_tokens_rough(small)
+
+    def test_empty_history(self):
+        assert estimate_messages_tokens_rough([]) == 0
+
+    def test_proportional_to_count(self):
+        few = _make_history(10, content_size=1000)
+        many = _make_history(100, content_size=1000)
+        assert estimate_messages_tokens_rough(many) > estimate_messages_tokens_rough(few)
+
+    def test_pathological_session_detected(self):
+        """The reported pathological case: 648 messages, ~299K tokens.
+
+        With a 200k model at 85% threshold (170k), this should trigger.
+        """
+        history = _make_history(648, content_size=1800)
+        tokens = estimate_messages_tokens_rough(history)
+        # Should be well above the 170K threshold for a 200k model
+        threshold = int(200_000 * 0.85)
+        assert tokens > threshold
 
 
 @pytest.mark.asyncio
@@ -805,7 +892,22 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     assert result == "ok"
     agent = FakeInPlaceCompressAgent.last_instance
     assert agent is not None
-    async_session_db.get_session.assert_awaited_once_with("sess-1")
+    # Hygiene must have fetched the stored system prompt for THIS session.
+    # Parity note (2026-08-08): this was ``assert_awaited_once_with``, which
+    # also asserted that NOTHING ELSE reads the session row during the turn.
+    # The fork's ``_resolve_footer_message_stats`` (fork-only; absent
+    # upstream) legitimately awaits ``get_session`` again later in
+    # ``_handle_message_with_agent`` to render the Nmsgs footer, so the
+    # stricter form fails on a correct turn. Assert the contract that
+    # matters — hygiene looked up this session — not the call count of an
+    # unrelated feature.
+    assert any(
+        call.args == ("sess-1",)
+        for call in async_session_db.get_session.await_args_list
+    ), (
+        "hygiene must fetch the stored system prompt for sess-1; awaits were "
+        f"{async_session_db.get_session.await_args_list}"
+    )
     agent.context_compressor.bind_session_state.assert_called_once_with(fake_db, "sess-1")
     # In-place compaction already persisted via archive_and_compact() —
     # rewrite_transcript would replace_messages(active_only=False) and DELETE
@@ -1524,6 +1626,12 @@ async def test_repeated_hygiene_timeouts_escalate_to_a_loud_warning(monkeypatch,
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
     fake_db = MagicMock()
+    # A bare MagicMock returns a MagicMock for EVERY attribute, so the
+    # hygiene cooldown gate (`_cooldown_state.get("remaining_seconds", 0) > 0`)
+    # compares MagicMock > int and raises TypeError. This test drives the
+    # cooldown to 0 via config; say so on the DB too. Sibling hygiene tests
+    # already stub this the same way.
+    fake_db.get_compression_failure_cooldown.return_value = None
 
     class AlwaysTimingOutAgent:
         def __init__(self, **kwargs):

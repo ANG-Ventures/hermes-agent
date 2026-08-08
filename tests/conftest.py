@@ -772,12 +772,54 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
     # phantom ``source=claude_code`` entry into every anthropic credential
     # pool built in tests (with a per-run random id), which silently changes
     # pool arithmetic: a fixture that writes a ONE-entry auth.json gets a
-    # TWO-entry pool, so single-entry guards never fire. Close the second
-    # source too.
+    # TWO-entry pool, so single-entry guards never fire.
+    #
+    # Scoped, NOT blanket: tests that legitimately exercise this path point
+    # HOME at a tmp_path and write their own fake credentials file (see
+    # tests/hermes_cli/test_codex_cli_model_picker.py::claude_code_only_env).
+    # Only suppress the read when it would resolve to the REAL developer home
+    # (captured from HERMES_REAL_HOME's parent, or pwd, before any redirect).
+    try:
+        _rh = os.environ.get("HERMES_REAL_HOME", "").strip()
+        if _rh:
+            _real_home_dir = Path(_rh).expanduser().parent
+        else:
+            import pwd as _pwd
+
+            _real_home_dir = Path(_pwd.getpwuid(os.getuid()).pw_dir)
+    except Exception:
+        _real_home_dir = None
+    _real_claude_creds = (
+        (_real_home_dir / ".claude" / ".credentials.json") if _real_home_dir else None
+    )
+
+    _orig_read_file = getattr(
+        _anthropic_adapter, "_read_claude_code_credentials_from_file", None
+    )
+
+    def _hermetic_read_from_file(*_args, **_kwargs):
+        if _real_claude_creds is None:
+            return None
+        try:
+            # Resolve the home the ADAPTER will use. Tests that legitimately
+            # exercise this path redirect it (``monkeypatch.setattr(Path,
+            # "home", ...)`` or HOME), so read it the same way the adapter
+            # does rather than trusting the process env.
+            target = Path.home() / ".claude" / ".credentials.json"
+            if target.resolve() != _real_claude_creds.resolve():
+                # Redirected to a sandbox: this is a deliberate fixture, let
+                # the real reader run against the fake file.
+                if _orig_read_file is None:
+                    return None
+                return _orig_read_file(*_args, **_kwargs)
+        except Exception:
+            return None
+        return None
+
     monkeypatch.setattr(
         _anthropic_adapter,
         "_read_claude_code_credentials_from_file",
-        lambda *_args, **_kwargs: None,
+        _hermetic_read_from_file,
         raising=False,
     )
     return None
