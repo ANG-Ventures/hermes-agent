@@ -260,12 +260,13 @@ def _hermes_compression_float(key: str, default: float) -> float:
     (which would let one agent's config silently change another's calibration —
     Greptile PR #111). Returns ``default`` on any read/parse failure or absence.
     """
-    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    cfg_path = home / "config.yaml"
+    # fork-parity: go through this module's own _load_hermes_config_yaml()
+    # helper instead of a second raw yaml.safe_load. It already handles the
+    # missing-file, unparseable, and no-yaml-installed cases (LCM is vendored
+    # and cannot assume PyYAML), and it keeps this module's config reads on ONE
+    # path — which is what upstream's test_config_read_guard is enforcing.
     try:
-        if yaml is None:
-            return default
-        cfg = yaml.safe_load(cfg_path.read_text()) or {}
+        cfg = _load_hermes_config_yaml()
         compression = cfg.get("compression") or {}
         val = compression.get(key)
         if val is None:
@@ -278,12 +279,9 @@ def _hermes_compression_float(key: str, default: float) -> float:
 
 def _hermes_lcm_value(key: str):
     """Read ``lcm.<key>`` from ~/.hermes/config.yaml; None on absence/failure."""
-    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    cfg_path = home / "config.yaml"
+    # fork-parity: same single-read-path rule as above.
     try:
-        if yaml is None:
-            return None
-        cfg = yaml.safe_load(cfg_path.read_text()) or {}
+        cfg = _load_hermes_config_yaml()
         return (cfg.get("lcm") or {}).get(key)
     except Exception:
         return None

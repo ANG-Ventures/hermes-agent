@@ -1,5 +1,5 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import {
   DropdownMenu,
@@ -7,41 +7,14 @@ import {
   DropdownMenuSub,
   DropdownMenuSubTrigger
 } from '@/components/ui/dropdown-menu'
-import type * as HermesApi from '@/hermes'
-import { $modelPresets, getModelPreset } from '@/store/model-presets'
-import {
-  $activeSessionId,
-  $currentFastMode,
-  $currentReasoningEffort,
-  getCurrentModelSource,
-  setCurrentFastMode,
-  setCurrentModelSource,
-  setCurrentReasoningEffort
-} from '@/store/session'
 
 import { type FastControl, ModelEditSubmenu } from './model-edit-submenu'
-
-vi.mock('@/hermes', async importOriginal => {
-  const actual = await importOriginal<typeof HermesApi>()
-
-  return { ...actual, setApiRequestProfile: vi.fn() }
-})
 
 // Radix calls these on open; jsdom doesn't implement them.
 beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn()
   Element.prototype.hasPointerCapture = vi.fn(() => false)
   Element.prototype.releasePointerCapture = vi.fn()
-})
-
-beforeEach(() => {
-  window.localStorage.clear()
-  $modelPresets.set({})
-  $activeSessionId.set(null)
-  setCurrentFastMode(false)
-  setCurrentModelSource('')
-  setCurrentReasoningEffort('')
-  $currentReasoningEffort.set('medium')
 })
 
 afterEach(() => {
@@ -51,13 +24,13 @@ afterEach(() => {
 
 // Render the submenu inside an open menu/sub so its content (switches) mounts.
 function renderSubmenu(opts: {
+  defaultEffort?: string
   effort?: string
-  fastControl?: FastControl
+  fastControl: FastControl
   isActive?: boolean
-  model?: string
-  provider?: string
-  reasoning?: boolean
-  requestGateway?: () => Promise<unknown>
+  onSelectModel?: (model: string) => void
+  onSetOptions: (patch: { effort?: string; fast?: boolean }) => void
+  reasoning: boolean
 }) {
   return render(
     <DropdownMenu open>
@@ -65,14 +38,15 @@ function renderSubmenu(opts: {
         <DropdownMenuSub open>
           <DropdownMenuSubTrigger>edit</DropdownMenuSubTrigger>
           <ModelEditSubmenu
+            defaultEffort={opts.defaultEffort ?? 'medium'}
             effort={opts.effort ?? 'medium'}
-            fastControl={opts.fastControl ?? { kind: 'none' }}
+            fastControl={opts.fastControl}
             isActive={opts.isActive ?? true}
-            model={opts.model ?? 'm1'}
-            onSelectModel={vi.fn()}
-            provider={opts.provider ?? 'p1'}
-            reasoning={opts.reasoning ?? true}
-            requestGateway={(opts.requestGateway ?? vi.fn().mockResolvedValue({})) as never}
+            model="m1"
+            onSelectModel={opts.onSelectModel ?? vi.fn()}
+            onSetOptions={opts.onSetOptions}
+            provider="p1"
+            reasoning={opts.reasoning}
           />
         </DropdownMenuSub>
       </DropdownMenuContent>
@@ -80,128 +54,78 @@ function renderSubmenu(opts: {
   )
 }
 
-const effortRadio = (name: string) => screen.getByRole('menuitemradio', { name })
-
-// Regression: editing the active row before a live session exists must stay
-// preset-only — the gateway's config.set falls back to global config when no
-// session matches, so it must not be called. (Caught in the second review.)
-describe('ModelEditSubmenu no-session guard', () => {
-  it('param fast: records explicit off in the draft but skips the gateway without a session', () => {
-    const requestGateway = vi.fn().mockResolvedValue({})
-    setCurrentFastMode(true)
-    renderSubmenu({ fastControl: { kind: 'param', on: true }, reasoning: false, requestGateway })
-
-    fireEvent.click(screen.getByRole('switch'))
-
-    expect(getModelPreset('p1', 'm1').fast).toBe(false)
-    expect($currentFastMode.get()).toBe(false)
-    expect(getCurrentModelSource()).toBe('manual')
-    expect(requestGateway).not.toHaveBeenCalled()
-  })
-
-  it('reasoning: records the preset but skips the gateway without a session', () => {
-    const requestGateway = vi.fn().mockResolvedValue({})
-    renderSubmenu({ fastControl: { kind: 'none' }, reasoning: true, requestGateway })
-
-    // Thinking starts on (medium); toggling it off routes through patchReasoning.
-    fireEvent.click(screen.getByRole('switch'))
-
-    expect(getModelPreset('p1', 'm1').effort).toBe('none')
-    expect($currentReasoningEffort.get()).toBe('none')
-    expect(getCurrentModelSource()).toBe('manual')
-    expect(requestGateway).not.toHaveBeenCalled()
-  })
-
-  it('param fast: pushes to the gateway once a session is active', async () => {
-    const requestGateway = vi.fn().mockResolvedValue({})
-    $activeSessionId.set('sess1')
-    renderSubmenu({ fastControl: { kind: 'param', on: false }, reasoning: false, requestGateway })
+// The submenu is PURE: it reports edits and never writes to a session, a
+// preset store, or the gateway. That's the invariant that lets the same
+// component drive a live chat session AND a detached per-task override — if it
+// ever writes directly again, picking an effort for a kanban card would reach
+// over and change the user's live chat.
+describe('ModelEditSubmenu reports edits without performing them', () => {
+  it('param fast: reports the toggle', () => {
+    const onSetOptions = vi.fn()
+    renderSubmenu({ fastControl: { kind: 'param', on: true }, onSetOptions, reasoning: false })
 
     fireEvent.click(screen.getByRole('switch'))
 
-    expect(requestGateway).toHaveBeenCalledWith('config.set', { key: 'fast', session_id: 'sess1', value: 'fast' })
-  })
-})
-
-describe('ModelEditSubmenu reasoning effort parity', () => {
-  it('offers distinct enabled effort rows in Hermes order', () => {
-    renderSubmenu({ effort: 'medium' })
-
-    expect(screen.getAllByRole('menuitemradio').map((item: HTMLElement) => item.textContent)).toEqual([
-      'Minimal',
-      'Low',
-      'Medium',
-      'High',
-      'Extra High',
-      'Max',
-      'Ultra'
-    ])
+    expect(onSetOptions).toHaveBeenCalledWith({ fast: false })
   })
 
-  it('selects Max when the active effort is max, not Medium', () => {
-    renderSubmenu({ effort: 'max' })
+  it('thinking: toggling off reports the none level', () => {
+    const onSetOptions = vi.fn()
+    renderSubmenu({ fastControl: { kind: 'none' }, onSetOptions, reasoning: true })
 
-    expect(effortRadio('Max').getAttribute('data-state')).toBe('checked')
-    expect(effortRadio('Medium').getAttribute('data-state')).toBe('unchecked')
+    // Thinking starts on (medium); toggling it off reports 'none'.
+    fireEvent.click(screen.getByRole('switch'))
+
+    expect(onSetOptions).toHaveBeenCalledWith({ effort: 'none' })
   })
 
-  it('selects Extra High when the active effort is xhigh', () => {
-    renderSubmenu({ effort: 'xhigh' })
+  it('thinking: toggling back on restores the row level, not the hardcoded default', () => {
+    const onSetOptions = vi.fn()
+    renderSubmenu({
+      defaultEffort: 'high',
+      effort: 'none',
+      fastControl: { kind: 'none' },
+      onSetOptions,
+      reasoning: true
+    })
 
-    expect(effortRadio('Extra High').getAttribute('data-state')).toBe('checked')
+    fireEvent.click(screen.getByRole('switch'))
+
+    expect(onSetOptions).toHaveBeenCalledWith({ effort: 'high' })
   })
 
-  it('keeps Thinking off and no effort radio selected for none', () => {
-    renderSubmenu({ effort: 'none' })
+  it('variant fast: swaps the model only when the row is active', () => {
+    const onSelectModel = vi.fn()
+    const onSetOptions = vi.fn()
 
-    expect(screen.getByRole('switch').getAttribute('data-state')).toBe('unchecked')
-    expect(
-      screen.getAllByRole('menuitemradio').every((item: HTMLElement) => item.getAttribute('data-state') === 'unchecked')
-    ).toBe(true)
+    renderSubmenu({
+      fastControl: { baseId: 'm1', fastId: 'm1-fast', kind: 'variant', on: false },
+      isActive: false,
+      onSelectModel,
+      onSetOptions,
+      reasoning: false
+    })
+
+    fireEvent.click(screen.getByRole('switch'))
+
+    // Inactive rows stay preference-only — no model switch.
+    expect(onSetOptions).toHaveBeenCalledWith({ fast: true })
+    expect(onSelectModel).not.toHaveBeenCalled()
   })
 
-  it('sends, stores, and persists xhigh when Extra High is selected in an active session', async () => {
-    const requestGateway = vi.fn().mockResolvedValue({})
-    $activeSessionId.set('sess1')
-    renderSubmenu({ effort: 'medium', requestGateway })
+  it('variant fast: active row swaps to the -fast sibling', () => {
+    const onSelectModel = vi.fn()
+    const onSetOptions = vi.fn()
 
-    fireEvent.click(effortRadio('Extra High'))
+    renderSubmenu({
+      fastControl: { baseId: 'm1', fastId: 'm1-fast', kind: 'variant', on: false },
+      onSelectModel,
+      onSetOptions,
+      reasoning: false
+    })
 
-    await waitFor(() =>
-      expect(requestGateway).toHaveBeenCalledWith('config.set', {
-        key: 'reasoning',
-        session_id: 'sess1',
-        value: 'xhigh'
-      })
-    )
-    expect($currentReasoningEffort.get()).toBe('xhigh')
-    expect(getModelPreset('p1', 'm1').effort).toBe('xhigh')
-  })
+    fireEvent.click(screen.getByRole('switch'))
 
-  it('sends, stores, and persists max when Max is selected in an active session', async () => {
-    const requestGateway = vi.fn().mockResolvedValue({})
-    $activeSessionId.set('sess1')
-    renderSubmenu({ effort: 'xhigh', requestGateway })
-
-    fireEvent.click(effortRadio('Max'))
-
-    await waitFor(() =>
-      expect(requestGateway).toHaveBeenCalledWith('config.set', { key: 'reasoning', session_id: 'sess1', value: 'max' })
-    )
-    expect($currentReasoningEffort.get()).toBe('max')
-    expect(getModelPreset('p1', 'm1').effort).toBe('max')
-  })
-
-  it('rolls back a rejected Max mutation to the exact prior value and preset', async () => {
-    const requestGateway = vi.fn().mockRejectedValue(new Error('rejected'))
-    $activeSessionId.set('sess1')
-    $currentReasoningEffort.set('xhigh')
-    renderSubmenu({ effort: 'xhigh', requestGateway })
-
-    fireEvent.click(effortRadio('Max'))
-
-    await waitFor(() => expect(requestGateway).toHaveBeenCalled())
-    await waitFor(() => expect($currentReasoningEffort.get()).toBe('xhigh'))
-    expect(getModelPreset('p1', 'm1').effort).toBe('xhigh')
+    expect(onSelectModel).toHaveBeenCalledWith('m1-fast')
   })
 })

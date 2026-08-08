@@ -1,10 +1,18 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 
-// DOM is bounded by a rendered-PART budget, not a message/turn count: a single
-// assistant message folds every tool call into a part, so heavy sessions are
-// ~40 turns / ~100 messages but ~1000 parts — and parts are what drive node
-// count. This is the steady-state window ("Show earlier" adds another page).
-export const RENDER_BUDGET = 300
+// DOM is bounded by a render-COST budget, not a message/turn count. The
+// currency is `messagePaintWeight` (see @/lib/render-weight): what a turn
+// actually MOUNTS, not what its payload weighs — a settled run of twelve reads
+// is one grey summary line, while a diff or a wall of markdown is charged for
+// the DOM it really builds. This is the steady-state window ("Show earlier"
+// adds another page).
+//
+// fork parity NOTE (2026-08-07 upstream merge): 300 -> 600 because upstream
+// re-priced the budget from PARTS to weight units. 600 units ≈ 10-20 agentic
+// turns on measured real sessions (a tool-heavy turn prices at 30-90, a plain
+// exchange at 5-10). This constant lives here rather than in list.tsx so the
+// hook and its consumer cannot drift apart on the value.
+export const RENDER_BUDGET = 600
 
 // First paint after a session switch renders only the newest tail. Profiled on
 // a 1,294-message session (MBP, 2026-07-15): committing the full 300-part

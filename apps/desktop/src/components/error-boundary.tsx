@@ -131,7 +131,7 @@ function RootErrorFallback({ error, reset }: ErrorBoundaryFallbackProps) {
   }
 
   return (
-    <div className="fixed inset-0 z-[1500] grid place-items-center bg-(--ui-chat-surface-background) p-6">
+    <div className="fixed inset-0 z-(--z-crash) grid place-items-center bg-(--ui-chat-surface-background) p-6">
       <ErrorState
         className="w-full max-w-[28rem]"
         description={error.message || t.errors.boundaryDesc}

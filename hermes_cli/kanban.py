@@ -133,7 +133,9 @@ def _parse_branch_flag(value: Optional[str]) -> Optional[str]:
     return branch
 
 
-def _check_dispatcher_presence() -> tuple[bool, str]:
+def _check_dispatcher_presence(
+    hermes_home: Optional[Path] = None,
+) -> tuple[bool, str]:
     """Return ``(running, message)``.
 
     - ``running=True``: a gateway is alive for this HERMES_HOME and its
@@ -149,23 +151,41 @@ def _check_dispatcher_presence() -> tuple[bool, str]:
     probe itself errors, we return ``(True, "")`` so we don't spam
     false warnings (better to miss a warning than to cry wolf).
 
-    NOTE (fork parity, 2026-08-06): upstream's version takes a
-    ``hermes_home`` param and probes via the ``resolve_gateway_liveness``
-    ladder — a symbol this fork's ``gateway.status`` does not have yet.
-    Commit 11cffc4d5 carried the upstream body across anyway, which made
-    the import fail on every call and the probe permanently silent (the
-    no-gateway / dispatch-off warnings never fired). Restored to the
-    fork's ``get_running_pid`` probe; the liveness-ladder enrichment
-    returns at the next upstream->fork parity merge.
+    ``hermes_home`` scopes the probe to a named profile's directory. The
+    dashboard plugin API passes it because the dashboard backend process can
+    be running under a different HERMES_HOME than the profile the request
+    targets, which otherwise produced a "no gateway is running" warning
+    against a perfectly healthy profile gateway (#71211). CLI callers leave
+    it ``None`` and keep the existing process-level behavior.
+
+    NOTE (fork parity, 2026-08-07 parity merge): the upstream
+    ``resolve_gateway_liveness`` ladder now lands in this fork's
+    ``gateway.status`` via this merge, so the liveness-ladder enrichment
+    that commit 11cffc4d5 prematurely carried (and #475 reverted to the
+    fork ``get_running_pid`` probe to unbreak the import) is re-adopted here
+    against the now-present symbol.
     """
     try:
-        from gateway.status import get_running_pid  # type: ignore
+        from gateway.status import resolve_gateway_liveness  # type: ignore
     except Exception:
         return (True, "")  # can't probe — silent
     try:
-        pid = get_running_pid()
+        # Same shared ladder the dashboard status endpoints use, so a
+        # PID-file-less (launch-service-managed) or cross-container gateway
+        # is not misreported as absent. use_cache=False: this is a one-shot
+        # CLI/create-time probe, not a polling loop, and it must observe the
+        # gateway's state right now rather than a cached snapshot.
+        liveness = resolve_gateway_liveness(
+            profile_dir=hermes_home, use_cache=False
+        )
     except Exception:
         return (True, "")  # probe errored — silent
+    if liveness.probe_error:
+        # The resolver swallows per-rung failures so status endpoints never
+        # 500. This caller must still fail OPEN: an unreadable probe means
+        # "can't tell", not "no gateway", and warning on it cries wolf.
+        return (True, "")
+    pid = liveness.pid
 
     # Even if the gateway is up, dispatch_in_gateway may be off.
     try:
@@ -2868,14 +2888,16 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
         if kb.get_task(conn, args.task_id) is None:
             print(f"no such task: {args.task_id}", file=sys.stderr)
             return 1
-        # NOTE (fork parity, 2026-08-06): fork main's add_notify_sub predates
-        # the upstream chat_type param (11cffc4d5 adapted #80564 but missed
-        # dropping the kwarg at this call site — it was a guaranteed
-        # TypeError). --chat-type stays accepted for CLI interface parity;
-        # the enrichment reconnects at the next upstream->fork parity merge.
+        # Parity NOTE resolved (2026-08-07 parity merge): fork main's
+        # add_notify_sub previously lacked upstream's chat_type param, so
+        # #470 carried an adaptation here. The merge lands the full upstream
+        # signature (kanban_db.add_notify_sub now accepts chat_type +
+        # delivery_metadata), so the adaptation is retired and this is a
+        # plain upstream-form call again.
         kb.add_notify_sub(
             conn, task_id=args.task_id,
             platform=args.platform, chat_id=args.chat_id,
+            chat_type=args.chat_type,
             thread_id=args.thread_id, user_id=args.user_id,
             notifier_profile=args.notifier_profile or _profile_author(),
         )

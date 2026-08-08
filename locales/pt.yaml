@@ -19,6 +19,7 @@ gateway:
   agents:
     active_agents: '**Agentes ativos:** {count}'
     async_jobs: '**Tarefas assíncronas do gateway:** {count}'
+    background_delegations: '**Delegações em segundo plano:** {count}'
     header: 🤖 **Agentes e tarefas ativos**
     more: '... e mais {count}'
     none: Não há agentes ativos nem tarefas em execução.
@@ -97,7 +98,7 @@ gateway:
     full_request_no_fixed: after excludes system prompt + tool schemas (no resident agent to measure them); next live turn will show the full size.
     full_request_real: 'Full request size: {before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; before = last live request, after = estimate of next)'
     full_request_unchanged: 'Full request size: {before} tokens (unchanged — next turn resends the same context)'
-    in_progress: '⏳ Comprimindo ~{count:,} mensagens… uma sessão grande pode levar alguns minutos. Vou publicar o resultado aqui quando terminar.'
+    in_progress: ⏳ Comprimindo ~{count:,} mensagens… uma sessão grande pode levar alguns minutos. Vou publicar o resultado aqui quando terminar.
     no_provider: Nenhum fornecedor configurado — não é possível comprimir.
     not_enough: Não há conversa suficiente para comprimir (são necessárias pelo menos 4 mensagens).
     nothing_to_do: Ainda não há nada para comprimir (a transcrição continua a ser todo o contexto protegido).
@@ -105,6 +106,24 @@ gateway:
     summary_failed: ⚠️ Falha ao gerar o resumo ({error}). {count} mensagem(ns) histórica(s) foram removidas e substituídas por um marcador; o contexto anterior já não pode ser recuperado. Considera verificar a configuração do modelo auxiliary.compression.
   config_read_failed: '⚠️ Não foi possível ler config.yaml: {error}'
   config_save_failed: '⚠️ Não foi possível guardar a configuração: {error}'
+  context:
+    bar: '{bar}'
+    compressions: 'Compressions this session: {count}'
+    detail_after_first: _(Full compression and throughput stats available after the first agent response)_
+    estimated: 'Estimated context: ~{count} tokens across {messages} messages'
+    header: 🧠 **Context Window**
+    headroom: 'Headroom to limit: {headroom} tokens'
+    in_use: 'In use: {used} / {total} ({pct}%)'
+    last_savings: 'Last compression freed: {savings}% of context'
+    model: 'Model: `{model}`'
+    no_data: No context data available yet. Send a message to start a session.
+    over_threshold: ⚠️ **Over auto-compression threshold ({threshold}, {threshold_pct}%)**
+    threshold: 'Auto-compresses at: {threshold} ({threshold_pct}%) — {to_go} to go'
+    throughput_note: _Throughput, not context size — each call re-sends the window above._
+    total_billed: 'Total billed: {total}'
+    totals_header: Session totals (cumulative across {calls} API calls)
+    totals_line: Input {input} · Output {output} · Reasoning {reasoning}
+    window: 'Window: {total} tokens'
   credits:
     not_logged_in: Você não está conectado ao Nous Portal. Faça login para ver seu saldo de créditos e recarregar.
   debug:
@@ -120,6 +139,10 @@ gateway:
     denied_singular: ❌ Comando negado.
     no_pending: Não há nenhum comando pendente para negar.
     stale: ❌ Comando negado (a aprovação tinha expirado).
+  diff:
+    failed: '{error}'
+    no_changes: Sem alterações.
+    not_enabled: "Os checkpoints não estão ativados, então não há linha de base da sessão.\nAtive em config.yaml:\n```\ncheckpoints:\n  enabled: true\n```\nO /diff simples continua funcionando — ele usa git diretamente."
   draining: ⏳ A aguardar que {count} agente(s) ativo(s) terminem antes de reiniciar...
   fast:
     choice_fast: fast — Priority Processing ativado
@@ -344,11 +367,11 @@ gateway:
       **Visualização:** {display}
 
 
-      _Uso:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|reset|show|hide> [--global]`'
+      _Uso:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|ultra|reset|show|hide> [--global]`'
     unknown_arg: '⚠️ Argumento desconhecido: `{arg}`
 
 
-      **Níveis válidos:** none, minimal, low, medium, high, xhigh, max
+      **Níveis válidos:** none, minimal, low, medium, high, xhigh, max, ultra
 
       **Visualização:** show, hide
 
@@ -505,7 +528,7 @@ gateway:
     state_no: Não
     state_yes: Sim ⚡
     title: '**Título:** {title}'
-    tokens: '**Tokens de API cumulativos (reenviados a cada chamada):** {tokens}'
+    tokens: '**Lifetime tokens billed:** {tokens} _(not your current context size; use `/context`)_'
   stop:
     no_active: Não há nenhuma tarefa ativa para parar.
     stopped: ⚡ Parado. Podes continuar esta sessão.
@@ -581,7 +604,7 @@ gateway:
       message: the last message
       tool: a tool result
       user: your message
-    removed: "↩️ Undid {turns} half-turn(s) ({count} message(s))."
+    removed: ↩️ Undid {turns} half-turn(s) ({count} message(s)).
   update:
     hermes_cmd_not_found: ✗ Não foi possível localizar o comando `hermes`. O Hermes está em execução, mas o comando de atualização não conseguiu encontrar o executável no PATH nem através do interpretador Python atual. Tenta executar `hermes update` manualmente no teu terminal.
     not_git_repo: ✗ Não é um repositório git — não é possível atualizar.

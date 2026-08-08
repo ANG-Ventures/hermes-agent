@@ -1,5 +1,6 @@
 import { type MutableRefObject, useCallback, useRef, useState } from 'react'
 
+import { setTerminalFontFamilyFromConfig } from '@/app/right-sidebar/terminal/terminal-font'
 import { getHermesConfig, getHermesConfigDefaults } from '@/hermes'
 import { BUILTIN_PERSONALITIES, normalizePersonalityValue, personalityNamesFromConfig } from '@/lib/chat-runtime'
 import { normalize } from '@/lib/text'
@@ -11,10 +12,15 @@ import {
   setCurrentPersonality,
   setCurrentReasoningEffort,
   setCurrentServiceTier,
+  setDefaultReasoningEffort,
   setIntroPersonality,
   setResetModelOnNewSession
 } from '@/store/session'
-import { applyAutoSpeakFromConfig } from '@/store/voice-prefs'
+import {
+  applyAutoSpeakFromConfig,
+  applyThinkingSoundFromConfig,
+  applyVoiceStopPhraseFromConfig
+} from '@/store/voice-prefs'
 
 const DEFAULT_VOICE_SECONDS = 120
 const FAST_TIERS = new Set(['fast', 'priority', 'on'])
@@ -84,6 +90,12 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
         const reasoning = normalizeConfigEffort(config.agent?.reasoning_effort)
         const tier = (config.agent?.service_tier ?? '').trim()
 
+        // Publish the profile default regardless of whether the composer is
+        // reseeded below: picker rows and preset application resolve "the
+        // default" from here, so a manual model pick must not leave them
+        // rendering/applying Hermes' built-in medium over the user's config.
+        setDefaultReasoningEffort(reasoning)
+
         const shouldSeedComposer =
           !activeSessionIdRef.current &&
           getComposerSelectionGeneration() === selectionGeneration &&
@@ -99,7 +111,10 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
         setVoiceMaxRecordingSeconds(recordingLimit(config.voice?.max_recording_seconds))
         setSttEnabled(config.stt?.enabled !== false)
         setResetModelOnNewSession(config.desktop?.reset_model_on_new_session === true)
+        setTerminalFontFamilyFromConfig(config.terminal?.font_family)
         applyAutoSpeakFromConfig(config)
+        applyVoiceStopPhraseFromConfig(config)
+        applyThinkingSoundFromConfig(config)
       } catch {
         // Config is nice-to-have; chat still works without it.
       }

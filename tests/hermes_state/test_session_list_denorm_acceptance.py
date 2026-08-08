@@ -709,11 +709,18 @@ def _literal_sql(node: ast.AST) -> Optional[str]:
 
 def _parent_mutation_contract(source: str) -> Tuple[Set[str], Set[str]]:
     tree = ast.parse(source)
-    session_db = next(
+    # fork-parity: upstream's parity merge SPLIT the hermes_state monolith, so
+    # the SessionDB body is now assembled from mixin classes across sibling
+    # modules (hermes_state_portability.SessionPortabilityMixin et al). Scan the
+    # SessionDB class when present, otherwise every mixin class in the module —
+    # a hard `next(... name == "SessionDB")` raises StopIteration on the split-out
+    # files and would silently under-count the mutation sites.
+    carriers = [
         node
         for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "SessionDB"
-    )
+        if isinstance(node, ast.ClassDef)
+        and (node.name == "SessionDB" or node.name.endswith("Mixin"))
+    ]
     sites: Set[str] = set()
     maintained: Set[str] = set()
     maintenance_calls = {
@@ -723,48 +730,59 @@ def _parent_mutation_contract(source: str) -> Tuple[Set[str], Set[str]]:
         "_recompute_effective_last_active_many",
     }
 
-    for function in session_db.body:
-        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        for node in ast.walk(function):
-            if not isinstance(node, ast.Call) or not node.args:
+    for session_db in carriers:
+        for function in session_db.body:
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            if not isinstance(node.func, ast.Attribute):
-                continue
-            if node.func.attr in maintenance_calls:
-                maintained.add(function.name)
-            if node.func.attr not in {"execute", "executemany", "executescript"}:
-                continue
-            sql = _literal_sql(node.args[0])
-            if sql is None:
-                continue
-            for statement in sql.split(";"):
-                normalized = " ".join(statement.split())
-                set_clause = ""
-                if normalized.upper().startswith("UPDATE SESSIONS SET "):
-                    set_clause = normalized.split(" SET ", 1)[1].split(" WHERE ", 1)[0]
-                is_update = bool(
-                    re.search(
-                        r"(?:^|,)\s*parent_session_id\s*=",
-                        set_clause,
-                        flags=re.IGNORECASE,
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Call) or not node.args:
+                    continue
+                if not isinstance(node.func, ast.Attribute):
+                    continue
+                if node.func.attr in maintenance_calls:
+                    maintained.add(function.name)
+                if node.func.attr not in {"execute", "executemany", "executescript"}:
+                    continue
+                sql = _literal_sql(node.args[0])
+                if sql is None:
+                    continue
+                for statement in sql.split(";"):
+                    normalized = " ".join(statement.split())
+                    set_clause = ""
+                    if normalized.upper().startswith("UPDATE SESSIONS SET "):
+                        set_clause = normalized.split(" SET ", 1)[1].split(" WHERE ", 1)[0]
+                    is_update = bool(
+                        re.search(
+                            r"(?:^|,)\s*parent_session_id\s*=",
+                            set_clause,
+                            flags=re.IGNORECASE,
+                        )
                     )
-                )
-                is_upsert = bool(
-                    re.search(
-                        r"ON CONFLICT\s*\([^)]*\).*parent_session_id\s*=\s*COALESCE",
-                        normalized,
-                        flags=re.IGNORECASE,
+                    is_upsert = bool(
+                        re.search(
+                            r"ON CONFLICT\s*\([^)]*\).*parent_session_id\s*=\s*COALESCE",
+                            normalized,
+                            flags=re.IGNORECASE,
+                        )
                     )
-                )
-                if is_update or is_upsert:
-                    sites.add(function.name)
+                    if is_update or is_upsert:
+                        sites.add(function.name)
 
     return sites, maintained
 
 
 def test_all_six_session_parent_mutation_sites_are_maintenance_adjacent():
-    source = Path(hermes_state.__file__).read_text(encoding="utf-8")
+    # fork-parity: upstream's parity merge SPLIT the hermes_state monolith into
+    # hermes_state{,_portability,_schema,_search,_common}.py. The 6th mutation
+    # site (import_sessions' parent re-link) now lives in hermes_state_portability,
+    # so scanning hermes_state.py alone finds only 5 and the contract reads as a
+    # violation. Scan every module the SessionDB mixins are assembled from.
+    import hermes_state_portability
+
+    source = "\n".join(
+        Path(mod.__file__).read_text(encoding="utf-8")
+        for mod in (hermes_state, hermes_state_portability)
+    )
     sites, maintained = _parent_mutation_contract(source)
 
     assert len(sites) == 6, sites

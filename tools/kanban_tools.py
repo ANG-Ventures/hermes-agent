@@ -1534,17 +1534,18 @@ def subscribe_calling_session(
 
         # Lazy-import to keep the module-level dependency light
         from hermes_cli import kanban_db as _kb
-        # NOTE (fork parity, 2026-08-06): fork main's add_notify_sub predates
-        # the upstream chat_type / delivery_metadata params (config_defaults
-        # extraction + notify-sub enrichment are upstream-only until the next
-        # parity merge). Pass only the params this fork's signature accepts;
-        # the enrichment is additive and its absence just omits optional
-        # delivery metadata, never the subscription row itself.
+        # Parity NOTE resolved (2026-08-07 parity merge): fork main's
+        # add_notify_sub previously lacked upstream's chat_type /
+        # delivery_metadata params, so #470 stripped them here. The merge
+        # lands the full upstream signature, so the enrichment is reconnected
+        # and this is a plain upstream-form call again.
         _kb.add_notify_sub(
             conn, task_id=task_id,
             platform=platform, chat_id=chat_id,
+            chat_type=chat_type,
             thread_id=thread_id, user_id=user_id,
             notifier_profile=notifier_profile,
+            delivery_metadata=delivery_metadata or None,
         )
         return True
     except Exception as _exc:

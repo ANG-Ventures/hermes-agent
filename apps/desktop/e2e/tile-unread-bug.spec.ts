@@ -22,7 +22,12 @@ import {
   setupMockBackend,
   waitForAppReady,
 } from './fixtures'
-import { SIDEBAR_CROSS_TEXTS, restartMockServer } from './mock-server'
+import {
+  type BackgroundReleaseHandle,
+  createBackgroundReleaseHandle,
+  restartMockServer,
+  SIDEBAR_CROSS_TEXTS,
+} from './mock-server'
 
 /** Finished-unread dot aria-label. */
 const UNREAD_DOT_LABEL = 'Finished — unread'
@@ -54,7 +59,7 @@ function sessionRow(page: import('@playwright/test').Page, text: string) {
   return page.locator('[data-slot="sidebar"] button').filter({ hasText: text }).first()
 }
 
-/** Common setup: start a turn with a long bg process + subagent, wait for
+/** Common setup: start a turn with a held bg process + subagent, wait for
  *  the turn to complete, then switch to a new session so the first session is
  *  no longer $selectedStoredSessionId (required before opening a tile). */
 async function startTurnAndSwitchAway(page: import('@playwright/test').Page) {
@@ -87,8 +92,9 @@ async function startTurnAndSwitchAway(page: import('@playwright/test').Page) {
     { timeout: 90_000 },
   )
 
-  // The background dot should still be visible: the mock sleeps 30s
-  // (SIDEBAR_CROSS_BG_SLEEP_SECONDS), far longer than any turn latency.
+  // The background dot must still be visible: the turn is done but the
+  // process is held open by the sentinel, so this is a stable state rather
+  // than a window we have to catch in time.
   const bgDuringTurn = await page.locator(`[aria-label="${BG_DOT_LABEL}"]`).count()
   expect(bgDuringTurn, 'background dot should still be visible after turn completes').toBeGreaterThan(0)
 
@@ -98,17 +104,12 @@ async function startTurnAndSwitchAway(page: import('@playwright/test').Page) {
   await page.waitForTimeout(2000)
 }
 
-/**
- * Wait for the background process to finish and its dot to auto-dismiss.
- *
- * Budget must exceed the mock's background sleep (SIDEBAR_CROSS_BG_SLEEP_SECONDS,
- * 30s as of 2026-07-27) PLUS SUCCESS_LINGER_MS (4s) plus scheduling slack.
- * This is a HANG-GUARD, not a timing assertion: it asserts the dot eventually
- * disappears, and a ceiling well above the real duration fails only on a genuine
- * regression. (Keeping it at 30s while the sleep became 30s would have made THIS
- * a race in turn -- the exact bug we are fixing, relocated.)
- */
-async function waitForBgProcessToFinish(page: import('@playwright/test').Page) {
+/** Release the held background process, then wait for its dot to clear. */
+async function waitForBgProcessToFinish(
+  page: import('@playwright/test').Page,
+  release?: BackgroundReleaseHandle,
+) {
+  release?.release()
   await expect
     .poll(
       () => page.locator(`[aria-label="${BG_DOT_LABEL}"]`).count(),
@@ -173,15 +174,20 @@ test.describe('sidebar states — tab (hidden) unread is correct', () => {
   test.describe.configure({ mode: 'serial' })
 
   let fixture: MockBackendFixture
+  const bgRelease = createBackgroundReleaseHandle()
 
   test.beforeAll(async () => {
     restartMockServer()
-    fixture = await setupMockBackend()
+    fixture = await setupMockBackend({
+      mockServer: { backgroundReleasePath: bgRelease.path },
+    })
     await waitForAppReady(fixture, 120_000)
   })
 
   test.afterAll(async () => {
+    bgRelease.release()
     await fixture?.cleanup()
+    bgRelease.cleanup()
   })
 
   test('session opened as a tab (not visible) correctly gets unread dot', async () => {
@@ -221,18 +227,22 @@ test.describe('sidebar states — tab (hidden) unread is correct', () => {
     // Evidence: the tab is open but the session is not visible on screen.
     await page.screenshot({ path: 'test-results/tile-bug-tab-opened.png' })
 
-    await waitForBgProcessToFinish(page)
-    // The bg dot going away does NOT mean the unread-owning turn has ended.
+    await waitForBgProcessToFinish(page, bgRelease)
+    // fork parity NOTE (2026-08-07 upstream merge): the bg dot clearing does NOT
+    // mean the unread-owning turn has ended — the registry drop and the
+    // notify_on_complete follow-up land in either order (measured: ~0.5s apart
+    // about half the time). Upstream's sentinel removes the SLEEP race but not
+    // this one, so the fork's settle guard is kept; without it this helper was
+    // left defined-but-never-called by the merge.
     await waitForTurnToSettle(page)
 
     // A tab that's not the active tab IS hidden — the unread dot is correct.
     // The user is NOT looking at it, so marking it "unread" is right.
     //
-    // POLL, don't sample. The unread flag is set by an event-driven store
-    // transition, so a bare `.count()` reads whatever frame happens to be
-    // painted. The sibling cross-session spec in sidebar-states.spec.ts already
-    // polls this exact assertion for the same reason; this one was left as a
-    // one-shot read and was the last remaining sampler in the file.
+    // Poll rather than sampling once: "finished-unread" is an event-driven
+    // transition that lands slightly after the running dot clears, and with a
+    // released (rather than slowly-expiring) process there is no incidental
+    // slack between the two. Same reasoning as the cross-session spec.
     await expect
       .poll(
         () => page.locator(`[aria-label="${UNREAD_DOT_LABEL}"]`).count(),
@@ -252,15 +262,20 @@ test.describe.skip('sidebar states — split (visible) unread bug (RED)', () => 
   test.describe.configure({ mode: 'serial' })
 
   let fixture: MockBackendFixture
+  const bgRelease = createBackgroundReleaseHandle()
 
   test.beforeAll(async () => {
     restartMockServer()
-    fixture = await setupMockBackend()
+    fixture = await setupMockBackend({
+      mockServer: { backgroundReleasePath: bgRelease.path },
+    })
     await waitForAppReady(fixture, 120_000)
   })
 
   test.afterAll(async () => {
+    bgRelease.release()
     await fixture?.cleanup()
+    bgRelease.cleanup()
   })
 
   test('session visible in a split tile does NOT get unread dot when it finishes', async () => {
@@ -306,7 +321,14 @@ test.describe.skip('sidebar states — split (visible) unread bug (RED)', () => 
     // Evidence: the split tile is now open side-by-side — both sessions visible.
     await page.screenshot({ path: 'test-results/tile-bug-split-opened.png' })
 
-    await waitForBgProcessToFinish(page)
+    await waitForBgProcessToFinish(page, bgRelease)
+    // fork parity NOTE (2026-08-07 upstream merge): the bg dot clearing does NOT
+    // mean the unread-owning turn has ended — the registry drop and the
+    // notify_on_complete follow-up land in either order (measured: ~0.5s apart
+    // about half the time). Upstream's sentinel removes the SLEEP race but not
+    // this one, so the fork's settle guard is kept; without it this helper was
+    // left defined-but-never-called by the merge.
+    await waitForTurnToSettle(page)
 
     // THE BUG: the session visible in the split tile should NOT have the green
     // "finished unread" dot — the user is looking right at it. This assertion

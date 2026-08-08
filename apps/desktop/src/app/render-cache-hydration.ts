@@ -48,7 +48,11 @@ export interface HydrationResult {
 export async function hydrateFromRenderCache(deps: {
   getSessions: () => SessionInfo[]
   setSessions: (rows: SessionInfo[]) => void
-  setSessionsTotal: (total: number) => void
+  /** fork parity NOTE (2026-08-07 upstream merge): OPTIONAL now. Upstream deleted
+   *  the exact-totals store ($sessionsTotal/setSessionsTotal) in favour of
+   *  "is there another page?" booleans, so there is no longer a store to seed —
+   *  callers that still track a total may pass one, everyone else omits it. */
+  setSessionsTotal?: (total: number) => void
   rememberedSessionId?: string | null
   /** Optional transcript paint: only used when the messages store is empty. */
   getMessages?: () => unknown[]
@@ -104,7 +108,7 @@ export async function hydrateFromRenderCache(deps: {
     }
 
     deps.setSessions(rows)
-    deps.setSessionsTotal(Number.isFinite(cached!.total) ? cached!.total : rows.length)
+    deps.setSessionsTotal?.(Number.isFinite(cached!.total) ? cached!.total : rows.length)
 
     return {
       painted: true,

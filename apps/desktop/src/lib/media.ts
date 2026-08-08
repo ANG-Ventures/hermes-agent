@@ -83,6 +83,52 @@ export async function resolveMediaDisplaySrc(path: string): Promise<string> {
   return window.hermesDesktop.readFileDataUrl(filePathFromMediaPath(path))
 }
 
+// Audio/video need a seekable source instead of a whole-file data URL. Keep
+// remote URLs untouched, route gateway-local files through the authenticated
+// download endpoint, and reserve the Electron protocol for files on this
+// desktop machine.
+//
+// fork parity NOTE (2026-08-07 upstream merge): upstream reached for
+// `mediaExternalUrl` here, but the fork REPURPOSED that helper for the OS
+// shell-open path — it now returns a `hermes-gateway-file://` URL that Electron
+// hands to the bytes-to-temp opener, and its tests assert it never carries a
+// `token=` query (see media.remote.test.ts). A <video>/<audio> element cannot
+// play that scheme, so calling it here would silently break remote playback.
+// Both contracts are real, so the authenticated download URL upstream needs
+// lives in its own helper instead of one being bent to serve both.
+export async function resolveMediaPlaybackSrc(path: string): Promise<string> {
+  if (isInlineMediaSrc(path)) {
+    return path
+  }
+
+  if (window.hermesDesktop && ['audio', 'video'].includes(mediaKind(path))) {
+    return isRemoteGateway() ? mediaDownloadUrl(path) : mediaStreamUrl(path)
+  }
+
+  return resolveMediaDisplaySrc(path)
+}
+
+// The authenticated `/api/files/download` URL for a gateway-local file: a plain
+// https source a media element can range-request and seek. Falls back to the
+// shell-open form when the connection has no scoped token to embed.
+export function mediaDownloadUrl(path: string): string {
+  if (/^https?:/i.test(path)) {
+    return path
+  }
+
+  if (isRemoteGateway()) {
+    const conn = $connection.get()
+
+    if (conn?.baseUrl && conn.token) {
+      const file = encodeURIComponent(filePathFromMediaPath(path))
+
+      return `${conn.baseUrl}/api/files/download?path=${file}&token=${encodeURIComponent(conn.token)}`
+    }
+  }
+
+  return mediaExternalUrl(path)
+}
+
 // Resolve a media path to a URL the shell can open. Remote mode cannot hand a
 // gateway-local path to this machine's OS as file://, and Ace's OAuth config has
 // no scoped query token. Route through Electron's authenticated bytes-to-temp

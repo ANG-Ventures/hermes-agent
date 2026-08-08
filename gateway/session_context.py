@@ -36,8 +36,9 @@ needs to replace the import + call site:
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
 """
 
+from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any
+from typing import Any, Iterator
 
 import logging
 
@@ -77,6 +78,7 @@ def session_context_engaged() -> bool:
 _SESSION_PLATFORM: ContextVar = ContextVar("HERMES_SESSION_PLATFORM", default=_UNSET)
 _SESSION_SOURCE: ContextVar = ContextVar("HERMES_SESSION_SOURCE", default=_UNSET)
 _SESSION_CHAT_ID: ContextVar = ContextVar("HERMES_SESSION_CHAT_ID", default=_UNSET)
+_SESSION_CHAT_TYPE: ContextVar = ContextVar("HERMES_SESSION_CHAT_TYPE", default=_UNSET)
 _SESSION_CHAT_NAME: ContextVar = ContextVar("HERMES_SESSION_CHAT_NAME", default=_UNSET)
 _SESSION_THREAD_ID: ContextVar = ContextVar("HERMES_SESSION_THREAD_ID", default=_UNSET)
 _SESSION_USER_ID: ContextVar = ContextVar("HERMES_SESSION_USER_ID", default=_UNSET)
@@ -96,6 +98,7 @@ _SESSION_UI_SESSION_ID: ContextVar = ContextVar("HERMES_UI_SESSION_ID", default=
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
+
 
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
@@ -138,6 +141,7 @@ _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
     "HERMES_SESSION_SOURCE": _SESSION_SOURCE,
     "HERMES_SESSION_CHAT_ID": _SESSION_CHAT_ID,
+    "HERMES_SESSION_CHAT_TYPE": _SESSION_CHAT_TYPE,
     "HERMES_SESSION_CHAT_NAME": _SESSION_CHAT_NAME,
     "HERMES_SESSION_THREAD_ID": _SESSION_THREAD_ID,
     "HERMES_SESSION_USER_ID": _SESSION_USER_ID,
@@ -172,18 +176,62 @@ def set_current_session_id(session_id: str) -> None:
     ``os.environ`` write is kept for **non-gateway single-process** entrypoints
     (CLI rotation, cron-standalone, dispatcher-spawned workers) whose tools read
     the ``os.environ`` fallback and where there is no concurrency to clobber.
+    Delegated subagent children are the exception: they are constructed inside
+    the parent process within ``delegated_child_context()``, and their
+    ``AIAgent.__init__`` calls this same helper. Writing a child's internal
+    session id to ``os.environ`` (process-global) would clobber the parent's
+    ``HERMES_SESSION_ID`` for the rest of the process — leaking the child id
+    into parent tools and subprocesses spawned after the child was built. The
+    ContextVar write below is task-local and safe for concurrent children; only
+    the process-global ``os.environ`` mirror is suppressed for delegated
+    children. Root agents (CLI, gateway, cron) keep both paths.
     """
     import os
 
     _SESSION_ID.set(session_id)
+
+    # Skip the process-global os.environ write for delegated children. The
+    # child's own tools and subprocesses still resolve their id through the
+    # ContextVar (task-local), while the parent's process-wide env keeps the
+    # parent's session identity. See HermesPRDelegationSessionContext task.
+    try:
+        from agent.delegation_context import is_delegated_child_context
+
+        if is_delegated_child_context():
+            return
+    except Exception:
+        pass
+
+    # Both guards are load-bearing and independent: the delegated-child check
+    # above protects the PARENT's id within one process, and this gateway check
+    # protects every CONCURRENT session's id inside the gateway process (the
+    # v3-latch bug class — tests/gateway/test_no_gateway_session_env_writes.py).
     if os.environ.get("_HERMES_GATEWAY") != "1":
         os.environ["HERMES_SESSION_ID"] = session_id
+
+
+@contextmanager
+def scoped_current_session_id(session_id: str | None = None) -> Iterator[None]:
+    """Bind a task-local session id and restore the prior value on exit.
+
+    With ``session_id=None`` this acts as a save/restore boundary around code
+    that may call :func:`set_current_session_id` itself (notably delegated
+    ``AIAgent`` construction).  It intentionally never mutates ``os.environ``.
+    """
+    previous = _SESSION_ID.get()
+    if session_id is not None:
+        _SESSION_ID.set(session_id)
+    try:
+        yield
+    finally:
+        _SESSION_ID.set(previous)
 
 
 def set_session_vars(
     platform: str = "",
     source: str = "",
     chat_id: str = "",
+    chat_type: str = "",
     chat_name: str = "",
     thread_id: str = "",
     user_id: str = "",
@@ -195,6 +243,7 @@ def set_session_vars(
     cwd: str = "",
     async_delivery: bool = True,
     ui_session_id: str = "",
+    cron_session: Any = _UNSET,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -209,6 +258,10 @@ def set_session_vars(
     background completion back to the agent after the turn ends (see
     ``_SESSION_ASYNC_DELIVERY`` / ``async_delivery_supported``). Stateless
     request/response adapters (the API server) pass ``False``.
+
+    ``cron_session`` is tri-state: ``_UNSET`` preserves legacy
+    ``os.environ["HERMES_CRON_SESSION"]`` fallback, ``"1"`` marks a cron job,
+    and ``""`` explicitly marks a non-cron session while masking leaked env.
     """
     # Mark the session-context machinery engaged for this process. The
     # subprocess-env bridge uses this to switch from "os.environ fallback" to
@@ -219,6 +272,7 @@ def set_session_vars(
         _SESSION_PLATFORM.set(platform),
         _SESSION_SOURCE.set(source),
         _SESSION_CHAT_ID.set(chat_id),
+        _SESSION_CHAT_TYPE.set(chat_type),
         _SESSION_CHAT_NAME.set(chat_name),
         _SESSION_THREAD_ID.set(thread_id),
         _SESSION_USER_ID.set(user_id),
@@ -228,6 +282,7 @@ def set_session_vars(
         _SESSION_UI_SESSION_ID.set(ui_session_id),
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
+        _CRON_SESSION.set(cron_session),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
     try:
@@ -273,6 +328,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_PLATFORM,
         _SESSION_SOURCE,
         _SESSION_CHAT_ID,
+        _SESSION_CHAT_TYPE,
         _SESSION_CHAT_NAME,
         _SESSION_THREAD_ID,
         _SESSION_USER_ID,
@@ -282,6 +338,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_UI_SESSION_ID,
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
+        _CRON_SESSION,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a
@@ -484,6 +541,56 @@ def is_cron_session() -> bool:
     from utils import is_truthy_value
 
     return is_truthy_value(get_session_env("HERMES_CRON_SESSION", ""), default=False)
+# Surfaces that are not a human chat channel. The gateway binds a platform
+# value (``telegram``) to HERMES_SESSION_PLATFORM, while the CLI, TUI, and
+# desktop bind HERMES_SESSION_SOURCE (``cli``, ``tui``, ``desktop``) and leave
+# the platform empty — so both have to be consulted. ``local``, ``api_server``,
+# ``webhook``, and ``msgraph_webhook`` are real Platform values that reach
+# HERMES_SESSION_PLATFORM but have no attachment channel behind them.
+# Default-deny: an unrecognized identity counts as messaging so a newly added
+# chat platform is never treated as a private surface before this set is
+# updated. Mirrors LOCAL_SESSION_SOURCE_IDS in
+# apps/desktop/src/lib/session-source.ts; keep roughly in sync when adding a
+# local or programmatic surface.
+NON_MESSAGING_SESSION_SURFACES = frozenset(
+    {
+        "",
+        "api_server",
+        "cli",
+        "codex",
+        "desktop",
+        "gateway",
+        "kanban",
+        "local",
+        "msgraph_webhook",
+        "tool",
+        "tui",
+        "webhook",
+    }
+)
+
+
+def session_is_messaging_surface() -> bool:
+    """Whether this turn is delivered over a human messaging channel.
+
+    Callers use this to decide anything that differs between "the user is
+    reading a chat message" and "the user is at a machine they own": whether
+    to emit a delivery tag, whether a file has to land somewhere the gateway
+    is allowed to send from, whether narration would read as chat noise.
+
+    Resolves ``HERMES_PLATFORM``, then the session platform, then the session
+    source, and reports messaging when any of them names a surface outside
+    :data:`NON_MESSAGING_SESSION_SURFACES`.
+    """
+    import os
+
+    platform = os.getenv("HERMES_PLATFORM") or get_session_env("HERMES_SESSION_PLATFORM", "")
+    source = get_session_env("HERMES_SESSION_SOURCE", "")
+    for identity in (platform, source):
+        identity = str(identity or "").strip().lower()
+        if identity and identity not in NON_MESSAGING_SESSION_SURFACES:
+            return True
+    return False
 
 
 def declare_stateless_channel() -> None:
