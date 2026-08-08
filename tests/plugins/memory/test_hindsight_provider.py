@@ -610,23 +610,29 @@ class TestPrefetchServerRetainVisibility:
         provider._client = self._client_with_ops(["pending", "pending", "completed"])
         provider._client.arecall = AsyncMock(side_effect=_recall)
 
-        # fork-parity: two independent wall-clock hazards made this test fail on
-        # CI's Linux runners (12 parallel workers) while passing on an idle mac:
+        # fork-parity: this test asserts an ORDERING contract (recall runs only
+        # after the tracked op reports completed, having polled >= 3 times) but
+        # the runtime reaches that state via real wall-clock sleeps, which made
+        # it fail on CI's contended Linux runners while passing on an idle mac.
         #
-        #   1. The status poll is spaced by _RETAIN_OP_POLL_INTERVAL_S (0.5s in
-        #      the runtime), so reaching the third "completed" status costs ~1.6s
-        #      of real sleeping.
-        #   2. _wait_for_retains_drained is bounded by _prefetch_retain_drain_timeout,
-        #      which DEFAULTS TO 10.0s — twice the 5.0s join budget below. Under
-        #      load the prefetch thread can legitimately still be inside its own
-        #      (correct) wait when the join gives up, so the assertions then read
-        #      a thread that simply had not finished yet.
+        # Two hazards, and note they pull in OPPOSITE directions -- the reason a
+        # single knob could not fix this:
         #
-        # Collapse the poll spacing AND bring the drain budget under the join so
-        # the test measures the ORDER contract it names rather than the scheduler.
-        # The runtime defaults are deliberately left alone — this is test pacing.
+        #   1. Poll spacing. _RETAIN_OP_POLL_INTERVAL_S is 0.5s, so reaching the
+        #      third "completed" status burns ~1.6s against the 5.0s join below.
+        #      Too SLOW => the join gives up mid-wait.
+        #   2. Drain budget. _wait_for_retains_drained gives barrier 1 (local
+        #      queue drain) and barrier 2 (server op polling) a SHARED deadline.
+        #      Too SHORT => a slow barrier 1 eats the budget and barrier 2 gets
+        #      one poll before expiring, dropping the op (await_count == 1) and
+        #      silently degrading into the timeout path this test is NOT about.
+        #
+        # So: make the polls effectively free (removes hazard 1) and keep the
+        # shared budget comfortably ABOVE what barrier 1 + three cheap polls
+        # need, while still UNDER the 5.0s join (removes hazard 2). Runtime
+        # defaults are deliberately untouched -- this is test pacing only.
         provider._RETAIN_OP_POLL_INTERVAL_S = 0.001
-        provider._prefetch_retain_drain_timeout = 2.0
+        provider._prefetch_retain_drain_timeout = 4.0
 
         provider.sync_turn("hello", "world")
         provider._retain_queue.join()
