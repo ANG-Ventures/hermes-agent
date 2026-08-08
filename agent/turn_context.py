@@ -1149,7 +1149,30 @@ def build_turn_context(
                     model=agent.model,
                 )
                 if _engine_preflight_status:
-                    agent._emit_status(_engine_preflight_status)
+                    # Ask the engine whether this pass is worth telling the user
+                    # about. A sanitize-only cleanup adoption RUNS but folds
+                    # nothing, so announcing it emits "maintenance compaction ...
+                    # this may take a moment" and then no stats at all, because
+                    # the stats renderer has a zero delta to report. Absent hook
+                    # => announce, so engines that never implement it are
+                    # byte-identical to today.
+                    _preflight_visible = True
+                    try:
+                        _visible_hook = getattr(
+                            _compressor, "preflight_is_user_visible", None
+                        )
+                        if callable(_visible_hook):
+                            _preflight_visible = bool(_visible_hook())
+                    except Exception:
+                        # A buggy engine must never silence a real compaction.
+                        _preflight_visible = True
+                    if _preflight_visible:
+                        agent._emit_status(_engine_preflight_status)
+                    else:
+                        logger.debug(
+                            "Engine preflight pass is not user-visible "
+                            "(sanitize-only); suppressing compaction status"
+                        )
                 _engine_input = messages
                 messages, active_system_prompt = agent._compress_context(
                     messages, system_message, approx_tokens=_preflight_tokens,

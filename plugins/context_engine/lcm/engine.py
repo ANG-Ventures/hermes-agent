@@ -1215,7 +1215,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """Whether the most recent compression/preflight decision was a no-op."""
         return self._last_compression_status == "noop"
 
-    def _mark_preflight_compression_requested(self, reason: str = "") -> bool:
+    def _mark_preflight_compression_requested(
+        self, reason: str = "", *, user_visible: bool = True
+    ) -> bool:
         """Record that preflight found work and clear any stale no-op reason.
 
         ``reason`` names WHICH branch of ``should_compress_preflight`` asked for
@@ -1225,11 +1227,30 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         compact at 46%?"). Every ``return True`` in the preflight decision tree
         routes through here, so the reason cannot drift out of sync with the
         branch that actually fired.
+
+        ``user_visible=False`` marks a pass that must RUN but must not announce
+        itself. Sanitize-only ingest-cleanup adoption is the case: it is
+        deterministic, already durable in the store, folds no messages and calls
+        no summarizer, so it routinely completes with the message count
+        unchanged. Announcing it produces a "maintenance compaction ... this may
+        take a moment" banner followed by no stats at all, because the stats
+        renderer has a zero delta to report. Measured 2026-08-08: 214 -> 214
+        messages in 171ms, and 4 of 21 compressions removed nothing.
         """
         self._last_compression_status = "pending"
         self._last_compression_noop_reason = ""
         self._last_preflight_reason = reason or ""
+        self._last_preflight_user_visible = bool(user_visible)
         return True
+
+    def preflight_is_user_visible(self) -> bool:
+        """Whether the pending preflight pass warrants a user-facing banner.
+
+        Consulted by the host AFTER ``should_compress_preflight()`` returns True
+        and BEFORE it emits compaction status. Defaults to True so any engine
+        that never sets the flag keeps today's behavior.
+        """
+        return bool(getattr(self, "_last_preflight_user_visible", True))
 
     @property
     def last_preflight_reason(self) -> str:
