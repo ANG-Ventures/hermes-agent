@@ -354,6 +354,14 @@ ENGINE_PREFLIGHT_MAINTENANCE_STATUS_TEMPLATE = (
     "(BELOW the {threshold:,} threshold) — the context engine requested this, "
     "not token pressure. This may take a moment."
 )
+# Same arm, but the engine told us WHY. A below-threshold compaction with no
+# cause reads as unprovoked ("we were nowhere near the threshold"), so prefer
+# this form whenever the engine exposes a reason.
+ENGINE_PREFLIGHT_MAINTENANCE_REASON_STATUS_TEMPLATE = (
+    "📦 {engine} maintenance compaction: ~{tokens:,} tokens "
+    "(BELOW the {threshold:,} threshold) — triggered because {reason}, "
+    "not token pressure. This may take a moment."
+)
 IDLE_COMPACTION_STATUS_TEMPLATE = (
     "💤 Resumed after {idle_seconds}s idle — compacting "
     "~{tokens:,} tokens before continuing."
