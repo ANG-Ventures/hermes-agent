@@ -86,6 +86,11 @@ paths = [
   '''plugins/context_engine/lcm/assertion_store\.py''',       # matches `allow_empty=True` kwarg, not a secret
   '''scripts/toolperf_abeval/ab_eval\.py''',                  # synthetic build-log marker `UNIQUE_TOKEN=tok_9f31c_middle`
   '''optional-skills/productivity/telephony/scripts/telephony\.py''',  # PUBLIC ElevenLabs voice ID (cjVigY5qzO86Huf0OWal, "Eric")
+  # Found only by gitleaks 8.18.4 (the version CI pins); 8.30.x does not flag these.
+  '''tests/gateway/test_buzz_websocket\.py''',       # SELF_PUBKEY = Nostr PUBLIC key + BIP-340 test vector
+  '''tests/gateway/test_buzz_adapter\.py''',         # same Nostr PUBLIC key constant
+  '''tests/test_iron_proxy\.py''',                   # literal "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END..."
+  '''tests/run_agent/test_run_agent_init_memory\.py''',  # api_key="test-key-123456789"
 ]
 # Regex allowlist — SOURCE files keep full scanning EXCEPT public OAuth *client
 # IDs* (client IDs are sent in browser auth flows — public by design, not
