@@ -27,6 +27,7 @@ import time
 import pytest
 
 from tools import async_delegation as ad
+from tools.process_registry import process_registry
 
 # Reuse the persistence suite's fixtures/builders so the two files cannot drift.
 # `_isolated_registry` is autouse; importing it into this module registers it here.
@@ -188,11 +189,34 @@ def test_restart_notice_names_whether_the_superseded_attempt_ever_started(
         runner_factory=lambda claimed, continuation: resumed_runner,
         max_async_children=1,
     )
-    assert started.wait(timeout=5)
-    assert result["claimed"] == 1
+    try:
+        assert started.wait(timeout=5)
+        assert result["claimed"] == 1
 
-    current = _load()["records"][record["delegation_id"]]
-    events = _restart_events(current)
-    assert events, "expected a restart notice"
-    assert events[-1]["payload"]["died_before_start"] is died_before_start
-    gate.set()
+        current = _load()["records"][record["delegation_id"]]
+        events = _restart_events(current)
+        assert events, "expected a restart notice"
+        assert events[-1]["payload"]["died_before_start"] is died_before_start
+    finally:
+        # Release the resumed runner and JOIN its completion before leaving.
+        # `_isolated_registry` drains the queue at teardown ENTRY, which is too
+        # early: this worker thread is still finishing and pushes its terminal
+        # event *after* that drain, leaking a live `async_delegation` event that
+        # a later test then dequeues as if it were its own. Block until the
+        # event lands, then drain, so the queue is provably clean on exit.
+        gate.set()
+        deadline = time.time() + 30
+        evt = None
+        while time.time() < deadline:
+            try:
+                evt = process_registry.completion_queue.get(timeout=0.5)
+                break
+            except Exception:
+                continue
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+        ad._reset_for_tests()
+
+    assert evt is not None, "resumed runner never published its completion"
+    # Nothing is left behind for an unrelated test to dequeue.
+    assert process_registry.completion_queue.empty()
