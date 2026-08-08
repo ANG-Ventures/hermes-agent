@@ -239,3 +239,45 @@ def test_dedupe_reset_is_wired_into_turn_context():
         "the dedupe reset must run BEFORE _restore_primary_runtime() — the "
         "restore path early-returns on cooldown without clearing it"
     )
+
+
+def test_single_hop_emits_exactly_one_chat_line(monkeypatch):
+    """ONE failover hop must produce ONE chat line, not two.
+
+    Regression for the 2026-08-07 duplicate-alert report: ``try_activate_fallback``
+    set BOTH the rich ``_emit_fallback_announce`` line AND a plainer one-shot
+    ``_pending_fallback_notice`` ("🔄 Switched to fallback model: ...").  The
+    notice was surfaced later by ``_emit_pending_fallback_notice`` on the turn's
+    first successful content, so a single apx-1 → apx-2 hop rendered as two
+    Discord messages, minutes apart, the second reading as a fresh switch.
+
+    The notice also bypassed the ``model.announce_route_change`` gate and the
+    per-transition dedupe that the announce honors, so it could not be turned
+    off and re-fired on re-entrant hops.
+    """
+    _patch_resolver(monkeypatch)
+    ac.set_runtime_main("claude-pool", "claude-opus-4-8",
+                        base_url="http://127.0.0.1:18810/anthropic",
+                        api_key="primary-key", api_mode="anthropic_messages")
+    agent = _fake_agent(model="claude-opus-4-8", provider="claude-pool",
+                        base_url="http://127.0.0.1:18810/anthropic",
+                        api_mode="anthropic_messages")
+
+    assert try_activate_fallback(agent, reason=FailoverReason.overloaded) is True
+
+    # No second, competing notice may be staged for the success path.
+    assert getattr(agent, "_pending_fallback_notice", None) is None, (
+        "try_activate_fallback staged a second fallback line; one hop must "
+        "produce exactly one chat message"
+    )
+
+    # And the user-visible total for this hop is exactly one line.
+    switch_lines = [
+        m for (_k, m) in agent._announced
+        if "fallback" in m.lower() or "switched to" in m.lower()
+    ]
+    assert len(switch_lines) == 1, (
+        f"one hop must emit one chat line, got {len(switch_lines)}: {switch_lines!r}"
+    )
+    # The surviving line is the rich one (carries the reason rider).
+    assert switch_lines[0].startswith("🔄 Model fallback"), switch_lines[0]
