@@ -1892,3 +1892,144 @@ class TestFinalPayloadHasNoBlankTextBlocks:
         )
         image_blocks = [b for b in tool_result_block["content"] if b.get("type") == "image"]
         assert len(image_blocks) == 1
+
+
+# ---------------------------------------------------------------------------
+# model.fine_grained_tool_streaming_beta knob
+# ---------------------------------------------------------------------------
+
+
+class TestFineGrainedToolStreamingBetaKnob:
+    """``model.fine_grained_tool_streaming_beta`` gates _TOOL_STREAMING_BETA.
+
+    The beta went GA on Claude 4.6+, so the header is a documented no-op
+    there. The knob lets an install stop advertising it without touching
+    code. Default True == the historical wire bytes.
+    """
+
+    @staticmethod
+    def _write_config(tmp_path, body: str):
+        (tmp_path / "config.yaml").write_text(body)
+
+    @staticmethod
+    def _reset_config_cache(monkeypatch):
+        """Clear config.py's real path-keyed caches for this test only."""
+        import hermes_cli.config as _cfg
+
+        monkeypatch.setattr(_cfg, "_LOAD_CONFIG_CACHE", {}, raising=True)
+        monkeypatch.setattr(_cfg, "_RAW_CONFIG_CACHE", {}, raising=True)
+
+    def _load(self, tmp_path, monkeypatch, body: str):
+        """Point config loading at a temp HERMES_HOME and return the flag."""
+        from agent.anthropic_adapter import (
+            _common_betas,
+            _fine_grained_tool_streaming_beta_enabled,
+        )
+
+        self._write_config(tmp_path, body)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._reset_config_cache(monkeypatch)
+        return _fine_grained_tool_streaming_beta_enabled(), _common_betas()
+
+    def test_default_absent_key_keeps_beta(self, tmp_path, monkeypatch):
+        """No key set == historical behaviour: the beta is still emitted."""
+        from agent.anthropic_adapter import _COMMON_BETAS
+
+        enabled, betas = self._load(tmp_path, monkeypatch, "model:\n  default: x\n")
+        assert enabled is True
+        assert betas == _COMMON_BETAS
+
+    def test_explicit_true_keeps_beta(self, tmp_path, monkeypatch):
+        from agent.anthropic_adapter import _COMMON_BETAS
+
+        enabled, betas = self._load(
+            tmp_path,
+            monkeypatch,
+            "model:\n  fine_grained_tool_streaming_beta: true\n",
+        )
+        assert enabled is True
+        assert betas == _COMMON_BETAS
+
+    def test_false_strips_only_that_beta(self, tmp_path, monkeypatch):
+        """The knob removes FGTS and NOTHING else."""
+        from agent.anthropic_adapter import _COMMON_BETAS, _TOOL_STREAMING_BETA
+
+        enabled, betas = self._load(
+            tmp_path,
+            monkeypatch,
+            "model:\n  fine_grained_tool_streaming_beta: false\n",
+        )
+        assert enabled is False
+        assert _TOOL_STREAMING_BETA not in betas
+        # Every other common beta survives, in order.
+        assert betas == [b for b in _COMMON_BETAS if b != _TOOL_STREAMING_BETA]
+        assert "interleaved-thinking-2025-05-14" in betas
+
+    def test_malformed_value_falls_back_to_default(self, tmp_path, monkeypatch):
+        """A non-bool must not strip a beta an endpoint might require."""
+        from agent.anthropic_adapter import _COMMON_BETAS
+
+        enabled, betas = self._load(
+            tmp_path,
+            monkeypatch,
+            "model:\n  fine_grained_tool_streaming_beta: 'nonsense'\n",
+        )
+        assert enabled is True
+        assert betas == _COMMON_BETAS
+
+    def test_falsy_non_bool_falls_back_to_default(self, tmp_path, monkeypatch):
+        """A falsy NON-bool (0) must not be coerced into "strip the beta"."""
+        from agent.anthropic_adapter import _COMMON_BETAS
+
+        body = "model:\n  fine_grained_tool_streaming_beta: " + chr(48) + "\n"
+        enabled, betas = self._load(tmp_path, monkeypatch, body)
+        assert enabled is True
+        assert betas == _COMMON_BETAS
+
+    def test_unreadable_config_falls_back_to_default(self, monkeypatch):
+        """A raising config loader must fail SAFE (keep the beta)."""
+        import agent.anthropic_adapter as mod
+
+        def _boom(*_a, **_kw):
+            raise RuntimeError("config exploded")
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly", _boom, raising=True
+        )
+        assert mod._fine_grained_tool_streaming_beta_enabled() is True
+        assert mod._common_betas() == mod._COMMON_BETAS
+
+    def test_knob_reaches_the_built_client_header(self, tmp_path, monkeypatch):
+        """End-to-end: the knob changes the actual anthropic-beta header."""
+        from agent.anthropic_adapter import _TOOL_STREAMING_BETA
+
+        self._write_config(
+            tmp_path, "model:\n  fine_grained_tool_streaming_beta: false\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._reset_config_cache(monkeypatch)
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client("sk-ant-oat01-" + "x" * 60)
+            betas = mock_sdk.Anthropic.call_args[1]["default_headers"][
+                "anthropic-beta"
+            ]
+        assert _TOOL_STREAMING_BETA not in betas
+        # The OAuth betas real Claude Code DOES send must survive.
+        assert "oauth-2025-04-20" in betas
+        assert "claude-code-20250219" in betas
+        assert "interleaved-thinking-2025-05-14" in betas
+
+    def test_minimax_still_stripped_when_knob_on(self, tmp_path, monkeypatch):
+        """The pre-existing MiniMax strip is independent of the knob."""
+        from agent.anthropic_adapter import (
+            _common_betas_for_base_url,
+            _TOOL_STREAMING_BETA,
+        )
+
+        self._write_config(
+            tmp_path, "model:\n  fine_grained_tool_streaming_beta: true\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._reset_config_cache(monkeypatch)
+        betas = _common_betas_for_base_url("https://api.minimax.io/anthropic")
+        assert _TOOL_STREAMING_BETA not in betas

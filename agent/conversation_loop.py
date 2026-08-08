@@ -6094,6 +6094,24 @@ def run_conversation(
             if agent.api_mode == "anthropic_messages":
                 _normalize_kwargs["strip_tool_prefix"] = agent._is_anthropic_oauth
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
+
+            # Provider-specific response post-processing (inverse of
+            # ProviderProfile.prepare_messages). Default is pass-through, so
+            # this is a no-op for every provider that does not opt in.
+            # Guarded: a misbehaving profile must not cost a user-visible turn.
+            try:
+                from providers import get_provider_profile as _gpp
+
+                _resp_profile = _gpp(agent.provider)
+                if _resp_profile is not None and isinstance(
+                    getattr(normalized, "content", None), str
+                ):
+                    normalized.content = _resp_profile.process_response_text(
+                        normalized.content
+                    )
+            except Exception:
+                pass
+
             assistant_message = normalized
             finish_reason = normalized.finish_reason
             
