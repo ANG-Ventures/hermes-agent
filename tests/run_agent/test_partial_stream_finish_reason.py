@@ -392,7 +392,7 @@ class TestEmptyPartialStreamStubNotPersisted:
     """
 
     def test_empty_stub_only_appends_continuation_user_message(self, loop_agent):
-        from tests.run_agent.test_run_agent import _mock_response, _mock_assistant_msg
+        from tests.run_agent._run_agent_helpers import _mock_response, _mock_assistant_msg
 
         # First API call: empty partial-stream stub — stream died mid
         # tool-call args with zero text delivered.
@@ -476,7 +476,7 @@ class TestBuildAssistantMessageEmptyContentPad:
 
     def test_empty_content_stored_as_is(self):
         from agent.chat_completion_helpers import build_assistant_message
-        from tests.run_agent.test_run_agent import _mock_assistant_msg
+        from tests.run_agent._run_agent_helpers import _mock_assistant_msg
 
         agent = self._agent_for_builder()
         msg = build_assistant_message(agent, _mock_assistant_msg(content=""), "stop")
@@ -488,7 +488,7 @@ class TestBuildAssistantMessageEmptyContentPad:
 
     def test_tool_call_turn_content_left_empty(self):
         from agent.chat_completion_helpers import build_assistant_message
-        from tests.run_agent.test_run_agent import _mock_assistant_msg, _mock_tool_call
+        from tests.run_agent._run_agent_helpers import _mock_assistant_msg, _mock_tool_call
 
         agent = self._agent_for_builder()
         msg = build_assistant_message(
@@ -501,7 +501,7 @@ class TestBuildAssistantMessageEmptyContentPad:
 
     def test_non_empty_content_unchanged(self):
         from agent.chat_completion_helpers import build_assistant_message
-        from tests.run_agent.test_run_agent import _mock_assistant_msg
+        from tests.run_agent._run_agent_helpers import _mock_assistant_msg
 
         agent = self._agent_for_builder()
         msg = build_assistant_message(agent, _mock_assistant_msg(content="hi"), "stop")
@@ -521,7 +521,7 @@ class TestSendTimeEmptyAssistantPad:
     be empty" / Anthropic "all messages must have non-empty content")."""
 
     def _run_one_turn_with_history(self, loop_agent, history):
-        from tests.run_agent.test_run_agent import _mock_response
+        from tests.run_agent._run_agent_helpers import _mock_response
         loop_agent.client.chat.completions.create.return_value = _mock_response(
             content="ok", finish_reason="stop",
         )
@@ -604,7 +604,7 @@ class TestSendTimePadMultimodalSafety:
     """
 
     def test_multimodal_assistant_content_not_touched(self, loop_agent):
-        from tests.run_agent.test_run_agent import _mock_response
+        from tests.run_agent._run_agent_helpers import _mock_response
         multimodal = [
             {"role": "user", "content": "look at this"},
             {"role": "assistant", "content": [
