@@ -610,6 +610,16 @@ class TestPrefetchServerRetainVisibility:
         provider._client = self._client_with_ops(["pending", "pending", "completed"])
         provider._client.arecall = AsyncMock(side_effect=_recall)
 
+        # fork-parity: the status poll is spaced by _RETAIN_OP_POLL_INTERVAL_S
+        # (0.5s in the runtime), so reaching the third "completed" status costs
+        # ~1.6s of real sleeping against the 5.0s join below — only ~3x margin.
+        # On a loaded CI runner (12 parallel workers) that margin is not enough
+        # and the join returns with the thread still sleeping, leaving
+        # order == [] (an ordering assertion failing for wall-clock reasons,
+        # not a behaviour regression). Collapse the poll spacing so the test
+        # measures the ORDER contract it names, not the scheduler.
+        provider._RETAIN_OP_POLL_INTERVAL_S = 0.001
+
         provider.sync_turn("hello", "world")
         provider._retain_queue.join()
         assert "op-1" in provider._pending_retain_ops
@@ -617,6 +627,9 @@ class TestPrefetchServerRetainVisibility:
         provider.queue_prefetch("next turn query")
         if provider._prefetch_thread:
             provider._prefetch_thread.join(timeout=5.0)
+            assert not provider._prefetch_thread.is_alive(), (
+                "prefetch thread did not finish within the join budget"
+            )
 
         # Recall ran, the op was polled to completion, and the pending set
         # was cleared (so a later prefetch won't re-poll it).

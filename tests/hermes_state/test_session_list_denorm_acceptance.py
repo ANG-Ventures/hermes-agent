@@ -633,7 +633,15 @@ def test_begin_immediate_serializes_detach_with_concurrent_insert(tmp_path):
         inserter.close()
 
 
+@pytest.mark.requires_wal
 def test_deferred_detach_upgrade_fails_after_concurrent_insert(tmp_path):
+    # fork-parity: this test asserts the DB is in WAL, then relies on WAL's
+    # deferred-read/upgrade semantics to produce SQLITE_BUSY. On SQLite builds
+    # carrying the WAL-reset bug (3.7.0-3.51.2), Hermes deliberately falls back
+    # to journal_mode=DELETE, so there is no WAL to assert on and the busy path
+    # never arises -- the test would be measuring a mode the runtime declined
+    # to enable, not a regression. The marker is upstream's own mechanism
+    # (tests/conftest.py::_wal_is_usable); this fork-only test predates it.
     db_path = tmp_path / "state.db"
     setup = SessionDB(db_path=db_path)
     try:
