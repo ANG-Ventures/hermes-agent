@@ -1187,13 +1187,28 @@ class TestRunCommandSttIdleTimeout:
         idle timeout shorter than its total runtime."""
         from tools.transcription_tools import _run_command_stt
 
+        # fork-parity: the original used timeout=0.1 with 0.04s ticks. That
+        # budget is an IDLE window, and the FIRST window has to cover Python
+        # interpreter startup, not just the sleep -- measured at 18ms median
+        # but 80ms worst case on an idle mac, i.e. 20ms of headroom. Under the
+        # parallel suite (per-file subprocesses, 5+ workers) startup routinely
+        # exceeds 100ms and the process is killed before its first tick, so the
+        # test failed 5/6 runs under 12-way CPU load while passing alone.
+        #
+        # Scale both sides by 5x rather than only the timeout: the property
+        # under test is "ticks keep resetting the idle timer, so total runtime
+        # (0.8s) may exceed the idle window (0.5s)" -- which still holds, and
+        # now with ~10x headroom over worst-case startup instead of 0.25x.
+        tick_interval = 0.2
+        idle_timeout = 0.5
+
         script = tmp_path / "progress_then_exit.py"
         script.write_text(
             "\n".join([
                 "import sys, time",
                 "for idx in range(4):",
                 "    print(f'tick {idx}', file=sys.stderr, flush=True)",
-                "    time.sleep(0.04)",
+                f"    time.sleep({tick_interval})",
                 "print('done', flush=True)",
             ]),
             encoding="utf-8",
@@ -1201,7 +1216,7 @@ class TestRunCommandSttIdleTimeout:
 
         result = _run_command_stt(
             self._shell_command(sys.executable, "-u", str(script)),
-            timeout=0.1,
+            timeout=idle_timeout,
         )
 
         assert result.returncode == 0
