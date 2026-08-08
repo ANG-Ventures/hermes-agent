@@ -392,6 +392,23 @@ def _background_review_write_guard(
         # same write was refused from then on. "Allowed exactly once" is not a
         # policy — it is a race with our own bookkeeping. Fail closed for both
         # shapes; `hermes curator adopt <name>` is the supported way in.
+        #
+        # FORK EXCEPTION (parity merge 2026-08-08): a skill living in a
+        # SHARED-CURATABLE dir is already an explicit, user-configured opt-in to
+        # autonomous curation — that is the entire purpose of
+        # ``skills.shared_curatable`` / ``is_shared_curatable_path`` (see the
+        # external-dir guard above, which deliberately lets these through). The
+        # fleet's shared skill tree is maintained BY the curator across agents;
+        # requiring a per-skill `hermes curator adopt` for each of them would
+        # disable shared-tree maintenance wholesale. Upstream has no shared tree,
+        # so its "must be curator-managed" rule never had to consider this case.
+        try:
+            from agent.skill_utils import is_shared_curatable_path
+            if is_shared_curatable_path(skill_dir):
+                return None
+        except Exception:
+            logger.debug("shared-curatable check failed for %s", name, exc_info=True)
+
         usage_data = skill_usage.load_usage()
         usage_rec = usage_data.get(name)
         if not skill_usage._is_curator_managed_record(usage_rec):

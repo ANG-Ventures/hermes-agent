@@ -108,8 +108,14 @@ class TestCalibration:
 
     def test_calibrated_motivating_644k_776k_defers(self, compressor):
         # The real 2026-06-26 case: real 644,027 on a ~776,594 rough request.
-        compressor.threshold_tokens = 750_000
+        # Parity merge 2026-08-08: threshold_tokens and context_length are now
+        # lazy PROPERTIES, and the context_length setter invalidates the derived
+        # budgets (_threshold_tokens = None) for a genuinely new window. Setting
+        # threshold FIRST therefore had it silently wiped by the very next line.
+        # Set the window first, then pin the threshold — the order real
+        # initialisation uses.
         compressor.context_length = 1_000_000
+        compressor.threshold_tokens = 750_000
         compressor._skew_floor = 0.6
         compressor.note_rough_sent(776_594)
         compressor.update_from_response({"prompt_tokens": 644_027, "completion_tokens": 10})
@@ -119,8 +125,14 @@ class TestCalibration:
         assert compressor.should_compress_calibrated(776_594) is False
 
     def test_calibrated_real_over_threshold_compacts(self, compressor):
-        compressor.threshold_tokens = 750_000
+        # Parity merge 2026-08-08: threshold_tokens and context_length are now
+        # lazy PROPERTIES, and the context_length setter invalidates the derived
+        # budgets (_threshold_tokens = None) for a genuinely new window. Setting
+        # threshold FIRST therefore had it silently wiped by the very next line.
+        # Set the window first, then pin the threshold — the order real
+        # initialisation uses.
         compressor.context_length = 1_000_000
+        compressor.threshold_tokens = 750_000
         # real ABOVE threshold on its request → skew ~1.0, calibrated ≈ raw → compacts.
         compressor.note_rough_sent(800_000)
         compressor.update_from_response({"prompt_tokens": 790_000, "completion_tokens": 10})
@@ -129,8 +141,14 @@ class TestCalibration:
     def test_no_ratchet_multi_turn(self, compressor):
         """The v0.1 defect: repeated sub-threshold turns must NOT creep the trigger.
         Calibration is a pure function of recorded scalars — structurally no creep."""
-        compressor.threshold_tokens = 750_000
+        # Parity merge 2026-08-08: threshold_tokens and context_length are now
+        # lazy PROPERTIES, and the context_length setter invalidates the derived
+        # budgets (_threshold_tokens = None) for a genuinely new window. Setting
+        # threshold FIRST therefore had it silently wiped by the very next line.
+        # Set the window first, then pin the threshold — the order real
+        # initialisation uses.
         compressor.context_length = 1_000_000
+        compressor.threshold_tokens = 750_000
         compressor._skew_floor = 0.6
         compressor.note_rough_sent(776_594)
         compressor.update_from_response({"prompt_tokens": 644_027, "completion_tokens": 10})
@@ -146,8 +164,14 @@ class TestCalibration:
     def test_raw_ceiling_fires_regardless_of_skew(self, compressor):
         """Dense in-turn paste / skew-content mismatch (INV-10): a raw rough near the
         window compacts even if a stale low skew would scale it under threshold."""
-        compressor.threshold_tokens = 750_000
+        # Parity merge 2026-08-08: threshold_tokens and context_length are now
+        # lazy PROPERTIES, and the context_length setter invalidates the derived
+        # budgets (_threshold_tokens = None) for a genuinely new window. Setting
+        # threshold FIRST therefore had it silently wiped by the very next line.
+        # Set the window first, then pin the threshold — the order real
+        # initialisation uses.
         compressor.context_length = 1_000_000
+        compressor.threshold_tokens = 750_000
         compressor._skew_floor = 0.5
         compressor._hard_frac = 0.95
         # Seed a low stale skew (0.6) from an earlier benign turn.
