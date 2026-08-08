@@ -6,13 +6,88 @@ Uses tiktoken when available, falls back to char-based estimate.
 import logging
 import threading
 from functools import lru_cache
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from .message_content import normalize_content_value
 
 logger = logging.getLogger(__name__)
 
 _CHARS_PER_TOKEN = 4
+
+# --- Media part accounting ---------------------------------------------------
+#
+# Multimodal content parts carry their payload as base64 (a data URL, or an
+# Anthropic ``source.data`` blob). ``normalize_content_value`` JSON-dumps the
+# whole structure, so counting its characters bills a 1.5 MB screenshot as
+# ~500,000 tokens when the provider charges ~1,500. Measured on a real
+# 1710x1518 PNG: char-counting gave 502,182 tokens vs Anthropic's actual
+# (w * h / 750) = 3,461 -- a 145x overestimate that drove spurious compaction.
+#
+# Providers price attachments by DIMENSION or PAGE, never by transport size, so
+# the payload's character length carries no pricing signal at all. Use a flat
+# per-part cost, which is the same model the host estimator uses.
+_IMAGE_PART_TOKENS = 1500
+# A PDF/document page costs roughly an image; we cannot cheaply count pages
+# without parsing, so bill a conservative multi-page default.
+_DOCUMENT_PART_TOKENS = 3000
+# Audio is billed per second of duration; the payload length is likewise not a
+# usable proxy. Flat, conservative.
+_AUDIO_PART_TOKENS = 1500
+
+_IMAGE_PART_TYPES = frozenset({"image", "image_url", "input_image"})
+_DOCUMENT_PART_TYPES = frozenset({"document", "input_file", "file"})
+_AUDIO_PART_TYPES = frozenset({"input_audio", "audio"})
+
+_MEDIA_PART_COSTS = tuple(
+    (types, cost)
+    for types, cost in (
+        (_IMAGE_PART_TYPES, _IMAGE_PART_TOKENS),
+        (_DOCUMENT_PART_TYPES, _DOCUMENT_PART_TOKENS),
+        (_AUDIO_PART_TYPES, _AUDIO_PART_TOKENS),
+    )
+)
+
+
+def media_part_token_cost(part: Any) -> int:
+    """Flat token cost for a multimodal content part, or 0 if it is not media.
+
+    Returns 0 for text parts and anything unrecognized, so callers can fall
+    through to normal character-based counting.
+    """
+    if not isinstance(part, dict):
+        return 0
+    part_type = part.get("type")
+    if not part_type:
+        return 0
+    for types, cost in _MEDIA_PART_COSTS:
+        if part_type in types:
+            return cost
+    return 0
+
+
+# Optional host-supplied replacement for ``count_messages_tokens``. A host that
+# already calibrates its token estimates against real provider usage can
+# register that counter here so LCM's compaction decisions and the host's
+# display agree, instead of each maintaining an independent guess that can
+# silently diverge. ``None`` = use the built-in estimate.
+_host_messages_token_counter: "Optional[Callable[[List[Dict[str, Any]]], int]]" = None
+
+
+def set_messages_token_counter(
+    counter: "Optional[Callable[[List[Dict[str, Any]]], int]]",
+) -> None:
+    """Register (or clear, with ``None``) the host's message token counter."""
+    global _host_messages_token_counter
+    if counter is not None and not callable(counter):
+        raise TypeError("token counter must be callable or None")
+    _host_messages_token_counter = counter
+
+
+def get_messages_token_counter() -> "Optional[Callable[[List[Dict[str, Any]]], int]]":
+    """Return the registered host counter, or ``None`` if using the built-in."""
+    return _host_messages_token_counter
+
+
 _encoder = None
 _encoder_ready = False
 _encoder_lock = threading.Lock()
@@ -151,11 +226,49 @@ def count_tokens(text) -> int:
     return _count_tokens_core(text)
 
 
+def _split_media_from_content(content: Any) -> tuple[Any, int]:
+    """Return (content_without_media, media_tokens).
+
+    Media parts are replaced by a short placeholder so the surrounding text is
+    still counted normally, while the base64 payload never reaches the
+    character counter.
+    """
+    media_tokens = 0
+    if isinstance(content, list):
+        remaining: List[Any] = []
+        for part in content:
+            cost = media_part_token_cost(part)
+            if cost:
+                media_tokens += cost
+                continue
+            remaining.append(part)
+        return remaining, media_tokens
+    # Multimodal tool results arrive wrapped: {"_multimodal": True, "content": [...]}
+    if isinstance(content, dict) and content.get("_multimodal"):
+        inner, inner_tokens = _split_media_from_content(content.get("content"))
+        if inner_tokens:
+            return {**content, "content": inner}, inner_tokens
+    return content, media_tokens
+
+
 def count_message_tokens(msg: Dict[str, Any]) -> int:
-    """Estimate tokens for a single OpenAI-format message."""
+    """Estimate tokens for a single OpenAI-format message.
+
+    Multimodal parts (images, documents, audio) are billed at a flat per-part
+    cost rather than by the character length of their base64 payload -- see
+    ``media_part_token_cost``. Counting the payload as text overestimated a real
+    screenshot by 145x and caused spurious compaction.
+    """
     total = 4  # role + overhead
-    content = normalize_content_value(msg.get("content")) or ""
-    total += count_tokens(content)
+    content, media_tokens = _split_media_from_content(msg.get("content"))
+    total += media_tokens
+    normalized = normalize_content_value(content) or ""
+    total += count_tokens(normalized)
+    # Anthropic-native blocks stashed off to the side still cost real tokens.
+    stashed = msg.get("_anthropic_content_blocks")
+    if isinstance(stashed, list):
+        for part in stashed:
+            total += media_part_token_cost(part)
     for tc in msg.get("tool_calls") or []:
         if isinstance(tc, dict):
             fn = tc.get("function", {})
@@ -165,6 +278,37 @@ def count_message_tokens(msg: Dict[str, Any]) -> int:
     return total
 
 
-def count_messages_tokens(messages: List[Dict[str, Any]]) -> int:
-    """Estimate total tokens for a message list."""
+def count_messages_tokens_builtin(messages: List[Dict[str, Any]]) -> int:
+    """LCM's own estimate, bypassing any registered host counter.
+
+    Exposed so a host can delegate selectively — using its own estimate only
+    where it is better informed, and falling back to this for the rest — without
+    reimplementing the per-message walk.
+    """
     return sum(count_message_tokens(m) for m in messages)
+
+
+def count_messages_tokens(messages: List[Dict[str, Any]]) -> int:
+    """Estimate total tokens for a message list.
+
+    Delegates to a host-supplied counter when one is registered (see
+    ``set_messages_token_counter``), so an embedding application that already
+    calibrates its estimates against real provider usage can make LCM's
+    accounting agree with its own instead of maintaining a second, independent
+    guess. Falls back to the built-in estimate when no counter is registered or
+    the host's counter raises.
+    """
+    counter = _host_messages_token_counter
+    if counter is not None:
+        try:
+            value = counter(messages)
+            if isinstance(value, int) and value >= 0:
+                return value
+            logger.debug(
+                "host token counter returned %r; using built-in estimate",
+                type(value).__name__,
+            )
+        except Exception:
+            logger.debug("host token counter failed; using built-in estimate",
+                         exc_info=True)
+    return count_messages_tokens_builtin(messages)

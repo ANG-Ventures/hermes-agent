@@ -16,6 +16,7 @@ lifecycle) through normal attribute lookup. ``LCMEngine`` mixes this in ahead of
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -262,9 +263,9 @@ class CompactionMixin:
     # lockstep: a new marker there needs a label here or the banner degrades to
     # the generic fallback.
     _INGEST_CLEANUP_REASON_MARKERS: tuple[tuple[str, str], ...] = (
-        ("[Externalized LCM ingest payload:", "a large attachment was moved to external storage"),
-        ("[Externalized payload: kind=raw_payload;", "a large payload was moved to external storage"),
-        ("[Externalized tool output:", "a large tool result was moved to external storage"),
+        ("[Externalized LCM ingest payload:", "an attachment too large to keep inline was moved to external storage"),
+        ("[Externalized payload: kind=raw_payload;", "a payload too large to keep inline was moved to external storage"),
+        ("[Externalized tool output:", "a tool result too large to keep inline was moved to external storage"),
         ("[LCM active replay placeholder: assistant output quarantined;", "a malformed assistant turn was quarantined"),
         ("[LCM active replay placeholder: message ignored;", "an ignored message was replaced with a placeholder"),
         ("[LCM sensitive redaction:", "a secret was redacted from the transcript"),
@@ -279,12 +280,15 @@ class CompactionMixin:
 
         The divergence gate answers only yes/no. A below-threshold compaction is
         inexplicable without the cause, so recover it here by re-walking the same
-        markers. Falls back to a generic phrase rather than raising: an
-        explanation is never allowed to break a compaction.
+        markers. Includes the SIZE of the offending payload when the marker
+        carries it: "a large attachment" leaves the user guessing which of their
+        messages did this, while "a 1.9 MB attachment" points straight at it.
+        Falls back to a generic phrase rather than raising: an explanation is
+        never allowed to break a compaction.
         """
         try:
             if len(original_messages) != len(replay_messages):
-                return "the stored transcript and live context diverged"
+                return "the stored transcript and the live context diverged"
             for original_msg, replay_msg in zip(original_messages, replay_messages):
                 original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""
                 replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
@@ -292,10 +296,27 @@ class CompactionMixin:
                     continue
                 for marker, label in self._INGEST_CLEANUP_REASON_MARKERS:
                     if marker in replay_text:
-                        return label
+                        size = self._describe_externalized_size(replay_text)
+                        return f"{label}{size}"
         except Exception:  # pragma: no cover - explanation must never raise
             logger.debug("LCM: failed to describe ingest-cleanup reason", exc_info=True)
-        return "the stored transcript and live context diverged"
+        return "the stored transcript and the live context diverged"
+
+    @staticmethod
+    def _describe_externalized_size(replay_text: str) -> str:
+        """`` (1.9 MB)`` when the externalization marker reports a size, else ''."""
+        try:
+            match = re.search(r"chars=(\d+)", replay_text)
+            if not match:
+                return ""
+            chars = int(match.group(1))
+            if chars >= 1_000_000:
+                return f" ({chars / 1_048_576:.1f} MB)"
+            if chars >= 1_000:
+                return f" ({chars / 1024:.0f} KB)"
+            return ""
+        except Exception:  # pragma: no cover
+            return ""
 
     def _has_ignored_backlog_outside_fresh_tail(self, messages: List[Dict[str, Any]]) -> bool:
         if not self._compiled_ignore_message_patterns or not messages:

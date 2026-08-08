@@ -105,12 +105,76 @@ def load_context_engine(name: str) -> Optional["ContextEngine"]:
     try:
         engine = _load_engine_from_dir(engine_dir)
         if engine:
+            _register_host_token_counter(engine_dir, name)
             return engine
         logger.warning("Context engine '%s' loaded but no engine instance found", name)
         return None
     except Exception as e:
         logger.warning("Failed to load context engine '%s': %s", name, e)
         return None
+
+
+def _register_host_token_counter(engine_dir: "Path", name: str) -> None:
+    """Give an engine the host's calibrated token counter, if it accepts one.
+
+    An engine that ships its own estimator is maintaining a SECOND, independent
+    guess at the same quantity the host already estimates and calibrates against
+    real provider usage. When the two diverge, compaction fires on numbers the
+    user never sees (2026-08-07: LCM billed a screenshot at 502,182 tokens while
+    the host — and the provider — said ~1,900).
+
+    Only registers when the host estimate is genuinely BETTER INFORMED than the
+    engine's own — currently the multimodal case, where the host knows provider
+    media pricing. For plain text the engine's tokenizer is at least as good
+    (it uses tiktoken) and, critically, is INTERNALLY CONSISTENT with the
+    per-message counter its own budget arithmetic compares against; swapping in
+    a differently-scaled whole-list estimate there makes ``count_messages_tokens``
+    disagree with ``sum(count_message_tokens(...))`` and breaks fresh-tail
+    budget walks. Purely optional: engines without
+    ``set_messages_token_counter`` are untouched, and any failure leaves the
+    engine on its built-in estimate.
+    """
+    try:
+        tokens_path = engine_dir / "tokens.py"
+        if not tokens_path.is_file():
+            return
+        import importlib
+
+        tokens_mod = importlib.import_module(
+            f"plugins.context_engine.{name}.tokens"
+        )
+        setter = getattr(tokens_mod, "set_messages_token_counter", None)
+        if not callable(setter):
+            return
+        builtin = getattr(tokens_mod, "count_messages_tokens_builtin", None)
+        media_cost = getattr(tokens_mod, "media_part_token_cost", None)
+        if not callable(builtin) or not callable(media_cost):
+            return
+        from agent.model_metadata import estimate_messages_tokens_rough
+
+        def _counter(messages):
+            """Host estimate for multimodal lists; engine's own for pure text."""
+            for msg in messages or ():
+                if not isinstance(msg, dict):
+                    continue
+                content = msg.get("content")
+                parts = content if isinstance(content, list) else None
+                if parts is None and isinstance(content, dict) and content.get("_multimodal"):
+                    parts = content.get("content")
+                if isinstance(parts, list) and any(media_cost(p) for p in parts):
+                    return estimate_messages_tokens_rough(messages)
+                if isinstance(msg.get("_anthropic_content_blocks"), list):
+                    return estimate_messages_tokens_rough(messages)
+            return builtin(messages)
+
+        setter(_counter)
+        logger.debug("Registered host token counter with context engine '%s'", name)
+    except Exception:
+        logger.debug(
+            "Could not register host token counter with '%s'; engine keeps its own",
+            name,
+            exc_info=True,
+        )
 
 
 def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:

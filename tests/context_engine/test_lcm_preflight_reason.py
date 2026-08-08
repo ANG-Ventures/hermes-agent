@@ -43,9 +43,9 @@ def test_mark_without_reason_clears_a_stale_one(tmp_path):
     "marker,expected",
     [
         ("[Externalized LCM ingest payload: kind=ingest_payload; chars=99]",
-         "a large attachment was moved to external storage"),
+         "an attachment too large to keep inline was moved to external storage"),
         ("[Externalized tool output: chars=99]",
-         "a large tool result was moved to external storage"),
+         "a tool result too large to keep inline was moved to external storage"),
         ("[LCM active replay placeholder: assistant output quarantined; reason=x]",
          "a malformed assistant turn was quarantined"),
         ("[LCM sensitive redaction: secret]",
@@ -65,7 +65,7 @@ def test_describe_handles_length_mismatch(tmp_path):
         [{"role": "user", "content": "a"}, {"role": "user", "content": "b"}],
         [{"role": "user", "content": "a"}],
     )
-    assert got == "the stored transcript and live context diverged"
+    assert got == "the stored transcript and the live context diverged"
 
 
 def test_describe_never_raises_on_garbage(tmp_path):
