@@ -84,12 +84,14 @@ from gateway.fork_ext.restart_policy import (
     _AGENT_CONFIG_ENV_BRIDGE,
     _RESTART_INITIATED_DIRNAME,
     _SAFE_RESTART_INSPECTION_VERBS,
+    _STARTUP_RESTORE_DRAIN_TIMEOUT_SECS_DEFAULT,
     _bridge_agent_config_to_env,
     _command_invokes_safe_restart,
     _restart_initiated_filename,
     _restart_initiated_ttl_secs,
     _restart_loop_threshold,
     _restart_loop_window_secs,
+    _startup_restore_drain_timeout_secs,
 )
 
 # --- Agent cache tuning ---------------------------------------------------
@@ -1033,7 +1035,10 @@ _AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT = 60 * 60
 # normal resume turn's first response yet short enough that one pathologically
 # long resumed turn can't hold every channel's inbound queued for minutes.
 # Override via ``config.yaml`` ``agent.gateway_startup_restore_drain_timeout``.
-_STARTUP_RESTORE_DRAIN_TIMEOUT_SECS_DEFAULT = 30.0
+# NOTE: defined in gateway/fork_ext/restart_policy.py and re-exported via the
+# import above. Do NOT redefine it here — test_fork_ext_restart_policy asserts
+# object IDENTITY (`is`), so a same-valued local copy silently breaks the
+# contract while every value-based check still passes.
 
 
 def _coerce_gateway_timestamp(value: Any) -> Optional[float]:
@@ -1307,38 +1312,9 @@ _REASON_RESTART_CONSUMED_INTERRUPTED = "restart_consumed_interrupted"
 _REASON_RESTART_CONSUMED = "restart_consumed"
 
 
-def _startup_restore_drain_timeout_secs() -> float:
-    """Max seconds ``_finish_startup_restore`` waits on boot auto-resume turns
-    before releasing the inbound gate and draining the queue.
-
-    While startup restore is in progress the gateway QUEUES every inbound
-    message (``_queue_startup_restore_event``) instead of processing it, so no
-    channel gets a reply until the gate opens.  The gate is opened by
-    ``_finish_startup_restore``, which waits for the synthetic boot
-    auto-resume turns to finish.  A single long resumed turn therefore held
-    the gate shut for every channel — inbound piled up unanswered for as long
-    as that one turn ran.
-
-    This bounds that wait.  Duplicate-agent safety does NOT depend on the
-    wait: ``_schedule_resume_pending_sessions`` claims each session's
-    ``_running_agents`` slot SYNCHRONOUSLY (before the gate ever runs), so a
-    message drained while a resume turn is still running queues behind that
-    slot rather than spawning a second agent.  So on timeout we release the
-    gate and let the slow turn finish in the background.
-
-    Reads ``HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT`` (bridged from
-    ``config.yaml`` ``agent.gateway_startup_restore_drain_timeout`` at gateway
-    startup, same pattern as the other ``agent.*`` knobs).  Non-positive
-    disables the bound (restores the historical "wait forever" behaviour).
-    """
-    raw = os.environ.get("HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT")
-    if raw is None or raw == "":
-        return float(_STARTUP_RESTORE_DRAIN_TIMEOUT_SECS_DEFAULT)
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return float(_STARTUP_RESTORE_DRAIN_TIMEOUT_SECS_DEFAULT)
-
+# _startup_restore_drain_timeout_secs is imported from
+# gateway/fork_ext/restart_policy.py (see the import block near the top).
+# Do NOT redefine it here — the re-export contract is asserted by identity.
 
 def _float_env(name: str, default: float) -> float:
     """Read an env var as float, falling back to ``default`` on typos/empty.
@@ -4171,6 +4147,40 @@ class TurnRunner:
         # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
         if event_type not in {"tool.started",}:
             return
+
+        # F2 self-completing-loop detection (C1): the safe-restart SKILL runs
+        # as a `terminal` tool call inside this gateway process. When we observe
+        # it start, set the SAME in-process flag request_restart() sets, so the
+        # clean-turn gate can tell "this turn initiated a restart" for the skill
+        # path too (request_restart covers /restart + programmatic; this covers
+        # the dominant skill path). One flag, no sentinel file, no new tool.
+        #
+        # Contract: the safe-gateway-restart skill invokes the literal
+        # `safe-restart.py` path via a python interpreter — _command_invokes_safe_restart
+        # is keyed to that. If the skill ever changes how it shells out, update
+        # the matcher in lockstep (a renamed/aliased/wrapped invocation escapes).
+        #
+        # RESTORED 2026-08-08 (parity merge): upstream relocated + dedented this
+        # progress callback and the block was dropped in the process. Without it
+        # a restart initiated via the SKILL path is not recorded as
+        # session-initiated, so the clean-turn gate misclassifies the turn.
+        try:
+            _sr_session_key = getattr(ctx, "session_key", None)
+            if _sr_session_key and tool_name == "terminal":
+                _cmd = ""
+                if isinstance(args, dict):
+                    _cmd = str(
+                        args.get("command")
+                        or args.get("cmd")
+                        or args.get("script")
+                        or ""
+                    )
+                if not _cmd:
+                    _cmd = str(args or "")
+                if _command_invokes_safe_restart(_cmd):
+                    self._runner._session_initiated_restart[_sr_session_key] = True
+        except Exception as _sr_err:
+            logger.debug("safe-restart self-loop detection failed: %s", _sr_err)
 
         # Never render a progress bubble for the clarify tool.  The
         # adapter's send_clarify IS the user-facing rendering (interactive

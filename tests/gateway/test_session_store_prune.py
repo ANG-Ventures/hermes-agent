@@ -35,6 +35,17 @@ def test_session_store_default_db_uses_runtime_hermes_home(tmp_path, monkeypatch
     fake_home = tmp_path / "alt_hermes_home"
     fake_home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_home))
+    # Parity merge 2026-08-08: upstream added _IMPORT_DEFAULT_DB_PATH and an
+    # override branch in _default_db_path(), so a deliberately re-pointed
+    # module-level DEFAULT_DB_PATH now OUTRANKS a runtime HERMES_HOME. The
+    # autouse hermetic fixture in tests/conftest.py sets exactly such a global
+    # (pinned to ITS per-test home), which would otherwise beat this test's more
+    # specific redirect. Re-point it alongside the env var so both signals agree
+    # — the property under test (no import-time path freeze) is unchanged.
+    import hermes_state as _hs
+
+    if hasattr(_hs, "DEFAULT_DB_PATH"):
+        monkeypatch.setattr(_hs, "DEFAULT_DB_PATH", fake_home / "state.db")
 
     with patch("gateway.session.SessionStore._ensure_loaded"):
         store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)

@@ -79,6 +79,13 @@ class PluginToolOverrideError(PermissionError):
 
 logger = logging.getLogger(__name__)
 
+# Built-in command names a PLUGIN is allowed to override. Without this, adding
+# a built-in with an existing plugin's name silently disables that plugin at
+# registration time (see _PluginAPI.register_command). Dispatch-side precedence
+# in gateway/run.py defers to the plugin for these names and falls through to
+# the built-in when no plugin is registered.
+_PLUGIN_OVERRIDABLE_BUILTINS = frozenset({"context"})
+
 
 # ---------------------------------------------------------------------------
 # Plugin developer debug logging
@@ -582,10 +589,19 @@ class PluginContext:
             )
             return
 
-        # Reject if it conflicts with a built-in command
+        # Reject if it conflicts with a built-in command.
+        #
+        # PLUGIN-OVERRIDE ALLOWLIST (parity merge 2026-08-08): upstream may add
+        # a BUILT-IN with a name a plugin already owns here, which silently
+        # disables that plugin — the registration is refused at load time, long
+        # before any dispatch-side precedence check can help. That happened to
+        # /context: upstream added a built-in handler, and the fork's
+        # blackbox-inspect plugin (which owns /context) stopped registering
+        # entirely, with only a WARNING nobody reads. For names the fork
+        # deliberately owns, the plugin wins and the built-in is the fallback.
         try:
             from hermes_cli.commands import resolve_command
-            if resolve_command(clean) is not None:
+            if clean not in _PLUGIN_OVERRIDABLE_BUILTINS and resolve_command(clean) is not None:
                 logger.warning(
                     "Plugin '%s' tried to register command '/%s' which conflicts "
                     "with a built-in command. Skipping.",

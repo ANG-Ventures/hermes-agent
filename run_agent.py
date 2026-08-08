@@ -264,6 +264,22 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
 )
 
 
+# Fields the fork stamps onto an ALREADY-FLUSHED message dict in place. The
+# incremental flush's bounded prefix scan matches on object identity, which
+# proves "same object" but NOT "same content" — so a message carrying one of
+# these must never be skipped as part of the matched prefix, or the in-place
+# stamp is silently lost on re-flush (an interrupted turn then reads back as a
+# clean one). Keep this list in sync with any new in-place mutation site.
+_MUTABLE_FLUSH_STATE_FIELDS = ("finish_reason",)
+
+
+def _has_mutable_flush_state(msg: Any) -> bool:
+    """True when *msg* carries a field the fork may have stamped in place."""
+    return isinstance(msg, dict) and any(
+        msg.get(field) is not None for field in _MUTABLE_FLUSH_STATE_FIELDS
+    )
+
+
 def _is_ephemeral_scaffolding(msg: Any) -> bool:
     """Return True when ``msg`` is internal recovery scaffolding that must never
     be persisted to the durable transcript (SQLite session store or JSON log)."""
@@ -2217,6 +2233,18 @@ class AIAgent:
             # strips markers on fresh copies, which breaks identity here and
             # forces a full re-scan). Identity match ⇒ identical skip decision,
             # so starting after the matched prefix is behavior-preserving.
+            #
+            # FORK EXCEPTION (parity merge 2026-08-08): the identity premise
+            # above is NOT sufficient on its own. Identity proves the same dict
+            # OBJECT, not the same CONTENT — and the fork mutates an already-
+            # flushed assistant tail IN PLACE when a turn is interrupted
+            # (close_interrupted_tool_sequence stamps finish_reason=
+            # "interrupt_close" on the existing dict). Skipping it as part of
+            # the matched prefix silently loses that stamp on re-flush, so an
+            # interrupted turn reads back as a clean one and resume logic
+            # mis-classifies it. Stop the prefix skip at the first message that
+            # carries a mutation-sensitive field, so those rows are always
+            # re-examined.
             _scan_start = 0
             _prev_prefix = getattr(self, "_db_flush_scan_prefix", None)
             if isinstance(_prev_prefix, list):
@@ -2224,6 +2252,7 @@ class AIAgent:
                 while (
                     _scan_start < _limit
                     and messages[_scan_start] is _prev_prefix[_scan_start]
+                    and not _has_mutable_flush_state(messages[_scan_start])
                 ):
                     _scan_start += 1
 

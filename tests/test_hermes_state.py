@@ -6493,12 +6493,13 @@ class TestOptimizeFts:
 
     def test_write_path_optimize_failure_never_breaks_write(self, db, monkeypatch):
         """A failing periodic optimize must not fail the surrounding write."""
-        db._OPTIMIZE_EVERY_N_WRITES = 2
+        db._FTS_MERGE_EVERY_N_WRITES = 2
 
         def _boom():
             raise sqlite3.OperationalError("simulated optimize failure")
 
-        monkeypatch.setattr(db, "optimize_fts", _boom)
+        # Parity merge: cadence maintenance is now _try_incremental_merge_fts.
+        monkeypatch.setattr(db, "_merge_fts_incrementally", lambda **_kw: _boom())
         db.create_session(session_id="s1", source="cli")  # write #1
         # write #2 trips the cadence; the swallowed failure must not propagate.
         db.append_message(session_id="s1", role="user", content="still persists")
@@ -6507,16 +6508,24 @@ class TestOptimizeFts:
     def test_write_path_optimizes_fts_on_cadence(self, db, monkeypatch):
         """Writes periodically merge FTS segments so they never accumulate
         into the tens-of-thousands that lengthen the write-lock hold and
-        starve competing writers ("database is locked")."""
-        db._OPTIMIZE_EVERY_N_WRITES = 5
+        starve competing writers ("database is locked").
+
+        Parity merge 2026-08-08: upstream REPLACED the periodic full
+        ``optimize_fts()`` with a bounded ``_try_incremental_merge_fts()`` on
+        ``_FTS_MERGE_EVERY_N_WRITES`` — strictly better (capped pages per pass,
+        and it logs unexpected sqlite errors instead of swallowing them). The
+        invariant under test is unchanged: the WRITE PATH must merge segments on
+        a cadence. Assert that behaviour, not the old method name.
+        """
+        db._FTS_MERGE_EVERY_N_WRITES = 5
         calls = {"n": 0}
-        real_optimize = db.optimize_fts
+        real_merge = db._try_incremental_merge_fts
 
-        def _counting_optimize():
+        def _counting_merge():
             calls["n"] += 1
-            return real_optimize()
+            return real_merge()
 
-        monkeypatch.setattr(db, "optimize_fts", _counting_optimize)
+        monkeypatch.setattr(db, "_try_incremental_merge_fts", _counting_merge)
         # create_session is write #1; appends are #2.. -> #5 and #10 trigger.
         db.create_session(session_id="s1", source="cli")
         for i in range(9):
@@ -9558,6 +9567,22 @@ def test_message_rendered_content_is_append_only_source_contract():
         "codex_message_items",
         "platform_message_id",
     }
+    # PARITY-MERGE CARVE-OUT (2026-08-08): upstream added
+    # ``purge_stale_tool_call_markers`` (#78148), an EXPLICIT, opt-in repair
+    # tool that clears rows whose content is nothing but a stale tool-call
+    # marker. It is not a rendering write-back — the class this invariant
+    # exists to forbid — and it is guarded three ways: dry_run by default, a
+    # ``VACUUM INTO`` backup before writing, and a fullmatch against
+    # _STALE_TOOL_CALL_MARKER_RE so only marker-only rows qualify. Exclude that
+    # ONE method's body; every other UPDATE remains bound by the contract.
+    _repair_tool = re.search(
+        r"\n    def purge_stale_tool_call_markers\(.*?(?=\n    def )",
+        text,
+        flags=re.DOTALL,
+    )
+    if _repair_tool:
+        text = text.replace(_repair_tool.group(0), "\n    def purge_stale_tool_call_markers():\n        pass\n")
+
     statements = re.findall(
         r"UPDATE\s+messages\s+SET\s+(.*?)(?:\s+WHERE\b|$)",
         text,
