@@ -689,10 +689,20 @@ class TestCleanupTempRecordings:
 # ============================================================================
 
 class TestPlayBeep:
-    def test_beep_calls_sounddevice_play(self, mock_sd):
+    def test_beep_calls_sounddevice_play(self, mock_sd, monkeypatch):
         np = pytest.importorskip("numpy")
 
+        import tools.voice_mode as voice_mode
         from tools.voice_mode import play_beep
+
+        # Parity merge 2026-08-08: upstream split the audio import so tone
+        # SYNTHESIS no longer pulls in sounddevice (which triggers the macOS TCC
+        # microphone prompt), and added an afplay branch — on macOS
+        # _sounddevice_output_allowed() is False, so play_beep writes a temp WAV
+        # and returns BEFORE sd.play(). This test is specifically about the
+        # sounddevice output path, so force that branch; the afplay branch has
+        # its own coverage.
+        monkeypatch.setattr(voice_mode, "_sounddevice_output_allowed", lambda: True)
 
         # play_beep uses polling (get_stream) + sd.stop() instead of sd.wait()
         mock_stream = MagicMock()
@@ -1407,7 +1417,14 @@ class TestWSL2PowerShellFallback:
             m.wait = MagicMock(return_value=m.returncode)
             return m
 
-        with patch("tools.voice_mode._is_wsl2_env", return_value=True), \
+        # The powershell/WSL branch is gated on ``platform.system() == "Linux"``.
+        # These tests emulate WSL via _is_wsl2_env/_is_wsl, but on a macOS dev
+        # box the outer gate skips the branch entirely and only ffplay is tried.
+        # Pin the platform so the code path under test is actually reachable.
+        with patch("tools.voice_mode.platform.system", return_value="Linux"), \
+             patch("tools.voice_mode._is_wsl", return_value=True), \
+             patch("tools.voice_mode._is_wsl2_env", return_value=True), \
+             patch("tools.voice_mode._sounddevice_output_allowed", return_value=False), \
              patch("tools.voice_mode._import_audio", side_effect=ImportError), \
              patch("tools.voice_mode.shutil.which",
                    side_effect=lambda x: f"/bin/{x}" if x in ("powershell.exe", "ffmpeg", "ffplay", "sh") else (x if x.startswith("/") else None)), \
@@ -1459,7 +1476,11 @@ class TestWSL2PowerShellFallback:
                 return io.StringIO("Linux Microsoft WSL2")
             return open(path, *args, **kwargs)
 
-        with patch("builtins.open", side_effect=_fake_open), \
+        # See the sibling test: the WSL branch is gated on platform.system().
+        with patch("tools.voice_mode.platform.system", return_value="Linux"), \
+             patch("tools.voice_mode._is_wsl", return_value=True), \
+             patch("tools.voice_mode._sounddevice_output_allowed", return_value=False), \
+             patch("builtins.open", side_effect=_fake_open), \
              patch("shutil.which", side_effect=lambda x: f"/bin/{x}" if x in ("powershell.exe", "ffmpeg", "ffplay") else None), \
              patch("subprocess.check_output", side_effect=_capture_check_output), \
              patch("subprocess.Popen", return_value=MagicMock(returncode=0, wait=lambda **k: 0)), \
