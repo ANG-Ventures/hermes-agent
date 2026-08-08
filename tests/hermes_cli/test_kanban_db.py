@@ -568,6 +568,15 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
         assert len(kb.list_runs(conn, t)) == 0
 
 
+def _running_task_with_pid(conn, pid: int) -> str:
+    """Create a task in ``running`` state whose ``worker_pid`` is ``pid``."""
+    t = kb.create_task(conn, title="live worker", assignee="alice")
+    assert kb.claim_task(conn, t) is not None
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (pid, t))
+    return t
+
+
 def test_delete_task_refuses_running_task_with_live_pid(kanban_home):
     with kb.connect() as conn:
         # os.getpid() is by definition alive, so this is a real liveness

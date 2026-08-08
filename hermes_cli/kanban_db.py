@@ -97,6 +97,7 @@ from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
+from utils import env_var_enabled
 
 _log = logging.getLogger(__name__)
 
@@ -470,7 +471,6 @@ def kanban_sandbox_enabled() -> bool:
     must not touch the live board — notably a dispatched worker writing tests
     against kanban internals, which inherits the dispatcher's pins.
     """
-    from utils import env_var_enabled
     return env_var_enabled("HERMES_KANBAN_SANDBOX")
 
 
@@ -514,11 +514,8 @@ def _warn_if_override_escapes_hermes_home(override: Path) -> None:
         target = override.resolve(strict=False)
     except OSError:
         return
-    try:
-        target.relative_to(root)
+    if target.is_relative_to(root):
         return  # override lives inside the HERMES_HOME-derived root: normal.
-    except ValueError:
-        pass
     _log.warning(
         "HERMES_KANBAN_DB=%s resolves OUTSIDE the HERMES_HOME-derived kanban "
         "root %s — the override wins, so redirecting HERMES_HOME did NOT "
