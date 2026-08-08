@@ -141,6 +141,28 @@ def test_message_growth_with_a_token_drop_is_real_work():
     assert _is_no_change_pass(1, 2, 1_234, 509) is False
 
 
+def test_manual_compress_is_out_of_scope():
+    """Manual /compress keeps its own feedback contract.
+
+    apps/desktop/e2e/session-compression-and-queue-stop.spec.ts asserts
+    /Compressed|No changes from compression/ on the manual path, and
+    manual_compression_feedback.py is a deliberate carve-out from the silence
+    rules. The reported bug was AUTOMATIC maintenance passes narrating
+    themselves dishonestly; widening past that bends an unrelated contract.
+    Caught by the Desktop E2E, not by unit tests.
+    """
+    line = _announce(trigger_reason="manual")
+    assert line is not None
+    assert "nothing to compact" not in line
+
+
+def test_automatic_passes_are_still_gated():
+    """The scope narrowing must not disable the fix for its actual target."""
+    for reason in ("engine_preflight_maintenance", "threshold", "idle_resume", None):
+        line = _announce(trigger_reason=reason)
+        assert "nothing to compact" in line, f"{reason} must still be gated"
+
+
 def test_garbage_counts_do_not_raise():
     assert _is_no_change_pass("x", None, [], {}) is False
 

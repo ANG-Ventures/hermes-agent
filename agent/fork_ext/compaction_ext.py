@@ -256,7 +256,16 @@ def _format_compaction_announce(
     # the repeat passes were then swallowed by the announce dedupe key, so the
     # user saw a "this may take a moment" banner and never a closing line.
     # Report the truth instead; the caller still gets exactly one line.
-    if _is_no_change_pass(old_messages, new_messages, pre_tokens, post_tokens):
+    #
+    # AUTOMATIC passes only. Manual /compress has its own deliberate feedback
+    # path (manual_compression_feedback.py) and its own downstream contract —
+    # apps/desktop/e2e/session-compression-and-queue-stop.spec.ts asserts
+    # /Compressed|No changes from compression/ — so it is out of scope here.
+    # The reported bug was automatic maintenance passes narrating themselves
+    # dishonestly; widening past that would bend an unrelated contract.
+    if trigger_reason != "manual" and _is_no_change_pass(
+        old_messages, new_messages, pre_tokens, post_tokens
+    ):
         return _format_no_change_close(
             engine_name=engine_name or "engine",
             pre_messages=old_messages,
