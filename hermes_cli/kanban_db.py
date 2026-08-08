@@ -45,6 +45,12 @@ overrides still work:
 * ``HERMES_KANBAN_WORKSPACES_ROOT`` — pin the workspaces root directly.
 * ``HERMES_KANBAN_HOME`` — pin the umbrella root that anchors kanban
   paths. Useful for tests and unusual deployments.
+* ``HERMES_KANBAN_SANDBOX`` — set to ``1`` to IGNORE all of the pins
+  above so every kanban path resolves from ``HERMES_HOME``. Required to
+  sandbox kanban: redirecting ``HERMES_HOME`` alone does NOT isolate a
+  process from the live board, because the pins outrank it and the
+  dispatcher injects them into every worker env. See
+  :func:`kanban_db_path`.
 
 The dispatcher injects ``HERMES_KANBAN_TASK``, ``HERMES_KANBAN_DB``,
 ``HERMES_KANBAN_WORKSPACES_ROOT``, and ``HERMES_KANBAN_BOARD`` into worker
@@ -439,6 +445,90 @@ def scoped_current_board(slug: str):
     finally:
         _CURRENT_BOARD_OVERRIDE.reset(token)
 
+
+# Env vars that pin a kanban path DIRECTLY, outranking anything derived from
+# ``HERMES_HOME``. The dispatcher injects several of these into every worker's
+# environment on purpose (defense in depth), which means a worker that redirects
+# ``HERMES_HOME`` to a tempdir — the standard, documented way to sandbox fleet
+# state — is NOT sandboxed for kanban and will happily write to the live board.
+# ``HERMES_KANBAN_SANDBOX=1`` neutralises all of them at once; see
+# :func:`kanban_db_path`.
+_KANBAN_PATH_PIN_ENV_VARS = (
+    "HERMES_KANBAN_HOME",
+    "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_WORKSPACES_ROOT",
+    "HERMES_KANBAN_ATTACHMENTS_ROOT",
+)
+
+
+def kanban_sandbox_enabled() -> bool:
+    """True when ``HERMES_KANBAN_SANDBOX`` requests HERMES_HOME-relative paths.
+
+    Set it to ``1``/``true``/``yes``/``on`` to make every kanban path resolve
+    from ``HERMES_HOME`` and ignore the ``HERMES_KANBAN_*`` path pins listed in
+    :data:`_KANBAN_PATH_PIN_ENV_VARS`. Intended for tests and any code that
+    must not touch the live board — notably a dispatched worker writing tests
+    against kanban internals, which inherits the dispatcher's pins.
+    """
+    from utils import env_var_enabled
+    return env_var_enabled("HERMES_KANBAN_SANDBOX")
+
+
+def _kanban_path_override(name: str) -> str:
+    """Return the raw ``name`` path-pin env value, or ``""`` when sandboxed.
+
+    Single choke point for every ``HERMES_KANBAN_*`` path pin so the sandbox
+    flag can't be honoured by some resolvers and silently ignored by others.
+    """
+    if kanban_sandbox_enabled():
+        return ""
+    return os.environ.get(name, "").strip()
+
+
+# Pairs of (HERMES_HOME, override) already evaluated by
+# ``_warn_if_override_escapes_hermes_home``. Keyed on the RAW env strings so
+# the filesystem work (two ``Path.resolve()`` calls) happens once per distinct
+# environment rather than on every ``kanban_db_path()`` — which sits on the
+# ``connect()`` path and is called constantly. Doubles as the warn-once ledger.
+_CHECKED_OVERRIDE_ESCAPES: set[tuple[str, str]] = set()
+
+
+def _warn_if_override_escapes_hermes_home(override: Path) -> None:
+    """Log once when ``HERMES_KANBAN_DB`` points outside the HERMES_HOME root.
+
+    This is the signal that was missing on 2026-08-08: a worker redirected
+    ``HERMES_HOME`` to a tempdir, believed it was sandboxed, and wrote six real
+    cards to the production board because the dispatcher's ``HERMES_KANBAN_DB``
+    outranks ``HERMES_HOME``. Resolution is unchanged — the override still wins
+    — but the escape is no longer silent.
+    """
+    hermes_home = os.environ.get("HERMES_HOME", "").strip()
+    if not hermes_home:
+        return
+    key = (hermes_home, str(override))
+    if key in _CHECKED_OVERRIDE_ESCAPES:
+        return
+    _CHECKED_OVERRIDE_ESCAPES.add(key)
+    try:
+        root = kanban_home().resolve(strict=False)
+        target = override.resolve(strict=False)
+    except OSError:
+        return
+    try:
+        target.relative_to(root)
+        return  # override lives inside the HERMES_HOME-derived root: normal.
+    except ValueError:
+        pass
+    _log.warning(
+        "HERMES_KANBAN_DB=%s resolves OUTSIDE the HERMES_HOME-derived kanban "
+        "root %s — the override wins, so redirecting HERMES_HOME did NOT "
+        "sandbox kanban. Set HERMES_KANBAN_SANDBOX=1 (or unset the "
+        "HERMES_KANBAN_* path pins) if you meant to isolate this process from "
+        "the live board.",
+        target, root,
+    )
+
+
 # Slug validator: lowercase alphanumerics, digits, hyphens; 1–64 chars.
 # Strict enough to stop traversal (`..`) and embedded path separators, loose
 # enough that kebab-case names like ``atm10-server`` or ``hermes-agent``
@@ -468,7 +558,8 @@ def kanban_home() -> Path:
     Resolution order:
 
     1. ``HERMES_KANBAN_HOME`` env var when set and non-empty (explicit
-       override for tests and unusual deployments).
+       override for tests and unusual deployments). Ignored when
+       ``HERMES_KANBAN_SANDBOX`` is set — see :func:`kanban_db_path`.
     2. ``get_default_hermes_root()``, which already returns ``<root>``
        when ``HERMES_HOME`` is ``<root>/profiles/<name>``, and returns
        ``HERMES_HOME`` directly for Docker / custom deployments.
@@ -478,7 +569,7 @@ def kanban_home() -> Path:
     profile's ``HERMES_HOME`` would silently fork the board per profile,
     which breaks the dispatcher / worker handoff.
     """
-    override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
+    override = _kanban_path_override("HERMES_KANBAN_HOME")
     if override:
         return Path(override).expanduser()
     from hermes_constants import get_default_hermes_root
@@ -622,10 +713,35 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
        :func:`get_current_board` is used.
     3. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
        Other boards → ``<root>/kanban/boards/<slug>/kanban.db``.
+
+    🔴 **The override DEFEATS ``HERMES_HOME`` sandboxing.** Because it is
+    checked before anything ``HERMES_HOME``-derived, and because the
+    dispatcher pins it into *every* worker env, the standard hermeticity
+    move — ``HERMES_HOME=$(mktemp -d)`` — does **not** isolate kanban. A
+    process that redirects only ``HERMES_HOME`` still resolves to, and
+    writes to, the LIVE board. On 2026-08-08 that put six fixture cards on
+    a production board and got a real worker spawned against one of them.
+
+    To isolate kanban, set ``HERMES_KANBAN_SANDBOX=1`` — it neutralises
+    every ``HERMES_KANBAN_*`` path pin so all kanban paths resolve from
+    ``HERMES_HOME``::
+
+        HERMES_KANBAN_SANDBOX=1 HERMES_HOME=$(mktemp -d) pytest ...
+
+    Equivalently, strip the pins before importing this module::
+
+        for _k in [k for k in os.environ if k.startswith("HERMES_KANBAN")]:
+            os.environ.pop(_k, None)
+
+    When ``HERMES_HOME`` is set and the override resolves outside the
+    ``HERMES_HOME``-derived kanban root, a warning is logged once — the
+    override still wins, but the escape is no longer silent.
     """
-    override = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    override = _kanban_path_override("HERMES_KANBAN_DB")
     if override:
-        return Path(override).expanduser()
+        path = Path(override).expanduser()
+        _warn_if_override_escapes_hermes_home(path)
+        return path
     slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
@@ -639,13 +755,14 @@ def workspaces_root(board: Optional[str] = None) -> Path:
 
     Anchored per-board so workspaces don't leak between projects.
     ``HERMES_KANBAN_WORKSPACES_ROOT`` pins the path directly (highest
-    precedence) — the dispatcher injects this into worker env.
+    precedence) — the dispatcher injects this into worker env. Ignored
+    when ``HERMES_KANBAN_SANDBOX`` is set — see :func:`kanban_db_path`.
 
     ``default`` keeps the legacy path ``<root>/kanban/workspaces/`` so
     that existing scratch workspaces from before the boards feature are
     preserved. Other boards use ``<root>/kanban/boards/<slug>/workspaces/``.
     """
-    override = os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
+    override = _kanban_path_override("HERMES_KANBAN_WORKSPACES_ROOT")
     if override:
         return Path(override).expanduser()
     slug = _normalize_board_slug(board)
@@ -664,7 +781,8 @@ def attachments_root(board: Optional[str] = None) -> Path:
     its own ``<root>/.../attachments/<task_id>/`` subdirectory.
 
     ``HERMES_KANBAN_ATTACHMENTS_ROOT`` pins the path directly (highest
-    precedence) for tests and unusual deployments.
+    precedence) for tests and unusual deployments. Ignored when
+    ``HERMES_KANBAN_SANDBOX`` is set — see :func:`kanban_db_path`.
 
     ``default`` uses ``<root>/kanban/attachments/``; other boards use
     ``<root>/kanban/boards/<slug>/attachments/``.
@@ -675,7 +793,7 @@ def attachments_root(board: Optional[str] = None) -> Path:
     directly. Remote backends (Docker/Modal) need this directory mounted;
     see the kanban docs.
     """
-    override = os.environ.get("HERMES_KANBAN_ATTACHMENTS_ROOT", "").strip()
+    override = _kanban_path_override("HERMES_KANBAN_ATTACHMENTS_ROOT")
     if override:
         return Path(override).expanduser()
     slug = _normalize_board_slug(board)
@@ -5517,7 +5635,7 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
     except OSError:
         return False, None
     roots: list[tuple[Path, Optional[str]]] = []
-    override = os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
+    override = _kanban_path_override("HERMES_KANBAN_WORKSPACES_ROOT")
     if override:
         try:
             roots.append((Path(override).expanduser().resolve(strict=False), None))
@@ -6781,17 +6899,90 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
+class TaskRunningError(RuntimeError):
+    """Raised by :func:`delete_task` when the target task is ``running``
+    with a live ``worker_pid`` and ``force`` was not requested.
+
+    Deliberately distinct from the ``not found -> False`` return so
+    callers can tell "there is nothing to delete" apart from "there is a
+    live worker attached to this row". The dashboard maps this to HTTP
+    409; ``force=True`` overrides it.
+
+    Structured attributes (``task_id``, ``worker_pid``, ``claim_lock``,
+    ``run_id``) are attached for callers that want more than the message.
+    """
+
+    def __init__(
+        self,
+        task_id: str,
+        worker_pid: Optional[int],
+        claim_lock: Optional[str] = None,
+        run_id: Optional[int] = None,
+    ):
+        self.task_id = task_id
+        self.worker_pid = worker_pid
+        self.claim_lock = claim_lock
+        self.run_id = run_id
+        super().__init__(
+            f"refusing to delete task {task_id}: it is running with a live "
+            f"worker (pid={worker_pid}, claim={claim_lock or 'none'}, "
+            f"run={run_id if run_id is not None else 'none'}). Deleting it "
+            "would amputate that worker — its board row, run history and "
+            "event log vanish mid-flight and it can no longer complete or "
+            "block. Archive the task first (which reclaims the run), or "
+            "pass force=True if the worker is genuinely wedged."
+        )
+
+
+def delete_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    force: bool = False,
+) -> bool:
     """Hard-delete a task and cascade to all related rows.
 
     Because the schema does not use ``ON DELETE CASCADE`` foreign keys,
     we explicitly delete from child tables first, then the task row.
     This keeps the operation atomic (single ``write_txn``).
 
+    **Live-claim guard.** A ``running`` task whose ``worker_pid`` is still
+    alive is refused with :class:`TaskRunningError` unless ``force=True``.
+    Without this, one dashboard click (or one REPL call) hard-deletes a
+    dispatched worker's row out from under it: the worker keeps burning
+    tokens against an id that no longer exists, every ``kanban_*`` call
+    fails with a bare "unknown task", and the cascade into ``task_runs`` /
+    ``task_events`` destroys the only record the run ever happened. The
+    liveness check runs *inside* the write transaction so a concurrent
+    claim can't slip in between the check and the delete.
+
+    Note the guard is deliberately narrow — it keys on a *live* pid, so a
+    crashed worker's stale claim stays deletable without ``force``. Prefer
+    :func:`archive_task` for anything reachable from a UI: it clears the
+    claim, closes the run as ``reclaimed``, and keeps the audit trail.
+
     Returns ``True`` if the task existed and was deleted, ``False``
-    if the task was not found.
+    if the task was not found. Raises :class:`TaskRunningError` when the
+    live-claim guard trips.
     """
     with write_txn(conn):
+        if not force:
+            row = conn.execute(
+                "SELECT status, worker_pid, claim_lock, current_run_id "
+                "FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if (
+                row is not None
+                and row["status"] == "running"
+                and _pid_alive(row["worker_pid"])
+            ):
+                raise TaskRunningError(
+                    task_id,
+                    row["worker_pid"],
+                    claim_lock=row["claim_lock"],
+                    run_id=row["current_run_id"],
+                )
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False

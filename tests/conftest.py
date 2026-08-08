@@ -360,6 +360,10 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     # lineage marker must not make parent-state tests run as delegated
     # children; tests that exercise child behavior set it explicitly.
     "HERMES_DELEGATED_CHILD_CONTEXT",
+    # Opt-in flag that makes kanban ignore the path pins above. A developer
+    # shell exporting it would silently flip path-resolution tests; tests
+    # that exercise it set it explicitly.
+    "HERMES_KANBAN_SANDBOX",
     "HERMES_TENANT",
     # Honcho host selection changes which nested config block wins. A local
     # shell override leaked "myhost" into the full suite and flipped 20
