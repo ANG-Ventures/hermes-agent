@@ -183,12 +183,21 @@ class TestCalibration:
         assert compressor.calibrated_tokens(960_000) < 750_000  # calibration alone would defer
         assert compressor.should_compress_calibrated(960_000) is True  # ceiling saves it
 
-    def test_skew_clamped_never_scales_up(self, compressor):
-        # A real reading ABOVE its rough (rough under-counted) → ratio clamped ≤ 1.0.
+    def test_skew_scales_up_on_a_measured_undercount(self, compressor):
+        # A real reading ABOVE its rough means the estimate UNDER-counted.
+        #
+        # This used to assert the ratio was clamped to <= 1.0 ("never scale
+        # UP"). Measured 2026-08-08, that clamp was the bug: live sessions
+        # under-count by 1.15-1.39x, every one recorded as a clean ratio=1.000,
+        # so the threshold gate compared against a number well below the real
+        # prompt and fired LATE — toward a provider overflow, the direction
+        # that actually hurts. The correction now applies (bounded by
+        # _SKEW_SCALE_UP_MAX; compression.skew_scale_up: false restores the
+        # old clamp).
         compressor.note_rough_sent(100_000)
         compressor.update_from_response({"prompt_tokens": 130_000, "completion_tokens": 10})
-        assert compressor._current_skew() == 1.0
-        assert compressor.calibrated_tokens(500_000) == 500_000
+        assert compressor._current_skew() == pytest.approx(1.3, abs=0.01)
+        assert compressor.calibrated_tokens(500_000) == pytest.approx(650_000, rel=0.01)
 
     def test_skew_floor_clamps_down_scale(self, compressor):
         compressor._skew_floor = 0.7

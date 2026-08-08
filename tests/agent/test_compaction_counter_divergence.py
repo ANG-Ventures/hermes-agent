@@ -197,15 +197,20 @@ def _bind_record_skew(engine):
 
 
 def test_undercount_is_logged_even_though_the_ratio_is_clamped(caplog):
-    """The clamp keeps calibration safe but must not make under-counting silent."""
+    """Under-counting must be loud in the logs regardless of calibration policy.
+
+    The recorded ratio is no longer clamped to 1.0 (see PR: the clamp WAS the
+    bug), but the warning is the half that matters here: an under-counting
+    estimate must never be silent.
+    """
     engine = _Engine(rough=503_180)
     with caplog.at_level(logging.WARNING, logger="agent.context_engine"):
         _bind_record_skew(engine)(693_766)
 
     assert "COMPACTION_ESTIMATE_UNDERCOUNT" in caplog.text
     assert "1.38" in caplog.text
-    # calibration itself still clamps — this change is observability only
-    assert engine._recent_skews == [1.0]
+    # the measured under-count now survives into the calibration history
+    assert engine._recent_skews and engine._recent_skews[0] > 1.0
 
 
 def test_normal_overcount_does_not_warn(caplog):

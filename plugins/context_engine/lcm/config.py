@@ -406,6 +406,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("deferred_maintenance_max_passes", "LCM_DEFERRED_MAINTENANCE_MAX_PASSES", int),
     _EnvFieldSpec("critical_budget_pressure_ratio", "LCM_CRITICAL_BUDGET_PRESSURE_RATIO", float),
     _EnvFieldSpec("threshold_full_sweep_enabled", "LCM_THRESHOLD_FULL_SWEEP_ENABLED", bool),
+    _EnvFieldSpec("maintenance_min_pressure_ratio", "LCM_MAINTENANCE_MIN_PRESSURE_RATIO", float),
     _EnvFieldSpec("summary_prefix_target_tokens", "LCM_SUMMARY_PREFIX_TARGET_TOKENS", int),
     _EnvFieldSpec("l2_budget_ratio", "LCM_L2_BUDGET_RATIO", float),
     _EnvFieldSpec("l3_truncate_tokens", "LCM_L3_TRUNCATE_TOKENS", int),
@@ -588,6 +589,25 @@ class LCMConfig:
     critical_budget_pressure_ratio: float = 0.0
     # Opt into one bounded synchronous sweep after threshold pressure is reached.
     threshold_full_sweep_enabled: bool = False
+    # Minimum fraction of ``threshold_tokens`` a session must reach before the
+    # engine may request a MAINTENANCE compaction (the "compactable backlog
+    # outside the fresh tail" / "ignored-message backlog" arms) on the
+    # divergent-replay path.
+    #
+    # Without this, that path checks leaf-compaction ELIGIBILITY with no token
+    # gate at all, while the non-divergent path gates the same check behind
+    # ``rough >= threshold_tokens``. The divergent path is entered whenever
+    # ingest externalized something (media, base64, a large tool result), so a
+    # media-heavy session compacts at any size: measured production fires at
+    # 21%, 23% and 32% of threshold within eight minutes of one another, whose
+    # yields (27-47% freed) were far worse than pressure-driven compactions
+    # (84-86%). Each one still costs a summarizer call and the whole prompt
+    # cache.
+    #
+    # 0.0 disables the floor (previous behavior). Deterministic ingest-cleanup
+    # adoption is NOT affected — it returns before this gate, costs no
+    # summarizer spend, and must stay available at any size.
+    maintenance_min_pressure_ratio: float = 0.0
     # Target frontier-summary size after a sweep (0 = derive one leaf budget).
     summary_prefix_target_tokens: int = 0
 
