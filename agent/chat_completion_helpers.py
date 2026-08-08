@@ -3781,6 +3781,25 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         # Build mock response matching non-streaming shape
         full_content = "".join(content_parts) or None
+
+        # Provider-specific response post-processing on the STREAMING path.
+        #
+        # Applied to the ASSEMBLED text, not to individual deltas: a transform
+        # needle can straddle a delta boundary, so a per-delta application would
+        # silently miss it. Buffering deltas to fix that would delay first-token
+        # display, so the persisted/returned text is corrected here while the
+        # live display keeps streaming unbuffered. This is why the hook is
+        # required to be idempotent — display and persistence can both apply it.
+        if full_content:
+            try:
+                from providers import get_provider_profile as _gpp
+
+                _resp_profile = _gpp(agent.provider)
+                if _resp_profile is not None:
+                    full_content = _resp_profile.process_response_text(full_content)
+            except Exception:
+                pass
+
         mock_tool_calls = None
         has_truncated_tool_args = False
         if tool_calls_acc:

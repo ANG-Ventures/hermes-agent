@@ -116,6 +116,35 @@ class ProviderProfile:
         """
         return messages
 
+    def process_response_text(self, text: str) -> str:
+        """Provider-specific post-processing for assistant TEXT.
+
+        The inverse seam of :meth:`prepare_messages`. Called on assistant text
+        coming back from the provider, before it reaches the conversation and
+        the display.
+
+        Motivating case: a provider profile that rewrites outbound content (for
+        example, replacing identity tokens before they reach an untrusted
+        third-party relay) currently has no supported way to undo that rewrite
+        on the way back. Today the only option is to monkey-patch
+        ``normalize_response`` from a plugin, which is both fragile and
+        provider-blind: the transports are shared by every OpenAI-compatible
+        provider and are not given the profile, so a patch installed for one
+        provider silently applies to all of them.
+
+        Contract for implementers:
+          * Must be PURE and DETERMINISTIC — the same input always yields the
+            same output. Non-determinism here corrupts replayed history.
+          * Must be IDEMPOTENT: ``f(f(x)) == f(x)``. The streaming path may
+            apply it to buffered fragments and again to the assembled text.
+          * Must NEVER raise. The caller guards, but an exception here costs a
+            user-visible turn.
+          * Should be cheap: it runs on every assistant response.
+
+        Default: pass-through.
+        """
+        return text
+
     def build_extra_body(
         self, *, session_id: str | None = None, **context: Any
     ) -> dict[str, Any]:
