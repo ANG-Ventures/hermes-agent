@@ -994,8 +994,8 @@ def _parents_blocking_ready(
     rows = conn.execute(
         "SELECT t.id, t.title, t.status FROM tasks t "
         "JOIN task_links l ON l.parent_id = t.id "
-        "WHERE l.child_id = ? AND t.status != 'done'",
-        (task_id,),
+        "WHERE l.child_id = ? AND COALESCE(l.kind, ?) = ? AND t.status != 'done'",
+        (task_id, kanban_db.DEFAULT_LINK_KIND, kanban_db.LINK_KIND_BLOCKS),
     ).fetchall()
     return [
         {"id": r["id"], "title": r["title"], "status": r["status"]}
@@ -1032,8 +1032,8 @@ def _set_status_direct(
             parent_statuses = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
-                (task_id,),
+                "WHERE l.child_id = ? AND COALESCE(l.kind, ?) = ?",
+                (task_id, kanban_db.DEFAULT_LINK_KIND, kanban_db.LINK_KIND_BLOCKS),
             ).fetchall()
             if parent_statuses and not all(
                 p["status"] == "done" for p in parent_statuses
@@ -1074,8 +1074,9 @@ def _set_status_direct(
             # the dependency gate. Demote those children immediately so the
             # dashboard does not keep advertising stale-ready work.
             for row in conn.execute(
-                "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
-                (task_id,),
+                "SELECT child_id FROM task_links WHERE parent_id = ? "
+                "AND COALESCE(kind, ?) = ? ORDER BY child_id",
+                (task_id, kanban_db.DEFAULT_LINK_KIND, kanban_db.LINK_KIND_BLOCKS),
             ).fetchall():
                 child_id = row["child_id"]
                 demoted = conn.execute(
@@ -1138,6 +1139,9 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
 class LinkBody(BaseModel):
     parent_id: str
     child_id: str
+    # 'blocks' (default) gates the child on the parent; 'derived-from' is
+    # provenance only. Omitted = 'blocks', so existing clients are unchanged.
+    kind: Optional[str] = None
 
 
 @router.post("/links")
@@ -1145,8 +1149,10 @@ def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        kanban_db.link_tasks(conn, payload.parent_id, payload.child_id)
-        return {"ok": True}
+        kanban_db.link_tasks(
+            conn, payload.parent_id, payload.child_id, kind=payload.kind,
+        )
+        return {"ok": True, "kind": kanban_db.normalize_link_kind(payload.kind)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     finally:
