@@ -4203,9 +4203,10 @@ def find_stranded_by_triage(
 
     A child is *stranded* when it sits in ``todo`` (the column
     ``recompute_ready`` holds it in while parents are open) and at least one
-    parent is in ``triage`` or ``blocked`` — a status that only a human can
-    clear. Parents in ``ready``/``running``/``review`` are excluded: those are
-    making progress and the child will promote on its own.
+    blocking parent is in ``triage`` or ``blocked`` — a status that only a
+    human can clear. Provenance-only parents and parents in
+    ``ready``/``running``/``review`` are excluded: those do not strand the
+    child.
 
     This is a pure read used to make a zero-spawn dispatch tick legible. The
     dispatcher is right to hold these children; the defect was that it held
@@ -4221,7 +4222,9 @@ def find_stranded_by_triage(
         "JOIN tasks c ON c.id = l.child_id "
         "JOIN tasks p ON p.id = l.parent_id "
         "WHERE c.status = 'todo' AND p.status IN ('triage', 'blocked') "
-        "ORDER BY l.child_id, l.parent_id"
+        "AND COALESCE(l.kind, ?) = ? "
+        "ORDER BY l.child_id, l.parent_id",
+        (DEFAULT_LINK_KIND, LINK_KIND_BLOCKS),
     ).fetchall()
     return [(r["child"], r["parent"]) for r in rows]
 
@@ -5883,20 +5886,21 @@ def block_task(
                 },
                 run_id=run_id,
             )
-            # Escalating to triage freezes every non-terminal descendant: the
-            # children stay in ``todo`` until a human resolves this card, and
-            # nothing else on the board says so. Record what this decision is
-            # costing AT THE MOMENT it happens, so the stranding is auditable
-            # from the parent's own event log and not just inferable from a
-            # dispatch tick nobody read.
+            # Escalating to triage freezes every non-terminal child linked by
+            # a blocking edge: those children stay in ``todo`` until a human
+            # resolves this card, and nothing else on the board says so.
+            # Record what this decision is costing AT THE MOMENT it happens,
+            # so the stranding is auditable from the parent's own event log
+            # and not just inferable from a dispatch tick nobody read.
             stranded_children = [
                 r["id"] for r in conn.execute(
                     "SELECT c.id AS id FROM task_links l "
                     "JOIN tasks c ON c.id = l.child_id "
                     "WHERE l.parent_id = ? "
+                    "AND COALESCE(l.kind, ?) = ? "
                     "AND c.status NOT IN ('done', 'archived') "
                     "ORDER BY c.id",
-                    (task_id,),
+                    (task_id, DEFAULT_LINK_KIND, LINK_KIND_BLOCKS),
                 )
             ]
             if stranded_children:

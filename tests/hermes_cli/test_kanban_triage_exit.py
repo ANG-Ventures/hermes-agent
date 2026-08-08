@@ -201,6 +201,45 @@ def test_escalation_records_the_stranded_subtree_at_the_moment_it_happens(
         assert payload["count"] == 1
 
 
+def test_escalation_event_excludes_provenance_only_children(
+    kanban_home: Path,
+) -> None:
+    """The escalation event names only descendants the parent really gates."""
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="looping parent", assignee="worker")
+        blocked_child = kb.create_task(
+            conn, title="blocked child", parents=[parent], assignee="worker",
+        )
+        provenance_child = kb.create_task(
+            conn,
+            title="provenance child",
+            parents=[parent],
+            parents_kind="derived-from",
+            assignee="worker",
+        )
+        blocked = kb.get_task(conn, blocked_child)
+        provenance = kb.get_task(conn, provenance_child)
+        assert blocked is not None and blocked.status == "todo"
+        assert provenance is not None and provenance.status == "ready"
+
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
+        assert kb.claim_task(conn, parent, claimer="worker") is not None
+        assert kb.block_task(conn, parent, reason="needs human", kind="needs_input")
+        assert kb.unblock_task(conn, parent)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='running' WHERE id=?", (parent,))
+        assert kb.block_task(
+            conn, parent, reason="still needs human", kind="needs_input",
+        )
+
+        payload = next(
+            e.payload for e in kb.list_events(conn, parent)
+            if e.kind == "triage_stranded_subtree"
+        )
+        assert payload == {"stranded": [blocked_child], "count": 1}
+
+
 def test_escalation_without_children_emits_no_stranding_event(
     kanban_home: Path,
 ) -> None:
