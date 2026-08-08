@@ -3125,10 +3125,14 @@ def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
 
 
 def _estimate_message_chars(msg: Dict[str, Any]) -> int:
-    """Char count for token estimation, excluding base64 image data.
+    """Char count for token estimation, excluding base64 media payloads.
 
-    Base64 images are counted via `_count_image_tokens` instead; including
-    their raw chars here would massively overestimate token usage.
+    Media parts (images, documents, audio) are counted at their provider price
+    via `_count_image_tokens` instead; including their raw base64 chars here
+    would bill them TWICE and massively overestimate token usage. The stripped
+    set MUST stay identical to that function's tallied set -- both reference
+    ``_MEDIA_PART_TYPES`` so they cannot drift (same rule as
+    ``_estimate_message_dense_sparse`` below).
     """
     if not isinstance(msg, dict):
         return len(str(msg))
@@ -3141,7 +3145,7 @@ def _estimate_message_chars(msg: Dict[str, Any]) -> int:
                 cleaned = []
                 for part in v:
                     if isinstance(part, dict):
-                        if part.get("type") in {"image", "image_url", "input_image"}:
+                        if part.get("type") in _MEDIA_PART_TYPES:
                             cleaned.append({"type": part.get("type"), "image": "[stripped]"})
                         else:
                             cleaned.append(part)
