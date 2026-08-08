@@ -27,6 +27,13 @@ class FailoverReason(enum.Enum):
     # Authentication / authorization
     auth = "auth"                        # Transient auth (401/403) — refresh/rotate
     auth_permanent = "auth_permanent"    # Auth failed after refresh — abort
+    # Account/organization ENTITLEMENT block: the credential is structurally
+    # valid and current, but the account is not permitted to use the API at all
+    # (lapsed subscription, org policy disallowing OAuth). No refresh, retry, or
+    # credential rotation can clear it — only a human fixing the subscription.
+    # Distinct from `auth` (a stale token refresh CAN fix) and from `billing`
+    # (credit exhaustion on an otherwise-entitled account). See #2026-08-08.
+    account_blocked = "account_blocked"
 
     # Billing / quota
     billing = "billing"                  # 402 or confirmed credit exhaustion — rotate immediately
@@ -114,7 +121,17 @@ class ClassifiedError:
 
     @property
     def is_auth(self) -> bool:
-        return self.reason in {FailoverReason.auth, FailoverReason.auth_permanent}
+        # account_blocked is included deliberately: it is an authorization
+        # failure for every CONTROL-FLOW purpose (escalate to the fallback
+        # chain, print auth guidance, abort as non-retryable). Only its
+        # user-facing LABEL and its refusal to rotate a credential differ —
+        # keeping it out of this set would silently drop the auth-failover
+        # escalation at conversation_loop.py:~4123.
+        return self.reason in {
+            FailoverReason.auth,
+            FailoverReason.auth_permanent,
+            FailoverReason.account_blocked,
+        }
 
 
 
@@ -226,6 +243,26 @@ _OVERLOADED_PATTERNS = [
 # paths classify identically regardless of whether the status code survives.
 _POOL_EXHAUSTED_PATTERNS = [
     "no eligible sub",
+]
+
+# Account/organization ENTITLEMENT block (2026-08-08, sub-vps-10). A lapsed
+# subscription makes Anthropic answer EVERY request with
+#   403 permission_error "OAuth authentication is currently not allowed for this
+#   organization." (error_code=oauth_not_allowed_for_organization)
+# The OAuth token is valid and current — so the 403 bucket classified it `auth`
+# and the failover announce rendered "(auth refresh)", implying a token problem
+# and a refresh that will never happen (agent_runtime_helpers explicitly SKIPS
+# the pool refresh for this exact body: "entitlement-shaped 403 … account lacks
+# subscription, not a transient auth failure"). Matched by body string BEFORE
+# the status-code logic so the classification is identical whether or not the
+# 403 survives onto the exception object — same two-surface split that produced
+# two different wrong labels for pool exhaustion.
+#
+# 🔴 KEEP NARROW. A bare 403, and `permission_error` on its own (e.g. "you do
+# not have access to this model"), must retain the historical `auth` behavior.
+_ACCOUNT_BLOCKED_PATTERNS = [
+    "oauth_not_allowed_for_organization",
+    "oauth authentication is currently not allowed for this organization",
 ]
 
 # Usage-limit patterns that need disambiguation (could be billing OR rate_limit)
@@ -817,6 +854,19 @@ def classify_api_error(
         return _result(
             FailoverReason.pool_exhausted,
             retryable=True,
+            should_rotate_credential=False,
+            should_fallback=True,
+        )
+
+    # Account/organization entitlement block (403 oauth_not_allowed_for_organization).
+    # Checked HERE, before status-code classification, for the same two-surface
+    # reason as pool exhaustion above. The credential is VALID — refreshing or
+    # rotating it cannot help and only burns a healthy key — so fall back to a
+    # different provider and tell the user the ACCOUNT is blocked.
+    if any(p in error_msg for p in _ACCOUNT_BLOCKED_PATTERNS):
+        return _result(
+            FailoverReason.account_blocked,
+            retryable=False,
             should_rotate_credential=False,
             should_fallback=True,
         )
