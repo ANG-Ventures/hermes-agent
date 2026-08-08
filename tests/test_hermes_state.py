@@ -1017,7 +1017,7 @@ class TestSessionLifecycle:
 
         # Phase 2: reopen with the config gate off.
         monkeypatch.setattr(
-            "hermes_state._trigram_fts_config_enabled", lambda: False
+            "hermes_state_schema._trigram_fts_config_enabled", lambda: False
         )
         reopened = SessionDB(db_path=db_path)
         try:
@@ -1033,7 +1033,7 @@ class TestSessionLifecycle:
     def test_trigram_config_disabled_skips_creation(self, tmp_path, monkeypatch):
         """session_store.trigram_fts=false must skip trigram table creation."""
         monkeypatch.setattr(
-            "hermes_state._trigram_fts_config_enabled", lambda: False
+            "hermes_state_schema._trigram_fts_config_enabled", lambda: False
         )
         db = SessionDB(db_path=tmp_path / "state.db")
         try:
@@ -1066,7 +1066,7 @@ class TestSessionLifecycle:
         """Re-enabling trigram_fts after a disabled period rebuilds + backfills."""
         db_path = tmp_path / "state.db"
         monkeypatch.setattr(
-            "hermes_state._trigram_fts_config_enabled", lambda: False
+            "hermes_state_schema._trigram_fts_config_enabled", lambda: False
         )
         gated = SessionDB(db_path=db_path)
         try:
@@ -1078,7 +1078,7 @@ class TestSessionLifecycle:
         # Reopen with the gate back on (default) — trigger repair recreates
         # the trigram table and backfills the rows written while it was off.
         monkeypatch.setattr(
-            "hermes_state._trigram_fts_config_enabled", lambda: True
+            "hermes_state_schema._trigram_fts_config_enabled", lambda: True
         )
         restored = SessionDB(db_path=db_path)
         try:
@@ -5720,13 +5720,19 @@ class TestListSessionsRich:
         """
         t0 = 1709500000.0
         db.create_session("root1", "cli")
+        # Parity note (2026-08-08): upstream added CompressionSessionClosedError —
+        # appending to a session already closed by compression now raises ("adopt
+        # its live continuation before appending"). That guard is correct and this
+        # test is not about it, so write the root's message BEFORE stamping it
+        # closed. The ordering assertion under test is unaffected: it depends on
+        # the row's timestamps, not on when the INSERT happened.
+        db.append_message("root1", "user", "old ask")
         with db._lock:
             db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "root1"))
             db._conn.execute(
                 "UPDATE sessions SET ended_at=?, end_reason=? WHERE id=?",
                 (t0 + 100, "compression", "root1"),
             )
-        db.append_message("root1", "user", "old ask")
 
         # Continuation tip created after root ended; last activity much later.
         db.create_session("tip1", "cli", parent_session_id="root1")
