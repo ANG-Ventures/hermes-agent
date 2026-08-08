@@ -3222,8 +3222,8 @@ def _fetch_anthropic_models(
     is_oauth = _is_oauth_token(token)
     if is_oauth:
         headers["Authorization"] = f"Bearer {token}"
-        from agent.anthropic_adapter import _COMMON_BETAS, _OAUTH_ONLY_BETAS, _CONTEXT_1M_BETA
-        headers["anthropic-beta"] = ",".join(_COMMON_BETAS + _OAUTH_ONLY_BETAS)
+        from agent.anthropic_adapter import _common_betas, _OAUTH_ONLY_BETAS, _CONTEXT_1M_BETA
+        headers["anthropic-beta"] = ",".join(_common_betas() + _OAUTH_ONLY_BETAS)
     else:
         headers["x-api-key"] = token
 
@@ -3253,7 +3253,7 @@ def _fetch_anthropic_models(
                     body_text = ""
                 if "long context beta" in body_text and "not yet available" in body_text:
                     headers["anthropic-beta"] = ",".join(
-                        [b for b in _COMMON_BETAS if b != _CONTEXT_1M_BETA]
+                        [b for b in _common_betas() if b != _CONTEXT_1M_BETA]
                         + list(_OAUTH_ONLY_BETAS)
                     )
                     data = _do_request(headers)

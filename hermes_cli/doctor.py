@@ -2012,7 +2012,7 @@ def run_doctor(args):
             import httpx
             from agent.anthropic_adapter import (
                 _is_oauth_token,
-                _COMMON_BETAS,
+                _common_betas,
                 _OAUTH_ONLY_BETAS,
                 _CONTEXT_1M_BETA,
             )
@@ -2020,7 +2020,7 @@ def run_doctor(args):
             is_oauth = _is_oauth_token(key)
             if is_oauth:
                 headers["Authorization"] = f"Bearer {key}"
-                headers["anthropic-beta"] = ",".join(_COMMON_BETAS + _OAUTH_ONLY_BETAS)
+                headers["anthropic-beta"] = ",".join(_common_betas() + _OAUTH_ONLY_BETAS)
             else:
                 headers["x-api-key"] = key
             r = httpx.get(
@@ -2038,7 +2038,7 @@ def run_doctor(args):
                 and "not yet available" in r.text.lower()
             ):
                 headers["anthropic-beta"] = ",".join(
-                    [b for b in _COMMON_BETAS if b != _CONTEXT_1M_BETA]
+                    [b for b in _common_betas() if b != _CONTEXT_1M_BETA]
                     + list(_OAUTH_ONLY_BETAS)
                 )
                 r = httpx.get(

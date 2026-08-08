@@ -328,6 +328,56 @@ _COMMON_BETAS = [
 # the fine-grained tool streaming beta is present.  Omit it so tool calls
 # fall back to the provider's default response path.
 _TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14"
+
+# Default for ``model.fine_grained_tool_streaming_beta``. True preserves the
+# historical behaviour of always emitting ``_TOOL_STREAMING_BETA``.
+_FINE_GRAINED_TOOL_STREAMING_BETA_DEFAULT = True
+
+
+def _fine_grained_tool_streaming_beta_enabled() -> bool:
+    """Whether ``_TOOL_STREAMING_BETA`` belongs in the common beta list.
+
+    Reads ``model.fine_grained_tool_streaming_beta`` from ``config.yaml``.
+    Defaults to ``True`` — the historical behaviour — so an install that never
+    sets the key emits a byte-identical header.
+
+    Set it to ``false`` to stop advertising the beta. The feature went GA on
+    Claude 4.6+, so the header is a documented no-op there; dropping it removes
+    a flag from our outbound identity that upstream clients no longer send.
+    Providers whose behaviour still depends on the header (MiniMax already
+    strips it; OpenRouter injects its own ``x-anthropic-beta``) are unaffected.
+
+    Any read/shape failure falls back to the default so a malformed config can
+    never strip a beta an endpoint might require.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        value = cfg_get(
+            load_config_readonly(),
+            "model",
+            "fine_grained_tool_streaming_beta",
+            default=_FINE_GRAINED_TOOL_STREAMING_BETA_DEFAULT,
+        )
+    except Exception:
+        return _FINE_GRAINED_TOOL_STREAMING_BETA_DEFAULT
+    if isinstance(value, bool):
+        return value
+    return _FINE_GRAINED_TOOL_STREAMING_BETA_DEFAULT
+
+
+def _common_betas() -> list[str]:
+    """``_COMMON_BETAS`` with config-disabled entries removed.
+
+    Every caller that would otherwise read ``_COMMON_BETAS`` directly goes
+    through here, so the knob cannot be honoured on one request path and
+    silently ignored on another.
+    """
+    if _fine_grained_tool_streaming_beta_enabled():
+        return list(_COMMON_BETAS)
+    return [b for b in _COMMON_BETAS if b != _TOOL_STREAMING_BETA]
+
+
 # 1M context beta. Native Anthropic does not get this by default because some
 # subscriptions reject it, but Bedrock/Azure still need it for 1M context.
 _CONTEXT_1M_BETA = "context-1m-2025-08-07"
@@ -634,7 +684,7 @@ def _common_betas_for_base_url(
     ``drop_context_1m_beta=True`` strips the 1M-context beta from any path that
     would otherwise include it after a subscription/endpoint rejects the beta.
     """
-    betas = list(_COMMON_BETAS)
+    betas = _common_betas()
     if _base_url_needs_context_1m_beta(base_url) and not drop_context_1m_beta:
         betas.append(_CONTEXT_1M_BETA)
     if _is_minimax_anthropic_endpoint(base_url):
@@ -885,7 +935,7 @@ def build_anthropic_bedrock_client(region: str):
         # Delegate retry to hermes's outer loop (honors Retry-After); the SDK
         # default max_retries=2 ignores it and double-retries. (#26293)
         max_retries=0,
-        default_headers={"anthropic-beta": ",".join([*_COMMON_BETAS, _CONTEXT_1M_BETA])},
+        default_headers={"anthropic-beta": ",".join([*_common_betas(), _CONTEXT_1M_BETA])},
     )
 
 
