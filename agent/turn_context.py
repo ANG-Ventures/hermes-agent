@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Mapping, Optional
 from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
     ENGINE_PREFLIGHT_MAINTENANCE_STATUS_TEMPLATE,
+    ENGINE_PREFLIGHT_MAINTENANCE_REASON_STATUS_TEMPLATE,
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
@@ -1108,21 +1109,40 @@ def build_turn_context(
                     f"{_preflight_tokens:,}",
                     f"{_engine_threshold:,}",
                 )
-                # Name the ARM that fired. Every other compaction path announces
-                # itself, so a below-threshold engine-driven compaction was the
-                # one event the user saw with no explanation — it reads as
-                # "why did it compact at 66%?". Say plainly that the engine
-                # asked, not token pressure.
-                _engine_preflight_status = automatic_compaction_status_message(
-                    _compressor,
-                    phase="engine_preflight_maintenance",
-                    default_message=(
+                # Name the ARM that fired, and WHY. Every other compaction path
+                # announces itself, so a below-threshold engine-driven compaction
+                # was the one event the user saw with no explanation — it reads
+                # as "why did it compact at 66%?". Say plainly that the engine
+                # asked, not token pressure, and name the trigger when the engine
+                # exposes one (an unexplained cause is the whole complaint).
+                _engine_reason = ""
+                try:
+                    _engine_reason = str(
+                        getattr(_compressor, "last_preflight_reason", "") or ""
+                    ).strip()
+                except Exception:
+                    _engine_reason = ""
+                if _engine_reason:
+                    _engine_preflight_default = (
+                        ENGINE_PREFLIGHT_MAINTENANCE_REASON_STATUS_TEMPLATE.format(
+                            engine=_engine_name,
+                            tokens=_preflight_tokens,
+                            threshold=_engine_threshold,
+                            reason=_engine_reason,
+                        )
+                    )
+                else:
+                    _engine_preflight_default = (
                         ENGINE_PREFLIGHT_MAINTENANCE_STATUS_TEMPLATE.format(
                             engine=_engine_name,
                             tokens=_preflight_tokens,
                             threshold=_engine_threshold,
                         )
-                    ),
+                    )
+                _engine_preflight_status = automatic_compaction_status_message(
+                    _compressor,
+                    phase="engine_preflight_maintenance",
+                    default_message=_engine_preflight_default,
                     approx_tokens=_preflight_tokens,
                     threshold_tokens=_engine_threshold,
                     model=agent.model,

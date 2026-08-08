@@ -37,6 +37,35 @@ _MEMORY_CONTEXT_HEAD_CHARS = 4_000
 _MEMORY_CONTEXT_TAIL_CHARS = 1_500
 _MEMORY_CONTEXT_TRUNCATION_MARKER = "\n...[memory provider context truncated]...\n"
 
+# The one compaction phase whose cause is NOT inferable from the context
+# percentage: the engine asked for maintenance while the context sat below the
+# token threshold. Named once here so the resolver and its tests agree.
+ENGINE_PREFLIGHT_MAINTENANCE_PHASE = "engine_preflight_maintenance"
+_BELOW_THRESHOLD_ANNOUNCE_KEY = "announce_below_threshold_compaction"
+
+
+def _below_threshold_announce_enabled() -> bool:
+    """Whether below-threshold compactions announce themselves (default True).
+
+    Operator kill switch: ``compression.announce_below_threshold_compaction:
+    false`` in config.yaml. Read defensively — a config failure must never
+    suppress the explanation, so every error path defaults to announcing.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly()
+        if not isinstance(cfg, dict):
+            return True
+        compression_cfg = cfg.get("compression")
+        if not isinstance(compression_cfg, dict):
+            return True
+        raw = compression_cfg.get(_BELOW_THRESHOLD_ANNOUNCE_KEY, True)
+        return str(raw).strip().lower() not in {"false", "0", "no", "off"}
+    except Exception:
+        logger.debug("below-threshold announce config read failed", exc_info=True)
+        return True
+
 
 def sanitize_memory_context(memory_context: str) -> str:
     """Prepare provider context for a context-engine/LLM egress boundary."""
@@ -67,9 +96,21 @@ def automatic_compaction_status_message(
     ``emit_automatic_compaction_status = False`` or customize it by defining
     ``get_automatic_compaction_status_message(...)``. Empty strings and
     ``None`` mean "do not emit a lifecycle status".
+
+    One phase overrides that opt-out: ``engine_preflight_maintenance``. Engines
+    silence routine chatter because the user can infer the cause from the
+    context percentage — but a compaction that fires while the context is BELOW
+    the threshold has no such tell, so silencing it produces a compaction the
+    user cannot explain. That phase is therefore always announced unless the
+    operator explicitly opts out via
+    ``compression.announce_below_threshold_compaction: false``.
     """
     if not getattr(engine, "emit_automatic_compaction_status", True):
-        return None
+        if not (
+            phase == ENGINE_PREFLIGHT_MAINTENANCE_PHASE
+            and _below_threshold_announce_enabled()
+        ):
+            return None
 
     formatter = getattr(engine, "get_automatic_compaction_status_message", None)
     if callable(formatter):
@@ -78,6 +119,12 @@ def automatic_compaction_status_message(
             default_message=default_message,
             **context,
         )
+        # An engine that opts out of routine status returns None from the base
+        # formatter regardless of phase. For the below-threshold arm the host's
+        # default IS the message the user needs, so fall back to it rather than
+        # letting the engine's blanket opt-out re-suppress what we just allowed.
+        if message is None and phase == ENGINE_PREFLIGHT_MAINTENANCE_PHASE:
+            message = default_message
     else:
         message = default_message
 

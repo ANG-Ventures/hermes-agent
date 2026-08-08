@@ -638,6 +638,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         self._last_overflow_recovery_failed = False
         self._last_condensation_suppressed_reason = ""
+        # Why the most recent preflight asked for a compaction (see
+        # _mark_preflight_compression_requested). Surfaced to the user for
+        # below-threshold compactions, which are otherwise unexplainable.
+        self._last_preflight_reason = ""
         self._last_condensations = []
         self._last_threshold_full_sweep: dict[str, Any] = {
             "status": "never_run",
@@ -1211,11 +1215,31 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """Whether the most recent compression/preflight decision was a no-op."""
         return self._last_compression_status == "noop"
 
-    def _mark_preflight_compression_requested(self) -> bool:
-        """Record that preflight found work and clear any stale no-op reason."""
+    def _mark_preflight_compression_requested(self, reason: str = "") -> bool:
+        """Record that preflight found work and clear any stale no-op reason.
+
+        ``reason`` names WHICH branch of ``should_compress_preflight`` asked for
+        the compaction. The host surfaces it verbatim in the user-visible
+        below-threshold banner: a compaction that fires while the context is
+        nowhere near the token threshold is inexplicable without it ("why did it
+        compact at 46%?"). Every ``return True`` in the preflight decision tree
+        routes through here, so the reason cannot drift out of sync with the
+        branch that actually fired.
+        """
         self._last_compression_status = "pending"
         self._last_compression_noop_reason = ""
+        self._last_preflight_reason = reason or ""
         return True
+
+    @property
+    def last_preflight_reason(self) -> str:
+        """Why the most recent preflight requested a compaction ('' if none).
+
+        Read by the host to explain a below-threshold compaction. Cleared on
+        every no-op decision so a stale reason cannot be attributed to a later,
+        unrelated compaction.
+        """
+        return getattr(self, "_last_preflight_reason", "")
 
     @property
     def bound_session_id(self) -> str:

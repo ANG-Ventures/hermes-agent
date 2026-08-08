@@ -1501,6 +1501,13 @@ DEFAULT_CONFIG = {
                                       # episodic break instead of a tiny break every
                                       # tool iteration. 0 = commit any non-zero prune.
         "hygiene_hard_message_limit": 400,  # gateway session-hygiene force-compress threshold by message count
+        "announce_below_threshold_compaction": True,  # announce a compaction the
+                                      # CONTEXT ENGINE requested while the context was
+                                      # BELOW the token threshold, naming the cause
+                                      # (e.g. a large attachment externalized). Those
+                                      # fire with no percentage tell, so silencing them
+                                      # produces a compaction the user cannot explain.
+                                      # Set False to keep that arm quiet.
         "hygiene_threshold": 0.85,    # gateway session-hygiene token threshold (fraction of window); higher than compression.threshold (pre-turn backstop)
         "hygiene_timeout_seconds": None,  # max seconds gateway waits for pre-agent hygiene compression.
                                       # None/unset = derive from auxiliary.compression.timeout
