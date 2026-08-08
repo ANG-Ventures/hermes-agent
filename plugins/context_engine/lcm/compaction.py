@@ -171,8 +171,16 @@ class CompactionMixin:
                     and self._compression_boundary_cooldown_active()
                 ):
                     self._preflight_cleanup_only_due_to_boundary_cooldown = True
+                # Sanitize-only cleanup adoption is bookkeeping, not compaction:
+                # deterministic, already durable, no summarizer call, and it
+                # folds nothing. It must still RUN (an externalized payload
+                # should not linger in active context), but announcing it emits
+                # a "maintenance compaction" banner that is then followed by no
+                # stats, because there is no delta to report. An overflow-driven
+                # pass through this branch is real work and stays visible.
                 return self._mark_preflight_compression_requested(
-                    self._describe_ingest_cleanup_reason(messages, replay_messages)
+                    self._describe_ingest_cleanup_reason(messages, replay_messages),
+                    user_visible=bool(force_overflow_requested),
                 )
             if force_overflow_requested:
                 return self._mark_preflight_compression_requested(
