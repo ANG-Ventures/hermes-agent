@@ -20,6 +20,11 @@ from urllib.parse import urlparse
 import requests
 import yaml
 
+from agent.media_token_accounting import (
+    IMAGE_TOKEN_COST as _IMAGE_TOKEN_COST,
+    MEDIA_PART_TYPES as _MEDIA_PART_TYPES,
+    media_part_token_cost,
+)
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname
 
 from hermes_constants import OPENROUTER_MODELS_URL
@@ -3050,26 +3055,13 @@ def estimate_tokens_rough(text: str) -> int:
     return dense + ((sparse + 3) // 4)
 
 
-# Media parts arrive as base64 but are billed by dimension/page/duration, never
-# by transport size, so their payload length carries no pricing signal. Flat
-# per-part costs; counting the base64 as characters overestimated a real
-# 1710x1518 screenshot by ~145x and drove spurious compaction (2026-08-07).
-_IMAGE_TOKEN_COST = 1500
-_DOCUMENT_TOKEN_COST = 3000
-_AUDIO_TOKEN_COST = 1500
-_IMAGE_PART_TYPES = frozenset({"image", "image_url", "input_image"})
-_DOCUMENT_PART_TYPES = frozenset({"document", "input_file", "file"})
-_AUDIO_PART_TYPES = frozenset({"input_audio", "audio"})
-_MEDIA_PART_TYPES = _IMAGE_PART_TYPES | _DOCUMENT_PART_TYPES | _AUDIO_PART_TYPES
-
-
 def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
     """Rough token estimate for a message list (pre-flight only).
 
-    Media parts (base64 images, PDFs, audio) are counted at a flat per-part
-    cost — the provider pricing model — instead of counting raw base64
-    character length. Without this, a single ~1MB screenshot would be
-    estimated at ~250K tokens and trigger premature context compression.
+    Media parts are billed by provider dimensions/pages/duration instead of
+    counting raw base64 character length. Without this, a single ~1MB
+    screenshot would be estimated at ~250K tokens and trigger premature
+    context compression.
     """
     dense_total = 0
     sparse_total = 0
@@ -3087,31 +3079,23 @@ def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
 
 
 def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
-    """Count image-like content parts in a message; return their token cost.
+    """Count media content parts in a message; return their token cost.
 
-    Also covers documents (PDF) and audio: like images, these arrive as base64
-    and are billed by page/duration, never by transport size, so their payload
-    length is not a usable proxy. Counting them as characters billed a 1.5 MB
-    PDF at ~419,000 tokens.
+    PDFs use page count and audio uses WAV/MP3 duration when parseable. All
+    parsers fail open to the historical flat cost; no media payload is ever
+    billed by transport length.
     """
-    count = 0
-    doc_count = 0
-    audio_count = 0
+    media_tokens = 0
 
     def _tally(parts: Any) -> None:
-        nonlocal count, doc_count, audio_count
+        nonlocal media_tokens
         if not isinstance(parts, list):
             return
         for part in parts:
-            if not isinstance(part, dict):
-                continue
-            ptype = part.get("type")
-            if ptype in _IMAGE_PART_TYPES:
-                count += 1
-            elif ptype in _DOCUMENT_PART_TYPES:
-                doc_count += 1
-            elif ptype in _AUDIO_PART_TYPES:
-                audio_count += 1
+            media_tokens += media_part_token_cost(
+                part,
+                image_token_cost=cost_per_image,
+            )
 
     content = msg.get("content") if isinstance(msg, dict) else None
     _tally(content)
@@ -3119,18 +3103,14 @@ def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
     # Multimodal tool results that haven't been converted yet.
     if isinstance(content, dict) and content.get("_multimodal"):
         _tally(content.get("content"))
-    return (
-        count * cost_per_image
-        + doc_count * _DOCUMENT_TOKEN_COST
-        + audio_count * _AUDIO_TOKEN_COST
-    )
+    return media_tokens
 
 
 def _estimate_message_chars(msg: Dict[str, Any]) -> int:
-    """Char count for token estimation, excluding base64 image data.
+    """Char count for token estimation, excluding base64 media data.
 
-    Base64 images are counted via `_count_image_tokens` instead; including
-    their raw chars here would massively overestimate token usage.
+    Media is counted via `_count_image_tokens` instead; including raw base64
+    here would massively overestimate token usage and double-bill the part.
     """
     if not isinstance(msg, dict):
         return len(str(msg))
@@ -3143,8 +3123,8 @@ def _estimate_message_chars(msg: Dict[str, Any]) -> int:
                 cleaned = []
                 for part in v:
                     if isinstance(part, dict):
-                        if part.get("type") in {"image", "image_url", "input_image"}:
-                            cleaned.append({"type": part.get("type"), "image": "[stripped]"})
+                        if part.get("type") in _MEDIA_PART_TYPES:
+                            cleaned.append({"type": part.get("type"), "media": "[stripped]"})
                         else:
                             cleaned.append(part)
                     else:
@@ -3248,7 +3228,7 @@ def compose_request_breakdown(
           delimiters, tool-call id wrappers that the char walk never sees.
           It scales with message count, so it lives in non-fixed.
 
-    Image parts count at the flat per-image cost (matching
+    Media parts count via provider dimensions/pages/duration (matching
     estimate_messages_tokens_rough). The system message inside messages is
     skipped (accounted via system_prompt) to avoid double-counting the prefix.
 
@@ -3274,7 +3254,7 @@ def compose_request_breakdown(
     history_chars = 0
     tool_result_chars = 0
     tool_arg_chars = 0
-    image_tokens = 0
+    media_tokens = 0
     tool_result_count = 0
     history_message_count = 0
     for msg in messages or []:
@@ -3285,7 +3265,7 @@ def compose_request_breakdown(
         role = msg.get("role")
         if role == "system":
             continue
-        image_tokens += _count_image_tokens(msg, IMG_COST)
+        media_tokens += _count_image_tokens(msg, IMG_COST)
         if role == "tool":
             tool_result_count += 1
             tool_result_chars += _estimate_message_chars(msg)
@@ -3333,7 +3313,7 @@ def compose_request_breakdown(
     # message on the wire (including the system message) since each carries
     # role/delimiter overhead. Scales with the conversation -> non-fixed.
     framing_tokens = PER_MESSAGE_FRAMING_TOKENS * len(messages or [])
-    history_tokens = _t(history_chars) + image_tokens
+    history_tokens = _t(history_chars) + media_tokens
     tool_result_tokens = _t(tool_result_chars)
     tool_arg_tokens = _t(tool_arg_chars)
     fixed_tokens = sys_tokens + tool_schema_tokens
