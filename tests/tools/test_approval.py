@@ -100,9 +100,22 @@ class TestDetectDangerousRm:
 
 
     def test_nonrecursive_verification_artifact_cleanup_is_not_dangerous(self):
-        with mock_patch("tempfile.gettempdir", return_value="/tmp"):
+        # fork-parity: this used to hardcode "/tmp", which is a SYMLINK to
+        # /private/tmp on macOS. _is_verification_artifact_cleanup compares the
+        # literal operand against os.path.realpath(gettempdir()) precisely so a
+        # symlinked temp dir is NOT exempt -- the invariant its sibling
+        # test_symlinked_temp_dir_only_exempts_canonical_target exists to pin.
+        # So on macOS the old assertion silently exercised the REJECT path and
+        # failed for platform reasons, not behaviour. Use a real canonical temp
+        # dir so the exemption path is what actually gets tested, on every OS.
+        import os as _os
+        import tempfile as _tempfile
+
+        canonical_tmp = _os.path.realpath(_tempfile.gettempdir())
+        with mock_patch("tempfile.gettempdir", return_value=canonical_tmp):
             for prefix in ("hermes-verify-", "hermes-ad-hoc-"):
-                assert detect_dangerous_command(f"rm -f /tmp/{prefix}example.py") == (
+                target = _os.path.join(canonical_tmp, f"{prefix}example.py")
+                assert detect_dangerous_command(f"rm -f {target}") == (
                     False,
                     None,
                     None,
@@ -124,18 +137,34 @@ class TestDetectDangerousRm:
             )
 
     def test_verification_cleanup_exemption_rejects_broader_deletions(self):
+        # fork-parity: same "/tmp"-is-a-symlink-on-macOS problem as the positive
+        # test above, but here it was WORSE than a false failure -- it made this
+        # negative test vacuous. Every command was rejected because the literal
+        # "/tmp" prefix never matched realpath("/private/tmp"), so the test
+        # passed even with the exemption predicate stubbed to `return True`
+        # (verified by mutation). Anchoring on the canonical temp dir means
+        # these commands are now rejected for the reasons they NAME (recursive,
+        # multi-operand, traversal, glob, substitution, chaining), and the
+        # mutation is caught.
+        import os as _os
+        import tempfile as _tempfile
+
+        canonical_tmp = _os.path.realpath(_tempfile.gettempdir())
+        t = lambda name: _os.path.join(canonical_tmp, name)  # noqa: E731
         commands = (
-            "rm -rf /tmp/hermes-verify-example.py",
-            "rm -f /tmp/hermes-verify-example.py /tmp/other.py",
-            "rm -f /tmp/nested/../hermes-verify-example.py",
-            "rm -f /tmp/a/../../tmp/hermes-verify-example.py",
+            f"rm -rf {t('hermes-verify-example.py')}",
+            f"rm -f {t('hermes-verify-example.py')} {t('other.py')}",
+            f"rm -f {t('nested/../hermes-verify-example.py')}",
+            f"rm -f {canonical_tmp}/a/../../tmp/hermes-verify-example.py",
             "rm -f /var/tmp/hermes-verify-example.py",
-            "rm -f /tmp/hermes-verify-*",
-            "rm -f /tmp/hermes-verify-$(touch>/tmp/pwned).py",
-            "rm -f /tmp/hermes-ad-hoc-`touch>/tmp/pwned`.py",
-            "rm -f /tmp/hermes-verify-example.py; touch /tmp/pwned",
+            f"rm -f {t('hermes-verify-*')}",
+            f"rm -f {t('hermes-verify-$(touch>/tmp/pwned).py')}",
+            f"rm -f {t('hermes-ad-hoc-`touch>/tmp/pwned`.py')}",
+            f"rm -f {t('hermes-verify-example.py')}; touch /tmp/pwned",
+            # Not a hermes artifact at all: the exemption must never cover it.
+            f"rm -f {t('definitely-not-ours.py')}",
         )
-        with mock_patch("tempfile.gettempdir", return_value="/tmp"):
+        with mock_patch("tempfile.gettempdir", return_value=canonical_tmp):
             for command in commands:
                 is_dangerous, key, desc = detect_dangerous_command(command)
                 assert is_dangerous is True, command

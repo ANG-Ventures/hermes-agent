@@ -1221,7 +1221,21 @@ class TestCaptureAppFilterNoMatch:
         assert backend._active_pid is None
         assert backend._active_window_id is None
 
-    def test_linux_default_capture_skips_gnome_shell_helper(self):
+    def test_linux_default_capture_skips_gnome_shell_helper(self, monkeypatch):
+        # fork-parity: the behaviour under test lives behind
+        # `sys.platform == "linux"` in cua_backend._choose_window (the GNOME
+        # backdrop-helper skip). The test never pinned the platform, so it only
+        # passed on a Linux runner and asserted the macOS path everywhere else
+        # (picking pid 100, the helper, instead of 200). Pin the platform so the
+        # test exercises what its name promises on any host.
+        import tools.computer_use.cua_backend as _cua
+
+        monkeypatch.setattr(_cua.sys, "platform", "linux", raising=False)
+        # The Linux branch may probe _NET_ACTIVE_WINDOW via xprop; there is no
+        # X11 here, so make that probe explicitly unavailable rather than
+        # letting it shell out.
+        monkeypatch.setattr(_cua, "_linux_x11_active_window_id", lambda: None)
+
         windows = [
             {"app_name": "", "pid": 100, "window_id": 1,
              "is_on_screen": None, "title": "@!1921,0;BDHF", "z_index": 0},

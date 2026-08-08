@@ -212,6 +212,15 @@ def _install_fake_openwakeword(monkeypatch):
     monkeypatch.setitem(sys.modules, "openwakeword", oww)
     monkeypatch.setitem(sys.modules, "openwakeword.model", model_mod)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *a, **k: None)
+    # fork-parity: the fake covers the openwakeword IMPORT but not the tflite
+    # RUNTIME probe. On macOS ARM64 the engine forces framework="tflite"
+    # (upstream dscripka/openWakeWord#336 breaks onnx there) and then raises
+    # RuntimeError when ai-edge-litert is absent -- so any test using this
+    # helper failed on an Apple Silicon dev box while passing on CI's Linux.
+    # The point of the fake is "engine builds with no network and no native
+    # deps", so stub the probe as satisfied; tests that specifically exercise
+    # the missing-runtime path patch it themselves.
+    monkeypatch.setattr(ww, "ensure_tflite_runtime", lambda *a, **k: True)
     return calls
 
 
