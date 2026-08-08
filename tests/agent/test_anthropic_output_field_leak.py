@@ -11,7 +11,13 @@ normalize_response capture, _sanitize_replay_block (ordered-blocks replay), and
 _convert_content_part_to_anthropic (content-list replay).
 """
 import sys, os
-sys.path.insert(0, os.path.expanduser("~/.hermes/hermes-agent"))
+# fork parity NOTE (2026-08-08): this used to hardcode
+# sys.path.insert(0, "~/.hermes/hermes-agent") — an ABSOLUTE path to a DIFFERENT
+# checkout. Any worktree (parity merge, CI, a second clone) then imported
+# `agent.*` from that other tree, so the test asserted against code it was not
+# testing and blew up on symbols the other tree lacked
+# (ImportError: SKILL_EXCERPT_JOINT). Resolve the repo root from THIS file.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import pytest
 from agent.anthropic_adapter import (
