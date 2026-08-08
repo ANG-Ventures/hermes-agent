@@ -67,6 +67,42 @@ class CompactionMixin:
             return False
         return tokens >= self.threshold_tokens
 
+    def _maintenance_pressure_met(self, observed_tokens: int) -> bool:
+        """Whether a MAINTENANCE compaction is allowed at the current size.
+
+        Maintenance arms ("compactable backlog outside the fresh tail",
+        "ignored-message backlog") are opportunistic tidying, not overflow
+        protection. On the divergent-replay path they historically ran with no
+        token gate at all, while the identical eligibility check on the
+        non-divergent path sits behind ``rough >= threshold_tokens``. Since the
+        divergent path is entered whenever ingest externalized something
+        (media, base64, a large tool result), a screenshot-heavy session
+        compacted at any size — measured production fires at 21%, 23% and 32%
+        of threshold inside eight minutes, freeing 27-47% where pressure-driven
+        compactions free 84-86%, each paying a summarizer call and the whole
+        prompt cache.
+
+        Returns True (allow) when the floor is disabled, when no threshold is
+        configured, or when the session has reached the configured fraction of
+        it. This gates ONLY the opportunistic arms: deterministic ingest-cleanup
+        adoption returns earlier and is unaffected, and overflow recovery is
+        checked before this on every path.
+        """
+        ratio = getattr(self._config, "maintenance_min_pressure_ratio", 0.0) or 0.0
+        if ratio <= 0.0:
+            return True
+        if self.threshold_tokens <= 0:
+            return True
+        floor = int(self.threshold_tokens * ratio)
+        if observed_tokens >= floor:
+            return True
+        logger.debug(
+            "LCM maintenance compaction deferred: %d tokens < %d floor "
+            "(%.0f%% of %d threshold)",
+            observed_tokens, floor, ratio * 100, self.threshold_tokens,
+        )
+        return False
+
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
         self._preflight_cleanup_only_due_to_boundary_cooldown = False
@@ -162,11 +198,13 @@ class CompactionMixin:
                     and replay_rough >= self.threshold_tokens
                 ),
             )
-            if eligible:
+            if eligible and self._maintenance_pressure_met(replay_rough):
                 return self._mark_preflight_compression_requested(
                     "compactable backlog outside the fresh tail"
                 )
-            if self._has_ignored_backlog_outside_fresh_tail(replay_messages):
+            if self._has_ignored_backlog_outside_fresh_tail(
+                replay_messages
+            ) and self._maintenance_pressure_met(replay_rough):
                 return self._mark_preflight_compression_requested(
                     "ignored-message backlog outside the fresh tail"
                 )

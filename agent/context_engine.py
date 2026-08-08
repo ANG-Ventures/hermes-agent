@@ -50,6 +50,40 @@ _BELOW_THRESHOLD_ANNOUNCE_KEY = "announce_below_threshold_compaction"
 # quiet while catching the structural gaps (a measured session ran 1.38x).
 _UNDERCOUNT_WARN_RATIO = 1.15
 
+# Config key for allowing the skew calibration to scale an UNDER-counting
+# estimate up toward provider truth (default on).
+_SKEW_SCALE_UP_KEY = "skew_scale_up"
+
+# Upper bound on the scale-up correction. The measured under-count range is
+# 1.15-1.39x; 1.60 leaves headroom for a worse model/toolset mix while ensuring
+# one anomalous (rough, real) pair can never drive a wildly premature
+# compaction. The existing skew_floor guards the other direction.
+_SKEW_SCALE_UP_MAX = 1.60
+
+
+def _scale_up_calibration_enabled() -> bool:
+    """Whether skew calibration may scale an under-counting estimate UP.
+
+    Operator kill switch: ``compression.skew_scale_up: false`` in config.yaml
+    restores the historical hard clamp at 1.0. Read defensively — a config
+    failure must never change compaction behavior, so every error path returns
+    the default (enabled).
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly()
+        if not isinstance(cfg, dict):
+            return True
+        compression_cfg = cfg.get("compression")
+        if not isinstance(compression_cfg, dict):
+            return True
+        raw = compression_cfg.get(_SKEW_SCALE_UP_KEY, True)
+        return str(raw).strip().lower() not in {"false", "0", "no", "off"}
+    except Exception:
+        logger.debug("skew scale-up config read failed", exc_info=True)
+        return True
+
 
 def _below_threshold_announce_enabled() -> bool:
     """Whether below-threshold compactions announce themselves (default True).
@@ -375,21 +409,26 @@ class ContextEngine(ABC):
         if real_prompt_tokens and real_prompt_tokens > 0 and last_rough > 0:
             self.rough_at_last_real = last_rough
             raw_ratio = real_prompt_tokens / last_rough
-            ratio = min(1.0, raw_ratio)
-            # The clamp above is deliberate: never scale the estimate UP, because
-            # an over-eager scale-up compacts early and often. But it also means a
-            # session where the estimate UNDER-counts records a reassuring
-            # ratio=1.000 while the real prompt is materially larger than the
-            # number the threshold gate compared against — i.e. compaction fires
-            # LATE, in the direction of a provider overflow. That is exactly the
-            # case that must not stay invisible, so surface it separately from the
-            # (clamped) value the calibration uses.
+            allow_up = _scale_up_calibration_enabled()
+            ratio = raw_ratio if allow_up else min(1.0, raw_ratio)
+            # Historically this was hard-clamped to <= 1.0 ("rough over-counts;
+            # never scale UP"). That holds only while the estimate over-counts.
+            # Measured 2026-08-08 across live sessions it UNDER-counts by
+            # 1.15-1.39x, and the clamp recorded every one of those as a clean
+            # ratio=1.000 — so the threshold gate compared against a number well
+            # below the real prompt and fired LATE, toward a provider overflow.
+            # Scaling up is now opt-in via compression.skew_scale_up (default
+            # ON): the correction is bounded by _SKEW_SCALE_UP_MAX so a single
+            # anomalous pair cannot drive premature compaction.
+            if allow_up and raw_ratio > 1.0:
+                ratio = min(ratio, _SKEW_SCALE_UP_MAX)
             if raw_ratio > _UNDERCOUNT_WARN_RATIO:
                 logger.warning(
                     "COMPACTION_ESTIMATE_UNDERCOUNT rough=%d real=%d raw_ratio=%.3f "
-                    "(clamped to 1.000 for calibration) — the local estimate reads "
-                    "%.2fx LOW, so threshold compaction fires later than intended",
-                    last_rough, int(real_prompt_tokens), raw_ratio, raw_ratio,
+                    "(recorded=%.3f, scale_up=%s) — the local estimate reads "
+                    "%.2fx LOW",
+                    last_rough, int(real_prompt_tokens), raw_ratio, ratio,
+                    "on" if allow_up else "off", raw_ratio,
                 )
             hist = getattr(self, "_recent_skews", None)
             if hist is None:
@@ -461,8 +500,17 @@ class ContextEngine(ABC):
             fh.write(f"{stamp} {line}\n")
 
     def _current_skew(self) -> float:
-        """Median of the last-k real/rough ratios, clamped to [floor, 1.0]. Returns
-        1.0 (no scaling = pre-P2 behavior) when no real reading has paired yet."""
+        """Median of the last-k real/rough ratios, clamped to [floor, ceiling].
+        Returns 1.0 (no scaling = pre-P2 behavior) when no real reading has
+        paired yet.
+
+        The upper clamp is 1.0 when scale-up is disabled (historical behavior:
+        the estimate is only ever corrected DOWN). When ``compression.
+        skew_scale_up`` is on (default) it rises to ``_SKEW_SCALE_UP_MAX`` so a
+        measured UNDER-count can actually reach the trigger — otherwise
+        record_skew_from_real's un-clamped ratio is silently re-clamped here and
+        the correction never takes effect.
+        """
         hist = getattr(self, "_recent_skews", None)
         if not hist:
             return 1.0
@@ -470,7 +518,8 @@ class ContextEngine(ABC):
         mid = len(ordered) // 2
         med = ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
         floor = getattr(self, "_skew_floor", self._SKEW_FLOOR_DEFAULT)
-        return max(floor, min(1.0, med))
+        ceiling = _SKEW_SCALE_UP_MAX if _scale_up_calibration_enabled() else 1.0
+        return max(floor, min(ceiling, med))
 
     def _trigger_skew(self) -> float:
         """Skew used for the compaction TRIGGER decision only (never for display).
