@@ -23,45 +23,171 @@ _CHARS_PER_TOKEN = 4
 # 1710x1518 PNG: char-counting gave 502,182 tokens vs Anthropic's actual
 # (w * h / 750) = 3,461 -- a 145x overestimate that drove spurious compaction.
 #
-# Providers price attachments by DIMENSION or PAGE, never by transport size, so
-# the payload's character length carries no pricing signal at all. Use a flat
-# per-part cost, which is the same model the host estimator uses.
+# Providers price attachments by DIMENSION, PAGE, or DURATION -- never by
+# transport size -- so the payload's character length carries no pricing signal
+# at all. Images use a flat per-part cost; documents and audio are sized from a
+# cheap, bounded header parse because a FLAT document cost under-counts a
+# 40-page PDF ~40x, and under-counting is the dangerous direction (compaction
+# fires too LATE and the turn can hit a real provider 400).
 _IMAGE_PART_TOKENS = 1500
-# A PDF/document page costs roughly an image; we cannot cheaply count pages
-# without parsing, so bill a conservative multi-page default.
+# Anthropic's PDF docs: "each page typically uses 1,500-3,000 tokens per page
+# depending on content density." Midpoint per page; the flat value is only the
+# fallback for a document whose page count we cannot determine.
+_DOCUMENT_TOKENS_PER_PAGE = 2250
 _DOCUMENT_PART_TOKENS = 3000
-# Audio is billed per second of duration; the payload length is likewise not a
-# usable proxy. Flat, conservative.
+# Audio is billed per second of duration.
+_AUDIO_TOKENS_PER_SECOND = 10
 _AUDIO_PART_TOKENS = 1500
 
 _IMAGE_PART_TYPES = frozenset({"image", "image_url", "input_image"})
 _DOCUMENT_PART_TYPES = frozenset({"document", "input_file", "file"})
 _AUDIO_PART_TYPES = frozenset({"input_audio", "audio"})
 
-_MEDIA_PART_COSTS = tuple(
-    (types, cost)
-    for types, cost in (
-        (_IMAGE_PART_TYPES, _IMAGE_PART_TOKENS),
-        (_DOCUMENT_PART_TYPES, _DOCUMENT_PART_TOKENS),
-        (_AUDIO_PART_TYPES, _AUDIO_PART_TOKENS),
-    )
-)
+# Only ever inspect this much of a payload -- a page count/duration lives in the
+# structure, not the content, so a bounded read keeps this O(1) in attachment
+# size. Guardrails stop a corrupt header producing an absurd bill.
+_MAX_INSPECT_BYTES = 4 * 1024 * 1024
+_MAX_PAGES = 10_000
+_MAX_AUDIO_SECONDS = 24 * 60 * 60
+
+
+def _decode_media_payload(part: Any) -> Any:
+    """Best-effort raw bytes for a media part, or None. Never raises."""
+    try:
+        import base64
+
+        raw = None
+        if isinstance(part, dict):
+            src = part.get("source")
+            if isinstance(src, dict) and isinstance(src.get("data"), str):
+                raw = src["data"]
+            if raw is None:
+                for key in ("image_url", "input_audio", "file"):
+                    holder = part.get(key)
+                    if isinstance(holder, dict):
+                        for field in ("url", "data", "file_data"):
+                            if isinstance(holder.get(field), str):
+                                raw = holder[field]
+                                break
+                    elif isinstance(holder, str):
+                        raw = holder
+                    if raw is not None:
+                        break
+            if raw is None and isinstance(part.get("data"), str):
+                raw = part["data"]
+        if not isinstance(raw, str) or not raw:
+            return None
+        if raw.startswith("["):  # externalized-payload marker, not data
+            return None
+        if raw.lstrip().startswith("data:") and "," in raw[:64]:
+            raw = raw.split(",", 1)[1]
+        cap = (_MAX_INSPECT_BYTES // 3) * 4
+        if len(raw) > cap:
+            raw = raw[:cap]
+        return base64.b64decode(raw + "=" * (-len(raw) % 4), validate=False)
+    except Exception:
+        return None
+
+
+def pdf_page_count(data: Any) -> Any:
+    """Pages in a PDF, or None if undecidable. Cheap, bounded, never raises."""
+    try:
+        if not data or not data.startswith(b"%PDF"):
+            return None
+        import re as _re
+        import zlib as _zlib
+
+        n = len(_re.findall(rb"/Type\s*/Page[^s]", data))
+        if n:
+            return min(n, _MAX_PAGES)
+        counts = [int(m) for m in _re.findall(rb"/Count\s+(\d+)", data)]
+        if counts:
+            return min(max(counts), _MAX_PAGES)
+        total = 0
+        for m in _re.finditer(rb"stream\r?\n", data):
+            start = m.end()
+            end = data.find(b"endstream", start)
+            if end == -1:
+                continue
+            try:
+                inflated = _zlib.decompress(data[start:end])
+            except Exception:
+                continue
+            total += len(_re.findall(rb"/Type\s*/Page[^s]", inflated))
+            if total >= _MAX_PAGES:
+                break
+        return min(total, _MAX_PAGES) if total else None
+    except Exception:
+        return None
+
+
+def audio_duration_seconds(data: Any) -> Any:
+    """Duration of a WAV/AIFF payload, or None. Cheap, bounded, never raises."""
+    try:
+        if not data or len(data) < 16:
+            return None
+        import struct as _struct
+
+        if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+            pos, rate, bits, channels, nbytes = 12, None, None, None, None
+            while pos + 8 <= len(data):
+                cid = data[pos:pos + 4]
+                size = _struct.unpack("<I", data[pos + 4:pos + 8])[0]
+                if cid == b"fmt " and pos + 24 <= len(data):
+                    channels = _struct.unpack("<H", data[pos + 10:pos + 12])[0]
+                    rate = _struct.unpack("<I", data[pos + 12:pos + 16])[0]
+                    bits = _struct.unpack("<H", data[pos + 22:pos + 24])[0]
+                elif cid == b"data":
+                    nbytes = size
+                    break
+                pos += 8 + size + (size & 1)
+            if rate and nbytes and bits and channels:
+                per_sec = rate * channels * max(bits // 8, 1)
+                if per_sec > 0:
+                    return min(nbytes / float(per_sec), _MAX_AUDIO_SECONDS)
+            return None
+        if data[:4] == b"FORM" and data[8:12] in (b"AIFF", b"AIFC"):
+            pos = 12
+            while pos + 8 <= len(data):
+                cid = data[pos:pos + 4]
+                size = _struct.unpack(">I", data[pos + 4:pos + 8])[0]
+                if cid == b"COMM" and pos + 22 <= len(data):
+                    frames = _struct.unpack(">I", data[pos + 10:pos + 14])[0]
+                    exponent = _struct.unpack(">H", data[pos + 16:pos + 18])[0]
+                    mantissa = _struct.unpack(">I", data[pos + 18:pos + 22])[0]
+                    rate = mantissa * (2.0 ** (exponent - 16383 - 31))
+                    if rate > 0:
+                        return min(frames / rate, _MAX_AUDIO_SECONDS)
+                    return None
+                pos += 8 + size + (size & 1)
+        return None
+    except Exception:
+        return None
 
 
 def media_part_token_cost(part: Any) -> int:
-    """Flat token cost for a multimodal content part, or 0 if it is not media.
+    """Token cost for a multimodal content part, or 0 if it is not media.
 
-    Returns 0 for text parts and anything unrecognized, so callers can fall
-    through to normal character-based counting.
+    Documents are priced per PAGE and audio per SECOND when the header can be
+    read; both fall back to a conservative flat cost otherwise. Returns 0 for
+    text parts and anything unrecognized, so callers fall through to normal
+    character-based counting.
     """
     if not isinstance(part, dict):
         return 0
     part_type = part.get("type")
     if not part_type:
         return 0
-    for types, cost in _MEDIA_PART_COSTS:
-        if part_type in types:
-            return cost
+    if part_type in _IMAGE_PART_TYPES:
+        return _IMAGE_PART_TOKENS
+    if part_type in _DOCUMENT_PART_TYPES:
+        pages = pdf_page_count(_decode_media_payload(part) or b"")
+        return pages * _DOCUMENT_TOKENS_PER_PAGE if pages else _DOCUMENT_PART_TOKENS
+    if part_type in _AUDIO_PART_TYPES:
+        seconds = audio_duration_seconds(_decode_media_payload(part) or b"")
+        if seconds:
+            return max(1, int(seconds * _AUDIO_TOKENS_PER_SECOND))
+        return _AUDIO_PART_TOKENS
     return 0
 
 
