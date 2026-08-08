@@ -627,12 +627,13 @@ class TestPrefetchServerRetainVisibility:
         #      one poll before expiring, dropping the op (await_count == 1) and
         #      silently degrading into the timeout path this test is NOT about.
         #
-        # So: make the polls effectively free (removes hazard 1) and keep the
-        # shared budget comfortably ABOVE what barrier 1 + three cheap polls
-        # need, while still UNDER the 5.0s join (removes hazard 2). Runtime
-        # defaults are deliberately untouched -- this is test pacing only.
+        # So: make the polls effectively free (removes hazard 1) and leave the
+        # shared drain budget at the runtime default of 10s, which is now
+        # comfortably UNDER the join below (removes hazard 2). Squeezing the
+        # drain budget instead -- which is what I tried first -- just moves the
+        # failure: barrier 1 eats a short budget and barrier 2 gets one poll.
+        # Runtime defaults are deliberately untouched; this is test pacing only.
         provider._RETAIN_OP_POLL_INTERVAL_S = 0.001
-        provider._prefetch_retain_drain_timeout = 4.0
 
         provider.sync_turn("hello", "world")
         provider._retain_queue.join()
@@ -640,7 +641,16 @@ class TestPrefetchServerRetainVisibility:
 
         provider.queue_prefetch("next turn query")
         if provider._prefetch_thread:
-            provider._prefetch_thread.join(timeout=5.0)
+            # fork-parity: join generously. The prefetch thread does real work
+            # off a SHARED background event loop (_run_sync -> safe_schedule_
+            # threadsafe), so its completion time tracks scheduler availability,
+            # not the logic under test. A 5s join was tuned for an idle mac and
+            # failed intermittently on CI's 12-shard runners. The bound exists
+            # only so a genuine deadlock fails the suite instead of hanging it;
+            # a healthy run finishes in well under a second locally, so 60s
+            # costs nothing when things work and still fails loudly when they
+            # do not.
+            provider._prefetch_thread.join(timeout=60.0)
             assert not provider._prefetch_thread.is_alive(), (
                 "prefetch thread did not finish within the join budget"
             )
