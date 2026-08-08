@@ -16,11 +16,28 @@ def _make_cli():
 
 class TestSlashCommandPrefixMatching:
     def test_unique_prefix_dispatches_command(self):
-        """/con should dispatch to /config when it uniquely matches."""
+        """A prefix matching exactly one built-in dispatches it.
+
+        Parity note (2026-08-08): this used ``/con``, which stopped being unique
+        when upstream added ``/context`` alongside ``/config``. ``config`` is NOT
+        a prefix of ``context``, so they are unrelated siblings and the CLI
+        correctly stays AMBIGUOUS — the same rule that keeps /re from silently
+        picking /redo over /reset. Asserting /con still dispatches would demand
+        the CLI guess between two unrelated commands. ``/conf`` is the unique
+        prefix now, and it exercises the same dispatch path.
+        """
         cli_obj = _make_cli()
         with patch.object(cli_obj, 'show_config') as mock_config:
-            cli_obj.process_command("/con")
+            cli_obj.process_command("/conf")
         mock_config.assert_called_once()
+
+    def test_con_prefix_is_ambiguous_between_config_and_context(self):
+        """Regression guard for the /con collision itself."""
+        cli_obj = _make_cli()
+        with patch("cli._cprint") as mock_cprint:
+            cli_obj.process_command("/con")
+            printed = " ".join(str(c) for c in mock_cprint.call_args_list)
+        assert "Ambiguous" in printed or "Did you mean" in printed
 
 
 
