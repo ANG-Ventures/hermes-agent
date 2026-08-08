@@ -2082,7 +2082,6 @@ export const zh: Translations = {
       moveNoFolder: '该项目没有可移入的文件夹',
       moveNoProjects: '没有其他项目',
       reveal: '在文件夹中显示',
-      remoteRevealUnavailable: '此路径位于网关上。远程工作区无法在这台 Mac 的文件管理器中显示；请改为复制路径。',
       copyPath: '复制路径',
       removeFromSidebar: '从侧边栏移除',
       createFailed: '无法创建项目',
@@ -3063,18 +3062,6 @@ export const zh: Translations = {
     yoloSystem: active => `此会话 YOLO ${active ? '已开启' : '已关闭'}`,
     yoloTitle: 'YOLO',
     yoloToggleFailed: '无法切换 YOLO',
-    footer: {
-      status: on => `运行时页脚：${on ? '开启' : '关闭'}。使用 /footer on|off。`,
-      set: on => `运行时页脚${on ? '已开启——回复末尾会显示模型 · 上下文 · cwd' : '已关闭'}`,
-      failed: '无法更新页脚'
-    },
-    reasoning: {
-      status: (level, display) =>
-        `推理强度：${level} · 显示：${display}。使用 /reasoning <none|minimal|low|medium|high|xhigh|max|show|hide>。`,
-      effortSet: level => `此会话的推理强度已设为 ${level}`,
-      displaySet: value => `推理显示：${value}`,
-      failed: '无法更新推理设置'
-    },
     profileStatus: current => `配置档案：${current}。使用 /profile <name> 或“新建会话”选择器在其他配置档案中开始对话。`,
     unknownProfile: '未知配置档案',
     noProfileNamed: (target, available) => `没有名为“${target}”的配置档案。可用：${available}`,
@@ -3135,7 +3122,6 @@ export const zh: Translations = {
     boundaryTitle: '界面出错了',
     boundaryDesc: '此视图遇到意外错误。你的对话和设置是安全的。',
     reloadWindow: '重新加载窗口',
-    resetAndRecover: '重置并恢复',
     openLogs: '打开日志'
   },
 

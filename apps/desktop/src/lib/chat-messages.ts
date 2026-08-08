@@ -25,8 +25,6 @@ export type ChatMessage = {
   interim?: boolean
   /** Composer attachment ref strings (`@file:...`, `@image:...`) sent with this user message. */
   attachmentRefs?: string[]
-  /** Runtime-metadata footer (model · context · latency · cwd) from message.complete. */
-  footer?: string
   /** Durable backend `messages.id`. Absent until the row is persisted. */
   rowId?: number
   /** Emoji reactions on this message — one per author (see MessageReaction). */
@@ -37,7 +35,6 @@ export type GatewayEventPayload = {
   text?: string
   rendered?: string
   status?: string
-  footer?: string
   message?: string
   id?: string
   name?: string
@@ -912,22 +909,14 @@ function withUniqueToolCallIds(messages: ChatMessage[]): ChatMessage[] {
   })
 }
 
-function storedMessageId(message: SessionMessage, fallback: string): string {
-  const id = message.id
-
-  return id === undefined || id === null || id === '' ? fallback : String(id)
-}
-
 export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
   const result: ChatMessage[] = []
   let pendingToolParts: ChatMessagePart[] = []
-  let pendingToolMessageId: string | undefined
   let pendingToolTimestamp: number | undefined
   let activeAssistantIndex: null | number = null
 
   const clearPendingTools = () => {
     pendingToolParts = []
-    pendingToolMessageId = undefined
     pendingToolTimestamp = undefined
   }
 
@@ -957,7 +946,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
 
     if (!appendPartsToActiveAssistant(pendingToolParts, pendingToolTimestamp)) {
       result.push({
-        id: pendingToolMessageId ?? `${pendingToolTimestamp || Date.now()}-${index}-tools`,
+        id: `${pendingToolTimestamp || Date.now()}-${index}-tools`,
         role: 'assistant',
         parts: pendingToolParts,
         timestamp: pendingToolTimestamp
@@ -983,7 +972,6 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       }
 
       pendingToolParts = [...pendingToolParts, storedToolMessagePart(message, index)]
-      pendingToolMessageId ??= storedMessageId(message, `${message.timestamp || Date.now()}-${index}-tools`)
       pendingToolTimestamp ??= message.timestamp
 
       return
@@ -1047,7 +1035,6 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
 
     if (isToolOnlyAssistant) {
       pendingToolParts = [...pendingToolParts, ...parts]
-      pendingToolMessageId ??= storedMessageId(message, `${message.timestamp || Date.now()}-${index}-tools`)
       pendingToolTimestamp ??= message.timestamp
 
       return
@@ -1087,7 +1074,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     const rowId = message.row_id ?? (typeof message.id === 'number' ? message.id : undefined)
 
     result.push({
-      id: storedMessageId(message, `${message.timestamp || Date.now()}-${index}-${displayRole}`),
+      id: `${message.timestamp || Date.now()}-${index}-${displayRole}`,
       role: displayRole,
       parts,
       timestamp: message.timestamp,

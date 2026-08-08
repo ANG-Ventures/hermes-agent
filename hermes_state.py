@@ -8576,6 +8576,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         if preserve_unparseable_tool_calls
                         else []
                     )
+            if msg.get("display_metadata") is not None:
+                msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
             result.append(msg)
         return result
 

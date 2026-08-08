@@ -7,7 +7,7 @@ import {
   chatWindowWebPreferences,
   createSessionWindowRegistry,
   instanceWindowBounds
-} from './session-windows.ts'
+} from './session-windows'
 
 // A minimal fake BrowserWindow: tracks listeners + destroyed state and lets a
 // test fire the 'closed' event, mirroring the slice of the Electron API the

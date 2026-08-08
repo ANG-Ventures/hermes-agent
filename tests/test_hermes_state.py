@@ -1818,8 +1818,13 @@ class TestMessageStorage:
         db.create_session("child", "tui", parent_session_id="root")
         db.append_message("child", role="user", content="next prompt")
 
-        model_expected = db.get_messages_as_conversation("child", repair_alternation=True)
-        display_expected = db.get_messages_as_conversation("child", include_ancestors=True)
+        # Same include_row_ids parity note as the sibling tests below.
+        model_expected = db.get_messages_as_conversation(
+            "child", repair_alternation=True, include_row_ids=True
+        )
+        display_expected = db.get_messages_as_conversation(
+            "child", include_ancestors=True, include_row_ids=True
+        )
         model_history, display_history = db.get_resume_conversations("child")
 
         assert model_history == model_expected
@@ -1851,8 +1856,19 @@ class TestMessageStorage:
             ],
         )
 
-        model_expected = db.get_messages_as_conversation("child", repair_alternation=True)
-        display_expected = db.get_messages_as_conversation("child", include_ancestors=True)
+        # Parity note (2026-08-08): upstream added an OPT-IN ``include_row_ids``
+        # (durable per-message identity for desktop reactions) and made
+        # get_resume_conversations pass include_row_ids=True on BOTH projections.
+        # The invariant under test is that the one-fetch resume equals the two
+        # separate reads it replaces — so the comparison reads must ask for the
+        # same shape. Without this the test compares a row-id-carrying dict to a
+        # bare one and fails on a difference that is purely opt-in metadata.
+        model_expected = db.get_messages_as_conversation(
+            "child", repair_alternation=True, include_row_ids=True
+        )
+        display_expected = db.get_messages_as_conversation(
+            "child", include_ancestors=True, include_row_ids=True
+        )
 
         model_history, display_history = db.get_resume_conversations("child")
 
@@ -1866,8 +1882,13 @@ class TestMessageStorage:
         db.append_message("solo", role="user", content="hi")
         db.append_message("solo", role="assistant", content="hello")
 
-        model_expected = db.get_messages_as_conversation("solo", repair_alternation=True)
-        display_expected = db.get_messages_as_conversation("solo", include_ancestors=True)
+        # Same include_row_ids parity note as the sibling test above.
+        model_expected = db.get_messages_as_conversation(
+            "solo", repair_alternation=True, include_row_ids=True
+        )
+        display_expected = db.get_messages_as_conversation(
+            "solo", include_ancestors=True, include_row_ids=True
+        )
         model_history, display_history = db.get_resume_conversations("solo")
 
         assert model_history == model_expected

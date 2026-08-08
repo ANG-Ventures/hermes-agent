@@ -1,14 +1,13 @@
-import { atom, computed, type ReadableAtom } from 'nanostores'
+import { atom, computed, type ReadableAtom, type WritableAtom } from 'nanostores'
 
+import { SIDEBAR_COLLAPSE_MEDIA_QUERY } from '@/app/layout-constants'
+import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
 import { isPaneVisible, revealTreePane } from '@/components/pane-shell/tree/store'
-import { setSessionPinned as patchSessionPinned } from '@/hermes'
+import { matchesQuery } from '@/hooks/use-media-query'
 import { Codecs, persistentAtom } from '@/lib/persisted'
-import { arraysEqual, readKey, writeKey } from '@/lib/storage'
-import { activeGateway } from '@/store/gateway'
+import { arraysEqual, insertUniqueId, readKey } from '@/lib/storage'
 
 import { $paneStates, ensurePaneRegistered, setPaneOpen, setPaneWidthOverride, togglePane } from './panes'
-import { $activeSessionId, $selectedStoredSessionId, $sessions, setSessions } from './session'
-import { broadcastSessionsChanged } from './session-sync'
 
 export const SIDEBAR_DEFAULT_WIDTH = 237
 export const SIDEBAR_MAX_WIDTH = 360
@@ -21,7 +20,7 @@ export const FILE_BROWSER_MAX_WIDTH = '20rem'
 
 export const SIDEBAR_SESSIONS_PAGE_SIZE = 50
 
-export const SIDEBAR_PINNED_STORAGE_KEY = 'hermes.desktop.pinnedSessions'
+const SIDEBAR_PINNED_STORAGE_KEY = 'hermes.desktop.pinnedSessions'
 const SIDEBAR_AGENTS_GROUPED_STORAGE_KEY = 'hermes.desktop.agentsGroupedByWorkspace'
 const SIDEBAR_CRON_OPEN_STORAGE_KEY = 'hermes.desktop.sidebarCronOpen'
 const SIDEBAR_MESSAGING_OPEN_STORAGE_KEY = 'hermes.desktop.sidebarMessagingOpen'
@@ -73,60 +72,13 @@ export const $sidebarWidth: ReadableAtom<number> = computed($paneStates, states 
   return typeof override === 'number' ? override : SIDEBAR_DEFAULT_WIDTH
 })
 
-const $legacyPinnedSessionIds = atom(readLegacyPinnedSessionIds())
-
-export const $pinnedSessionIds: ReadableAtom<string[]> = computed(
-  [$sessions, $legacyPinnedSessionIds],
-  (sessions, legacyPinnedSessionIds) => {
-    const serverCapable = sessions.some(session => 'pinned' in session)
-
-    if (!serverCapable) {
-      return legacyPinnedSessionIds
-    }
-
-    const ids: string[] = []
-
-    for (const session of sessions) {
-      if (!session.pinned) {
-        continue
-      }
-
-      const id = pinIdForSession(session)
-
-      if (!ids.includes(id)) {
-        ids.push(id)
-      }
-    }
-
-    return ids
-  }
-)
+export const $pinnedSessionIds = persistentAtom(SIDEBAR_PINNED_STORAGE_KEY, [] as string[], Codecs.stringArray)
 export const $sidebarSessionOrderIds = persistentAtom(
   SIDEBAR_SESSION_ORDER_STORAGE_KEY,
   [] as string[],
   Codecs.stringArray
 )
 export const $sidebarSessionOrderManual = persistentAtom(SIDEBAR_SESSION_ORDER_MANUAL_STORAGE_KEY, false, Codecs.bool)
-// Manual drag-order of PINNED rows, kept per-device (local) and layered over the
-// server-synced pinned SET ($pinnedSessionIds). Pin membership syncs across
-// machines; the visual order is a local preference — reordering on one device
-// must not reshuffle another. Keyed by durable (lineage-root) pin ids so the
-// order survives a session's compression id-change. Empty = default order.
-const SIDEBAR_PINNED_ORDER_STORAGE_KEY = 'hermes.desktop.pinnedOrder'
-export const $sidebarPinnedOrderIds = persistentAtom(
-  SIDEBAR_PINNED_ORDER_STORAGE_KEY,
-  [] as string[],
-  Codecs.stringArray
-)
-
-export function setSidebarPinnedOrderIds(ids: string[]) {
-  if (!arraysEqual($sidebarPinnedOrderIds.get(), ids)) {
-    $sidebarPinnedOrderIds.set(ids)
-  }
-}
-
-export const setPinnedSessionOrder = setSidebarPinnedOrderIds
-
 export const $sidebarWorkspaceOrderIds = persistentAtom(
   SIDEBAR_WORKSPACE_ORDER_STORAGE_KEY,
   [] as string[],
@@ -220,11 +172,6 @@ export const $dismissedWorktreeIds = persistentAtom(
   Codecs.stringArray
 )
 export const $sidebarPinsOpen = atom(true)
-// Set by the PaneShell hover-reveal overlay while the sidebar is collapsed; kept
-// true the whole time it's a floating overlay (not just while shown) so the
-// consumer mounts contents off-screen, ready to slide. ChatSidebar mounts its
-// rows on `sidebarOpen || this`.
-export const $sidebarOverlayMounted = atom(false)
 export const $sidebarRecentsOpen = atom(true)
 // Cron-job sessions live in their own section below recents, collapsed by
 // default (it only renders at all when cron sessions exist) so the
@@ -315,21 +262,37 @@ export function setSidebarWidth(width: number) {
   setPaneWidthOverride(CHAT_SIDEBAR_PANE_ID, bounded)
 }
 
+// Below the collapse breakpoint a collapsible rail leaves the grid and lives as
+// a hover/pin overlay, so open/toggle must route through the reveal event — the
+// docked `open` flag renders a 0px track invisibly. Centralised here so every
+// caller (titlebar, keybinds, session-search, reveal-file) inherits it instead
+// of re-deriving the narrow branch. Returns true when it handled the intent.
+function revealNarrowPane(id: string, mode: 'close' | 'open' | 'toggle'): boolean {
+  if (typeof window === 'undefined' || !matchesQuery(SIDEBAR_COLLAPSE_MEDIA_QUERY)) {
+    return false
+  }
+
+  window.dispatchEvent(new CustomEvent(PANE_TOGGLE_REVEAL_EVENT, { detail: { id, mode } }))
+
+  return true
+}
+
 export function setSidebarOpen(open: boolean) {
   setPaneOpen(CHAT_SIDEBAR_PANE_ID, open)
+  revealNarrowPane(CHAT_SIDEBAR_PANE_ID, open ? 'open' : 'close')
 }
 
 export function toggleSidebarOpen() {
-  togglePane(CHAT_SIDEBAR_PANE_ID)
+  if (!revealNarrowPane(CHAT_SIDEBAR_PANE_ID, 'toggle')) {
+    togglePane(CHAT_SIDEBAR_PANE_ID)
+  }
 }
 
 export function toggleFileBrowserOpen() {
-  // fork parity NOTE (2026-08-07 upstream merge): upstream guards this with
-  // `revealNarrowPane(...)` first, but the fork DELETED revealNarrowPane (0 refs
-  // on the fork side; the narrow/collapsed-rail reveal event went with it), so
-  // that guard is dropped. Upstream's tree-visibility fix below is kept — its
-  // deps (isPaneVisible / revealTreePane / FILES_PANE_ID) all exist here.
-  //
+  if (revealNarrowPane(FILE_BROWSER_PANE_ID, 'toggle')) {
+    return
+  }
+
   // Ask the TREE, not the pane's boolean. `$fileBrowserOpen` stays true while
   // the tree pane sits behind a sibling tab in the shared right column (the
   // preview rail, the diff) or inside a minimized zone, so ⌘J spent its press
@@ -347,6 +310,7 @@ export function toggleFileBrowserOpen() {
 
 export function setFileBrowserOpen(open: boolean) {
   setPaneOpen(FILE_BROWSER_PANE_ID, open)
+  revealNarrowPane(FILE_BROWSER_PANE_ID, open ? 'open' : 'close')
 }
 
 // "Reveal this file in the file-browser tree" — an absolute path the tree
@@ -383,10 +347,6 @@ export function setSidebarPinsOpen(open: boolean) {
   $sidebarPinsOpen.set(open)
 }
 
-export function setSidebarOverlayMounted(mounted: boolean) {
-  $sidebarOverlayMounted.set(mounted)
-}
-
 export function setSidebarRecentsOpen(open: boolean) {
   $sidebarRecentsOpen.set(open)
 }
@@ -407,10 +367,16 @@ export function setSidebarAgentsGrouped(grouped: boolean) {
   $sidebarAgentsGrouped.set(grouped)
 }
 
-export function setSidebarSessionOrderIds(ids: string[]) {
-  if (!arraysEqual($sidebarSessionOrderIds.get(), ids)) {
-    $sidebarSessionOrderIds.set(ids)
+// Write an order list only when it actually changed, so an identical drag
+// result keeps the same array reference and subscribers don't churn.
+function setOrderIds($atom: WritableAtom<string[]>, ids: string[]) {
+  if (!arraysEqual($atom.get(), ids)) {
+    $atom.set(ids)
   }
+}
+
+export function setSidebarSessionOrderIds(ids: string[]) {
+  setOrderIds($sidebarSessionOrderIds, ids)
 }
 
 export function setSidebarSessionOrderManual(manual: boolean) {
@@ -420,124 +386,60 @@ export function setSidebarSessionOrderManual(manual: boolean) {
 }
 
 export function setSidebarWorkspaceOrderIds(ids: string[]) {
-  if (!arraysEqual($sidebarWorkspaceOrderIds.get(), ids)) {
-    $sidebarWorkspaceOrderIds.set(ids)
-  }
+  setOrderIds($sidebarWorkspaceOrderIds, ids)
 }
 
 export function setSidebarWorkspaceParentOrderIds(ids: string[]) {
-  if (!arraysEqual($sidebarWorkspaceParentOrderIds.get(), ids)) {
-    $sidebarWorkspaceParentOrderIds.set(ids)
-  }
+  setOrderIds($sidebarWorkspaceParentOrderIds, ids)
 }
 
 export function setSidebarProjectOrderIds(ids: string[]) {
-  if (!arraysEqual($sidebarProjectOrderIds.get(), ids)) {
-    $sidebarProjectOrderIds.set(ids)
-  }
+  setOrderIds($sidebarProjectOrderIds, ids)
 }
 
 export function setSidebarResizing(resizing: boolean) {
   $isSidebarResizing.set(resizing)
 }
 
-export function readLegacyPinnedSessionIds(): string[] {
-  const raw = readKey(SIDEBAR_PINNED_STORAGE_KEY)
+export function pinSession(sessionId: string, index?: number) {
+  const prev = $pinnedSessionIds.get()
 
-  if (!raw) {
-    return []
-  }
-
-  try {
-    return Codecs.stringArray.decode(raw)
-  } catch {
-    return []
-  }
+  setOrderIds($pinnedSessionIds, insertUniqueId(prev, sessionId, index ?? prev.filter(id => id !== sessionId).length))
 }
 
-function clearLegacyPinnedSessionIds() {
-  writeKey(SIDEBAR_PINNED_STORAGE_KEY, null)
-  $legacyPinnedSessionIds.set([])
+export function unpinSession(sessionId: string) {
+  setOrderIds(
+    $pinnedSessionIds,
+    $pinnedSessionIds.get().filter(id => id !== sessionId)
+  )
 }
 
-export async function migrateLegacyPinnedSessions(
-  sessions: Array<{ id: string; _lineage_root_id?: null | string; pinned?: boolean }>,
-  pushPinned: (sessionId: string) => Promise<void>,
-  log: Pick<Console, 'info'> = console
-): Promise<number> {
-  const legacyIds = readLegacyPinnedSessionIds()
+// Apply a new pinned order from a drag. The dragged list only holds the pins
+// that currently RESOLVE to a loaded row, so this is a permutation of a subset:
+// re-slot the ids it names into the positions they already occupied, leaving
+// any pin it doesn't mention (row not loaded yet) exactly where it was.
+// Requiring both lists to be the same length instead let one unresolved pin
+// silently discard the whole reorder.
+export function setPinnedSessionOrder(ids: string[]) {
+  const prev = $pinnedSessionIds.get()
+  const pinned = new Set(prev)
+  const moving = ids.filter(id => pinned.has(id))
 
-  if (legacyIds.length === 0) {
-    return 0
+  if (!moving.length) {
+    return
   }
 
-  const serverPinnedIds = new Set(sessions.filter(session => session.pinned).map(pinIdForSession))
-  const pushedIds = legacyIds.filter((id, index) => legacyIds.indexOf(id) === index && !serverPinnedIds.has(id))
+  const movingSet = new Set(moving)
+  const next = [...prev]
+  let cursor = 0
 
-  await Promise.all(pushedIds.map(id => pushPinned(id)))
-  clearLegacyPinnedSessionIds()
-  log.info('server-side pinned sessions migration push count', {
-    pushed: pushedIds.length,
-    total: legacyIds.length
+  prev.forEach((id, index) => {
+    if (movingSet.has(id)) {
+      next[index] = moving[cursor++]
+    }
   })
 
-  return pushedIds.length
-}
-
-function sessionMatchesPinId(session: { id: string; _lineage_root_id?: null | string }, pinId: string): boolean {
-  return session.id === pinId || session._lineage_root_id === pinId || pinIdForSession(session) === pinId
-}
-
-function pinIdForSession(session: { id: string; _lineage_root_id?: null | string }): string {
-  return session._lineage_root_id || session.id
-}
-
-function markSessionPinned(pinId: string, pinned: boolean) {
-  setSessions(prev => prev.map(session => (sessionMatchesPinId(session, pinId) ? { ...session, pinned } : session)))
-}
-
-export async function setSessionPinned(sessionId: string, pinned: boolean): Promise<void> {
-  const session = $sessions.get().find(s => sessionMatchesPinId(s, sessionId))
-  const pinId = session ? pinIdForSession(session) : sessionId
-  const previous = $sessions.get()
-
-  markSessionPinned(pinId, pinned)
-
-  try {
-    const selectedStoredSessionId = $selectedStoredSessionId.get()
-
-    const runtimeId =
-      selectedStoredSessionId && (selectedStoredSessionId === sessionId || selectedStoredSessionId === pinId)
-        ? $activeSessionId.get()
-        : null
-
-    const gateway = runtimeId ? activeGateway() : null
-
-    if (gateway && runtimeId) {
-      try {
-        await gateway.request('session.pin', { session_id: runtimeId, pinned })
-        broadcastSessionsChanged()
-
-        return
-      } catch (err) {
-        console.warn('session.pin RPC failed; falling back to REST', err)
-      }
-    }
-
-    await patchSessionPinned(pinId, pinned, session?.profile)
-    broadcastSessionsChanged()
-  } catch (err) {
-    setSessions(previous)
-    throw err
-  }
-}
-
-export function pinSession(sessionId: string): Promise<void> {
-  return setSessionPinned(sessionId, true)
-}
-
-export function unpinSession(sessionId: string): Promise<void> {
-  return setSessionPinned(sessionId, false)
+  setOrderIds($pinnedSessionIds, next)
 }
 
 export function bumpSessionsLimit(step: number = SIDEBAR_SESSIONS_PAGE_SIZE) {

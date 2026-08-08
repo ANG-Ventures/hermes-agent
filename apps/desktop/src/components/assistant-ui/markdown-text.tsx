@@ -15,22 +15,18 @@ import { PreviewAttachment } from '@/components/chat/preview-attachment'
 import { chunkByLines, SyntaxHighlighter } from '@/components/chat/shiki-highlighter'
 import { ZoomableImage } from '@/components/chat/zoomable-image'
 import { detectArtifact } from '@/lib/artifact-detect'
-import { readDesktopFileDataUrl } from '@/lib/desktop-fs'
 import { normalizeExternalUrl, openExternalLink, PrettyLink } from '@/lib/external-link'
 import { createMemoizedMathPlugin } from '@/lib/katex-memo'
 import { parseMarkdownIntoBlocksCached } from '@/lib/markdown-blocks'
 import { preprocessMarkdown } from '@/lib/markdown-preprocess'
 import {
   downloadGatewayMediaFile,
-  filePathFromMediaPath,
-  gatewayMediaDataUrl,
   isInlineMediaSrc,
   isRemoteGateway,
   mediaExternalUrl,
   mediaKind,
   mediaName,
   mediaPathFromMarkdownHref,
-  mediaStreamUrl,
   resolveMediaDisplaySrc,
   resolveMediaPlaybackSrc
 } from '@/lib/media'
@@ -102,43 +98,6 @@ function preprocessWithTailRepair(text: string): string {
   }
 }
 
-// Memoized block splitting lives in `@/lib/markdown-blocks`
-// (`parseMarkdownIntoBlocksCached`, imported above) so the cache is shared and
-// unit-tested once.
-
-const AUDIO_VIDEO_KINDS = new Set(['audio', 'video'])
-
-function isGatewayFileOpenUrl(src: string): boolean {
-  return src.startsWith('hermes-gateway-file:')
-}
-
-export async function mediaSrc(path: string): Promise<string> {
-  if (/^(?:https?|data):/i.test(path)) {
-    return path
-  }
-
-  const kind = mediaKind(path)
-
-  // Remote gateway: the media lives on the gateway machine, so resolve it before
-  // any local streaming/read fallback. Audio/video use the Phase-2 bytes→temp
-  // opener because /api/media data URLs are capped and not seekable.
-  if (window.hermesDesktop && isRemoteGateway()) {
-    return AUDIO_VIDEO_KINDS.has(kind) ? mediaExternalUrl(path) : gatewayMediaDataUrl(path)
-  }
-
-  // Stream local audio/video through the custom protocol: data URLs are capped
-  // and load the whole file into memory, which broke playback for larger videos.
-  if (window.hermesDesktop && AUDIO_VIDEO_KINDS.has(kind)) {
-    return mediaStreamUrl(path)
-  }
-
-  if (!window.hermesDesktop) {
-    return mediaExternalUrl(path)
-  }
-
-  return readDesktopFileDataUrl(filePathFromMediaPath(path))
-}
-
 function useOpenMediaFile(path: string) {
   const [openFailed, setOpenFailed] = useState(false)
 
@@ -175,18 +134,6 @@ function OpenMediaButton({ kind, path }: { kind: 'audio' | 'video'; path: string
         Open {kind} file
       </button>
       {openFailed && <OpenMediaFailedNote name={mediaName(path)} />}
-    </span>
-  )
-}
-
-function RemoteMediaOpen({ kind, name, path }: { kind: 'audio' | 'video'; name: string; path: string }) {
-  return (
-    <span className="my-3 block max-w-md rounded-xl border border-border bg-muted/35 p-3">
-      <span className="mb-1 block truncate text-xs font-medium text-muted-foreground">{name}</span>
-      <span className="mb-2 block text-xs text-muted-foreground">
-        This {kind} lives on the gateway. Open it locally to play.
-      </span>
-      <OpenMediaButton kind={kind} path={path} />
     </span>
   )
 }
@@ -248,10 +195,6 @@ function MediaAttachment({ path }: { path: string }) {
     )
   }
 
-  if (kind === 'audio' && src && isGatewayFileOpenUrl(src)) {
-    return <RemoteMediaOpen kind="audio" name={name} path={path} />
-  }
-
   if (kind === 'audio' && src) {
     return (
       <span className="my-3 block max-w-md rounded-xl border border-(--ui-stroke-tertiary) bg-muted/35 p-3">
@@ -260,10 +203,6 @@ function MediaAttachment({ path }: { path: string }) {
         {failed && <OpenMediaButton kind="audio" path={path} />}
       </span>
     )
-  }
-
-  if (kind === 'video' && src && isGatewayFileOpenUrl(src)) {
-    return <RemoteMediaOpen kind="video" name={name} path={path} />
   }
 
   if (kind === 'video' && src) {

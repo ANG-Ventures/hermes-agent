@@ -9,7 +9,6 @@ import { setMutableRef } from '@/lib/mutable-ref'
 import {
   $activeSessionId,
   $busy,
-  $connection,
   $messages,
   setActiveSessionStoredIdRotation,
   setCurrentFastMode,
@@ -23,7 +22,6 @@ import {
 } from '@/store/session'
 import { publishSessionState } from '@/store/session-states'
 
-import { pushTranscriptToRenderCache } from '../../render-cache-hydration'
 import type { ClientSessionState } from '../../types'
 
 import { chatMessageArraysEquivalent } from './use-session-actions/utils'
@@ -195,10 +193,6 @@ export function useSessionStateCache({
 
     if (!chatMessageArraysEquivalent(nextMessages, currentMessages)) {
       setMessages(nextMessages)
-      // Render-cache write-through (Phase 2, startup-latency): persist the
-      // active session's transcript tail so the next cold launch can paint it.
-      // Fire-and-forget + debounced in the main process; row cap applied there.
-      pushTranscriptToRenderCache($connection.get()?.baseUrl ?? null, selectedStoredSessionIdRef.current, nextMessages)
     }
 
     viewSessionIdRef.current = pending.sessionId

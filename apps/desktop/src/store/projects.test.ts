@@ -26,7 +26,6 @@ import {
   refreshProjects,
   refreshProjectTree,
   refreshWorktrees,
-  revealPath,
   resolveNewSessionCwd,
   scanAndRecordRepos,
   tombstoneSessions
@@ -297,37 +296,6 @@ describe('pickProjectFolder', () => {
     selectDesktopPaths.mockResolvedValue([])
 
     await expect(pickProjectFolder()).resolves.toBeNull()
-  })
-})
-
-describe('revealPath', () => {
-  const nativeRevealPath = vi.fn(async () => true)
-
-  beforeEach(() => {
-    vi.clearAllMocks()
-    vi.stubGlobal('window', { hermesDesktop: { revealPath: nativeRevealPath } })
-  })
-
-  afterEach(() => {
-    vi.unstubAllGlobals()
-  })
-
-  it('uses the local file manager outside remote mode', async () => {
-    isDesktopFsRemoteMode.mockReturnValue(false)
-
-    await revealPath('/local/repo')
-
-    expect(nativeRevealPath).toHaveBeenCalledWith('/local/repo')
-    expect(notify).not.toHaveBeenCalled()
-  })
-
-  it('shows an honest message instead of revealing gateway paths locally', async () => {
-    isDesktopFsRemoteMode.mockReturnValue(true)
-
-    await revealPath('/gateway/repo')
-
-    expect(nativeRevealPath).not.toHaveBeenCalled()
-    expect(notify).toHaveBeenCalledWith({ kind: 'warning', message: 'sidebar.projects.remoteRevealUnavailable' })
   })
 })
 

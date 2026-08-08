@@ -9,14 +9,7 @@ import {
   normalizeSessionSource
 } from '@/lib/session-source'
 import { setCronJobs } from '@/store/cron'
-import {
-  $pinnedSessionIds,
-  $sessionsLimit,
-  bumpSessionsLimit,
-  migrateLegacyPinnedSessions,
-  setSessionPinned,
-  SIDEBAR_SESSIONS_PAGE_SIZE
-} from '@/store/layout'
+import { $pinnedSessionIds, $sessionsLimit, bumpSessionsLimit, SIDEBAR_SESSIONS_PAGE_SIZE } from '@/store/layout'
 import { ALL_PROFILES, normalizeProfileKey } from '@/store/profile'
 import { $removedSessionIds } from '@/store/projects'
 import {
@@ -81,7 +74,6 @@ interface UseSessionListActionsArgs {
  *  and the per-platform messaging slices. Returns the callbacks the controller
  *  wires into the sidebar and refresh effects. */
 export function useSessionListActions({ profileScope }: UseSessionListActionsArgs) {
-  const legacyPinnedMigrationStartedRef = useRef(false)
   const refreshSessionsRequestRef = useRef(0)
 
   // Messaging-platform sessions as their own slice, fetched separately from
@@ -210,17 +202,6 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
 
           return sameCronSignature(prev, next) ? prev : next
         })
-
-        // Fork: one-time migration of legacy per-session pinned flags into the
-        // desktop pinned store (preserved across the 2026-07-23 parity merge;
-        // adapted to upstream's tombstone-filtered `incoming` recents list).
-        if (!legacyPinnedMigrationStartedRef.current && incoming.some(session => 'pinned' in session)) {
-          legacyPinnedMigrationStartedRef.current = true
-          void migrateLegacyPinnedSessions(incoming, id => setSessionPinned(id, true)).catch(() => {
-            legacyPinnedMigrationStartedRef.current = false
-          })
-        }
-
         // "Is there another page?" instead of an exact total: the backend
         // reports which profiles filled their window, which costs nothing on
         // top of the rows it already read (the old exact totals ran a COUNT(*)

@@ -12,7 +12,6 @@ import {
   $activeSessionId,
   $currentModel,
   $currentProvider,
-  $resetModelOnNewSession,
   getComposerSelectionGeneration,
   getCurrentModelSource,
   markComposerSelectionManual,
@@ -85,19 +84,11 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
   // only fills an EMPTY selection so a user's pick (plain UI state in
   // $currentModel) survives the lifecycle refreshes that fire on boot / fresh
   // draft / session events. A live session owns the footer, so skip entirely.
-  //
-  // When config.yaml `desktop.reset_model_on_new_session` is on, a fresh draft
-  // is treated as a forced reseed too: the sticky last-picked model is
-  // overwritten with the profile default so a new chat always starts on the
-  // default (opt-in; default off preserves the sticky behavior).
   const refreshCurrentModel = useCallback(
     async (force = false) => {
       // A forced profile swap opens a new intent epoch; an older in-flight
-      // response for a previous profile must stand down when it resolves. The
-      // reset_model_on_new_session opt-in treats a fresh draft as forced too.
-      const effectiveForce = force || $resetModelOnNewSession.get()
-
-      if (effectiveForce) {
+      // response for a previous profile must stand down when it resolves.
+      if (force) {
         profileRefreshEpochRef.current += 1
       }
 
@@ -114,7 +105,7 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         // Reads the model-options cache the composer already populated; an
         // unknown/not-yet-loaded catalog conservatively preserves the pick.
         const keepManualPick = () => {
-          if (effectiveForce || !$currentModel.get() || getCurrentModelSource() !== 'manual') {
+          if (force || !$currentModel.get() || getCurrentModelSource() !== 'manual') {
             return false
           }
 

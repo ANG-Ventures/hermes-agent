@@ -10,7 +10,7 @@ import path from 'node:path'
 
 import simpleGit from 'simple-git'
 
-import { resolveRequestedPathForIpc } from './hardening.ts'
+import { resolveRequestedPathForIpc } from './hardening'
 
 const COMMIT_CONTEXT_DIFF_MAX_CHARS = 120_000
 const COMMIT_CONTEXT_UNTRACKED_MAX = 80

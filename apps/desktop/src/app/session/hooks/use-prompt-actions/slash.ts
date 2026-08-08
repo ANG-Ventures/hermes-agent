@@ -15,7 +15,6 @@ import {
   resolveDesktopCommand
 } from '@/lib/desktop-slash-commands'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
-import { isReasoningEffort } from '@/lib/reasoning-effort'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { openCommandPalettePage } from '@/store/command-palette'
 import { setComposerDraft } from '@/store/composer'
@@ -29,8 +28,8 @@ import {
   $connection,
   $sessions,
   $yoloActive,
-  setCurrentReasoningEffort,
   resolveComposerSessionKey,
+  setActiveSessionId,
   setCurrentUsage,
   setModelPickerOpen,
   setSessionPickerOpen,
@@ -64,7 +63,8 @@ import {
   renderCommandsCatalog,
   renderRpcResult,
   slashStatusText,
-  type SubmitTextOptions
+  type SubmitTextOptions,
+  withSessionNotFoundResume
 } from './utils'
 
 // Manual compression is LLM-bound and routinely outlives the desktop's 30s
@@ -387,12 +387,6 @@ export function useSlashCommand(deps: SlashCommandDeps) {
 
           return
         } catch (error) {
-          if (name === 'compress') {
-            renderSlashOutput(`error: ${error instanceof Error ? error.message : String(error)}`)
-
-            return
-          }
-
           // Fall back to command.dispatch for skill/send/alias directives, but
           // keep the worker error: a slash.exec worker timeout/crash is the real
           // failure, not the "not a quick/plugin/skill command" routing noise.
@@ -507,7 +501,8 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             return
           }
 
-          const { render: renderSlashOutput, sessionId, storedSessionId } = resolved
+          const { render: renderSlashOutput, sessionId: initialSessionId, storedSessionId } = resolved
+          let sessionId = initialSessionId
           const focusTopic = ctx.arg.trim()
           const noticeId = `session-compress:${sessionId}`
 
@@ -526,14 +521,40 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           })
 
           try {
-            const result = await requestGateway<SessionCompressResponse>(
-              'session.compress',
+            // Same stale-runtime recovery as prompt.submit: after sleep/wake a
+            // dead id 404s session.compress while plain chat still works, so
+            // /compress reported "session not found" on a healthy session.
+            // NOT alsoTimeout — compress is legitimately LLM-slow and a
+            // timeout here must not be retried as a dead session.
+            const { result, sessionId: liveSessionId } = await withSessionNotFoundResume(
+              sessionId,
+              storedSessionId,
+              liveId =>
+                requestGateway<SessionCompressResponse>(
+                  'session.compress',
+                  {
+                    session_id: liveId,
+                    ...(focusTopic ? { focus_topic: focusTopic } : {})
+                  },
+                  SESSION_COMPRESS_TIMEOUT_MS
+                ),
               {
-                session_id: sessionId,
-                ...(focusTopic ? { focus_topic: focusTopic } : {})
-              },
-              SESSION_COMPRESS_TIMEOUT_MS
+                requestGateway,
+                onRecovered: recoveredId => {
+                  // Move the in-flight claim onto the live id so the coalesce
+                  // guard releases the right key in `finally`.
+                  compressInFlightRef.current.delete(sessionId)
+                  compressInFlightRef.current.add(recoveredId)
+
+                  if (activeSessionIdRef.current === initialSessionId) {
+                    activeSessionIdRef.current = recoveredId
+                    setActiveSessionId(recoveredId)
+                  }
+                }
+              }
             )
+
+            sessionId = liveSessionId
 
             // Replace the transcript with the post-compress history so the
             // summarized bubbles actually disappear. `messages` is the same
@@ -773,86 +794,6 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             notify({ kind: 'success', message: copy.newChatsProfile(match.name) })
           } catch (err) {
             notifyError(err, copy.setProfileFailed)
-          }
-        },
-        // /footer toggles the runtime-metadata footer appended to the final
-        // message of each turn (display.runtime_footer.enabled) via the
-        // gateway's config.get/set — same persistence as CLI /footer.
-        footer: async ctx => {
-          const resolved = await withSlashOutput(ctx)
-
-          if (!resolved) {
-            return
-          }
-
-          const { render, sessionId } = resolved
-          const arg = ctx.arg.trim().toLowerCase()
-
-          try {
-            if (arg === 'status') {
-              const current = await requestGateway<{ value?: string }>('config.get', {
-                key: 'footer',
-                session_id: sessionId
-              })
-
-              render(copy.footer.status(current.value === 'on'))
-
-              return
-            }
-
-            const applied = await requestGateway<{ value?: string }>('config.set', {
-              key: 'footer',
-              session_id: sessionId,
-              value: arg
-            })
-
-            render(copy.footer.set(applied.value === 'on'))
-          } catch (err) {
-            render(`${copy.footer.failed}: ${err instanceof Error ? err.message : String(err)}`)
-          }
-        },
-        // /reasoning shows or sets the session's reasoning effort / thinking
-        // display via the gateway's session-scoped `config.get/set reasoning`
-        // (the same RPC the model-edit submenu uses). Levels update the
-        // composer's effort store so the pill reflects the change immediately.
-        reasoning: async ctx => {
-          const resolved = await withSlashOutput(ctx)
-
-          if (!resolved) {
-            return
-          }
-
-          const { render, sessionId } = resolved
-          const arg = ctx.arg.trim().toLowerCase()
-
-          try {
-            if (!arg) {
-              const current = await requestGateway<{ display?: string; value?: string }>('config.get', {
-                key: 'reasoning',
-                session_id: sessionId
-              })
-
-              render(copy.reasoning.status(current.value || 'medium', current.display || 'show'))
-
-              return
-            }
-
-            const applied = await requestGateway<{ value?: string }>('config.set', {
-              key: 'reasoning',
-              session_id: sessionId,
-              value: arg
-            })
-
-            const value = applied.value || arg
-
-            if (isReasoningEffort(value)) {
-              setCurrentReasoningEffort(value === 'none' ? 'none' : value)
-              render(copy.reasoning.effortSet(value))
-            } else {
-              render(copy.reasoning.displaySet(value))
-            }
-          } catch (err) {
-            render(`${copy.reasoning.failed}: ${err instanceof Error ? err.message : String(err)}`)
           }
         },
         skin: async ({ arg, command, recordInput, sessionHint }) => {

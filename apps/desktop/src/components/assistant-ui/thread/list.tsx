@@ -4,8 +4,8 @@ import {
   type CSSProperties,
   type FC,
   memo,
-  startTransition,
   type ReactNode,
+  startTransition,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -29,7 +29,6 @@ import { isSecondaryWindow } from '@/store/windows'
 
 import { MessageRenderBoundary } from '../message-render-boundary'
 
-import { RENDER_BUDGET, useTwoPhaseRenderBudget } from './use-two-phase-render-budget'
 import { resolveShowEarlierAction, useTranscriptWindow } from './transcript-window'
 
 type ThreadMessageComponents = ComponentProps<typeof ThreadPrimitive.MessageByIndex>['components']
@@ -61,11 +60,7 @@ export type MessageGroup = { id: string; weight: number } & (
 // What the DOM can hold is bounded above by the store window regardless
 // (TRANSCRIPT_WINDOW_BUDGET), so this cannot admit more than one window's
 // content.
-// fork parity NOTE (2026-08-07 upstream merge): RENDER_BUDGET is not declared
-// here — it is imported from ./use-two-phase-render-budget, the fork's extraction
-// of the same budget machinery (it also owns SWITCH_RENDER_BUDGET / the idle
-// raise). Upstream's 600 re-pricing rides along in that module so both the
-// hook and this file agree on one value.
+const RENDER_BUDGET = 600
 // Never offer "Show earlier" over fewer turns than this, however heavy they
 // are. A weight-only cut on a session of enormous turns put the button two
 // turns from the bottom, where it reads as broken rather than as paging — the
@@ -277,22 +272,35 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
 
   const { olderAvailable, expandWindow } = useTranscriptWindow()
 
-  // Read by the settle loop's dep array below. Upstream also used it to drive an
-  // inline render-phase budget reset; that half is owned by useTwoPhaseRenderBudget.
+  const [renderBudget, setRenderBudget] = useState(FIRST_PAINT_BUDGET)
+
+  // Cut the budget during RENDER, not in the post-commit layout effect. An
+  // effect-time cut is too late: React would first build the whole tree with
+  // the full budget (up to 300 cost units of markdown + syntax highlighting),
+  // commit it, and only then re-render at the small budget. The render-phase
+  // state adjustment restarts this component immediately — before any child
+  // renders — so the heavy commit never happens.
+  //
+  // Two triggers, because the transcript swap arrives differently per path:
+  // a WARM switch publishes sessionKey + messages in one commit (the key
+  // branch), while a COLD switch changes sessionKey with an empty transcript
+  // and the prefetched messages land hundreds of ms later under the SAME key
+  // (the empty→non-empty branch).
   const hasGroups = groups.length > 0
+  const [budgetSessionKey, setBudgetSessionKey] = useState(sessionKey)
+  const [hadGroups, setHadGroups] = useState(hasGroups)
 
-  // Two-phase budget: slim on the switch commit, full once the thread idles.
-  // Before the raise commits, record the distance-from-bottom so the restore
-  // effect below (shared with "Show earlier") preserves the viewport — at the
-  // bottom this restores to the bottom; scrolled up it holds the reading spot.
-  // The hook owns the render-phase switch reset + the idle-time backfill raise
-  // (upstream's inline budgetSessionKey/backfill machinery is the same feature
-  // as this hook; fork extracted it, so it lives in the hook, not here).
-  const [renderBudget, setRenderBudget] = useTwoPhaseRenderBudget(sessionKey, () => {
-    const el = scrollRef.current
+  if (budgetSessionKey !== sessionKey) {
+    setBudgetSessionKey(sessionKey)
+    setHadGroups(hasGroups)
+    setRenderBudget(FIRST_PAINT_BUDGET)
+  } else if (hadGroups !== hasGroups) {
+    setHadGroups(hasGroups)
 
-    restoreFromBottomRef.current = el ? el.scrollHeight - el.scrollTop : null
-  })
+    if (hasGroups) {
+      setRenderBudget(FIRST_PAINT_BUDGET)
+    }
+  }
 
   // Where to land after a prepend, in distance-from-bottom (survives the
   // height change). Shared by "Show earlier" and the budget backfill below.
@@ -426,9 +434,8 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   // New run → snap to the latest turn.
   useAuiEvent('thread.runStart', () => void scrollToBottom())
 
-  // Pin to bottom on mount + every session switch (messages swap in place on a
-  // long-lived runtime, so sessionKey is the only signal). The render-budget
-  // reset lives in useTwoPhaseRenderBudget (slim switch commit → idle raise).
+  // Reset the cap and pin to bottom on mount + every session switch (messages
+  // swap in place on a long-lived runtime, so sessionKey is the only signal).
   // The swap is multi-step and lays out over many frames; letting the library
   // follow re-pins every frame to a moving target — visible as ~10 scroll jumps.
   // Instead: quiet it, glue to the true bottom until the height holds steady,

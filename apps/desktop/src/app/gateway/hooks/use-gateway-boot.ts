@@ -31,30 +31,17 @@ import {
   $activeSessionId,
   $connection,
   $currentCwd,
-  $messages,
   $sessions,
   ensureDefaultWorkspaceCwd,
-  getRememberedSessionId,
   setConnection,
   setCurrentBranch,
   setCurrentCwd,
-  setMessages,
-  setSessions,
   setSessionsLoading
 } from '@/store/session'
 import { $attentionSessionIds, $workingSessionIds, resetTileRuntimeBindings } from '@/store/session-states'
 import type { RpcEvent } from '@/types/hermes'
 
-import { hydrateFromRenderCache, reconcileRenderCache } from '../../render-cache-hydration'
-import { preloadTranscripts } from '../../transcript-preload'
-
 import { stashGatewaySurvivor, survivorIsStale, takeGatewaySurvivor } from './gateway-hmr-survivor'
-
-// One boot sweep per app LAUNCH (not per hook mount): the I4b orphan cull only
-// needs to run once against the first live list; re-mounts must not re-sweep.
-const renderCacheSweptRef = { current: false }
-// One transcript-preload pass per launch, same reasoning.
-const transcriptPreloadStartedRef = { current: false }
 
 // After the reconnect loop has been failing for this long, raise a recoverable
 // boot error. Otherwise a dropped remote gateway loops the backoff forever
@@ -500,37 +487,6 @@ export function useGatewayBoot({
     })
 
     async function boot() {
-      // Cache paint (Phase 2, startup-latency): seed the sidebar from the
-      // render cache BEFORE any network round-trip, so a warm launch shows
-      // last-known-good sessions instead of skeletons. Fail-open: any cache
-      // problem paints nothing and boot proceeds exactly as before (I3). The
-      // painted rows are read-only by construction — the composer stays
-      // gateway-gated until the WS handshake completes (I2), and the live
-      // refreshSessions() below wholesale-replaces the list (I1/I5).
-      const hydration = await hydrateFromRenderCache({
-        getSessions: () => $sessions.get(),
-        setSessions: rows => setSessions(rows),
-        // Paint the last-open session's transcript tail too (the route restore
-        // below navigates to it), so the chat pane shows content, not a blank.
-        //
-        // fork parity NOTE (2026-08-07 upstream merge): upstream made remembered
-        // navigation PER-PROFILE (`getRememberedSessionId(profile)`); this
-        // fork-only render-cache call still passed no argument, which threw
-        // `Cannot read properties of undefined (reading 'trim')` inside
-        // profileNavigationKey and took the whole boot effect down. Same profile
-        // expression the rest of this file uses.
-        rememberedSessionId: getRememberedSessionId(normalizeProfileKey($activeGatewayProfile.get())),
-        getMessages: () => $messages.get(),
-        setMessages: rows => setMessages(rows as never)
-      }).catch(() => ({ painted: false, transcriptPainted: false, gatewayUrl: null, cachedSessionIds: [] }))
-
-      const cachedSessions = hydration.painted ? $sessions.get() : null
-
-      if (hydration.painted) {
-        // Rows are visible; kill the skeleton state early.
-        setSessionsLoading(false)
-      }
-
       try {
         const conn = await desktop.getConnection()
 
@@ -587,43 +543,8 @@ export function useGatewayBoot({
           return
         }
 
-        setDesktopBootStep({
-          phase: 'renderer.sessions',
-          message: translateNow('boot.steps.loadingSessions'),
-          progress: 99
-        })
-        await callbacksRef.current.refreshSessions().catch(() => undefined)
-
-        // Live list has landed (wholesale merge). Report cache divergence,
-        // write the fresh list back, and boot-sweep orphaned transcripts (I4b).
-        reconcileRenderCache({
-          gatewayUrl: hydration.gatewayUrl ?? conn?.baseUrl ?? null,
-          cachedSessionIds: hydration.cachedSessionIds,
-          cachedSessions,
-          liveSessions: $sessions.get(),
-          liveTotal: $sessions.get().length,
-          sweptRef: renderCacheSweptRef
-        })
-
         completeDesktopBoot()
         bootCompleted = true
-
-        // Transcript preload (follow-up, 2026-07-11): once boot has fully
-        // settled, gently warm the render cache with the transcripts of
-        // pinned + visible sessions so switching to any of them (and the next
-        // cold launch) paints instantly. Strictly sequential + paced; runs at
-        // most once per launch; stops if the gateway drops or we unmount.
-        if (!transcriptPreloadStartedRef.current) {
-          transcriptPreloadStartedRef.current = true
-          const preloadUrl = hydration.gatewayUrl ?? conn?.baseUrl ?? null
-          setTimeout(() => {
-            void preloadTranscripts({
-              gatewayUrl: preloadUrl,
-              sessions: $sessions.get(),
-              shouldStop: () => cancelled || !gatewayOpen()
-            }).catch(() => undefined)
-          }, 5_000)
-        }
       } catch (err) {
         if (!cancelled) {
           const message = err instanceof Error ? err.message : String(err)

@@ -19,7 +19,7 @@ import {
   resolveRequestedPathForIpc,
   resolveTimeoutMs,
   sensitiveFileBlockReason
-} from './hardening.ts'
+} from './hardening'
 
 async function rejectsWithCode(promise, code: string) {
   await assert.rejects(promise, (error: any) => {

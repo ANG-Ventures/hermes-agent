@@ -4,9 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { Tip } from '@/components/ui/tooltip'
 import { type Translations, useI18n } from '@/i18n'
-import { isDesktopFsRemoteMode, readDesktopFileDataUrl } from '@/lib/desktop-fs'
-import { createHardenedHtmlBlobUrl } from '@/lib/html-preview'
-import { Bug } from '@/lib/icons'
+import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
 import { openPreviewTargetInBrowser, remoteHtmlPreviewDocument } from '@/lib/local-preview'
 import { rafCoalesce } from '@/lib/raf-coalesce'
 import { cn } from '@/lib/utils'
@@ -55,20 +53,6 @@ interface PreviewLoadErrorState {
 
 const FILE_RELOAD_DEBOUNCE_MS = 200
 const SERVER_RESTART_TIMEOUT_MS = 45_000
-
-function filePathForPreviewTarget(target: PreviewTarget) {
-  if (target.path) {
-    return target.path
-  }
-
-  try {
-    const url = new URL(target.url)
-
-    return url.protocol === 'file:' ? decodeURIComponent(url.pathname) : target.source
-  } catch {
-    return target.source
-  }
-}
 
 function loadErrorTitle(error: PreviewLoadErrorState, copy: Translations['preview']['web']): string {
   const description = error.description.toLowerCase()
@@ -161,14 +145,6 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<PreviewLoadErrorState | null>(null)
   const [localReloadKey, setLocalReloadKey] = useState(0)
-  const [remoteHtmlBlobUrl, setRemoteHtmlBlobUrl] = useState<string | null>(null)
-  const [remoteHtmlReloadKey, setRemoteHtmlReloadKey] = useState(0)
-
-  const isRemoteHtmlPreview =
-    target.kind === 'file' && target.previewKind === 'html' && target.renderMode !== 'source' && isDesktopFsRemoteMode()
-
-  const previewFilePath = filePathForPreviewTarget(target)
-  const webviewUrl = isRemoteHtmlPreview ? remoteHtmlBlobUrl : target.url
 
   // Artifacts have no URL to load — they render from the registry, never in a
   // webview.
@@ -259,18 +235,12 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       return
     }
 
-    if (isRemoteHtmlPreview) {
-      setRemoteHtmlReloadKey(key => key + 1)
-
-      return
-    }
-
     if (webviewRef.current?.reloadIgnoringCache) {
       webviewRef.current.reloadIgnoringCache()
     } else {
       webviewRef.current?.reload?.()
     }
-  }, [isRemoteHtmlPreview, isWebPreview])
+  }, [isWebPreview])
 
   const appendConsoleEntry = useCallback(
     (entry: Omit<ConsoleEntry, 'id'>) => {
@@ -560,52 +530,6 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
-    if (!isRemoteHtmlPreview) {
-      setRemoteHtmlBlobUrl(null)
-
-      return
-    }
-
-    let active = true
-    let objectUrl = ''
-
-    setRemoteHtmlBlobUrl(null)
-    setLoadError(null)
-    setLoading(true)
-
-    void readDesktopFileDataUrl(previewFilePath)
-      .then(dataUrl => {
-        objectUrl = createHardenedHtmlBlobUrl(dataUrl)
-
-        if (active) {
-          setRemoteHtmlBlobUrl(objectUrl)
-          setCurrentUrl(objectUrl)
-        } else {
-          URL.revokeObjectURL(objectUrl)
-        }
-      })
-      .catch(error => {
-        if (!active) {
-          return
-        }
-
-        setLoadError({
-          description: error instanceof Error ? error.message : String(error),
-          url: target.url
-        })
-        setLoading(false)
-      })
-
-    return () => {
-      active = false
-
-      if (objectUrl) {
-        URL.revokeObjectURL(objectUrl)
-      }
-    }
-  }, [isRemoteHtmlPreview, previewFilePath, remoteHtmlReloadKey, target.url])
-
-  useEffect(() => {
     const host = hostRef.current
 
     if (!host) {
@@ -620,8 +544,8 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     consoleState.reset()
     setLoading(true)
 
-    if (!isWebPreview || isRemoteHtml || !webviewUrl) {
-      setLoading(isWebPreview && !isRemoteHtml && !webviewUrl)
+    if (!isWebPreview || isRemoteHtml) {
+      setLoading(false)
 
       return
     }
@@ -629,11 +553,8 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     const webview = document.createElement('webview') as PreviewWebview
     webview.className = 'flex h-full w-full flex-1 bg-transparent'
     webview.setAttribute('partition', 'persist:hermes-preview')
-    webview.setAttribute('src', webviewUrl)
-    webview.setAttribute(
-      'webpreferences',
-      `contextIsolation=yes,nodeIntegration=no,sandbox=yes${isRemoteHtmlPreview ? ',javascript=no' : ''}`
-    )
+    webview.setAttribute('src', target.url)
+    webview.setAttribute('webpreferences', 'contextIsolation=yes,nodeIntegration=no,sandbox=yes')
 
     const onConsole = (event: Event) => {
       const detail = event as Event & {
@@ -655,7 +576,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       if ((detail.level ?? 0) >= 3 && isModuleMimeError(message)) {
         setLoadError({
           description: copy.moduleMimeDescription,
-          url: webview.getURL?.() || webviewUrl
+          url: webview.getURL?.() || target.url
         })
         setLoading(false)
       }
@@ -690,7 +611,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       setLoadError({
         code: errorCode,
         description: detail.errorDescription || copy.unreachableDescription,
-        url: detail.validatedURL || webview.getURL?.() || webviewUrl
+        url: detail.validatedURL || webview.getURL?.() || target.url
       })
       setLoading(false)
     }
@@ -725,7 +646,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       webview.removeEventListener('did-stop-loading', onStop)
       webview.remove()
     }
-  }, [appendConsoleEntry, consoleState, copy, isRemoteHtml, isRemoteHtmlPreview, isWebPreview, target.url, webviewUrl])
+  }, [appendConsoleEntry, consoleState, copy, isRemoteHtml, isWebPreview, target.url])
 
   return (
     <aside className="relative flex h-full w-full min-w-0 flex-col overflow-hidden bg-transparent text-muted-foreground">

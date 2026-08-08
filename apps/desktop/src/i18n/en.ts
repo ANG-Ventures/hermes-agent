@@ -1888,8 +1888,6 @@ export const en: Translations = {
       moveNoFolder: 'That project has no folder to move into',
       moveNoProjects: 'No other projects',
       reveal: 'Reveal in folder',
-      remoteRevealUnavailable:
-        'This path lives on the gateway. Reveal in this Mac’s file manager is not available for remote workspaces; copy the path instead.',
       copyPath: 'Copy path',
       removeFromSidebar: 'Hide from sidebar',
       createFailed: 'Could not create project',
@@ -2901,18 +2899,6 @@ export const en: Translations = {
     yoloSystem: active => `YOLO ${active ? 'on' : 'off'} for this session`,
     yoloTitle: 'YOLO',
     yoloToggleFailed: 'Could not toggle YOLO',
-    footer: {
-      status: on => `Runtime footer: ${on ? 'ON' : 'OFF'}. Use /footer on|off.`,
-      set: on => `Runtime footer ${on ? 'ON — replies now end with model · context · cwd' : 'OFF'}`,
-      failed: 'Could not update footer'
-    },
-    reasoning: {
-      status: (level, display) =>
-        `Reasoning effort: ${level} · display: ${display}. Use /reasoning <none|minimal|low|medium|high|xhigh|max|show|hide>.`,
-      effortSet: level => `Reasoning effort set to ${level} for this session`,
-      displaySet: value => `Reasoning display: ${value}`,
-      failed: 'Could not update reasoning'
-    },
     profileStatus: current =>
       `Profile: ${current}. Use /profile <name> or the "New session" picker to start a chat in another profile.`,
     unknownProfile: 'Unknown profile',
@@ -2975,7 +2961,6 @@ export const en: Translations = {
     boundaryTitle: 'Something broke in the interface',
     boundaryDesc: 'The view hit an unexpected error. Your chats and settings are safe.',
     reloadWindow: 'Reload window',
-    resetAndRecover: 'Reset & recover',
     openLogs: 'Open logs'
   },
 

@@ -27,7 +27,7 @@ import {
   waitForDashboardPort,
   waitForDashboardPortAnnouncement,
   waitForDashboardReadyFile
-} from './backend-ready.ts'
+} from './backend-ready'
 
 type FakeChildProcess = EventEmitter & {
   stdout: EventEmitter

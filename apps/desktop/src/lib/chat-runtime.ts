@@ -432,13 +432,8 @@ export function toRuntimeMessage(message: ChatMessage): ThreadMessage {
       unstable_annotations: [],
       unstable_data: [],
       steps: [],
-      // Merge fork footer surfacing with upstream interim footer-gate flag
-      // and upstream reaction metadata.
-      custom: {
-        ...(message.footer ? { footer: message.footer } : {}),
-        ...(message.interim ? { interim: true } : {}),
-        ...reactionMeta
-      }
+      // Carries ChatMessage.interim to AssistantMessage's footer gate.
+      custom: { ...(message.interim ? { interim: true } : {}), ...reactionMeta }
     }
   } as ThreadMessage
 }
@@ -475,53 +470,6 @@ function isToolOnlyAssistant(message: ChatMessage): boolean {
  * merged/un-merged mid-stream. `cache` keys merged results by source identity,
  * so a stable turn yields stable merged objects (no re-render churn).
  */
-/**
- * Concatenate two tool-part arrays while enforcing the assistant-ui render-key
- * invariant: `tapResources` (the library's element loop) keys tool parts by
- * `toolCallId` and HARD-THROWS on a duplicate ("Duplicate key toolCallId-… in
- * tapResources") — which surfaces as the full-window "Something broke in the
- * interface" crash. Two tool-only assistant messages can each legitimately carry
- * a part with the SAME toolCallId (a duplicate the backend persisted — Anthropic
- * returns 200 on a repeated tool_use id — or a stream/resume re-delivery that
- * landed as a separate message), and the naive `[...prev, ...next]` concat below
- * would then produce a duplicate-keyed array and crash the whole renderer.
- *
- * Dedupe by toolCallId, keeping the FIRST occurrence's position but letting a
- * later duplicate MERGE onto it (so a re-delivered completion still updates the
- * existing row rather than being dropped). Parts without a toolCallId are passed
- * through untouched.
- */
-function mergeToolParts(prevParts: ChatMessagePart[], nextParts: ChatMessagePart[]): ChatMessagePart[] {
-  const merged: ChatMessagePart[] = []
-  const indexByToolCallId = new Map<string, number>()
-
-  for (const part of [...prevParts, ...nextParts]) {
-    const id = part.type === 'tool-call' && typeof part.toolCallId === 'string' ? part.toolCallId : undefined
-
-    if (id === undefined) {
-      merged.push(part)
-
-      continue
-    }
-
-    const existing = indexByToolCallId.get(id)
-
-    if (existing === undefined) {
-      indexByToolCallId.set(id, merged.length)
-      merged.push(part)
-    } else {
-      // Collapse the duplicate onto the existing row (later wins its fields).
-      const previous = merged[existing]
-
-      if (previous.type === 'tool-call') {
-        merged[existing] = { ...previous, ...part }
-      }
-    }
-  }
-
-  return merged
-}
-
 export function coalesceToolOnlyAssistants(messages: ChatMessage[], cache: ToolMergeCache): ChatMessage[] {
   const out: ChatMessage[] = []
 
@@ -534,7 +482,7 @@ export function coalesceToolOnlyAssistants(messages: ChatMessage[], cache: ToolM
       const merged =
         cached && cached.prev === prev && cached.prevParts === prev.parts && cached.parts === message.parts
           ? cached.merged
-          : { ...prev, parts: mergeToolParts(prev.parts, message.parts) }
+          : { ...prev, parts: [...prev.parts, ...message.parts] }
 
       cache.set(message, { merged, parts: message.parts, prev, prevParts: prev.parts })
       out[out.length - 1] = merged

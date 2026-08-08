@@ -13,8 +13,7 @@ import {
   setCurrentReasoningEffort,
   setCurrentServiceTier,
   setDefaultReasoningEffort,
-  setIntroPersonality,
-  setResetModelOnNewSession
+  setIntroPersonality
 } from '@/store/session'
 import {
   applyAutoSpeakFromConfig,
@@ -110,7 +109,6 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
 
         setVoiceMaxRecordingSeconds(recordingLimit(config.voice?.max_recording_seconds))
         setSttEnabled(config.stt?.enabled !== false)
-        setResetModelOnNewSession(config.desktop?.reset_model_on_new_session === true)
         setTerminalFontFamilyFromConfig(config.terminal?.font_family)
         applyAutoSpeakFromConfig(config)
         applyVoiceStopPhraseFromConfig(config)

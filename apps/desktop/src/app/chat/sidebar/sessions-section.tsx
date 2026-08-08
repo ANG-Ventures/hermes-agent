@@ -133,9 +133,6 @@ interface SidebarSessionsSectionProps {
   // When false the section header is static (no caret/toggle) and always open.
   collapsible?: boolean
   sortable?: boolean
-  // Search results: prefix each row with its origin context ("Discord:
-  // voice-assitant: Desktop App" / "TUI") so cross-surface hits read apart.
-  showOriginContext?: boolean
   // The persisted drag order, applied WITHIN each date group (see
   // orderRowsWithinGroups). Chronology decides the groups; this decides the
   // sequence inside one, so a reorder no longer costs the whole list its
@@ -194,7 +191,6 @@ export function SidebarSessionsSection({
   labelIcon,
   collapsible = true,
   sortable = false,
-  showOriginContext = false,
   manualOrderIds,
   onReorderSessions,
   onReorderProjects,
@@ -248,11 +244,6 @@ export function SidebarSessionsSection({
         onResume: () => onResumeSession(session.id),
         reorderable: draggable && !branchStem,
         session,
-        // fork parity NOTE (2026-08-07 upstream merge): upstream promoted
-        // renderRow to a useCallback and its version predates this prop, so the
-        // fork's search-origin-context prefix must be re-grafted here (and into
-        // the dep array) or the feature silently renders nothing.
-        showOriginContext,
         showProfile: showProfileTags
       }
 
@@ -270,7 +261,6 @@ export function SidebarSessionsSection({
       onResumeSession,
       onTogglePin,
       pinned,
-      showOriginContext,
       showProfileTags,
       workingSessionIdSet
     ]

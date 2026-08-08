@@ -9,7 +9,7 @@ import path from 'node:path'
 
 import { test } from 'vitest'
 
-import { isPackagedInstallPath } from './workspace-cwd.ts'
+import { isPackagedInstallPath } from './workspace-cwd'
 
 const installRoot = path.resolve('/opt/Hermes')
 

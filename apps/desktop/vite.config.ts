@@ -3,7 +3,6 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import path from 'path'
 import fs from 'fs'
-import os from 'os'
 
 // `hgui` symlinks a worktree's node_modules to the main checkout. Vite realpaths
 // those before enforcing server.fs.allow, so codicon/font assets resolve outside
@@ -16,21 +15,12 @@ const real = (p: string): string | null => {
   }
 }
 
-// Under vitest, the electron/scripts node tests stage real files into the OS
-// temp dir and then `await import()` them; vitest 4's module runner serves those
-// imports through this dev server, which enforces server.fs.allow. The OS tmpdir
-// lives outside the worktree root, so without whitelisting it the staged import
-// 404s with "Cannot find module …/unixTerminal.js". Only widen fs.allow for test
-// runs (VITEST set) — the shipped dev/preview server keeps the strict root.
-const tmpRoots = process.env.VITEST ? [os.tmpdir(), real(os.tmpdir())].filter((p): p is string => p !== null) : []
-
 const fsAllow = [
   ...new Set(
     [
       path.resolve(__dirname, '../..'),
       real(path.resolve(__dirname, 'node_modules')),
-      real(path.resolve(__dirname, '../../node_modules')),
-      ...tmpRoots
+      real(path.resolve(__dirname, '../../node_modules'))
     ].filter((p): p is string => p !== null)
   )
 ]
@@ -87,15 +77,6 @@ const emojibaseAssets = () => ({
 export default defineConfig(({ command }) => ({
   base: './',
   plugins: [react(), tailwindcss(), emojibaseAssets()],
-  test: {
-    environmentOptions: {
-      jsdom: {
-        url: 'http://localhost/'
-      }
-    },
-    include: ['src/**/*.{test,spec}.{ts,tsx}', 'scripts/**/*.{test,spec}.mjs'],
-    setupFiles: ['./src/test/setup.ts']
-  },
   css: {
     // Pin an explicit (empty) PostCSS config. Tailwind is handled entirely by
     // `@tailwindcss/vite`, so the renderer needs no PostCSS plugins — and

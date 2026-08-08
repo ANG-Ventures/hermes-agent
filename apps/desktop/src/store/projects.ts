@@ -1198,17 +1198,9 @@ export async function removeWorktreePath(
 
 // Reveal a project/worktree path in the OS file manager (git-GUI standard).
 export async function revealPath(path: null | string): Promise<void> {
-  if (!path) {
-    return
+  if (path) {
+    await window.hermesDesktop?.revealPath?.(path)
   }
-
-  if (isDesktopFsRemoteMode()) {
-    notify({ kind: 'warning', message: translateNow('sidebar.projects.remoteRevealUnavailable') })
-
-    return
-  }
-
-  await window.hermesDesktop?.revealPath?.(path)
 }
 
 // Copy a path to the clipboard (git-GUI standard).

@@ -26,7 +26,7 @@ import {
   UPDATE_MARKER_MAX_AGE_MS,
   updateHandoffConflict,
   writeUpdateMarker
-} from './update-marker.ts'
+} from './update-marker'
 
 function tmpHome(tag) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `hermes-marker-${tag}-`))

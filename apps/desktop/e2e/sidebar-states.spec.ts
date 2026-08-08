@@ -147,7 +147,7 @@ test.describe('sidebar states — subagent and background dot coexist', () => {
       { timeout: 15_000 },
     )
 
-    // The long background process should show a "Background task
+    // The background process (sleep 5) should show a "Background task
     // running" dot while the subagent is also running.
     await expect
       .poll(
@@ -166,18 +166,10 @@ test.describe('sidebar states — subagent and background dot coexist', () => {
       { timeout: 90_000 },
     )
 
-    // After the process exits and auto-dismiss fires, the background dot
-    // should be gone. Poll for the transition instead of sleeping a fixed
-    // interval: the mock's background sleep is 30s (SIDEBAR_CROSS_BG_SLEEP_
-    // SECONDS) plus SUCCESS_LINGER_MS, so a bare waitForTimeout(8000) would
-    // assert before dismissal and fail deterministically. Polling asserts the
-    // STATE (dot gone) rather than a duration.
-    await expect
-      .poll(
-        () => page.locator(`[aria-label="${BG_DOT_LABEL}"]`).count(),
-        { timeout: 60_000, message: 'background dot should be gone after process exits' },
-      )
-      .toBe(0)
+    // After the turn + auto-dismiss, the background dot should be gone.
+    await page.waitForTimeout(8000)
+    const bgCount = await page.locator(`[aria-label="${BG_DOT_LABEL}"]`).count()
+    expect(bgCount, 'background dot should be gone after process exits').toBe(0)
   })
 })
 
@@ -254,7 +246,7 @@ test.describe('sidebar states — cross-session dot transition', () => {
     await expect
       .poll(
         () => page.locator(`[aria-label="${BG_DOT_LABEL}"]`).count(),
-        { timeout: 60_000, message: 'background dot should disappear after process finishes' },
+        { timeout: 30_000, message: 'background dot should disappear after process finishes' },
       )
       .toBe(0)
 

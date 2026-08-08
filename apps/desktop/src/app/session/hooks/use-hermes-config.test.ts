@@ -10,14 +10,12 @@ import {
   $currentFastMode,
   $currentReasoningEffort,
   $defaultReasoningEffort,
-  $resetModelOnNewSession,
   markComposerSelectionManual,
   setCurrentCwd,
   setCurrentFastMode,
   setCurrentModelSource,
   setCurrentReasoningEffort,
-  setDefaultReasoningEffort,
-  setResetModelOnNewSession,
+  setDefaultReasoningEffort
 } from '@/store/session'
 
 import { useHermesConfig } from './use-hermes-config'
@@ -46,7 +44,6 @@ describe('useHermesConfig refreshHermesConfig', () => {
   beforeEach(() => {
     // Reset atoms and localStorage between tests
     setCurrentCwd('')
-    setResetModelOnNewSession(false)
     setCurrentFastMode(false)
     setCurrentModelSource('')
     setCurrentReasoningEffort('')
@@ -156,39 +153,6 @@ describe('useHermesConfig refreshHermesConfig', () => {
 
     expect($currentReasoningEffort.get()).toBe('low')
     expect($currentFastMode.get()).toBe(false)
-  })
-
-  it('mirrors desktop.reset_model_on_new_session=true into the store', async () => {
-    mockConfig({ desktop: { reset_model_on_new_session: true } })
-
-    const { result } = renderHook(() =>
-      useHermesConfig({
-        activeSessionIdRef: { current: null }
-      })
-    )
-
-    await act(async () => {
-      await result.current.refreshHermesConfig()
-    })
-
-    expect($resetModelOnNewSession.get()).toBe(true)
-  })
-
-  it('defaults the reset-model flag to false when the config key is absent', async () => {
-    setResetModelOnNewSession(true) // prove the refresh clears a stale true
-    mockConfig({})
-
-    const { result } = renderHook(() =>
-      useHermesConfig({
-        activeSessionIdRef: { current: null }
-      })
-    )
-
-    await act(async () => {
-      await result.current.refreshHermesConfig()
-    })
-
-    expect($resetModelOnNewSession.get()).toBe(false)
   })
 
   it('loads the profile terminal font for already-mounted terminal surfaces', async () => {

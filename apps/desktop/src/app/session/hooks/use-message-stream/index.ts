@@ -40,8 +40,6 @@ interface MessageStreamOptions {
     storedSessionId?: string | null,
     runtimeSessionId?: string | null
   ) => Promise<void>
-  onTurnComplete?: (sessionId: string, payload: GatewayEventPayload | undefined) => void
-  onTurnFrame?: (sessionId: string) => void
   queryClient: QueryClient
   refreshHermesConfig: () => Promise<void>
   refreshSessions: () => Promise<void>
@@ -69,8 +67,6 @@ export function useMessageStream({
   activeGatewayProfile = 'default',
   activeSessionIdRef,
   hydrateFromStoredSession,
-  onTurnComplete,
-  onTurnFrame,
   queryClient,
   refreshHermesConfig,
   refreshSessions,

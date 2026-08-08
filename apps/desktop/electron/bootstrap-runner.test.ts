@@ -16,7 +16,7 @@ import {
   resolveInstallScript,
   resolveMarkerPinnedCommit,
   runBootstrap
-} from './bootstrap-runner.ts'
+} from './bootstrap-runner'
 
 const SCRIPT_NAME = process.platform === 'win32' ? 'install.ps1' : 'install.sh'
 const ZERO_COMMIT = '0000000000000000000000000000000000000000'

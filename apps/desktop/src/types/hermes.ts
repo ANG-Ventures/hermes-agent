@@ -336,10 +336,6 @@ export interface HermesConfig {
     repo_scan_enabled?: boolean
     repo_scan_roots?: string[]
     repo_scan_exclude_paths?: string[]
-    // When true, a fresh chat (Cmd+N / app relaunch) reseeds the composer model
-    // to the profile default instead of carrying the last-picked model forward.
-    // Default false preserves the sticky-last-pick behavior.
-    reset_model_on_new_session?: boolean
   }
   terminal?: {
     cwd?: string
@@ -467,7 +463,6 @@ export interface SessionCreateResponse {
 
 export interface SessionInfo {
   archived?: boolean
-  pinned?: boolean
   cwd?: null | string
   /** Git branch checked out in {@link cwd} when the session started/resumed.
    *  The sidebar groups main-checkout sessions by this so feature-branch work
@@ -513,10 +508,6 @@ export interface SessionInfo {
   /** Handoff lifecycle: 'pending' | 'in_progress' | 'completed' | 'failed'. */
   handoff_state?: null | string
   handoff_error?: null | string
-  /** Gateway presentation path for messaging-born sessions — server/channel/
-   *  thread names (e.g. "Daemonarchy / #general / My Thread"). Searchable so
-   *  channel/thread names are findable like titles. */
-  display_name?: null | string
   /** Owning profile name, set by the cross-profile aggregator
    *  (`/api/profiles/sessions`). Absent on legacy single-profile responses,
    *  which the UI treats as the default profile. */
@@ -548,7 +539,6 @@ export interface SessionMessage {
   codex_reasoning_items?: unknown
   content: unknown
   context?: unknown
-  id?: number | string
   name?: string
   reasoning?: null | string
   reasoning_content?: null | string
@@ -580,6 +570,12 @@ export interface SessionMessage {
 
 export interface SessionMessagesResponse {
   messages: SessionMessage[]
+  pagination?: {
+    limit: number
+    offset: number
+    order: 'latest' | 'oldest'
+    returned: number
+  }
   session_id: string
 }
 
@@ -630,7 +626,6 @@ export interface SessionRuntimeInfo {
   install_warning?: string
   model?: string
   personality?: string
-  pinned?: boolean
   provider?: string
   reasoning_effort?: string
   running?: boolean
@@ -1115,12 +1110,6 @@ export interface SessionSearchResult {
   session_started: number | null
   snippet: string
   source: string | null
-  /** Session title when the hit came from the title-match lane (human-assigned
-   *  intent — ranked above content hits in the sidebar merge). */
-  title?: string | null
-  /** Gateway presentation path (server/channel/thread names) when the hit
-   *  came from the title/channel-match lane. */
-  display_name?: string | null
 }
 
 export interface SessionSearchResponse {

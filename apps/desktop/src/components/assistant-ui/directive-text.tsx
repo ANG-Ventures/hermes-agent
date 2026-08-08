@@ -6,7 +6,6 @@ import type { FC } from 'react'
 import { Fragment, useEffect, useMemo, useState } from 'react'
 
 import { ZoomableImage } from '@/components/chat/zoomable-image'
-import { readDesktopFileDataUrl } from '@/lib/desktop-fs'
 import type { I18nContextValue } from '@/i18n'
 import { extractEmbeddedImages } from '@/lib/embedded-images'
 import { openExternalLink } from '@/lib/external-link'
@@ -405,11 +404,8 @@ const DirectiveImage: FC<{ id: string; label: string }> = ({ id, label }) => {
 
     // Remote gateway: the image lives on the gateway's disk, not ours — fetch
     // it over the authenticated API. Local: read it straight off this disk.
-    const load = window.hermesDesktop
-      ? isRemoteGateway()
-        ? gatewayMediaDataUrl(id)
-        : readDesktopFileDataUrl(id)
-      : null
+    const load =
+      window.hermesDesktop && isRemoteGateway() ? gatewayMediaDataUrl(id) : window.hermesDesktop?.readFileDataUrl(id)
 
     void Promise.resolve(load)
       .then(url => alive && url && setSrc(url))

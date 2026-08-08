@@ -1585,7 +1585,6 @@ export interface Translations {
       moveNoFolder: string
       moveNoProjects: string
       reveal: string
-      remoteRevealUnavailable: string
       copyPath: string
       removeFromSidebar: string
       createFailed: string
@@ -2455,17 +2454,6 @@ export interface Translations {
     yoloSystem: (active: boolean) => string
     yoloTitle: string
     yoloToggleFailed: string
-    footer: {
-      status: (on: boolean) => string
-      set: (on: boolean) => string
-      failed: string
-    }
-    reasoning: {
-      status: (level: string, display: string) => string
-      effortSet: (level: string) => string
-      displaySet: (value: string) => string
-      failed: string
-    }
     profileStatus: (current: string) => string
     unknownProfile: string
     noProfileNamed: (target: string, available: string) => string
@@ -2526,7 +2514,6 @@ export interface Translations {
     boundaryTitle: string
     boundaryDesc: string
     reloadWindow: string
-    resetAndRecover: string
     openLogs: string
   }
 

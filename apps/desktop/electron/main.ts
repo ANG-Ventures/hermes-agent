@@ -677,15 +677,6 @@ const WINDOW_BUTTON_POSITION = {
 // (pure + unit-testable); computeNativeOverlayWidth() applies it per platform.
 // It's only the pre-layout fallback — the renderer measures the exact overlay
 // width live via the Window Controls Overlay API.
-// Ordered by NATIVE readability, not by convenience: `app.dock.setIcon()` and
-// BrowserWindow's `icon` are native calls that cannot read inside an asar
-// archive, while `fs.statSync` CAN (Electron shims fs for asar paths). So an
-// existence check alone picks a path that exists for JS and throws for native
-// ("Failed to load image from path .../app.asar/public/apple-touch-icon.png",
-// an uncaught main-process exception at startup). Put the asar.unpacked copy
-// first so the native call gets a real on-disk file; the in-asar paths remain
-// as fallbacks for dev runs (unpacked tree, where APP_ROOT has no .asar).
-//
 // The apple-touch PNG bakes in the macOS-style ~10% margin, which is correct
 // for the dock but renders visibly smaller than neighboring taskbar icons on
 // Windows, where icons are full-bleed. Windows prefers the full-bleed
@@ -695,9 +686,9 @@ const APP_ICON_PATHS = [
   ...(IS_WINDOWS
     ? [path.join(process.resourcesPath ?? '', 'icon.ico'), path.join(APP_ROOT, 'assets', 'icon.ico')]
     : []),
-  path.join(unpackedPathFor(APP_ROOT), 'dist', 'apple-touch-icon.png'),
   path.join(APP_ROOT, 'public', 'apple-touch-icon.png'),
-  path.join(APP_ROOT, 'dist', 'apple-touch-icon.png')
+  path.join(APP_ROOT, 'dist', 'apple-touch-icon.png'),
+  path.join(unpackedPathFor(APP_ROOT), 'dist', 'apple-touch-icon.png')
 ]
 
 let rendererTitleBarTheme = null
@@ -9285,15 +9276,7 @@ function createWindow() {
     mainWindow.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
 
     if (icon) {
-      // Cosmetic only — never let a dock-icon load failure take down the
-      // window. setIcon() is a native call that throws on an unreadable path
-      // (e.g. an in-asar file), and an uncaught throw here aborts createWindow()
-      // and leaves the app with no window at all.
-      try {
-        app.dock?.setIcon(icon)
-      } catch (error) {
-        console.warn(`[main] failed to set dock icon from ${icon}:`, error)
-      }
+      app.dock?.setIcon(icon)
     }
   }
 
@@ -10148,9 +10131,16 @@ async function interceptSessionRequestForRemote(request) {
       return undefined
     }
 
+    // Preserve every non-profile query param (limit/offset/order pagination —
+    // stripping them made getAllSessionMessages loop the same default page
+    // against paginating remote backends).
+    const passthroughParams = new URLSearchParams(searchParams)
+    passthroughParams.delete('profile')
+    const passthroughQuery = passthroughParams.toString()
+
     if (profileHasRemoteOverride(profile)) {
       if (method === 'GET') {
-        return fetchJsonForProfile(profile, pathname)
+        return fetchJsonForProfile(profile, passthroughQuery ? `${pathname}?${passthroughQuery}` : pathname)
       }
 
       const body = request.body && typeof request.body === 'object' ? { ...request.body } : request.body
@@ -10164,8 +10154,8 @@ async function interceptSessionRequestForRemote(request) {
 
     if (globalRemoteActive()) {
       // Single global backend: keep ?profile= so it opens the right state.db.
-      const sep = pathname.includes('?') ? '&' : '?'
-      const path = `${pathname}${sep}profile=${encodeURIComponent(profile)}`
+      passthroughParams.set('profile', profile)
+      const path = `${pathname}?${passthroughParams.toString()}`
 
       if (method === 'GET') {
         return fetchJsonForProfile(null, path)

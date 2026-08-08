@@ -12,8 +12,7 @@ import {
   getCurrentModelSource,
   setCurrentModel,
   setCurrentModelSource,
-  setCurrentProvider,
-  setResetModelOnNewSession
+  setCurrentProvider
 } from '@/store/session'
 import type * as SessionStates from '@/store/session-states'
 
@@ -87,7 +86,6 @@ describe('useModelControls', () => {
     setCurrentModel('')
     setCurrentModelSource('')
     setCurrentProvider('')
-    setResetModelOnNewSession(false)
   })
 
   afterEach(() => {
@@ -98,7 +96,6 @@ describe('useModelControls', () => {
     setCurrentModel('')
     setCurrentModelSource('')
     setCurrentProvider('')
-    setResetModelOnNewSession(false)
   })
 
   it('applies the global model when there is no active runtime session', async () => {
@@ -407,46 +404,6 @@ describe('useModelControls', () => {
     // A profile swap forces a reseed to the new profile's default.
     await result.current.refreshCurrentModel(true)
     expect($currentModel.get()).toBe('openai/gpt-5.5')
-  })
-
-  it('reseeds a sticky last-picked model to the default when reset_model_on_new_session is ON', async () => {
-    vi.mocked(getGlobalModelInfo).mockResolvedValue({ model: 'claude-opus-4-8', provider: 'claude-apr' })
-    setCurrentModel('claude-fable-5')
-    setCurrentProvider('claude-apr')
-    setResetModelOnNewSession(true)
-
-    const { result } = renderHook(() =>
-      useModelControls({
-        queryClient: new QueryClient(),
-        requestGateway: vi.fn()
-      })
-    )
-
-    // Flag ON: a fresh draft snaps the sticky pick back to the profile default.
-    await result.current.refreshCurrentModel()
-    expect($currentModel.get()).toBe('claude-opus-4-8')
-    expect($currentProvider.get()).toBe('claude-apr')
-  })
-
-  it('never reseeds the composer for an ACTIVE session even when the flag is ON', async () => {
-    vi.mocked(getGlobalModelInfo).mockResolvedValue({ model: 'claude-opus-4-8', provider: 'claude-apr' })
-    setCurrentModel('claude-fable-5')
-    setCurrentProvider('claude-apr')
-    setResetModelOnNewSession(true)
-    $activeSessionId.set('runtime-1')
-
-    const { result } = renderHook(() =>
-      useModelControls({
-        queryClient: new QueryClient(),
-        requestGateway: vi.fn()
-      })
-    )
-
-    await result.current.refreshCurrentModel()
-
-    // A live session owns its model; the flag must not disturb it mid-conversation.
-    expect($currentModel.get()).toBe('claude-fable-5')
-    expect($currentProvider.get()).toBe('claude-apr')
   })
 
   it('reseeds a sticky manual pick that was removed from the catalog', async () => {

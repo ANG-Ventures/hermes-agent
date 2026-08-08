@@ -13,7 +13,6 @@ import type { SessionInfo } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
-import { sessionOriginContext } from '@/lib/session-search'
 import { middleClickHandlers } from '@/lib/middle-click'
 import { handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
 import { coarseElapsed } from '@/lib/time'
@@ -42,11 +41,6 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   reorderable?: boolean
   dragging?: boolean
   dragHandleProps?: React.HTMLAttributes<HTMLElement>
-  /** Search results show WHERE a session lives ("Discord: voice-assitant:
-   *  Desktop App" / "TUI") above the title, so cross-surface hits are
-   *  tellable apart. Off in the normal sidebar lists (the section headers
-   *  already carry that context there). */
-  showOriginContext?: boolean
   /** Tag the row with its owning profile (initial chip + tooltip). Used by
    *  flat cross-profile lists — Pinned and search results in the All-profiles
    *  view — where no group header communicates ownership (#66003). */
@@ -76,7 +70,6 @@ function SidebarSessionRowImpl({
   reorderable = false,
   dragging = false,
   dragHandleProps,
-  showOriginContext = false,
   showProfile = false,
   className,
   style,
@@ -89,7 +82,6 @@ function SidebarSessionRowImpl({
   const title = sessionTitle(session)
   const age = formatAge(session.last_active || session.started_at, r)
   const handleLabel = `Reorder ${title}`
-  const originContext = showOriginContext ? sessionOriginContext(session) : null
   // A handed-off session's live source is local, but it originated on a
   // messaging platform — surface that origin as a small badge so e.g. a
   // Telegram thread continued here still reads as Telegram.
@@ -247,16 +239,7 @@ function SidebarSessionRowImpl({
             </Tip>
           ) : null}
           <SidebarRowLabel className="flex-1 font-normal group-hover:text-foreground group-data-[working=true]:text-foreground/90">
-            {originContext ? (
-              <span className="flex min-w-0 flex-col">
-                <span className="truncate text-[0.625rem] leading-tight text-(--ui-text-tertiary)">
-                  {originContext}
-                </span>
-                <span className="truncate">{title}</span>
-              </span>
-            ) : (
-              title
-            )}
+            {title}
           </SidebarRowLabel>
           {showProfile && <ProfileTag profile={session.profile} />}
         </SidebarRowBody>

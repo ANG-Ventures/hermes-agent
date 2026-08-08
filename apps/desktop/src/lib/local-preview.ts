@@ -1,7 +1,6 @@
 import DOMPurify from 'dompurify'
 
 import { isDesktopFsRemoteMode, readDesktopFileDataUrl, readDesktopFileText } from '@/lib/desktop-fs'
-import { mediaExternalUrl } from '@/lib/media'
 import type { PreviewTarget } from '@/store/preview'
 
 const HTML_EXTENSIONS = new Set(['.htm', '.html'])
@@ -222,47 +221,23 @@ export function localPreviewTarget(rawTarget: string, cwd?: string | null): Prev
 }
 
 async function enrichPreviewTarget(target: PreviewTarget | null): Promise<PreviewTarget | null> {
-  if (!isDesktopFsRemoteMode() || !target || target.kind !== 'file' || target.previewKind === 'pdf') {
+  if (
+    !isDesktopFsRemoteMode() ||
+    !target ||
+    target.kind !== 'file' ||
+    target.previewKind === 'image' ||
+    target.previewKind === 'pdf'
+  ) {
     return target
   }
 
-  const remoteTarget = { ...target, url: mediaExternalUrl(target.path || target.source) }
-
-  if (target.previewKind === 'image') {
-    return remoteTarget
-  }
-
-  // fork parity NOTE (2026-08-07 upstream merge): upstream added the sanitized
-  // remote-HTML data-url path; the fork routes remote targets through
-  // `remoteTarget` (authenticated bytes-to-temp url) which the shared tail below
-  // consumes, and local-preview.remote.test.ts pins BOTH the url and the
-  // read-text call. So the data-url is layered ONTO remoteTarget and then falls
-  // through to the fork's read — never an early return that drops `url`.
   if (target.previewKind === 'html') {
-    let htmlDataUrl: string | undefined
-
     try {
-      htmlDataUrl = validatedRemoteHtmlDataUrl(await readDesktopFileDataUrl(target.path || target.source)) || undefined
-    } catch {
-      htmlDataUrl = undefined
-    }
+      const dataUrl = validatedRemoteHtmlDataUrl(await readDesktopFileDataUrl(target.path || target.source))
 
-    try {
-      const result = await readDesktopFileText(target.path || target.source)
-
-      return {
-        ...remoteTarget,
-        ...(htmlDataUrl ? { dataUrl: htmlDataUrl } : { renderMode: 'source', transient: true }),
-        binary: result.binary,
-        byteSize: result.byteSize,
-        language: result.language || target.language,
-        large: (result.byteSize ?? 0) > 512 * 1024,
-        mimeType: result.mimeType
-      }
+      return dataUrl ? { ...target, dataUrl } : { ...target, renderMode: 'source', transient: true }
     } catch {
-      return htmlDataUrl
-        ? { ...remoteTarget, dataUrl: htmlDataUrl }
-        : { ...remoteTarget, renderMode: 'source', transient: true }
+      return { ...target, renderMode: 'source', transient: true }
     }
   }
 
@@ -270,7 +245,7 @@ async function enrichPreviewTarget(target: PreviewTarget | null): Promise<Previe
     const result = await readDesktopFileText(target.path || target.source)
 
     return {
-      ...remoteTarget,
+      ...target,
       binary: result.binary,
       byteSize: result.byteSize,
       language: result.language || target.language,
@@ -278,7 +253,7 @@ async function enrichPreviewTarget(target: PreviewTarget | null): Promise<Previe
       mimeType: result.mimeType
     }
   } catch {
-    return remoteTarget
+    return target
   }
 }
 

@@ -39,6 +39,7 @@ describe('desktop slash command curation', () => {
     expect(isDesktopSlashSuggestion('/density')).toBe(false)
     expect(isDesktopSlashSuggestion('/redraw')).toBe(false)
     expect(isDesktopSlashSuggestion('/approve')).toBe(false)
+    expect(isDesktopSlashSuggestion('/model')).toBe(false)
     expect(isDesktopSlashSuggestion('/skills')).toBe(false)
     expect(isDesktopSlashSuggestion('/voice')).toBe(false)
     expect(isDesktopSlashSuggestion('/curator')).toBe(false)
@@ -52,8 +53,7 @@ describe('desktop slash command curation', () => {
     expect(isDesktopSlashSuggestion('/compress')).toBe(true)
   })
 
-  it('surfaces /model, /tools, /save, and /personality on the desktop', () => {
-    expect(isDesktopSlashSuggestion('/model')).toBe(true)
+  it('surfaces /tools, /save, and /personality on the desktop', () => {
     expect(isDesktopSlashSuggestion('/tools')).toBe(true)
     expect(isDesktopSlashSuggestion('/save')).toBe(true)
     expect(isDesktopSlashSuggestion('/personality')).toBe(true)
@@ -209,7 +209,6 @@ describe('desktop slash command curation', () => {
     ])
     expect(filtered.pairs).toEqual([
       ['/new', 'Start a new desktop chat'],
-      ['/model', 'Switch the model for this session'],
       ['/ship-it', 'Run release checklist']
     ])
     // skill_count is recomputed from the filtered output (only /ship-it is an
@@ -270,31 +269,7 @@ describe('desktop slash command curation', () => {
   it('explains known commands that desktop owns elsewhere', () => {
     expect(desktopSlashUnavailableMessage('/model sonnet')).toContain('model picker')
     expect(desktopSlashUnavailableMessage('/skills')).toContain('desktop sidebar')
-    expect(desktopSlashUnavailableMessage('/verbose')).toContain('terminal interface')
-  })
-
-  it('routes /footer to a desktop action with arg options', () => {
-    expect(resolveDesktopCommand('/footer')?.surface).toEqual({ kind: 'action', action: 'footer' })
-    expect(resolveDesktopCommand('/footer')?.args).toBe(true)
-    expect(isDesktopSlashSuggestion('/footer')).toBe(true)
-    expect(desktopSlashUnavailableMessage('/footer')).toBeNull()
-  })
-
-  it('routes /reasoning (and /effort) to the reasoning action with arg options', () => {
-    expect(resolveDesktopCommand('/reasoning')?.surface).toEqual({ kind: 'action', action: 'reasoning' })
-    expect(resolveDesktopCommand('/effort')?.surface).toEqual({ kind: 'action', action: 'reasoning' })
-    expect(resolveDesktopCommand('/reasoning')?.args).toBe(true)
-    expect(isDesktopSlashSuggestion('/reasoning')).toBe(true)
-    expect(isDesktopSlashSuggestion('/effort')).toBe(false) // alias: executes, stays out of the popover
-    expect(desktopSlashUnavailableMessage('/reasoning')).toBeNull()
-    expect(desktopSlashDescription('/reasoning', '')).toContain('xhigh|max|show|hide')
-  })
-
-  it('treats /clear and /models as aliases of /new and /model', () => {
-    expect(resolveDesktopCommand('/clear')?.name).toBe('/new')
-    expect(resolveDesktopCommand('/models')?.name).toBe('/model')
-    expect(isDesktopSlashCommand('/clear')).toBe(true)
-    expect(isDesktopSlashCommand('/models')).toBe(true)
+    expect(desktopSlashUnavailableMessage('/clear')).toContain('terminal interface')
   })
 
   it('flags /model as a picker-owned command so the desktop opens the overlay', () => {
@@ -308,7 +283,7 @@ describe('desktop slash command curation', () => {
     expect(isPickerCommand('/resume', 'session')).toBe(true)
     expect(isPickerCommand('/sessions', 'session')).toBe(true)
     expect(isPickerCommand('/switch', 'session')).toBe(true)
-    // Like /model, /resume shows in the popover; its aliases stay hidden.
+    // Unlike /model, /resume shows in the popover; its aliases stay hidden.
     expect(isDesktopSlashSuggestion('/resume')).toBe(true)
     expect(isDesktopSlashSuggestion('/sessions')).toBe(false)
     expect(isDesktopSlashCommand('/switch')).toBe(true)
@@ -321,8 +296,7 @@ describe('desktop slash command curation', () => {
     expect(resolveDesktopCommand('/reset')?.surface).toEqual({ kind: 'action', action: 'new' })
     expect(resolveDesktopCommand('/resume')?.surface).toEqual({ kind: 'picker', picker: 'session' })
     expect(resolveDesktopCommand('/usage')?.surface).toEqual({ kind: 'exec' })
-    expect(resolveDesktopCommand('/clear')?.surface).toEqual({ kind: 'action', action: 'new' })
-    expect(resolveDesktopCommand('/verbose')?.surface).toEqual({ kind: 'unavailable', reason: 'terminal' })
+    expect(resolveDesktopCommand('/clear')?.surface).toEqual({ kind: 'unavailable', reason: 'terminal' })
     // Skill / quick commands aren't in the registry.
     expect(resolveDesktopCommand('/gif-search')).toBeNull()
   })

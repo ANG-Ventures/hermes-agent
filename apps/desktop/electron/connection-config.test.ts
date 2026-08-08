@@ -41,7 +41,7 @@ import {
   RT_COOKIE_VARIANTS,
   savedProfileSsh,
   tokenPreview
-} from './connection-config.ts'
+} from './connection-config'
 
 // --- connectionScopeKey / normAuthMode ---
 

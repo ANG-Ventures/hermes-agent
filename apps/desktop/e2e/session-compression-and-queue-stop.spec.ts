@@ -119,29 +119,7 @@ auxiliary:
     await waitForTranscript(page, MOCK_REPLY)
     await pasteAndSend(page, 'E2E_COMPACTION_HISTORY_TWO '.repeat(5))
     await waitForTranscript(page, MOCK_REPLY)
-    // Upstream pasted 500 repeats of one phrase and expected automatic
-    // compaction at raw-estimate >= 22k. Two fork behaviors make that
-    // under-provisioned: (1) the P2 skew-calibrated trigger
-    // (agent/context_engine.py) applies a conservative cold-start prior when
-    // the mock backend never returns real prompt_tokens, so the trigger fires
-    // at raw >= threshold/skew (worst case threshold/0.5 = 44k), guarding the
-    // 2026-07-18 premature-lossy-compaction incident; (2) the rough estimator
-    // discounts repeated identical tokens, so repeating ONE phrase grows
-    // sublinearly (measured: 500 reps -> 21.4k, 1200 -> 28k). Use VARIED text
-    // (indexed words) so the estimate scales linearly, and size it past the
-    // worst-case trigger (~48k raw) while staying under the 95% window hard
-    // ceiling (60.8k) and the paste path's own limits.
-    // RE-MEASURED against the merged tree's own estimator (2026-08-07):
-    //   upstream's `'…'.repeat(1500)` -> 14,152 rough  (below even the 22k
-    //   threshold, let alone the 44k worst-case cold-start trigger)
-    //   this 4,200-word varied filler -> 53,314 rough  (clears 44k, under the
-    //   60.8k hard ceiling). Both fork behaviors still exist post-merge:
-    //   _TRIGGER_SKEW_MIN=0.5 (context_engine.py:372) and the estimator's memo.
-    const compactionFiller = Array.from(
-      { length: 4200 },
-      (_, i) => `E2E_TRIGGER_AUTOMATIC_COMPACTION_${i.toString(36)}_${(i * 7919).toString(36)}`,
-    ).join(' ')
-    await pasteAndSend(page, compactionFiller)
+    await pasteAndSend(page, 'E2E_TRIGGER_AUTOMATIC_COMPACTION '.repeat(1500))
     await fixture.mock.waitForHeldCompletion()
     await expect(page.getByRole('status', { name: 'Summarizing thread' }).last()).toBeVisible()
 
