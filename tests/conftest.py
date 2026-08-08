@@ -276,6 +276,10 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_KANBAN_RUN_ID",
     "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_DISPATCH_IN_GATEWAY",
+    # Opt-in flag that makes kanban ignore the path pins above. A developer
+    # shell exporting it would silently flip path-resolution tests; tests
+    # that exercise it set it explicitly.
+    "HERMES_KANBAN_SANDBOX",
     "HERMES_TENANT",
     # Honcho host selection changes which nested config block wins. A local
     # shell override leaked "myhost" into the full suite and flipped 20
