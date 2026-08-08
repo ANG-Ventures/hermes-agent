@@ -470,7 +470,17 @@ def _cwd_marker(session_id: str) -> str:
 # as the Python-side contract for the exclusion set; the dump path unsets by
 # name/prefix instead of grepping declare lines (see below / issue #71296).
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
-    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|HERMES_CRON_SESSION)"
+    # Matches BOTH shell dump forms: bash's ``declare -x NAME=...`` and the
+    # ``export NAME=...`` form (the fork's pre-merge pattern covered both;
+    # upstream's rewrite narrowed it to ``declare -x`` only). Callers use this
+    # as the Python-side contract, so it must recognise whatever a caller's
+    # dump actually produced.
+    #
+    # HERMES_HOME is matched EXACTLY (``=`` anchored), not as a prefix:
+    # HERMES_HOME_BACKUP and friends are ordinary user vars and must survive
+    # the snapshot. The SESSION_/CRON_ entries stay prefix matches by design.
+    "^(declare -x |export )(HERMES_SESSION_|HERMES_UI_SESSION_ID"
+    "|HERMES_CRON_AUTO_DELIVER_|HERMES_CRON_SESSION|HERMES_HOME=)"
 )
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -513,8 +523,15 @@ def _export_dump_excluding_session_vars(
         extra_unset = f" {extra_unset}"
     return (
         "{ ( "
+        # HERMES_HOME is excluded for the same reason as the per-session vars:
+        # the snapshot is replayed in OTHER sessions, and a captured HERMES_HOME
+        # silently repoints them at a foreign agent home (state.db, auth.json,
+        # kanban). The fork's pre-merge filter was
+        # ``HERMES_(SESSION_[A-Z0-9_]+|HOME)=``; upstream's rewrite from a
+        # grep-based filter to this name/prefix unset (#71296 — safer for values
+        # containing newlines) kept the SESSION_ half and dropped HOME.
         "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
-        f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
+        f"HERMES_UI_SESSION_ID HERMES_HOME{extra_unset} 2>/dev/null; "
         "export -p; "
         ") || true; } "
         f"> {tmp_path}"
