@@ -106,19 +106,21 @@ jobs:
   e2e-desktop:
     name: Desktop E2E
     needs: detect
-    # python_prod (not python): the Playwright suite exercises the built app
-    # + `hermes serve` backend, which never import anything under tests/.
-    # Tests-only PRs (~17% of commits) skip this 5-minute job — the longest
-    # single job in the workflow — while still running the full pytest lanes.
+    # fork-parity: upstream TEMPORARILY DISABLED this job on Aug 2 2026 with a
+    # `false &&` guard (their #76627 — the mock-backend Electron window never
+    # got a title after the Aug 1 engines/npm churn, so every spec failed
+    # regardless of the diff). That disable arrived here through the parity
+    # merge, but it is NOT true on this fork: `Desktop E2E / Playwright E2E
+    # (Linux)` concludes `success` on fork/main today (verified on runs
+    # 31280614721 and 31278775668).
     #
-    # ⛔ TEMPORARILY DISABLED (Aug 2, 2026, Teknium) — the suite is red on
-    # every PR and on main itself since the Aug 1 night engines/npm churn
-    # (#76499 → #76562 → #76575): the mock-backend Electron window never
-    # gets a title, so boot/chat/setup/interim specs all fail identically
-    # regardless of the PR's diff (verified on #76573 and the docs-only
-    # #76582). Tracking issue: #76627 (assigned: Ari). To re-enable,
-    # delete the `false &&` below — nothing else changed.
-    if: ${{ false && (needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true') }}
+    # Keeping upstream's guard would have skipped the job while
+    # scripts/ci/evaluate_needs.py (fork-only, from #476) still requires it to
+    # run — which is exactly the "classifier inconsistency" that failed the
+    # umbrella gate. Two correct halves, contradictory when merged. Restore the
+    # fork's condition rather than weakening the gate: a job that is required
+    # must actually run, and here it both runs and passes.
+    if: needs.detect.outputs.python == 'true' || needs.detect.outputs.frontend == 'true'
     uses: ./.github/workflows/e2e-desktop.yml
 
   docs-site:
