@@ -6282,6 +6282,15 @@ class AIAgent:
         self._client_kwargs["base_url"] = self.base_url
         self._reapply_route_client_config(route_changed=route_changed)
         self._replace_primary_openai_client(reason="credential_rotation")
+        # Fork contract: ``_swap_credential`` returns a tri-state SwapOutcome,
+        # never None (upstream's copy of this tail returns nothing because
+        # upstream's signature is a bare bool). Keep the terminal return HERE,
+        # in the caller — NOT inside ``_reapply_route_client_config``, which
+        # upstream extracted as a void helper and which the env-refresh path
+        # also calls. The 2026-08-07 merge put the rebuild + return inside the
+        # helper, so every rotation rebuilt the client TWICE (once in the
+        # helper, once here).
+        return SwapOutcome.SWAPPED
 
     def _reapply_route_client_config(self, *, route_changed: bool) -> None:
         """Recompute route-derived client kwargs for the current ``self.base_url``.
@@ -6316,8 +6325,6 @@ class AIAgent:
             self.base_url,
             apply_user_headers=not route_changed,
         )
-        self._replace_primary_openai_client(reason="credential_rotation")
-        return SwapOutcome.SWAPPED
 
     def _recover_with_credential_pool(
         self,

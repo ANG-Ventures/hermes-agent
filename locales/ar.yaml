@@ -1,442 +1,724 @@
-# Hermes static-message catalog -- Arabic (العربية)
-#
-# Mirrors locales/en.yaml key-for-key.  Only user-facing static prose is
-# translated: command names, /slash commands, config keys, paths, URLs, model
-# IDs, provider names, emojis and {placeholder} tokens are kept verbatim so
-# interpolation and identifiers keep working.  tests/agent/test_i18n.py asserts
-# key parity and placeholder parity against en.yaml.
-
 approval:
-  dangerous_header: "⚠️  أمر خطير: {description}"
-  choose_long:     "      [o] مرة  |  [s] الجلسة  |  [a] دائمًا  |  [d] رفض"
-  choose_short:    "      [o] مرة  |  [s] الجلسة  |  [d] رفض"
-  prompt_long:     "      الاختيار [o/s/a/D]: "
-  prompt_short:    "      الاختيار [o/s/D]: "
-  choose_smart_deny: "      [o] مرة  |  [d] رفض"
-  prompt_smart_deny: "      الاختيار [o/D]: "
-  smart_deny_once_inputs: "o,once"
-  smart_deny_deny_inputs: "d,deny"
-  timeout:         "      ⏱ انتهت المهلة - يتم رفض الأمر"
-  allowed_once:    "      ✓ مسموح مرة واحدة"
-  allowed_session: "      ✓ مسموح لهذه الجلسة"
-  allowed_always:  "      ✓ أُضيف إلى قائمة السماح الدائمة"
-  denied:          "      ✗ مرفوض"
-  cancelled:       "      ✗ أُلغي"
-  blocklist_message: "هذا الأمر مدرج في قائمة الحظر غير المشروطة ولا يمكن الموافقة عليه."
-
+  allowed_always: '      ✓ أُضيف إلى قائمة السماح الدائمة'
+  allowed_once: '      ✓ مسموح مرة واحدة'
+  allowed_session: '      ✓ مسموح لهذه الجلسة'
+  blocklist_message: هذا الأمر مدرج في قائمة الحظر غير المشروطة ولا يمكن الموافقة عليه.
+  cancelled: '      ✗ أُلغي'
+  choose_long: '      [o] مرة  |  [s] الجلسة  |  [a] دائمًا  |  [d] رفض'
+  choose_short: '      [o] مرة  |  [s] الجلسة  |  [d] رفض'
+  choose_smart_deny: '      [o] مرة  |  [d] رفض'
+  dangerous_header: '⚠️  أمر خطير: {description}'
+  denied: '      ✗ مرفوض'
+  prompt_long: '      الاختيار [o/s/a/D]: '
+  prompt_short: '      الاختيار [o/s/D]: '
+  prompt_smart_deny: '      الاختيار [o/D]: '
+  smart_deny_deny_inputs: d,deny
+  smart_deny_once_inputs: o,once
+  timeout: '      ⏱ انتهت المهلة - يتم رفض الأمر'
 gateway:
-  context:
-    header:                "🧠 **Context Window**"
-    model:                 "Model: `{model}`"
-    window:                "Window: {total} tokens"
-    in_use:                "In use: {used} / {total} ({pct}%)"
-    bar:                   "{bar}"
-    headroom:              "Headroom to limit: {headroom} tokens"
-    threshold:             "Auto-compresses at: {threshold} ({threshold_pct}%) — {to_go} to go"
-    over_threshold:        "⚠️ **Over auto-compression threshold ({threshold}, {threshold_pct}%)**"
-    compressions:          "Compressions this session: {count}"
-    last_savings:          "Last compression freed: {savings}% of context"
-    totals_header:         "Session totals (cumulative across {calls} API calls)"
-    totals_line:           "Input {input} · Output {output} · Reasoning {reasoning}"
-    total_billed:          "Total billed: {total}"
-    throughput_note:       "_Throughput, not context size — each call re-sends the window above._"
-    estimated:             "Estimated context: ~{count} tokens across {messages} messages"
-    detail_after_first:    "_(Full compression and throughput stats available after the first agent response)_"
-    no_data:               "No context data available yet. Send a message to start a session."
-  approval_expired: "⚠️ انتهت صلاحية الموافقة (لم يعد الوكيل ينتظر). اطلب من الوكيل المحاولة مرة أخرى."
-  draining:         "⏳ جارٍ إنهاء {count} وكيل نشط قبل إعادة التشغيل..."
-  goal_cleared:     "✓ تم مسح الهدف."
-  no_active_goal:   "لا يوجد هدف نشط."
-  config_read_failed: "⚠️ تعذّر قراءة config.yaml: {error}"
-  config_save_failed: "⚠️ تعذّر حفظ الإعدادات: {error}"
-
-  model:
-    error_prefix:           "خطأ: {error}"
-    switched:               "تم التبديل إلى النموذج `{model}`"
-    provider_label:         "المزوّد: {provider}"
-    context_label:          "السياق: {tokens} رمزًا"
-    max_output_label:       "أقصى خرج: {tokens} رمزًا"
-    cost_label:             "التكلفة: {cost}"
-    capabilities_label:     "القدرات: {capabilities}"
-    prompt_caching_enabled: "التخزين المؤقت للموجِّه: مُفعّل"
-    warning_prefix:         "تحذير: {warning}"
-    saved_global:           "حُفظ في config.yaml (‏`--global`)"
-    session_only_hint:      "_(هذه الجلسة فقط — أضف `--global` للحفظ الدائم)_"
-    current_label:          "الحالي: `{model}` على {provider}"
-    current_tag:            " (الحالي)"
-    more_models_suffix:     " (+{count} آخر)"
-    usage_switch_model:     "`/model <name>` — تبديل النموذج"
-    usage_switch_provider:  "`/model <name> --provider <slug>` — تبديل المزوّد"
-    usage_persist:          "`/model <name> --global` — حفظ دائم"
-
   agents:
-    header:                "🤖 **الوكلاء والمهام النشطة**"
-    active_agents:         "**الوكلاء النشطون:** {count}"
-    this_chat:             " · هذه المحادثة"
-    more:                  "... و{count} آخر"
-    running_processes:     "**العمليات الخلفية الجارية:** {count}"
-    async_jobs:            "**مهام البوابة غير المتزامنة:** {count}"
-    background_delegations: "**التفويضات في الخلفية:** {count}"
-    none:                  "لا يوجد وكلاء نشطون أو مهام جارية."
-    state_starting:        "قيد البدء"
-    state_running:         "قيد التشغيل"
-
+    active_agents: '**الوكلاء النشطون:** {count}'
+    async_jobs: '**مهام البوابة غير المتزامنة:** {count}'
+    background_delegations: '**التفويضات في الخلفية:** {count}'
+    header: 🤖 **الوكلاء والمهام النشطة**
+    more: '... و{count} آخر'
+    none: لا يوجد وكلاء نشطون أو مهام جارية.
+    running_processes: '**العمليات الخلفية الجارية:** {count}'
+    state_running: قيد التشغيل
+    state_starting: قيد البدء
+    this_chat: ' · هذه المحادثة'
+  approval_expired: ⚠️ انتهت صلاحية الموافقة (لم يعد الوكيل ينتظر). اطلب من الوكيل المحاولة مرة أخرى.
   approve:
-    no_pending:            "لا يوجد أمر معلّق للموافقة عليه."
-    once_singular:         "✅ تمت الموافقة على الأمر. الوكيل يستأنف..."
-    once_plural:           "✅ تمت الموافقة على الأوامر ({count} أوامر). الوكيل يستأنف..."
-    session_singular:      "✅ تمت الموافقة على الأمر (النمط مُوافق عليه لهذه الجلسة). الوكيل يستأنف..."
-    session_plural:        "✅ تمت الموافقة على الأوامر (النمط مُوافق عليه لهذه الجلسة) ({count} أوامر). الوكيل يستأنف..."
-    always_singular:       "✅ تمت الموافقة على الأمر (النمط مُوافق عليه دائمًا). الوكيل يستأنف..."
-    always_plural:         "✅ تمت الموافقة على الأوامر (النمط مُوافق عليه دائمًا) ({count} أوامر). الوكيل يستأنف..."
-
+    always_plural: ✅ تمت الموافقة على الأوامر (النمط مُوافق عليه دائمًا) ({count} أوامر). الوكيل يستأنف...
+    always_singular: ✅ تمت الموافقة على الأمر (النمط مُوافق عليه دائمًا). الوكيل يستأنف...
+    no_pending: لا يوجد أمر معلّق للموافقة عليه.
+    once_plural: ✅ تمت الموافقة على الأوامر ({count} أوامر). الوكيل يستأنف...
+    once_singular: ✅ تمت الموافقة على الأمر. الوكيل يستأنف...
+    session_plural: ✅ تمت الموافقة على الأوامر (النمط مُوافق عليه لهذه الجلسة) ({count} أوامر). الوكيل يستأنف...
+    session_singular: ✅ تمت الموافقة على الأمر (النمط مُوافق عليه لهذه الجلسة). الوكيل يستأنف...
   background:
-    usage:                 "الاستخدام: /background <prompt>\nمثال: /background لخّص أهم قصص HN اليوم\n\nيشغّل الموجِّه في جلسة منفصلة. يمكنك متابعة المحادثة — ستظهر النتيجة هنا عند الانتهاء."
-    started:               "🔄 بدأت مهمة خلفية: \"{preview}\"\nمعرّف المهمة: {task_id}\nيمكنك متابعة المحادثة — ستظهر النتائج عند الانتهاء."
+    started: '🔄 بدأت مهمة خلفية: "{preview}"
 
+      معرّف المهمة: {task_id}
+
+      يمكنك متابعة المحادثة — ستظهر النتائج عند الانتهاء.'
+    usage: 'الاستخدام: /background <prompt>
+
+      مثال: /background لخّص أهم قصص HN اليوم
+
+
+      يشغّل الموجِّه في جلسة منفصلة. يمكنك متابعة المحادثة — ستظهر النتيجة هنا عند الانتهاء.'
   branch:
-    db_unavailable:        "قاعدة بيانات الجلسات غير متاحة."
-    no_conversation:       "لا توجد محادثة للتفريع — أرسل رسالة أولًا."
-    create_failed:         "فشل إنشاء الفرع: {error}"
-    switch_failed:         "أُنشئ الفرع لكن تعذّر التبديل إليه."
-    branched_one:          "⑂ تم التفريع إلى **{title}** (نُسخت {count} رسالة)\nالأصل: `{parent}`\nالفرع: `{new}`\nاستخدم `/resume` للعودة إلى الأصل."
-    branched_many:         "⑂ تم التفريع إلى **{title}** (نُسخت {count} رسالة)\nالأصل: `{parent}`\nالفرع: `{new}`\nاستخدم `/resume` للعودة إلى الأصل."
+    branched_many: '⑂ تم التفريع إلى **{title}** (نُسخت {count} رسالة)
 
+      الأصل: `{parent}`
+
+      الفرع: `{new}`
+
+      استخدم `/resume` للعودة إلى الأصل.'
+    branched_one: '⑂ تم التفريع إلى **{title}** (نُسخت {count} رسالة)
+
+      الأصل: `{parent}`
+
+      الفرع: `{new}`
+
+      استخدم `/resume` للعودة إلى الأصل.'
+    create_failed: 'فشل إنشاء الفرع: {error}'
+    db_unavailable: قاعدة بيانات الجلسات غير متاحة.
+    no_conversation: لا توجد محادثة للتفريع — أرسل رسالة أولًا.
+    switch_failed: أُنشئ الفرع لكن تعذّر التبديل إليه.
+    thread_branched_many: '⑂ Branched into a new thread → {thread} (**{title}**, {count} messages inherited).
+
+      The parent channel stays on its own session; use `/merge` inside the thread to fold it back.'
+    thread_branched_one: '⑂ Branched into a new thread → {thread} (**{title}**, {count} message inherited).
+
+      The parent channel stays on its own session; use `/merge` inside the thread to fold it back.'
+    thread_intro: '⑂ **Branched thread — {title}**
+
+      This thread inherits the parent conversation ({count} messages) from {parent}. Explore freely here; the parent channel keeps its own session. Use `/merge` to fold a summary back into the parent.'
+    thread_parent_fallback: the parent conversation
   commands:
-    usage:                 "الاستخدام: `/commands [page]`"
-    skill_header:          "⚡ **أوامر المهارات**:"
-    default_desc:          "أمر مهارة"
-    none:                  "لا توجد أوامر متاحة."
-    header:                "📚 **الأوامر** ({total} إجمالًا، صفحة {page}/{total_pages})"
-    nav_prev:              "`/commands {page}` ← السابق"
-    nav_next:              "التالي → `/commands {page}`"
-    out_of_range:          "_(الصفحة المطلوبة {requested} خارج النطاق، يتم عرض الصفحة {page}.)_"
-
+    default_desc: أمر مهارة
+    header: 📚 **الأوامر** ({total} إجمالًا، صفحة {page}/{total_pages})
+    nav_next: التالي → `/commands {page}`
+    nav_prev: '`/commands {page}` ← السابق'
+    none: لا توجد أوامر متاحة.
+    out_of_range: _(الصفحة المطلوبة {requested} خارج النطاق، يتم عرض الصفحة {page}.)_
+    skill_header: '⚡ **أوامر المهارات**:'
+    usage: 'الاستخدام: `/commands [page]`'
   compress:
-    not_enough:            "لا توجد محادثة كافية للضغط (يلزم 4 رسائل على الأقل)."
-    no_provider:           "لا يوجد مزوّد مُهيّأ -- لا يمكن الضغط."
-    nothing_to_do:         "لا شيء للضغط بعد (النص كله لا يزال سياقًا محميًا)."
-    aggressive_unsupported: "الخيار --aggressive غير مدعوم؛ استخدم '/compress here [N]' للإبقاء على أحدث التبادلات فقط، أو /undo لإسقاط الأدوار."
-    focus_line:            "التركيز: \"{topic}\""
-    summary_failed:        "⚠️ فشل توليد الملخّص ({error}). أُزيلت {count} رسالة تاريخية واستُبدلت بعنصر نائب؛ لم يعد السياق الأقدم قابلًا للاسترجاع. فكّر في مراجعة إعداد نموذج auxiliary.compression."
-    aborted:               "⚠️ أُلغي الضغط ({error}). لم تُسقط أي رسائل — المحادثة كما هي. شغّل /compress للمحاولة مجددًا، أو /reset لجلسة نظيفة، أو راجع إعداد نموذج auxiliary.compression."
-    aux_failed:            "ℹ️ فشل نموذج الضغط المُهيّأ `{model}` ({error}). تم التعافي باستخدام نموذجك الرئيسي — السياق سليم — لكن قد ترغب في مراجعة `auxiliary.compression.model` في config.yaml."
-    failed:                "فشل الضغط: {error}"
-
-  debug:
-    upload_failed:         "✗ فشل رفع تقرير التصحيح: {error}"
-    header:                "**تم رفع تقرير التصحيح:**"
-    auto_delete:           "⏱ ستُحذف اللصقات تلقائيًا خلال 6 ساعات."
-    full_logs_hint:        "لرفع السجلات الكاملة، استخدم `hermes debug share` من واجهة الأوامر."
-    share_hint:            "شارك هذه الروابط مع فريق Hermes للحصول على الدعم."
-
-  deny:
-    stale:                 "❌ رُفض الأمر (الموافقة كانت قديمة)."
-    no_pending:            "لا يوجد أمر معلّق لرفضه."
-    denied_singular:       "❌ رُفض الأمر."
-    denied_plural:         "❌ رُفضت الأوامر ({count} أوامر)."
-    denied_reason_singular: "❌ رُفض الأمر. السبب المُبلّغ للوكيل: \"{reason}\""
-    denied_reason_plural:  "❌ رُفضت الأوامر ({count} أوامر). السبب المُبلّغ للوكيل: \"{reason}\""
-
-  fast:
-    not_supported:         "⚡ /fast متاح فقط لنماذج OpenAI التي تدعم المعالجة ذات الأولوية."
-    status:                "⚡ المعالجة ذات الأولوية\n\nالوضع الحالي: `{mode}`\n\n_الاستخدام:_ `/fast <normal|fast|status>`"
-    unknown_arg:           "⚠️ وسيط غير معروف: `{arg}`\n\n**الخيارات الصالحة:** normal, fast, status"
-    saved:                 "⚡ ✓ المعالجة ذات الأولوية: **{label}** (حُفظت في الإعدادات)\n_(تسري على الرسالة التالية)_"
-    session_only:          "⚡ ✓ المعالجة ذات الأولوية: **{label}** (هذه الجلسة فقط)"
-    label_fast:            "سريع"
-    label_normal:          "عادي"
-    status_fast:           "fast"
-    status_normal:         "normal"
-    picker_title:          "⚡ **المعالجة ذات الأولوية**\n\nالوضع الحالي: `{mode}`\n\nاختر خيارًا:"
-    choice_fast:           "fast — المعالجة ذات الأولوية مُفعّلة"
-    choice_normal:         "normal — المعالجة القياسية"
-
-  footer:
-    status:                "📎 تذييل التشغيل: **{state}**\nالحقول: `{fields}`\nالمنصّة: `{platform}`"
-    usage:                 "الاستخدام: `/footer [on|off|status]`"
-    saved:                 "📎 تذييل التشغيل: **{state}**{example}\n_(حُفظ عالميًا — يسري على الرسالة التالية)_"
-    example_line:          "\nمثال: `{preview}`"
-    state_on:              "مُفعّل"
-    state_off:             "مُعطّل"
-
-  goal:
-    unavailable:           "الأهداف غير متاحة في هذه الجلسة."
-    no_goal_set:           "لم يُحدَّد هدف."
-    paused:                "⏸ أُوقف الهدف مؤقتًا: {goal}"
-    no_resume:             "لا يوجد هدف لاستئنافه."
-    resumed:               "▶ استُؤنف الهدف: {goal}\nأرسل أي رسالة للمتابعة، أو انتظر — سأتخذ الخطوة التالية في الدور القادم."
-    invalid:               "هدف غير صالح: {error}"
-    set:                   "⊙ حُدِّد الهدف (ميزانية {budget} دور): {goal}\nسأواصل العمل حتى يكتمل الهدف، أو توقفه/تمسحه، أو تنفد الميزانية.\nالتحكم: /goal status · /goal pause · /goal resume · /goal clear"
-
-  help:
-    header:                "📖 **أوامر Hermes**\n"
-    skill_header:          "\n⚡ **أوامر المهارات** ({count} نشطة):"
-    more_use_commands:     "\n... و{count} آخر. استخدم `/commands` للقائمة الكاملة المُقسّمة إلى صفحات."
-
-  insights:
-    invalid_days:          "قيمة --days غير صالحة: {value}"
-    error:                 "خطأ في توليد الرؤى: {error}"
-
-  kanban:
-    error_prefix:          "⚠ خطأ kanban: {error}"
-    subscribed_suffix:     "(مُشترك — ستُخطَر عند اكتمال {task_id} أو حجبها)"
-    truncated_suffix:      "… (مقتطع؛ استخدم `hermes kanban …` في الطرفية للخرج الكامل)"
-    no_output:             "(لا يوجد خرج)"
-    wake:
-      completed:           "اكتملت"
-      gave_up:             "استسلم (نفدت المحاولات)"
-      crashed:             "تعطّل (خرج العامل)؛ سيعيد المُوزّع المحاولة"
-      timed_out:           "انتهت المهلة؛ سيعيد المُوزّع المحاولة"
-      blocked:             "محجوبة؛ تحتاج إلى انتباه"
-      status_default:      "تغيّرت الحالة"
-      status_joiner:       "، "
-      message:             "[kanban] المهمة {task_id} {status}.\nالعنوان: {title}\nالمُكلَّف: @{assignee}\nاللوحة: {board}\n\nراجع النتيجة أو قرّر الخطوة التالية."
-
-  personality:
-    none_configured:       "لا توجد شخصيات مُهيّأة في `{path}/config.yaml`"
-    header:                "🎭 **الشخصيات المتاحة**\n"
-    none_option:           "• `none` — (بدون طبقة شخصية)"
-    item:                  "• `{name}` — {preview}"
-    usage:                 "\nالاستخدام: `/personality <name>`"
-    save_failed:           "⚠️ فشل حفظ تغيير الشخصية: {error}"
-    cleared:               "🎭 مُسحت الشخصية — يتم استخدام سلوك الوكيل الأساسي.\n_(يسري على الرسالة التالية)_"
-    set_to:                "🎭 ضُبطت الشخصية إلى **{name}**\n_(يسري على الرسالة التالية)_"
-    unknown:               "شخصية غير معروفة: `{name}`\n\nالمتاح: {available}"
-
-  profile:
-    header:                "👤 **الملف الشخصي:** `{profile}`"
-    home:                  "📂 **المجلد الرئيسي:** `{home}`"
-
-  reasoning:
-    level_default:             "medium (افتراضي)"
-    level_disabled:            "none (مُعطّل)"
-    scope_session:             "تجاوز الجلسة"
-    scope_global:              "الإعدادات العامة"
-    status:                    "🧠 **إعدادات التفكير**\n\n**الجهد:** `{level}`\n**النطاق:** {scope}\n**العرض:** {display}\n\n_الاستخدام:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|ultra|reset|show|hide> [--global]`"
-    display_on:                "مُفعّل ✓"
-    display_off:               "مُعطّل"
-    display_set_on:            "🧠 ✓ عرض التفكير: **مُفعّل**\nسيُعرض تفكير النموذج قبل كل رد على **{platform}**."
-    display_set_off:           "🧠 ✓ عرض التفكير: **مُعطّل** لـ **{platform}**"
-    reset_global_unsupported:  "⚠️ `/reasoning reset --global` غير مدعوم. استخدم `/reasoning <level> --global` لتغيير الافتراضي العام."
-    reset_done:                "🧠 ✓ مُسح تجاوز التفكير للجلسة؛ العودة إلى الإعدادات العامة."
-    unknown_arg:               "⚠️ وسيط غير معروف: `{arg}`\n\n**المستويات الصالحة:** none, minimal, low, medium, high, xhigh, max, ultra\n**العرض:** show, hide\n**الحفظ:** أضف `--global` للحفظ بعد هذه الجلسة"
-    picker_title:              "🧠 **إعدادات التفكير**\n\n**الجهد:** `{level}`\n**النطاق:** {scope}\n**العرض:** {display}\n\nاختر خيارًا:"
-    choice_none:               "none — تعطيل التفكير"
-    choice_reset:              "reset — مسح تجاوز الجلسة"
-    choice_show:               "عرض التفكير في الردود"
-    choice_hide:               "إخفاء التفكير من الردود"
-    set_global:                "🧠 ✓ ضُبط جهد التفكير إلى `{effort}` (حُفظ في الإعدادات)\n_(يسري على الرسالة التالية)_"
-    set_global_save_failed:    "🧠 ✓ ضُبط جهد التفكير إلى `{effort}` (الجلسة فقط — فشل حفظ الإعدادات)\n_(يسري على الرسالة التالية)_"
-    set_session:               "🧠 ✓ ضُبط جهد التفكير إلى `{effort}` (الجلسة فقط — أضف `--global` للحفظ الدائم)\n_(يسري على الرسالة التالية)_"
-
-  reload_mcp:
-    cancelled:             "🟡 أُلغي /reload-mcp. أدوات MCP دون تغيير."
-    always_followup:       "ℹ️ ستُشغَّل استدعاءات `/reload-mcp` المستقبلية دون تأكيد. أعِد التفعيل عبر `approvals.mcp_reload_confirm: true` في config.yaml."
-    confirm_prompt:        "⚠️ **تأكيد /reload-mcp**\n\nإعادة تحميل خوادم MCP تعيد بناء مجموعة الأدوات لهذه الجلسة و**تُبطل التخزين المؤقت لموجِّه المزوّد** — ستُعاد الرسالة التالية بكامل رموز الإدخال.  على النماذج ذات السياق الطويل أو التفكير العالي قد يكون ذلك مكلفًا.\n\nاختر:\n• **الموافقة مرة** — أعِد التحميل الآن\n• **الموافقة دائمًا** — أعِد التحميل الآن واكتم هذا التنبيه نهائيًا\n• **إلغاء** — اترك أدوات MCP دون تغيير\n\n_بديل نصي: رُدّ بـ `/approve` أو `/always` أو `/cancel`._"
-    header:                "🔄 **أُعيد تحميل خوادم MCP**\n"
-    reconnected:           "♻️ أُعيد الاتصال: {names}"
-    added:                 "➕ أُضيف: {names}"
-    removed:               "➖ أُزيل: {names}"
-    none_connected:        "لا توجد خوادم MCP متصلة."
-    tools_available:       "\n🔧 {tools} أداة متاحة من {servers} خادم"
-    failed:                "❌ فشلت إعادة تحميل MCP: {error}"
-
-  reload_skills:
-    header:                "🔄 **أُعيد تحميل المهارات**\n"
-    no_new:                "لم تُكتشف مهارات جديدة."
-    total:                 "\n📚 {count} مهارة متاحة"
-    added_header:          "➕ **مهارات مُضافة:**"
-    removed_header:        "➖ **مهارات مُزالة:**"
-    item_with_desc:        "    - {name}: {desc}"
-    item_no_desc:          "    - {name}"
-    failed:                "❌ فشلت إعادة تحميل المهارات: {error}"
-
-  reset:
-    header_default:        "✨ أُعيد ضبط الجلسة! بداية جديدة."
-    header_new:            "✨ بدأت جلسة جديدة!"
-    header_titled:         "✨ بدأت جلسة جديدة: {title}"
-    title_rejected:        "\n⚠️ رُفض العنوان: {error}"
-    title_error_untitled:  "\n⚠️ {error} — بدأت الجلسة دون عنوان."
-    title_empty_untitled:  "\n⚠️ العنوان فارغ بعد التنظيف — بدأت الجلسة دون عنوان."
-    tip:                   "\n✦ نصيحة: {tip}"
-
-  restart:
-    in_progress:           "⏳ إعادة تشغيل البوابة قيد التنفيذ بالفعل..."
-    restarting:            "♻ جارٍ إعادة تشغيل البوابة. إن لم تُخطَر خلال 60 ثانية، أعِد التشغيل من وحدة التحكّم باستخدام `hermes gateway restart`."
-
-  resume:
-    db_unavailable:        "قاعدة بيانات الجلسات غير متاحة."
-    parse_error:           "⚠️ تعذّر تحليل وسائط `/resume`: {error}.\nاستخدم علامات اقتباس حول العناوين التي تحتوي مسافات، مثال: `/resume \"Project A Plan\"`."
-    matrix_no_named_sessions: "لم يُعثر على جلسات مُسمّاة لغرفة Matrix هذه.\nاستخدم `/title My Session` لتسمية جلسة الغرفة الحالية، أو `/resume --all` لسرد كل جلسات Matrix، أو `/resume --cross-room <session name>` لتجاوز حدود الغرفة صراحةً."
-    matrix_blocked_no_origin: "⚠️ حُجب /resume في Matrix: هذه الجلسة المُسمّاة لا تملك أصل غرفة مُسجّلًا، لذا لن يستأنفها Hermes داخل الغرفة الحالية افتراضيًا. استخدم `/resume --cross-room {name}` إن كنت تريد عمدًا تجاوز حدود الغرفة."
-    matrix_blocked_other_room: "⚠️ حُجب /resume في Matrix: تلك الجلسة تخصّ غرفة Matrix مختلفة ({room}). استخدم `/resume --cross-room {name}` إن كنت تريد عمدًا استئنافها هنا."
-    matrix_cross_room_success: "⚠️ استئناف عبر الغرف: استُؤنفت **{title}** داخل غرفة Matrix ‏**{room}**.\nستستخدم الرسائل المستقبلية في هذه الغرفة ذلك النص حتى `/reset` أو `/resume` آخر.{msg_part}"
-    blocked_not_owner:     "⚠️ حُجب /resume: '**{name}**' تخصّ مستخدمًا أو محادثة مختلفة. يمكنك فقط استئناف جلسات هذه المحادثة."
-    no_named_sessions:     "لم يُعثر على جلسات مُسمّاة.\nاستخدم `/title My Session` لتسمية جلستك الحالية، ثم `/resume My Session` للعودة إليها لاحقًا."
-    list_header:           "📋 **الجلسات المُسمّاة**\n"
-    list_item:             "• **{title}**{preview_part}"
-    list_item_numbered:    "{index}. **{title}**{preview_part}"
-    list_preview_suffix:   " — _{preview}_"
-    list_footer:           "\nالاستخدام: `/resume <session name>`"
-    list_footer_numbered:  "\nالاستخدام: `/resume <session name>` أو `/resume <number>` (مثال: `/resume 1` للأحدث)"
-    list_failed:           "تعذّر سرد الجلسات: {error}"
-    out_of_range:          "مؤشر الاستئناف {index} خارج النطاق.\nاستخدم `/resume` دون وسائط لعرض الجلسات المتاحة."
-    not_found:             "لم يُعثر على جلسة تطابق '**{name}**'.\nاستخدم `/resume` دون وسائط لعرض الجلسات المتاحة."
-    already_on:            "📌 أنت بالفعل على الجلسة **{name}**."
-    switch_failed:         "فشل تبديل الجلسة."
-    resumed_one:           "↻ استُؤنفت الجلسة **{title}** ({count} رسالة). استُعيدت المحادثة."
-    resumed_many:          "↻ استُؤنفت الجلسة **{title}** ({count} رسالة). استُعيدت المحادثة."
-    resumed_no_count:      "↻ استُؤنفت الجلسة **{title}**. استُعيدت المحادثة."
-
-  retry:
-    no_previous:           "لا توجد رسالة سابقة لإعادة المحاولة."
-
-  rollback:
-    not_enabled:           "نقاط التحقّق غير مُفعّلة.\nفعّلها في config.yaml:\n```\ncheckpoints:\n  enabled: true\n```"
-    none_found:            "لم يُعثر على نقاط تحقّق لـ {cwd}"
-    invalid_number:        "رقم نقطة تحقّق غير صالح. استخدم 1-{max}."
-    restored:              "✅ استُعيد إلى نقطة التحقّق {hash}: {reason}\nحُفظت لقطة ما قبل التراجع تلقائيًا."
-    restore_failed:        "❌ {error}"
-
-  diff:
-    not_enabled:           "نقاط التحقق غير مفعّلة، لذا لا يوجد خط أساس للجلسة.\nفعّلها في config.yaml:\n```\ncheckpoints:\n  enabled: true\n```\nلا يزال /diff العادي يعمل — فهو يستخدم git مباشرة."
-    no_changes:            "لا توجد تغييرات."
-    failed:                "{error}"
-
-  set_home:
-    save_failed:           "فشل حفظ القناة الرئيسية: {error}"
-    success:               "✅ ضُبطت القناة الرئيسية إلى **{name}** (المعرّف: {chat_id}).\nستُسلَّم مهام cron والرسائل عبر المنصّات هنا."
-
-  status:
-    header:                "📊 **حالة بوابة Hermes**"
-    matrix_scope_header:   "**نطاق Matrix:**"
-    matrix_scope_room:     "  الغرفة: {room}"
-    matrix_scope_room_id:  "  معرّف الغرفة: {room_id}"
-    matrix_scope_thread:   "  معرّف الخيط: {thread_id}"
-    matrix_scope_mode:     "  نطاق الجلسة: {scope}"
-    matrix_scope_key:      "  مفتاح الجلسة: {session_key}"
-    session_id:            "**معرّف الجلسة:** `{session_id}`"
-    title:                 "**العنوان:** {title}"
-    created:               "**أُنشئت:** {timestamp}"
-    last_activity:         "**آخر نشاط:** {timestamp}"
-    model:                 "**النموذج:** `{model}`"
-    model_provider:        "**النموذج:** `{model}` ({provider})"
-    context:               "**السياق:** {used} / {total} ({pct}%)"
-    context_used:          "**السياق:** ~{used} رمزًا"
-    tokens:                "**رموز API التراكمية (تُعاد كل استدعاء):** {tokens}"
-    agent_running:         "**الوكيل قيد التشغيل:** {state}"
-    state_yes:             "نعم ⚡"
-    state_no:              "لا"
-    queued:                "**المتابعات في الطابور:** {count}"
-    platforms:             "**المنصّات المتصلة:** {platforms}"
-
-  stop:
-    stopped_pending:       "⚡ تم الإيقاف. لم يكن الوكيل قد بدأ بعد — يمكنك متابعة هذه الجلسة."
-    stopped:               "⚡ تم الإيقاف. يمكنك متابعة هذه الجلسة."
-    no_active:             "لا توجد مهمة نشطة لإيقافها."
-
-  title:
-    db_unavailable:        "قاعدة بيانات الجلسات غير متاحة."
-    warn_prefix:           "⚠️ {error}"
-    empty_after_clean:     "⚠️ العنوان فارغ بعد التنظيف. من فضلك استخدم أحرفًا قابلة للطباعة."
-    set_to:                "✏️ ضُبط عنوان الجلسة: **{title}**"
-    not_found:             "لم يُعثر على الجلسة في قاعدة البيانات."
-    current_with_title:    "📌 الجلسة: `{session_id}`\nالعنوان: **{title}**"
-    current_no_title:      "📌 الجلسة: `{session_id}`\nلم يُضبط عنوان. الاستخدام: `/title My Session Name`"
-
-  topic:
-    not_telegram_dm:         "الأمر /topic متاح فقط في محادثات Telegram الخاصة."
-    no_session_db:           "قاعدة بيانات الجلسات غير متاحة."
-    unauthorized:            "غير مصرّح لك باستخدام /topic على هذا البوت."
-    restore_needs_topic:     "لاستعادة جلسة، أنشئ أو افتح موضوع Telegram أولًا، ثم أرسل /topic <session-id> داخل ذلك الموضوع. لإنشاء موضوع جديد، افتح All Messages وأرسل أي رسالة هناك."
-    topics_disabled:         "مواضيع Telegram غير مُفعّلة لهذا البوت بعد.\n\nكيفية تفعيلها:\n1. افتح @BotFather.\n2. اختر البوت الخاص بك.\n3. افتح Bot Settings → Threads Settings.\n4. فعّل Threaded Mode وتأكّد من السماح للمستخدمين بإنشاء خيوط جديدة.\n\nثم أرسل /topic مرة أخرى."
-    topics_user_disallowed:  "مواضيع Telegram مُفعّلة، لكن غير مسموح للمستخدمين بإنشاء مواضيع.\n\nافتح @BotFather → اختر البوت → Bot Settings → Threads Settings، ثم أوقف 'Disallow users to create new threads'.\n\nثم أرسل /topic مرة أخرى."
-    enable_failed:           "فشل تفعيل وضع مواضيع Telegram: {error}"
-    bound_status:            "هذا الموضوع مرتبط بـ:\nالجلسة: {label}\nالمعرّف: {session_id}\n\nاستخدم /new لاستبدال هذا الموضوع بجلسة جديدة.\nللعمل المتوازي، افتح All Messages وأرسل رسالة هناك لإنشاء موضوع آخر."
-    thread_ready:            "مواضيع Telegram متعددة الجلسات مُفعّلة.\n\nسيُستخدم هذا الموضوع كجلسة Hermes مستقلة. استخدم /new لاستبدال جلسة هذا الموضوع الحالية. للعمل المتوازي، افتح All Messages وأرسل رسالة هناك لإنشاء موضوع آخر."
-    untitled_session:        "جلسة دون عنوان"
-
-  undo:
-    nothing:               "لا شيء للتراجع عنه."
-    removed:               "↩️ تم التراجع عن {turns} دور ({count} رسالة).\nنُسخ احتياطيًا إلى: \"{preview}\"\nانسخ/عدّل النص أعلاه وأرسله لإعادة التوجيه من هنا."
-    invalid_count:         "عدد غير صالح \"{arg}\" — استخدم /undo أو /undo N."
-
-  update:
-    platform_not_messaging:  "✗ /update متاح فقط من منصّات المراسلة. شغّل `hermes update` من الطرفية."
-    not_git_repo:            "✗ ليس مستودع git — لا يمكن التحديث."
-    hermes_cmd_not_found:    "✗ تعذّر تحديد موقع أمر `hermes`. Hermes يعمل، لكن أمر التحديث لم يجد الملف التنفيذي على PATH أو عبر مُفسّر Python الحالي. جرّب تشغيل `hermes update` يدويًا في طرفيتك."
-    start_failed:            "✗ فشل بدء التحديث: {error}"
-    starting:                "⚕ جارٍ بدء تحديث Hermes… سأبثّ التقدّم هنا."
-
-  usage:
-    rate_limits:              "⏱️ **حدود المعدّل:** {state}"
-    header_session:           "📊 **استخدام رموز الجلسة**"
-    label_model:              "النموذج: `{model}`"
-    label_input_tokens:       "رموز الإدخال: {count}"
-    label_cache_read:         "رموز قراءة التخزين المؤقت: {count}"
-    label_cache_write:        "رموز كتابة التخزين المؤقت: {count}"
-    label_output_tokens:      "رموز الإخراج: {count}"
-    label_total:              "الإجمالي: {count}"
-    label_api_calls:          "استدعاءات API: {count}"
-    label_cost:               "التكلفة: {prefix}${amount}"
-    label_cost_included:      "التكلفة: مشمولة"
-    label_context:            "السياق: {used} / {total} ({pct}%)"
-    label_compressions:       "عمليات الضغط: {count}"
-    breakdown_header:         "🧩 **تفصيل السياق** _(تقديري)_"
-    breakdown_line:           "• {label}: ~{count} ({pct}%)"
-    breakdown_cat_system_prompt:        "موجّه النظام"
-    breakdown_cat_tool_definitions:     "تعريفات الأدوات"
-    breakdown_cat_rules:                "القواعد"
-    breakdown_cat_skills:               "المهارات"
-    breakdown_cat_mcp:                  "MCP"
-    breakdown_cat_subagent_definitions: "تعريفات الوكلاء الفرعيين"
-    breakdown_cat_memory:               "الذاكرة"
-    breakdown_cat_conversation:         "المحادثة"
-    header_session_info:      "📊 **معلومات الجلسة**"
-    label_messages:           "الرسائل: {count}"
-    label_estimated_context:  "السياق المُقدّر: ~{count} رمزًا"
-    detailed_after_first:     "_(الاستخدام المُفصّل متاح بعد أول رد من الوكيل)_"
-    no_data:                  "لا تتوفّر بيانات استخدام لهذه الجلسة."
-    unknown_subcommand:       "أمر فرعي غير معروف لـ /usage: `{args}`. جرّب `/usage` أو `/usage reset [--force]`."
-    reset_wrong_provider:     "إعادة تعيين الاستخدام المُدّخر متاحة فقط على مزوّد openai-codex. بدّل عبر `/model` أولًا."
-
+    aborted: ⚠️ أُلغي الضغط ({error}). لم تُسقط أي رسائل — المحادثة كما هي. شغّل /compress للمحاولة مجددًا، أو /reset لجلسة نظيفة، أو راجع إعداد نموذج auxiliary.compression.
+    aggressive_unsupported: الخيار --aggressive غير مدعوم؛ استخدم '/compress here [N]' للإبقاء على أحدث التبادلات فقط، أو /undo لإسقاط الأدوار.
+    aux_failed: ℹ️ فشل نموذج الضغط المُهيّأ `{model}` ({error}). تم التعافي باستخدام نموذجك الرئيسي — السياق سليم — لكن قد ترغب في مراجعة `auxiliary.compression.model` في config.yaml.
+    chat_size: 'Chat size: ~{before:,} → ~{after:,} tokens (excludes system, tools, tool results)'
+    chat_size_unchanged: 'Chat size: ~{before:,} tokens (unchanged; excludes system, tools, tool results)'
+    failed: 'فشل الضغط: {error}'
+    focus_line: 'التركيز: "{topic}"'
+    full_request_est: 'Full request size: ~{before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; estimated — no live request yet)'
+    full_request_no_fixed: after excludes system prompt + tool schemas (no resident agent to measure them); next live turn will show the full size.
+    full_request_real: 'Full request size: {before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; before = last live request, after = estimate of next)'
+    full_request_unchanged: 'Full request size: {before} tokens (unchanged — next turn resends the same context)'
+    in_progress: ⏳ Compressing ~{count:,} messages… a large session can take a few minutes. I'll post the result here when it's done.
+    no_provider: لا يوجد مزوّد مُهيّأ -- لا يمكن الضغط.
+    not_enough: لا توجد محادثة كافية للضغط (يلزم 4 رسائل على الأقل).
+    nothing_to_do: لا شيء للضغط بعد (النص كله لا يزال سياقًا محميًا).
+    persist_failed: ⚠️ Compression ran, but the result could not be saved — the session database was busy (locked). Nothing was lost; your transcript is unchanged. Run /compress again in a moment to retry.
+    summary_failed: ⚠️ فشل توليد الملخّص ({error}). أُزيلت {count} رسالة تاريخية واستُبدلت بعنصر نائب؛ لم يعد السياق الأقدم قابلًا للاسترجاع. فكّر في مراجعة إعداد نموذج auxiliary.compression.
+  config_read_failed: '⚠️ تعذّر قراءة config.yaml: {error}'
+  config_save_failed: '⚠️ تعذّر حفظ الإعدادات: {error}'
+  context:
+    bar: '{bar}'
+    compressions: 'Compressions this session: {count}'
+    detail_after_first: _(Full compression and throughput stats available after the first agent response)_
+    estimated: 'Estimated context: ~{count} tokens across {messages} messages'
+    header: 🧠 **Context Window**
+    headroom: 'Headroom to limit: {headroom} tokens'
+    in_use: 'In use: {used} / {total} ({pct}%)'
+    last_savings: 'Last compression freed: {savings}% of context'
+    model: 'Model: `{model}`'
+    no_data: No context data available yet. Send a message to start a session.
+    over_threshold: ⚠️ **Over auto-compression threshold ({threshold}, {threshold_pct}%)**
+    threshold: 'Auto-compresses at: {threshold} ({threshold_pct}%) — {to_go} to go'
+    throughput_note: _Throughput, not context size — each call re-sends the window above._
+    total_billed: 'Total billed: {total}'
+    totals_header: Session totals (cumulative across {calls} API calls)
+    totals_line: Input {input} · Output {output} · Reasoning {reasoning}
+    window: 'Window: {total} tokens'
   credits:
-    not_logged_in:            "لم تُسجّل الدخول إلى Nous Portal. سجّل الدخول لرؤية رصيد أرصدتك وإعادة الشحن."
+    not_logged_in: لم تُسجّل الدخول إلى Nous Portal. سجّل الدخول لرؤية رصيد أرصدتك وإعادة الشحن.
+  debug:
+    auto_delete: ⏱ ستُحذف اللصقات تلقائيًا خلال 6 ساعات.
+    full_logs_hint: لرفع السجلات الكاملة، استخدم `hermes debug share` من واجهة الأوامر.
+    header: '**تم رفع تقرير التصحيح:**'
+    share_hint: شارك هذه الروابط مع فريق Hermes للحصول على الدعم.
+    upload_failed: '✗ فشل رفع تقرير التصحيح: {error}'
+  deny:
+    denied_plural: ❌ رُفضت الأوامر ({count} أوامر).
+    denied_reason_plural: '❌ رُفضت الأوامر ({count} أوامر). السبب المُبلّغ للوكيل: "{reason}"'
+    denied_reason_singular: '❌ رُفض الأمر. السبب المُبلّغ للوكيل: "{reason}"'
+    denied_singular: ❌ رُفض الأمر.
+    no_pending: لا يوجد أمر معلّق لرفضه.
+    stale: ❌ رُفض الأمر (الموافقة كانت قديمة).
+  diff:
+    failed: '{error}'
+    no_changes: لا توجد تغييرات.
+    not_enabled: "نقاط التحقق غير مفعّلة، لذا لا يوجد خط أساس للجلسة.\nفعّلها في config.yaml:\n```\ncheckpoints:\n  enabled: true\n```\nلا يزال /diff العادي يعمل — فهو يستخدم git مباشرة."
+  draining: ⏳ جارٍ إنهاء {count} وكيل نشط قبل إعادة التشغيل...
+  fast:
+    choice_fast: fast — المعالجة ذات الأولوية مُفعّلة
+    choice_normal: normal — المعالجة القياسية
+    family_anthropic_fast: Anthropic Fast
+    family_codex_fast: Codex Fast
+    family_openai_priority: OpenAI API Priority Processing
+    family_unsupported: Fast
+    label_fast: سريع
+    label_normal: عادي
+    model_switch_unavailable: '⚡ Fast: unavailable on `{route}`; requests will use normal speed.'
+    not_supported: ⚡ /fast متاح فقط لنماذج OpenAI التي تدعم المعالجة ذات الأولوية.
+    picker_title: '⚡ **المعالجة ذات الأولوية**
 
-  verbose:
-    not_enabled:           "الأمر `/verbose` غير مُفعّل لمنصّات المراسلة.\n\nفعّله في `config.yaml`:\n```yaml\ndisplay:\n  tool_progress_command: true\n```"
-    mode_off:              "⚙️ تقدّم الأدوات: **مُعطّل** — لا يُعرض نشاط الأدوات."
-    mode_new:              "⚙️ تقدّم الأدوات: **NEW** — يُعرض عند تغيّر الأداة (طول المعاينة: `display.tool_preview_length`، افتراضي 40)."
-    mode_all:              "⚙️ تقدّم الأدوات: **ALL** — يُعرض كل استدعاء أداة (طول المعاينة: `display.tool_preview_length`، افتراضي 40)."
-    mode_verbose:          "⚙️ تقدّم الأدوات: **VERBOSE** — كل استدعاء أداة مع وسائطه الكاملة."
-    mode_log:              "⚙️ تقدّم الأدوات: **LOG** — صامت في المحادثة؛ تُكتب استدعاءات الأدوات إلى ~/.hermes/logs/tool_calls.log."
-    saved_suffix:          "_(حُفظ لـ **{platform}** — يسري على الرسالة التالية)_"
-    save_failed:           "_(تعذّر الحفظ في الإعدادات: {error})_"
 
-  voice:
-    enabled_voice_only:    "وضع الصوت مُفعّل.\nسأردّ بالصوت عندما ترسل رسائل صوتية.\nاستخدم /voice tts للحصول على ردود صوتية لكل الرسائل."
-    disabled_text:         "وضع الصوت مُعطّل. ردود نصّية فقط."
-    tts_enabled:           "TTS التلقائي مُفعّل.\nستتضمّن كل الردود رسالة صوتية."
-    status_mode:           "وضع الصوت: {label}"
-    status_channel:        "قناة الصوت: #{channel}"
-    status_participants:   "المشاركون: {count}"
-    status_member:         "  - {name}{status}"
-    speaking:              " (يتحدّث)"
-    enabled_short:         "وضع الصوت مُفعّل."
-    disabled_short:        "وضع الصوت مُعطّل."
-    label_off:             "مُعطّل (نص فقط)"
-    label_voice_only:      "مُفعّل (رد صوتي على الرسائل الصوتية)"
-    label_all:             "TTS (رد صوتي على كل الرسائل)"
-    help:                  "{toggle}\n\n**كيف يعمل /voice**\n• `/voice on` — رد صوتي عند إرسال رسالة صوتية\n• `/voice tts` — رد صوتي على *كل* رسالة\n• `/voice off` — العودة إلى ردود نصّية فقط\n• `/voice status` — عرض الوضع الحالي\n• `/voice` (بدون وسيط) — تبديل سريع بين التفعيل والتعطيل{channels}"
-    help_channels:         "\n\n**قنوات الصوت الحيّة (Discord)**\n• انضمّ إلى قناة صوتية أولًا، ثم `/voice channel` — سأنضمّ وأستمع وأنطق ردودي\n• `/voice leave` — قطع الاتصال بالقناة الصوتية"
+      الوضع الحالي: `{mode}`
 
-  yolo:
-    disabled:                   "⚠️ وضع YOLO **مُعطّل** لهذه الجلسة — ستتطلّب الأوامر الخطيرة موافقة."
-    enabled:                    "⚡ وضع YOLO **مُفعّل** لهذه الجلسة — كل الأوامر مُوافق عليها تلقائيًا. استخدمه بحذر."
 
+      اختر خيارًا:'
+    preference_off: '⚡ Configured session preference: Fast off — {reason} Route availability is checked before each turn.'
+    preference_status: '⚡ Configured session preference: Fast {state} — {family} on `{route}`. Route availability is checked before each turn.'
+    preference_unavailable: ⚡ Configured session preference `{route}` is currently unavailable because its credentials could not be resolved. The preference remains saved; restore credentials or use `/model reset`.
+    route_off: '⚡ Fast: off — {reason}'
+    route_saved: '⚡ ✓ {family}: **{label}** (saved to config)'
+    route_session_only: '⚡ ✓ {family}: **{label}** (config save failed; applied gateway-process-wide until restart)'
+    route_status: '⚡ Fast: {state} — {family} on `{route}`'
+    route_unavailable: ⚡ Fast unavailable — {reason}
+    saved: '⚡ ✓ المعالجة ذات الأولوية: **{label}** (حُفظت في الإعدادات)
+
+      _(تسري على الرسالة التالية)_'
+    session_only: '⚡ ✓ المعالجة ذات الأولوية: **{label}** (هذه الجلسة فقط)'
+    state_off: 'off'
+    state_on: 'on'
+    status: '⚡ المعالجة ذات الأولوية
+
+
+      الوضع الحالي: `{mode}`
+
+
+      _الاستخدام:_ `/fast <normal|fast|status>`'
+    status_fast: fast
+    status_normal: normal
+    unknown_arg: '⚠️ وسيط غير معروف: `{arg}`
+
+
+      **الخيارات الصالحة:** normal, fast, status'
+  footer:
+    example_line: '
+
+      مثال: `{preview}`'
+    saved: '📎 تذييل التشغيل: **{state}**{example}
+
+      _(حُفظ عالميًا — يسري على الرسالة التالية)_'
+    state_off: مُعطّل
+    state_on: مُفعّل
+    status: '📎 تذييل التشغيل: **{state}**
+
+      الحقول: `{fields}`
+
+      المنصّة: `{platform}`'
+    usage: 'الاستخدام: `/footer [on|off|status]`'
+  goal:
+    invalid: 'هدف غير صالح: {error}'
+    no_goal_set: لم يُحدَّد هدف.
+    no_resume: لا يوجد هدف لاستئنافه.
+    paused: '⏸ أُوقف الهدف مؤقتًا: {goal}'
+    resumed: '▶ استُؤنف الهدف: {goal}
+
+      أرسل أي رسالة للمتابعة، أو انتظر — سأتخذ الخطوة التالية في الدور القادم.'
+    set: '⊙ حُدِّد الهدف (ميزانية {budget} دور): {goal}
+
+      سأواصل العمل حتى يكتمل الهدف، أو توقفه/تمسحه، أو تنفد الميزانية.
+
+      التحكم: /goal status · /goal pause · /goal resume · /goal clear'
+    unavailable: الأهداف غير متاحة في هذه الجلسة.
+  goal_cleared: ✓ تم مسح الهدف.
+  help:
+    header: '📖 **أوامر Hermes**
+
+      '
+    more_use_commands: '
+
+      ... و{count} آخر. استخدم `/commands` للقائمة الكاملة المُقسّمة إلى صفحات.'
+    skill_header: '
+
+      ⚡ **أوامر المهارات** ({count} نشطة):'
+  insights:
+    error: 'خطأ في توليد الرؤى: {error}'
+    invalid_days: 'قيمة --days غير صالحة: {value}'
+  kanban:
+    error_prefix: '⚠ خطأ kanban: {error}'
+    no_output: (لا يوجد خرج)
+    subscribed_suffix: (مُشترك — ستُخطَر عند اكتمال {task_id} أو حجبها)
+    truncated_suffix: … (مقتطع؛ استخدم `hermes kanban …` في الطرفية للخرج الكامل)
+    wake:
+      blocked: محجوبة؛ تحتاج إلى انتباه
+      completed: اكتملت
+      crashed: تعطّل (خرج العامل)؛ سيعيد المُوزّع المحاولة
+      gave_up: استسلم (نفدت المحاولات)
+      message: '[kanban] المهمة {task_id} {status}.
+
+        العنوان: {title}
+
+        المُكلَّف: @{assignee}
+
+        اللوحة: {board}
+
+
+        راجع النتيجة أو قرّر الخطوة التالية.'
+      status_default: تغيّرت الحالة
+      status_joiner: '، '
+      timed_out: انتهت المهلة؛ سيعيد المُوزّع المحاولة
+  merge:
+    already_merged: This session was already merged into **{title}** — not folding it again. (Start a new exploration to merge fresh material.)
+    blocked_not_owner: You can only merge into sessions you own. '{name}' belongs to a different chat/owner.
+    fold_body: '[MERGED SESSION — {title}] A summary of another session (''{title}'') was folded into this conversation. Treat it as reference context:
+
+
+      {summary}'
+    fold_body_thread: '[BRANCHED THREAD MERGED — {title}] A branched thread was explored and folded back into this conversation. Summary of what happened in the branch:
+
+
+      {summary}'
+    fold_failed: 'Failed to fold the summary into the target session: {error}'
+    ledger_failed: Couldn't safely record the merge (session store busy) — nothing was folded. Try again in a moment.
+    list_footer: _`/merge <number>` folds a summary of THIS session into that one._
+    list_header: '🔀 **Sessions you can merge into** — reply `/merge <number>` or `/merge <name>`:'
+    md_suffix: ' · full record: `{path}`'
+    merged_named: ✅ Merged into **{title}** — a summary of this session is now in its context.{md}
+    merged_thread: ✅ **Folded back into _{title}_**{parent} — a summary of this thread is now in the parent's context, and this thread is archived (still resumable).{md}
+    merged_thread_no_archive: ✅ **Folded back into _{title}_**{parent} — a summary of this thread is now in the parent's context. (Couldn't archive the thread automatically; you can close it manually.){md}
+    no_conversation: Nothing to merge — this session has no conversation yet.
+    no_named_sessions: No titled sessions to merge into yet. Give a session a name with `/title` first.
+    no_new_turns: Nothing new to merge — no turns happened in this thread after the branch point.
+    no_summary: Couldn't generate a summary of this session; nothing was merged. Try again in a moment.
+    not_a_branch: This thread wasn't created by `/branch`, so there's no parent session to merge into.
+    not_a_thread: '`/merge` only works inside a branched thread. Start one with `/branch` in a channel first.'
+    not_found: No session found matching '{name}'. Use `/merge` with no name to list mergeable sessions.
+    note_record_suffix: ' · full record: `{path}`'
+    parent_note: '🔀 **Merged from thread ''{title}''**
+
+      {summary}'
+    same_session: That's the session you're already in — pick a different target to merge into.
+    source_marker: '[MERGED — this thread''s new exploration was folded into ''{target}'' on {when}. You can keep going here, but its summary already lives in that conversation.]'
+    source_marker_named: '[MERGED — a summary of this session was folded into ''{target}'' on {when}. You can keep going here, but its summary already lives in that conversation.]'
+    source_thread_link: ' ({thread})'
+    target_note: 🔀 **Folded in from _{source}_**{child} — a summary of {turns} message(s) is now in this conversation's context.{record}
+    target_note_named: 🔀 **Folded in from _{source}_** — a summary of _{source}_ ({turns} message(s)) is now in this conversation's context.{record}
+    target_parent_link: ' ({parent})'
+  model:
+    capabilities_label: 'القدرات: {capabilities}'
+    context_label: 'السياق: {tokens} رمزًا'
+    cost_label: 'التكلفة: {cost}'
+    current_label: 'الحالي: `{model}` على {provider}'
+    current_tag: ' (الحالي)'
+    error_prefix: 'خطأ: {error}'
+    max_output_label: 'أقصى خرج: {tokens} رمزًا'
+    more_models_suffix: ' (+{count} آخر)'
+    prompt_caching_enabled: 'التخزين المؤقت للموجِّه: مُفعّل'
+    provider_label: 'المزوّد: {provider}'
+    reasoning_label: 'Reasoning: {effort}'
+    saved_global: حُفظ في config.yaml (‏`--global`)
+    session_only_hint: _(هذه الجلسة فقط — أضف `--global` للحفظ الدائم)_
+    switched: تم التبديل إلى النموذج `{model}`
+    usage_persist: '`/model <name> --global` — حفظ دائم'
+    usage_switch_model: '`/model <name>` — تبديل النموذج'
+    usage_switch_provider: '`/model <name> --provider <slug>` — تبديل المزوّد'
+    warning_prefix: 'تحذير: {warning}'
+  no_active_goal: لا يوجد هدف نشط.
+  personality:
+    cleared: '🎭 مُسحت الشخصية — يتم استخدام سلوك الوكيل الأساسي.
+
+      _(يسري على الرسالة التالية)_'
+    header: '🎭 **الشخصيات المتاحة**
+
+      '
+    item: • `{name}` — {preview}
+    none_configured: لا توجد شخصيات مُهيّأة في `{path}/config.yaml`
+    none_option: • `none` — (بدون طبقة شخصية)
+    save_failed: '⚠️ فشل حفظ تغيير الشخصية: {error}'
+    set_to: '🎭 ضُبطت الشخصية إلى **{name}**
+
+      _(يسري على الرسالة التالية)_'
+    unknown: 'شخصية غير معروفة: `{name}`
+
+
+      المتاح: {available}'
+    usage: '
+
+      الاستخدام: `/personality <name>`'
+  profile:
+    header: 👤 **الملف الشخصي:** `{profile}`
+    home: 📂 **المجلد الرئيسي:** `{home}`
+  reasoning:
+    choice_hide: إخفاء التفكير من الردود
+    choice_none: none — تعطيل التفكير
+    choice_reset: reset — مسح تجاوز الجلسة
+    choice_show: عرض التفكير في الردود
+    display_off: مُعطّل
+    display_on: مُفعّل ✓
+    display_set_off: '🧠 ✓ عرض التفكير: **مُعطّل** لـ **{platform}**'
+    display_set_on: '🧠 ✓ عرض التفكير: **مُفعّل**
+
+      سيُعرض تفكير النموذج قبل كل رد على **{platform}**.'
+    level_default: medium (افتراضي)
+    level_disabled: none (مُعطّل)
+    picker_title: '🧠 **إعدادات التفكير**
+
+
+      **الجهد:** `{level}`
+
+      **النطاق:** {scope}
+
+      **العرض:** {display}
+
+
+      اختر خيارًا:'
+    reset_done: 🧠 ✓ مُسح تجاوز التفكير للجلسة؛ العودة إلى الإعدادات العامة.
+    reset_global_unsupported: ⚠️ `/reasoning reset --global` غير مدعوم. استخدم `/reasoning <level> --global` لتغيير الافتراضي العام.
+    scope_global: الإعدادات العامة
+    scope_session: تجاوز الجلسة
+    set_global: '🧠 ✓ ضُبط جهد التفكير إلى `{effort}` (حُفظ في الإعدادات)
+
+      _(يسري على الرسالة التالية)_'
+    set_global_save_failed: '🧠 ✓ ضُبط جهد التفكير إلى `{effort}` (الجلسة فقط — فشل حفظ الإعدادات)
+
+      _(يسري على الرسالة التالية)_'
+    set_session: '🧠 ✓ ضُبط جهد التفكير إلى `{effort}` (الجلسة فقط — أضف `--global` للحفظ الدائم)
+
+      _(يسري على الرسالة التالية)_'
+    status: '🧠 **إعدادات التفكير**
+
+
+      **الجهد:** `{level}`
+
+      **النطاق:** {scope}
+
+      **العرض:** {display}
+
+
+      _الاستخدام:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|ultra|reset|show|hide> [--global]`'
+    unknown_arg: '⚠️ وسيط غير معروف: `{arg}`
+
+
+      **المستويات الصالحة:** none, minimal, low, medium, high, xhigh, max, ultra
+
+      **العرض:** show, hide
+
+      **الحفظ:** أضف `--global` للحفظ بعد هذه الجلسة'
+  redo:
+    busy: ⏳ The database was busy — nothing was changed. Try /redo again in a moment.
+    draining: ⏳ The last turn was stopped but is still finishing its current step — /redo can't run yet. Try again in a moment.
+    error: ⚠️ Couldn't complete /redo (internal error — nothing was changed). It's been logged.
+    invalid_count: Invalid count "{arg}" — use /redo or /redo N.
+    nothing: Nothing to redo.
+    restart_lost: Nothing to redo — redo history does not survive a restart.
+    restored: ↪️ Redid {ops} undo operation(s) ({count} message(s) restored).
+  reload_mcp:
+    added: '➕ أُضيف: {names}'
+    always_followup: 'ℹ️ ستُشغَّل استدعاءات `/reload-mcp` المستقبلية دون تأكيد. أعِد التفعيل عبر `approvals.mcp_reload_confirm: true` في config.yaml.'
+    cancelled: 🟡 أُلغي /reload-mcp. أدوات MCP دون تغيير.
+    confirm_prompt: '⚠️ **تأكيد /reload-mcp**
+
+
+      إعادة تحميل خوادم MCP تعيد بناء مجموعة الأدوات لهذه الجلسة و**تُبطل التخزين المؤقت لموجِّه المزوّد** — ستُعاد الرسالة التالية بكامل رموز الإدخال.  على النماذج ذات السياق الطويل أو التفكير العالي قد يكون ذلك مكلفًا.
+
+
+      اختر:
+
+      • **الموافقة مرة** — أعِد التحميل الآن
+
+      • **الموافقة دائمًا** — أعِد التحميل الآن واكتم هذا التنبيه نهائيًا
+
+      • **إلغاء** — اترك أدوات MCP دون تغيير
+
+
+      _بديل نصي: رُدّ بـ `/approve` أو `/always` أو `/cancel`._'
+    failed: '❌ فشلت إعادة تحميل MCP: {error}'
+    header: '🔄 **أُعيد تحميل خوادم MCP**
+
+      '
+    none_connected: لا توجد خوادم MCP متصلة.
+    reconnected: '♻️ أُعيد الاتصال: {names}'
+    removed: '➖ أُزيل: {names}'
+    tools_available: '
+
+      🔧 {tools} أداة متاحة من {servers} خادم'
+  reload_skills:
+    added_header: ➕ **مهارات مُضافة:**
+    failed: '❌ فشلت إعادة تحميل المهارات: {error}'
+    header: '🔄 **أُعيد تحميل المهارات**
+
+      '
+    item_no_desc: '    - {name}'
+    item_with_desc: '    - {name}: {desc}'
+    no_new: لم تُكتشف مهارات جديدة.
+    removed_header: ➖ **مهارات مُزالة:**
+    total: '
+
+      📚 {count} مهارة متاحة'
+  reset:
+    header_default: ✨ أُعيد ضبط الجلسة! بداية جديدة.
+    header_new: ✨ بدأت جلسة جديدة!
+    header_titled: '✨ بدأت جلسة جديدة: {title}'
+    model_preference_unavailable: '
+
+      ⚠ Preserved the explicit model preference, but it is currently unavailable because its credentials could not be resolved. Restore credentials or use `/model reset`.'
+    preferences_preserved: '
+
+      ↪ Preserved explicit {preferences} preferences. Use `/model reset` and `/reasoning reset` to return to configured defaults.'
+    tip: '
+
+      ✦ نصيحة: {tip}'
+    title_empty_untitled: '
+
+      ⚠️ العنوان فارغ بعد التنظيف — بدأت الجلسة دون عنوان.'
+    title_error_untitled: '
+
+      ⚠️ {error} — بدأت الجلسة دون عنوان.'
+    title_rejected: '
+
+      ⚠️ رُفض العنوان: {error}'
+  restart:
+    in_progress: ⏳ إعادة تشغيل البوابة قيد التنفيذ بالفعل...
+    restarting: ♻ جارٍ إعادة تشغيل البوابة. إن لم تُخطَر خلال 60 ثانية، أعِد التشغيل من وحدة التحكّم باستخدام `hermes gateway restart`.
+  resume:
+    already_on: 📌 أنت بالفعل على الجلسة **{name}**.
+    blocked_not_owner: '⚠️ حُجب /resume: ''**{name}**'' تخصّ مستخدمًا أو محادثة مختلفة. يمكنك فقط استئناف جلسات هذه المحادثة.'
+    db_unavailable: قاعدة بيانات الجلسات غير متاحة.
+    list_failed: 'تعذّر سرد الجلسات: {error}'
+    list_footer: '
+
+      الاستخدام: `/resume <session name>`'
+    list_footer_numbered: '
+
+      الاستخدام: `/resume <session name>` أو `/resume <number>` (مثال: `/resume 1` للأحدث)'
+    list_header: '📋 **الجلسات المُسمّاة**
+
+      '
+    list_item: • **{title}**{preview_part}
+    list_item_numbered: '{index}. **{title}**{preview_part}'
+    list_preview_suffix: ' — _{preview}_'
+    matrix_blocked_no_origin: '⚠️ حُجب /resume في Matrix: هذه الجلسة المُسمّاة لا تملك أصل غرفة مُسجّلًا، لذا لن يستأنفها Hermes داخل الغرفة الحالية افتراضيًا. استخدم `/resume --cross-room {name}` إن كنت تريد عمدًا تجاوز حدود الغرفة.'
+    matrix_blocked_other_room: '⚠️ حُجب /resume في Matrix: تلك الجلسة تخصّ غرفة Matrix مختلفة ({room}). استخدم `/resume --cross-room {name}` إن كنت تريد عمدًا استئنافها هنا.'
+    matrix_cross_room_success: '⚠️ استئناف عبر الغرف: استُؤنفت **{title}** داخل غرفة Matrix ‏**{room}**.
+
+      ستستخدم الرسائل المستقبلية في هذه الغرفة ذلك النص حتى `/reset` أو `/resume` آخر.{msg_part}'
+    matrix_no_named_sessions: 'لم يُعثر على جلسات مُسمّاة لغرفة Matrix هذه.
+
+      استخدم `/title My Session` لتسمية جلسة الغرفة الحالية، أو `/resume --all` لسرد كل جلسات Matrix، أو `/resume --cross-room <session name>` لتجاوز حدود الغرفة صراحةً.'
+    no_named_sessions: 'لم يُعثر على جلسات مُسمّاة.
+
+      استخدم `/title My Session` لتسمية جلستك الحالية، ثم `/resume My Session` للعودة إليها لاحقًا.'
+    not_found: 'لم يُعثر على جلسة تطابق ''**{name}**''.
+
+      استخدم `/resume` دون وسائط لعرض الجلسات المتاحة.'
+    out_of_range: 'مؤشر الاستئناف {index} خارج النطاق.
+
+      استخدم `/resume` دون وسائط لعرض الجلسات المتاحة.'
+    parse_error: '⚠️ تعذّر تحليل وسائط `/resume`: {error}.
+
+      استخدم علامات اقتباس حول العناوين التي تحتوي مسافات، مثال: `/resume "Project A Plan"`.'
+    resumed_many: ↻ استُؤنفت الجلسة **{title}** ({count} رسالة). استُعيدت المحادثة.
+    resumed_no_count: ↻ استُؤنفت الجلسة **{title}**. استُعيدت المحادثة.
+    resumed_one: ↻ استُؤنفت الجلسة **{title}** ({count} رسالة). استُعيدت المحادثة.
+    switch_failed: فشل تبديل الجلسة.
+  retry:
+    no_previous: لا توجد رسالة سابقة لإعادة المحاولة.
+  rollback:
+    invalid_number: رقم نقطة تحقّق غير صالح. استخدم 1-{max}.
+    none_found: لم يُعثر على نقاط تحقّق لـ {cwd}
+    not_enabled: "نقاط التحقّق غير مُفعّلة.\nفعّلها في config.yaml:\n```\ncheckpoints:\n  enabled: true\n```"
+    restore_failed: ❌ {error}
+    restored: '✅ استُعيد إلى نقطة التحقّق {hash}: {reason}
+
+      حُفظت لقطة ما قبل التراجع تلقائيًا.'
+  set_home:
+    save_failed: 'فشل حفظ القناة الرئيسية: {error}'
+    success: '✅ ضُبطت القناة الرئيسية إلى **{name}** (المعرّف: {chat_id}).
+
+      ستُسلَّم مهام cron والرسائل عبر المنصّات هنا.'
   shared:
-    session_db_unavailable:      "قاعدة بيانات الجلسات غير متاحة."
-    session_db_unavailable_prefix: "قاعدة بيانات الجلسات غير متاحة"
-    session_not_found:           "لم يُعثر على الجلسة في قاعدة البيانات."
-    warn_passthrough:            "⚠️ {error}"
+    session_db_unavailable: قاعدة بيانات الجلسات غير متاحة.
+    session_db_unavailable_prefix: قاعدة بيانات الجلسات غير متاحة
+    session_not_found: لم يُعثر على الجلسة في قاعدة البيانات.
+    warn_passthrough: ⚠️ {error}
+  status:
+    agent_running: '**الوكيل قيد التشغيل:** {state}'
+    context: '**السياق:** {used} / {total} ({pct}%)'
+    context_used: '**السياق:** ~{used} رمزًا'
+    created: '**أُنشئت:** {timestamp}'
+    header: 📊 **حالة بوابة Hermes**
+    last_activity: '**آخر نشاط:** {timestamp}'
+    matrix_scope_header: '**نطاق Matrix:**'
+    matrix_scope_key: '  مفتاح الجلسة: {session_key}'
+    matrix_scope_mode: '  نطاق الجلسة: {scope}'
+    matrix_scope_room: '  الغرفة: {room}'
+    matrix_scope_room_id: '  معرّف الغرفة: {room_id}'
+    matrix_scope_thread: '  معرّف الخيط: {thread_id}'
+    model: '**النموذج:** `{model}`'
+    model_provider: '**النموذج:** `{model}` ({provider})'
+    platforms: '**المنصّات المتصلة:** {platforms}'
+    queued: '**المتابعات في الطابور:** {count}'
+    session_id: '**معرّف الجلسة:** `{session_id}`'
+    state_no: لا
+    state_yes: نعم ⚡
+    title: '**العنوان:** {title}'
+    tokens: '**رموز API التراكمية (تُعاد كل استدعاء):** {tokens}'
+  stop:
+    no_active: لا توجد مهمة نشطة لإيقافها.
+    stopped: ⚡ تم الإيقاف. يمكنك متابعة هذه الجلسة.
+    stopped_pending: ⚡ تم الإيقاف. لم يكن الوكيل قد بدأ بعد — يمكنك متابعة هذه الجلسة.
+  title:
+    current_no_title: '📌 الجلسة: `{session_id}`
+
+      لم يُضبط عنوان. الاستخدام: `/title My Session Name`'
+    current_with_title: '📌 الجلسة: `{session_id}`
+
+      العنوان: **{title}**'
+    db_unavailable: قاعدة بيانات الجلسات غير متاحة.
+    empty_after_clean: ⚠️ العنوان فارغ بعد التنظيف. من فضلك استخدم أحرفًا قابلة للطباعة.
+    not_found: لم يُعثر على الجلسة في قاعدة البيانات.
+    set_to: '✏️ ضُبط عنوان الجلسة: **{title}**'
+    warn_prefix: ⚠️ {error}
+  topic:
+    bound_status: 'هذا الموضوع مرتبط بـ:
+
+      الجلسة: {label}
+
+      المعرّف: {session_id}
+
+
+      استخدم /new لاستبدال هذا الموضوع بجلسة جديدة.
+
+      للعمل المتوازي، افتح All Messages وأرسل رسالة هناك لإنشاء موضوع آخر.'
+    enable_failed: 'فشل تفعيل وضع مواضيع Telegram: {error}'
+    no_session_db: قاعدة بيانات الجلسات غير متاحة.
+    not_telegram_dm: الأمر /topic متاح فقط في محادثات Telegram الخاصة.
+    restore_needs_topic: لاستعادة جلسة، أنشئ أو افتح موضوع Telegram أولًا، ثم أرسل /topic <session-id> داخل ذلك الموضوع. لإنشاء موضوع جديد، افتح All Messages وأرسل أي رسالة هناك.
+    thread_ready: 'مواضيع Telegram متعددة الجلسات مُفعّلة.
+
+
+      سيُستخدم هذا الموضوع كجلسة Hermes مستقلة. استخدم /new لاستبدال جلسة هذا الموضوع الحالية. للعمل المتوازي، افتح All Messages وأرسل رسالة هناك لإنشاء موضوع آخر.'
+    topics_disabled: 'مواضيع Telegram غير مُفعّلة لهذا البوت بعد.
+
+
+      كيفية تفعيلها:
+
+      1. افتح @BotFather.
+
+      2. اختر البوت الخاص بك.
+
+      3. افتح Bot Settings → Threads Settings.
+
+      4. فعّل Threaded Mode وتأكّد من السماح للمستخدمين بإنشاء خيوط جديدة.
+
+
+      ثم أرسل /topic مرة أخرى.'
+    topics_user_disallowed: 'مواضيع Telegram مُفعّلة، لكن غير مسموح للمستخدمين بإنشاء مواضيع.
+
+
+      افتح @BotFather → اختر البوت → Bot Settings → Threads Settings، ثم أوقف ''Disallow users to create new threads''.
+
+
+      ثم أرسل /topic مرة أخرى.'
+    unauthorized: غير مصرّح لك باستخدام /topic على هذا البوت.
+    untitled_session: جلسة دون عنوان
+  undo:
+    busy: ⏳ The database was busy — nothing was changed. Try /undo again in a moment.
+    draining: ⏳ The last turn was stopped but is still finishing its current step — /undo can't run yet. Try again in a moment.
+    error: ⚠️ Couldn't complete /undo (internal error — nothing was changed). It's been logged.
+    invalid_count: عدد غير صالح "{arg}" — استخدم /undo أو /undo N.
+    nothing: لا شيء للتراجع عنه.
+    now_at: '↦ Now at — {who}:
+
+      “{preview}”'
+    now_at_notext: ↦ Now at — {who} (no text).
+    now_empty: ↦ Now at — start of the thread (no messages left).
+    party:
+      assistant: my reply
+      message: the last message
+      tool: a tool result
+      user: your message
+    removed: ↩️ تم التراجع عن {turns} دور ({count} رسالة).
+  update:
+    hermes_cmd_not_found: ✗ تعذّر تحديد موقع أمر `hermes`. Hermes يعمل، لكن أمر التحديث لم يجد الملف التنفيذي على PATH أو عبر مُفسّر Python الحالي. جرّب تشغيل `hermes update` يدويًا في طرفيتك.
+    not_git_repo: ✗ ليس مستودع git — لا يمكن التحديث.
+    platform_not_messaging: ✗ /update متاح فقط من منصّات المراسلة. شغّل `hermes update` من الطرفية.
+    start_failed: '✗ فشل بدء التحديث: {error}'
+    starting: ⚕ جارٍ بدء تحديث Hermes… سأبثّ التقدّم هنا.
+  usage:
+    breakdown_cat_conversation: المحادثة
+    breakdown_cat_mcp: MCP
+    breakdown_cat_memory: الذاكرة
+    breakdown_cat_rules: القواعد
+    breakdown_cat_skills: المهارات
+    breakdown_cat_subagent_definitions: تعريفات الوكلاء الفرعيين
+    breakdown_cat_system_prompt: موجّه النظام
+    breakdown_cat_tool_definitions: تعريفات الأدوات
+    breakdown_header: 🧩 **تفصيل السياق** _(تقديري)_
+    breakdown_line: '• {label}: ~{count} ({pct}%)'
+    comp_fixed: '• Fixed: ~{fixed} tok ({sys} system + {tools} tool schemas)'
+    comp_header: 'Last request composition (char-based estimate):'
+    comp_nonfixed: '• Non-fixed: ~{nonfixed} tok ({hist} history + {results} tool results + {args} tool args)'
+    comp_total: '• Estimated request total: ~{total} tok (sums exactly; fixed + non-fixed)'
+    detailed_after_first: _(الاستخدام المُفصّل متاح بعد أول رد من الوكيل)_
+    header_session: 📊 **استخدام رموز الجلسة**
+    header_session_info: 📊 **معلومات الجلسة**
+    label_api_calls: 'استدعاءات API: {count}'
+    label_cache_read: 'رموز قراءة التخزين المؤقت: {count}'
+    label_cache_write: 'رموز كتابة التخزين المؤقت: {count}'
+    label_compressions: 'عمليات الضغط: {count}'
+    label_context: 'السياق: {used} / {total} ({pct}%)'
+    label_cost: 'التكلفة: {prefix}${amount}'
+    label_cost_included: 'التكلفة: مشمولة'
+    label_estimated_context: 'السياق المُقدّر: ~{count} رمزًا'
+    label_input_tokens: 'رموز الإدخال: {count}'
+    label_messages: 'الرسائل: {count}'
+    label_model: 'النموذج: `{model}`'
+    label_output_tokens: 'رموز الإخراج: {count}'
+    label_total: 'الإجمالي: {count}'
+    no_data: لا تتوفّر بيانات استخدام لهذه الجلسة.
+    rate_limits: ⏱️ **حدود المعدّل:** {state}
+    reset_wrong_provider: إعادة تعيين الاستخدام المُدّخر متاحة فقط على مزوّد openai-codex. بدّل عبر `/model` أولًا.
+    unknown_subcommand: 'أمر فرعي غير معروف لـ /usage: `{args}`. جرّب `/usage` أو `/usage reset [--force]`.'
+  verbose:
+    mode_all: '⚙️ تقدّم الأدوات: **ALL** — يُعرض كل استدعاء أداة (طول المعاينة: `display.tool_preview_length`، افتراضي 40).'
+    mode_log: '⚙️ تقدّم الأدوات: **LOG** — صامت في المحادثة؛ تُكتب استدعاءات الأدوات إلى ~/.hermes/logs/tool_calls.log.'
+    mode_new: '⚙️ تقدّم الأدوات: **NEW** — يُعرض عند تغيّر الأداة (طول المعاينة: `display.tool_preview_length`، افتراضي 40).'
+    mode_off: '⚙️ تقدّم الأدوات: **مُعطّل** — لا يُعرض نشاط الأدوات.'
+    mode_verbose: '⚙️ تقدّم الأدوات: **VERBOSE** — كل استدعاء أداة مع وسائطه الكاملة.'
+    not_enabled: "الأمر `/verbose` غير مُفعّل لمنصّات المراسلة.\n\nفعّله في `config.yaml`:\n```yaml\ndisplay:\n  tool_progress_command: true\n```"
+    save_failed: '_(تعذّر الحفظ في الإعدادات: {error})_'
+    saved_suffix: _(حُفظ لـ **{platform}** — يسري على الرسالة التالية)_
+  voice:
+    disabled_short: وضع الصوت مُعطّل.
+    disabled_text: وضع الصوت مُعطّل. ردود نصّية فقط.
+    enabled_short: وضع الصوت مُفعّل.
+    enabled_voice_only: 'وضع الصوت مُفعّل.
+
+      سأردّ بالصوت عندما ترسل رسائل صوتية.
+
+      استخدم /voice tts للحصول على ردود صوتية لكل الرسائل.'
+    help: '{toggle}
+
+
+      **كيف يعمل /voice**
+
+      • `/voice on` — رد صوتي عند إرسال رسالة صوتية
+
+      • `/voice tts` — رد صوتي على *كل* رسالة
+
+      • `/voice off` — العودة إلى ردود نصّية فقط
+
+      • `/voice status` — عرض الوضع الحالي
+
+      • `/voice` (بدون وسيط) — تبديل سريع بين التفعيل والتعطيل{channels}'
+    help_channels: '
+
+
+      **قنوات الصوت الحيّة (Discord)**
+
+      • انضمّ إلى قناة صوتية أولًا، ثم `/voice channel` — سأنضمّ وأستمع وأنطق ردودي
+
+      • `/voice leave` — قطع الاتصال بالقناة الصوتية'
+    label_all: TTS (رد صوتي على كل الرسائل)
+    label_off: مُعطّل (نص فقط)
+    label_voice_only: مُفعّل (رد صوتي على الرسائل الصوتية)
+    speaking: ' (يتحدّث)'
+    status_channel: 'قناة الصوت: #{channel}'
+    status_member: '  - {name}{status}'
+    status_mode: 'وضع الصوت: {label}'
+    status_participants: 'المشاركون: {count}'
+    tts_enabled: 'TTS التلقائي مُفعّل.
+
+      ستتضمّن كل الردود رسالة صوتية.'
+  yolo:
+    disabled: ⚠️ وضع YOLO **مُعطّل** لهذه الجلسة — ستتطلّب الأوامر الخطيرة موافقة.
+    enabled: ⚡ وضع YOLO **مُفعّل** لهذه الجلسة — كل الأوامر مُوافق عليها تلقائيًا. استخدمه بحذر.

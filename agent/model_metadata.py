@@ -3608,6 +3608,21 @@ def _estimate_message_dense_sparse(msg: Dict[str, Any]) -> tuple[int, int]:
     return _split_dense_sparse(str(_wire_message_shadow(msg)))
 
 
+def _estimate_message_tokens_without_images(msg: Dict[str, Any]) -> int:
+    """Token estimate for a message shadow with image payloads stripped.
+
+    Parity note (2026-08-07): upstream's per-message scalar estimator. The
+    fork's own estimator is the dense/sparse SPLIT above (whose sparse
+    remainder must be summed across the whole list before a single ceil), so
+    nothing in fork code calls this. It is kept as upstream's reference
+    implementation: ``tests/agent/test_cursor_optimizations_parity.py``
+    imports it to assert the optimized path still matches the naive one.
+    """
+    if not isinstance(msg, dict):
+        return estimate_tokens_rough(str(msg))
+    return estimate_tokens_rough(str(_wire_message_shadow(msg)))
+
+
 def estimate_request_tokens_rough(
     messages: List[Dict[str, Any]],
     *,

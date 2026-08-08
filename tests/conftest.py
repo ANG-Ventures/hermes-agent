@@ -765,6 +765,21 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
         lambda *_args, **_kwargs: None,
         raising=False,
     )
+    # ``read_claude_code_credentials()`` has TWO sources: the Keychain and
+    # ``~/.claude/.credentials.json``. Stubbing only the Keychain still lets a
+    # developer's real Claude Code login leak in from the FILE — outside
+    # HERMES_HOME, so the sandbox redirect can't catch it. That injects a
+    # phantom ``source=claude_code`` entry into every anthropic credential
+    # pool built in tests (with a per-run random id), which silently changes
+    # pool arithmetic: a fixture that writes a ONE-entry auth.json gets a
+    # TWO-entry pool, so single-entry guards never fire. Close the second
+    # source too.
+    monkeypatch.setattr(
+        _anthropic_adapter,
+        "_read_claude_code_credentials_from_file",
+        lambda *_args, **_kwargs: None,
+        raising=False,
+    )
     return None
 
 

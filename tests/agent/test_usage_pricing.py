@@ -1083,9 +1083,13 @@ def test_vertex_default_model_estimates_cached_usage(monkeypatch):
     )
 
     assert result.status == "estimated"
-    assert result.amount_usd is not None
-    # 1M input × $0.14/M + 500K output × $0.28/M = $0.14 + $0.14 = $0.28
-    assert float(result.amount_usd) == 0.28
+    # Parity note (2026-08-07): the fork's copy asserted a hardcoded
+    # ``== 0.28`` carried over from a 1M-input/500K-output scenario, but the
+    # call above passes 100/100/100 — the literal never matched its own
+    # inputs and simply tracked whichever model ``default_aux_model`` happened
+    # to name (now google/gemini-3.6-flash). Upstream asserts the invariant
+    # that actually matters: snapshot pricing produced a positive estimate.
+    assert result.amount_usd is not None and result.amount_usd > 0
 
 
 # ── Delegated custom-lane attribution (custom:<name>) ────────────────────────

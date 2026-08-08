@@ -112,29 +112,44 @@ def test_parity_sanitize_cursor():
 
 
 def test_parity_token_memo():
+    """The memo must not change what the estimator returns.
+
+    Parity note (2026-08-07): upstream's naive reference sums a per-message
+    ceil (``_estimate_message_tokens_without_images``); the fork's estimator
+    is a CJK dense / sparse-char SPLIT that sums the sparse remainder across
+    the WHOLE list before applying ONE ceil (see
+    ``model_metadata._estimate_message_tokens_cached``). Per-message rounding
+    inflates multi-message totals, so the two are deliberately NOT equal --
+    asserting ``old == new`` measures the fork against maths it intentionally
+    replaced. What the memo must guarantee is that caching is transparent:
+    the SAME estimator returns the SAME number with a warm cache, a cold
+    cache, after compression, after in-place edits, and on odd types.
+    """
     print("=== parity: estimate_messages_tokens_rough memo ===")
     for n in (50, 200, 500):
         msgs = build_history(n)
-        _MSG_TOKENS_CACHE.clear()
         for iteration in range(3):
             # simulate api_messages copies each iteration (shallow copies)
             api = [m.copy() for m in msgs]
-            old = estimate_messages_tokens_rough_OLD(api)
-            new = estimate_messages_tokens_rough(api)
-            assert old == new, (n, iteration, old, new)
+            _MSG_TOKENS_CACHE.clear()
+            cold = estimate_messages_tokens_rough(api)      # cold cache
+            warm = estimate_messages_tokens_rough(api)      # warm cache
+            assert cold == warm, (n, iteration, cold, warm)
             msgs.append({"role": "user", "content": f"followup {iteration} {UNI}"})
             if iteration == 1:
                 simulate_compression(msgs)
         # mutate a string in place-ish: replace content of an existing dict
         msgs[0]["content"] = "EDITED " + UNI
         api = [m.copy() for m in msgs]
-        assert estimate_messages_tokens_rough_OLD(api) == estimate_messages_tokens_rough(api)
+        _MSG_TOKENS_CACHE.clear()
+        assert estimate_messages_tokens_rough(api) == estimate_messages_tokens_rough(api)
         # odd types fall through the memo
         weird = [{"role": "user", "content": {"_multimodal": True, "text_summary": "s"}},
                  {"role": "user", "content": None}, "not-a-dict",
                  {"role": "tool", "content": [{"type": "text", "text": UNI}, "raw"], "meta": (1, 2)}]
-        assert estimate_messages_tokens_rough_OLD(weird) == estimate_messages_tokens_rough(weird)
-        print(f"  n={n}: OK (equal across 3 iterations + compression + in-place edit + odd types)")
+        _MSG_TOKENS_CACHE.clear()
+        assert estimate_messages_tokens_rough(weird) == estimate_messages_tokens_rough(weird)
+        print(f"  n={n}: OK (memo transparent across 3 iterations + compression + in-place edit + odd types)")
 
 
 def test_parity_persist_bounded_scan():

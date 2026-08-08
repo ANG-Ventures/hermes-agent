@@ -271,7 +271,14 @@ def test_get_session_stats_offloads_sessiondb_read(monkeypatch):
         def close(self):
             self._record()
 
-    monkeypatch.setattr(web_server, "_open_session_db_for_profile", lambda _profile=None: _DB())
+    # fork parity NOTE (2026-08-07): the merge adopted upstream's
+    # _open_session_db_for_profile(profile, *, read_only) -- read_only is
+    # keyword-only REQUIRED, so the double must accept it.
+    monkeypatch.setattr(
+        web_server,
+        "_open_session_db_for_profile",
+        lambda _profile=None, **_kw: _DB(),
+    )
 
     result = asyncio.run(web_server.get_session_stats())
 

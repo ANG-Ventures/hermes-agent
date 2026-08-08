@@ -123,15 +123,21 @@ def test_t_missing_key_in_non_english_falls_back_to_english(tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize("lang", list(i18n.SUPPORTED_LANGUAGES))
-def test_reasoning_help_advertises_max_but_not_ultra(lang: str):
+def test_reasoning_help_advertises_ultra(lang: str):
+    """Help text advertises the full scale including ultra.
+
+    History: until 2026-08-07 this test asserted the OPPOSITE (no ultra in the
+    help strings) — a snapshot of the fork's 2026-07-15 help text (#359), not a
+    capability contract (VALID_REASONING_EFFORTS has included ultra throughout).
+    Inverted by owner directive during the 2026-08-07 parity merge: parity by
+    default; the engine supports ultra on both sides, so the help must say so.
+    """
     raw = _load_raw(lang)
     status = raw["gateway"]["reasoning"]["status"]
     unknown = raw["gateway"]["reasoning"]["unknown_arg"]
 
-    assert "xhigh|max|reset" in status
-    assert "high, xhigh, max" in unknown
-    assert "ultra" not in status.lower()
-    assert "ultra" not in unknown.lower()
+    assert "xhigh|max|ultra|reset" in status
+    assert "high, xhigh, max, ultra" in unknown
 
 
 # ---------------------------------------------------------------------------

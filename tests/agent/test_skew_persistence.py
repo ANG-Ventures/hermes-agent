@@ -62,6 +62,15 @@ def make_compressor(session_db=None, session_id=""):
             protect_last_n=2,
             quiet_mode=True,
         )
+        # Parity note (2026-08-07): upstream made ``context_length`` a LAZY
+        # property (``_resolve_context_length`` on first read) where the fork
+        # resolved it eagerly in __init__ -- see the setter's own comment about
+        # "main's eager-init behavior". Reading it here forces resolution while
+        # the patch is still active; otherwise the first post-patch read falls
+        # back to 256k and every threshold assertion below is measured against
+        # the wrong window.
+        _ = c.context_length
+        _ = c.threshold_tokens
     if session_db is not None:
         c.bind_session_state(session_db=session_db, session_id=session_id)
     return c

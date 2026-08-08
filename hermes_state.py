@@ -5508,6 +5508,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         "cache_write_tokens", "reasoning_tokens", "api_call_count",
     )
     _TOKEN_DELTA_COST_FIELDS = ("estimated_cost_usd", "actual_cost_usd")
+    # Snapshot fields: NOT summed. These are "the last turn's usage", written
+    # with COALESCE(?, existing) — last non-None wins. Upstream added them
+    # (2026-08) after the fork's coalescer shipped; because they were in no
+    # bucket, a merged run kept only the FIRST delta's values and every later
+    # turn's snapshot was silently dropped. Merging must therefore take the
+    # LAST non-None value, matching the sequential-apply semantics.
+    _TOKEN_DELTA_SNAPSHOT_FIELDS = (
+        "last_turn_input_tokens", "last_turn_output_tokens",
+        "last_turn_cache_read_tokens", "last_turn_cache_write_tokens",
+        "last_turn_reasoning_tokens",
+    )
     _TOKEN_DELTA_ROUTE_FIELDS = (
         "model", "cost_status", "cost_source", "pricing_version",
         "billing_provider", "billing_base_url", "billing_mode",
@@ -5679,6 +5690,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         # None-preserving sum: an all-None run must stay
                         # None so COALESCE keeps the stored value untouched.
                         merged[f] = (merged.get(f) or 0.0) + value
+                for f in self._TOKEN_DELTA_SNAPSHOT_FIELDS:
+                    value = kwargs.get(f)
+                    if value is not None:
+                        # Last-non-None-wins (NOT a sum): these mirror the
+                        # COALESCE(?, existing) write, so a merged run must
+                        # end up with the newest turn's snapshot exactly as
+                        # applying the deltas one-by-one would.
+                        merged[f] = value
             else:
                 groups.append((key, session_id, dict(kwargs)))
         return [(sid, kw) for _, sid, kw in groups]
