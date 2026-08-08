@@ -17,6 +17,27 @@ class _CapturingSessionDB:
         self.rows.append({"role": role, "content": content})
         return len(self.rows)
 
+    def append_messages_batch(self, session_id=None, messages=None, **kwargs):
+        """Batched write path (parity merge 2026-08-08).
+
+        Upstream replaced the per-message ``append_message`` calls in
+        ``_flush_messages_to_session_db`` with a single batched write. A fake
+        that only implements the old method silently captures NOTHING — the
+        real code calls the batch entrypoint, ``rows`` stays empty, and the
+        role-sequence assertions below compare against []. Capture the same
+        shape so this test keeps measuring what it was written to measure.
+        """
+        row_ids = []
+        for msg in (messages or []):
+            self.rows.append(
+                {"role": msg.get("role"), "content": msg.get("content")}
+            )
+            row_ids.append(len(self.rows))
+        out = kwargs.get("row_ids_out")
+        if isinstance(out, list):
+            out.extend(row_ids)
+        return row_ids
+
     def recompute_effective_last_active(self, _session_id):
         pass
 
@@ -136,7 +157,16 @@ def test_leaked_flag_cannot_drop_next_real_turn_row():
     # (a) the reset exists, and (b) it is STRAIGHT-LINE before the set — assert
     # there is no control-flow break (return/continue/break/raise) textually
     # between the reset line and the resume-pending `if` that guards the set.
-    gsrc = inspect.getsource(gr.GatewayRunner._run_agent_inner)
+    #
+    # Parity note (2026-08-08): this used to inspect
+    # ``GatewayRunner._run_agent_inner``. Upstream EXTRACTED the turn pipeline
+    # into a new ``TurnRunner`` class and moved the resume-pending block into
+    # ``TurnRunner.run_sync`` (there is no resume_pending logic left in
+    # _run_agent_inner at all), so the old target yields a source string with
+    # zero markers and the structural proof passes/fails for the wrong reason.
+    # Inspect the method that actually owns the reset+set today; the contract
+    # asserted is unchanged.
+    gsrc = inspect.getsource(gr.TurnRunner.run_sync)
     reset_marker = "agent._suppress_user_turn_persist = False"
     resume_if_marker = "if _is_resume_pending:"
     # Markers must be UNIQUE, else first-match str.index() could slice the wrong

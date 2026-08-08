@@ -135,6 +135,12 @@ def test_wrapped_context_engine_tool_schemas_are_not_double_wrapped():
     enabled_toolsets = _get_platform_tools(cfg, "cli", include_default_mcp_servers=False)
     with (
         patch("hermes_cli.config.load_config", return_value=cfg),
+        # Parity note (2026-08-08): agent_init reads config through
+        # ``load_config_readonly`` (upstream's deepcopy-free fast path), so
+        # patching only ``load_config`` leaves init reading the real
+        # config.yaml — the stub engine never registers and valid_tool_names
+        # comes back empty. The two sibling tests above already patch both.
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
         patch("plugins.context_engine.load_context_engine", return_value=engine),
         patch("agent.model_metadata.get_model_context_length", return_value=204_800),
         patch("run_agent.get_tool_definitions", return_value=[]),

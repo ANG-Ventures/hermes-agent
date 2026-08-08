@@ -5709,6 +5709,25 @@ class TurnRunner:
                 getattr(_resume_entry, "last_resume_marked_at", None),
                 window_secs=_freshness_window,
             )
+        # 🔴 Defensive reset (pass-2 B1): clear any stale suppress flag from
+        # a PRIOR turn before this turn can set it. A cached/reused agent can
+        # carry _suppress_user_turn_persist=True if a prior resume turn set it
+        # then aborted before build_turn_context consumed it — which would
+        # wrongly drop THIS turn's (possibly real) user row. Reset every turn
+        # so the flag only ever reflects the current turn's resume-pending
+        # decision below.
+        #
+        # Parity note (2026-08-08): upstream has no reference to this flag in
+        # gateway/run.py (it consumes-once inside agent/turn_context.py), so
+        # the merge took upstream's side here and silently dropped the fork's
+        # per-turn reset. turn_context's own docstring still promises "the
+        # gateway additionally resets it at the top of every turn so it never
+        # carries across turns" — consume-once alone does NOT give that: an
+        # aborted resume turn leaves the flag set with nothing to consume it.
+        try:
+            agent._suppress_user_turn_persist = False
+        except Exception:
+            pass
         _is_resume_pending = bool(
             _resume_entry is not None
             and getattr(_resume_entry, "resume_pending", False)
@@ -5723,6 +5742,41 @@ class TurnRunner:
         if _is_resume_pending:
             _reason = getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
             _persist_user_message_override = ctx.message
+            # An internal auto-resume continuation with no real user text (the
+            # MessageEvent text="" internal=True trigger — the ONLY path that
+            # produces an empty resume-pending turn) must NOT persist an empty
+            # user row: it pollutes the transcript, breaks role alternation,
+            # and is what /undo lands on as "(no text)". Flag the agent so
+            # build_turn_context stamps the user row ephemeral and the flush
+            # drops it. A resume turn carrying REAL queued user text has
+            # non-empty ``ctx.message`` here, so it still persists (I2). The
+            # model still receives the resume prompt built below (I1).
+            #
+            # Parity note (2026-08-08): upstream has no reference to
+            # _suppress_user_turn_persist in gateway/run.py, so the merge
+            # dropped BOTH halves of the fork's suppression (this set and the
+            # per-turn defensive reset above). agent/turn_context.py still
+            # consumes the flag and its docstring still promises the gateway
+            # sets/resets it — restored here against upstream's ctx shape.
+            if not str(ctx.message or "").strip():
+                # Belt-and-suspenders (pass-1 B1): flag the row ephemeral AND
+                # keep the override forced to empty text, so if the ephemeral
+                # stamp ever misses the persisted row degrades to a benign
+                # EMPTY row — never to a resume-prompt-shaped fake user
+                # message (ctx.message is reassigned to the prompt just below).
+                _persist_user_message_override = ""
+                try:
+                    agent._suppress_user_turn_persist = True
+                    logger.info(
+                        "resume: suppressing empty internal-resume user row "
+                        "for %s (reason=%s) — not persisting an empty user turn",
+                        ctx.session_key, _reason,
+                    )
+                except Exception:
+                    logger.debug(
+                        "resume: could not flag empty-resume user-row suppression",
+                        exc_info=True,
+                    )
             # The empty-message case is the auto-resume startup turn
             # synthesized by _schedule_resume_pending_sessions — there is
             # no NEW user message to address.  Guidance is adapter-aware:

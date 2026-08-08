@@ -425,6 +425,12 @@ def test_recover_with_credential_pool_rotates_on_xai_spending_limit_403():
             status_code,
             error_context=None,
             api_key_hint=None,
+            # Parity note (2026-08-08): upstream's pool API gained
+            # ``failure_reason`` (and ``credential_id``); the recovery path
+            # now always passes the classified reason so the pool can tell a
+            # billing 403 from an edge-throttle 403. Absorb the newer kwargs
+            # so this double keeps matching the real signature.
+            **_kwargs,
         ):
             assert status_code == 403
             assert api_key_hint == "test-key"
