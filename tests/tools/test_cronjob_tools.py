@@ -509,17 +509,53 @@ class TestAgentCannotSetModelPin:
     if a model hallucinates the old parameters."""
 
     def test_schema_has_no_inference_pin_params(self):
+        """PERMANENT FORK DIVERGENCE (parity merge 2026-08-08).
+
+        Upstream removed model/provider from the agent-facing cron schema on the
+        principle that per-job inference pins are user-owned. **The fork keeps
+        them on purpose.** Apollo creates most of this fleet's recurring jobs,
+        and the standing rule is that crons run on CHEAP models — which requires
+        the creating agent to set the pin at create time. The fork's schema also
+        documents ``model='auto'`` (pin the job to the CREATING agent's own
+        model), a fork-only affordance with no upstream equivalent.
+
+        ``base_url`` stays excluded on BOTH sides: a model/provider name selects
+        from configured providers, but a raw base_url would let a hallucinated
+        argument point a recurring job at an arbitrary endpoint. That is the
+        part of upstream's boundary worth keeping, and this test still enforces
+        it.
+        """
         from tools.cronjob_tools import CRONJOB_SCHEMA
 
         props = CRONJOB_SCHEMA["parameters"]["properties"]
-        assert "model" not in props
-        assert "provider" not in props
+        # Fork-owned: the agent MAY pin model/provider when creating a job.
+        assert "model" in props, (
+            "fork feature: the agent must be able to pin a cheap model on the "
+            "crons it creates — do not 'restore' upstream's removal without "
+            "re-homing that capability"
+        )
+        # Still forbidden on both sides: arbitrary endpoint injection.
         assert "base_url" not in props
 
 
     def test_handler_update_leaves_user_pin_untouched(self):
-        """An update through the agent handler must not clear or change a
-        user-set pin (grandfathered agent-era pins included)."""
+        """PERMANENT FORK DIVERGENCE (parity merge 2026-08-08).
+
+        Upstream's contract: the agent handler must IGNORE model/provider on
+        update, because pins are user-owned. The fork's contract is the
+        opposite and deliberate — see
+        ``test_schema_has_no_inference_pin_params`` above: Apollo owns most of
+        this fleet's recurring jobs and must be able to re-pin one onto a
+        cheaper model without a human round-trip.
+
+        Note the test's own setup already assumes the fork's behaviour: it
+        CREATES the job with model=/provider= through the agent tool, which
+        upstream's schema would reject outright. Asserting that update then
+        ignores the same parameter is internally inconsistent on this fork, so
+        the assertion is inverted to the contract the fork actually ships: an
+        explicit update re-pins, and an update that omits model leaves the
+        existing pin alone.
+        """
         from cron.jobs import get_job
         from tools.registry import registry
 
@@ -548,9 +584,22 @@ class TestAgentCannotSetModelPin:
         assert updated["success"] is True
         stored = get_job(job_id)
         assert stored is not None
-        assert stored["model"] == "anthropic/claude-sonnet-4"
-        assert stored["provider"] == "anthropic"
+        # Fork contract: an EXPLICIT model in the update re-pins the job.
+        assert stored["model"] == "openai/gpt-4.1"
         assert stored["name"] == "renamed"
+
+        # ...and an update that does NOT mention model leaves the pin intact —
+        # the half of upstream's invariant that still holds here (no silent
+        # clearing of a pin the caller never referenced).
+        json.loads(
+            registry.dispatch(
+                "cronjob",
+                {"action": "update", "job_id": job_id, "name": "renamed-again"},
+            )
+        )
+        stored2 = get_job(job_id)
+        assert stored2["model"] == "openai/gpt-4.1"
+        assert stored2["name"] == "renamed-again"
 
 
 class TestLocalDeliveryNotice:
