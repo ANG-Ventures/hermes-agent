@@ -255,12 +255,12 @@ def _write_creds_tmp():
 
 def test_creds_file_parsing(tmp_path):
     f = tmp_path / "rail-client.env"
-    f.write_text("# comment\nGBRAIN_RAIL_CLIENT_ID=abc\nGBRAIN_RAIL_CLIENT_SECRET='s3c'\n")
+    f.write_text("# comment\nGBRAIN_RAIL_CLIENT_ID=abc\nGBRAIN_RAIL_CLIENT_SECRET='s3c'\n", encoding="utf-8")
     creds = gbrain_recall._read_client_creds(str(f))
     assert creds == {"client_id": "abc", "client_secret": "s3c"}
     assert gbrain_recall._read_client_creds(str(tmp_path / "missing.env")) is None
     g = tmp_path / "partial.env"
-    g.write_text("GBRAIN_RAIL_CLIENT_ID=abc\n")
+    g.write_text("GBRAIN_RAIL_CLIENT_ID=abc\n", encoding="utf-8")
     assert gbrain_recall._read_client_creds(str(g)) is None
 
 

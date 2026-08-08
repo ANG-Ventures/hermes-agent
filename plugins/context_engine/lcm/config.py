@@ -157,7 +157,7 @@ def _hermes_config_path() -> Path:
 def _load_hermes_config_yaml() -> dict[str, Any]:
     cfg_path = _hermes_config_path()
     try:
-        text = cfg_path.read_text()
+        text = cfg_path.read_text(encoding="utf-8")
     except Exception:
         return {}
     if yaml is not None:
