@@ -139,6 +139,7 @@ def _format_compaction_announce(
     stats: "Any | None" = None,
     recovery_hint: "str | None" = None,
     in_place: bool = False,
+    real_prompt_tokens: "int | None" = None,
 ) -> "str | None":
     """Build the engine-aware announce line, or ``None`` if gating says skip."""
     is_lcm = engine_name == "lcm"
@@ -189,6 +190,7 @@ def _format_compaction_announce(
     if stats is not None:
         line = _format_granular_announce(
             head, stats, model_part, after_fallback, window_from, window_to,
+            real_prompt_tokens=real_prompt_tokens,
         )
     else:
         parts = [f"{head}: {old_messages}→{new_messages} messages"]
@@ -244,14 +246,62 @@ def _append_subsplit_lines(lines, *, tool_count, tool_tokens, other_count, other
         )
 
 
+def _counter_divergence_line(
+    estimated_tokens: "int | None",
+    real_prompt_tokens: "int | None",
+    *,
+    tolerance: float = 0.15,
+) -> "str | None":
+    """Render a 'the two counters disagree' line, or None when they agree.
+
+    The compaction banner reports a LOCAL ESTIMATE over messages; the runtime
+    footer reports the PROVIDER's real ``prompt_tokens``. These are different
+    counters and they can diverge substantially — a measured session showed
+    estimate 503,180 vs provider 693,766 (1.38x). With only one number visible,
+    that reads as an unexplained compaction ("the banner says ~503K but the
+    footer said 733.5k"), which is expensive to diagnose after the fact.
+
+    Only rendered past ``tolerance`` so an ordinary few-percent difference does
+    not add noise to every compaction. Direction is named explicitly, because
+    UNDER-counting is the dangerous one: it means the real prompt is larger than
+    the number the threshold gate compared against, so compaction fires LATE.
+    """
+    try:
+        est = int(estimated_tokens or 0)
+        real = int(real_prompt_tokens or 0)
+    except (TypeError, ValueError):
+        return None
+    if est <= 0 or real <= 0:
+        return None
+    ratio = real / est
+    if abs(ratio - 1.0) <= tolerance:
+        return None
+    direction = "under" if ratio > 1.0 else "over"
+    return (
+        f"   ⚠ Counters disagree: estimate {_abbrev_tokens(est)}"
+        f" vs provider-measured {_abbrev_tokens(real)}"
+        f"   (local estimate reads {ratio:.2f}x {direction})"
+    )
+
+
 def _format_granular_announce(
     head: str, stats: "Any", model_part: str,
     after_fallback: bool, window_from: "int | None", window_to: "int | None",
     *, basis: str = "live",
     wire_before: "int | None" = None,
     wire_after: "int | None" = None,
+    real_prompt_tokens: "int | None" = None,
 ) -> str:
-    """Render the multi-line single-unit breakdown from validated stats."""
+    """Render the multi-line single-unit breakdown from validated stats.
+
+    ``real_prompt_tokens`` is the provider's own ``prompt_tokens`` from the last
+    completed call. When it is present AND materially disagrees with the local
+    estimate, the Context line shows BOTH numbers. Rationale: the estimate and
+    the provider's accounting are different counters over different scopes, and
+    a silent disagreement between them reads as an unexplained compaction —
+    "it says ~503K but my footer said 733.5k" costs hours to diagnose. Showing
+    the divergence inline makes that class of question self-answering.
+    """
     stored = basis == "stored"
     wire_mode = bool(stored and (wire_before or 0) > 0 and (wire_after or 0) > 0)
     ctx_label = "Stored transcript:" if (stored and not wire_mode) else "Context:  "
@@ -288,11 +338,17 @@ def _format_granular_announce(
             f"   {ctx_label} {_abbrev_tokens(stats.pre_tokens)} → {_abbrev_tokens(stats.post_tokens)} tokens"
             f"   ({freed_verb} {_abbrev_tokens(stats.freed_tokens)}, {stats.freed_pct}% smaller)"
         )
+        _div = _counter_divergence_line(stats.pre_tokens, real_prompt_tokens)
+        if _div:
+            lines.append(_div)
     else:
         lines.append(
             f"   {ctx_label} {_abbrev_tokens(stats.pre_tokens)} → {_abbrev_tokens(stats.post_tokens)} tokens"
             f"   (no net token reduction this pass)"
         )
+        _div = _counter_divergence_line(stats.pre_tokens, real_prompt_tokens)
+        if _div:
+            lines.append(_div)
 
     removed = stats.cleared_count + stats.folded_count
     if removed > 0:

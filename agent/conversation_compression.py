@@ -1542,6 +1542,24 @@ def compress_context(
         agent._compression_feasibility_checked = True
 
     _pre_msg_count = len(messages)
+    # Capture the provider's REAL prompt_tokens BEFORE compression runs. The
+    # compaction path sets last_prompt_tokens = -1 (the "await real usage"
+    # sentinel) well before the announce is rendered, so reading it at announce
+    # time yields the sentinel, not the measurement. Prefer
+    # last_real_prompt_tokens (the compressor's durable copy of the last real
+    # reading); fall back to last_prompt_tokens for engines that do not keep one.
+    # Used only for the display-side counter-divergence line — never for a gate.
+    try:
+        _cc_pre = getattr(agent, "context_compressor", None)
+        _real_prompt_tokens_pre = int(
+            getattr(_cc_pre, "last_real_prompt_tokens", 0)
+            or getattr(_cc_pre, "last_prompt_tokens", 0)
+            or 0
+        )
+        if _real_prompt_tokens_pre < 0:
+            _real_prompt_tokens_pre = 0
+    except Exception:
+        _real_prompt_tokens_pre = 0
     # In-place compaction (config: compression.in_place, see #38763). When True,
     # this compaction rewrites the message list and refreshes the system prompt
     # when necessary, but keeps the SAME session_id — no end_session, no
@@ -2682,6 +2700,7 @@ def compress_context(
                     reasoning=_reasoning_inturn,
                     stats=_inturn_stats,
                     in_place=in_place,
+                    real_prompt_tokens=_real_prompt_tokens_pre or None,
                 )
         except Exception:
             logger.debug("compaction announce skipped (non-fatal)", exc_info=True)
