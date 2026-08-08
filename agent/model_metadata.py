@@ -3051,16 +3051,19 @@ def estimate_tokens_rough(text: str) -> int:
 
 
 # Media parts arrive as base64 but are billed by dimension/page/duration, never
-# by transport size, so their payload length carries no pricing signal. Flat
-# per-part costs; counting the base64 as characters overestimated a real
-# 1710x1518 screenshot by ~145x and drove spurious compaction (2026-08-07).
-_IMAGE_TOKEN_COST = 1500
-_DOCUMENT_TOKEN_COST = 3000
-_AUDIO_TOKEN_COST = 1500
-_IMAGE_PART_TYPES = frozenset({"image", "image_url", "input_image"})
-_DOCUMENT_PART_TYPES = frozenset({"document", "input_file", "file"})
-_AUDIO_PART_TYPES = frozenset({"input_audio", "audio"})
-_MEDIA_PART_TYPES = _IMAGE_PART_TYPES | _DOCUMENT_PART_TYPES | _AUDIO_PART_TYPES
+# by transport size, so their payload length carries no pricing signal. Counting
+# the base64 as characters overestimated a real 1710x1518 screenshot by ~145x and
+# drove spurious compaction (2026-08-07). Rates + the cheap header parsers that
+# recover page count / duration live in agent/media_tokens.py, imported by BOTH
+# this estimator and the LCM engine's so the two cannot drift.
+from agent.media_tokens import (  # noqa: E402
+    AUDIO_PART_TYPES as _AUDIO_PART_TYPES,
+    DOCUMENT_PART_TYPES as _DOCUMENT_PART_TYPES,
+    IMAGE_PART_TYPES as _IMAGE_PART_TYPES,
+    IMAGE_TOKEN_COST as _IMAGE_TOKEN_COST,
+    MEDIA_PART_TYPES as _MEDIA_PART_TYPES,
+    media_part_token_cost as _media_part_token_cost,
+)
 
 
 def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
@@ -3087,31 +3090,30 @@ def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
 
 
 def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
-    """Count image-like content parts in a message; return their token cost.
+    """Token cost of every media part in a message (images, documents, audio).
 
-    Also covers documents (PDF) and audio: like images, these arrive as base64
-    and are billed by page/duration, never by transport size, so their payload
-    length is not a usable proxy. Counting them as characters billed a 1.5 MB
-    PDF at ~419,000 tokens.
+    Each part is priced individually by ``media_part_token_cost`` — documents by
+    PAGE and audio by DURATION, recovered from a cheap header parse — rather than
+    by a flat per-category constant. A flat document cost under-counted a 40-page
+    PDF ~40x, and under-counting is the dangerous direction: compaction then
+    fires too LATE and the turn can hit a real provider 400.
+
+    ``cost_per_image`` is honored for image parts so existing callers that tune
+    it keep working.
     """
-    count = 0
-    doc_count = 0
-    audio_count = 0
+    total = 0
 
     def _tally(parts: Any) -> None:
-        nonlocal count, doc_count, audio_count
+        nonlocal total
         if not isinstance(parts, list):
             return
         for part in parts:
             if not isinstance(part, dict):
                 continue
-            ptype = part.get("type")
-            if ptype in _IMAGE_PART_TYPES:
-                count += 1
-            elif ptype in _DOCUMENT_PART_TYPES:
-                doc_count += 1
-            elif ptype in _AUDIO_PART_TYPES:
-                audio_count += 1
+            if part.get("type") in _IMAGE_PART_TYPES:
+                total += cost_per_image
+            else:
+                total += _media_part_token_cost(part)
 
     content = msg.get("content") if isinstance(msg, dict) else None
     _tally(content)
@@ -3119,11 +3121,7 @@ def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
     # Multimodal tool results that haven't been converted yet.
     if isinstance(content, dict) and content.get("_multimodal"):
         _tally(content.get("content"))
-    return (
-        count * cost_per_image
-        + doc_count * _DOCUMENT_TOKEN_COST
-        + audio_count * _AUDIO_TOKEN_COST
-    )
+    return total
 
 
 def _estimate_message_chars(msg: Dict[str, Any]) -> int:
