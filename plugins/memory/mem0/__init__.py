@@ -842,6 +842,14 @@ class Mem0MemoryProvider(MemoryProvider):
         "definitely", "certainly", "totally", "exactly", "yea",
         "hmm", "hm", "mhm", "mmhm", "uh", "um", "oh", "ah", "ha", "haha", "lol",
         "so", "well", "just", "now", "here", "there", "yet", "still",
+        # Bare status-ping tokens (2026-08-08): "status?" was the fleet's #1 recurring
+        # L2 near-miss (rr_max -0.18, flagged daily) — a pure context-dependent ping with
+        # no recall intent. Gating it at Gate A stops the wasted search + the standing
+        # digest ⚠️. INV-7 holds: none of these is a domain noun in isolation — a real
+        # query ("status of the NAS", "eta on the backup") always carries another token.
+        "status", "progress", "eta", "news", "update", "updates",
+        "how", "hows", "how's", "going", "coming", "along", "any", "anything",
+        "what", "whats", "what's", "where", "up", "at",
     })
 
     def _prefetch_floor_cfg(self) -> dict:

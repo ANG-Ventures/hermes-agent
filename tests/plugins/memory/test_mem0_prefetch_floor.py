@@ -58,6 +58,11 @@ def _results(*memories):
     "yes please", "ok do it", "sure go ahead", "yes please proceed",
     "thanks that sounds good", "yep", "ok", "do it",
     "perfect thanks", "sounds great", "yes", "okay cool",
+    # Bare status pings (2026-08-08): the fleet's #1 recurring near-miss ("status?"
+    # at rr_max -0.18, flagged daily). Pure context-dependent — no recall intent.
+    "status?", "status", "whats the status", "what's up", "any update?",
+    "any updates?", "progress?", "eta?", "hows it going", "how's it coming along",
+    "where are we at", "status update?", "any news",
 ])
 def test_specificity_gate_blanks_ack_query(monkeypatch, tmp_path, ack):
     """A pure-acknowledgment turn has 0 content tokens → gated (the fix)."""
@@ -73,6 +78,10 @@ def test_specificity_gate_blanks_ack_query(monkeypatch, tmp_path, ack):
     "what temperature is the guest room", "bent pin CPU socket LGA1718 NAS",
     "yes please spec out the mem0 prefetch relevance floor",  # ack-prefixed but substantive
     "mute the kitchen",
+    # status-ping tokens must NOT swallow real queries (INV-7 zero-false-positive bar):
+    "status of the NAS", "eta on the backup", "update hermes", "whats the IP of the NAS",
+    "where is the NAS", "what time is it", "up the volume", "look at the logs",
+    "progress on the vault refactor", "news digest broken",
 ])
 def test_specificity_gate_keeps_real_short_query(monkeypatch, tmp_path, q):
     """INV-7/AC-8: a genuine short query (incl. ≤2-char domain tokens, 1-token commands)
