@@ -52,7 +52,7 @@ class TestFailoverReason:
 
     def test_enum_members_exist(self):
         expected = {
-            "auth", "auth_permanent", "billing", "rate_limit",
+            "auth", "auth_permanent", "account_blocked", "billing", "rate_limit",
             "upstream_rate_limit", "pool_exhausted",
             "overloaded", "server_error", "timeout",
             "ssl_cert_verification",
@@ -316,6 +316,59 @@ class TestClassifyApiError:
         )
         result = classify_api_error(e, provider="claude-bpr", model="x")
         assert result.reason == FailoverReason.overloaded
+
+    # ── Account/org entitlement 403 (subscription lapsed / org disallows OAuth) ──
+
+    def test_entitlement_403_classifies_as_account_blocked(self):
+        """2026-08-08 (sub-vps-10): a lapsed subscription makes Anthropic return
+        403 permission_error oauth_not_allowed_for_organization on EVERY request.
+        The token is structurally valid, so 'auth' rendered the misleading
+        '(auth refresh)' rider — while the runtime explicitly SKIPS the refresh
+        for this exact body (it is entitlement, not a stale token). Needs its own
+        reason so the announce can say what is actually wrong."""
+        e = MockAPIError(
+            "Error code: 403 - {'type': 'error', 'error': {'type': 'permission_error', "
+            "'message': 'OAuth authentication is currently not allowed for this "
+            "organization.', 'details': {'error_code': "
+            "'oauth_not_allowed_for_organization'}}}",
+            status_code=403,
+        )
+        result = classify_api_error(e, provider="claude-apr", model="claude-opus-5")
+        assert result.reason == FailoverReason.account_blocked
+        assert result.should_fallback is True
+        assert result.retryable is False
+        # Refreshing/rotating cannot fix an entitlement block — the credential
+        # is valid. Rotating just burns a healthy key.
+        assert result.should_rotate_credential is False
+
+    def test_entitlement_403_status_only_in_message(self):
+        """Same split as pool_exhausted: the body must classify identically
+        whether or not the status_code survives onto the exception."""
+        e = MockAPIError(
+            'HTTP 403: {"error":{"details":{"error_code":'
+            '"oauth_not_allowed_for_organization"}}}',
+            status_code=None,
+        )
+        result = classify_api_error(e, provider="claude-apr", model="claude-opus-5")
+        assert result.reason == FailoverReason.account_blocked
+        assert result.should_rotate_credential is False
+
+    def test_plain_403_still_auth(self):
+        """NEGATIVE CONTROL: a bare 403 keeps its historical 'auth' behavior —
+        only the entitlement/org shape gets the new reason."""
+        e = MockAPIError("Error code: 403 - forbidden", status_code=403)
+        result = classify_api_error(e, provider="anthropic", model="x")
+        assert result.reason == FailoverReason.auth
+
+    def test_permission_error_403_without_oauth_marker_stays_auth(self):
+        """NEGATIVE CONTROL: permission_error alone is too broad to reclassify."""
+        e = MockAPIError(
+            "Error code: 403 - {'error': {'type': 'permission_error', 'message': "
+            "'You do not have access to this model.'}}",
+            status_code=403,
+        )
+        result = classify_api_error(e, provider="anthropic", model="x")
+        assert result.reason == FailoverReason.auth
 
     def test_non_xai_403_generic_billing_code_remains_auth(self):
         """Do not broaden generic providers' historical structured-403 behavior."""

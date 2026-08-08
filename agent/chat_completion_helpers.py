@@ -1783,6 +1783,7 @@ _FALLBACK_REASON_LABELS = {
     "ssl_cert_verification": "TLS error",
     "auth": "auth refresh",
     "auth_permanent": "auth failed",
+    "account_blocked": "account blocked",
     "model_not_found": "model unavailable",
     "payload_too_large": "payload too large",
     "image_too_large": "image too large",
