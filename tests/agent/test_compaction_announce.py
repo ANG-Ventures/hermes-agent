@@ -600,7 +600,7 @@ def _real_transcript() -> list:
 
 
 class TestDoneSiteWiringBuiltin:
-    def test_builtin_compaction_emits_announce_with_session_pointer(self, tmp_path: Path):
+    def test_builtin_compaction_emits_announce_with_session_pointer(self, tmp_path: Path, monkeypatch):
         from hermes_state import SessionDB
 
         emitted: list = []
@@ -626,12 +626,23 @@ class TestDoneSiteWiringBuiltin:
         # client resolves, so the announce fires. Stub the preflight resolver to a
         # truthy client so this test exercises the announce WIRING it asserts
         # (companion to the _generate_summary stub above).
+        #
+        # Use monkeypatch, NOT a bare module-attribute assignment: this rebinds a
+        # MODULE-GLOBAL function that every later test in the process shares.  A
+        # hand-rolled save/restore here previously saved the original and never
+        # restored it, so the stub leaked for the rest of the session and any
+        # later test asserting "no aux provider resolves" received the stub's
+        # ``(object(), "test/model")`` instead of ``(None, None)`` — surfacing as
+        # ``assert <object object at 0x...> is None`` in a completely unrelated
+        # file (tests/run_agent/test_provider_parity.py). monkeypatch restores at
+        # teardown unconditionally, including on failure.
         import agent.conversation_compression as _ccmod
-        _orig_get_aux = None
         try:
             import agent.auxiliary_client as _auxmod
-            _orig_get_aux = _auxmod.get_text_auxiliary_client
-            _auxmod.get_text_auxiliary_client = lambda *a, **k: (object(), "test/model")
+            monkeypatch.setattr(
+                _auxmod, "get_text_auxiliary_client",
+                lambda *a, **k: (object(), "test/model"),
+            )
         except Exception:
             pass
 
