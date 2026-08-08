@@ -9,11 +9,13 @@ Covers:
 
 from __future__ import annotations
 
+import base64
 import json
 import sqlite3
 
 import pytest
 
+from agent.media_tokens import MEDIA_PART_TYPES
 from agent.model_metadata import compose_request_breakdown
 
 
@@ -174,6 +176,228 @@ def test_image_parts_use_flat_cost_not_raw_length():
     # Image flat cost is 1500; the raw base64 must not blow up history.
     assert comp["history_tokens"] < 5000
     assert comp["history_tokens"] >= 1500
+
+
+# --------------------------------------------------------------------------- #
+# Media double-billing regression (documents + audio, not just images)
+#
+# `_estimate_message_chars` (the char walk behind history_tokens) stripped only
+# IMAGE part types while `_count_image_tokens` tallied EVERY media type at its
+# provider price. Documents and audio were therefore billed twice: once
+# correctly per page/second, and again as raw base64 characters. Measured on a
+# synthetic 3-page PDF (533,580 base64 chars): 159,254 tokens instead of 6,788.
+# --------------------------------------------------------------------------- #
+def _synthetic_pdf(pages: int, pad_bytes: int) -> bytes:
+    """Minimal PDF whose page tree yields exactly `pages`, padded to size."""
+    objs = b"".join(
+        b"%d 0 obj\n<< /Type /Page /Parent 1 0 R >>\nendobj\n" % (i + 2)
+        for i in range(pages)
+    )
+    # Pad with a comment run so the payload is large without adding page nodes.
+    return (
+        b"%PDF-1.4\n" + objs + b"%" + (b"A" * pad_bytes) + b"\n"
+        + b"trailer\n<< /Root 1 0 R >>\n%%EOF\n"
+    )
+
+
+def _synthetic_wav(seconds: float, rate: int = 16000) -> bytes:
+    """Minimal 16-bit mono WAV of the requested duration."""
+    import struct
+
+    per_sec = rate * 2
+    fmt = struct.pack("<HHIIHH", 1, 1, rate, rate * 2, 2, 16)
+    data = b"\x00" * int(seconds * per_sec)
+    body = (
+        b"WAVE" + b"fmt " + struct.pack("<I", len(fmt)) + fmt
+        + b"data" + struct.pack("<I", len(data)) + data
+    )
+    return b"RIFF" + struct.pack("<I", len(body)) + body
+
+
+def _media_message(part: dict) -> dict:
+    return {"role": "user", "content": [{"type": "text", "text": "look at this"}, part]}
+
+
+@pytest.mark.parametrize(
+    "label, part_factory",
+    [
+        (
+            "document_pdf",
+            lambda: {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": base64.b64encode(
+                        _synthetic_pdf(pages=3, pad_bytes=400_000)
+                    ).decode(),
+                },
+            },
+        ),
+        (
+            "audio",
+            lambda: {
+                "type": "input_audio",
+                "input_audio": {
+                    "data": base64.b64encode(_synthetic_wav(seconds=12.5)).decode(),
+                    "format": "wav",
+                },
+            },
+        ),
+    ],
+)
+def test_document_and_audio_base64_is_not_double_billed(label, part_factory):
+    """Non-image media must be priced once, not once flat + once as base64."""
+    from agent.media_tokens import media_part_token_cost
+    from agent.model_metadata import estimate_messages_tokens_rough
+
+    part = part_factory()
+    msgs = [_media_message(part)]
+
+    priced = media_part_token_cost(part)
+    assert priced > 0, f"{label}: fixture is not recognized as media"
+
+    rough = estimate_messages_tokens_rough(msgs)
+    comp = compose_request_breakdown(msgs)
+    billed = comp["total_tokens"]
+
+    # `estimate_messages_tokens_rough` already strips media correctly; the
+    # breakdown must agree with it rather than re-billing the base64 payload.
+    # The small delta is per-message framing overhead, which rough omits.
+    assert billed <= rough + 64, (
+        f"{label}: billed {billed:,} tokens but the correct estimate is "
+        f"{rough:,} (media priced at {priced:,}); the base64 payload is being "
+        f"counted a second time as characters"
+    )
+    # And the absolute bound: nowhere near the raw base64 char count.
+    assert billed < priced * 4, (
+        f"{label}: billed {billed:,} tokens for media priced at {priced:,}"
+    )
+
+
+def test_media_stripping_is_insensitive_to_payload_size():
+    """Growing a document payload 10x must not change the token bill.
+
+    Payload size carries no pricing signal for media (documents bill per page),
+    so a larger base64 blob with the same page count must bill identically.
+    """
+    small = {
+        "type": "document",
+        "source": {
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": base64.b64encode(_synthetic_pdf(3, 40_000)).decode(),
+        },
+    }
+    large = {
+        "type": "document",
+        "source": {
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": base64.b64encode(_synthetic_pdf(3, 400_000)).decode(),
+        },
+    }
+    assert len(large["source"]["data"]) > len(small["source"]["data"]) * 5
+
+    a = compose_request_breakdown([_media_message(small)])["total_tokens"]
+    b = compose_request_breakdown([_media_message(large)])["total_tokens"]
+    assert a == b, (
+        f"token bill moved with payload size ({a:,} -> {b:,}); media base64 "
+        f"is leaking into the character walk"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# DRIFT GUARD
+#
+# The bug above was two sibling functions disagreeing about which part types
+# count as media. `_estimate_message_chars` and `_estimate_message_dense_sparse`
+# must strip the SAME set, and that set must be exactly `_count_image_tokens`'s
+# tallied set (`MEDIA_PART_TYPES`). This is behavioral: it exercises both
+# functions against every member of the shared constant.
+# --------------------------------------------------------------------------- #
+def _payload_for(part_type: str, blob: str) -> dict:
+    """A content part of `part_type` carrying `blob` wherever that type puts it."""
+    from agent.media_tokens import AUDIO_PART_TYPES, DOCUMENT_PART_TYPES
+
+    if part_type in AUDIO_PART_TYPES:
+        return {"type": part_type, "input_audio": {"data": blob, "format": "wav"}}
+    if part_type in DOCUMENT_PART_TYPES:
+        return {
+            "type": part_type,
+            "source": {"type": "base64", "media_type": "application/pdf", "data": blob},
+        }
+    return {"type": part_type, "image_url": {"url": f"data:image/png;base64,{blob}"}}
+
+
+@pytest.mark.parametrize("part_type", sorted(MEDIA_PART_TYPES))
+def test_both_char_walks_strip_every_media_part_type(part_type):
+    """Drift guard: both estimators must strip EVERY member of MEDIA_PART_TYPES.
+
+    If either function's stripped set falls behind the shared constant, its
+    char count scales with the base64 payload and the part gets billed twice.
+    """
+    from agent.model_metadata import (
+        _estimate_message_chars,
+        _estimate_message_dense_sparse,
+    )
+
+    small = _media_message(_payload_for(part_type, "Q" * 1_000))
+    large = _media_message(_payload_for(part_type, "Q" * 500_000))
+
+    chars_small = _estimate_message_chars(small)
+    chars_large = _estimate_message_chars(large)
+    assert chars_small == chars_large, (
+        f"_estimate_message_chars does not strip {part_type!r}: char count grew "
+        f"{chars_small:,} -> {chars_large:,} with the payload, so its base64 is "
+        f"billed on top of the flat media price"
+    )
+
+    ds_small = _estimate_message_dense_sparse(small)
+    ds_large = _estimate_message_dense_sparse(large)
+    assert ds_small == ds_large, (
+        f"_estimate_message_dense_sparse does not strip {part_type!r}: "
+        f"{ds_small} -> {ds_large}"
+    )
+
+
+def test_char_walks_agree_on_which_types_are_media():
+    """The two sibling walks must classify every part type identically.
+
+    Sweeps media AND non-media types: a part is 'stripped' iff its char count
+    is insensitive to payload size. Both functions must make the same call on
+    every type, so neither can drift ahead of (or behind) the other.
+    """
+    from agent.media_tokens import MEDIA_PART_TYPES
+    from agent.model_metadata import (
+        _estimate_message_chars,
+        _estimate_message_dense_sparse,
+    )
+
+    candidates = sorted(MEDIA_PART_TYPES) + ["text", "thinking", "tool_result"]
+    chars_strips: dict[str, bool] = {}
+    dense_strips: dict[str, bool] = {}
+
+    for part_type in candidates:
+        small = _media_message(_payload_for(part_type, "Q" * 1_000))
+        large = _media_message(_payload_for(part_type, "Q" * 200_000))
+        chars_strips[part_type] = (
+            _estimate_message_chars(small) == _estimate_message_chars(large)
+        )
+        dense_strips[part_type] = (
+            _estimate_message_dense_sparse(small)
+            == _estimate_message_dense_sparse(large)
+        )
+
+    assert chars_strips == dense_strips, (
+        "the two char walks disagree about which part types are media: "
+        f"_estimate_message_chars={chars_strips} vs "
+        f"_estimate_message_dense_sparse={dense_strips}"
+    )
+    # And the agreed-upon set is exactly the shared media vocabulary.
+    assert {t for t, stripped in chars_strips.items() if stripped} == set(
+        MEDIA_PART_TYPES
+    )
 
 
 def test_empty_inputs_are_all_zero():
