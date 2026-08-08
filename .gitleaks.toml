@@ -72,6 +72,25 @@ paths = [
   '''tests/hermes_cli/test_auth_provider_gate\.py''', # OpenRouter auth-gate fake sk-or- key
   '''tests/run_agent/test_moa_privacy_filter\.py''',  # fabricated JWT for privacy-filter redaction test
   '''native/fts5_cjk/vendor/sqlite3ext\.h''',         # VENDORED SQLite header — fn-ptr names, not credentials
+  # --- 2026-08-08 upstream parity sync: new upstream fake fixtures + verified FPs ---
+  # Each entry was opened and read before allowlisting; none is a live credential.
+  '''apps/desktop/electron/native-token-store\.test\.ts''',   # AT-live-…c123 / RT-live-…z789 keychain round-trip fixtures
+  '''tests/agent/test_anthropic_thinking_block_order\.py''',  # sk-LIVE-…-123 curl-header fixture
+  '''tests/hermes_cli/test_agent_import\.py''',               # ghp_SE…T123 fake GitHub PAT
+  '''tests/hermes_cli/test_arcee_provider\.py''',             # arc-te…2345 fake Arcee key
+  '''tests/hermes_cli/test_ollama_cloud_auth\.py''',          # test-o…2345 fake Ollama Cloud key
+  '''tests/hermes_cli/test_tencent_tokenhub_provider\.py''',  # sk-tes…5678 fake Tencent keys (x2)
+  '''tests/run_agent/test_reset_aware_primary_restore\.py''', # test-k…5678 fake primary-restore key
+  '''tests/skills/test_google_workspace_api\.py''',           # ya29.i…cted redacted-OAuth-token fixture
+  # Non-test sources — verified FPs, NOT credentials:
+  '''plugins/context_engine/lcm/assertion_store\.py''',       # matches `allow_empty=True` kwarg, not a secret
+  '''scripts/toolperf_abeval/ab_eval\.py''',                  # synthetic build-log marker `UNIQUE_TOKEN=tok_9f31c_middle`
+  '''optional-skills/productivity/telephony/scripts/telephony\.py''',  # PUBLIC ElevenLabs voice ID (cjVigY5qzO86Huf0OWal, "Eric")
+  # Found only by gitleaks 8.18.4 (the version CI pins); 8.30.x does not flag these.
+  '''tests/gateway/test_buzz_websocket\.py''',       # SELF_PUBKEY = Nostr PUBLIC key + BIP-340 test vector
+  '''tests/gateway/test_buzz_adapter\.py''',         # same Nostr PUBLIC key constant
+  '''tests/test_iron_proxy\.py''',                   # literal "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END..."
+  '''tests/run_agent/test_run_agent_init_memory\.py''',  # api_key="test-key-123456789"
 ]
 # Regex allowlist — SOURCE files keep full scanning EXCEPT public OAuth *client
 # IDs* (client IDs are sent in browser auth flows — public by design, not

@@ -108,6 +108,20 @@ def test_start_server_disables_ws_ping_on_loopback(monkeypatch):
     assert captured["ws_ping_timeout"] is None
 
 
+def test_start_server_accepts_base64_desktop_attachments_above_preview_limit(monkeypatch):
+    """The gateway frame cap must fit the Desktop attachment default after
+    base64 expansion and JSON framing; uvicorn's 16 MiB default would reject
+    the request before ``file.attach`` can stage it.
+    """
+    captured = _stub_uvicorn(monkeypatch)
+
+    web_server.start_server(host="127.0.0.1", port=0, open_browser=False)
+
+    raw_attachment_bytes = 256 * 1024 * 1024
+    base64_bytes = ((raw_attachment_bytes + 2) // 3) * 4
+    assert captured["ws_max_size"] > base64_bytes
+
+
 def test_start_server_enables_ws_ping_for_half_open_detection(monkeypatch):
     """Non-loopback (public) binds MUST keep the ws ping enabled so half-open
     connections (reverse-proxy 524, dropped Cloudflare Tunnel) raise
@@ -249,15 +263,28 @@ def test_get_session_stats_offloads_sessiondb_read(monkeypatch):
             self._record()
             return 12
 
-        def session_counts_by_source(self, **kwargs):
+        # fork parity NOTE (2026-08-08): get_session_stats moved to
+        # hermes_cli/web_routers/sessions.py, which calls
+        # session_count_by_source (SINGULAR) with an added exclude_children
+        # kwarg. The old double was named session_countS_by_source, so the real
+        # call hit AttributeError -> the caller's bare `except` swallowed it and
+        # by_source silently came back {}. Match the real signature.
+        def session_count_by_source(self, **kwargs):
             self._record()
-            assert kwargs == {"include_archived": True}
+            assert kwargs == {"include_archived": True, "exclude_children": True}
             return {"cli": 3, "telegram": 2}
 
         def close(self):
             self._record()
 
-    monkeypatch.setattr(web_server, "_open_session_db_for_profile", lambda _profile=None: _DB())
+    # fork parity NOTE (2026-08-07): the merge adopted upstream's
+    # _open_session_db_for_profile(profile, *, read_only) -- read_only is
+    # keyword-only REQUIRED, so the double must accept it.
+    monkeypatch.setattr(
+        web_server,
+        "_open_session_db_for_profile",
+        lambda _profile=None, **_kw: _DB(),
+    )
 
     result = asyncio.run(web_server.get_session_stats())
 

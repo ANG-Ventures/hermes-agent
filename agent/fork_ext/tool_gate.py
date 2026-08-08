@@ -62,6 +62,15 @@ def resolve_tool_search_unwrap(agent, function_name: str, function_args: dict[st
             underlying, underlying_args, err = _ts.resolve_underlying_call(function_args)
             if not err and underlying:
                 if underlying in tool_search_scoped_names(agent):
+                    # Probe-validate before unwrapping (port of ironclaw#5149,
+                    # merged from upstream 2026-08-08): a deferred tool's schema
+                    # is invisible until ``tool_describe``, so models invoke it
+                    # blind and omit required args. Returning the parameter
+                    # schema beats dispatching into an opaque KeyError that
+                    # cheap models loop on until the iteration budget dies.
+                    probe_err = _ts.validate_deferred_call_args(underlying, underlying_args)
+                    if probe_err is not None:
+                        return function_name, function_args, probe_err, probe_err
                     return underlying, underlying_args, None, None
                 block_message = tool_scope_block_message(underlying)
                 return function_name, function_args, block_message, tool_scope_block_result(underlying)

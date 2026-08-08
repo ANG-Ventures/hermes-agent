@@ -39,13 +39,6 @@ if not _os.environ.get("PYTEST_VERSION"):  # pragma: no cover - non-pytest harne
     _standalone_store.__enter__()  # held for the process lifetime, by design
 
 
-@pytest.fixture(autouse=True)
-def _self_isolated_cron_store(tmp_path):
-    """Belt-and-suspenders: never write 'brief' fixture jobs to a real store."""
-    import cron.jobs as _jm
-    with _jm.use_cron_store(tmp_path):
-        yield
-
 # ---------------------------------------------------------------------------
 # Self-isolation (2026-07-15 fixture-leak incident).
 #

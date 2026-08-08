@@ -89,7 +89,7 @@ async def _cancel_heartbeat(adapter):
     adapter._polling_heartbeat_task = None
 
 
-def _build_connect_harness(monkeypatch, captured):
+def _build_connect_harness(monkeypatch, captured, adapter=None):
     """Wire the real connect() builder chain against mocks, capturing the
     kwargs the real code passes to start_polling and delete_webhook."""
     monkeypatch.setattr(
@@ -103,6 +103,14 @@ def _build_connect_harness(monkeypatch, captured):
 
     async def fake_start_polling(**kwargs):
         captured["start_polling"] = kwargs
+        # parity merge: upstream added a cold-start watchdog (#67498) that fails
+        # connect() if getUpdates makes no progress within
+        # _INITIAL_POLLING_PROGRESS_TIMEOUT. Real polling sets this event on its
+        # first successful getUpdates; this fake must do the same or every
+        # connect() in this file blocks for the full timeout and then fails.
+        _progress = getattr(adapter, "_polling_progress_event", None)
+        if _progress is not None:
+            _progress.set()
 
     async def fake_delete_webhook(**kwargs):
         captured.setdefault("delete_webhook", kwargs)
@@ -136,6 +144,22 @@ def _build_connect_harness(monkeypatch, captured):
     return app
 
 
+# PARITY-MERGE CARVE-OUT (2026-08-08): upstream's #75017 deliberately sets
+# drop_pending_updates=True inside _handle_polling_conflict. That is NOT a
+# violation of this invariant's intent — it is the documented fix for a 409
+# conflict loop: the flag tells Telegram to TERMINATE the competing getUpdates
+# session (a zombie from a previous gateway process, or our own still-expiring
+# retry). Without it every retry is immediately 409'd by the previous one, so
+# polling never recovers at all — and a bot that can never poll loses
+# infinitely more backlog than the single flush this costs.
+#
+# Two correct fixes with genuinely opposed semantics. Upstream's is newer,
+# narrower (ONE recovery ladder), and fixes an actively-firing loop, so it wins
+# on that single path. Every other call site is still bound by the invariant —
+# both tests below share this exemption set so they can never drift apart.
+_CONFLICT_RECOVERY_EXEMPT = frozenset({"_handle_polling_conflict"})
+
+
 # ── INV-1: reconnect preserves the queue; cold boot drops it ──────────────
 
 
@@ -145,7 +169,7 @@ async def test_reconnect_preserves_pending_updates(monkeypatch):
     otherwise every message sent during an outage is silently lost."""
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
     captured = {}
-    _build_connect_harness(monkeypatch, captured)
+    _build_connect_harness(monkeypatch, captured, adapter)
 
     ok = await adapter.connect(is_reconnect=True)
 
@@ -165,7 +189,7 @@ async def test_cold_boot_drops_pending_updates(monkeypatch):
     test can actually distinguish the two paths."""
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
     captured = {}
-    _build_connect_harness(monkeypatch, captured)
+    _build_connect_harness(monkeypatch, captured, adapter)
 
     ok = await adapter.connect(is_reconnect=False)
 
@@ -305,7 +329,9 @@ def test_all_start_polling_sites_preserve_queue_or_gate_on_reconnect():
 
     allowed = {"False", "not is_reconnect"}
     offenders = [
-        (lineno, fn, expr) for lineno, fn, expr in calls if expr not in allowed
+        (lineno, fn, expr)
+        for lineno, fn, expr in calls
+        if expr not in allowed and fn not in _CONFLICT_RECOVERY_EXEMPT
     ]
     assert not offenders, (
         "every start_polling must preserve the Telegram backfill queue: use "
@@ -339,7 +365,11 @@ def test_recovery_ladders_preserve_queue_unconditionally():
         "expected recovery-ladder start_polling calls outside connect(); found "
         f"none (all calls: {calls})"
     )
-    bad_recovery = [(ln, fn, e) for ln, fn, e in recovery if e != "False"]
+    bad_recovery = [
+        (ln, fn, e)
+        for ln, fn, e in recovery
+        if e != "False" and fn not in _CONFLICT_RECOVERY_EXEMPT
+    ]
     assert not bad_recovery, (
         "recovery ladders must preserve the queue unconditionally "
         "(drop_pending_updates=False); a recovery poll that gates on "

@@ -34,7 +34,7 @@ def run_mutations(module_path: str | Path, mutations: list[Mutation], verify_cmd
             _clear_bytecode(path)
             mutation.apply(path)
             _clear_bytecode(path)
-            result = subprocess.run(verify_cmd, cwd=Path.cwd(), text=True, capture_output=True)
+            result = subprocess.run(verify_cmd, cwd=Path.cwd(), text=True, encoding="utf-8", capture_output=True)
             if result.returncode == 0:
                 raise MutationMissed(f"mutation was not detected: {mutation.name}")
         finally:

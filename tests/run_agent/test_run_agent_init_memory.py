@@ -15,6 +15,15 @@ from tests.run_agent._run_agent_helpers import (
 
 
 class TestInit:
+    # Parity note (2026-08-08): these patch
+    # ``hermes_cli.config.load_config_readonly`` (not ``load_config``).
+    # Upstream switched agent_init's config read to the readonly fast path
+    # — it returns the cached dict without load_config()'s defensive
+    # deepcopy (~135us saved on a hot path the agent hits 20-50x per turn).
+    # Patching the old symbol leaves init reading the REAL config, so every
+    # assertion here silently measured the developer's config.yaml instead
+    # of the fixture.
+
     def test_anthropic_base_url_accepted(self):
         """Anthropic base URLs should route to native Anthropic client."""
         with (
@@ -106,7 +115,7 @@ class TestInit:
             patch("run_agent.get_tool_definitions", return_value=[]),
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
-            patch("hermes_cli.config.load_config", return_value={}),
+            patch("hermes_cli.config.load_config_readonly", return_value={}),
         ):
             a = AIAgent(
                 api_key="test-k...7890",
@@ -125,7 +134,7 @@ class TestInit:
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
             patch(
-                "hermes_cli.config.load_config",
+                "hermes_cli.config.load_config_readonly",
                 return_value={"prompt_caching": {"cache_ttl": "1h"}},
             ),
         ):
@@ -146,7 +155,7 @@ class TestInit:
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
             patch(
-                "hermes_cli.config.load_config",
+                "hermes_cli.config.load_config_readonly",
                 return_value={"model": {"max_tokens": 4096}},
             ),
         ):
@@ -172,7 +181,7 @@ class TestInit:
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
             patch(
-                "hermes_cli.config.load_config",
+                "hermes_cli.config.load_config_readonly",
                 return_value={"model": {"max_tokens": 4096}},
             ),
         ):
@@ -196,7 +205,7 @@ class TestInit:
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
             patch(
-                "hermes_cli.config.load_config",
+                "hermes_cli.config.load_config_readonly",
                 return_value={"prompt_caching": {"cache_ttl": "30m"}},
             ),
         ):

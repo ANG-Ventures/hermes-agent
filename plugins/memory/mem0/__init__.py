@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional
 import weakref
 
 from agent.memory_provider import MemoryProvider
+from agent.secret_scope import get_secret
 from tools.registry import tool_error
 
 from .temporal_parse import created_at_in_window, parse_temporal_window
@@ -177,7 +178,10 @@ def _load_config() -> dict:
     from hermes_constants import get_hermes_home
 
     config = {
-        "api_key": os.environ.get("MEM0_API_KEY", ""),
+        # parity 2026-08-07: fork dropped upstream's "mode" key (dead — 0 consumers in
+        # this module); ADOPTED upstream's get_secret() secret-scope routing for the
+        # credential (falls through to os.environ when no scope is installed).
+        "api_key": get_secret("MEM0_API_KEY", ""),
         "host": os.environ.get("MEM0_HOST", ""),
         "admin_api_key": os.environ.get("MEM0_ADMIN_API_KEY", ""),
         "ca_bundle": os.environ.get("MEM0_CA_BUNDLE", ""),
@@ -663,7 +667,7 @@ class Mem0MemoryProvider(MemoryProvider):
         existing = {}
         if config_path.exists():
             try:
-                existing = json.loads(config_path.read_text())
+                existing = json.loads(config_path.read_text(encoding="utf-8"))
             except Exception:
                 pass
         existing.update(values)

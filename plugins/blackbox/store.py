@@ -551,7 +551,7 @@ def reprice_unpriced(pricing_fn, *, apply: bool = False, limit: int | None = Non
             if committed_ids:
                 nonce = uuid.uuid4().hex[:8]
                 manifest = _db_path().parent / f"reprice-run-{time.strftime('%Y%m%d-%H%M%S')}-{nonce}.json"
-                manifest.write_text(json.dumps(committed_ids))
+                manifest.write_text(json.dumps(committed_ids), encoding="utf-8")
         return result
     finally:
         conn.close()

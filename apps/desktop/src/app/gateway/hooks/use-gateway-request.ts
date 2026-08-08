@@ -7,19 +7,16 @@ import { $gateway, ensureActiveGatewayOpen, isActivePrimary } from '@/store/gate
 import { $activeGatewayProfile } from '@/store/profile'
 import { $gatewayState, setConnection } from '@/store/session'
 
-// This client's source label, threaded to the backend on session-originating
-// RPCs so turns from the desktop app are attributed to "desktop" rather than
-// the shared "tui" default. The backend sanitizes it (see
-// tui_gateway.server._sanitize_client_source).
-const CLIENT_SOURCE = 'desktop'
-
-// RPC methods that MINT or (RE)ATTACH a session and therefore build an agent
-// whose platform should carry the client label. Other methods (steer, title,
-// usage, …) act on an existing session and ignore a `source` field.
-const SESSION_ORIGIN_METHODS = new Set(['session.create', 'session.resume'])
-
 export function useGatewayRequest() {
   const gatewayState = useStore($gatewayState)
+  // Reactive companion to `gatewayRef`. The ref exists so `requestGateway`
+  // keeps a stable identity and always reaches the live socket, but it is only
+  // populated by the subscription effect below — i.e. AFTER the first render.
+  // A component that reads `gatewayRef.current` while rendering therefore sees
+  // null on mount, and if the connection state doesn't happen to flip
+  // afterwards it never re-renders to pick the instance up. Anything that needs
+  // the gateway as a render-time VALUE (props, memo deps) must use this.
+  const gateway = useStore($gateway) as HermesGateway | null
   const gatewayRef = useRef<HermesGateway | null>(null)
 
   const connectionRef = useRef<Awaited<ReturnType<NonNullable<typeof window.hermesDesktop>['getConnection']>> | null>(
@@ -33,6 +30,7 @@ export function useGatewayRequest() {
   // message instead of the opaque "connection closed" that triggered the retry.
   const reauthErrorRef = useRef<unknown>(null)
 
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     gatewayStateRef.current = gatewayState
   }, [gatewayState])
@@ -113,19 +111,8 @@ export function useGatewayRequest() {
         throw new Error('Hermes gateway unavailable')
       }
 
-      // Tag session-originating calls with this client so the backend records
-      // the turn's platform/source as "desktop" instead of the shared "tui"
-      // default (the desktop app, dashboard, and Ink TUI all drive the same
-      // JSON-RPC server). Only stamp when the caller hasn't set an explicit
-      // source, and only on the methods that mint/attach a session — every
-      // other RPC ignores the field.
-      const outbound =
-        SESSION_ORIGIN_METHODS.has(method) && params.source === undefined
-          ? { ...params, source: CLIENT_SOURCE }
-          : params
-
       try {
-        return await gateway.request<T>(method, outbound, timeoutMs, signal)
+        return await gateway.request<T>(method, params, timeoutMs, signal)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
 
@@ -151,11 +138,11 @@ export function useGatewayRequest() {
           throw error
         }
 
-        return recovered.request<T>(method, outbound, timeoutMs, signal)
+        return recovered.request<T>(method, params, timeoutMs, signal)
       }
     },
     [ensureGatewayOpen]
   )
 
-  return { connectionRef, gatewayRef, requestGateway }
+  return { connectionRef, gateway, gatewayRef, requestGateway }
 }

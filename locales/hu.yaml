@@ -19,6 +19,7 @@ gateway:
   agents:
     active_agents: '**Aktív ügynökök:** {count}'
     async_jobs: '**Átjáró aszinkron feladatai:** {count}'
+    background_delegations: '**Háttérdelegálások:** {count}'
     header: 🤖 **Aktív ügynökök és feladatok**
     more: '... és még {count}'
     none: Nincsenek aktív ügynökök vagy futó feladatok.
@@ -97,7 +98,7 @@ gateway:
     full_request_no_fixed: after excludes system prompt + tool schemas (no resident agent to measure them); next live turn will show the full size.
     full_request_real: 'Full request size: {before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; before = last live request, after = estimate of next)'
     full_request_unchanged: 'Full request size: {before} tokens (unchanged — next turn resends the same context)'
-    in_progress: '⏳ ~{count:,} üzenet tömörítése… egy nagy munkamenet néhány percig is eltarthat. Az eredményt itt teszem közzé, ha kész.'
+    in_progress: ⏳ ~{count:,} üzenet tömörítése… egy nagy munkamenet néhány percig is eltarthat. Az eredményt itt teszem közzé, ha kész.
     no_provider: Nincs konfigurált szolgáltató — nem lehet tömöríteni.
     not_enough: Nincs elég beszélgetés a tömörítéshez (legalább 4 üzenet kell).
     nothing_to_do: Még nincs mit tömöríteni (a teljes átirat még védett kontextus).
@@ -105,6 +106,24 @@ gateway:
     summary_failed: ⚠️ Az összefoglaló generálása sikertelen ({error}). {count} korábbi üzenet eltávolítva és helykitöltővel helyettesítve; a korábbi kontextus már nem helyreállítható. Érdemes ellenőrizni az auxiliary.compression modell konfigurációját.
   config_read_failed: '⚠️ Nem sikerült olvasni a config.yaml fájlt: {error}'
   config_save_failed: '⚠️ Nem sikerült menteni a konfigurációt: {error}'
+  context:
+    bar: '{bar}'
+    compressions: 'Compressions this session: {count}'
+    detail_after_first: _(Full compression and throughput stats available after the first agent response)_
+    estimated: 'Estimated context: ~{count} tokens across {messages} messages'
+    header: 🧠 **Context Window**
+    headroom: 'Headroom to limit: {headroom} tokens'
+    in_use: 'In use: {used} / {total} ({pct}%)'
+    last_savings: 'Last compression freed: {savings}% of context'
+    model: 'Model: `{model}`'
+    no_data: No context data available yet. Send a message to start a session.
+    over_threshold: ⚠️ **Over auto-compression threshold ({threshold}, {threshold_pct}%)**
+    threshold: 'Auto-compresses at: {threshold} ({threshold_pct}%) — {to_go} to go'
+    throughput_note: _Throughput, not context size — each call re-sends the window above._
+    total_billed: 'Total billed: {total}'
+    totals_header: Session totals (cumulative across {calls} API calls)
+    totals_line: Input {input} · Output {output} · Reasoning {reasoning}
+    window: 'Window: {total} tokens'
   credits:
     not_logged_in: Nincs bejelentkezve a Nous Portalra. Jelentkezz be a kreditegyenleg megtekintéséhez és feltöltéséhez.
   debug:
@@ -120,6 +139,10 @@ gateway:
     denied_singular: ❌ Parancs elutasítva.
     no_pending: Nincs elutasítható függőben lévő parancs.
     stale: ❌ Parancs elutasítva (a jóváhagyás elavult).
+  diff:
+    failed: '{error}'
+    no_changes: Nincs változás.
+    not_enabled: "A checkpointok nincsenek engedélyezve, így nincs munkamenet-alapvonal.\nEngedélyezd a config.yaml-ban:\n```\ncheckpoints:\n  enabled: true\n```\nA sima /diff továbbra is működik — közvetlenül a gitet használja."
   draining: ⏳ {count} aktív ügynök befejezésére várunk az újraindítás előtt...
   fast:
     choice_fast: fast — Priority Processing bekapcsolva
@@ -344,11 +367,11 @@ gateway:
       **Megjelenítés:** {display}
 
 
-      _Használat:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|reset|show|hide> [--global]`'
+      _Használat:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|ultra|reset|show|hide> [--global]`'
     unknown_arg: '⚠️ Ismeretlen argumentum: `{arg}`
 
 
-      **Érvényes szintek:** none, minimal, low, medium, high, xhigh, max
+      **Érvényes szintek:** none, minimal, low, medium, high, xhigh, max, ultra
 
       **Megjelenítés:** show, hide
 
@@ -505,7 +528,7 @@ gateway:
     state_no: Nem
     state_yes: Igen ⚡
     title: '**Cím:** {title}'
-    tokens: '**Tokenek:** {tokens}'
+    tokens: '**Lifetime tokens billed:** {tokens} _(not your current context size; use `/context`)_'
   stop:
     no_active: Nincs leállítható aktív feladat.
     stopped: ⚡ Leállítva. Folytathatod ezt a munkamenetet.
@@ -581,7 +604,7 @@ gateway:
       message: the last message
       tool: a tool result
       user: your message
-    removed: "↩️ Undid {turns} half-turn(s) ({count} message(s))."
+    removed: ↩️ Undid {turns} half-turn(s) ({count} message(s)).
   update:
     hermes_cmd_not_found: ✗ Nem sikerült megtalálni a `hermes` parancsot. A Hermes fut, de a frissítőparancs nem találta a futtatható fájlt a PATH-on vagy a jelenlegi Python interpreteren keresztül. Próbáld futtatni a `hermes update` parancsot manuálisan a terminálban.
     not_git_repo: ✗ Nem git-tárhely — frissítés nem lehetséges.

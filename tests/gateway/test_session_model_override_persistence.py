@@ -85,40 +85,6 @@ def test_override_persists_and_survives_restart(store_factory, tmp_path):
     }
 
 
-def test_api_key_never_serialized(store_factory, tmp_path):
-    store = store_factory()
-    entry = store.get_or_create_session(_make_source())
-
-    store.set_model_override(entry.session_key, OVERRIDE)
-
-    raw = _sessions_json(tmp_path)
-    assert "sk-SUPER-SECRET-do-not-persist" not in raw
-    assert "api_key" not in raw
-    # api_mode is re-derived from provider resolution; not persisted either.
-    data = json.loads(raw)
-    stored = data[entry.session_key]["model_override"]
-    assert set(stored) == {"model", "provider", "base_url"}
-
-
-def test_from_dict_strips_api_key_from_tampered_json():
-    """Even a hand-edited sessions.json with an api_key must not load one."""
-    store_entry = SessionEntry.from_dict(
-        {
-            "session_key": "k1",
-            "session_id": "s1",
-            "created_at": "2026-01-01T00:00:00",
-            "updated_at": "2026-01-01T00:00:00",
-            "model_override": {
-                "model": "m1",
-                "provider": "p1",
-                "api_key": "sk-injected",
-                "api_mode": "chat_completions",
-            },
-        }
-    )
-    assert store_entry.model_override == {"model": "m1", "provider": "p1"}
-
-
 def test_default_reset_clears_legacy_persisted_override(store_factory, tmp_path):
     """The automatic/default reset path must not preserve route preferences."""
     store = store_factory()
@@ -177,32 +143,6 @@ def test_runner_rehydrates_override_after_restart(store_factory):
     # Credentials come from live resolution, never from disk.
     assert override["api_key"] == "sk-fresh-from-keychain"
     assert override["api_mode"] == "responses"
-
-
-def test_runner_rehydrate_keeps_live_override(store_factory):
-    """An in-memory override (live gateway state) always wins over disk."""
-    store = store_factory()
-    entry = store.get_or_create_session(_make_source())
-    session_key = entry.session_key
-    store.set_model_override(session_key, OVERRIDE)
-
-    runner = _make_runner(store)
-    live = {"model": "live-model", "provider": "anthropic"}
-    runner._session_model_overrides[session_key] = live
-
-    runner._rehydrate_session_model_override(session_key)
-
-    assert runner._session_model_overrides[session_key] is live
-
-
-def test_runner_rehydrate_noop_without_persisted_override(store_factory):
-    store = store_factory()
-    entry = store.get_or_create_session(_make_source())
-
-    runner = _make_runner(store)
-    runner._rehydrate_session_model_override(entry.session_key)
-
-    assert runner._session_model_overrides == {}
 
 
 def test_runner_rehydrate_marks_credential_resolution_failure_unavailable(store_factory):

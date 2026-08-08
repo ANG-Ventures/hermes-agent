@@ -27,6 +27,7 @@ class TestNousCredentialRefresh:
         agent.api_mode = "chat_completions"
 
         closed = {"value": False}
+        retired = {"value": False}
         rebuilt = {"kwargs": None}
         captured = {}
 
@@ -53,11 +54,28 @@ class TestNousCredentialRefresh:
         )
 
         agent.client = _ExistingClient()
+        monkeypatch.setattr(
+            type(agent),
+            "_retire_shared_openai_client",
+            lambda self, client, *, reason: retired.__setitem__("value", True),
+            raising=False,
+        )
         with patch("run_agent.OpenAI", side_effect=_fake_openai):
             ok = agent._try_refresh_nous_client_credentials(force=True)
 
         assert ok is True
-        assert closed["value"] is True
+        # Parity note (2026-08-08): this asserted the replaced client was
+        # hard-``close()``d. Upstream removed that on purpose (#70773 /
+        # #67142 / #29507): ``close()`` releases the pool's raw FDs from the
+        # CALLING thread, but the shared primary client has no single owner —
+        # a credential refresh on the turn thread can yank an FD out from
+        # under another thread still unwinding a request. The replacement is
+        # ``_retire_shared_openai_client``: shut the sockets down (FD-safe
+        # from any thread) and let GC release the FDs once every borrower has
+        # unwound. Assert RETIREMENT, which is the contract now — asserting
+        # close() would demand the use-after-free back.
+        assert retired["value"] is True
+        assert closed["value"] is False
         assert captured["force_refresh"] is True
         assert rebuilt["kwargs"]["api_key"] == "new-nous-key"
         assert (
@@ -76,7 +94,7 @@ class TestCredentialPoolRecovery:
             def current(self):
                 return current
 
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, api_key_hint=None):
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, api_key_hint=None, **_kwargs):
                 assert status_code == 402
                 assert error_context is None
                 return next_entry
@@ -97,7 +115,7 @@ class TestCredentialPoolRecovery:
         next_entry = SimpleNamespace(label="secondary")
 
         class _Pool:
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, api_key_hint=None):
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, api_key_hint=None, **_kwargs):
                 assert status_code == 400
                 assert error_context == {"reason": "out_of_extra_usage"}
                 return next_entry
@@ -126,7 +144,7 @@ class TestCredentialPoolRecovery:
             def entries(self):
                 return []
 
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, api_key_hint=None):
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, api_key_hint=None, **_kwargs):
                 assert status_code == 429
                 assert error_context is None
                 return next_entry
@@ -178,7 +196,7 @@ class TestCredentialPoolRecovery:
             def try_refresh_matching(self, api_key_hint=None):
                 return None  # refresh failed
 
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, api_key_hint=None):
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, api_key_hint=None, **_kwargs):
                 assert status_code == 401
                 assert error_context is None
                 return next_entry
@@ -202,7 +220,7 @@ class TestCredentialPoolRecovery:
             def try_refresh_matching(self, api_key_hint=None):
                 return None
 
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, api_key_hint=None):
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, api_key_hint=None, **_kwargs):
                 assert error_context is None
                 return None  # no more credentials
 
@@ -282,7 +300,7 @@ class TestCredentialPoolRecovery:
             def entries(self):
                 return []
 
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, api_key_hint=None):
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, api_key_hint=None, **_kwargs):
                 captured["status_code"] = status_code
                 captured["error_context"] = error_context
                 return next_entry
@@ -605,8 +623,20 @@ class TestPersistUserMessageOverride:
             "[Voice input — respond concisely and conversationally, "
             "2-3 sentences max. No code blocks or markdown.] Hello there"
         )
-        first_db_write = agent._session_db.append_message.call_args_list[0].kwargs
+        # Parity note (2026-08-08): upstream replaced the per-message
+        # ``append_message`` writes with a single batched
+        # ``append_messages_batch`` call (0 refs on the fork, 2 upstream).
+        # The #48677 contract is unchanged and still verified below — the
+        # DB row carries the clean override while ``api_content`` preserves
+        # the exact text sent to the model — only the write API moved.
+        batch_call = agent._session_db.append_messages_batch.call_args
+        assert batch_call is not None, "messages must still be persisted"
+        first_db_write = batch_call.kwargs["messages"][0]
         assert first_db_write["content"] == "Hello there"
+        assert first_db_write["api_content"] == (
+            "[Voice input — respond concisely and conversationally, "
+            "2-3 sentences max. No code blocks or markdown.] Hello there"
+        )
 
 
 class TestOAuthFlagAfterCredentialRefresh:

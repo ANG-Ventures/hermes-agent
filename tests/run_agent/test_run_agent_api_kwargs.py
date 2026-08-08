@@ -16,6 +16,15 @@ from tests.run_agent._run_agent_helpers import (
 )
 
 
+# Parity note (2026-08-08): these patch
+# ``hermes_cli.config.load_config_readonly``, not ``load_config``.
+# Upstream switched agent_init's config read to the readonly fast path
+# (returns the cached dict without load_config's defensive deepcopy —
+# ~135us on a path the agent hits 20-50x per turn). Patching the old
+# symbol leaves __init__ reading the REAL ~/.hermes/config.yaml, so the
+# assertions below silently measured the developer's machine.
+
+
 class TestBuildSystemPrompt:
     def test_always_has_identity(self, agent):
         prompt = agent._build_system_prompt()
@@ -136,7 +145,7 @@ class TestToolUseEnforcementConfig:
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
             patch(
-                "hermes_cli.config.load_config",
+                "hermes_cli.config.load_config_readonly",
                 return_value={"agent": {"tool_use_enforcement": tool_use_enforcement}},
             ),
         ):
@@ -282,7 +291,7 @@ class TestToolUseEnforcementConfig:
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
             patch(
-                "hermes_cli.config.load_config",
+                "hermes_cli.config.load_config_readonly",
                 return_value={"agent": {"tool_use_enforcement": True}},
             ),
         ):
@@ -319,7 +328,7 @@ class TestTaskCompletionGuidance:
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
             patch(
-                "hermes_cli.config.load_config",
+                "hermes_cli.config.load_config_readonly",
                 return_value={"agent": agent_cfg},
             ),
         ):
@@ -376,7 +385,7 @@ class TestTaskCompletionGuidance:
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
             patch(
-                "hermes_cli.config.load_config",
+                "hermes_cli.config.load_config_readonly",
                 return_value={"agent": {"task_completion_guidance": True}},
             ),
         ):
@@ -408,7 +417,7 @@ class TestEnvironmentProbeIntegration:
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
             patch(
-                "hermes_cli.config.load_config",
+                "hermes_cli.config.load_config_readonly",
                 return_value={"agent": {"environment_probe": environment_probe}},
             ),
         ):

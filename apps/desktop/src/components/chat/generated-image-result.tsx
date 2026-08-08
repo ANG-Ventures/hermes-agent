@@ -6,7 +6,6 @@ import { DiffusionCanvas } from '@/components/chat/image-generation-placeholder'
 import { ImageActionButton, ImageLightbox } from '@/components/chat/zoomable-image'
 import { useImageDownload } from '@/hooks/use-image-download'
 import { useI18n } from '@/i18n'
-import { readDesktopFileDataUrl } from '@/lib/desktop-fs'
 import { generatedImageFromResult } from '@/lib/generated-images'
 import { filePathFromMediaPath, gatewayMediaDataUrl, isRemoteGateway, mediaExternalUrl, mediaName } from '@/lib/media'
 import { cn } from '@/lib/utils'
@@ -42,11 +41,11 @@ async function resolveImageSrc(path: string): Promise<string> {
     return gatewayMediaDataUrl(path)
   }
 
-  if (!window.hermesDesktop) {
+  if (!window.hermesDesktop?.readFileDataUrl) {
     return mediaExternalUrl(path)
   }
 
-  return readDesktopFileDataUrl(filePathFromMediaPath(path))
+  return window.hermesDesktop.readFileDataUrl(filePathFromMediaPath(path))
 }
 
 export const GeneratedImage: FC<{ aspectRatio?: string; result?: unknown }> = ({ aspectRatio, result }) => {
@@ -97,7 +96,7 @@ export const GeneratedImage: FC<{ aspectRatio?: string; result?: unknown }> = ({
   if (failed && image) {
     return (
       <a
-        className="mt-2 inline-block font-semibold text-foreground underline underline-offset-4 decoration-current/20 wrap-anywhere"
+        className="mt-2 ref inline-block wrap-anywhere"
         href="#"
         onClick={event => {
           event.preventDefault()

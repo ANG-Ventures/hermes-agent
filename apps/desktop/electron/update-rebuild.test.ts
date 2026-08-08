@@ -16,7 +16,7 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { runRebuildWithRetry, shouldRetryRebuild } from './update-rebuild.ts'
+import { runRebuildWithRetry, shouldRetryRebuild } from './update-rebuild'
 
 test('shouldRetryRebuild retries only on a non-success exit', () => {
   assert.equal(shouldRetryRebuild(0), false)

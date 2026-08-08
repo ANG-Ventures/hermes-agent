@@ -5,6 +5,7 @@ import type { HermesConnection } from '@/global'
 import { HermesGateway } from '@/hermes'
 import { translateNow } from '@/i18n'
 import { desktopDefaultCwd } from '@/lib/desktop-fs'
+import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import {
   $desktopBoot,
   applyDesktopBootProgress,
@@ -30,39 +31,28 @@ import {
   $activeSessionId,
   $connection,
   $currentCwd,
-  $messages,
   $sessions,
-  $sessionsTotal,
   ensureDefaultWorkspaceCwd,
-  getRememberedSessionId,
   setConnection,
   setCurrentBranch,
   setCurrentCwd,
-  setMessages,
-  setSessions,
-  setSessionsLoading,
-  setSessionsTotal
+  setSessionsLoading
 } from '@/store/session'
 import { $attentionSessionIds, $workingSessionIds, resetTileRuntimeBindings } from '@/store/session-states'
 import type { RpcEvent } from '@/types/hermes'
 
-import { hydrateFromRenderCache, reconcileRenderCache } from '../../render-cache-hydration'
-import { preloadTranscripts } from '../../transcript-preload'
-
 import { stashGatewaySurvivor, survivorIsStale, takeGatewaySurvivor } from './gateway-hmr-survivor'
 
-// One boot sweep per app LAUNCH (not per hook mount): the I4b orphan cull only
-// needs to run once against the first live list; re-mounts must not re-sweep.
-const renderCacheSweptRef = { current: false }
-// One transcript-preload pass per launch, same reasoning.
-const transcriptPreloadStartedRef = { current: false }
-
-// After this many consecutive failed reconnects (≈45s with the 1→15s backoff)
-// raise a recoverable boot error. Otherwise a dropped remote gateway loops the
-// backoff forever behind the fullscreen CONNECTING overlay with no way to reach
-// Settings / sign in / switch to local — the "lost connection breaks the app"
-// dead end. The next successful reconnect clears it.
-const RECONNECT_ESCALATE_AFTER = 6
+// After the reconnect loop has been failing for this long, raise a recoverable
+// boot error. Otherwise a dropped remote gateway loops the backoff forever
+// behind the fullscreen CONNECTING overlay with no way to reach Settings /
+// sign in / switch to local — the "lost connection breaks the app" dead end.
+// The next successful reconnect clears it. Time-based (not attempt-count)
+// because the full-jitter backoff makes attempt counts a meaningless clock:
+// six jittered attempts can elapse in ~9s, while the old deterministic
+// 1→15s ladder took ~45s to reach six failures — this threshold keeps that
+// original ~45s calibration.
+const RECONNECT_ESCALATE_AFTER_MS = 45_000
 
 interface GatewayBootOptions {
   beforeConnectionSwitch: () => void
@@ -129,13 +119,18 @@ export function useGatewayBoot({
     let reconnecting = false
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
     let reconnectAttempt = 0
+    // Wall-clock start of the current disconnect episode (first failed
+    // reconnect attempt); null while healthy. Drives the time-based
+    // escalation below. Reset on a clean open or a manual/wake reconnect.
+    let reconnectFailingSince: number | null = null
     // Surface "sign in again" once per disconnect episode, not on every backoff
     // tick — a stale OAuth ticket fails every attempt and would otherwise stack
     // identical error toasts (and their haptics). Reset on the next clean open.
     let reauthNotified = false
-    // Raised once the reconnect loop crosses RECONNECT_ESCALATE_AFTER so the
-    // recovery overlay replaces the dead-end CONNECTING screen. Reset on a clean
-    // open or a manual/wake-driven reconnect.
+    // Raised once the reconnect loop has been failing for
+    // RECONNECT_ESCALATE_AFTER_MS so the recovery overlay replaces the
+    // dead-end CONNECTING screen. Reset on a clean open or a manual/
+    // wake-driven reconnect.
     let escalated = false
 
     // Wrap the live getter in a call so TS control-flow analysis doesn't narrow
@@ -188,6 +183,7 @@ export function useGatewayBoot({
         }
 
         reconnectAttempt = 0
+        reconnectFailingSince = null
         // A respawned backend re-mints (recycles) runtime ids, so any tile's
         // bound runtime id is now stale — drop them so each tile re-resumes.
         resetTileRuntimeBindings()
@@ -207,7 +203,11 @@ export function useGatewayBoot({
         reconnecting = false
 
         if (!cancelled && !gatewayOpen() && !$gatewaySwitching.get()) {
-          if (reconnectAttempt >= RECONNECT_ESCALATE_AFTER && !escalated) {
+          if (reconnectFailingSince === null) {
+            reconnectFailingSince = Date.now()
+          }
+
+          if (Date.now() - reconnectFailingSince >= RECONNECT_ESCALATE_AFTER_MS && !escalated) {
             escalated = true
             failDesktopBoot(translateNow('boot.errors.gatewayConnectionLost'))
           }
@@ -222,8 +222,11 @@ export function useGatewayBoot({
         return
       }
 
-      // 1s, 2s, 4s … capped at 15s.
-      const delay = Math.min(15_000, 1_000 * 2 ** Math.min(reconnectAttempt, 4))
+      // Full-jitter exponential backoff (300ms base, 15s cap) so a gateway
+      // restart doesn't get redialed by every desktop client in lockstep —
+      // an immediate-retry reconnect storm can exhaust the gateway's file
+      // descriptors while it's still coming back up.
+      const delay = reconnectBackoffDelayMs(reconnectAttempt)
       reconnectAttempt += 1
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null
@@ -238,6 +241,7 @@ export function useGatewayBoot({
 
       clearReconnectTimer()
       reconnectAttempt = 0
+      reconnectFailingSince = null
       escalated = false
       reconnectSecondaryGateways()
 
@@ -284,6 +288,7 @@ export function useGatewayBoot({
       $gatewaySwitching.set(true)
       clearReconnectTimer()
       reconnectAttempt = 0
+      reconnectFailingSince = null
       escalated = false
       reauthNotified = false
       callbacksRef.current.beforeConnectionSwitch()
@@ -386,6 +391,7 @@ export function useGatewayBoot({
 
       if (st === 'open') {
         reconnectAttempt = 0
+        reconnectFailingSince = null
         reauthNotified = false
         escalated = false
         clearReconnectTimer()
@@ -481,31 +487,6 @@ export function useGatewayBoot({
     })
 
     async function boot() {
-      // Cache paint (Phase 2, startup-latency): seed the sidebar from the
-      // render cache BEFORE any network round-trip, so a warm launch shows
-      // last-known-good sessions instead of skeletons. Fail-open: any cache
-      // problem paints nothing and boot proceeds exactly as before (I3). The
-      // painted rows are read-only by construction — the composer stays
-      // gateway-gated until the WS handshake completes (I2), and the live
-      // refreshSessions() below wholesale-replaces the list (I1/I5).
-      const hydration = await hydrateFromRenderCache({
-        getSessions: () => $sessions.get(),
-        setSessions: rows => setSessions(rows),
-        setSessionsTotal: total => setSessionsTotal(total),
-        // Paint the last-open session's transcript tail too (the route restore
-        // below navigates to it), so the chat pane shows content, not a blank.
-        rememberedSessionId: getRememberedSessionId(),
-        getMessages: () => $messages.get(),
-        setMessages: rows => setMessages(rows as never)
-      }).catch(() => ({ painted: false, transcriptPainted: false, gatewayUrl: null, cachedSessionIds: [] }))
-
-      const cachedSessions = hydration.painted ? $sessions.get() : null
-
-      if (hydration.painted) {
-        // Rows are visible; kill the skeleton state early.
-        setSessionsLoading(false)
-      }
-
       try {
         const conn = await desktop.getConnection()
 
@@ -562,43 +543,8 @@ export function useGatewayBoot({
           return
         }
 
-        setDesktopBootStep({
-          phase: 'renderer.sessions',
-          message: translateNow('boot.steps.loadingSessions'),
-          progress: 99
-        })
-        await callbacksRef.current.refreshSessions().catch(() => undefined)
-
-        // Live list has landed (wholesale merge). Report cache divergence,
-        // write the fresh list back, and boot-sweep orphaned transcripts (I4b).
-        reconcileRenderCache({
-          gatewayUrl: hydration.gatewayUrl ?? conn?.baseUrl ?? null,
-          cachedSessionIds: hydration.cachedSessionIds,
-          cachedSessions,
-          liveSessions: $sessions.get(),
-          liveTotal: $sessionsTotal.get(),
-          sweptRef: renderCacheSweptRef
-        })
-
         completeDesktopBoot()
         bootCompleted = true
-
-        // Transcript preload (follow-up, 2026-07-11): once boot has fully
-        // settled, gently warm the render cache with the transcripts of
-        // pinned + visible sessions so switching to any of them (and the next
-        // cold launch) paints instantly. Strictly sequential + paced; runs at
-        // most once per launch; stops if the gateway drops or we unmount.
-        if (!transcriptPreloadStartedRef.current) {
-          transcriptPreloadStartedRef.current = true
-          const preloadUrl = hydration.gatewayUrl ?? conn?.baseUrl ?? null
-          setTimeout(() => {
-            void preloadTranscripts({
-              gatewayUrl: preloadUrl,
-              sessions: $sessions.get(),
-              shouldStop: () => cancelled || !gatewayOpen()
-            }).catch(() => undefined)
-          }, 5_000)
-        }
       } catch (err) {
         if (!cancelled) {
           const message = err instanceof Error ? err.message : String(err)
