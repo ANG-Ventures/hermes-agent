@@ -935,9 +935,15 @@ class GatewaySlashCommandsMixin:
         if not used:
             used = _int_value(getattr(session_entry, "last_prompt_tokens", 0))
 
-        if not model_name and self._session_db:
+        # getattr guard: this method is reachable on a GatewayRunner built via
+        # object.__new__ (plugin-command tests, and any partially-initialised
+        # runner), where __init__ never ran and _session_db is absent. Every
+        # other attribute read in this block is already defensive; this one was
+        # the outlier and raised AttributeError after the parity merge.
+        _sdb = getattr(self, "_session_db", None)
+        if not model_name and _sdb:
             try:
-                row = await self._session_db.get_session(session_entry.session_id) or {}
+                row = await _sdb.get_session(session_entry.session_id) or {}
                 if isinstance(row, dict):
                     model_name = _clean_str(row.get("model", ""))
             except Exception:

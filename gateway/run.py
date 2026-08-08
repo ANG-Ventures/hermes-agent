@@ -10947,7 +10947,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         path = self._restart_failure_counts_path()
         try:
-            raw_counts = json.loads(path.read_text()) if path.exists() else {}
+            raw_counts = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         except Exception:
             return {}
         if not isinstance(raw_counts, dict):
@@ -17862,7 +17862,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return format_status_text()
 
         if canonical == "context":
-            return await self._handle_context_command(event)
+            # A plugin-registered /context wins over the built-in. Upstream added
+            # this built-in handler above the plugin-dispatch block (further
+            # down), which silently shadows any plugin that registers the same
+            # name — the fork ships exactly such a plugin. Defer to the plugin
+            # when one is registered; otherwise fall through to the built-in.
+            try:
+                from hermes_cli.plugins import get_plugin_command_handler
+
+                if get_plugin_command_handler("context") is None:
+                    return await self._handle_context_command(event)
+            except Exception:
+                return await self._handle_context_command(event)
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
