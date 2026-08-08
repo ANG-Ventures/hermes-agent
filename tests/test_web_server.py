@@ -263,9 +263,15 @@ def test_get_session_stats_offloads_sessiondb_read(monkeypatch):
             self._record()
             return 12
 
-        def session_counts_by_source(self, **kwargs):
+        # fork parity NOTE (2026-08-08): get_session_stats moved to
+        # hermes_cli/web_routers/sessions.py, which calls
+        # session_count_by_source (SINGULAR) with an added exclude_children
+        # kwarg. The old double was named session_countS_by_source, so the real
+        # call hit AttributeError -> the caller's bare `except` swallowed it and
+        # by_source silently came back {}. Match the real signature.
+        def session_count_by_source(self, **kwargs):
             self._record()
-            assert kwargs == {"include_archived": True}
+            assert kwargs == {"include_archived": True, "exclude_children": True}
             return {"cli": 3, "telegram": 2}
 
         def close(self):

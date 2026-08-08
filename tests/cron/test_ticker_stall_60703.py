@@ -56,12 +56,6 @@ if not os.environ.get("PYTEST_VERSION"):  # pragma: no cover - non-pytest harnes
     _standalone_store.__enter__()  # held for the process lifetime, by design
 
 
-@pytest.fixture(autouse=True)
-def _self_isolated_cron_store(tmp_path):
-    """Belt-and-suspenders: never write fixture jobs to a non-temp store."""
-    with jobs_mod.use_cron_store(tmp_path):
-        yield
-
 
 
 # ---------------------------------------------------------------------------

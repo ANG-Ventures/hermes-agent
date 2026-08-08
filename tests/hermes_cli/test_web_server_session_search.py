@@ -63,16 +63,6 @@ class _FakeSessionDB:
         assert include_archived is True
         return []
 
-    def search_messages(self, query, limit=20):
-        assert query == "20260603*"
-        return [
-            row
-            for row in rows
-            if self._source_allowed(
-                row, source=source, sources=sources, exclude_sources=exclude_sources
-            )
-        ][:limit]
-
     def search_messages(
         self,
         query,
