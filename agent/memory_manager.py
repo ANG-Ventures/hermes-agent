@@ -524,8 +524,77 @@ class MemoryManager:
         - Skill turns with a user instruction return that instruction.
         - Bare skill invocations (no instruction) return None → callers skip
           the turn, since there is no user content worth remembering.
+
+        Gateway HARNESS metadata is stripped first (see
+        ``_strip_harness_metadata``): platform surfaces decorate the user's
+        message with per-turn scaffolding — a leading timestamp, the Discord
+        ``[Triggering message id: ...]`` block, ``[Replying to: "..."]``
+        pointers, voice-channel notes, a channel-context backfill ending in
+        ``[New message]``, and a ``[<sender>]`` prefix in group chats. Judging
+        recall gates (query-specificity, exact-token detection) or embedding
+        capture on the decorated text instead of the user's words breaks both:
+        the backticked message id trips the exact-token rerank bypass on EVERY
+        Discord turn, and the wrapper's content tokens defeat the ack/ping
+        specificity gate (observed live 2026-08-08).
         """
-        return extract_user_instruction_from_skill_message(text)
+        cleaned = MemoryManager._strip_harness_metadata(text)
+        return extract_user_instruction_from_skill_message(cleaned)
+
+    # Harness wrapper shapes, anchored to the exact strings the gateway emits
+    # (gateway/run.py message_text decoration + gateway/message_timestamps.py).
+    # Conservative by design: strip only KNOWN leading shapes, pass all else.
+    _HARNESS_LEADING_PATTERNS = (
+        # "[Sat 2026-08-08 15:30:26 PDT] " (message_timestamps.format: %a %Y-%m-%d %H:%M:%S %Z)
+        re.compile(r"^\[\w{3} \d{4}-\d\d-\d\d \d\d:\d\d:\d\d [^\]\n]{1,8}\]\s*"),
+        # "[Triggering message id: `NNN` — use as `message_id` ... ]" (run.py, Discord)
+        re.compile(r"^\[Triggering message id:[^\]]*\]\s*"),
+        # '[Replying to: "..."]' / '[Replying to your previous message: "..."]'
+        # (snippet may span lines / contain brackets → DOTALL, anchored on the closing quote)
+        re.compile(r'^\[Replying to(?: your previous message)?: ".*?"\]\s*', re.S),
+        # "[Voice channel now: ...]" (run.py VC note)
+        re.compile(r"^\[Voice channel now:[^\]]*\]\s*"),
+    )
+    # Group-chat sender prefix: "[Ace] message" — a short, single-line bracket tag
+    # followed by a space. Stripped LAST and only once, after the known shapes.
+    _HARNESS_SENDER_PREFIX = re.compile(r"^\[[^\]\n]{1,80}\] ")
+
+    @staticmethod
+    def _strip_harness_metadata(text: str) -> str:
+        """Remove gateway per-turn decoration, returning the user's own text.
+
+        Fail-safe: any error — or a strip that would leave nothing — returns
+        the input unchanged (better to gate on decorated text than to lose the
+        turn entirely).
+        """
+        if not isinstance(text, str) or not text:
+            return text
+        try:
+            cleaned = text
+            # A history-backfill block ends with "[New message]"; the user's
+            # message is everything after the LAST such marker.
+            marker = "[New message]\n"
+            idx = cleaned.rfind(marker)
+            if idx != -1:
+                cleaned = cleaned[idx + len(marker):]
+            # Peel known leading harness tags (they can stack, in any order).
+            stripped_something = True
+            while stripped_something:
+                stripped_something = False
+                cleaned = cleaned.lstrip()
+                for pat in MemoryManager._HARNESS_LEADING_PATTERNS:
+                    m = pat.match(cleaned)
+                    if m:
+                        cleaned = cleaned[m.end():]
+                        stripped_something = True
+            # Finally one short single-line "[sender] " tag, if present.
+            cleaned = cleaned.lstrip()
+            m = MemoryManager._HARNESS_SENDER_PREFIX.match(cleaned)
+            if m:
+                cleaned = cleaned[m.end():]
+            cleaned = cleaned.strip()
+            return cleaned if cleaned else text
+        except Exception:
+            return text
 
     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
         """Collect prefetch context from all providers.
