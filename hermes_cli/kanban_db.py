@@ -4191,6 +4191,36 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def find_stranded_by_triage(
+    conn: sqlite3.Connection,
+) -> list[tuple[str, str]]:
+    """Return ``(child_id, parent_id)`` pairs stranded behind a human-gated parent.
+
+    A child is *stranded* when it sits in ``todo`` (the column
+    ``recompute_ready`` holds it in while parents are open) and at least one
+    parent is in ``triage`` or ``blocked`` — a status that only a human can
+    clear. Parents in ``ready``/``running``/``review`` are excluded: those are
+    making progress and the child will promote on its own.
+
+    This is a pure read used to make a zero-spawn dispatch tick legible. The
+    dispatcher is right to hold these children; the defect was that it held
+    them *silently*, so a triaged parent froze an entire subtree while
+    ``Spawned: 0`` looked exactly like an idle board.
+
+    Ordered by child id then parent id so the report is stable across ticks
+    (an operator diffing two ticks should see content changes, not shuffling).
+    """
+    rows = conn.execute(
+        "SELECT l.child_id AS child, l.parent_id AS parent "
+        "FROM task_links l "
+        "JOIN tasks c ON c.id = l.child_id "
+        "JOIN tasks p ON p.id = l.parent_id "
+        "WHERE c.status = 'todo' AND p.status IN ('triage', 'blocked') "
+        "ORDER BY l.child_id, l.parent_id"
+    ).fetchall()
+    return [(r["child"], r["parent"]) for r in rows]
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -5845,6 +5875,36 @@ def block_task(
                 },
                 run_id=run_id,
             )
+            # Escalating to triage freezes every non-terminal descendant: the
+            # children stay in ``todo`` until a human resolves this card, and
+            # nothing else on the board says so. Record what this decision is
+            # costing AT THE MOMENT it happens, so the stranding is auditable
+            # from the parent's own event log and not just inferable from a
+            # dispatch tick nobody read.
+            stranded_children = [
+                r["id"] for r in conn.execute(
+                    "SELECT c.id AS id FROM task_links l "
+                    "JOIN tasks c ON c.id = l.child_id "
+                    "WHERE l.parent_id = ? "
+                    "AND c.status NOT IN ('done', 'archived') "
+                    "ORDER BY c.id",
+                    (task_id,),
+                )
+            ]
+            if stranded_children:
+                _append_event(
+                    conn, task_id, "triage_stranded_subtree",
+                    {"stranded": stranded_children, "count": len(stranded_children)},
+                    run_id=run_id,
+                )
+                _log.warning(
+                    "kanban: %s escalated to triage and is stranding %d "
+                    "downstream task(s): %s — they will not spawn until it is "
+                    "resolved (hermes kanban triage-resolve %s --to "
+                    "todo|done|archived --reason \"...\")",
+                    task_id, len(stranded_children),
+                    ", ".join(stranded_children), task_id,
+                )
         else:
             if expected_run_id is None:
                 cur = conn.execute(
@@ -6135,6 +6195,121 @@ def specify_triage_task(
     # idling in 'todo' until the next sweep.
     recompute_ready(conn)
     return True
+
+
+#: Statuses a human may resolve a ``triage`` card into. Deliberately does NOT
+#: include ``ready`` — routing straight into the work pool would re-arm the very
+#: unblock→re-block spin the escalation exists to stop. ``todo`` goes through
+#: ``recompute_ready``, so parent gating still applies.
+TRIAGE_RESOLVE_TARGETS = ("todo", "done", "archived")
+
+
+def triage_resolve_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    to: str,
+    reason: str,
+    actor: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """Resolve a ``triage`` card into ``to`` with an explicit human decision.
+
+    ``triage`` is the terminus of the unblock-loop breaker in
+    :func:`block_task`: an automated unblocker already tried and failed
+    :data:`BLOCK_RECURRENCE_LIMIT` times, so a human must decide. That intent is
+    correct — but before this verb existed the column had **no supported exit**.
+    ``unblock_task`` no-ops (it only matches ``blocked``/``scheduled``),
+    ``promote_task`` refuses ("promote only applies to 'todo' or 'blocked'"),
+    and ``complete_task`` refuses (its guard is ``running``/``ready``/``blocked``).
+    Operators were left writing raw SQL against a live board.
+
+    This is that exit, and it is deliberately human-shaped:
+
+    * ``to`` must be named explicitly (one of :data:`TRIAGE_RESOLVE_TARGETS`).
+      There is no default, because "where should this go" is exactly the
+      decision the escalation asked a human for.
+    * ``reason`` is mandatory and non-blank — the audit trail is the point.
+    * ``ready`` is NOT a legal target. Resolving to ``todo`` hands the card to
+      ``recompute_ready``, which honours parent gating; jumping the queue would
+      re-create the spin.
+
+    On success the loop counter is cleared (``block_recurrences = 0``,
+    ``block_kind = NULL``) so a human decision genuinely starts the task over
+    rather than leaving it one re-block away from bouncing back to ``triage``.
+    Any run still pointed at by ``current_run_id`` is closed as ``reclaimed``,
+    and a ``triage_resolved`` event records WHO / WHY / WHERE.
+
+    Returns ``(True, None)`` on success, ``(False, reason)`` when refused.
+    """
+    if to not in TRIAGE_RESOLVE_TARGETS:
+        return False, (
+            f"invalid target {to!r}; triage-resolve accepts "
+            f"{', '.join(TRIAGE_RESOLVE_TARGETS)}"
+        )
+    reason = (reason or "").strip()
+    if not reason:
+        return False, "a reason is required (this is a human-in-the-loop decision)"
+
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, f"task {task_id} not found"
+        if row["status"] != "triage":
+            return False, (
+                f"task {task_id} is {row['status']!r}; triage-resolve only "
+                f"applies to 'triage' (use unblock/promote/complete instead)"
+            )
+        # A triaged card should have no live run (block_task closes it), but a
+        # crash between the two writes could leave the pointer dangling. Close
+        # it here so the runs invariant holds after the status flip.
+        run_id = _end_run(
+            conn, task_id,
+            outcome="reclaimed", status="reclaimed",
+            summary="triage resolved with run still active",
+        )
+        completed_at_sql = ", completed_at = ?" if to == "done" else ""
+        params: list[Any] = [to]
+        if to == "done":
+            params.append(now)
+        params.append(task_id)
+        cur = conn.execute(
+            f"""
+            UPDATE tasks
+               SET status            = ?{completed_at_sql},
+                   claim_lock        = NULL,
+                   claim_expires     = NULL,
+                   worker_pid        = NULL,
+                   block_kind        = NULL,
+                   block_recurrences = 0,
+                   consecutive_failures = 0,
+                   last_failure_error = NULL
+             WHERE id = ? AND status = 'triage'
+            """,
+            tuple(params),
+        )
+        if cur.rowcount != 1:
+            return False, f"task {task_id} status changed during resolve"
+        if actor and actor.strip():
+            # Inline INSERT: we're already inside this function's write_txn and
+            # ``add_comment`` would open a nested BEGIN IMMEDIATE.
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (task_id, actor.strip(), f"TRIAGE-RESOLVE -> {to}: {reason}", now),
+            )
+        _append_event(
+            conn, task_id, "triage_resolved",
+            {"to": to, "reason": reason, "actor": actor},
+            run_id=run_id,
+        )
+    # Outside the txn (recompute_ready opens its own IMMEDIATE txn). Resolving
+    # to ``todo`` promotes straight to ``ready`` when parents allow; resolving
+    # to ``done``/``archived`` unblocks any children this card was stranding.
+    recompute_ready(conn)
+    return True, None
 
 
 def decompose_triage_task(
@@ -7292,6 +7467,18 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    stranded_by_triage: list[tuple[str, str]] = field(default_factory=list)
+    """``(child_id, parent_id)`` pairs where a ``todo`` card is held ONLY
+    because a parent sits in ``triage``/``blocked`` — i.e. behind a card that
+    needs a human and will never clear on its own.
+
+    Operator-actionable, and the reason this bucket exists: a triaged parent
+    silently freezes its whole subtree. The dispatcher was correct to hold the
+    children (parent gating is the invariant), but ``Spawned: 0`` with every
+    other bucket empty is byte-identical to "nothing to do" — so a deploy card
+    sat idle for hours behind a triaged parent and nobody was told. Surfacing
+    the pairs makes the stranding LOUD; ``hermes kanban triage-resolve`` is the
+    exit."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -8831,6 +9018,10 @@ def _dispatch_once_locked(
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    # Children held in ``todo`` behind a parent only a human can clear.
+    # Computed AFTER recompute_ready so anything promotable this tick has
+    # already left ``todo`` and can't be mis-reported as stranded.
+    result.stranded_by_triage = find_stranded_by_triage(conn)
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full

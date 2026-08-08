@@ -737,6 +737,34 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit machine-readable JSON result",
     )
 
+    p_triage_resolve = sub.add_parser(
+        "triage-resolve",
+        help="Resolve a triage card with an explicit human decision "
+             "(the supported exit from the unblock-loop escalation)",
+    )
+    p_triage_resolve.add_argument("task_id")
+    p_triage_resolve.add_argument(
+        "--to",
+        required=True,
+        choices=list(kb.TRIAGE_RESOLVE_TARGETS),
+        help="Where the card goes. 'todo' re-queues it through normal parent "
+             "gating; 'done'/'archived' close it. 'ready' is deliberately not "
+             "offered — jumping the queue re-arms the unblock loop.",
+    )
+    p_triage_resolve.add_argument(
+        "--reason",
+        required=True,
+        help="Why (required). Recorded on the triage_resolved event and as a "
+             "comment — this is the human-in-the-loop decision the escalation "
+             "asked for.",
+    )
+    p_triage_resolve.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        help="Emit machine-readable JSON result",
+    )
+
     p_archive = sub.add_parser("archive", help="Archive one or more tasks")
     p_archive.add_argument("task_ids", nargs="*",
                            help="Task ids to archive (default mode)")
@@ -1116,6 +1144,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
+            "triage-resolve": _cmd_triage_resolve,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
@@ -1181,6 +1210,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "schedule",
     "unblock",
     "promote",
+    "triage-resolve",
     "archive",
     "dispatch",
     "daemon",
@@ -1675,6 +1705,18 @@ def _cmd_list(args: argparse.Namespace) -> int:
             workflow_template_id=args.workflow_template_id,
             current_step_key=args.current_step_key,
         )
+        # Board-level triage/stranding health, computed after the same
+        # recompute the dispatcher would do. Read-only and best-effort — a
+        # listing must never fail because a banner couldn't be built.
+        try:
+            triage_ids = [
+                r["id"] for r in conn.execute(
+                    "SELECT id FROM tasks WHERE status = 'triage' ORDER BY id"
+                )
+            ]
+            stranded = kb.find_stranded_by_triage(conn)
+        except Exception:
+            triage_ids, stranded = [], []
     if getattr(args, "json", False):
         print(json.dumps([_task_to_dict(t) for t in tasks], indent=2, ensure_ascii=False))
         return 0
@@ -1693,12 +1735,42 @@ def _cmd_list(args: argparse.Namespace) -> int:
             f"({other_count} other board{'s' if other_count != 1 else ''} — "
             f"`hermes kanban boards list`)\n"
         )
+    _print_triage_banner(triage_ids, stranded)
     if not tasks:
         print("(no matching tasks)")
         return 0
     for t in tasks:
         print(_fmt_task_line(t))
     return 0
+
+
+def _print_triage_banner(triage_ids, stranded) -> None:
+    """Header naming cards that need a human, and what they're freezing.
+
+    ``triage`` is the only status no automation will ever clear — it is
+    reached precisely because an unblocker gave up. In a flat listing it reads
+    like any other bucket, so the cards that most need attention are the least
+    visible, and their stranded children are invisible entirely.
+    """
+    ids = list(triage_ids or [])
+    if not ids:
+        return
+    print(
+        f"TRIAGE: {len(ids)} card(s) need a human decision — "
+        f"{', '.join(ids)}"
+    )
+    stranded_kids = sorted({
+        child for child, parent in (stranded or []) if parent in set(ids)
+    })
+    if stranded_kids:
+        print(
+            f"  ...stranding {len(stranded_kids)} downstream task(s): "
+            f"{', '.join(stranded_kids)}"
+        )
+    print(
+        "  resolve: hermes kanban triage-resolve <id> "
+        "--to todo|done|archived --reason \"...\"\n"
+    )
 
 
 def _cmd_show(args: argparse.Namespace) -> int:
@@ -2564,6 +2636,43 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_triage_resolve(args: argparse.Namespace) -> int:
+    """The supported exit from the ``triage`` column.
+
+    ``triage`` means an automated unblocker already tried and failed
+    repeatedly, so a human must decide. That escalation is correct and stays
+    exactly as-is — this verb only supplies the exit it was missing.
+    """
+    with kb.connect_closing() as conn:
+        ok, err = kb.triage_resolve_task(
+            conn,
+            args.task_id,
+            to=args.to,
+            reason=args.reason,
+            actor=_profile_author(),
+        )
+        status = kb.get_task(conn, args.task_id).status if ok else None
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "task_id": args.task_id,
+            "resolved": ok,
+            "to": args.to,
+            "status": status,
+            "reason": args.reason,
+            "error": err,
+        }, indent=2, ensure_ascii=False))
+        return 0 if ok else 1
+    if not ok:
+        print(f"cannot triage-resolve {args.task_id}: {err}", file=sys.stderr)
+        return 1
+    # The landing column may differ from --to: resolving to 'todo' runs
+    # recompute_ready, which promotes to 'ready' when parents allow. Report
+    # where the card ACTUALLY is so nobody waits on a card that already moved.
+    landed = f" (now {status!r})" if status and status != args.to else ""
+    print(f"Resolved {args.task_id} -> {args.to}{landed}: {args.reason}")
+    return 0
+
+
 def _cmd_archive(args: argparse.Namespace) -> int:
     ids = list(args.task_ids or [])
     purge_ids = list(getattr(args, "purge_ids", None) or [])
@@ -2685,6 +2794,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "spawned_unwatched": spawned_unwatched,
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "stranded_by_triage": [
+                {"task_id": child, "parent_id": parent}
+                for (child, parent) in res.stranded_by_triage
+            ],
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
@@ -2740,7 +2853,38 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    _print_stranded_by_triage(res.stranded_by_triage)
     return 0
+
+
+def _print_stranded_by_triage(stranded) -> None:
+    """Name the subtrees frozen behind a human-gated parent.
+
+    Without this, a board where one triaged parent holds a whole subtree
+    prints ``Spawned: 0`` and nothing else — identical to an idle board. That
+    false negative let a deploy card sit idle for hours. Group by parent so
+    the operator sees how many cards each stuck decision is costing, and name
+    the exact verb that clears it.
+    """
+    entries = list(stranded or [])
+    if not entries:
+        return
+    by_parent: dict[str, list[str]] = {}
+    for child, parent in entries:
+        by_parent.setdefault(parent, []).append(child)
+    n_children = len({child for child, _ in entries})
+    print(
+        f"STRANDED: {n_children} task(s) held in todo behind "
+        f"{len(by_parent)} triaged/blocked parent(s) — nothing will spawn "
+        f"until a human resolves them:"
+    )
+    for parent in sorted(by_parent):
+        kids = ", ".join(sorted(by_parent[parent]))
+        print(f"  - {parent} blocks: {kids}")
+    print(
+        "  resolve with: hermes kanban triage-resolve <parent-id> "
+        "--to todo|done|archived --reason \"...\"  (or `unblock` if blocked)"
+    )
 
 
 def _cmd_daemon(args: argparse.Namespace) -> int:
@@ -2941,7 +3085,19 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         return 0
     print("By status:")
     for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
-        print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
+        n = stats["by_status"].get(k, 0)
+        # ``triage`` is the only status that CANNOT clear itself — it exists
+        # because an automated unblocker already gave up. Printed flush with
+        # every other bucket it reads like ordinary queue depth, so a card
+        # needing a human hides in plain sight (and silently strands its
+        # children). Mark it.
+        flag = "  <- needs a human" if k == "triage" and n else ""
+        print(f"  {k:8s}  {n}{flag}")
+    if stats["by_status"].get("triage"):
+        print(
+            "\nResolve triage with: hermes kanban triage-resolve <id> "
+            "--to todo|done|archived --reason \"...\""
+        )
     if stats["by_assignee"]:
         print("\nBy assignee:")
         for who, counts in sorted(stats["by_assignee"].items()):

@@ -1220,6 +1220,10 @@ class GatewayKanbanWatchersMixin:
         HEALTH_WINDOW = 6
         bad_ticks = 0
         last_warn_at = 0
+        # Per-board rate limiter for the stranded-subtree warning. A triage
+        # decision can legitimately sit for hours; warn every 5 min per board
+        # rather than every tick.
+        last_stranded_warn_at: dict[str, int] = {}
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
@@ -1534,6 +1538,33 @@ class GatewayKanbanWatchersMixin:
                             len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                             _format_respawn_guarded_summary(guarded),
                         )
+                    # Stranded subtrees: children held in ``todo`` behind a
+                    # parent only a human can clear. This CANNOT reach the
+                    # stall detector below — that gate requires a non-empty
+                    # ready queue, and a fully-stranded board has none, so a
+                    # triaged parent freezing a whole subtree looked exactly
+                    # like an idle board. Warn on its own path, rate-limited
+                    # so a long-lived triage decision doesn't spam every tick.
+                    stranded = (
+                        getattr(res, "stranded_by_triage", None)
+                        if res is not None else None
+                    )
+                    if stranded:
+                        now_s = int(time.time())
+                        if now_s - last_stranded_warn_at.get(slug, 0) >= 300:
+                            parents = sorted({p for _c, p in stranded})
+                            children = sorted({c for c, _p in stranded})
+                            logger.warning(
+                                "kanban dispatcher [%s]: %d task(s) STRANDED "
+                                "behind %d triaged/blocked parent(s) — no "
+                                "worker will spawn until a human resolves "
+                                "them. parents=%s stranded=%s. Resolve with "
+                                "`hermes kanban triage-resolve <id> --to "
+                                "todo|done|archived --reason \"...\"`.",
+                                slug, len(children), len(parents),
+                                ", ".join(parents), ", ".join(children),
+                            )
+                            last_stranded_warn_at[slug] = now_s
                 # Health telemetry (aggregate across boards).
                 #
                 # A tick with ready work but zero spawns is only a REAL stall
