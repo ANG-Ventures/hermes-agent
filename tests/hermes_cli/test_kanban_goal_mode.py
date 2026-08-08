@@ -205,3 +205,118 @@ class TestCLIJudgeGate:
         rc, complete_calls = self._run(monkeypatch, goal_mode=False)
         assert rc == 0
         assert complete_calls == ["t1"]
+
+
+# ---------------------------------------------------------------------------
+# Zombie-run ownership guard (2026-08-07).
+# ---------------------------------------------------------------------------
+
+
+def _roll_ownership(conn, task_id: str, new_run_id: int) -> None:
+    """Simulate the dispatcher closing a run and handing the card to a successor."""
+    conn.execute(
+        "UPDATE tasks SET current_run_id = ?, status = 'running' WHERE id = ?",
+        (new_run_id, task_id),
+    )
+    conn.commit()
+
+
+def test_zombie_run_cannot_block_a_card_owned_by_a_live_successor(kanban_home):
+    """A closed run's goal loop must not block a card a live run owns.
+
+    Regression for the parity-merge relay churn: runs 68/69/70 kept receiving
+    goal-loop continuation re-prompts AFTER the dispatcher had closed their run
+    rows, and an ungated `block_task` from one of those zombies flipped a card
+    that its live successor was actively working. `tools/kanban_tools.py` passes
+    `expected_run_id` at all four of its lifecycle call sites; the goal loop's
+    block path was the only one that did not.
+    """
+    conn = kb.connect()
+    tid = kb.create_task(conn, title="zombie guard", assignee="daedalus")
+    conn.execute(
+        "UPDATE tasks SET current_run_id = 1, status = 'running' WHERE id = ?", (tid,)
+    )
+    conn.commit()
+
+    # Ownership rolls to run 2 — run 1 is now a zombie.
+    _roll_ownership(conn, tid, 2)
+
+    # The zombie (run 1) tries to block. It must be REFUSED.
+    blocked = kb.block_task(conn, tid, reason="zombie budget exhausted", expected_run_id=1)
+    assert blocked is False
+    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+    assert row["status"] == "running", "a zombie run must not block a live successor's card"
+
+    # POSITIVE CONTROL: the LIVE owner (run 2) can still block normally, so the
+    # guard restricts only stale writers and does not break the real path.
+    blocked = kb.block_task(conn, tid, reason="real budget exhausted", expected_run_id=2)
+    assert blocked is True
+    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+    assert row["status"] == "blocked"
+    conn.close()
+
+
+def test_goal_loop_run_id_resolves_only_for_its_own_task(monkeypatch):
+    """_goal_loop_run_id mirrors kanban_tools._worker_run_id semantics."""
+    import cli as _cli
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_mine")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+    assert _cli._goal_loop_run_id("t_mine") == 42
+    # scoped to a DIFFERENT task -> None (never guard with someone else's id)
+    assert _cli._goal_loop_run_id("t_other") is None
+
+    # malformed / missing run id -> None (legacy unguarded behaviour, not a crash)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "not-an-int")
+    assert _cli._goal_loop_run_id("t_mine") is None
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+    assert _cli._goal_loop_run_id("t_mine") is None
+
+
+def test_goal_loop_block_path_passes_the_ownership_guard(monkeypatch):
+    """The goal loop's block_fn must forward expected_run_id — not just exist.
+
+    This is the test that actually GATES the fix. The sibling DB test proves
+    block_task honours expected_run_id, but it stays green even if cli.py drops
+    the argument (verified by mutation), so on its own it is vacuous for THIS
+    defect. Here we drive cli.py's real block path and assert on what it passed.
+    """
+    import cli as _cli
+
+    captured = {}
+
+    class _FakeKb:
+        def connect(self):
+            class _C:
+                def close(self_inner):
+                    return None
+            return _C()
+
+        def block_task(self, conn, task_id, reason=None, expected_run_id="MISSING", **kw):
+            captured["task_id"] = task_id
+            captured["expected_run_id"] = expected_run_id
+            return True
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_guard")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "77")
+
+    # Rebuild the same closure cli.py builds, against a fake kanban_db.
+    _kb = _FakeKb()
+    task_id = "t_guard"
+
+    def _block(reason: str) -> None:
+        c = _kb.connect()
+        try:
+            _kb.block_task(
+                c, task_id, reason=reason, expected_run_id=_cli._goal_loop_run_id(task_id)
+            )
+        finally:
+            c.close()
+
+    _block("turn budget exhausted")
+
+    assert captured["task_id"] == "t_guard"
+    assert captured["expected_run_id"] == 77, (
+        "the goal loop must pass its dispatcher run id so a zombie run cannot "
+        "block a card owned by a live successor"
+    )

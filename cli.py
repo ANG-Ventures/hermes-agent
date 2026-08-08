@@ -18119,6 +18119,27 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 # Main Entry Point
 # ============================================================================
 
+def _goal_loop_run_id(task_id: str) -> "int | None":
+    """This worker's dispatcher run id, when it is scoped to ``task_id``.
+
+    Mirrors ``tools/kanban_tools._worker_run_id``. Returns None when the env
+    does not identify this process as the owner of ``task_id`` — passing None
+    keeps the legacy unguarded behavior for non-dispatcher contexts (a human
+    running the loop by hand) rather than hard-failing them.
+    """
+    import os as _os
+
+    if _os.environ.get("HERMES_KANBAN_TASK") != task_id:
+        return None
+    raw = _os.environ.get("HERMES_KANBAN_RUN_ID")
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
@@ -18190,7 +18211,20 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     def _block(reason: str) -> None:
         c = _kb.connect()
         try:
-            _kb.block_task(c, task_id, reason=reason)
+            # OWNERSHIP GUARD (2026-08-07). Without expected_run_id a ZOMBIE run
+            # — one the dispatcher already closed and replaced — can block a card
+            # that a LIVE successor run owns and is actively working. Observed on
+            # the parity-merge relay: runs 68/69/70 kept receiving goal-loop
+            # continuation re-prompts after their run rows were closed, and one
+            # of them blocked the card out from under its successor. Every other
+            # worker-side lifecycle mutation already passes this guard
+            # (tools/kanban_tools.py:365,811,910,974); this path was the only
+            # unguarded one. block_task appends `AND current_run_id = ?` when the
+            # id is supplied, so a stale run's write is refused instead of
+            # silently winning.
+            _kb.block_task(
+                c, task_id, reason=reason, expected_run_id=_goal_loop_run_id(task_id)
+            )
         finally:
             try:
                 c.close()

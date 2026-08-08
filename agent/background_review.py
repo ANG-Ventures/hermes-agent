@@ -28,6 +28,14 @@ from agent.thread_scoped_output import thread_scoped_silence
 
 logger = logging.getLogger(__name__)
 
+# Iteration ceiling for the background-review fork. This is the ONLY bound on
+# the fork (it has no wall-clock timeout), so it is deliberately small relative
+# to a real agent turn. Raised 16 -> 30 on 2026-08-08: 16 was undocumented and
+# unmeasured, and exhaustion was silent — a review could die mid-write with no
+# trace. Exhaustion now emits a WARNING; if that warning is common in practice,
+# tune here rather than guessing.
+_REVIEW_MAX_ITERATIONS = 30
+
 
 # ---------------------------------------------------------------------------
 # Background-review aux-model selector + routed digest.
@@ -810,7 +818,14 @@ def _run_review_in_thread(
                         _fork_kwargs[_pref_attr] = _pref_val
             review_agent = AIAgent(
                 model=_rt.get("model") or agent.model,
-                max_iterations=16,
+                # The review fork has NO wall-clock timeout — this iteration cap
+                # is its only circuit breaker, and it spawns after every turn on
+                # a daemon thread nobody watches. Keep it tight. With a 4-tool
+                # whitelist (memory/skill_manage/skill_view/skills_list) a normal
+                # review is 1 read + 1-3 writes; 30 leaves generous headroom for
+                # a multi-skill turn while still bounding a runaway loop.
+                # Exhaustion is now logged loudly below (was silent).
+                max_iterations=_REVIEW_MAX_ITERATIONS,
                 quiet_mode=True,
                 platform=agent.platform,
                 chat_id=getattr(agent, "_chat_id", None) or "",
@@ -999,10 +1014,35 @@ def _run_review_in_thread(
                         "management tools. Other tools will be denied "
                         "at runtime — do not attempt them."
                     )
-                review_agent.run_conversation(
+                _review_result = review_agent.run_conversation(
                     user_message=(prompt + _tool_reminder),
                     conversation_history=_review_history,
                 )
+                # LOUD on budget exhaustion. The fork runs with
+                # suppress_status_output=True and quiet_mode=True (so its
+                # lifecycle chatter never leaks into the user's turn), which
+                # also meant hitting the ceiling was completely silent: the
+                # review could die mid-write having banked only half its
+                # memories, and nothing anywhere said so. This is the one
+                # lifecycle event worth breaking that silence for — it goes to
+                # the log, not the user's transcript.
+                try:
+                    _exit_reason = ""
+                    if isinstance(_review_result, dict):
+                        _exit_reason = str(_review_result.get("turn_exit_reason") or "")
+                    if "max_iterations_reached" in _exit_reason or "budget_exhausted" in _exit_reason:
+                        logger.warning(
+                            "background review EXHAUSTED its iteration budget "
+                            "(%s/%s, exit_reason=%s) — the review stopped early and "
+                            "may have banked only part of its memory/skill writes. "
+                            "If this recurs, raise _REVIEW_MAX_ITERATIONS in "
+                            "agent/background_review.py.",
+                            getattr(review_agent, "max_iterations", "?"),
+                            _REVIEW_MAX_ITERATIONS,
+                            _exit_reason or "unknown",
+                        )
+                except Exception:  # pragma: no cover - telemetry must never break the review
+                    pass
             finally:
                 clear_thread_tool_whitelist()
 

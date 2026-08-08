@@ -14,12 +14,13 @@ from pathlib import Path
 
 import pytest
 
-# fork-parity: parents[2] is the REPO ROOT; parents[1] is ``tests/``, which
-# contains an ``agent`` package of its own — putting it first on sys.path
-# shadows the repo's real ``agent/`` and makes ``agent.session_activity``
-# (imported by hermes_state) unresolvable. Latent since forever; it only
-# started failing when upstream added agent/session_activity.py. Reproduced on
-# upstream 1e5b5074 standalone (6 errors), so this is inherited, not merge damage.
+# parents[1] is tests/ -- inserting it at sys.path[0] makes the *test package*
+# tests/hermes_cli/ shadow the real top-level hermes_cli package, so
+# `from hermes_cli import __version__` inside web_server.py resolves to the
+# empty tests/hermes_cli/__init__.py and raises ImportError. The repo root is
+# parents[2]. tests/conftest.py already puts the repo root on sys.path, so the
+# insert is redundant anyway -- keep it correct rather than delete it, in case
+# this file is ever run without that conftest.
 _repo = str(Path(__file__).resolve().parents[2])
 if _repo not in sys.path:
     sys.path.insert(0, _repo)

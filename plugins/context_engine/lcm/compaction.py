@@ -16,6 +16,7 @@ lifecycle) through normal attribute lookup. ``LCMEngine`` mixes this in ahead of
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -65,6 +66,42 @@ class CompactionMixin:
         if self.threshold_tokens <= 0:
             return False
         return tokens >= self.threshold_tokens
+
+    def _maintenance_pressure_met(self, observed_tokens: int) -> bool:
+        """Whether a MAINTENANCE compaction is allowed at the current size.
+
+        Maintenance arms ("compactable backlog outside the fresh tail",
+        "ignored-message backlog") are opportunistic tidying, not overflow
+        protection. On the divergent-replay path they historically ran with no
+        token gate at all, while the identical eligibility check on the
+        non-divergent path sits behind ``rough >= threshold_tokens``. Since the
+        divergent path is entered whenever ingest externalized something
+        (media, base64, a large tool result), a screenshot-heavy session
+        compacted at any size — measured production fires at 21%, 23% and 32%
+        of threshold inside eight minutes, freeing 27-47% where pressure-driven
+        compactions free 84-86%, each paying a summarizer call and the whole
+        prompt cache.
+
+        Returns True (allow) when the floor is disabled, when no threshold is
+        configured, or when the session has reached the configured fraction of
+        it. This gates ONLY the opportunistic arms: deterministic ingest-cleanup
+        adoption returns earlier and is unaffected, and overflow recovery is
+        checked before this on every path.
+        """
+        ratio = getattr(self._config, "maintenance_min_pressure_ratio", 0.0) or 0.0
+        if ratio <= 0.0:
+            return True
+        if self.threshold_tokens <= 0:
+            return True
+        floor = int(self.threshold_tokens * ratio)
+        if observed_tokens >= floor:
+            return True
+        logger.debug(
+            "LCM maintenance compaction deferred: %d tokens < %d floor "
+            "(%.0f%% of %d threshold)",
+            observed_tokens, floor, ratio * 100, self.threshold_tokens,
+        )
+        return False
 
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
@@ -134,9 +171,21 @@ class CompactionMixin:
                     and self._compression_boundary_cooldown_active()
                 ):
                     self._preflight_cleanup_only_due_to_boundary_cooldown = True
-                return self._mark_preflight_compression_requested()
+                # Sanitize-only cleanup adoption is bookkeeping, not compaction:
+                # deterministic, already durable, no summarizer call, and it
+                # folds nothing. It must still RUN (an externalized payload
+                # should not linger in active context), but announcing it emits
+                # a "maintenance compaction" banner that is then followed by no
+                # stats, because there is no delta to report. An overflow-driven
+                # pass through this branch is real work and stays visible.
+                return self._mark_preflight_compression_requested(
+                    self._describe_ingest_cleanup_reason(messages, replay_messages),
+                    user_visible=bool(force_overflow_requested),
+                )
             if force_overflow_requested:
-                return self._mark_preflight_compression_requested()
+                return self._mark_preflight_compression_requested(
+                    "context overflow recovery"
+                )
             # A boundary skip cools down summary-producing leaf/condensation
             # work. It must not prevent the host from adopting a replay cleanup
             # that ingest has already made durable (for example a live tool
@@ -157,25 +206,37 @@ class CompactionMixin:
                     and replay_rough >= self.threshold_tokens
                 ),
             )
-            if eligible:
-                return self._mark_preflight_compression_requested()
-            if self._has_ignored_backlog_outside_fresh_tail(replay_messages):
-                return self._mark_preflight_compression_requested()
+            if eligible and self._maintenance_pressure_met(replay_rough):
+                return self._mark_preflight_compression_requested(
+                    "compactable backlog outside the fresh tail"
+                )
+            if self._has_ignored_backlog_outside_fresh_tail(
+                replay_messages
+            ) and self._maintenance_pressure_met(replay_rough):
+                return self._mark_preflight_compression_requested(
+                    "ignored-message backlog outside the fresh tail"
+                )
             if self.threshold_tokens > 0 and replay_rough >= self.threshold_tokens:
                 if self._should_run_deferred_maintenance(replay_messages, observed_tokens=replay_rough):
-                    return self._mark_preflight_compression_requested()
+                    return self._mark_preflight_compression_requested(
+                        "deferred maintenance backlog"
+                    )
                 self._last_compression_status = "noop"
                 self._last_compression_noop_reason = reason
                 logger.info("LCM preflight compression no-op: %s", reason)
                 return False
             self._refresh_raw_backlog_debt(replay_messages, observed_tokens=replay_rough)
             if self._should_run_deferred_maintenance(replay_messages, observed_tokens=replay_rough):
-                return self._mark_preflight_compression_requested()
+                return self._mark_preflight_compression_requested(
+                    "deferred maintenance backlog"
+                )
             return False
         if self._compression_boundary_cooldown_active():
             return False
         if self._should_force_overflow_recovery(observed_tokens=rough):
-            return self._mark_preflight_compression_requested()
+            return self._mark_preflight_compression_requested(
+                "context overflow recovery"
+            )
         if self.threshold_tokens > 0 and rough >= self.threshold_tokens:
             if pre_ingest_placeholder_ambiguous_noop:
                 self._last_compression_status = "noop"
@@ -187,18 +248,26 @@ class CompactionMixin:
                 allow_partial_leaf=self._config.threshold_full_sweep_enabled,
             )
             if eligible:
-                return self._mark_preflight_compression_requested()
+                return self._mark_preflight_compression_requested(
+                    "compactable backlog outside the fresh tail"
+                )
             if self._has_ignored_backlog_outside_fresh_tail(messages):
-                return self._mark_preflight_compression_requested()
+                return self._mark_preflight_compression_requested(
+                    "ignored-message backlog outside the fresh tail"
+                )
             if self._should_run_deferred_maintenance(messages, observed_tokens=rough):
-                return self._mark_preflight_compression_requested()
+                return self._mark_preflight_compression_requested(
+                    "deferred maintenance backlog"
+                )
             self._last_compression_status = "noop"
             self._last_compression_noop_reason = reason
             logger.info("LCM preflight compression no-op: %s", reason)
             return False
         self._refresh_raw_backlog_debt(messages, observed_tokens=rough)
         if self._should_run_deferred_maintenance(messages, observed_tokens=rough):
-            return self._mark_preflight_compression_requested()
+            return self._mark_preflight_compression_requested(
+                "deferred maintenance backlog"
+            )
         return False
 
     def _replay_diff_requests_ingest_cleanup(
@@ -233,6 +302,67 @@ class CompactionMixin:
             ):
                 return True
         return False
+
+    # Human-readable labels for each ingest-cleanup trigger, in the SAME order
+    # the gate above tests them, so the explanation always names the branch that
+    # actually fired. Keep this list and _replay_diff_requests_ingest_cleanup in
+    # lockstep: a new marker there needs a label here or the banner degrades to
+    # the generic fallback.
+    _INGEST_CLEANUP_REASON_MARKERS: tuple[tuple[str, str], ...] = (
+        ("[Externalized LCM ingest payload:", "an attachment too large to keep inline was moved to external storage"),
+        ("[Externalized payload: kind=raw_payload;", "a payload too large to keep inline was moved to external storage"),
+        ("[Externalized tool output:", "a tool result too large to keep inline was moved to external storage"),
+        ("[LCM active replay placeholder: assistant output quarantined;", "a malformed assistant turn was quarantined"),
+        ("[LCM active replay placeholder: message ignored;", "an ignored message was replaced with a placeholder"),
+        ("[LCM sensitive redaction:", "a secret was redacted from the transcript"),
+    )
+
+    def _describe_ingest_cleanup_reason(
+        self,
+        original_messages: List[Dict[str, Any]],
+        replay_messages: List[Dict[str, Any]],
+    ) -> str:
+        """Name WHY the replay view diverged, for the user-visible banner.
+
+        The divergence gate answers only yes/no. A below-threshold compaction is
+        inexplicable without the cause, so recover it here by re-walking the same
+        markers. Includes the SIZE of the offending payload when the marker
+        carries it: "a large attachment" leaves the user guessing which of their
+        messages did this, while "a 1.9 MB attachment" points straight at it.
+        Falls back to a generic phrase rather than raising: an explanation is
+        never allowed to break a compaction.
+        """
+        try:
+            if len(original_messages) != len(replay_messages):
+                return "the stored transcript and the live context diverged"
+            for original_msg, replay_msg in zip(original_messages, replay_messages):
+                original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""
+                replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
+                if original_text == replay_text:
+                    continue
+                for marker, label in self._INGEST_CLEANUP_REASON_MARKERS:
+                    if marker in replay_text:
+                        size = self._describe_externalized_size(replay_text)
+                        return f"{label}{size}"
+        except Exception:  # pragma: no cover - explanation must never raise
+            logger.debug("LCM: failed to describe ingest-cleanup reason", exc_info=True)
+        return "the stored transcript and the live context diverged"
+
+    @staticmethod
+    def _describe_externalized_size(replay_text: str) -> str:
+        """`` (1.9 MB)`` when the externalization marker reports a size, else ''."""
+        try:
+            match = re.search(r"chars=(\d+)", replay_text)
+            if not match:
+                return ""
+            chars = int(match.group(1))
+            if chars >= 1_000_000:
+                return f" ({chars / 1_048_576:.1f} MB)"
+            if chars >= 1_000:
+                return f" ({chars / 1024:.0f} KB)"
+            return ""
+        except Exception:  # pragma: no cover
+            return ""
 
     def _has_ignored_backlog_outside_fresh_tail(self, messages: List[Dict[str, Any]]) -> bool:
         if not self._compiled_ignore_message_patterns or not messages:

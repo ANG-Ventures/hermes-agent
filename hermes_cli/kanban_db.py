@@ -7112,7 +7112,15 @@ def _parse_github_pr_url(url: str) -> Optional[tuple[str, int]]:
     """Return ``(owner/repo, number)`` for a canonical GitHub PR URL."""
     if not isinstance(url, str):
         return None
-    cleaned = url.rstrip(".,;:!?)]}>")
+    # Strip trailing punctuation that commonly abuts a URL in prose AND in
+    # serialized payloads. The quote characters matter: workers routinely post
+    # structured JSON handbacks (``"pr": "https://github.com/o/r/pull/3",``),
+    # and the URL regex captures the trailing ``",`` — which made this parser
+    # return None, which ``check_respawn_guard`` treats as "assume open" and
+    # fail-closed to ``active_pr`` FOREVER, even after the PR merged. Observed
+    # 2026-08-07: a task stayed undispatchable across repeated dispatch ticks
+    # while its only referenced PR was demonstrably MERGED.
+    cleaned = url.rstrip(".,;:!?)]}>\"'")
     match = _RESPAWN_GUARD_PR_PARSE_RE.fullmatch(cleaned)
     if match is None:
         return None

@@ -152,7 +152,21 @@ def finalize_turn(
         # We route through ``_record_task_failure(outcome="timed_out")``
         # rather than ``kanban_block`` so this counts toward the dispatcher's
         # consecutive-failure circuit breaker (#29747 gap 2).
-        _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
+        #
+        # ONLY the worker's own turn may do this. Background-review forks are
+        # separate ``AIAgent`` instances built with a hardcoded
+        # ``max_iterations=16`` (``agent/background_review.py``) that inherit
+        # this process's environment — including ``HERMES_KANBAN_TASK``. Without
+        # this guard the *fork* exhausting its own 16-iteration budget records a
+        # ``timed_out`` failure against the **parent's** card while the real
+        # worker is still healthy and mid-task, tripping the failure circuit
+        # with a ceiling ("16/16") that matches no configured limit — which is
+        # precisely what made it near-untraceable in the field (parity card
+        # t_c348a9f0, 2026-08-07: runs 74/75/81 all died this way).
+        _is_review_fork = (
+            getattr(agent, "_memory_write_origin", None) == "background_review"
+        )
+        _kanban_task = None if _is_review_fork else os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
             try:
                 from hermes_cli import kanban_db as _kb

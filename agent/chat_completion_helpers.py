@@ -2962,16 +2962,17 @@ def try_activate_fallback(
             f"🔄 Primary model failed — switching to fallback: "
             f"{fb_model} via {fb_provider}"
         )
-        # The buffered line above is dropped on successful recovery, but a
-        # provider/model switch is a durable state change operators must see
-        # even when the fallback succeeds.  Record a one-shot notice that the
-        # success path surfaces exactly once via _emit_pending_fallback_notice
-        # (see run_agent.py); it is discarded on terminal failure since the
-        # buffered line is flushed instead.  See fallback-observability fix.
-        agent._pending_fallback_notice = (
-            f"🔄 Switched to fallback model: {old_model} via {old_provider} "
-            f"→ {fb_model} via {fb_provider}"
-        )
+        # Deliberately do NOT set ``agent._pending_fallback_notice`` here.  It
+        # used to record a second, plainer "Switched to fallback model: ..."
+        # line that ``_emit_pending_fallback_notice`` surfaced later, on the
+        # turn's first successful content.  ``_emit_fallback_announce`` below
+        # now reports the same hop at the moment it happens AND carries the
+        # reason / reasoning-effort / context-window riders, a per-transition
+        # dedupe, and the ``model.announce_route_change`` gate.  Setting both
+        # emitted TWO chat lines for ONE hop, minutes apart (the later one
+        # reading as a second switch), and the notice bypassed both that gate
+        # and the dedupe.  The terminal-failure path is unaffected: the
+        # buffered line above is still flushed by ``_flush_status_buffer``.
         logger.info(
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,

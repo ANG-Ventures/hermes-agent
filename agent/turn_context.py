@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Mapping, Optional
 from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
     ENGINE_PREFLIGHT_MAINTENANCE_STATUS_TEMPLATE,
+    ENGINE_PREFLIGHT_MAINTENANCE_REASON_STATUS_TEMPLATE,
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
@@ -779,6 +780,7 @@ def build_turn_context(
                 messages, active_system_prompt = agent._compress_context(
                     messages, system_message, approx_tokens=_idle_tokens,
                     task_id=effective_task_id,
+                    trigger_reason="idle_resume",
                 )
                 # ``_compress_context`` returns the INPUT list object when it
                 # skips (per-session lock held by another path, failure
@@ -1143,31 +1145,74 @@ def build_turn_context(
                     f"{_preflight_tokens:,}",
                     f"{_engine_threshold:,}",
                 )
-                # Name the ARM that fired. Every other compaction path announces
-                # itself, so a below-threshold engine-driven compaction was the
-                # one event the user saw with no explanation — it reads as
-                # "why did it compact at 66%?". Say plainly that the engine
-                # asked, not token pressure.
-                _engine_preflight_status = automatic_compaction_status_message(
-                    _compressor,
-                    phase="engine_preflight_maintenance",
-                    default_message=(
+                # Name the ARM that fired, and WHY. Every other compaction path
+                # announces itself, so a below-threshold engine-driven compaction
+                # was the one event the user saw with no explanation — it reads
+                # as "why did it compact at 66%?". Say plainly that the engine
+                # asked, not token pressure, and name the trigger when the engine
+                # exposes one (an unexplained cause is the whole complaint).
+                _engine_reason = ""
+                try:
+                    _engine_reason = str(
+                        getattr(_compressor, "last_preflight_reason", "") or ""
+                    ).strip()
+                except Exception:
+                    _engine_reason = ""
+                if _engine_reason:
+                    _engine_preflight_default = (
+                        ENGINE_PREFLIGHT_MAINTENANCE_REASON_STATUS_TEMPLATE.format(
+                            engine=_engine_name,
+                            tokens=_preflight_tokens,
+                            threshold=_engine_threshold,
+                            reason=_engine_reason,
+                        )
+                    )
+                else:
+                    _engine_preflight_default = (
                         ENGINE_PREFLIGHT_MAINTENANCE_STATUS_TEMPLATE.format(
                             engine=_engine_name,
                             tokens=_preflight_tokens,
                             threshold=_engine_threshold,
                         )
-                    ),
+                    )
+                _engine_preflight_status = automatic_compaction_status_message(
+                    _compressor,
+                    phase="engine_preflight_maintenance",
+                    default_message=_engine_preflight_default,
                     approx_tokens=_preflight_tokens,
                     threshold_tokens=_engine_threshold,
                     model=agent.model,
                 )
                 if _engine_preflight_status:
-                    agent._emit_status(_engine_preflight_status)
+                    # Ask the engine whether this pass is worth telling the user
+                    # about. A sanitize-only cleanup adoption RUNS but folds
+                    # nothing, so announcing it emits "maintenance compaction ...
+                    # this may take a moment" and then no stats at all, because
+                    # the stats renderer has a zero delta to report. Absent hook
+                    # => announce, so engines that never implement it are
+                    # byte-identical to today.
+                    _preflight_visible = True
+                    try:
+                        _visible_hook = getattr(
+                            _compressor, "preflight_is_user_visible", None
+                        )
+                        if callable(_visible_hook):
+                            _preflight_visible = bool(_visible_hook())
+                    except Exception:
+                        # A buggy engine must never silence a real compaction.
+                        _preflight_visible = True
+                    if _preflight_visible:
+                        agent._emit_status(_engine_preflight_status)
+                    else:
+                        logger.debug(
+                            "Engine preflight pass is not user-visible "
+                            "(sanitize-only); suppressing compaction status"
+                        )
                 _engine_input = messages
                 messages, active_system_prompt = agent._compress_context(
                     messages, system_message, approx_tokens=_preflight_tokens,
                     task_id=effective_task_id,
+                    trigger_reason="engine_preflight_maintenance",
                 )
                 # ``_compress_context`` returns the INPUT list object on every
                 # skip path (per-session lock held elsewhere, cooldown,

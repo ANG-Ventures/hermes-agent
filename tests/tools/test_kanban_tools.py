@@ -472,6 +472,207 @@ def test_create_rejects_non_string_model_override(worker_env):
     assert json.loads(out).get("error")
 
 
+def test_create_rejects_non_list_parents(worker_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_create({"title": "t", "assignee": "a", "parents": 42})
+    assert json.loads(out).get("error")
+
+
+def test_create_parses_triage_string_false(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_create({
+        "title": "not triage",
+        "assignee": "peer",
+        "triage": "false",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, d["task_id"])
+        assert task.status == "ready"
+    finally:
+        conn.close()
+
+
+def test_create_parses_triage_string_true(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_create({
+        "title": "needs triage",
+        "assignee": "peer",
+        "triage": "true",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, d["task_id"])
+        assert task.status == "triage"
+    finally:
+        conn.close()
+
+
+def test_create_rejects_bad_triage(worker_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_create({
+        "title": "bad triage",
+        "assignee": "peer",
+        "triage": "sometimes",
+    })
+    assert "triage must be" in json.loads(out).get("error", "")
+
+
+def test_create_accepts_string_parent(worker_env):
+    """Convenience: a single parent id as string is coerced to [id]."""
+    from tools import kanban_tools as kt
+    out = kt._handle_create({
+        "title": "t", "assignee": "a", "parents": worker_env,
+    })
+    assert json.loads(out)["ok"]
+
+
+def test_create_accepts_skills_list(worker_env):
+    """Tool writes the per-task skills through to the kernel."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_create({
+        "title": "skilled",
+        "assignee": "linguist",
+        "skills": ["translation", "github-code-review"],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, d["task_id"])
+    assert task.skills == ["translation", "github-code-review"]
+
+
+def test_create_accepts_skills_string(worker_env):
+    """Convenience: a single skill name as string is coerced to [name]."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_create({
+        "title": "one-skill",
+        "assignee": "a",
+        "skills": "translation",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, d["task_id"])
+    assert task.skills == ["translation"]
+
+
+def test_create_rejects_non_list_skills(worker_env):
+    """skills: 42 must be rejected, not silently dropped."""
+    from tools import kanban_tools as kt
+    out = kt._handle_create({
+        "title": "t", "assignee": "a", "skills": 42,
+    })
+    assert json.loads(out).get("error")
+
+
+def test_create_forwards_reasoning_effort(worker_env):
+    from tools import kanban_tools as kt
+
+    created = json.loads(
+        kt._handle_create({
+            "title": "deep child task",
+            "assignee": "peer",
+            "reasoning_effort": "high",
+        })
+    )
+    assert created["reasoning_effort"] == "high"
+
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, created["task_id"])
+
+    assert task is not None
+    assert task.reasoning_effort == "high"
+
+
+def test_create_preserves_none_reasoning_effort(worker_env):
+    from tools import kanban_tools as kt
+
+    created = json.loads(
+        kt._handle_create({
+            "title": "non-reasoning child task",
+            "assignee": "peer",
+            "reasoning_effort": "none",
+        })
+    )
+
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, created["task_id"])
+
+    assert task is not None
+    assert task.reasoning_effort == "none"
+
+
+def test_create_omitted_reasoning_effort_inherits(worker_env):
+    from tools import kanban_tools as kt
+
+    created = json.loads(
+        kt._handle_create({
+            "title": "inheriting child task",
+            "assignee": "peer",
+        })
+    )
+
+    assert created["reasoning_effort"] is None
+
+
+def test_create_rejects_invalid_reasoning_effort(worker_env):
+    from tools import kanban_tools as kt
+
+    result = json.loads(
+        kt._handle_create({
+            "title": "invalid child task",
+            "assignee": "peer",
+            "reasoning_effort": "extremely-hard",
+        })
+    )
+
+    assert "reasoning_effort must be one of" in result["error"]
+
+
+def test_show_surfaces_reasoning_effort(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="non-reasoning task",
+            assignee="peer",
+            reasoning_effort="none",
+        )
+
+    shown = json.loads(kt._handle_show({"task_id": task_id}))
+
+    assert shown["task"]["reasoning_effort"] == "none"
+
+
+def test_create_schema_exposes_optional_reasoning_effort():
+    from hermes_constants import VALID_REASONING_EFFORTS
+    from tools import kanban_tools as kt
+
+    properties = kt.KANBAN_CREATE_SCHEMA["parameters"]["properties"]
+
+    assert properties["reasoning_effort"]["enum"] == [
+        "",
+        "none",
+        *VALID_REASONING_EFFORTS,
+    ]
+    assert "reasoning_effort" not in kt.KANBAN_CREATE_SCHEMA["parameters"]["required"]
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()

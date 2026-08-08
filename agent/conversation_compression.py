@@ -392,6 +392,14 @@ ENGINE_PREFLIGHT_MAINTENANCE_STATUS_TEMPLATE = (
     "(BELOW the {threshold:,} threshold) — the context engine requested this, "
     "not token pressure. This may take a moment."
 )
+# Same arm, but the engine told us WHY. A below-threshold compaction with no
+# cause reads as unprovoked ("we were nowhere near the threshold"), so prefer
+# this form whenever the engine exposes a reason.
+ENGINE_PREFLIGHT_MAINTENANCE_REASON_STATUS_TEMPLATE = (
+    "📦 {engine} maintenance compaction: ~{tokens:,} tokens "
+    "(BELOW the {threshold:,} threshold) — triggered because {reason}, "
+    "not token pressure. This may take a moment."
+)
 IDLE_COMPACTION_STATUS_TEMPLATE = (
     "💤 Resumed after {idle_seconds}s idle — compacting "
     "~{tokens:,} tokens before continuing."
@@ -2583,6 +2591,24 @@ def compress_context(
         agent._compression_feasibility_checked = True
 
     _pre_msg_count = len(messages)
+    # Capture the provider's REAL prompt_tokens BEFORE compression runs. The
+    # compaction path sets last_prompt_tokens = -1 (the "await real usage"
+    # sentinel) well before the announce is rendered, so reading it at announce
+    # time yields the sentinel, not the measurement. Prefer
+    # last_real_prompt_tokens (the compressor's durable copy of the last real
+    # reading); fall back to last_prompt_tokens for engines that do not keep one.
+    # Used only for the display-side counter-divergence line — never for a gate.
+    try:
+        _cc_pre = getattr(agent, "context_compressor", None)
+        _real_prompt_tokens_pre = int(
+            getattr(_cc_pre, "last_real_prompt_tokens", 0)
+            or getattr(_cc_pre, "last_prompt_tokens", 0)
+            or 0
+        )
+        if _real_prompt_tokens_pre < 0:
+            _real_prompt_tokens_pre = 0
+    except Exception:
+        _real_prompt_tokens_pre = 0
     # In-place compaction (config: compression.in_place, see #38763). When True,
     # this compaction rewrites the message list and refreshes the system prompt
     # when necessary, but keeps the SAME session_id — no end_session, no
@@ -2606,9 +2632,22 @@ def compress_context(
     # to tell this TRANSIENT, retryable failure apart from a genuine
     # nothing-to-compress no-op (both leave session_id unchanged). See #44794.
     persist_failed = False
+    # Attribution is load-bearing: a compaction whose cause is not recorded is a
+    # compaction nobody can explain later, which is exactly the class of bug that
+    # produced the 2026-08-07 "why did it compact at 46%?" incident. Every caller
+    # passes ``trigger_reason``; a missing one is a WIRING DEFECT in a new call
+    # site, so name it loudly in the log rather than letting it read as normal.
+    _trigger_label = (trigger_reason or "").strip() or "UNATTRIBUTED"
+    if _trigger_label == "UNATTRIBUTED":
+        logger.warning(
+            "context compression has no trigger_reason (session=%s) — a caller "
+            "is not passing one; every compaction must name its arm",
+            agent.session_id or "none",
+        )
     logger.info(
-        "context compression started: session=%s messages=%d tokens=~%s model=%s focus=%r",
-        agent.session_id or "none", _pre_msg_count,
+        "context compression started: session=%s trigger=%s messages=%d "
+        "tokens=~%s model=%s focus=%r",
+        agent.session_id or "none", _trigger_label, _pre_msg_count,
         f"{approx_tokens:,}" if approx_tokens else "unknown", agent.model,
         focus_topic,
     )
@@ -4158,6 +4197,7 @@ def compress_context(
                     reasoning=_reasoning_inturn,
                     stats=_inturn_stats,
                     in_place=in_place,
+                    real_prompt_tokens=_real_prompt_tokens_pre or None,
                 )
         except Exception:
             logger.debug("compaction announce skipped (non-fatal)", exc_info=True)

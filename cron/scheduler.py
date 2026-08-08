@@ -514,7 +514,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, advance_next_runs, get_job, claim_dispatch, heartbeat_run_claim
+from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, advance_next_runs, get_job, claim_dispatch, heartbeat_run_claim, resolve_job_ref, AmbiguousJobReference
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -4756,13 +4756,38 @@ def run_job_now(job_id: str, *, verbose: bool = True, adapters=None, loop=None) 
     Unlike ``tick()``, this does NOT consult the due-list or advance
     ``next_run_at`` — it runs the named job right now regardless of schedule,
     using the exact same execute → save → deliver → mark pipeline. Backs the
-    ``hermes cron run <id> --wait`` CLI flag so slow jobs can be verified to
-    completion in the foreground.
+    ``hermes cron run <id-or-name> --wait`` CLI flag so slow jobs can be
+    verified to completion in the foreground.
+
+    ``job_id`` accepts an ID **or** a job name, matching every other cron
+    subcommand (``resolve_job_ref``: exact-ID first, then case-insensitive
+    name). Before 2026-08-08 this used the ID-only ``get_job()``, so
+    ``hermes cron run <name> --wait`` reported "Job not found" for a job that
+    ``hermes cron list`` displayed by name one line earlier — and our own
+    alert templates print that exact by-name command as their triage step.
 
     Returns the structured result dict from ``_process_one_job``, or a
-    ``{"success": False, "error": "... not found"}`` dict if the id is unknown.
+    ``{"success": False, "error": "..."}`` dict if the reference is unknown or
+    ambiguous.
     """
-    job = get_job(job_id)
+    try:
+        job = resolve_job_ref(job_id)
+    except AmbiguousJobReference as exc:
+        matches = ", ".join(
+            f"{j.get('id')} ({j.get('name')})" for j in getattr(exc, "matches", [])
+        )
+        return {
+            "processed": False,
+            "success": False,
+            "job_id": job_id,
+            "final_response": "",
+            "error": (
+                f"Ambiguous job reference: {job_id} matches multiple jobs"
+                + (f" — run one by ID: {matches}" if matches else "")
+            ),
+            "delivery_error": None,
+            "output_file": None,
+        }
     if not job:
         return {
             "processed": False,

@@ -79,6 +79,58 @@ def _int_value(value: Any) -> int:
         return 0
 
 
+
+# Default for ``model.stale_code_switch_guard``. The guard trades a rare
+# annoyance (a refused /model in the window between a deploy and a restart) for
+# a mid-conversation ImportError crash, so it ships ON; operators who deploy
+# often and accept the crash risk can turn it off in config.yaml.
+_STALE_CODE_SWITCH_GUARD_DEFAULT = True
+
+
+def _stale_code_switch_guard_enabled() -> bool:
+    """Runtime-read toggle for the model-switch stale-code guard.
+
+    Reads ``model.stale_code_switch_guard`` from ``config.yaml`` on every call
+    (no restart needed to flip it). A missing key, a malformed section, or any
+    read failure uses the safe default (guard ON) — a config problem must never
+    silently disarm a crash guard.
+    """
+    try:
+        from hermes_cli.config import read_raw_config
+
+        raw = read_raw_config() or {}
+        model_cfg = raw.get("model", {}) if isinstance(raw, dict) else {}
+        if not isinstance(model_cfg, dict):
+            logger.warning(
+                "Malformed model config section while reading "
+                "stale_code_switch_guard; defaulting to enabled"
+            )
+            return _STALE_CODE_SWITCH_GUARD_DEFAULT
+        value = model_cfg.get(
+            "stale_code_switch_guard", _STALE_CODE_SWITCH_GUARD_DEFAULT
+        )
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off"}:
+                return False
+        logger.warning(
+            "Malformed model.stale_code_switch_guard (%r); defaulting to enabled",
+            value,
+        )
+        return _STALE_CODE_SWITCH_GUARD_DEFAULT
+    except Exception as exc:
+        logger.warning(
+            "Could not read model.stale_code_switch_guard; defaulting to "
+            "enabled (error=%s)",
+            type(exc).__name__,
+        )
+        return _STALE_CODE_SWITCH_GUARD_DEFAULT
+
+
 def _model_switch_skew_guard() -> Optional[str]:
     """Refuse a model switch when the gateway is running stale code.
 
@@ -91,6 +143,10 @@ def _model_switch_skew_guard() -> Optional[str]:
     Intentionally scoped to model switching — the known, highest-risk trigger.
     Any first-time lazy import on a stale process is technically exposed; we
     don't guard every import site, only this one.
+
+    Disable with ``model.stale_code_switch_guard: false`` in ``config.yaml``.
+    Detection still runs when disabled so a suppressed skew leaves a WARNING
+    breadcrumb in the log — otherwise a later stale-import crash looks causeless.
     """
     from gateway.code_skew import detect_code_skew
 
@@ -98,6 +154,15 @@ def _model_switch_skew_guard() -> Optional[str]:
     if not skew:
         return None
     boot_rev, disk_rev = skew
+    if not _stale_code_switch_guard_enabled():
+        logger.warning(
+            "Model-switch stale-code guard DISABLED by config "
+            "(model.stale_code_switch_guard=false): allowing a switch with "
+            "code skew boot=%s disk=%s — a stale-module ImportError is possible",
+            boot_rev,
+            disk_rev,
+        )
+        return None
     return t(
         "gateway.model.error_prefix",
         error=(
@@ -5130,6 +5195,7 @@ class GatewaySlashCommandsMixin:
                         approx_tokens=approx_tokens,
                         focus_topic=focus_topic,
                         force=True,
+                        trigger_reason="manual_compress_command",
                         defer_context_engine_notification=True,
                     )
                 )

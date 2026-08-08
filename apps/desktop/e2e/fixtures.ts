@@ -90,6 +90,46 @@ function stripCredentials(env: Record<string, string | undefined>): Record<strin
 
 // ─── Sandbox creation ──────────────────────────────────────────────────
 
+
+/**
+ * Close an Electron app with a hard deadline. A naked `app.close()` waits for
+ * a graceful renderer/main shutdown that can hang FOREVER when the app is in a
+ * broken state (e.g. the boot-failure specs kill/deny the backend, leaving no
+ * healthy main-process loop to service the close). That hang surfaces as
+ * Playwright's "afterAll hook timeout of 90000ms exceeded" and — because the
+ * timeout fails the LAST test of the worker — reads as a flaky spec. Observed
+ * 3/3 on merge-group runs of boot-failure.spec.ts (2026-08-07), evicting a
+ * green PR from the merge queue repeatedly.
+ *
+ * close() is raced against `timeoutMs`; on expiry the underlying process gets
+ * SIGKILL. Cleanup must be bounded: a teardown that can outlive its hook
+ * timeout is a test-infra bug, not a flake.
+ */
+export async function closeAppWithDeadline(
+  app: ElectronApplication,
+  timeoutMs = 15_000,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<'timeout'>((resolve) => {
+    timer = setTimeout(() => resolve('timeout'), timeoutMs)
+  })
+  try {
+    const result = await Promise.race([
+      app.close().then(() => 'closed' as const, () => 'closed' as const),
+      deadline,
+    ])
+    if (result === 'timeout') {
+      try {
+        app.process().kill('SIGKILL')
+      } catch {
+        // process already gone — fine
+      }
+    }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 export interface Sandbox {
   root: string
   hermesHome: string
@@ -404,7 +444,7 @@ export async function setupMockBackend(options: MockBackendOptions = {}): Promis
     mockUrl: mock.url,
     sandbox,
     cleanup: async () => {
-      await app.close().catch(() => undefined)
+      await closeAppWithDeadline(app)
       await mock.close()
       sandbox.cleanup()
     },
@@ -434,7 +474,7 @@ export async function setupNoProvider(): Promise<NoProviderFixture> {
     page,
     sandbox,
     cleanup: async () => {
-      await app.close().catch(() => undefined)
+      await closeAppWithDeadline(app)
       sandbox.cleanup()
     },
   }
@@ -495,7 +535,7 @@ providers:
     page,
     sandbox,
     cleanup: async () => {
-      await app.close().catch(() => undefined)
+      await closeAppWithDeadline(app)
       sandbox.cleanup()
     },
   }
@@ -581,7 +621,7 @@ export async function setupPackagedApp(): Promise<PackagedAppFixture> {
     page,
     sandbox,
     cleanup: async () => {
-      await app.close().catch(() => undefined)
+      await closeAppWithDeadline(app)
       sandbox.cleanup()
     },
   }

@@ -3391,11 +3391,27 @@ def estimate_tokens_rough(text: str) -> int:
     return dense + ((sparse + 3) // 4)
 
 
+# Media parts arrive as base64 but are billed by dimension/page/duration, never
+# by transport size, so their payload length carries no pricing signal. Counting
+# the base64 as characters overestimated a real 1710x1518 screenshot by ~145x and
+# drove spurious compaction (2026-08-07). Rates + the cheap header parsers that
+# recover page count / duration live in agent/media_tokens.py, imported by BOTH
+# this estimator and the LCM engine's so the two cannot drift.
+from agent.media_tokens import (  # noqa: E402
+    AUDIO_PART_TYPES as _AUDIO_PART_TYPES,
+    DOCUMENT_PART_TYPES as _DOCUMENT_PART_TYPES,
+    IMAGE_PART_TYPES as _IMAGE_PART_TYPES,
+    IMAGE_TOKEN_COST as _IMAGE_TOKEN_COST,
+    MEDIA_PART_TYPES as _MEDIA_PART_TYPES,
+    media_part_token_cost as _media_part_token_cost,
+)
+
+
 def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
     """Rough token estimate for a message list (pre-flight only).
 
-    Image parts (base64 PNG/JPEG) are counted as a flat ~1500 tokens per
-    image — the Anthropic pricing model — instead of counting raw base64
+    Media parts (base64 images, PDFs, audio) are counted at a flat per-part
+    cost — the provider pricing model — instead of counting raw base64
     character length. Without this, a single ~1MB screenshot would be
     estimated at ~250K tokens and trigger premature context compression.
 
@@ -3405,7 +3421,6 @@ def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
     actually changed. The memo is exact: equal fingerprints imply identical
     leaf objects and structure, hence an identical estimate.
     """
-    _IMAGE_TOKEN_COST = 1500
     dense_total = 0
     sparse_total = 0
     image_tokens = 0
@@ -3503,29 +3518,38 @@ def _estimate_message_tokens_cached(
 
 
 def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
-    """Count image-like content parts in a message; return their token cost."""
-    count = 0
-    content = msg.get("content") if isinstance(msg, dict) else None
-    if isinstance(content, list):
-        for part in content:
+    """Token cost of every media part in a message (images, documents, audio).
+
+    Each part is priced individually by ``media_part_token_cost`` — documents by
+    PAGE and audio by DURATION, recovered from a cheap header parse — rather than
+    by a flat per-category constant. A flat document cost under-counted a 40-page
+    PDF ~40x, and under-counting is the dangerous direction: compaction then
+    fires too LATE and the turn can hit a real provider 400.
+
+    ``cost_per_image`` is honored for image parts so existing callers that tune
+    it keep working.
+    """
+    total = 0
+
+    def _tally(parts: Any) -> None:
+        nonlocal total
+        if not isinstance(parts, list):
+            return
+        for part in parts:
             if not isinstance(part, dict):
                 continue
-            ptype = part.get("type")
-            if ptype in {"image", "image_url", "input_image"}:
-                count += 1
-    stashed = msg.get("_anthropic_content_blocks") if isinstance(msg, dict) else None
-    if isinstance(stashed, list):
-        for part in stashed:
-            if isinstance(part, dict) and part.get("type") == "image":
-                count += 1
+            if part.get("type") in _IMAGE_PART_TYPES:
+                total += cost_per_image
+            else:
+                total += _media_part_token_cost(part)
+
+    content = msg.get("content") if isinstance(msg, dict) else None
+    _tally(content)
+    _tally(msg.get("_anthropic_content_blocks") if isinstance(msg, dict) else None)
     # Multimodal tool results that haven't been converted yet.
     if isinstance(content, dict) and content.get("_multimodal"):
-        inner = content.get("content")
-        if isinstance(inner, list):
-            for part in inner:
-                if isinstance(part, dict) and part.get("type") in {"image", "image_url"}:
-                    count += 1
-    return count * cost_per_image
+        _tally(content.get("content"))
+    return total
 
 
 def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
@@ -3574,8 +3598,8 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
                 cleaned = []
                 for part in v:
                     if isinstance(part, dict):
-                        if part.get("type") in {"image", "image_url", "input_image"}:
-                            cleaned.append({"type": part.get("type"), "image": "[stripped]"})
+                        if part.get("type") in _MEDIA_PART_TYPES:
+                            cleaned.append({"type": part.get("type"), "media": "[stripped]"})
                         else:
                             cleaned.append(part)
                     else:
@@ -3602,7 +3626,12 @@ def _estimate_message_chars(msg: Dict[str, Any]) -> int:
 
 
 def _estimate_message_dense_sparse(msg: Dict[str, Any]) -> tuple[int, int]:
-    """(cjk_dense, sparse) char split for a message with image payloads stripped."""
+    """(cjk_dense, sparse) char split for a message with media payloads stripped.
+
+    Every media part counted at a flat cost by ``_count_image_tokens`` must be
+    stripped here, or its base64 is billed twice: once flat, once as characters.
+    Keep the stripped set and that function's tallied set identical.
+    """
     if not isinstance(msg, dict):
         return _split_dense_sparse(str(msg))
     return _split_dense_sparse(str(_wire_message_shadow(msg)))

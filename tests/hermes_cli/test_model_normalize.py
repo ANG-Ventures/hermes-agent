@@ -4,7 +4,9 @@ Covers issue #5211: opencode-go model names with dots (e.g. minimax-m2.7)
 must NOT be mangled to hyphens (minimax-m2-7).
 """
 import pytest
+from unittest import mock
 
+from hermes_cli import model_normalize
 from hermes_cli.model_normalize import (
     normalize_model_for_provider,
     _DOT_TO_HYPHEN_PROVIDERS,
@@ -38,6 +40,57 @@ class TestIssue5211OpenCodeGoDotPreservation:
 
 class TestAnthropicDotToHyphen:
     """Anthropic API still needs dots→hyphens."""
+
+
+# ── Anthropic-WIRE relay providers serving non-Claude models (regression) ──
+
+class TestAnthropicWireRelayNonClaudeModels:
+    """Dots->hyphens is an Anthropic MODEL-naming rule, not a provider rule.
+
+    The Anthropic-wire relay providers (claude-apr, claude-apx-*, claude-proxy*)
+    are injected into _DOT_TO_HYPHEN_PROVIDERS at runtime because they speak the
+    Anthropic wire format — but they front a pool that ALSO serves non-Claude
+    models. Rewriting those names produced a model id upstream never heard of:
+    live 2026-08-07, a cron pinned model=gpt-5.6-sol on provider=claude-apr was
+    rewritten to gpt-5-6-sol and every tick died with
+    ``HTTP 404: model: gpt-5-6-sol``.
+    """
+
+    @pytest.mark.parametrize("provider", [
+        "anthropic",
+        "claude-apr",
+        "claude-apx-2",
+        "claude-proxy",
+    ])
+    @pytest.mark.parametrize("model", [
+        "gpt-5.6-sol",
+        "minimax-m2.7",
+    ])
+    def test_non_claude_models_keep_their_dots(self, provider, model):
+        # Simulate the runtime injection of Anthropic-wire relay providers.
+        with mock.patch.object(
+            model_normalize,
+            "_DOT_TO_HYPHEN_PROVIDERS",
+            frozenset({"anthropic", "claude-apr", "claude-apx-2", "claude-proxy"}),
+        ):
+            assert normalize_model_for_provider(model, provider) == model
+
+    @pytest.mark.parametrize("provider", [
+        "anthropic",
+        "claude-apr",
+        "claude-apx-2",
+    ])
+    def test_claude_models_still_convert_on_the_same_providers(self, provider):
+        # The fix must not weaken the Anthropic rule it is narrowing.
+        with mock.patch.object(
+            model_normalize,
+            "_DOT_TO_HYPHEN_PROVIDERS",
+            frozenset({"anthropic", "claude-apr", "claude-apx-2", "claude-proxy"}),
+        ):
+            assert (
+                normalize_model_for_provider("claude-sonnet-4.6", provider)
+                == "claude-sonnet-4-6"
+            )
 
 
 # ── OpenCode Zen regression ────────────────────────────────────────────

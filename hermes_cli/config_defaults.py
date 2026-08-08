@@ -788,6 +788,13 @@ DEFAULT_CONFIG = {
     # Re-homed here from hermes_cli/config.py when upstream extracted
     # DEFAULT_CONFIG into this module. Fork-owned; keep on future syncs.
         "hygiene_failure_alert_after": 3,  # after N consecutive hygiene-compression failures, escalate
+        "announce_below_threshold_compaction": True,  # announce a compaction the
+                                      # CONTEXT ENGINE requested while the context was
+                                      # BELOW the token threshold, naming the cause
+                                      # (e.g. a large attachment externalized). Those
+                                      # fire with no percentage tell, so silencing them
+                                      # produces a compaction the user cannot explain.
+                                      # Set False to keep that arm quiet.
         "hygiene_threshold": 0.85,    # gateway session-hygiene token threshold (fraction of window); higher than compression.threshold (pre-turn backstop)
     },
 
