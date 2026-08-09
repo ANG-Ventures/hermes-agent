@@ -585,6 +585,14 @@ def _handle_show(args: dict, **kw) -> str:
                 "task": _task_dict(task),
                 "parents": parents,
                 "children": children,
+                "parent_links": [
+                    {"id": pid, "kind": kind}
+                    for pid, kind in kb.parent_links(conn, tid)
+                ],
+                "child_links": [
+                    {"id": cid, "kind": kind}
+                    for cid, kind in kb.child_links(conn, tid)
+                ],
                 "comments": [
                     {"author": c.author, "body": c.body,
                      "created_at": c.created_at}
@@ -1272,6 +1280,7 @@ def _handle_create(args: dict, **kw) -> str:
         )
     body = args.get("body")
     parents = args.get("parents") or []
+    parents_kind = args.get("parents_kind")
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
     # Stamp the originating session id when the agent loop runs under
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
@@ -1363,6 +1372,7 @@ def _handle_create(args: dict, **kw) -> str:
                 body=body,
                 assignee=str(assignee),
                 parents=tuple(parents),
+                parents_kind=parents_kind,
                 tenant=tenant,
                 priority=int(priority) if priority is not None else 0,
                 workspace_kind=str(workspace_kind),
@@ -1603,16 +1613,23 @@ def _handle_link(args: dict, **kw) -> str:
     child_id = args.get("child_id")
     if not parent_id or not child_id:
         return tool_error("both parent_id and child_id are required")
+    kind = args.get("kind")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
         try:
-            kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
-            return _ok(parent_id=parent_id, child_id=child_id)
+            kb.link_tasks(
+                conn, parent_id=parent_id, child_id=child_id, kind=kind,
+            )
+            return _ok(
+                parent_id=parent_id,
+                child_id=child_id,
+                kind=kb.normalize_link_kind(kind),
+            )
         finally:
             conn.close()
     except ValueError as e:
-        # Covers cycle + self-parent rejections
+        # Covers cycle + self-parent + unknown-kind rejections
         return tool_error(f"kanban_link: {e}")
     except Exception as e:
         logger.exception("kanban_link failed")
@@ -2043,11 +2060,26 @@ KANBAN_CREATE_SCHEMA = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "Parent task ids. The new task stays in 'todo' "
+                    "Parent task ids. With the default "
+                    "parents_kind='blocks' the new task stays in 'todo' "
                     "until every parent reaches 'done'; then it "
                     "auto-promotes to 'ready'. Typical fan-in: list "
                     "all the researcher task ids when creating a "
                     "synthesizer task."
+                ),
+            },
+            "parents_kind": {
+                "type": "string",
+                "enum": ["blocks", "derived-from"],
+                "description": (
+                    "Semantics for every parent edge. 'blocks' (default) = "
+                    "real dependency, this task waits. 'derived-from' = "
+                    "provenance only: the parent DISCOVERED this work "
+                    "(audit/survey/investigation filing remediation) and the "
+                    "new task is dispatchable immediately. Use it whenever "
+                    "you are recording WHERE work came from rather than what "
+                    "it must wait for — a DEPLOY must never be gated on a "
+                    "DISCOVERY."
                 ),
             },
             "tenant": {
@@ -2229,15 +2261,29 @@ KANBAN_UNBLOCK_SCHEMA = {
 KANBAN_LINK_SCHEMA = {
     "name": "kanban_link",
     "description": (
-        "Add a parent→child dependency edge after both tasks already "
-        "exist. The child won't promote to 'ready' until all parents "
-        "are 'done'. Cycles and self-links are rejected."
+        "Add a parent→child edge after both tasks already exist. With "
+        "kind='blocks' (default) the child won't promote to 'ready' until "
+        "all blocking parents are 'done'. With kind='derived-from' the edge "
+        "is provenance only and never gates — use it when the parent "
+        "DISCOVERED the child (audit/survey/investigation → remediation). "
+        "Cycles and self-links are rejected."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "parent_id": {"type": "string", "description": "Parent task id."},
             "child_id":  {"type": "string", "description": "Child task id."},
+            "kind": {
+                "type": "string",
+                "enum": ["blocks", "derived-from"],
+                "description": (
+                    "Edge semantics. 'blocks' (default) = real dependency, "
+                    "the child waits. 'derived-from' = provenance only, the "
+                    "child is independently dispatchable. A DEPLOY must never "
+                    "be gated on a DISCOVERY. Re-linking an existing pair "
+                    "updates its kind."
+                ),
+            },
             "board": _board_schema_prop(),
         },
         "required": ["parent_id", "child_id"],
