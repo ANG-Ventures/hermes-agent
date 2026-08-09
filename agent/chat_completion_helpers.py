@@ -2031,6 +2031,15 @@ def _primary_cooldown_seconds(error_context: Optional[Dict[str, Any]] = None) ->
     repeated turns do not restore an exhausted primary after the old fixed
     60-second grace. Clamp absurdly-low/absurdly-high values to keep the
     fallback mechanism useful and bounded.
+
+    🔴 The ceiling is WINDOW-AWARE. A 6h cap is right for an unidentified
+    reset (be conservative about benching a primary on a number we can't
+    attribute), but WRONG for an identified 7-day quota: Anthropic's own
+    ``retry-after`` on a 7d-exhausted sub is ~2 days, so a 6h clamp re-probes a
+    provably-dead sub 8 times before it can possibly recover — each probe a full
+    turn's context marshaled, 429'd, and thrown away. When
+    ``_extract_unified_quota_window`` positively identified the 7d window, trust
+    it and allow up to 7 days. Everything else keeps the historical 6h bound.
     """
     default = 60.0
     if not isinstance(error_context, dict):
@@ -2047,7 +2056,12 @@ def _primary_cooldown_seconds(error_context: Optional[Dict[str, Any]] = None) ->
     seconds = reset_at_float - time.time() if reset_at_float > 1_000_000_000 else reset_at_float
     if seconds <= 0:
         return default
-    return max(default, min(seconds, 6 * 60 * 60))
+    ceiling = (
+        7 * 24 * 60 * 60
+        if error_context.get("quota_window") == "7d"
+        else 6 * 60 * 60
+    )
+    return max(default, min(seconds, ceiling))
 
 
 def _format_context_window(tokens: "int | None") -> str:
@@ -2579,7 +2593,16 @@ def try_activate_fallback(
             base_cooldown = _primary_cooldown_seconds(error_context)
             backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
             agent._rate_limit_backoff_count = backoff_count + 1
-            backoff_seconds = min(base_cooldown * (2 ** backoff_count), 14400)
+            # The 4h escalation ceiling exists to stop an unattributed backoff
+            # from compounding forever. It must NOT clamp a LONGER, PROVIDER-
+            # STATED window back down: on a 7d-exhausted sub the provider says
+            # ~2 days, and re-clamping to 4h re-probes a provably-dead primary
+            # ~12 times before it can possibly recover. Take the escalation
+            # ceiling OR the provider's own base, whichever is larger.
+            backoff_seconds = min(
+                base_cooldown * (2 ** backoff_count),
+                max(base_cooldown, 14400),
+            )
             agent._rate_limited_until = time.monotonic() + backoff_seconds
             logging.info(
                 "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d)",
@@ -2611,11 +2634,11 @@ def try_activate_fallback(
         agent._unavailable_fallback_keys = unavailable
     if fb_key in unavailable:
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
-        return agent._try_activate_fallback(reason)
+        return agent._try_activate_fallback(reason, error_context=error_context)
     fb_provider = (fb.get("provider") or "").strip().lower()
     fb_model = (fb.get("model") or "").strip()
     if not fb_provider or not fb_model:
-        return agent._try_activate_fallback(reason)  # skip invalid, try next
+        return agent._try_activate_fallback(reason, error_context=error_context)  # skip invalid, try next
 
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
@@ -2626,7 +2649,7 @@ def try_activate_fallback(
             fb_model,
             local_skip_reason,
         )
-        return agent._try_activate_fallback(reason)
+        return agent._try_activate_fallback(reason, error_context=error_context)
 
     # Skip entries that resolve to the same backend that just failed —
     # falling back to it loops the failure. Identity semantics (which axes
@@ -2651,7 +2674,7 @@ def try_activate_fallback(
             "as the current one (%s)",
             fb_provider, fb_model, current_ident.base_url or current_ident.provider,
         )
-        return agent._try_activate_fallback(reason)
+        return agent._try_activate_fallback(reason, error_context=error_context)
 
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()
@@ -2681,7 +2704,7 @@ def try_activate_fallback(
                 "Fallback to %s failed: provider not configured",
                 fb_provider)
             unavailable.add(fb_key)
-            return agent._try_activate_fallback(reason)  # try next in chain
+            return agent._try_activate_fallback(reason, error_context=error_context)  # try next in chain
         try:
             from hermes_cli.model_normalize import normalize_model_for_provider
 
@@ -3102,7 +3125,7 @@ def try_activate_fallback(
         if fb_provider == "nous":
             unavailable.add(fb_key)
         logger.error("Failed to activate fallback %s: %s", fb_model, e)
-        return agent._try_activate_fallback(reason)  # try next in chain
+        return agent._try_activate_fallback(reason, error_context=error_context)  # try next in chain
 
 
 
