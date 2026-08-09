@@ -471,19 +471,29 @@ class ContextEngine(ABC):
         """Seed the skew history from persisted per-session state (restart resume).
 
         Only applies when the in-memory history is empty (a live history is
-        fresher than any persisted snapshot) and only accepts sane ratios
-        (0 < r <= 1.0; rough never under-counts). Invalid input is ignored —
-        seeding is an optimization, never a correctness requirement.
+        fresher than any persisted snapshot) and only accepts sane ratios.
+        Invalid input is ignored — seeding is an optimization, never a
+        correctness requirement.
+
+        The accepted band MUST match what ``_current_skew`` is willing to apply,
+        or persisted calibration is silently thrown away on every restart. When
+        scale-up is enabled the recorder emits ratios ABOVE 1.0 (the estimate
+        read LOW), so an upper bound of 1.0 here would discard exactly the
+        readings that matter most — an under-count means threshold compaction
+        fires LATE, toward provider overflow. Bound by the same
+        ``_SKEW_SCALE_UP_MAX`` ceiling ``_current_skew`` clamps to, so a corrupt
+        or absurd persisted value still can't be seeded.
         """
         if getattr(self, "_recent_skews", None):
             return
+        upper = _SKEW_SCALE_UP_MAX if _scale_up_calibration_enabled() else 1.0
         clean = []
         for r in ratios or []:
             try:
                 f = float(r)
             except (TypeError, ValueError):
                 continue
-            if 0.0 < f <= 1.0:
+            if 0.0 < f <= upper:
                 clean.append(f)
         if clean:
             self._recent_skews = clean[-self._SKEW_HISTORY:]

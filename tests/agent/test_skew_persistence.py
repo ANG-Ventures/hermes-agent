@@ -181,12 +181,27 @@ class TestSeedRules:
 
     def test_seed_rejects_garbage(self):
         c = make_compressor()
-        c.seed_skew_calibration([0.0, -1, 1.5, "nan-ish", None, 2.0])
+        # NOTE: 1.5 and 2.0 are NOT garbage since PR #506 enabled scale-up
+        # calibration — a ratio above 1.0 means the estimate read LOW, which is
+        # the dangerous direction (compaction fires LATE). Only genuinely
+        # unusable values are rejected here.
+        c.seed_skew_calibration([0.0, -1, "nan-ish", None])
         assert c._current_skew() == 1.0  # nothing sane to seed
+
+    def test_seed_accepts_scale_up_ratios(self):
+        """Under-count ratios must survive the restart-resume path.
+
+        Regression for the third missed site in #506: seed_skew_calibration
+        kept the pre-#506 ``0 < r <= 1.0`` band, so every scale-up ratio the
+        session learned was persisted and then silently discarded on restart.
+        """
+        c = make_compressor()
+        c.seed_skew_calibration([1.5, 2.0])
+        assert c._current_skew() > 1.0
 
     def test_seed_accepts_partial_garbage(self):
         c = make_compressor()
-        c.seed_skew_calibration([1.5, 0.8, None, 0.9])
+        c.seed_skew_calibration([0.8, None, 0.9])
         assert c._current_skew() == pytest.approx(0.85)
 
     def test_corrupt_persisted_json_ignored(self):
