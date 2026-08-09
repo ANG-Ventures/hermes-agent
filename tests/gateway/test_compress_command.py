@@ -237,6 +237,53 @@ async def test_compress_command_in_place_skips_destructive_rewrite():
     agent_instance.close.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    ("configured_in_place", "expected_warning", "unexpected_warning"),
+    [
+        (False, "in-place mode is off", "in-place compaction did not complete"),
+        (True, "in-place compaction did not complete", "in-place mode is off"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_compress_warning_distinguishes_disabled_mode_from_incomplete_run(
+    caplog, configured_in_place, expected_warning, unexpected_warning
+):
+    """The configured mode and the last run's outcome are separate states."""
+    history = _make_history()
+    runner = _make_runner(history)
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.context_compressor._last_compress_aborted = True
+    agent_instance.context_compressor._last_summary_fallback_used = False
+    agent_instance.context_compressor._last_summary_dropped_count = 0
+    agent_instance.context_compressor._last_summary_error = "synthetic abort"
+    agent_instance.context_compressor._last_aux_model_failure_model = None
+    agent_instance.context_compressor._last_aux_model_failure_error = None
+    agent_instance.compression_in_place = configured_in_place
+    agent_instance._last_compaction_in_place = False
+    agent_instance._last_compaction_persist_failed = False
+    agent_instance.session_id = "sess-1"
+    agent_instance._compress_context.return_value = (list(history), "")
+    agent_instance._compression_skipped_due_to_lock = False
+
+    with (
+        caplog.at_level("WARNING", logger="gateway.run"),
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
+    ):
+        await runner._handle_compress_command(_make_event())
+
+    warning = "\n".join(caplog.messages)
+    assert expected_warning in warning
+    assert unexpected_warning not in warning
+
+
 @pytest.mark.asyncio
 async def test_compress_command_preserves_platform_and_gateway_session_key():
     """The temporary compression agent must carry the originating source's

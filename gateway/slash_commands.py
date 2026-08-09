@@ -5227,6 +5227,9 @@ class GatewaySlashCommandsMixin:
                 rotated = new_session_id != session_entry.session_id
                 _old_session_id = session_entry.session_id
                 _in_place = bool(getattr(tmp_agent, "_last_compaction_in_place", False))
+                _in_place_configured = bool(
+                    getattr(tmp_agent, "compression_in_place", False)
+                )
                 # Did the compressor produce a compacted list whose DB persist
                 # was rolled back (locked/contended state.db, FK error, ENOSPC)?
                 # This is a TRANSIENT, retryable failure that leaves session_id
@@ -5285,11 +5288,17 @@ class GatewaySlashCommandsMixin:
                     # transcript inside _compress_context — nothing to do.
                     pass
                 else:
+                    _failure_reason = (
+                        "in-place compaction did not complete"
+                        if _in_place_configured
+                        else "in-place mode is off"
+                    )
                     logger.warning(
                         "Manual /compress: session rotation did not occur "
-                        "(session_id unchanged) and in-place mode is off — "
+                        "(session_id unchanged) and %s — "
                         "preserving original transcript instead of overwriting "
-                        "it (#44794)."
+                        "it (#44794).",
+                        _failure_reason,
                     )
                 # Whether the STORED transcript actually changed. Downstream
                 # feedback must be computed on this basis — when no rewrite
