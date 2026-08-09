@@ -2145,6 +2145,7 @@ _FALLBACK_REASON_LABELS = {
     "overloaded": "provider overloaded",
     "server_error": "provider error",
     "timeout": "connection dropped",
+    "decode_error": "corrupt response",
     "ssl_cert_verification": "TLS error",
     "auth": "auth refresh",
     "auth_permanent": "auth failed",
@@ -2161,6 +2162,49 @@ _FALLBACK_REASON_LABELS = {
 # stream-drop that failed over with no reason). "connection issue" is the honest
 # floor: a transport/stream fault we routed around but can't name precisely.
 _GENERIC_FALLBACK_LABEL = "connection issue"
+
+
+def _quota_window_suffix(agent) -> str:
+    """Return ' (7d limit, resets Mon 14:00)'-style detail for a rate-limit label.
+
+    Reads the quota window that ``extract_api_error_context`` recorded from
+    Anthropic's ``anthropic-ratelimit-unified-*`` headers and stamped on the
+    agent. Returns '' whenever we don't know — a provider that sends no such
+    headers, or a transport failure with no response at all, must render exactly
+    the old flat label.
+
+    Consume-once, mirroring ``_resolve_failover_reason``: the stamp is cleared
+    unconditionally so a stale window can never leak onto a later, unrelated
+    failover.
+    """
+    ctx = getattr(agent, "_pending_quota_window", None)
+    try:
+        agent._pending_quota_window = None
+    except Exception:
+        pass
+    if not isinstance(ctx, dict):
+        return ""
+    window = ctx.get("quota_window")
+    if window not in {"5h", "7d"}:
+        return ""
+
+    detail = f"{window} limit"
+    reset_at = ctx.get("quota_window_reset")
+    if reset_at:
+        try:
+            remaining = float(reset_at) - time.time()
+        except (TypeError, ValueError):
+            remaining = 0
+        if remaining > 0:
+            # Relative is what the reader actually needs ("do I wait, or give
+            # up on this sub?"). Hours for anything under a day, else days.
+            if remaining < 3600:
+                detail += f", resets in {int(remaining // 60)}m"
+            elif remaining < 86400:
+                detail += f", resets in {remaining / 3600:.0f}h"
+            else:
+                detail += f", resets in {remaining / 86400:.1f}d"
+    return detail
 
 
 def _fallback_reason_label(reason: "Any | None") -> "str | None":
@@ -2326,6 +2370,15 @@ def _emit_fallback_announce(
         _reason_suffix = f" ({recovery_via})" if recovery_via else ""
     else:
         _reason_label = _fallback_reason_label(reason)
+        # For a quota 429, name WHICH window bound (5h vs 7d) and when it
+        # clears — those are opposite decisions ("wait an hour" vs "this sub is
+        # gone for two days") that both used to render as a flat "rate limit".
+        # Silently unchanged for providers that send no unified-quota headers.
+        if reason in {FailoverReason.rate_limit, FailoverReason.upstream_rate_limit,
+                      FailoverReason.pool_exhausted}:
+            _window = _quota_window_suffix(agent)
+            if _window:
+                _reason_label = f"{_reason_label} · {_window}"
         _reason_suffix = f" ({_reason_label})" if _reason_label else ""
     msg = f"{icon} {verb}{_reason_suffix}: {old_label} → {new_label}"
     old_lbl = _format_context_window(old_window)

@@ -56,6 +56,7 @@ class TestFailoverReason:
             "upstream_rate_limit", "pool_exhausted",
             "overloaded", "server_error", "timeout",
             "ssl_cert_verification",
+            "decode_error",
             "context_overflow", "payload_too_large", "image_too_large",
             "model_not_found", "format_error",
             "malformed_conversation",

@@ -4148,6 +4148,73 @@ def cleanup_dead_connections(agent) -> bool:
 
 
 
+def _extract_unified_quota_window(headers, context: Dict[str, Any]) -> None:
+    """Record WHICH Anthropic quota window is exhausted, and when it resets.
+
+    Anthropic answers a quota 429 with a family of ``anthropic-ratelimit-unified-*``
+    headers describing EVERY window independently, e.g. (captured live 2026-08-08
+    from a 7d-exhausted sub)::
+
+        anthropic-ratelimit-unified-5h-status: allowed
+        anthropic-ratelimit-unified-5h-utilization: 0.0
+        anthropic-ratelimit-unified-5h-reset: 1786245600
+        anthropic-ratelimit-unified-7d-status: rejected
+        anthropic-ratelimit-unified-7d-utilization: 1.0
+        anthropic-ratelimit-unified-7d-reset: 1786424400
+        anthropic-ratelimit-unified-representative-claim: seven_day
+
+    "5h exhausted" and "7d exhausted" are OPPOSITE operational situations — the
+    first clears in under an hour, the second can be two days away — but both
+    previously rendered as a flat, unqualified "rate limit". This records the
+    binding window so the failover announce can say WHICH one.
+
+    ``representative-claim`` names the binding window directly, so prefer it and
+    only fall back to scanning the per-window ``-status`` fields. Populates
+    ``quota_window`` ('5h' | '7d') and ``quota_window_reset`` (epoch seconds), and
+    fills ``reset_at`` from the binding window when nothing else supplied it.
+
+    Silent no-op when the headers are absent — every non-Anthropic provider, and
+    any transport-level failure with no response at all, must keep working.
+    """
+    def _h(name: str):
+        try:
+            return headers.get(name)
+        except Exception:
+            return None
+
+    _CLAIM_TO_WINDOW = {"seven_day": "7d", "five_hour": "5h"}
+
+    window = _CLAIM_TO_WINDOW.get(
+        str(_h("anthropic-ratelimit-unified-representative-claim") or "").strip().lower()
+    )
+
+    # No (or unrecognized) claim → find a window that actually reports rejected.
+    # Checked 5h-then-7d only to be deterministic; the claim header is the real
+    # source of truth when present.
+    if not window:
+        for candidate, header in (("5h", "anthropic-ratelimit-unified-5h-status"),
+                                  ("7d", "anthropic-ratelimit-unified-7d-status")):
+            if str(_h(header) or "").strip().lower() == "rejected":
+                window = candidate
+                break
+
+    if not window:
+        return
+
+    context["quota_window"] = window
+
+    reset_raw = _h(f"anthropic-ratelimit-unified-{window}-reset")
+    if reset_raw not in (None, ""):
+        try:
+            reset_epoch = float(reset_raw)
+        except (TypeError, ValueError):
+            return
+        context["quota_window_reset"] = reset_epoch
+        # The binding window's reset is the most accurate cooldown we have; only
+        # use it if retry-after / x-ratelimit-reset didn't already answer.
+        context.setdefault("reset_at", reset_epoch)
+
+
 def extract_api_error_context(error: Exception) -> Dict[str, Any]:
     """Extract structured rate-limit details from provider errors."""
     context: Dict[str, Any] = {}
@@ -4191,6 +4258,7 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
         ratelimit_reset = headers.get("x-ratelimit-reset")
         if ratelimit_reset and "reset_at" not in context:
             context["reset_at"] = ratelimit_reset
+        _extract_unified_quota_window(headers, context)
 
     if "message" not in context:
         raw_message = str(error).strip()
