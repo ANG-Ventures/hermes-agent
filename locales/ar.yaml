@@ -103,6 +103,7 @@ gateway:
     not_enough: لا توجد محادثة كافية للضغط (يلزم 4 رسائل على الأقل).
     nothing_to_do: لا شيء للضغط بعد (النص كله لا يزال سياقًا محميًا).
     persist_failed: ⚠️ Compression ran, but the result could not be saved — the session database was busy (locked). Nothing was lost; your transcript is unchanged. Run /compress again in a moment to retry.
+    timed_out: ⚠️ Compression timed out ({reason}). No messages were dropped; your transcript is unchanged. Run /compress again to retry, or check auxiliary.compression if this keeps happening.
     summary_failed: ⚠️ فشل توليد الملخّص ({error}). أُزيلت {count} رسالة تاريخية واستُبدلت بعنصر نائب؛ لم يعد السياق الأقدم قابلًا للاسترجاع. فكّر في مراجعة إعداد نموذج auxiliary.compression.
   config_read_failed: '⚠️ تعذّر قراءة config.yaml: {error}'
   config_save_failed: '⚠️ تعذّر حفظ الإعدادات: {error}'

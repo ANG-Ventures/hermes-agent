@@ -103,6 +103,7 @@ gateway:
     not_enough: Nicht genug Konversation zum Komprimieren (mindestens 4 Nachrichten erforderlich).
     nothing_to_do: Noch nichts zu komprimieren (das Transkript ist weiterhin vollständig geschützter Kontext).
     persist_failed: ⚠️ Die Komprimierung lief, aber das Ergebnis konnte nicht gespeichert werden — die Sitzungsdatenbank war belegt (gesperrt). Es ging nichts verloren; dein Transkript ist unverändert. Führe gleich noch einmal /compress aus, um es erneut zu versuchen.
+    timed_out: ⚠️ Zeitüberschreitung bei der Komprimierung ({reason}). Es wurden keine Nachrichten entfernt; dein Transkript ist unverändert. Führe /compress erneut aus, oder prüfe auxiliary.compression, falls das wiederholt auftritt.
     summary_failed: ⚠️ Zusammenfassungsgenerierung fehlgeschlagen ({error}). {count} historische Nachricht(en) wurden entfernt und durch einen Platzhalter ersetzt; früherer Kontext ist nicht mehr wiederherstellbar. Überprüfen Sie die Konfiguration des auxiliary.compression-Modells.
   config_read_failed: '⚠️ config.yaml konnte nicht gelesen werden: {error}'
   config_save_failed: '⚠️ Konfiguration konnte nicht gespeichert werden: {error}'

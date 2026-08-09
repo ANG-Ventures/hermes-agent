@@ -5237,6 +5237,23 @@ class GatewaySlashCommandsMixin:
                 _persist_failed = bool(
                     getattr(tmp_agent, "_last_compaction_persist_failed", False)
                 )
+                # Did the owned progress-aware wrapper abort before the commit
+                # boundary (summary model made no progress / total ceiling)?
+                # Like a genuine no-op this preserves the transcript and leaves
+                # session_id unchanged, so the explicit agent signal is the only
+                # honest discriminator. Literal True avoids MagicMock truthiness.
+                _compaction_aborted = (
+                    getattr(tmp_agent, "_last_compaction_aborted", False) is True
+                )
+                _compaction_abort_reason = getattr(
+                    tmp_agent, "_last_compaction_abort_reason", None
+                )
+                if not isinstance(_compaction_abort_reason, str) or not (
+                    _compaction_abort_reason.strip()
+                ):
+                    _compaction_abort_reason = (
+                        "the compression worker stopped before making progress"
+                    )
 
                 # Persist the compressed transcript BEFORE repointing the live
                 # session onto the new session_id. Order matters: if we
@@ -5555,6 +5572,30 @@ class GatewaySlashCommandsMixin:
                     t("gateway.compress.full_request_unchanged", before=_fr_before)
                 )
                 return "\n".join(_pf_lines)
+            # CASE E (timeout/abort): no commit boundary was reached, so the
+            # original transcript is intact and the next request resends the
+            # same context. This is retryable, but it is not CASE C's genuine
+            # no-op and must not be rendered as "No changes."
+            if _compaction_aborted and not _rewritten:
+                _fr_before = (
+                    f"{real_before_tokens:,}"
+                    if real_before_tokens > 0
+                    else f"~{approx_tokens:,}"
+                )
+                _abort_lines = [
+                    t(
+                        "gateway.compress.timed_out",
+                        reason=_compaction_abort_reason,
+                    )
+                ]
+                if focus_topic:
+                    _abort_lines.append(
+                        t("gateway.compress.focus_line", topic=focus_topic)
+                    )
+                _abort_lines.append(
+                    t("gateway.compress.full_request_unchanged", before=_fr_before)
+                )
+                return "\n".join(_abort_lines)
             # Headline + per-axis lines. When the granular reconciling
             # breakdown built successfully (rewrite happened, stats validated),
             # it REPLACES the headline/chat/dropped lines with the full

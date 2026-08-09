@@ -103,6 +103,7 @@ gateway:
     not_enough: Níl go leor comhrá le dlúthú (teastaíonn 4 theachtaireacht ar a laghad).
     nothing_to_do: Níl aon rud le dlúthú fós (tá an traschríbhinn fós uile mar chomhthéacs cosanta).
     persist_failed: ⚠️ Rith an comhbhrú, ach níorbh fhéidir an toradh a shábháil — bhí bunachar sonraí an tseisiúin gnóthach (faoi ghlas). Níor cailleadh aon rud; tá do thras-scríbhinn gan athrú. Rith /compress arís i gceann nóiméid chun triail eile a bhaint as.
+    timed_out: ⚠️ Chuaigh an comhbhrú thar am ({reason}). Níor baineadh aon teachtaireacht; tá do thras-scríbhinn gan athrú. Rith /compress arís chun triail eile a bhaint as, nó seiceáil auxiliary.compression má leanann sé seo ar aghaidh.
     summary_failed: ⚠️ Theip ar ghiniúint achoimre ({error}). Baineadh {count} teachtaireacht stairiúil agus cuireadh ionadaí ina n-áit; níl an comhthéacs roimhe seo in-aisghabhála a thuilleadh. Smaoinigh ar an gcumraíocht auxiliary.compression a sheiceáil.
   config_read_failed: '⚠️ Níorbh fhéidir config.yaml a léamh: {error}'
   config_save_failed: '⚠️ Níorbh fhéidir an chumraíocht a shábháil: {error}'

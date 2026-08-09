@@ -51,6 +51,9 @@ class TestRunCompressContextWithProgressTimeout:
         started = threading.Event()
         release = threading.Event()
         commit_attempted = threading.Event()
+        telemetry_agent = MagicMock()
+        telemetry_agent._last_compaction_aborted = False
+        telemetry_agent._last_compaction_abort_reason = None
 
         def worker(fence: CompressionCommitFence):
             started.set()
@@ -74,6 +77,7 @@ class TestRunCompressContextWithProgressTimeout:
             on_timeout=lambda idle, waited, since: warnings.append(
                 (idle, waited, since)
             ),
+            telemetry_agent=telemetry_agent,
         )
 
         assert started.wait(timeout=1)
@@ -91,11 +95,42 @@ class TestRunCompressContextWithProgressTimeout:
         assert not commit_attempted.is_set(), (
             "cancelled fence must block late session mutation"
         )
+        assert telemetry_agent._last_compaction_aborted is True
+        assert "no progress" in telemetry_agent._last_compaction_abort_reason
+
+    def test_streaming_worker_total_ceiling_sets_abort_reason(self):
+        original = [{"role": "user", "content": "keep-me"}]
+        telemetry_agent = MagicMock()
+        telemetry_agent._last_compaction_aborted = False
+        telemetry_agent._last_compaction_abort_reason = None
+
+        def worker(fence: CompressionCommitFence):
+            while not fence.is_cancelled:
+                fence.touch_progress()
+                time.sleep(0.05)
+            return original, "late"
+
+        result_msgs, result_prompt = run_compress_context_with_progress_timeout(
+            worker=worker,
+            messages=original,
+            system_prompt_fallback="fallback",
+            idle_timeout_seconds=0.5,
+            total_ceiling_seconds=0.8,
+            telemetry_agent=telemetry_agent,
+        )
+
+        assert result_msgs is original
+        assert result_prompt == "fallback"
+        assert telemetry_agent._last_compaction_aborted is True
+        assert "total time limit" in telemetry_agent._last_compaction_abort_reason
 
     def test_progress_extends_idle_budget_until_success(self):
         original = [{"role": "user", "content": "a"}]
         compressed = [{"role": "user", "content": "summarized"}]
         fence_holder: dict = {}
+        telemetry_agent = MagicMock()
+        telemetry_agent._last_compaction_aborted = True
+        telemetry_agent._last_compaction_abort_reason = "stale timeout"
 
         def worker(fence: CompressionCommitFence):
             fence_holder["fence"] = fence
@@ -121,16 +156,22 @@ class TestRunCompressContextWithProgressTimeout:
             system_prompt_fallback="fallback",
             idle_timeout_seconds=0.5,
             total_ceiling_seconds=5.0,
+            telemetry_agent=telemetry_agent,
         )
 
         assert result_msgs == compressed
         assert result_prompt == "ok-prompt"
         assert "fence" in fence_holder
+        assert telemetry_agent._last_compaction_aborted is False
+        assert telemetry_agent._last_compaction_abort_reason is None
 
     def test_commit_started_before_timeout_returns_worker_result(self):
         original = [{"role": "user", "content": "a"}]
         compressed = [{"role": "assistant", "content": "done"}]
         entered = threading.Event()
+        telemetry_agent = MagicMock()
+        telemetry_agent._last_compaction_aborted = True
+        telemetry_agent._last_compaction_abort_reason = "stale timeout"
 
         def worker(fence: CompressionCommitFence):
             assert fence.begin_commit()
@@ -147,11 +188,14 @@ class TestRunCompressContextWithProgressTimeout:
             system_prompt_fallback="fallback",
             idle_timeout_seconds=0.05,
             total_ceiling_seconds=0.05,
+            telemetry_agent=telemetry_agent,
         )
 
         assert entered.wait(timeout=1)
         assert result_msgs == compressed
         assert result_prompt == "committed"
+        assert telemetry_agent._last_compaction_aborted is False
+        assert telemetry_agent._last_compaction_abort_reason is None
 
     def test_never_finishing_commit_waits_past_pre_commit_ceiling(self):
         """Once begin_commit() wins, the commit is waited on to completion —
@@ -423,6 +467,8 @@ class TestCompressContextForwarderOwnsTimeout:
         assert out_msgs is original
         assert out_prompt == "sys"
         assert calls["n"] == 1
+        assert getattr(agent, "_last_compaction_aborted", False) is True
+        assert "no progress" in getattr(agent, "_last_compaction_abort_reason", "")
         agent._emit_warning.assert_called_once()
         assert agent.context_compressor._consecutive_timeout_failures == 1
         agent.context_compressor._record_compression_failure_cooldown.assert_called_once()

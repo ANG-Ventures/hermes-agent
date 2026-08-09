@@ -103,6 +103,7 @@ gateway:
     not_enough: Not enough conversation to compress (need at least 4 messages).
     nothing_to_do: Nothing to compress yet (the transcript is still all protected context).
     persist_failed: ⚠️ Compression ran, but the result could not be saved — the session database was busy (locked). Nothing was lost; your transcript is unchanged. Run /compress again in a moment to retry.
+    timed_out: ⚠️ Compression timed out ({reason}). No messages were dropped; your transcript is unchanged. Run /compress again to retry, or check auxiliary.compression if this keeps happening.
     summary_failed: ⚠️ Summary generation failed ({error}). {count} historical message(s) were removed and replaced with a placeholder; earlier context is no longer recoverable. Consider checking your auxiliary.compression model configuration.
   config_read_failed: '⚠️ Could not read config.yaml: {error}'
   config_save_failed: '⚠️ Could not save config: {error}'

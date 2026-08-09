@@ -1078,6 +1078,10 @@ async def test_compress_command_persist_failure_surfaces_retry_not_noop():
     agent_instance.context_compressor._last_aux_model_failure_error = None
     agent_instance.compression_in_place = False
     agent_instance._last_compaction_in_place = False
+    # CASE D has precedence if stale/impossible mixed outcome state is ever
+    # observed: a persistence failure is the stronger durable-state claim.
+    agent_instance._last_compaction_aborted = True
+    agent_instance._last_compaction_abort_reason = "stale timeout"
     # The persist-failure signal: rotation's child-session create was rolled
     # back (DB locked), so the compacted result never reached the store.
     agent_instance._last_compaction_persist_failed = True
@@ -1121,9 +1125,59 @@ async def test_compress_command_persist_failure_surfaces_retry_not_noop():
     # Must NOT fabricate a shrink: the store is untouched, next request resends
     # the same context.
     assert "unchanged" in result.lower()
+    assert "timed out" not in result.lower()
     # Nothing was persisted -> last_prompt_tokens must NOT be zeroed, transcript
     # must NOT be overwritten.
     runner.session_store.update_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_compress_command_timeout_surfaces_retry_not_noop():
+    """CASE E regression: a host timeout returns the original transcript and
+    leaves session_id unchanged, but must not masquerade as a genuine no-op."""
+    history = _make_tool_heavy_history()
+    runner = _make_runner(history)
+    session_store: MagicMock = runner.session_store  # type: ignore[assignment]
+    session_entry = session_store.get_or_create_session.return_value
+    session_entry.last_prompt_tokens = 453_542
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.context_compressor._last_compress_aborted = False
+    agent_instance.context_compressor._last_summary_error = None
+    agent_instance.context_compressor._last_aux_model_failure_model = None
+    agent_instance.context_compressor._last_aux_model_failure_error = None
+    agent_instance.compression_in_place = False
+    agent_instance._last_compaction_in_place = False
+    agent_instance._last_compaction_persist_failed = False
+    agent_instance._last_compaction_aborted = True
+    agent_instance._last_compaction_abort_reason = (
+        "the summary model made no progress for 120.0s"
+    )
+    agent_instance.session_id = "sess-1"
+    agent_instance._compression_skipped_due_to_lock = False
+    agent_instance._compress_context.return_value = (list(history), "")
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "k"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_messages_tokens_rough", return_value=100),
+        patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
+    ):
+        result = await runner._handle_compress_command(_make_event())
+
+    assert "timed out" in result.lower()
+    assert "no progress for 120.0s" in result
+    assert "retry" in result.lower() or "/compress" in result
+    assert "No changes: transcript preserved" not in result
+    assert "could not be saved" not in result.lower()
+    assert "Full request size: 453,542 tokens (unchanged" in result
+    session_store.update_session.assert_not_called()
+    session_store.rewrite_transcript.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1358,6 +1412,8 @@ async def test_compress_command_true_noop_preserves_measured_tokens():
     # No persist failure: MagicMock would otherwise return a truthy Mock for
     # this attr and spuriously trigger the CASE D retry message (#44794).
     agent_instance._last_compaction_persist_failed = False
+    agent_instance._last_compaction_aborted = False
+    agent_instance._last_compaction_abort_reason = None
 
     def _compress(messages, *_args, **_kwargs):
         return list(messages), ""
@@ -1381,6 +1437,7 @@ async def test_compress_command_true_noop_preserves_measured_tokens():
     # No dropped-rows claim, no fabricated shrink.
     assert "Dropped:" not in result
     assert "reclaimed" not in result
+    assert "timed out" not in result.lower()
     assert "Full request size: 453,542 tokens (unchanged" in result
     # The real provider-measured count survives for the next /compress or /usage.
     runner.session_store.update_session.assert_not_called()
@@ -1407,6 +1464,8 @@ async def test_compress_command_true_noop_still_says_preserved_not_failure():
     agent_instance.compression_in_place = False
     agent_instance._last_compaction_in_place = False
     agent_instance._last_compaction_persist_failed = False  # genuine no-op
+    agent_instance._last_compaction_aborted = False
+    agent_instance._last_compaction_abort_reason = None
     agent_instance.session_id = "sess-1"
     agent_instance._compression_skipped_due_to_lock = False
 
@@ -1430,6 +1489,7 @@ async def test_compress_command_true_noop_still_says_preserved_not_failure():
     assert "No changes: transcript preserved (7 messages: 4 chat + 3 tool/system)" in result
     assert "could not be saved" not in result.lower()
     assert "database" not in result.lower()
+    assert "timed out" not in result.lower()
 
 
 @pytest.mark.asyncio

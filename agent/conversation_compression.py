@@ -1134,6 +1134,14 @@ def run_compress_context_with_progress_timeout(
             "idle_timeout_seconds > 0; call compress_context directly to disable"
         )
 
+    # Rotation-independent outcome signal for manual /compress. A timeout
+    # returns the original transcript, which otherwise looks identical to a
+    # genuine no-op at the gateway. Reset it for every owned attempt so a
+    # previous timeout cannot leak into a later successful/no-op response.
+    if telemetry_agent is not None:
+        telemetry_agent._last_compaction_aborted = False
+        telemetry_agent._last_compaction_abort_reason = None
+
     def _resolve_fallback_prompt() -> str:
         if callable(system_prompt_fallback):
             return system_prompt_fallback()
@@ -1206,11 +1214,13 @@ def run_compress_context_with_progress_timeout(
     # settle admission themselves (worker result returned, or fence cancel
     # won); everything else revokes in the ``finally``.
     handled_exit = False
+    timeout_kind: Optional[str] = None
     try:
         while True:
             waited = time.monotonic() - wait_started
             remaining_ceiling = ceiling - waited
             if remaining_ceiling <= 0:
+                timeout_kind = "total_ceiling"
                 break
             # #76354 S3 analogue for this wait: charge the idle budget from
             # the LAST PROGRESS event, not from the start of this wait slice.
@@ -1237,6 +1247,9 @@ def run_compress_context_with_progress_timeout(
                         ceiling,
                     )
                     continue
+                timeout_kind = (
+                    "total_ceiling" if waited >= ceiling else "no_progress"
+                )
                 break
 
         # F6: a not-yet-started future must not linger as a stale queued job.
@@ -1329,6 +1342,15 @@ def run_compress_context_with_progress_timeout(
         fence.release_cancelled_compression_lock()
         waited = time.monotonic() - wait_started
         since_progress = fence.seconds_since_progress()
+        if timeout_kind == "total_ceiling":
+            abort_reason = f"the {ceiling:.1f}s total time limit was reached"
+        else:
+            abort_reason = (
+                f"the summary model made no progress for {since_progress:.1f}s"
+            )
+        if telemetry_agent is not None:
+            telemetry_agent._last_compaction_aborted = True
+            telemetry_agent._last_compaction_abort_reason = abort_reason
         if on_timeout is not None:
             try:
                 on_timeout(idle, waited, since_progress)
