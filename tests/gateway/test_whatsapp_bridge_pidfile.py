@@ -101,7 +101,19 @@ class TestKillPortProcess:
     and SIGTERMed every time the (crash-looping) bridge restarted.
     """
 
-    def test_listener_lookup_excludes_client_process(self):
+    def test_listener_lookup_excludes_client_process(self, monkeypatch):
+        real_run = subprocess.run
+
+        def run_with_ci_timeout(*args, **kwargs):
+            # Keep the production 5s fail-safe unchanged while allowing this
+            # real lsof/ss integration probe to complete on a loaded runner.
+            kwargs["timeout"] = 30
+            return real_run(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "plugins.platforms.whatsapp.adapter.subprocess.run",
+            run_with_ci_timeout,
+        )
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("127.0.0.1", 0))
@@ -110,8 +122,8 @@ class TestKillPortProcess:
         # A separate process holding a *client* connection to that port.
         client = subprocess.Popen([
             sys.executable, "-c",
-            "import socket,time; c=socket.create_connection(('127.0.0.1',%d)); time.sleep(0.2)" % port,
-        ])
+            "import socket,sys; c=socket.create_connection(('127.0.0.1',%d)); sys.stdin.buffer.read(1)" % port,
+        ], stdin=subprocess.PIPE)
         try:
             conn, _ = srv.accept()  # establish the client connection
             pids = _listener_pids_on_port(port)
@@ -122,7 +134,12 @@ class TestKillPortProcess:
             assert client.pid not in pids
             conn.close()
         finally:
-            client.kill()
-            client.wait()
+            if client.stdin is not None:
+                client.stdin.close()
+            try:
+                client.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                client.kill()
+                client.wait()
             srv.close()
 

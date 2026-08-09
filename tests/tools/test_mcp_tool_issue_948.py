@@ -1,6 +1,7 @@
 import asyncio
 import os
 import sys
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -124,25 +125,37 @@ def test_run_stdio_malware_check_does_not_block_event_loop():
 def test_run_stdio_malware_check_times_out_fail_open():
     """A check that hangs past the timeout must NOT freeze startup: it times
     out, logs, and proceeds (fail-open) so the server still starts."""
-    import time
     mock_stdio_cm, mock_session_cm = _stdio_mocks()
+    check_entered = threading.Event()
+    release_check = threading.Event()
+    check_returned = threading.Event()
 
     def hung_check(_command, _args):
-        time.sleep(0.5)  # outlasts the 0.2s timeout 2.5x; short enough not to stall teardown
-        return "MALWARE"  # would block startup if awaited to completion
+        check_entered.set()
+        try:
+            release_check.wait(timeout=10)
+            return "MALWARE"  # would block startup if awaited to completion
+        finally:
+            check_returned.set()
 
     async def _test():
-        with patch("tools.osv_check.check_package_for_malware", side_effect=hung_check), \
-             patch("tools.mcp_tool._OSV_MALWARE_CHECK_TIMEOUT_S", 0.2), \
-             patch("tools.mcp_tool.StdioServerParameters"), \
-             patch("tools.mcp_tool.stdio_client", return_value=mock_stdio_cm), \
-             patch("tools.mcp_tool.ClientSession", return_value=mock_session_cm):
-            server = MCPServerTask("srv")
-            start = time.monotonic()
-            await server.start({"command": "npx", "args": ["-y", "pkg"]})
-            elapsed = time.monotonic() - start
-            await server.shutdown()
-        # Returned shortly after the 0.2s timeout (fail-open), not the 0.5s hang.
-        assert elapsed < 1.0, f"startup did not fail-open promptly ({elapsed:.1f}s)"
+        try:
+            with patch("tools.osv_check.check_package_for_malware", side_effect=hung_check), \
+                 patch("tools.mcp_tool._OSV_MALWARE_CHECK_TIMEOUT_S", 0.2), \
+                 patch("tools.mcp_tool.StdioServerParameters"), \
+                 patch("tools.mcp_tool.stdio_client", return_value=mock_stdio_cm), \
+                 patch("tools.mcp_tool.ClientSession", return_value=mock_session_cm):
+                server = MCPServerTask("srv")
+                await server.start({"command": "npx", "args": ["-y", "pkg"]})
+
+                assert check_entered.is_set(), "OSV check never started"
+                assert not check_returned.is_set(), (
+                    "OSV check finished before startup returned; timeout did not fail open"
+                )
+                mock_session_cm.__aenter__.return_value.initialize.assert_awaited_once()
+                await server.shutdown()
+        finally:
+            release_check.set()
+            assert check_returned.wait(timeout=10), "OSV check worker did not exit"
 
     asyncio.run(_test())
