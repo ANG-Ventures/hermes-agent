@@ -4135,6 +4135,15 @@ def run_conversation(
 
                 status_code = getattr(api_error, "status_code", None)
                 error_context = agent._extract_api_error_context(api_error)
+                # Stamp the quota window (5h vs 7d) so the failover announce can
+                # name WHICH limit bound. Consumed once by _quota_window_suffix;
+                # only set when the provider actually told us, so non-Anthropic
+                # providers keep the flat label.
+                if isinstance(error_context, dict) and error_context.get("quota_window"):
+                    agent._pending_quota_window = {
+                        "quota_window": error_context.get("quota_window"),
+                        "quota_window_reset": error_context.get("quota_window_reset"),
+                    }
 
                 # ── Classify the error for structured recovery decisions ──
                 _compressor = getattr(agent, "context_compressor", None)

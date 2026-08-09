@@ -61,6 +61,17 @@ class FailoverReason(enum.Enum):
     # Retrying reproduces the identical handshake failure, so fail fast
     # with actionable guidance instead of burning retries.
     ssl_cert_verification = "ssl_cert_verification"
+    # The response body could not be DECODED — the bytes on the wire did not
+    # match the `content-encoding` the response advertised (a proxy that decodes
+    # a body but relays a stale `content-encoding`, or a truncated/corrupt
+    # compressed stream). httpx raises this from the decoder BEFORE the status
+    # line or body are parsed, so the underlying error (often a clean 429) is
+    # invisible to us. Deterministic for the rung that produced it — the same
+    # request reproduces the identical corruption — so retrying in place is
+    # pure waste; fail over instead. Distinct from `timeout` (a genuine
+    # transport blip that CAN succeed on retry) and from the `unknown` floor,
+    # so the announce reads "corrupt response" instead of "connection issue".
+    decode_error = "decode_error"
 
     # Context / payload
     context_overflow = "context_overflow"  # Context too large — compress, not failover
@@ -655,6 +666,31 @@ _TRANSPORT_ERROR_TYPES = frozenset({
     "APITimeoutError",
 })
 
+# Content-decode failure types. httpx raises DecodingError when a response body
+# cannot be decoded per its advertised `content-encoding`; zlib/gzip/brotli
+# raise their own. These are NOT transport blips — the bytes arrived, they were
+# just not what the headers claimed — so they must not land in
+# `_TRANSPORT_ERROR_TYPES` (retryable) or the `unknown` floor.
+#
+# 🔴 KEEP NARROW. This must match a genuine BODY-DECODE failure only. Do not add
+# generic words ("decode", "invalid") that would swallow JSON-parse errors or a
+# model's own malformed output — those are different bugs with different fixes.
+_DECODE_ERROR_TYPES = frozenset({
+    "DecodingError",
+    "ContentDecodingError",
+    "BrotliDecompressError",
+})
+
+# Message patterns for the same class, for providers/SDKs that re-raise a decode
+# failure as a bare Exception without preserving the original type. Anchored on
+# zlib's exact wording plus the codec names so they cannot match loosely.
+_DECODE_ERROR_PATTERNS = [
+    "while decompressing data",       # zlib: "Error -3 while decompressing data: ..."
+    "incorrect header check",         # zlib's specific gzip/deflate header mismatch
+    "error decoding response body",
+    "failed to decode response",
+]
+
 # Server disconnect patterns (no status code, but transport-level).
 # These are the "ambiguous" patterns — a plain connection close could be
 # transient transport hiccup OR server-side context overflow rejection
@@ -1128,6 +1164,35 @@ def classify_api_error(
         return _result(
             FailoverReason.timeout,
             retryable=False,
+            should_fallback=True,
+        )
+
+    # ── 7c. Undecodable / corrupt response body → fail over, don't retry ──
+    # A content-decode failure means the bytes on the wire did not match the
+    # `content-encoding` the response advertised (e.g. a proxy that decodes a
+    # body but relays the upstream's now-false `content-encoding: gzip`, or a
+    # genuinely truncated/corrupt compressed stream). httpx raises this from
+    # the decoder BEFORE the status line or body are parsed, so the real error
+    # — very often a perfectly clean 429 — never reaches the classifier at all.
+    #
+    # This is DETERMINISTIC for the rung that produced it: the same request to
+    # the same endpoint reproduces the identical corruption byte-for-byte, so
+    # retrying in place only multiplies the failure. Measured 2026-08-08: a
+    # gzip-mislabeled 429 burned the full 3-attempt budget on EVERY provider in
+    # the fallback chain (~13s per rung, ~90s end to end, 12+ identical
+    # failures) and then landed back where it started.
+    #
+    # Classify non-retryable + should_fallback so the chain advances on the
+    # FIRST hit, and give it its own reason so the announce says "corrupt
+    # response" instead of the misleading "connection issue" transport floor.
+    # Credential rotation is explicitly OFF: the key is fine, the bytes are not.
+    if error_type in _DECODE_ERROR_TYPES or any(
+        p in error_msg for p in _DECODE_ERROR_PATTERNS
+    ):
+        return _result(
+            FailoverReason.decode_error,
+            retryable=False,
+            should_rotate_credential=False,
             should_fallback=True,
         )
 
