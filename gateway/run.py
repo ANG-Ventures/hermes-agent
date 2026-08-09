@@ -5929,6 +5929,37 @@ class TurnRunner:
             _output_toks = getattr(_agent, "session_completion_tokens", 0)
             _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
         _resolved_model = getattr(_agent, "model", None) if _agent else None
+        # Fork feature (footer provider_model): the served PROVIDER must ride the
+        # turn result alongside the model — build_footer_line renders
+        # ``provider/model`` and silently degrades to the bare model when the
+        # result carries no "provider" key (regression seen 2026-08-08 after the
+        # parity merge dropped this local).
+        _resolved_provider = getattr(_agent, "provider", None) if _agent else None
+        # Live, session-truthful reasoning config for the runtime footer.
+        # This single value already folds in the session ``/reasoning``
+        # override, the per-model ``reasoning_overrides``, AND any active
+        # fallback entry's per-entry ``reasoning_effort`` (the gateway sets
+        # it per-message from ``_resolve_session_reasoning_config`` and
+        # fallback activation mutates it) — so it is strictly more correct
+        # than re-deriving from global config at the footer site.
+        _resolved_reasoning_config = (
+            getattr(_agent, "reasoning_config", None) if _agent else None
+        )
+
+        # Persist the FINAL served route for the next turn's pre-run
+        # comparison (persist-only — announces fire where the transitions
+        # happen: failover mid-turn, restore inline in
+        # restore_primary_runtime, re-init at the pre-run site above).
+        # Fork feature: without this call ``last_served_identity`` is never
+        # written and ``_announce_and_persist_served_route`` is dead code
+        # (the 2026-08-08 parity merge orphaned it).
+        self._runner._announce_and_persist_served_route(
+            agent=_agent,
+            session_key=ctx.session_key,
+            served_provider=_resolved_provider,
+            served_model=_resolved_model,
+            was_reinit=not reused_cached_agent,
+        )
 
         # Sync session_id immediately after run_conversation(). Compression
         # can rotate before a follow-up model call fails; the failure return
@@ -6064,6 +6095,8 @@ class TurnRunner:
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
+                "provider": _resolved_provider,
+                "reasoning_config": _resolved_reasoning_config,
                 "context_length": _context_length,
             }
 
@@ -6202,6 +6235,8 @@ class TurnRunner:
             "input_tokens": _input_toks,
             "output_tokens": _output_toks,
             "model": _resolved_model,
+            "provider": _resolved_provider,
+            "reasoning_config": _resolved_reasoning_config,
             "context_length": _context_length,
             "session_id": effective_session_id,
             "response_previewed": result.get("response_previewed", False),
