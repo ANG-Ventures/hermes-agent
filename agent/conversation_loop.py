@@ -1434,6 +1434,12 @@ def run_conversation(
     agent._last_compaction_in_place = False
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
+    # Same per-turn lifetime as the flags above: a compaction that ABORTED
+    # (stalled summariser / no-progress timeout) on an earlier turn must not
+    # make a later, healthy turn look aborted to the gateway's /compress
+    # feedback branch.
+    agent._last_compaction_aborted = False
+    agent._last_compaction_abort_reason = ""
 
     # Adopt any ~/.hermes/.env credential/base-url edits made since the last
     # turn — a Settings save updates .env but not this worker's client, which

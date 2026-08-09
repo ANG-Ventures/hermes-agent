@@ -103,6 +103,7 @@ gateway:
     not_enough: Nincs elég beszélgetés a tömörítéshez (legalább 4 üzenet kell).
     nothing_to_do: Még nincs mit tömöríteni (a teljes átirat még védett kontextus).
     persist_failed: ⚠️ A tömörítés lefutott, de az eredményt nem sikerült menteni — a munkamenet-adatbázis foglalt volt (zárolva). Semmi sem veszett el; az átirat változatlan. Futtasd újra a /compress parancsot egy pillanat múlva az újrapróbálkozáshoz.
+    timed_out: "⚠️ A tömörítés nem tudott befejeződni — az összefoglaló elakadt, és a próbálkozás időtúllépéssel zárult, mielőtt bármit előállított volna. Semmi nem veszett el; az átirat változatlan. Futtasd újra a /compress parancsot egy pillanat múlva."
     summary_failed: ⚠️ Az összefoglaló generálása sikertelen ({error}). {count} korábbi üzenet eltávolítva és helykitöltővel helyettesítve; a korábbi kontextus már nem helyreállítható. Érdemes ellenőrizni az auxiliary.compression modell konfigurációját.
   config_read_failed: '⚠️ Nem sikerült olvasni a config.yaml fájlt: {error}'
   config_save_failed: '⚠️ Nem sikerült menteni a konfigurációt: {error}'

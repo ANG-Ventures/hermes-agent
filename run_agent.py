@@ -7841,6 +7841,17 @@ class AIAgent:
                     waited,
                     total_ceiling,
                 )
+                # Rotation-independent ABORT signal. A timed-out compaction
+                # produces NOTHING to persist, so ``_last_compaction_persist_failed``
+                # stays False and the id is unchanged — the exact surface
+                # signature of a genuine "nothing to compress" no-op. Without
+                # this flag the gateway renders the bland "No changes:
+                # transcript preserved" for a run that actually died on a
+                # stalled summariser, telling the user nothing actionable.
+                # Mirrors the #44794 persist-failure signal.
+                self._last_compaction_aborted = True
+                self._last_compaction_abort_reason = "timeout"
+                self._last_compaction_abort_waited = float(waited)
                 touch = getattr(self, "_touch_activity", None)
                 if callable(touch):
                     try:

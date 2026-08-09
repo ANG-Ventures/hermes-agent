@@ -103,6 +103,7 @@ gateway:
     not_enough: Conversation insuffisante pour la compression (au moins 4 messages nécessaires).
     nothing_to_do: Rien à compresser pour l'instant (la transcription est encore entièrement du contexte protégé).
     persist_failed: ⚠️ La compression a bien été exécutée, mais le résultat n'a pas pu être enregistré — la base de données de la session était occupée (verrouillée). Rien n'a été perdu ; votre transcription est inchangée. Relancez /compress dans un instant pour réessayer.
+    timed_out: "⚠️ La compression n'a pas pu aboutir — le générateur de résumé s'est bloqué et la tentative a expiré avant de produire quoi que ce soit. Rien n'a été perdu ; votre transcription est inchangée. Relancez /compress dans un instant."
     summary_failed: ⚠️ Échec de la génération du résumé ({error}). {count} message(s) historique(s) ont été supprimés et remplacés par un espace réservé ; le contexte antérieur n'est plus récupérable. Vérifiez la configuration du modèle auxiliary.compression.
   config_read_failed: '⚠️ Impossible de lire config.yaml : {error}'
   config_save_failed: '⚠️ Impossible de sauvegarder la configuration : {error}'

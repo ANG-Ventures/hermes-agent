@@ -22,7 +22,31 @@ from agent.conversation_compression import (
 
 
 class TestResolveContextCompressionTimeouts:
-    def test_defaults_when_empty_cfg(self):
+    def test_defaults_when_empty_cfg(self, monkeypatch):
+        # The DEFAULT no-progress guard is derived from the inner auxiliary
+        # deadline rather than frozen at a literal: an outer guard tighter than
+        # the deadline it wraps abandons the worker before the aux call can
+        # fail, so ``call_llm`` never raises and the configured
+        # ``fallback_providers`` chain is never consulted (2026-08-08 incident).
+        # Assert the INVARIANT, not the number.
+        monkeypatch.setattr(
+            "agent.auxiliary_client._effective_aux_timeout",
+            lambda task, timeout: 300.0,
+        )
+        idle, ceiling = resolve_context_compression_timeouts({})
+        assert idle > 300.0
+        assert ceiling >= idle
+        assert ceiling >= 600.0
+
+    def test_default_idle_is_unchanged_without_an_inner_deadline(
+        self, monkeypatch
+    ):
+        # With no discoverable aux deadline the reconciler is a no-op and the
+        # historical default still applies.
+        monkeypatch.setattr(
+            "agent.auxiliary_client._effective_aux_timeout",
+            lambda task, timeout: 0.0,
+        )
         idle, ceiling = resolve_context_compression_timeouts({})
         assert idle == 120.0
         assert ceiling == 600.0
