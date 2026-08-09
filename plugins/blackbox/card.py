@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from plugins.blackbox.record import TurnRecord, tools_summary, turn_output_split
@@ -226,13 +225,10 @@ def render(record: "dict | TurnRecord", threshold_usd: float | None = None) -> s
 def _configured_threshold() -> float | None:
     """Best-effort read of blackbox.cost_alert_threshold_usd from config.yaml."""
     try:
-        import yaml
-        from hermes_constants import get_hermes_home
+        # fork-parity: canonical loader, not raw yaml (test_config_read_guard).
+        from hermes_cli.config import load_config_readonly
 
-        path = Path(get_hermes_home()) / "config.yaml"
-        if not path.exists():
-            return None
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        data = load_config_readonly() or {}
         block = data.get("blackbox")
         if isinstance(block, dict) and block.get("cost_alert_threshold_usd") is not None:
             return float(block["cost_alert_threshold_usd"])

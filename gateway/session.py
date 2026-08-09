@@ -208,6 +208,18 @@ class SessionSource:
     auto_thread_created: bool = False
     auto_thread_initial_name: Optional[str] = None
 
+    # Discord auto-thread session-continuity signal. Set by the connector on an
+    # inbound CHANNEL message (no thread_id yet) that its auto-thread policy WILL
+    # deliver into a newly-created thread. A Discord thread created from a message
+    # reuses that message's id as the thread id, so the connector knows the id
+    # before the thread exists. The gateway keys the session on this so a
+    # channel message and its thread follow-ups share ONE session: the channel
+    # message INITIATES it (keyed on the prospective thread id), and later
+    # messages arriving in that thread (real thread_id == this value) CONTINUE
+    # it. Without this, every channel message collapses into one parent-channel
+    # session and only the first auto-thread ever gets an auto-title/rename.
+    prospective_thread_id: Optional[str] = None
+
     # Internal, wire-INVISIBLE trust signal: True when this event was delivered
     # to the gateway over the per-instance-authenticated relay WebSocket (the
     # Team Gateway connector). The connector authenticates the gateway's socket
@@ -285,6 +297,8 @@ class SessionSource:
             d["auto_thread_created"] = True
         if self.auto_thread_initial_name:
             d["auto_thread_initial_name"] = self.auto_thread_initial_name
+        if self.prospective_thread_id:
+            d["prospective_thread_id"] = self.prospective_thread_id
         return d
 
     @classmethod
@@ -308,6 +322,7 @@ class SessionSource:
             profile=data.get("profile"),
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
+            prospective_thread_id=data.get("prospective_thread_id"),
         )
     
 
@@ -389,7 +404,19 @@ def _slack_tools_loaded() -> bool:
     except Exception:
         pass
 
-    if not (os.environ.get("SLACK_BOT_TOKEN") or "").strip():
+    # Presence check through the profile secret scope: under multiplex the
+    # process env may carry another profile's token (Slack pattern for the
+    # unscoped default-profile path).
+    try:
+        from agent.secret_scope import UnscopedSecretError, get_secret
+
+        try:
+            _slack_token = get_secret("SLACK_BOT_TOKEN") or ""
+        except UnscopedSecretError:
+            _slack_token = os.environ.get("SLACK_BOT_TOKEN") or ""
+    except Exception:
+        _slack_token = os.environ.get("SLACK_BOT_TOKEN") or ""
+    if not _slack_token.strip():
         return False
     try:
         from hermes_cli.config import load_config
@@ -418,11 +445,13 @@ def _discord_tools_loaded() -> bool:
     Returns False (safe default — keeps the stale-API disclaimer) on any
     error so a bad config can't silently promise tools the agent lacks.
     """
-    if not (os.environ.get("DISCORD_BOT_TOKEN") or "").strip():
-        return False
     try:
+        from agent.secret_scope import get_secret
         from hermes_cli.config import load_config
         from hermes_cli.tools_config import _get_platform_tools
+
+        if not (get_secret("DISCORD_BOT_TOKEN", "") or "").strip():
+            return False
         cfg = load_config()
         enabled = _get_platform_tools(cfg, "discord", include_default_mcp_servers=False)
         return "discord" in enabled or "discord_admin" in enabled
@@ -1246,20 +1275,37 @@ def build_session_key(
         # single group member gets two isolated per-user sessions when the
         # bridge reshuffles alias forms.
         participant_id = canonical_whatsapp_identifier(str(participant_id)) or participant_id
-    key_parts = [ns, platform, source.chat_type]
+    # Discord auto-thread continuity: a channel-initiating message carries no
+    # thread_id yet, but the connector tells us the thread its reply WILL be
+    # auto-threaded into (prospective_thread_id == the message id, which becomes
+    # the thread id). Key the session on that so the initiating channel message
+    # and every follow-up that later arrives IN that thread (real thread_id ==
+    # prospective_thread_id) resolve to the SAME session — "initiate in channel,
+    # continue in thread". A real thread_id always wins when present.
+    #
+    # The follow-up arrives with chat_type="thread" while the initiating message
+    # has chat_type="group"/"channel"; normalize the chat_type slot to "thread"
+    # when keying on a prospective id so the two byte-match. (Real-thread events
+    # already carry chat_type="thread", so this only rewrites the initiating
+    # channel message's slot.)
+    effective_thread_id = source.thread_id or source.prospective_thread_id
+    chat_type_slot = source.chat_type
+    if source.prospective_thread_id and not source.thread_id:
+        chat_type_slot = "thread"
+    key_parts = [ns, platform, chat_type_slot]
 
     if slack_scope_id:
         key_parts.append(slack_scope_id)
     if source.chat_id:
         key_parts.append(source.chat_id)
-    if source.thread_id:
-        key_parts.append(source.thread_id)
+    if effective_thread_id:
+        key_parts.append(effective_thread_id)
 
     # In threads, default to shared sessions (all participants see the same
     # conversation).  Per-user isolation only applies when explicitly enabled
     # via thread_sessions_per_user, or when there is no thread (regular group).
     isolate_user = group_sessions_per_user
-    if source.thread_id and not thread_sessions_per_user:
+    if effective_thread_id and not thread_sessions_per_user:
         isolate_user = False
 
     if isolate_user and participant_id:
@@ -1313,6 +1359,11 @@ class SessionStore:
         self._save_lock = threading.Lock()
         self._routing_generation = 0
         self._persisted_routing_generation = 0
+        # Single-entry upserts persisted since the last full rewrite:
+        # session_key -> (revision, entry_json). Revisions are allocated
+        # from _routing_generation, so fast and full snapshots are totally
+        # ordered; guarded by _save_lock (see _save_entry).
+        self._fast_persisted_entries: Dict[str, tuple[int, str]] = {}
         self._inflight_lock = threading.Lock()
         self._inflight_sessions: Dict[str, _SessionFlight] = {}
         # An unscoped pre-migration Slack key can represent at most one
@@ -1321,6 +1372,11 @@ class SessionStore:
         self._legacy_slack_claim_lock = threading.Lock()
         self._claimed_legacy_slack_keys: set[str] = set()
         self._transcript_retry_lock = threading.Lock()
+        # Exactly one transcript drainer mutates routing/queues at a time. SQLite
+        # serializes writes anyway; this outer lock also makes parent->child
+        # queue migration and routing publication linearizable.
+        self._transcript_drain_lock = threading.RLock()
+        self._transcript_reroutes: Dict[str, str] = {}
         self._dirty_transcripts: Dict[str, List[Dict[str, Any]]] = {}
         self._transcript_append_failures: Dict[str, int] = {}
         self._fts_rebuild_attempted = False
@@ -1337,6 +1393,14 @@ class SessionStore:
         try:
             from hermes_state import SessionDB
             self._db = SessionDB()
+        except RuntimeError as e:
+            if "live-system guard" in str(e):
+                # Test-isolation guard fired: a pytest-context process
+                # resolved the developer's production state.db. Never
+                # swallow this into the JSONL fallback — the whole point
+                # is a loud, hard failure.
+                raise
+            print(f"[gateway] Warning: SQLite session store unavailable, falling back to JSONL: {e}")
         except Exception as e:
             print(f"[gateway] Warning: SQLite session store unavailable, falling back to JSONL: {e}")
 
@@ -1622,12 +1686,23 @@ class SessionStore:
             require_primary=require_primary,
         )
 
+    def _next_routing_generation_locked(self) -> int:
+        """Bump and return the shared routing counter. Caller holds ``_lock``.
+
+        BOTH full snapshots (_snapshot_routing_locked) and single-entry fast
+        saves (_save_entry) MUST allocate from this one counter — the stale-
+        write protection in _persist_routing_data/_save_entry is a total order
+        over serialization times and silently breaks if the two paths ever
+        number themselves independently.
+        """
+        self._routing_generation = getattr(self, "_routing_generation", 0) + 1
+        return self._routing_generation
+
     def _snapshot_routing_locked(self) -> tuple[Dict[str, Any], int]:
         """Capture immutable routing data and a monotonic generation."""
-        self._routing_generation = getattr(self, "_routing_generation", 0) + 1
         return (
             {key: entry.to_dict() for key, entry in self._entries.items()},
-            self._routing_generation,
+            self._next_routing_generation_locked(),
         )
 
     def _persist_routing_data(
@@ -1645,6 +1720,16 @@ class SessionStore:
         with save_lock:
             if generation <= getattr(self, "_persisted_routing_generation", 0):
                 return
+            # Fold in single-entry upserts with a newer revision than this
+            # snapshot (see _save_entry): revisions share the routing
+            # generation counter, so a fast record numbered above us was
+            # serialized after us and a delayed full rewrite must not
+            # regress it.
+            fast_persisted = getattr(self, "_fast_persisted_entries", None)
+            if fast_persisted:
+                for key, (revision, entry_json) in fast_persisted.items():
+                    if revision > generation:
+                        data[key] = json.loads(entry_json)
             db_saved = False
             _db = getattr(self, "_db", None)
             if _db:
@@ -1681,6 +1766,14 @@ class SessionStore:
                 # Its failure remains fatal because no durable commit exists.
                 self._save_sessions_json(data)
             self._persisted_routing_generation = generation
+            # This rewrite supersedes fast records at or below its
+            # generation; newer ones stay for the next delayed full writer.
+            if fast_persisted:
+                for key in [
+                    k for k, (rev, _) in fast_persisted.items()
+                    if rev <= generation
+                ]:
+                    del fast_persisted[key]
 
     def _save_sessions_json(self, data: Dict[str, Any]) -> None:
         """Write the legacy sessions.json mirror of the routing index."""
@@ -1727,6 +1820,84 @@ class SessionStore:
         with self._lock:
             data, generation = self._snapshot_routing_locked()
         self._persist_routing_data(data, generation)
+
+    def _save_entry(self, session_key: str) -> None:
+        """Persist ONE routing entry via UPSERT — the per-turn fast path.
+
+        The steady-state turn only bumps ``updated_at`` /
+        ``last_prompt_tokens`` on one entry; routing that through the
+        full index rewrite re-serializes every entry, DELETE+INSERTs
+        every gateway_routing row, and dumps+fsyncs a multi-MB
+        sessions.json — ~50ms p50 at ~1100 routing keys, and it runs
+        twice per turn.  A single-row UPSERT keeps the durable state.db
+        mapping current in well under a millisecond.
+
+        Correctness constraints this path relies on:
+
+        - The key -> session_id mapping never changes here.  Structural
+          transitions (create/recover/reset/switch/prune, and
+          compression-tip heals — see get_or_create_session) still use
+          the full-rewrite path, which also refreshes the legacy
+          sessions.json mirror.  Between structural saves the mirror may
+          lag in metadata only; every remaining sessions.json reader is
+          a legacy fallback and state.db stays primary, so restart
+          rebinding is unaffected.
+
+        - Ordering vs concurrent writers: the entry is serialized under
+          ``_lock`` together with a revision allocated from the routing
+          generation counter, so every snapshot — fast or full — carries
+          a unique, monotonically increasing number, and a higher number
+          always means same-or-newer data for this key.  Under
+          ``_save_lock`` the upsert is skipped when a snapshot numbered
+          above ours already persisted this key: a FULL snapshot
+          (``_persisted_routing_generation``) or another fast save of
+          the same key (``_fast_persisted_entries``).  Either contains a
+          same-or-newer copy, so writing ours would regress it.  The
+          reverse interaction — a delayed full rewrite landing after a
+          later-serialized fast save — is handled in
+          ``_persist_routing_data``, which folds fast records numbered
+          above its snapshot into the rewrite.  An older snapshot can
+          therefore never overwrite a newer one, in either direction.
+
+        - No DB, or a failed upsert, falls back to the full rewrite so
+          DB-less installs keep sessions.json — their primary store —
+          durable every turn.
+        """
+        with self._lock:
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return
+            entry_json = json.dumps(entry.to_dict())
+            revision = self._next_routing_generation_locked()
+        _db = getattr(self, "_db", None)
+        saver = getattr(_db, "save_gateway_routing_entry", None) if _db else None
+        if callable(saver):
+            save_lock = getattr(self, "_save_lock", None)
+            if save_lock is None:
+                save_lock = threading.Lock()
+                self._save_lock = save_lock
+            try:
+                with save_lock:
+                    if getattr(self, "_persisted_routing_generation", 0) >= revision:
+                        return
+                    fast_persisted = getattr(self, "_fast_persisted_entries", None)
+                    if fast_persisted is None:
+                        fast_persisted = {}
+                        self._fast_persisted_entries = fast_persisted
+                    persisted = fast_persisted.get(session_key)
+                    if persisted is not None and persisted[0] >= revision:
+                        return
+                    saver(session_key, entry_json, scope=self._routing_scope())
+                    fast_persisted[session_key] = (revision, entry_json)
+                return
+            except Exception as exc:
+                logger.warning(
+                    "gateway.session: single-entry routing save failed for %r "
+                    "(%s); falling back to full index rewrite",
+                    session_key, exc,
+                )
+        self._save_entries()
+
     def _resolve_profile_for_key(self, source: Optional[SessionSource] = None) -> Optional[str]:
         """Return the profile namespace for session keys, or None when off.
 
@@ -2052,6 +2223,7 @@ class SessionStore:
         session_key: str,
         source: Optional[SessionSource],
         display_name: Optional[str] = None,
+        include_compression_ancestors: bool = False,
     ) -> None:
         """Persist the routing peer for an existing gateway session row."""
         if not self._db or not source:
@@ -2075,6 +2247,7 @@ class SessionStore:
                 thread_id=source.thread_id,
                 display_name=display_name or source.chat_name,
                 origin_json=origin_json,
+                include_compression_ancestors=include_compression_ancestors,
             )
         except TypeError:
             # Older SessionDB without display_name/origin_json kwargs.
@@ -2340,7 +2513,7 @@ class SessionStore:
         """
         if self._db:
             try:
-                return self._db.session_count() > 1
+                return self._db.session_count_ge(2)
             except Exception:
                 pass  # fall through to heuristic
         # Fallback: check if sessions.json was loaded with existing data.
@@ -2519,6 +2692,11 @@ class SessionStore:
 
         # ---- Phase 2: lock write -- apply decisions to _entries ----
         _needs_save = False
+        # Healthy-path saves only bump updated_at on one entry; they take
+        # the single-row UPSERT fast path instead of the full index rewrite
+        # (see _save_entry). Structural transitions (recover/create below)
+        # keep the full rewrite.
+        _metadata_only_save = False
         _needs_recover = False
         entry: Optional[SessionEntry] = None
         was_auto_reset = False
@@ -2531,7 +2709,10 @@ class SessionStore:
 
             if session_key in self._entries and not force_new:
                 entry = self._entries[session_key]
-                self._heal_compression_tip_locked(
+                # A heal rewrites entry.session_id, so it must reach the
+                # sessions.json mirror too: force the full-rewrite save
+                # below (the fast path persists state.db only).
+                _healed = self._heal_compression_tip_locked(
                     entry, existing_session_id, canonical_existing_session_id
                 )
 
@@ -2567,6 +2748,7 @@ class SessionStore:
                     # window.  Treat as healthy -- bump updated_at and save.
                     entry.updated_at = now
                     _needs_save = True
+                    _metadata_only_save = not _healed
                 else:
                     # Stale check clean.  Apply reset decision.
                     if _reset_reason:
@@ -2590,6 +2772,7 @@ class SessionStore:
                     else:
                         entry.updated_at = now
                         _needs_save = True
+                        _metadata_only_save = not _healed
             else:
                 if not force_new:
                     _needs_recover = True
@@ -2656,7 +2839,10 @@ class SessionStore:
                 }
 
         if _needs_save:
-            self._save_entries()
+            if _metadata_only_save:
+                self._save_entry(session_key)
+            else:
+                self._save_entries()
 
         # SQLite operations outside the lock (unchanged).
         if self._db and db_end_session_id:
@@ -2708,28 +2894,37 @@ class SessionStore:
         """
         with self._lock:
             self._ensure_loaded_locked()
-
-            if session_key in self._entries:
-                entry = self._entries[session_key]
-                entry.updated_at = _now()
-                if last_prompt_tokens is not None:
-                    entry.last_prompt_tokens = last_prompt_tokens
-                    # Latch the durable "had a real turn" flag on any positive
-                    # token count. The compression path calls update_session
-                    # with last_prompt_tokens=0 to mark the value stale — that
-                    # must NOT set the flag, so gate on > 0. Once True it never
-                    # goes back to False here.
-                    if last_prompt_tokens > 0:
-                        entry.had_any_turn = True
-                if served_identity:
-                    entry.last_served_identity = served_identity
-                self._save()
-                self._record_gateway_session_peer(
-                    entry.session_id,
-                    session_key,
-                    entry.origin,
-                    display_name=entry.display_name,
-                )
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return
+            entry.updated_at = _now()
+            if last_prompt_tokens is not None:
+                entry.last_prompt_tokens = last_prompt_tokens
+                # Latch the durable "had a real turn" flag on any positive
+                # token count. The compression path calls update_session
+                # with last_prompt_tokens=0 to mark the value stale — that
+                # must NOT set the flag, so gate on > 0. Once True it never
+                # goes back to False here.
+                if last_prompt_tokens > 0:
+                    entry.had_any_turn = True
+            if served_identity:
+                entry.last_served_identity = served_identity
+            # Snapshot peer fields while still holding _lock: a concurrent
+            # reset/heal may rewrite the entry, and mixing old and new
+            # fields would record a torn peer row.
+            peer_session_id = entry.session_id
+            peer_origin = entry.origin
+            peer_display_name = entry.display_name
+        # Metadata-only change on one entry: single-row UPSERT instead of
+        # the full index rewrite (see _save_entry). Both writes run outside
+        # ``_lock`` so the SQLite commit never blocks routing lookups.
+        self._save_entry(session_key)
+        self._record_gateway_session_peer(
+            peer_session_id,
+            session_key,
+            peer_origin,
+            display_name=peer_display_name,
+        )
 
     def get_session_metadata(
         self,
@@ -3287,6 +3482,7 @@ class SessionStore:
                 session_key,
                 new_entry.origin if new_entry else None,
                 display_name=new_entry.display_name if new_entry else None,
+                include_compression_ancestors=True,
             )
 
         return new_entry
@@ -3333,6 +3529,29 @@ class SessionStore:
             return getattr(entry, "session_id", None) if entry else None
     
     def append_to_transcript(self, session_id: str, message: Dict[str, Any], skip_db: bool = False) -> None:
+        """Serialize transcript draining across queue migration boundaries."""
+        if not self._db or skip_db:
+            return
+        drain_lock = getattr(self, "_transcript_drain_lock", None)
+        if drain_lock is None:
+            # Compatibility for old in-memory/test instances created via
+            # object.__new__ before this field existed.
+            drain_lock = threading.RLock()
+            self._transcript_drain_lock = drain_lock
+        with drain_lock:
+            reroutes = getattr(self, "_transcript_reroutes", None)
+            if reroutes is None:
+                reroutes = {}
+                self._transcript_reroutes = reroutes
+            seen = set()
+            while session_id in reroutes and session_id not in seen:
+                seen.add(session_id)
+                session_id = reroutes[session_id]
+            self._append_to_transcript_serialized(session_id, message)
+
+    def _append_to_transcript_serialized(
+        self, session_id: str, message: Dict[str, Any]
+    ) -> None:
         """Append a message to a session's transcript (SQLite).
 
         Args:
@@ -3341,15 +3560,13 @@ class SessionStore:
                      _flush_messages_to_session_db(), preventing the
                      duplicate-write bug (#860).
         """
-        if not self._db or skip_db:
-            return
         with self._transcript_retry_lock:
             pending = self._dirty_transcripts.setdefault(session_id, [])
             pending.append(dict(message))
             # Cap pending messages per session to avoid unbounded memory
             # growth when the DB is persistently broken. Drop the oldest.
             if len(pending) > self._MAX_PENDING_PER_SESSION:
-                dropped = pending.pop(0)
+                pending.pop(0)
                 logger.warning(
                     "Session DB transcript pending queue full for %s "
                     "(cap=%d); dropping oldest message to make room",
@@ -3365,12 +3582,76 @@ class SessionStore:
             # Snapshot the first pending message, then release the lock
             # before the DB write so other sessions are not blocked.
             msg = pending[0]
+        queue_session_id = session_id
         # DB write outside the retry lock — other sessions can append
         # concurrently. We re-acquire the lock only to update the queue.
         while True:
             try:
                 self._append_transcript_message(session_id, msg)
             except Exception as exc:
+                from hermes_state import CompressionSessionClosedError
+
+                if isinstance(exc, CompressionSessionClosedError):
+                    child = self._db.find_live_compression_child(session_id)
+                    child_id = str(child["id"]) if child and child.get("id") else ""
+                    if child_id:
+                        try:
+                            self._append_transcript_message(child_id, msg)
+                        except Exception as reroute_exc:
+                            exc = reroute_exc
+                        else:
+                            with self._transcript_retry_lock:
+                                if pending and pending[0] is msg:
+                                    pending.pop(0)
+                                existing_child_pending = self._dirty_transcripts.get(
+                                    child_id, []
+                                )
+                                if pending:
+                                    # Older parent backlog must precede messages
+                                    # already queued directly on the child.
+                                    pending.extend(existing_child_pending)
+                                    self._dirty_transcripts[child_id] = pending
+                                elif existing_child_pending:
+                                    pending = existing_child_pending
+                                self._dirty_transcripts.pop(queue_session_id, None)
+                                previous_failures = self._transcript_append_failures.pop(
+                                    queue_session_id, 0
+                                )
+                                if previous_failures:
+                                    self._transcript_append_failures[child_id] = max(
+                                        previous_failures,
+                                        self._transcript_append_failures.get(child_id, 0),
+                                    )
+                                self._transcript_reroutes[session_id] = child_id
+                                queue_session_id = child_id
+                            # Publish routing only after the retry queue has moved,
+                            # so new child writes cannot bypass older parent backlog.
+                            with self._lock:
+                                for entry in self._entries.values():
+                                    if entry.session_id == session_id:
+                                        entry.session_id = child_id
+                                self._save()
+                            if not pending:
+                                return
+                            msg = pending[0]
+                            session_id = child_id
+                            continue
+                    else:
+                        # This is a permanent routing invariant failure, not a
+                        # transient DB outage. Drop it from the retry queue so it
+                        # cannot poison later transcript writes indefinitely.
+                        with self._transcript_retry_lock:
+                            if pending and pending[0] is msg:
+                                pending.pop(0)
+                            if not pending:
+                                self._dirty_transcripts.pop(queue_session_id, None)
+                                self._transcript_append_failures.pop(session_id, None)
+                        logger.error(
+                            "Session DB transcript append rejected for compression-ended "
+                            "%s with no unique live child; not retrying",
+                            session_id,
+                        )
+                        return
                 if self._is_fts_corruption_error(exc) and self._rebuild_fts_once():
                     try:
                         self._append_transcript_message(session_id, msg)
@@ -3381,7 +3662,7 @@ class SessionStore:
                             if pending and pending[0] is msg:
                                 pending.pop(0)
                             if not pending:
-                                self._dirty_transcripts.pop(session_id, None)
+                                self._dirty_transcripts.pop(queue_session_id, None)
                                 self._transcript_append_failures.pop(session_id, None)
                         continue
                 with self._transcript_retry_lock:
@@ -3398,7 +3679,7 @@ class SessionStore:
                     if pending and pending[0] is msg:
                         pending.pop(0)
                     if not pending:
-                        self._dirty_transcripts.pop(session_id, None)
+                        self._dirty_transcripts.pop(queue_session_id, None)
                         self._transcript_append_failures.pop(session_id, None)
                         return
                     msg = pending[0]
@@ -3542,11 +3823,24 @@ class SessionStore:
             )
             return (False, False)
 
-    def rewrite_transcript(self, session_id: str, messages: List[Dict[str, Any]]) -> bool:
+    def rewrite_transcript(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        active_only: bool = False,
+    ) -> bool:
         """Replace the entire transcript for a session with new messages.
 
-        Used by /retry, /undo, and /compress to persist modified conversation
-        history. state.db is the canonical store.
+        Used by /retry and /compress to persist modified conversation
+        history. state.db is the canonical store. (/undo is not a caller:
+        it soft-archives rows via rewind_session / rewind_to_message.)
+
+        DESTRUCTIVE by default: ``replace_messages(active_only=False)``
+        DELETEs every row for the session, including the soft-archived
+        compaction history that archive_and_compact() keeps on disk
+        (#38763). Callers rewriting the live transcript of a session that
+        may carry archived rows must pass ``active_only=True`` so only the
+        live rows are replaced.
 
         Returns ``True`` when the write lands (or there is no DB to write to)
         and ``False`` when the canonical write fails. Most callers can ignore
@@ -3559,7 +3853,7 @@ class SessionStore:
             return True
         self._clear_dirty_transcript(session_id)
         try:
-            self._db.replace_messages(session_id, messages)
+            self._db.replace_messages(session_id, messages, active_only=active_only)
             # A transcript rewrite hard-deletes and renumbers rows, so any
             # in-memory undo/redo stack now references dead ids. Invalidate it
             # so a later /redo can't try to restore vanished rows.

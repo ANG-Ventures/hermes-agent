@@ -12,6 +12,12 @@ from unittest.mock import MagicMock, patch
 
 from tools.interrupt import set_interrupt
 
+# Holder for the child agent under test, populated by the patched
+# ``run_conversation`` below so the mocked API call can observe the same
+# interrupt signal a real socket abort would race. See the parity note on
+# ``_make_slow_api_response``.
+_CURRENT_CHILD_AGENT = [None]
+
 
 # The mocked API call blocks for this long. The interrupt MUST short-circuit it,
 # so the delegate returns in ~2s (happy path), NOT after the full delay. The
@@ -25,10 +31,37 @@ API_DELAY = 30.0
 
 
 def _make_slow_api_response(delay=API_DELAY):
-    """Create a mock that simulates a slow API response (like a real LLM call)."""
+    """Create a mock that simulates a slow API response (like a real LLM call).
+
+    Parity note (2026-08-08): upstream extended
+    ``should_use_direct_api_call`` to cover DELEGATED CHILDREN (#60203), not
+    just cron turns — children now run their request INLINE on the
+    conversation thread instead of on an interrupt worker, which fixes a
+    nested-daemon-pool wedge where a child hung at its first API call after
+    multi-day gateway uptime.
+
+    That changes how an interrupt reaches an in-flight call. The worker path
+    could abandon a blocked thread; the inline path instead registers
+    ``agent._active_request_abort`` and ``interrupt()`` shuts the active
+    SOCKETS down cross-thread, which unblocks the request. A bare
+    ``time.sleep(delay)`` has no socket, so it cannot be aborted by any
+    mechanism and this test measured the sleep rather than the contract.
+
+    Sleep on an Event that the registered abort hook sets, so the mock
+    unblocks exactly when a real socket abort would.
+    """
     def slow_create(**kwargs):
-        # Simulate a slow API call
-        time.sleep(delay)
+        # Simulate a slow API call that an interrupt CAN short-circuit.
+        # The inline path aborts the real request by shutting its sockets
+        # down; with no socket here, poll the same cooperative signal that
+        # abort would race — the child's own interrupt flag — so the mock
+        # unblocks when (and only when) a real abort would have landed.
+        deadline = time.monotonic() + delay
+        while time.monotonic() < deadline:
+            agent = _CURRENT_CHILD_AGENT[0]
+            if agent is not None and getattr(agent, "_interrupt_requested", False):
+                break
+            time.sleep(0.05)
         # Return a simple text response (no tool calls)
         resp = MagicMock()
         resp.choices = [MagicMock()]
@@ -112,8 +145,15 @@ class TestRealSubagentInterrupt(unittest.TestCase):
                         original_run = AIAgent.run_conversation
 
                         def patched_run(self_agent, *args, **kwargs):
+                            # Expose the child so the mocked API call can see
+                            # its interrupt flag (parity note above).
+                            _CURRENT_CHILD_AGENT[0] = self_agent
                             child_started.set()
-                            return original_run(self_agent, *args, **kwargs)
+                            try:
+                                return original_run(self_agent, *args, **kwargs)
+                            finally:
+                                if _CURRENT_CHILD_AGENT[0] is self_agent:
+                                    _CURRENT_CHILD_AGENT[0] = None
 
                         with patch.object(AIAgent, 'run_conversation', patched_run):
                             # Build a real child agent (AIAgent is NOT patched here,

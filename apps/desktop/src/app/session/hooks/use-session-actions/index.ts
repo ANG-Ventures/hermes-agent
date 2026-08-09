@@ -1,15 +1,17 @@
 import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
-import type { NavigateFunction } from 'react-router-dom'
+import type { NavigateFunction } from 'react-router'
 
 import { revealTreePane } from '@/components/pane-shell/tree/store'
-import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
+import { deleteSession, getAllSessionMessages, getLatestSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
+import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
+import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import {
@@ -21,7 +23,6 @@ import {
 } from '@/store/projects'
 import {
   $activeSessionStoredIdRotation,
-  $connection,
   $currentCwd,
   $currentFastMode,
   $currentModel,
@@ -33,6 +34,7 @@ import {
   $yoloActive,
   type NewChatWorkspaceTarget,
   resolveComposerSessionKey,
+  sessionPinId,
   setActiveSessionId,
   setActiveSessionStoredIdRotation,
   setAwaitingResponse,
@@ -51,11 +53,12 @@ import {
   setSelectedStoredSessionId,
   setSessions,
   setSessionStartedAt,
-  setSessionsTotal,
   setTurnStartedAt,
+  setWorkspaceCwdOwner,
   setYoloActive
 } from '@/store/session'
 import {
+  $sessionTiles,
   closeSessionTile,
   dropSessionState,
   openSessionTile,
@@ -67,13 +70,7 @@ import { broadcastSessionsChanged } from '@/store/session-sync'
 import { isWatchWindow } from '@/store/windows'
 import type { SessionCreateResponse, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'
 
-import {
-  cullRenderCacheSession,
-  normalizeCachedTranscriptRows,
-  readCachedTranscript
-} from '../../../render-cache-hydration'
-import { NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
-import { cullStashedTranscript, readStashedTranscript, stashTranscript } from '../../../transcript-stash'
+import { navigateToWorkspacePage, NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
 import type { ClientSessionState, SidebarNavItem } from '../../../types'
 import { sessionContextDrift } from '../session-context-drift'
 
@@ -87,6 +84,7 @@ import {
   patchSessionWorkspace,
   preserveLocalPendingTurnMessages,
   reconcileResumeMessages,
+  resolveSessionProfile,
   resolveStoredSession,
   sessionMatchesStoredId,
   sessionShouldHaveTranscript,
@@ -228,6 +226,7 @@ export function useSessionActions({
   // by A's delayed session.info event and visibly jump back to A.
   const storedIdRotation = useStore($activeSessionStoredIdRotation)
 
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     if (!storedIdRotation) {
       return
@@ -293,16 +292,22 @@ export function useSessionActions({
         ? normalizeNewChatWorkspaceTarget(draftOptions.workspaceTarget)
         : undefined
 
-      // Leaving a session for a fresh draft: stash its rows so clicking back
-      // repaints instantly (same contract as the resume-path stash).
-      stashTranscript(selectedStoredSessionIdRef.current, $messages.get())
-
       resetViewSync()
       busyRef.current = false
       setBusy(false)
       setAwaitingResponse(false)
       clearNotifications()
       setIntroSeed(seed => seed + 1)
+      // A fresh chat takes the screen. Front the workspace — and ONLY that:
+      // `$terminalTakeover` is the terminal's open/closed state in every
+      // layout, not a Focus-only overlay flag, so clearing it here would close
+      // a terminal sitting harmlessly in its own zone (Default, Terminal deck,
+      // Quad) and would persist a `false` that leaves the Focus tab unable to
+      // mount its workspace on the next boot. Behind another tab the terminal
+      // is hidden, not closed: it keeps its PTYs and the overlay stops
+      // painting on the pane-hidden marker, which is what actually cleared the
+      // chat.
+      revealTreePane('workspace')
       // Clear the durable route intent synchronously, before React Router
       // publishes /new. Submit uses that intent to heal an existing-session
       // rebind race, so leaving the old id here could revive it on a very fast
@@ -346,6 +351,11 @@ export function useSessionActions({
         setCurrentCwd(workspaceTarget)
       }
 
+      // A fresh draft resolves its own workspace right here, so it owns it. The
+      // selected stored id is null for a draft, and so is the owner — they match,
+      // which keeps workspace surfaces live on a new chat instead of treating the
+      // draft as an un-re-homed switch (#71254).
+      setWorkspaceCwdOwner(null)
       setCurrentBranch('')
       // Never clear the composer here — ChatBar's per-thread draft swap owns it.
       setFreshDraftReady(true)
@@ -465,7 +475,7 @@ export function useSessionActions({
       }
 
       if (item.route) {
-        navigate(item.route)
+        navigateToWorkspacePage(navigate, item.route)
       }
     },
     [navigate, startFreshSessionDraft]
@@ -482,13 +492,14 @@ export function useSessionActions({
    *  list (Cursor-style draft tab); it surfaces on the next refresh once the
    *  first message persists a turn. "Open in split" keeps the listed behavior. */
   const openNewSessionTile = useCallback(
-    async (dir: TileDock = 'right', options?: { listed?: boolean }) => {
+    async (dir: TileDock = 'right', options?: { cwd?: null | string; listed?: boolean }) => {
       const listed = options?.listed ?? true
 
       try {
-        // Fresh tile → the resolved new-session cwd (project/default), not the
-        // primary composer's live cwd.
-        const params = await desktopSessionCreateParams(resolveNewSessionCwd().trim())
+        // Fresh tile → the caller's workspace when one was named (the sidebar
+        // "+" on a project/worktree lane), else the resolved new-session cwd
+        // (focused session's project → project scope → default).
+        const params = await desktopSessionCreateParams((options?.cwd || resolveNewSessionCwd()).trim())
         const created = await requestGateway<SessionCreateResponse>('session.create', params)
         const stored = created.stored_session_id
 
@@ -509,11 +520,23 @@ export function useSessionActions({
           upsertOptimisticSession(created, stored, null, null)
         }
 
-        const runtimeInfo = applyRuntimeInfo(created.info)
+        // A tile lives in its OWN worktree, so it must not run the full
+        // foreground composer publish. A CENTER tile is the focused surface,
+        // though, and the Files pane still keys off the global `$currentCwd` —
+        // so the right rail kept showing the previous session's tree when a
+        // Project "+" created a session while the main chat was occupied
+        // (#76696). Split/side tiles deliberately stay isolated.
+        const runtimeInfo = applyRuntimeInfo(created.info, { foreground: false })
         updateSessionState(created.session_id, state => (runtimeInfo ? { ...state, ...runtimeInfo } : state), stored)
 
         openSessionTile(stored, dir)
         patchSessionTile(stored, { runtimeId: created.session_id })
+
+        if (dir === 'center' && runtimeInfo?.cwd) {
+          setCurrentCwd(runtimeInfo.cwd)
+          setWorkspaceCwdOwner(stored)
+        }
+
         revealTreePane(`session-tile:${stored}`)
 
         if (listed) {
@@ -552,24 +575,31 @@ export function useSessionActions({
 
       // Paint the click before the profile-resolve / gateway-swap awaits below,
       // so there's zero dead air: highlight the row instantly (the sidebar reads
-      // $selectedStoredSessionId) and, for a cold target, swap the transcript in
-      // the SAME frame from the in-memory stash when we have one — no blank, no
-      // loader (Ace 2026-07-15: the old->blank->new sandwich reads as a flash).
-      // Setting the ref here is also what use-route-resume's self-heal assumes
-      // ("set synchronously at resume entry").
-      //
-      // Stash the outgoing session's rows first so switching BACK is instant.
-      const previousStoredSessionId = selectedStoredSessionIdRef.current
-
-      if (previousStoredSessionId && previousStoredSessionId !== storedSessionId) {
-        stashTranscript(previousStoredSessionId, $messages.get())
-      }
-
+      // $selectedStoredSessionId) and, for a cold target, drop the previous
+      // transcript so the thread shows its loader instead of the old session
+      // lingering until resume lands. A warm-cached target keeps its transcript —
+      // the cached fast-path repaints it this same tick. Setting the ref here is
+      // also what use-route-resume's self-heal assumes ("set synchronously at
+      // resume entry").
       setFreshDraftReady(false)
       clearNotifications()
       resetViewSync()
       setSelectedStoredSessionId(storedSessionId)
       selectedStoredSessionIdRef.current = storedSessionId
+
+      // A session is EITHER the main thread OR a tile — never both. openSessionTile
+      // enforces this from the tile side (it refuses to tile the selected session);
+      // this enforces it from the main side. Loading an existing session into main
+      // (cold-start restore, a pasted/⌘K route, a notification jump) while it's also
+      // an open tile would paint the same transcript twice — the workspace pane from
+      // the route and the tile pane in parallel, both fighting one runtime. Drop the
+      // now-redundant tile so main owns it. Runs before the async awaits below (and
+      // before the selection listener homes focus) so the tile is gone the same tick
+      // the route takes over; the warm cache/runtime binding survives for main to reuse.
+      if ($sessionTiles.get().some(t => t.storedSessionId === storedSessionId)) {
+        closeSessionTile(storedSessionId)
+      }
+
       // Optimistically clear any prior resume-failure latch for this session:
       // we're attempting a fresh resume, so the self-heal in use-route-resume
       // must not keep treating it as stranded. It's re-armed below only if THIS
@@ -612,43 +642,8 @@ export function useSessionActions({
         setActiveSessionId(null)
         activeSessionIdRef.current = null
 
-        // Resuming the SAME already-selected session keeps its live rows on
-        // screen (upstream guard); a switch to a different target paints from
-        // the in-memory stash / disk cache instead of blanking.
         if (!resumedSameSelectedSession) {
-          // Instant paint: if this session's rows are stashed in memory (visited
-          // earlier this run), swap them in synchronously — the click's own
-          // commit shows the target transcript, never a blank/loader frame. The
-          // stash is a snapshot, not an authority: the live prefetch/resume
-          // below wholesale-replaces it (invariant I1), exactly like the disk
-          // cache paint.
-          const stashedRows = readStashedTranscript(storedSessionId)
-
-          if (stashedRows) {
-            setMessages(stashedRows)
-          } else {
-            setMessages([])
-
-            // Switch-paint from the disk render cache (Ace 2026-07-11): for a
-            // cold target, paint the cached transcript while the live prefetch
-            // below runs. Read is async (~ms IPC + disk); guarded so it only
-            // applies while THIS resume is current and nothing live (or a newer
-            // click) has painted yet — the live prefetch/resume wholesale-
-            // replaces these rows when it lands (same SWR contract as boot).
-            void readCachedTranscript(storedSessionId)
-              .then(cachedRows => {
-                if (!cachedRows || !isCurrentResume() || $messages.get().length > 0) {
-                  return
-                }
-
-                const painted = normalizeCachedTranscriptRows(cachedRows)
-
-                if (painted.length > 0) {
-                  setMessages(painted)
-                }
-              })
-              .catch(() => undefined)
-          }
+          setMessages([])
         }
       }
 
@@ -712,7 +707,7 @@ export function useSessionActions({
           // prefetch. Watch mirrors stay live-only by design.
           const persistedTranscriptPromise = isWatchWindow()
             ? null
-            : getSessionMessages(storedSessionId, sessionProfile).catch(() => null)
+            : getLatestSessionMessages(storedSessionId, sessionProfile).catch(() => null)
 
           setFreshDraftReady(false)
           clearNotifications()
@@ -722,6 +717,12 @@ export function useSessionActions({
           activeSessionIdRef.current = cachedRuntimeId
           syncSessionStateToView(cachedRuntimeId, cachedViewState)
           setCurrentCwd(cachedViewState.cwd)
+          // The warm cache IS this conversation's own workspace truth, so the
+          // switch is already re-homed here. This claim cannot wait for
+          // `session.activate`: its missing-RPC compat branch returns before
+          // `applyRuntimeInfo` runs, which would leave the workspace marked
+          // un-owned for the life of the session (#71254).
+          setWorkspaceCwdOwner(storedSessionId)
           setCurrentBranch(cachedViewState.branch)
           setSessionStartedAt(Date.now())
 
@@ -731,7 +732,8 @@ export function useSessionActions({
             try {
               activated = await requestGateway<SessionResumeResponse>('session.activate', {
                 session_id: cachedRuntimeId,
-                cols: 96
+                cols: 96,
+                omit_messages: true
               })
             } catch (error) {
               // Compatibility for older backends. Modern backends require
@@ -864,13 +866,17 @@ export function useSessionActions({
       const stored =
         $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId)) ?? storedForProfile
 
-      applyStoredSessionPreviewRuntimeInfo(stored)
+      applyStoredSessionPreviewRuntimeInfo(stored, storedSessionId)
 
       if (stored) {
         applyStoredUsage(stored)
       }
 
       let resumedRunning = false
+      // A recovered in-flight tail means the turn already produced output, so
+      // it resumes into the streaming state rather than the "awaiting first
+      // token" spinner.
+      let recoveredInFlightTail = false
 
       try {
         const watchWindow = isWatchWindow()
@@ -887,46 +893,20 @@ export function useSessionActions({
         // max(prefetch, resume) instead of their sum. The prefetch paints the
         // transcript as soon as it lands; the RPC binds the runtime id.
         // Watch windows skip the prefetch — lazy resume attaches the live mirror.
-        const prefetchPromise = watchWindow ? null : getSessionMessages(storedSessionId, sessionProfile)
-
-        // Switch-paint from the render cache (Ace 2026-07-11: first click on a
-        // session shouldn't wait on the network). If this session's transcript
-        // is cached (transcript preloader / write-through), paint it NOW while
-        // the prefetch + resume run. Interim paint only: it never feeds
-        // localSnapshot, so the live prefetch/resume below wholesale-replaces
-        // it (same I5 discipline as the boot paint).
-        if (!watchWindow && $messages.get().length === 0) {
-          readCachedTranscript(storedSessionId)
-            .then(rows => {
-              if (!rows || !isCurrentResume()) {
-                return
-              }
-
-              // A live payload may already have landed while the cache read
-              // resolved; never clobber it with the cached copy.
-              if ($messages.get().length > 0) {
-                return
-              }
-
-              const painted = normalizeCachedTranscriptRows(rows)
-
-              if (painted.length > 0) {
-                setMessages(painted)
-              }
-            })
-            .catch(() => undefined)
-        }
+        const prefetchPromise = watchWindow ? null : getLatestSessionMessages(storedSessionId, sessionProfile)
 
         const resumePromise = requestGateway<SessionResumeResponse>('session.resume', {
           session_id: storedSessionId,
           cols: 96,
           source: 'desktop',
+          // REST is the transcript authority for Desktop. Avoid duplicating a
+          // potentially huge compression lineage in the WebSocket response.
           // Watch windows attach lazily (live mirror). Every other cold resume
           // gets the gateway's default deferred build: the RPC returns the
           // transcript immediately instead of blocking the switch on _make_agent
           // (MCP discovery / prompt build), and the agent pre-warms in the
           // background while the prefetch above paints the transcript.
-          ...(watchWindow ? { lazy: true } : {}),
+          ...(watchWindow ? { lazy: true } : { omit_messages: true }),
           ...(sessionProfile ? { profile: sessionProfile } : {})
         })
 
@@ -990,15 +970,36 @@ export function useSessionActions({
                 return chatMessageArraysEquivalent(currentMessages, resumedMessages) ? currentMessages : resumedMessages
               })()
 
+        resumedRunning = Boolean((resumed as { running?: boolean }).running)
+
+        // Crash-survivable turn progress: fold a journaled in-flight tail
+        // (persisted by use-session-state-cache while the turn streamed;
+        // survives renderer/app death) back onto the restored transcript. The
+        // backend's own inflight projection is already inside
+        // `preferredMessages` (appendLiveSessionProjection), so this merge only
+        // adds the locally recorded structure — tool calls, sealed interim
+        // rows — that the backend's text-only snapshot cannot carry. A no-op
+        // returns `preferredMessages` by reference, keeping the fast path
+        // below intact.
+        const inFlightRecovery = recoverInFlightTurnJournal(storedSessionId, preferredMessages, {
+          keepPending: resumedRunning
+        })
+
+        recoveredInFlightTail = inFlightRecovery.applied
+
         // Prefetch-hit fast path: `preferredMessages` IS the live `$messages`
         // array (already error-merged when `localSnapshot` was built), so reuse
         // the ref instead of rebuilding a throwaway transcript+Map every switch.
         const messagesForView =
-          preferredMessages === currentMessages
+          inFlightRecovery.messages === currentMessages
             ? currentMessages
-            : preserveLocalAssistantErrors(preferredMessages, currentMessages)
+            : preserveLocalAssistantErrors(inFlightRecovery.messages, currentMessages)
 
-        if (sessionShouldHaveTranscript(stored) && messagesForView.length === 0) {
+        // Fail-latch on the PRE-recovery transcript: an orphan journal tail
+        // must not mask a lost transcript (a retry that reloads real history
+        // is safer than surfacing the in-flight turn alone). Recovery only
+        // ever appends, so this matches the final transcript's emptiness.
+        if (sessionShouldHaveTranscript(stored) && preferredMessages.length === 0) {
           setActiveSessionId(null)
           activeSessionIdRef.current = null
           setResumeFailedSessionId(storedSessionId)
@@ -1013,8 +1014,6 @@ export function useSessionActions({
 
         patchSessionWorkspace(storedSessionId, runtimeInfo?.cwd)
 
-        resumedRunning = Boolean((resumed as { running?: boolean }).running)
-
         updateSessionState(
           resumed.session_id,
           state => ({
@@ -1022,7 +1021,18 @@ export function useSessionActions({
             ...(runtimeInfo ?? {}),
             messages: messagesForView,
             busy: resumedRunning,
-            awaitingResponse: resumedRunning
+            awaitingResponse: resumedRunning && !recoveredInFlightTail,
+            ...(inFlightRecovery.applied
+              ? {
+                  sawAssistantPayload: true,
+                  // Point live deltas at the recovered row when the backend is
+                  // still mid-turn; a settled recovery keeps the stream idle.
+                  streamId: resumedRunning ? inFlightRecovery.streamId : null,
+                  turnStartedAt: resumedRunning
+                    ? (inFlightRecovery.turnStartedAt ?? state.turnStartedAt ?? Date.now())
+                    : state.turnStartedAt
+                }
+              : {})
           }),
           storedSessionId
         )
@@ -1050,7 +1060,7 @@ export function useSessionActions({
         let fallbackError: unknown = null
 
         try {
-          const fallback = await getSessionMessages(storedSessionId, sessionProfile)
+          const fallback = await getLatestSessionMessages(storedSessionId, sessionProfile)
 
           if (!isCurrentResume()) {
             return
@@ -1060,7 +1070,14 @@ export function useSessionActions({
             ? preserveLocalPendingTurnMessages($messages.get(), resumeStartMessages)
             : $messages.get()
 
-          setMessages(reconcileAuthoritativeMessages(fallback.messages, previousMessages))
+          // Resume failed, so there is no live projection — the journal is the
+          // only carrier of a crashed turn's progress on this path.
+          const fallbackRecovery = recoverInFlightTurnJournal(
+            storedSessionId,
+            reconcileAuthoritativeMessages(fallback.messages, previousMessages)
+          )
+
+          setMessages(fallbackRecovery.messages)
         } catch (e) {
           // Fallback also failed: nothing to paint. Leave whatever messages are
           // already shown and fall through to arm the resume-failure latch so
@@ -1112,7 +1129,7 @@ export function useSessionActions({
         if (isCurrentResume()) {
           busyRef.current = resumedRunning
           setBusy(resumedRunning)
-          setAwaitingResponse(resumedRunning)
+          setAwaitingResponse(resumedRunning && !recoveredInFlightTail)
         }
       }
     },
@@ -1135,18 +1152,39 @@ export function useSessionActions({
   // `parentStoredId` so it nests under its parent, then open it as its own tab
   // and switch to it — the parent chat stays put (mirrors openNewSessionTile).
   const forkBranch = useCallback(
-    async (branchMessages: BranchMessage[], parentStoredId: null | string, cwd?: string): Promise<boolean> => {
+    async (
+      branchMessages: BranchMessage[],
+      sourceSessionId: null | string,
+      parentStoredId: null | string,
+      cwd?: string,
+      profile?: null | string
+    ): Promise<boolean> => {
       creatingSessionRef.current = true
 
       try {
+        // A branch belongs to its parent's OWNING profile. Swapping the live
+        // gateway first AND passing `profile` on the create mirrors
+        // desktopSessionCreateParams/resumeSession: in app-global remote mode
+        // one backend serves every profile, so an omitted profile silently
+        // lands the branch on the launch (default) profile — the "session
+        // jumps between profiles after branching" bug. The swap also makes
+        // upsertOptimisticSession's $activeGatewayProfile stamp correct.
+        await ensureGatewayProfile(profile)
+
         // No title: the backend auto-names the branch from its parent's lineage.
-        const branched = await requestGateway<SessionCreateResponse>('session.create', {
-          cols: 96,
-          source: 'desktop',
-          ...(cwd && { cwd }),
-          messages: branchMessages.map(({ content, role }) => ({ content, role })),
-          ...(parentStoredId && { parent_session_id: parentStoredId })
-        })
+        const branched = sourceSessionId
+          ? await requestGateway<SessionCreateResponse>('session.branch', {
+              session_id: sourceSessionId,
+              count: branchMessages.length
+            })
+          : await requestGateway<SessionCreateResponse>('session.create', {
+              cols: 96,
+              source: 'desktop',
+              ...(cwd && { cwd }),
+              ...(profile ? { profile } : {}),
+              messages: branchMessages.map(({ content, role }) => ({ content, role })),
+              ...(parentStoredId && { parent_session_id: parentStoredId })
+            })
 
         const routedSessionId = branched.stored_session_id ?? branched.session_id
         const preview = branchMessages.map(({ content }) => content).find(Boolean) ?? null
@@ -1181,7 +1219,9 @@ export function useSessionActions({
           routedSessionId
         )
 
-        const runtimeInfo = applyRuntimeInfo(branched.info)
+        // The branch opens as its own tile in the parent's worktree, not as the
+        // primary session — keep its runtime out of the main composer atoms.
+        const runtimeInfo = applyRuntimeInfo(branched.info, { foreground: false })
         patchSessionWorkspace(routedSessionId, runtimeInfo?.cwd)
 
         if (runtimeInfo) {
@@ -1232,7 +1272,7 @@ export function useSessionActions({
         ? messages.findIndex(message => message.id === messageId)
         : messages.findLastIndex(message => message.role === 'assistant' || message.role === 'user')
 
-      const start = at >= 0 ? at : Math.max(messages.length - 1, 0)
+      const start = 0
       const end = at >= 0 ? at + 1 : messages.length
       const branchMessages = toBranchMessages(messages.slice(start, end))
 
@@ -1244,7 +1284,18 @@ export function useSessionActions({
 
       clearNotifications()
 
-      return forkBranch(branchMessages, selectedStoredSessionIdRef.current, $currentCwd.get().trim())
+      // The open chat's owning profile, NOT the picker's / launch profile —
+      // /profile only retargets new chats, so a branch of an existing thread
+      // must stay on that thread's backend (cache hit for an open session).
+      const profile = await resolveSessionProfile(selectedStoredSessionIdRef.current)
+
+      return forkBranch(
+        branchMessages,
+        activeSessionIdRef.current,
+        selectedStoredSessionIdRef.current,
+        $currentCwd.get().trim(),
+        profile
+      )
     },
     [activeSessionIdRef, busyRef, copy, forkBranch, selectedStoredSessionIdRef]
   )
@@ -1267,7 +1318,7 @@ export function useSessionActions({
 
       try {
         await ensureGatewayProfile(profile)
-        const { messages } = await getSessionMessages(storedSessionId, profile)
+        const { messages } = await getAllSessionMessages(storedSessionId, profile)
         const branchMessages = toBranchMessages(toChatMessages(messages))
 
         if (!branchMessages.length) {
@@ -1276,7 +1327,7 @@ export function useSessionActions({
           return false
         }
 
-        return await forkBranch(branchMessages, stored?.id ?? storedSessionId, stored?.cwd?.trim())
+        return await forkBranch(branchMessages, null, stored?.id ?? storedSessionId, stored?.cwd?.trim(), profile)
       } catch (err) {
         notifyError(err, copy.branchFailed)
 
@@ -1294,20 +1345,20 @@ export function useSessionActions({
       const wasSelected = selectedStoredSessionId === storedSessionId
       const closingRuntimeId = wasSelected ? activeSessionId : null
       const previousMessages = $messages.get()
+      const previousPinned = $pinnedSessionIds.get()
+      // Pins are keyed on the durable lineage-root id; the stored id may be the
+      // live tip after compression. Drop both so the pin can't linger.
+      const removedPinId = removed ? sessionPinId(removed) : storedSessionId
       const removedIds = [storedSessionId, removed?.id, removed?._lineage_root_id]
 
       setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
-      // Pin rows derive from $sessions (computed) — removing the session row
-      // below drops the pin automatically; restore happens via setSessions rollback.
       // Evict from the project tree's optimistic layer too (the backend snapshot
       // still lists it until its next refresh), so grouped + flat views drop the
       // row in lockstep. Pin the tombstone against the projects.tree prune while
       // the delete RPC is in flight, so a racing refresh can't flash it back.
       tombstoneSessions(removedIds)
       beginSessionMutation(removedIds)
-      // Keep $sessionsTotal in sync so the sidebar's "Load N more" footer
-      // doesn't keep claiming the removed row is still on the server.
-      setSessionsTotal(prev => Math.max(0, prev - 1))
+      $pinnedSessionIds.set(previousPinned.filter(id => id !== storedSessionId && id !== removedPinId))
 
       // Tear down before awaiting so the route effect can't resume the
       // doomed session via the stale /<sid> URL.
@@ -1322,10 +1373,6 @@ export function useSessionActions({
 
         await deleteSession(storedSessionId, removed?.profile)
         clearQueuedPrompts(storedSessionId)
-        // I4b delete wire: forward the delete to the render-cache culler so the
-        // deleted session's cached transcript doesn't outlive it on disk.
-        cullRenderCacheSession($connection.get()?.baseUrl ?? null, storedSessionId)
-        cullStashedTranscript(storedSessionId)
 
         if (closingRuntimeId) {
           clearQueuedPrompts(closingRuntimeId)
@@ -1345,10 +1392,10 @@ export function useSessionActions({
       } catch (err) {
         if (removed) {
           setSessions(prev => [removed, ...prev])
-          setSessionsTotal(prev => prev + 1)
         }
 
         untombstoneSessions(removedIds)
+        $pinnedSessionIds.set(previousPinned)
 
         if (wasSelected) {
           setFreshDraftReady(false)
@@ -1397,20 +1444,17 @@ export function useSessionActions({
 
       const archived = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
       const wasSelected = selectedStoredSessionId === storedSessionId
+      const previousPinned = $pinnedSessionIds.get()
       // Pins are keyed on the durable lineage-root id; the stored id may be the
       // live tip after compression. Drop both so the pin can't linger.
+      const archivedPinId = archived ? sessionPinId(archived) : storedSessionId
       const archivedIds = [storedSessionId, archived?.id, archived?._lineage_root_id]
 
       // Soft-hide: drop from the sidebar immediately, keep the data.
       setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
-      // Drop the pin optimistically too, restored on the rollback below if the
-      // archive PATCH fails.
       tombstoneSessions(archivedIds)
       beginSessionMutation(archivedIds)
-      // Archived sessions are hidden by the listSessions(min_messages=1) query
-      // on the next refresh, so they count as "removed" for the load-more
-      // footer math.
-      setSessionsTotal(prev => Math.max(0, prev - 1))
+      $pinnedSessionIds.set(previousPinned.filter(id => id !== storedSessionId && id !== archivedPinId))
 
       if (wasSelected) {
         startFreshSessionDraft(true)
@@ -1418,11 +1462,6 @@ export function useSessionActions({
 
       try {
         await setSessionArchived(storedSessionId, true, archived?.profile)
-        // A sidebar refresh can race the optimistic removal while the PATCH is
-        // in flight and briefly reinsert the still-unarchived backend row. Win
-        // that race after the mutation succeeds so right-click → Archive does
-        // not appear to do nothing until the next full refresh.
-        setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
         // An archived session is hidden from the sidebar; its tile must go too.
         const tiledRuntimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
         closeSessionTile(storedSessionId)
@@ -1437,10 +1476,10 @@ export function useSessionActions({
       } catch (err) {
         if (archived) {
           setSessions(prev => [archived, ...prev.filter(session => !sessionMatchesStoredId(session, storedSessionId))])
-          setSessionsTotal(prev => prev + 1)
         }
 
         untombstoneSessions(archivedIds)
+        $pinnedSessionIds.set(previousPinned)
         notifyError(err, copy.archiveFailed)
       } finally {
         endSessionMutation(archivedIds)

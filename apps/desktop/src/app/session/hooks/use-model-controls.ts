@@ -4,6 +4,7 @@ import { useCallback, useRef } from 'react'
 import type { ModelSelection } from '@/app/shell/model-menu-panel'
 import { getGlobalModelInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { isBusySessionModelSwitch } from '@/lib/gateway-rpc'
 import { manualPickRemoved, modelOptionsQueryKey } from '@/lib/model-options'
 import { notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
@@ -11,7 +12,6 @@ import {
   $activeSessionId,
   $currentModel,
   $currentProvider,
-  $resetModelOnNewSession,
   getComposerSelectionGeneration,
   getCurrentModelSource,
   markComposerSelectionManual,
@@ -56,24 +56,39 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
     [queryClient]
   )
 
+  // Settings → Model writes the profile default, which the backend applies to
+  // new sessions only. Keep a live session's renderer state and session-scoped
+  // model-options cache authoritative instead of briefly painting the saved
+  // default as if the active agent had switched. Marking the composer as
+  // default-derived still lets the next fresh draft reseed from profile config.
+  const applySavedMainModel = useCallback(
+    (provider: string, model: string) => {
+      const liveSessionId = $activeSessionId.get()
+
+      setCurrentModelSource('default')
+
+      if (!liveSessionId) {
+        setCurrentProvider(provider)
+        setCurrentModel(model)
+      }
+
+      // A null session id is the profile-global model-options key. Never patch
+      // the live session key here: only config.set --session may change it.
+      updateModelOptionsCache(null, provider, model, false)
+    },
+    [updateModelOptionsCache]
+  )
+
   // Seed the composer's model state from the profile default. `force` reseeds
   // for a profile swap (the new profile has its own default); otherwise this
   // only fills an EMPTY selection so a user's pick (plain UI state in
   // $currentModel) survives the lifecycle refreshes that fire on boot / fresh
   // draft / session events. A live session owns the footer, so skip entirely.
-  //
-  // When config.yaml `desktop.reset_model_on_new_session` is on, a fresh draft
-  // is treated as a forced reseed too: the sticky last-picked model is
-  // overwritten with the profile default so a new chat always starts on the
-  // default (opt-in; default off preserves the sticky behavior).
   const refreshCurrentModel = useCallback(
     async (force = false) => {
       // A forced profile swap opens a new intent epoch; an older in-flight
-      // response for a previous profile must stand down when it resolves. The
-      // reset_model_on_new_session opt-in treats a fresh draft as forced too.
-      const effectiveForce = force || $resetModelOnNewSession.get()
-
-      if (effectiveForce) {
+      // response for a previous profile must stand down when it resolves.
+      if (force) {
         profileRefreshEpochRef.current += 1
       }
 
@@ -90,7 +105,7 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         // Reads the model-options cache the composer already populated; an
         // unknown/not-yet-loaded catalog conservatively preserves the pick.
         const keepManualPick = () => {
-          if (effectiveForce || !$currentModel.get() || getCurrentModelSource() !== 'manual') {
+          if (force || !$currentModel.get() || getCurrentModelSource() !== 'manual') {
             return false
           }
 
@@ -192,16 +207,32 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
       }
 
       try {
-        await requestGateway('config.set', {
+        const result = await requestGateway<{ deferred?: boolean }>('config.set', {
           session_id: liveSessionId,
           key: 'model',
           value: `${selection.model} --provider ${selection.provider} --session`
         })
 
-        void queryClient.invalidateQueries({ queryKey: modelOptionsQueryKey(liveGatewayProfile, liveSessionId) })
+        // A pick made DURING a turn is queued by the gateway and applied at the
+        // next turn start (`deferred`). Re-fetching now would answer with the
+        // model still running and repaint the old name over the user's choice —
+        // the switch publishes session.info when it lands, and that is what
+        // re-syncs every surface.
+        if (!result?.deferred) {
+          void queryClient.invalidateQueries({ queryKey: modelOptionsQueryKey(liveGatewayProfile, liveSessionId) })
+        }
 
         return true
       } catch (err) {
+        // An OLDER gateway refuses a mid-turn switch outright (4009) instead of
+        // deferring it. Don't punish the user for a backend they haven't
+        // updated: keep the pick painted as the composer's selection, which is
+        // what the NEXT turn runs anyway. Current gateways never take this
+        // path — they answer `deferred`.
+        if (isBusySessionModelSwitch(err)) {
+          return true
+        }
+
         if (touchesPrimary) {
           setCurrentModel(prevModel)
           setCurrentProvider(prevProvider)
@@ -229,5 +260,5 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
     [copy.modelSwitchFailed, queryClient, requestGateway, updateModelOptionsCache]
   )
 
-  return { refreshCurrentModel, selectModel, updateModelOptionsCache }
+  return { applySavedMainModel, refreshCurrentModel, selectModel }
 }

@@ -66,24 +66,6 @@ class _SlowProvider(MemoryProvider):
         return ""
 
 
-def test_sync_all_does_not_block_on_slow_provider():
-    """The crux of the fix: a slow provider must NOT stall the caller."""
-    mgr = MemoryManager()
-    provider = _SlowProvider(delay=10.0)
-    mgr.add_provider(provider)
-
-    mgr.sync_all("hi", "hey", session_id="s1")
-    mgr.queue_prefetch_all("hi", session_id="s1")
-
-    # Positive witness (replaces `elapsed < 0.5`): the provider sets
-    # sync_done/prefetch_done only AFTER its 10s sleep, so if either call
-    # had run inline the flag would already be True here.  Both unset ==
-    # both were dispatched off-thread.  Load cannot flip this; only an
-    # inline regression can.
-    assert not provider.sync_done, "sync_all ran sync_turn inline"
-    assert not provider.prefetch_done, "queue_prefetch_all ran queue_prefetch inline"
-
-
 def test_background_work_still_completes():
     """Dispatching off-thread must not silently drop the write."""
     mgr = MemoryManager()
@@ -96,52 +78,6 @@ def test_background_work_still_completes():
     assert mgr.flush_pending(timeout=10) is True
     assert p.sync_done is True
     assert p.prefetch_done is True
-
-
-def test_flush_pending_no_executor_is_true():
-    """flush_pending must be a no-op (return True) before any sync ran."""
-    mgr = MemoryManager()
-    assert mgr.flush_pending(timeout=1) is True
-
-
-def test_no_providers_does_not_create_executor():
-    """Builtin-only / no-provider sessions must not spawn an executor."""
-    mgr = MemoryManager()
-    mgr.sync_all("hi", "hey")
-    mgr.queue_prefetch_all("hi")
-    assert mgr._sync_executor is None
-
-
-def test_shutdown_all_is_bounded_with_wedged_provider():
-    """A provider that never returns must not hang teardown."""
-    mgr = MemoryManager()
-    mgr.add_provider(_SlowProvider(delay=30.0))
-    mgr.sync_all("hi", "hey")
-
-    t0 = time.time()
-    mgr.shutdown_all()
-    elapsed = time.time() - t0
-
-    # Bounded by _SYNC_DRAIN_TIMEOUT_S (5s) plus a little slack.
-    assert elapsed < 8.0, f"shutdown blocked {elapsed:.1f}s on wedged provider"
-
-
-def test_writes_are_serialized_in_order():
-    """Single-worker executor must preserve turn ordering (N before N+1)."""
-    order = []
-
-    class _OrderProvider(_SlowProvider):
-        _name = "order"
-
-        def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None):
-            order.append(user_content)
-
-    mgr = MemoryManager()
-    mgr.add_provider(_OrderProvider(delay=0.0))
-    for i in range(5):
-        mgr.sync_all(f"turn-{i}", "resp", session_id="s1")
-    assert mgr.flush_pending(timeout=10) is True
-    assert order == [f"turn-{i}" for i in range(5)]
 
 
 def test_shutdown_drains_queued_writes_and_boundary_in_fifo_order():

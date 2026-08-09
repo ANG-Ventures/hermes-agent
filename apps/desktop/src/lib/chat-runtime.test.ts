@@ -2,12 +2,11 @@ import { describe, expect, it } from 'vitest'
 
 import type { ComposerAttachment } from '@/store/composer'
 
-import type { ChatMessage } from './chat-messages'
 import {
   attachmentDisplayText,
-  coalesceToolOnlyAssistants,
+  attachmentId,
   coerceThinkingText,
-  createToolMergeCache,
+  messageCreatedAt,
   optimisticAttachmentRef,
   parseCommandDispatch,
   parseSlashCommand
@@ -154,66 +153,50 @@ describe('parseSlashCommand', () => {
   })
 })
 
-describe('coalesceToolOnlyAssistants — duplicate toolCallId render-key crash guard', () => {
-  const toolMsg = (id: string, parts: { toolCallId: string; toolName: string; result?: unknown }[]): ChatMessage => ({
-    id,
-    role: 'assistant',
-    parts: parts.map(p => ({
-      type: 'tool-call' as const,
-      toolCallId: p.toolCallId,
-      toolName: p.toolName,
-      args: {} as never,
-      argsText: '{}',
-      ...(p.result !== undefined ? { result: p.result } : {})
-    })),
-    timestamp: 1
+describe('attachmentId', () => {
+  it('normalizes a trailing slash on a url so a re-attach dedupes (#59305 P2)', () => {
+    expect(attachmentId('url', 'https://example.com/a')).toBe(attachmentId('url', 'https://example.com/a/'))
   })
 
-  // Reproduces the live "Duplicate key toolCallId-… in tapResources" crash: two
-  // tool-only assistant messages that each carry a part with the SAME toolCallId
-  // get merged into ONE message; assistant-ui's tapResources keys tool parts by
-  // toolCallId and HARD-THROWS on a duplicate, crashing the whole renderer.
-  it('does not emit two tool parts sharing a toolCallId when merging tool-only assistants', () => {
-    const messages: ChatMessage[] = [
-      toolMsg('m1', [{ toolCallId: 'toolu_DUP', toolName: 'tapResources' }]),
-      // a re-delivery / persisted duplicate landing as a SEPARATE tool-only assistant
-      toolMsg('m2', [{ toolCallId: 'toolu_DUP', toolName: 'tapResources', result: { ok: true } }])
-    ]
-
-    const coalesced = coalesceToolOnlyAssistants(messages, createToolMergeCache())
-
-    // Must merge to a single message...
-    expect(coalesced).toHaveLength(1)
-
-    const parts = coalesced[0].parts.filter(
-      (p): p is Extract<ChatMessage['parts'][number], { type: 'tool-call' }> => p.type === 'tool-call'
-    )
-
-    // ...whose tool parts have NO duplicate toolCallId (the tapResources invariant).
-    const ids = parts.map(p => p.toolCallId)
-    expect(new Set(ids).size).toBe(ids.length)
-    expect(ids).toEqual(['toolu_DUP'])
-    // The later duplicate's fields merged onto the surviving row, not dropped.
-    expect(parts[0].result).toMatchObject({ ok: true })
+  it('falls back to the trimmed raw value for a malformed url instead of throwing', () => {
+    expect(() => attachmentId('url', 'not a url')).not.toThrow()
+    expect(attachmentId('url', '  not a url  ')).toBe(attachmentId('url', 'not a url'))
   })
 
-  it('preserves distinct tool calls and their order when merging', () => {
-    const messages: ChatMessage[] = [
-      toolMsg('m1', [{ toolCallId: 'a', toolName: 'read_file' }]),
-      toolMsg('m2', [
-        { toolCallId: 'b', toolName: 'tapResources' },
-        { toolCallId: 'c', toolName: 'web_search' }
-      ])
-    ]
+  it('normalizes backslash path separators so a Windows and posix path dedupe', () => {
+    expect(attachmentId('file', 'a\\b.ts')).toBe(attachmentId('file', 'a/b.ts'))
+  })
 
-    const coalesced = coalesceToolOnlyAssistants(messages, createToolMergeCache())
+  it('normalizes a trailing slash on a folder path', () => {
+    expect(attachmentId('folder', 'src/app/')).toBe(attachmentId('folder', 'src/app'))
+  })
 
-    expect(coalesced).toHaveLength(1)
+  it('does not collapse a bare root path to an empty id', () => {
+    expect(attachmentId('folder', '/')).toBe('folder:/')
+  })
 
-    const ids = coalesced[0].parts
-      .filter((p): p is Extract<ChatMessage['parts'][number], { type: 'tool-call' }> => p.type === 'tool-call')
-      .map(p => p.toolCallId)
+  it('keeps distinct urls distinct', () => {
+    expect(attachmentId('url', 'https://example.com/a')).not.toBe(attachmentId('url', 'https://example.com/b'))
+  })
+})
 
-    expect(ids).toEqual(['a', 'b', 'c'])
+describe('messageCreatedAt', () => {
+  const NOW = Date.UTC(2026, 6, 28, 18, 0, 0)
+
+  it('reads the authoritative Unix-seconds timestamp (not ms)', () => {
+    // 1785282262s → July 2026, not the 1970 epoch a *1000-less read would give.
+    expect(messageCreatedAt({ timestamp: 1785282262 }, NOW).getFullYear()).toBe(2026)
+  })
+
+  it('falls back to now — never digs digits out of the id → "20663d ago" (1970)', () => {
+    // The old fallback did `new Date(Number(id.match(/\d+/)))`, so a session-style
+    // id like 20260728_184420_05e697 parsed to 20260728 *ms* = Jan 1970, showing
+    // as an absurd 20663-day age. A timestamp-less message is freshly created.
+    expect(messageCreatedAt({ timestamp: undefined }, NOW).getTime()).toBe(NOW)
+  })
+
+  it('treats a zero / non-finite timestamp as absent', () => {
+    expect(messageCreatedAt({ timestamp: 0 }, NOW).getTime()).toBe(NOW)
+    expect(messageCreatedAt({ timestamp: Number.NaN }, NOW).getTime()).toBe(NOW)
   })
 })

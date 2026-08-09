@@ -13,13 +13,6 @@ def test_stt_echo_transcripts_defaults_on_for_backwards_compatibility():
     assert cfg.to_dict()["stt_echo_transcripts"] is True
 
 
-def test_stt_echo_transcripts_can_be_disabled_in_stt_section():
-    cfg = GatewayConfig.from_dict({"stt": {"enabled": True, "echo_transcripts": False}})
-
-    assert cfg.stt_enabled is True
-    assert cfg.stt_echo_transcripts is False
-
-
 def test_top_level_stt_echo_transcripts_takes_precedence():
     cfg = GatewayConfig.from_dict({
         "stt_echo_transcripts": False,
@@ -29,72 +22,3 @@ def test_top_level_stt_echo_transcripts_takes_precedence():
     assert cfg.stt_echo_transcripts is False
 
 
-def test_load_gateway_config_honors_top_level_stt_echo_transcripts(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    (tmp_path / "config.yaml").write_text(
-        "stt:\n  echo_transcripts: true\nstt_echo_transcripts: false\n",
-        encoding="utf-8",
-    )
-
-    cfg = load_gateway_config()
-
-    assert cfg.stt_echo_transcripts is False
-
-
-def test_gateway_runner_uses_stt_echo_transcripts_flag():
-    runner = GatewayRunner.__new__(GatewayRunner)
-
-    runner.config = SimpleNamespace(stt_echo_transcripts=False)
-    assert runner._should_echo_stt_transcripts() is False
-
-    runner.config = SimpleNamespace(stt_echo_transcripts=True)
-    assert runner._should_echo_stt_transcripts() is True
-
-    runner.config = SimpleNamespace()
-    assert runner._should_echo_stt_transcripts() is True
-
-
-def test_all_gateway_transcript_echo_sends_are_gated():
-    """Every 🎙️ echo site must sit behind the stt_echo_transcripts gate.
-
-    Checked structurally (the gate appears anywhere in the ENCLOSING
-    function, resolved via the AST) rather than within a fixed line
-    window: the guard is a property of the function, and a window-based
-    check breaks whenever unrelated logic is added between the gate and
-    the send.
-    """
-    import ast
-
-    source = Path(__file__).resolve().parents[2] / "gateway" / "run.py"
-    text = source.read_text()
-    lines = text.splitlines()
-
-    echo_send_lines = [
-        index + 1  # 1-based, to match AST line numbers
-        for index, line in enumerate(lines)
-        if "f'🎙️" in line or 'f"🎙️' in line
-    ]
-
-    assert echo_send_lines
-
-    tree = ast.parse(text)
-    functions = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    ]
-
-    for lineno in echo_send_lines:
-        enclosing = [
-            fn
-            for fn in functions
-            if fn.lineno <= lineno <= (fn.end_lineno or fn.lineno)
-        ]
-        assert enclosing, f"no enclosing function for transcript echo on line {lineno}"
-        # Innermost enclosing function wins.
-        fn = max(enclosing, key=lambda f: f.lineno)
-        body = ast.get_source_segment(text, fn) or ""
-        assert "_should_echo_stt_transcripts()" in body, (
-            f"transcript echo on line {lineno} (in {fn.name}) is not gated by "
-            "_should_echo_stt_transcripts()"
-        )

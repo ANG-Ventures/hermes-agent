@@ -569,7 +569,14 @@ class TestRunConversation:
         # #34452: the bare "(empty)" sentinel is now replaced by a
         # user-visible end-of-turn explanation so the failure isn't silent.
         assert result["final_response"] != "(empty)"
-        assert "No reply:" in result["final_response"]
+        # Parity note (2026-08-08): the fork's "⚠️ No reply: …" prefix
+        # (run_agent.py) covers the genuinely-EMPTY terminal. Upstream added a
+        # richer terminal for the reasoning-ONLY case (conversation_loop.py,
+        # idea credit PR #48795): rather than discard the model's work it
+        # surfaces the reasoning text, clearly labelled. This test drives the
+        # reasoning-only path, so assert the #34452 contract (not silent, not
+        # "(empty)") against the message that path actually produces.
+        assert "produced only internal reasoning" in result["final_response"]
         assert result["turn_exit_reason"] == "empty_response_exhausted"
         assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
 
@@ -592,7 +599,10 @@ class TestRunConversation:
         assert result["completed"] is True
         # #34452: explanation replaces the bare "(empty)" sentinel.
         assert result["final_response"] != "(empty)"
-        assert "No reply:" in result["final_response"]
+        # Parity note (2026-08-08): reasoning-only terminal — see the sibling
+        # test above. Upstream surfaces the model's own reasoning here
+        # instead of the fork's generic "No reply:" prefix.
+        assert "produced only internal reasoning" in result["final_response"]
         assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
 
     def test_reasoning_only_prefill_succeeds_on_continuation(self, agent):

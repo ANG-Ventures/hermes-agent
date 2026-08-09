@@ -6,7 +6,6 @@ import json
 import time
 import uuid
 import logging
-from pathlib import Path
 from threading import Lock
 from typing import Any
 
@@ -30,9 +29,6 @@ def _preview(value: Any) -> str:
             text = str(value)
     return text[:_PREVIEW_CHARS]
 
-import yaml
-
-from hermes_constants import get_hermes_home
 from plugins.blackbox.card import render_card
 from plugins.blackbox.cost import compute_turn_cost
 from plugins.blackbox.record import TurnRecord
@@ -125,10 +121,13 @@ def _profile_name() -> str:
 
 def _config() -> dict[str, Any] | None:
     try:
-        path = Path(get_hermes_home()) / "config.yaml"
-        if not path.exists():
-            return None
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        # fork-parity: read through the canonical loader, not raw yaml. Upstream
+        # added tests/hermes_cli/test_config_read_guard.py, which forbids raw
+        # yaml.safe_load of config.yaml outside the allowlisted owner modules —
+        # a raw read also misses the managed-scope overlay the loader applies.
+        from hermes_cli.config import load_config_readonly
+
+        data = load_config_readonly() or {}
         block = data.get("blackbox")
         if not isinstance(block, dict):
             return None

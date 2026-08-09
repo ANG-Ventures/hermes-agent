@@ -890,24 +890,28 @@ class TestAgentRuntimePostHookOwnershipSync:
     AGENT_RUNTIME_POST_HOOK_TOOL_NAMES has to match exactly the static
     `function_name == "..."` branches in the inline dispatch chain.
 
-    The chain is the if/elif tower anchored on `_block_msg is not None`.
+    The chain is the if/elif tower whose head is `function_name == "todo"`.
     Pre-dispatch `function_name == "..."` checks (counter resets, checkpoint
     triggers) live outside the dispatch chain and are explicitly skipped.
+
+    parity NOTE (upstream->fork merge 2026-08-08): this used to anchor on
+    `_block_msg is not None`, the head of the fork's inline block ladder.
+    Upstream moved plugin/scope/guardrail blocking out of both dispatchers and
+    into the shared choke point (`_run_agent_tool_execution_middleware` ->
+    `_authorized_dispatch`), deleting `_block_msg` — so the tower now begins at
+    its first real dispatch arm. Only the ANCHOR moved; the invariant this test
+    guards is unchanged and still enforced by the assertions below (verified at
+    re-anchor time: chain == frozenset == invoke_tool ==
+    {clarify, delegate_task, memory, read_preview, read_terminal,
+    session_search, todo}).
     """
 
-    _DISPATCH_ANCHOR_LEFT = "_block_msg"
+    _DISPATCH_ANCHOR_TOOL = "todo"
 
     @classmethod
     def _is_dispatch_anchor(cls, test_node) -> bool:
-        # Looking for `_block_msg is not None`.
-        if not isinstance(test_node, ast.Compare):
-            return False
-        if not (isinstance(test_node.left, ast.Name) and test_node.left.id == cls._DISPATCH_ANCHOR_LEFT):
-            return False
-        if not (len(test_node.ops) == 1 and isinstance(test_node.ops[0], ast.IsNot)):
-            return False
-        comparator = test_node.comparators[0]
-        return isinstance(comparator, ast.Constant) and comparator.value is None
+        # Looking for the tower head: `function_name == "todo"`.
+        return cls._function_name_literal(test_node) == cls._DISPATCH_ANCHOR_TOOL
 
     @staticmethod
     def _function_name_literal(test_node) -> str | None:
@@ -925,8 +929,8 @@ class TestAgentRuntimePostHookOwnershipSync:
 
     @classmethod
     def _extract_dispatch_chain_names(cls, func) -> set[str]:
-        """Find the if/elif chain anchored on `_block_msg is not None`, return its
-        `function_name == "..."` literals."""
+        """Find the if/elif chain whose head is `function_name == "todo"`, return
+        its `function_name == "..."` literals."""
         source = inspect.cleandoc("\n" + inspect.getsource(func))
         tree = ast.parse(source)
         names: set[str] = set()
@@ -969,9 +973,9 @@ class TestAgentRuntimePostHookOwnershipSync:
             tool_executor.execute_tool_calls_sequential
         )
         assert inline_names, (
-            "Could not find the dispatch chain (anchored on "
-            "`_block_msg is not None`) in execute_tool_calls_sequential. "
-            "If the dispatcher was refactored, update _DISPATCH_ANCHOR_LEFT "
+            "Could not find the dispatch chain (anchored on the tower head "
+            "`function_name == \"todo\"`) in execute_tool_calls_sequential. "
+            "If the dispatcher was refactored, update _DISPATCH_ANCHOR_TOOL "
             "and the walker in this test."
         )
         assert inline_names == set(AGENT_RUNTIME_POST_HOOK_TOOL_NAMES), (

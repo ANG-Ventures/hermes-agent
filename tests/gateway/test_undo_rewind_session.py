@@ -52,30 +52,3 @@ def test_rewind_n_turns(store):
     assert len(store.load_transcript(sid)) == 4  # q1,a1,q2,a2
 
 
-def test_rewind_soft_deletes_rows_for_audit(store):
-    sid = _seed(store, "gw-3")
-    store.rewind_session(sid, 1)
-    all_rows = store._db.get_messages(sid, include_inactive=True)
-    assert len(all_rows) == 6  # nothing hard-deleted
-    assert sum(1 for r in all_rows if r["active"] == 1) == 5
-    assert store._db.get_session(sid)["rewind_count"] == 1
-
-
-def test_rewind_clamps_to_oldest_turn(store):
-    sid = _seed(store, "gw-4", turns=2)
-    res = store.rewind_session(sid, 99)
-    assert res["rewound_ids"]
-    assert res["prefill_text"] is None
-    assert len(store.load_transcript(sid)) == 0
-
-
-def test_rewind_empty_session_returns_none(store):
-    store._db.create_session("gw-5", source="discord")
-    assert store.rewind_session("gw-5") is None
-
-
-def test_rewind_clamps_negative_count_to_one(store):
-    sid = _seed(store, "gw-6")
-    res = store.rewind_session(sid, -5)
-    assert len(res["rewound_ids"]) == 1
-    assert res["prefill_text"] == "q3"

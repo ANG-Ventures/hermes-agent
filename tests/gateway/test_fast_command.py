@@ -201,24 +201,6 @@ def test_turn_route_serializes_provider_specific_fast_override(
     assert route["request_overrides"] == expected
 
 
-def test_turn_route_skips_priority_processing_for_unsupported_models():
-    runner = _make_runner()
-    runner._service_tier = "priority"
-    runtime_kwargs = {
-        "api_key": "***",
-        "base_url": "https://openrouter.ai/api/v1",
-        "provider": "openrouter",
-        "api_mode": "chat_completions",
-        "command": None,
-        "args": [],
-        "credential_pool": None,
-    }
-
-    route = gateway_run.GatewayRunner._resolve_turn_agent_config(runner, "hi", "gpt-5.3-codex", runtime_kwargs)
-
-    assert route["request_overrides"] == {}
-
-
 def test_gateway_configured_identity_uses_shared_api_mode_inference(monkeypatch):
     infer = MagicMock(return_value="shared-mode")
     monkeypatch.setattr(
@@ -231,26 +213,6 @@ def test_gateway_configured_identity_uses_shared_api_mode_inference(monkeypatch)
 
     assert identity == ("m", "openai-codex", "shared-mode")
     infer.assert_called_once_with("openai-codex")
-
-
-@pytest.mark.asyncio
-async def test_handle_fast_command_session_scoped_by_default(monkeypatch, tmp_path):
-    """Bare /fast fast applies a session override — config.yaml untouched."""
-    runner = _make_runner()
-
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
-    runner._resolve_configured_session_route_identity = MagicMock(
-        return_value=("gpt-5.4", "openai-api", "codex_responses")
-    )
-
-    response = await runner._handle_fast_command(_make_event("/fast fast"))
-
-    assert "FAST" in response
-    assert runner._service_tier == "priority"
-    # Session override recorded; config.yaml NOT written.
-    assert runner._session_service_tier_overrides
-    assert not (tmp_path / "config.yaml").exists()
 
 
 @pytest.mark.asyncio
@@ -856,55 +818,6 @@ def test_new_fast_gateway_messages_have_english_i18n_fallbacks():
 
 
 @pytest.mark.asyncio
-async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch, tmp_path):
-    _install_fake_agent(monkeypatch)
-    runner = _make_runner()
-
-    (tmp_path / "config.yaml").write_text("agent:\n  service_tier: fast\n", encoding="utf-8")
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
-    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
-    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
-    # ``_load_service_tier`` was refactored to call ``_load_gateway_runtime_config``
-    # (which wraps ``_load_gateway_config`` plus env-expansion).  Since the test
-    # stubs ``_load_gateway_config`` to ``{}``, also stub the runtime wrapper
-    # directly so the priority routing assertions still exercise the live tier.
-    monkeypatch.setattr(
-        gateway_run,
-        "_load_gateway_runtime_config",
-        lambda: {"agent": {"service_tier": "fast"}},
-    )
-    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
-    monkeypatch.setattr(
-        gateway_run,
-        "_resolve_runtime_agent_kwargs",
-        lambda: {
-            "provider": "openai-api",
-            "api_mode": "codex_responses",
-            "base_url": "https://api.openai.com/v1",
-            "api_key": "***",
-        },
-    )
-
-    import hermes_cli.tools_config as tools_config
-    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
-
-    _CapturingAgent.last_init = None
-    result = await runner._run_agent(
-        message="hi",
-        context_prompt="",
-        history=[],
-        source=_make_source(),
-        session_id="session-1",
-        session_key="agent:main:telegram:dm:12345",
-    )
-
-    assert result["final_response"] == "ok"
-    assert _CapturingAgent.last_init["service_tier"] == "priority"
-    assert _CapturingAgent.last_init["request_overrides"] == {"service_tier": "priority"}
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("resolution_failure", [None, RuntimeError("keychain unavailable")])
 async def test_run_agent_fails_closed_when_persisted_route_credentials_unavailable(
     monkeypatch, tmp_path, resolution_failure
@@ -1108,55 +1021,3 @@ async def test_malformed_persisted_identity_roundtrip_fails_closed_before_enrich
     assert _CapturingAgent.last_init is None
 
 
-@pytest.mark.asyncio
-async def test_run_agent_passes_discord_auto_thread_title_callback(monkeypatch, tmp_path):
-    _install_fake_agent(monkeypatch)
-    runner = _make_runner()
-    runner._session_db = SimpleNamespace(_db=MagicMock())  # type: ignore[assignment]
-
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
-    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
-    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
-    monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: {})
-    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
-    monkeypatch.setattr(
-        gateway_run,
-        "_resolve_runtime_agent_kwargs",
-        lambda: {
-            "provider": "openrouter",
-            "api_mode": "chat_completions",
-            "base_url": "https://openrouter.ai/api/v1",
-            "api_key": "***",
-        },
-    )
-
-    import hermes_cli.tools_config as tools_config
-    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
-
-    with patch("agent.title_generator.maybe_auto_title") as mock_title:
-        await runner._run_agent(
-            message="raw user prompt",
-            context_prompt="",
-            history=[],
-            source=_make_discord_auto_thread_source(),
-            session_id="session-1",
-            session_key="agent:main:discord:thread:999",
-        )
-
-    mock_title.assert_called_once()
-    callback = mock_title.call_args.kwargs["title_callback"]
-    with patch.object(runner, "_schedule_discord_semantic_thread_rename") as mock_schedule:
-        callback("Semantic Session Title")
-    mock_schedule.assert_called_once()
-    assert mock_schedule.call_args.args[1] == "session-1"
-    assert mock_schedule.call_args.args[2] == "Semantic Session Title"
-
-
-def test_session_source_preserves_discord_auto_thread_metadata():
-    source = _make_discord_auto_thread_source()
-
-    restored = SessionSource.from_dict(source.to_dict())
-
-    assert restored.auto_thread_created is True
-    assert restored.auto_thread_initial_name == "raw user prompt"

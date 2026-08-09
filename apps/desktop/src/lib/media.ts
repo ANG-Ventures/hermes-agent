@@ -1,9 +1,8 @@
 import { readDesktopFileDataUrl } from '@/lib/desktop-fs'
+import { capitalize } from '@/lib/text'
 import { $connection } from '@/store/session'
 
 export type MediaKind = 'audio' | 'image' | 'video' | 'file'
-
-const REMOTE_GATEWAY_FILE_SCHEME = 'hermes-gateway-file:'
 
 interface MediaInfo {
   kind: MediaKind
@@ -83,10 +82,25 @@ export async function resolveMediaDisplaySrc(path: string): Promise<string> {
   return window.hermesDesktop.readFileDataUrl(filePathFromMediaPath(path))
 }
 
-// Resolve a media path to a URL the shell can open. Remote mode cannot hand a
-// gateway-local path to this machine's OS as file://, and Ace's OAuth config has
-// no scoped query token. Route through Electron's authenticated bytes-to-temp
-// opener instead; local mode keeps the file:// form.
+// Audio/video need a seekable source instead of a whole-file data URL. Keep
+// remote URLs untouched, route gateway-local files through the authenticated
+// download endpoint, and reserve the Electron protocol for files on this
+// desktop machine.
+export async function resolveMediaPlaybackSrc(path: string): Promise<string> {
+  if (isInlineMediaSrc(path)) {
+    return path
+  }
+
+  if (window.hermesDesktop && ['audio', 'video'].includes(mediaKind(path))) {
+    return isRemoteGateway() ? mediaExternalUrl(path) : mediaStreamUrl(path)
+  }
+
+  return resolveMediaDisplaySrc(path)
+}
+
+// Resolve a media path to a URL the shell can open. Remote mode rewrites
+// gateway-local paths to an authenticated /api/files/download URL (the file
+// lives on the gateway, not this disk); local mode keeps the file:// form.
 export function mediaExternalUrl(path: string): string {
   if (/^https?:/i.test(path)) {
     return path
@@ -94,37 +108,18 @@ export function mediaExternalUrl(path: string): string {
 
   if (isRemoteGateway()) {
     const conn = $connection.get()
-    const file = filePathFromMediaPath(path)
-    const query = [`path=${encodeURIComponent(file)}`]
 
-    if (conn?.profile) {
-      query.push(`profile=${encodeURIComponent(conn.profile)}`)
+    if (conn?.baseUrl && conn.token) {
+      const file = encodeURIComponent(filePathFromMediaPath(path))
+
+      return `${conn.baseUrl}/api/files/download?path=${file}&token=${encodeURIComponent(conn.token)}`
     }
-
-    return `hermes-gateway-file://open?${query.join('&')}`
   }
 
   return /^file:/i.test(path) ? path : `file://${path}`
 }
 
-export function pathFromRemoteGatewayFileUrl(url: string): { path: string; profile?: string } | null {
-  try {
-    const parsed = new URL(url)
-
-    if (parsed.protocol !== REMOTE_GATEWAY_FILE_SCHEME || parsed.hostname !== 'open') {
-      return null
-    }
-
-    const path = parsed.searchParams.get('path') || ''
-    const profile = parsed.searchParams.get('profile') || undefined
-
-    return path ? { path, ...(profile ? { profile } : {}) } : null
-  } catch {
-    return null
-  }
-}
-
-// Custom Electron scheme (registered in electron/main.cjs) that streams a local
+// Custom Electron scheme (registered in electron/main.ts) that streams a local
 // file with Range support. Used for audio/video so playback bypasses the data
 // URL size cap and supports seeking. `path` may be a plain path or `file://…`.
 export function mediaStreamUrl(path: string): string {
@@ -169,13 +164,6 @@ export async function gatewayMediaDataUrl(path: string): Promise<string> {
   return readDesktopFileDataUrl(filePathFromMediaPath(path))
 }
 
-export function mediaDisplayLabel(path: string): string {
-  const escaped = mediaName(path).replace(/[[\]\\]/g, '\\$&')
-  const kind = mediaKind(path)
-
-  return `${kind[0].toUpperCase()}${kind.slice(1)}: ${escaped}`
-}
-
 // Remote-mode replacement for opening gateway-local file paths with file://.
 // The file lives on the gateway, so fetch it over the authenticated fs bridge
 // and hand the bytes to the local browser shell as a download.
@@ -196,4 +184,11 @@ export async function downloadGatewayMediaFile(path: string): Promise<void> {
   anchor.click()
   anchor.remove()
   window.setTimeout(() => URL.revokeObjectURL(blobUrl), 30_000)
+}
+
+export function mediaDisplayLabel(path: string): string {
+  const escaped = mediaName(path).replace(/[[\]\\]/g, '\\$&')
+  const kind = mediaKind(path)
+
+  return `${capitalize(kind)}: ${escaped}`
 }

@@ -19,6 +19,7 @@ gateway:
   agents:
     active_agents: '**Gníomhairí gníomhacha:** {count}'
     async_jobs: '**Tascanna asincrónacha gateway:** {count}'
+    background_delegations: '**Tarmligin sa chúlra:** {count}'
     header: 🤖 **Gníomhairí & Tascanna Gníomhacha**
     more: '... agus {count} eile'
     none: Níl aon ghníomhairí gníomhacha ná tascanna ag rith.
@@ -97,7 +98,7 @@ gateway:
     full_request_no_fixed: after excludes system prompt + tool schemas (no resident agent to measure them); next live turn will show the full size.
     full_request_real: 'Full request size: {before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; before = last live request, after = estimate of next)'
     full_request_unchanged: 'Full request size: {before} tokens (unchanged — next turn resends the same context)'
-    in_progress: '⏳ Ag comhbhrú ~{count:,} teachtaireacht… féadann seisiún mór cúpla nóiméad a thógáil. Cuirfidh mé an toradh anseo nuair a bheidh sé déanta.'
+    in_progress: ⏳ Ag comhbhrú ~{count:,} teachtaireacht… féadann seisiún mór cúpla nóiméad a thógáil. Cuirfidh mé an toradh anseo nuair a bheidh sé déanta.
     no_provider: Níl aon soláthraí cumraithe — ní féidir dlúthú.
     not_enough: Níl go leor comhrá le dlúthú (teastaíonn 4 theachtaireacht ar a laghad).
     nothing_to_do: Níl aon rud le dlúthú fós (tá an traschríbhinn fós uile mar chomhthéacs cosanta).
@@ -105,6 +106,24 @@ gateway:
     summary_failed: ⚠️ Theip ar ghiniúint achoimre ({error}). Baineadh {count} teachtaireacht stairiúil agus cuireadh ionadaí ina n-áit; níl an comhthéacs roimhe seo in-aisghabhála a thuilleadh. Smaoinigh ar an gcumraíocht auxiliary.compression a sheiceáil.
   config_read_failed: '⚠️ Níorbh fhéidir config.yaml a léamh: {error}'
   config_save_failed: '⚠️ Níorbh fhéidir an chumraíocht a shábháil: {error}'
+  context:
+    bar: '{bar}'
+    compressions: 'Compressions this session: {count}'
+    detail_after_first: _(Full compression and throughput stats available after the first agent response)_
+    estimated: 'Estimated context: ~{count} tokens across {messages} messages'
+    header: 🧠 **Context Window**
+    headroom: 'Headroom to limit: {headroom} tokens'
+    in_use: 'In use: {used} / {total} ({pct}%)'
+    last_savings: 'Last compression freed: {savings}% of context'
+    model: 'Model: `{model}`'
+    no_data: No context data available yet. Send a message to start a session.
+    over_threshold: ⚠️ **Over auto-compression threshold ({threshold}, {threshold_pct}%)**
+    threshold: 'Auto-compresses at: {threshold} ({threshold_pct}%) — {to_go} to go'
+    throughput_note: _Throughput, not context size — each call re-sends the window above._
+    total_billed: 'Total billed: {total}'
+    totals_header: Session totals (cumulative across {calls} API calls)
+    totals_line: Input {input} · Output {output} · Reasoning {reasoning}
+    window: 'Window: {total} tokens'
   credits:
     not_logged_in: Níl tú logáilte isteach i Nous Portal. Logáil isteach chun d'iarmhéid creidmheasa a fheiceáil agus breis a chur leis.
   debug:
@@ -120,6 +139,10 @@ gateway:
     denied_singular: ❌ Ordú diúltaithe.
     no_pending: Níl aon ordú ag fanacht le diúltú.
     stale: ❌ Ordú diúltaithe (bhí an cead imithe i léig).
+  diff:
+    failed: '{error}'
+    no_changes: Gan athruithe.
+    not_enabled: "Níl seicphointí cumasaithe, mar sin níl aon bhonnlíne seisiúin ann.\nCumasaigh in config.yaml:\n```\ncheckpoints:\n  enabled: true\n```\nOibríonn /diff simplí fós — úsáideann sé git go díreach."
   draining: ⏳ Ag fanacht le {count} gníomhaire(í) gníomhach roimh atosú...
   fast:
     choice_fast: fast — Priority Processing ar siúl
@@ -344,11 +367,11 @@ gateway:
       **Taispeáint:** {display}
 
 
-      _Úsáid:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|reset|show|hide> [--global]`'
+      _Úsáid:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|ultra|reset|show|hide> [--global]`'
     unknown_arg: '⚠️ Argóint anaithnid: `{arg}`
 
 
-      **Leibhéil bhailí:** none, minimal, low, medium, high, xhigh, max
+      **Leibhéil bhailí:** none, minimal, low, medium, high, xhigh, max, ultra
 
       **Taispeáint:** show, hide
 
@@ -505,7 +528,7 @@ gateway:
     state_no: Níl
     state_yes: Tá ⚡
     title: '**Teideal:** {title}'
-    tokens: '**Comharthaí:** {tokens}'
+    tokens: '**Lifetime tokens billed:** {tokens} _(not your current context size; use `/context`)_'
   stop:
     no_active: Níl aon tasc gníomhach le stopadh.
     stopped: ⚡ Stoptha. Is féidir leat leanúint leis an seisiún seo.
@@ -581,7 +604,7 @@ gateway:
       message: the last message
       tool: a tool result
       user: your message
-    removed: "↩️ Undid {turns} half-turn(s) ({count} message(s))."
+    removed: ↩️ Undid {turns} half-turn(s) ({count} message(s)).
   update:
     hermes_cmd_not_found: ✗ Níorbh fhéidir an t-ordú `hermes` a aimsiú. Tá Hermes ag rith, ach níorbh fhéidir leis an ordú nuashonraithe an inrite a aimsiú ar PATH ná tríd an léirmhínitheoir Python reatha. Bain triail as `hermes update` a rith de láimh i do theirminéal.
     not_git_repo: ✗ Ní stór git é seo — ní féidir nuashonrú.

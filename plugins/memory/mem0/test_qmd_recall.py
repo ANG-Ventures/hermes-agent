@@ -102,7 +102,7 @@ def test_join_skips_separator_when_empty():
 
 # ---- Task 4: parse against the CAPTURED real fixture (M1, INV-5) ----------
 def test_parse_real_fixture():
-    payload = json.loads(FIXTURE.read_text())
+    payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
     hits = qr.parse_qmd_results(payload, min_score=0.3)
     assert len(hits) >= 1
     top = hits[0]
@@ -112,7 +112,7 @@ def test_parse_real_fixture():
 
 
 def test_parse_min_score_filters():
-    payload = json.loads(FIXTURE.read_text())
+    payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
     # an impossibly-high floor drops everything
     assert qr.parse_qmd_results(payload, min_score=2.0) == []
 

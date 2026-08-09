@@ -22,6 +22,15 @@ Available fields:
     latency         — wall-clock duration of the turn (``22s``, ``1m05s``)
     cwd             — home-relative working dir (``~``)
 
+Available fields:
+    model        — bare model id, vendor prefix dropped (``gpt-5.4``)
+    context_pct  — last-call context occupancy as a percent (``5%``)
+    latency      — wall-clock duration of the turn (``22s``, ``1m05s``)
+    cwd          — home-relative working dir (``~``)
+
+``latency`` is opt-in: it is NOT in the default field set, so a footer whose
+``fields`` are unset renders exactly as before.
+
 Per-platform overrides live under ``display.platforms.<platform>.runtime_footer``.
 Users can toggle the global setting with ``/footer on|off`` from both the CLI
 and any gateway platform.
@@ -140,7 +149,7 @@ def resolve_footer_config(
 
 
 def _format_latency(seconds: float) -> str:
-    """Humanize a turn duration: ``22s``, ``1m05s``, ``<1s``."""
+    """Humanize a turn duration: ``<1s``, ``22s``, ``1m05s``."""
     if seconds < 1:
         return "<1s"
     total = int(round(seconds))
@@ -283,6 +292,10 @@ def build_footer_line(
     Returns the footer text (empty string when disabled or no data).  Callers
     append this to the final response themselves, preserving a single blank
     line of separation.
+
+    ``turn_seconds`` is the wall-clock duration of the agent run, measured by
+    the caller with ``time.monotonic()``.  Callers that don't measure it leave
+    it ``None`` and the ``latency`` field is skipped.
     """
     cfg = resolve_footer_config(user_config, platform_key)
     if not cfg.get("enabled"):

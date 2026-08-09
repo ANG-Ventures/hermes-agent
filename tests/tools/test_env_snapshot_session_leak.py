@@ -21,7 +21,12 @@ import re
 import pytest
 
 from tools.environments.local import LocalEnvironment
-from tools.environments.base import _SNAPSHOT_EXCLUDE_PATTERN
+# parity merge: upstream renamed this constant
+# (_SNAPSHOT_EXCLUDE_PATTERN -> _SNAPSHOT_EXCLUDED_ENV_REGEX) while keeping the
+# same contract — the regex the dump path excludes session vars by.
+from tools.environments.base import (
+    _SNAPSHOT_EXCLUDED_ENV_REGEX as _SNAPSHOT_EXCLUDE_PATTERN,
+)
 
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="POSIX shell semantics")

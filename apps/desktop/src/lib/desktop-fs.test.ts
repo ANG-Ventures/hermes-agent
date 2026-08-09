@@ -7,27 +7,18 @@ import {
   desktopFileDiff,
   desktopFsCacheKey,
   desktopGitRoot,
-  readComposerImagePreview,
   readDesktopDir,
   readDesktopFileDataUrl,
   readDesktopFileText,
-  REMOTE_MUTATION_UNAVAILABLE_MESSAGE,
-  REMOTE_REVEAL_UNAVAILABLE_MESSAGE,
-  renameDesktopFile,
-  revealDesktopFile,
   selectDesktopPaths,
-  setDesktopFsRemotePicker,
-  trashDesktopFile
+  setDesktopFsRemotePicker
 } from './desktop-fs'
 
 const readDir = vi.fn(async () => ({ entries: [{ name: 'local', path: '/local', isDirectory: true }] }))
 const readFileText = vi.fn(async () => ({ path: '/local/file.txt', text: 'local', byteSize: 5 }))
 const readFileDataUrl = vi.fn(async () => 'data:text/plain;base64,bG9jYWw=')
 const gitRoot = vi.fn(async () => '/local')
-const revealPath = vi.fn(async () => true)
-const renamePath = vi.fn(async () => ({ path: '/work/renamed.txt' }))
 const selectPaths = vi.fn(async () => ['/local'])
-const trashPath = vi.fn(async () => undefined)
 
 const api = vi.fn(async ({ path }: { path: string }) => {
   if (path.startsWith('/api/fs/list?')) {
@@ -65,10 +56,7 @@ function stubBridge() {
       readDir,
       readFileDataUrl,
       readFileText,
-      renamePath,
-      revealPath,
-      selectPaths,
-      trashPath
+      selectPaths
     }
   })
 }
@@ -225,84 +213,5 @@ describe('desktop filesystem facade', () => {
 
     expect(remoteSelect).toHaveBeenCalledWith({ directories: true, multiple: false })
     expect(selectPaths).not.toHaveBeenCalled()
-  })
-
-  it('keeps local reveal rename and delete on the local Electron bridge', async () => {
-    $connection.set({ mode: 'local' } as never)
-
-    await expect(revealDesktopFile('/work/file.txt')).resolves.toBeUndefined()
-    await expect(renameDesktopFile('/work/file.txt', 'renamed.txt')).resolves.toBe('/work/renamed.txt')
-    await expect(trashDesktopFile('/work/file.txt')).resolves.toBeUndefined()
-
-    expect(revealPath).toHaveBeenCalledWith('/work/file.txt')
-    expect(renamePath).toHaveBeenCalledWith('/work/file.txt', 'renamed.txt')
-    expect(trashPath).toHaveBeenCalledWith('/work/file.txt')
-  })
-
-  it('blocks local-only reveal rename and delete in remote mode with honest messages', async () => {
-    $connection.set({ mode: 'remote' } as never)
-
-    await expect(revealDesktopFile('/remote/file.txt')).rejects.toThrow(REMOTE_REVEAL_UNAVAILABLE_MESSAGE)
-    await expect(renameDesktopFile('/remote/file.txt', 'renamed.txt')).rejects.toThrow(
-      REMOTE_MUTATION_UNAVAILABLE_MESSAGE
-    )
-    await expect(trashDesktopFile('/remote/file.txt')).rejects.toThrow(REMOTE_MUTATION_UNAVAILABLE_MESSAGE)
-
-    expect(revealPath).not.toHaveBeenCalled()
-    expect(renamePath).not.toHaveBeenCalled()
-    expect(trashPath).not.toHaveBeenCalled()
-  })
-})
-
-describe('readComposerImagePreview', () => {
-  beforeEach(() => {
-    stubBridge()
-    $connection.set(null)
-  })
-
-  afterEach(() => {
-    vi.unstubAllGlobals()
-    vi.clearAllMocks()
-    $connection.set(null)
-  })
-
-  // The regression this guards: a composer image (paste/clipboard/drop) is
-  // written to the CLIENT's local Electron disk even in remote mode, so its
-  // preview MUST be read locally. Reading it through the remote-aware
-  // readDesktopFileDataUrl would GET /api/fs/read-data-url on the backend, which
-  // has no such file → 404 "File not found" → "Image preview failed" toast.
-  it('reads the preview from the LOCAL bridge in remote mode (never the backend)', async () => {
-    $connection.set({ mode: 'remote' } as never)
-
-    await expect(readComposerImagePreview('/Users/ace/Library/.../composer_x.png')).resolves.toBe(
-      'data:text/plain;base64,bG9jYWw='
-    )
-
-    expect(readFileDataUrl).toHaveBeenCalledWith('/Users/ace/Library/.../composer_x.png')
-    // The backend FS REST must NOT be touched — that's the whole bug.
-    expect(api).not.toHaveBeenCalled()
-  })
-
-  it('reads the preview from the local bridge in local mode too', async () => {
-    $connection.set({ mode: 'local' } as never)
-
-    await expect(readComposerImagePreview('/tmp/composer_y.png')).resolves.toBe('data:text/plain;base64,bG9jYWw=')
-
-    expect(readFileDataUrl).toHaveBeenCalledWith('/tmp/composer_y.png')
-    expect(api).not.toHaveBeenCalled()
-  })
-
-  it('falls back to the remote-aware read when the local bridge cannot read the path', async () => {
-    // A path dragged from the REMOTE file tree is not on local disk: the local
-    // bridge read throws, and we fall through to the backend read-data-url.
-    $connection.set({ mode: 'remote' } as never)
-    readFileDataUrl.mockRejectedValueOnce(new Error('ENOENT: no such file'))
-
-    await expect(readComposerImagePreview('/home/user/project/pic.png')).resolves.toBe(
-      'data:text/plain;base64,cmVtb3Rl'
-    )
-
-    expect(readFileDataUrl).toHaveBeenCalledWith('/home/user/project/pic.png')
-    expect(api).toHaveBeenCalledWith({ path: '/api/fs/read-data-url?path=%2Fhome%2Fuser%2Fproject%2Fpic.png' })
   })
 })

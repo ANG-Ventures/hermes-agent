@@ -45,6 +45,11 @@ def _make_runner(platform: Platform):
     runner._running_agents = {}
     runner._running_agents_ts = {}
     runner._update_prompt_pending = {}
+    # parity merge: the exception path reaches the session:start hook emit
+    # (gateway/run.py), which a bare object.__new__ runner does not have.
+    # Previously the plugin-conflict rejection short-circuited before this
+    # line was ever reached, so the gap was invisible.
+    runner.hooks = SimpleNamespace(emit=AsyncMock())
     return runner
 
 

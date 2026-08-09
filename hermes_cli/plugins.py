@@ -79,6 +79,13 @@ class PluginToolOverrideError(PermissionError):
 
 logger = logging.getLogger(__name__)
 
+# Built-in command names a PLUGIN is allowed to override. Without this, adding
+# a built-in with an existing plugin's name silently disables that plugin at
+# registration time (see _PluginAPI.register_command). Dispatch-side precedence
+# in gateway/run.py defers to the plugin for these names and falls through to
+# the built-in when no plugin is registered.
+_PLUGIN_OVERRIDABLE_BUILTINS = frozenset({"context"})
+
 
 # ---------------------------------------------------------------------------
 # Plugin developer debug logging
@@ -162,6 +169,9 @@ VALID_HOOKS: Set[str] = {
     "on_session_end",
     "on_session_finalize",
     "on_session_reset",
+    # Successful skill lifecycle facts. The local skill name is available to
+    # plugins, while built-in shared metrics emit only bounded classifications.
+    "on_skill_lifecycle",
     "subagent_start",
     "subagent_stop",
     # Gateway pre-dispatch hook. Fired once per incoming MessageEvent
@@ -345,6 +355,7 @@ class PluginContext:
         self._manager = manager
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
+        self._subagent_lifecycle: Any = None
 
     # -- host-owned LLM access ----------------------------------------------
 
@@ -364,6 +375,24 @@ class PluginContext:
             plugin_id = self.manifest.key or self.manifest.name
             self._llm = PluginLlm(plugin_id=plugin_id)
         return self._llm
+
+    @property
+    def subagent_lifecycle(self) -> Any:
+        """Return the public, plugin-safe subagent lifecycle service.
+
+        The service only resolves the active host-owned parent agent when a
+        child is launched. Plugins receive serializable handles and immutable
+        snapshots; they never receive a live agent or a private registry.
+        """
+        if self._subagent_lifecycle is None:
+            from agent.subagent_lifecycle import (
+                SubagentLifecycleService,
+                get_active_subagent_parent,
+            )
+            self._subagent_lifecycle = SubagentLifecycleService(
+                get_active_subagent_parent
+            )
+        return self._subagent_lifecycle
 
     # -- profile awareness --------------------------------------------------
 
@@ -560,10 +589,19 @@ class PluginContext:
             )
             return
 
-        # Reject if it conflicts with a built-in command
+        # Reject if it conflicts with a built-in command.
+        #
+        # PLUGIN-OVERRIDE ALLOWLIST (parity merge 2026-08-08): upstream may add
+        # a BUILT-IN with a name a plugin already owns here, which silently
+        # disables that plugin — the registration is refused at load time, long
+        # before any dispatch-side precedence check can help. That happened to
+        # /context: upstream added a built-in handler, and the fork's
+        # blackbox-inspect plugin (which owns /context) stopped registering
+        # entirely, with only a WARNING nobody reads. For names the fork
+        # deliberately owns, the plugin wins and the built-in is the fallback.
         try:
             from hermes_cli.commands import resolve_command
-            if resolve_command(clean) is not None:
+            if clean not in _PLUGIN_OVERRIDABLE_BUILTINS and resolve_command(clean) is not None:
                 logger.warning(
                     "Plugin '%s' tried to register command '/%s' which conflicts "
                     "with a built-in command. Skipping.",
@@ -943,12 +981,20 @@ class PluginContext:
         """Register a gateway platform adapter.
 
         The adapter_factory receives a ``PlatformConfig`` and returns a
-        ``BasePlatformAdapter`` subclass instance.  The gateway calls
-        ``check_fn()`` before instantiation to verify dependencies.
+        ``BasePlatformAdapter`` subclass instance.
+
+        ``check_fn`` is a PASSIVE dependency probe — "are deps importable
+        right now?".  It must never install anything: status displays and
+        config loading call it freely.  If your platform's SDK is
+        lazy-installable, pass the ACTIVE installer separately as
+        ``ensure_deps_fn`` (forwarded via ``entry_kwargs``); the gateway
+        calls it from ``create_adapter()`` when ``check_fn`` is False,
+        right before connecting the platform.
 
         Extra keyword arguments are forwarded to ``PlatformEntry`` (e.g.
-        ``setup_fn``, ``emoji``, ``allowed_users_env``, ``platform_hint``).
-        Unknown keys raise TypeError from the dataclass constructor.
+        ``setup_fn``, ``emoji``, ``allowed_users_env``, ``platform_hint``,
+        ``ensure_deps_fn``).  Unknown keys raise TypeError from the
+        dataclass constructor.
 
         Example::
 
@@ -1602,7 +1648,7 @@ class PluginManager:
                 init_file = plugin_dir / "__init__.py"
                 if init_file.exists():
                     try:
-                        source_text = init_file.read_text(errors="replace")[:8192]
+                        source_text = init_file.read_text(errors="replace", encoding="utf-8")[:8192]
                         if (
                             "register_memory_provider" in source_text
                             or "MemoryProvider" in source_text
@@ -2048,7 +2094,7 @@ def discover_plugins(force: bool = False) -> None:
 
 
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
-    """Invoke a lifecycle hook on all loaded plugins.
+    """Invoke a lifecycle hook on loaded plugins.
 
     Returns a list of non-``None`` return values from plugin callbacks.
     """
@@ -2073,7 +2119,7 @@ def has_middleware(kind: str) -> bool:
 
 
 def has_hook(hook_name: str) -> bool:
-    """Return True when a hook has registered callbacks."""
+    """Return True when a loaded plugin handles a hook."""
     return get_plugin_manager().has_hook(hook_name)
 
 
@@ -2187,7 +2233,9 @@ def _get_pre_tool_call_directive_details(
                 message=fmt.format(tool_name=tool_name),
             )
 
-    hook_results = invoke_hook(
+    from hermes_cli.lifecycle import invoke_hook as invoke_lifecycle_hook
+
+    hook_results = invoke_lifecycle_hook(
         "pre_tool_call",
         tool_name=tool_name,
         args=args if isinstance(args, dict) else {},
@@ -2303,12 +2351,32 @@ def resolve_pre_tool_block(
         return details.message
     if details.action == "approve":
         try:
-            from tools.approval import request_tool_approval
-            result = request_tool_approval(
-                tool_name,
-                details.message or "",
-                rule_key=details.rule_key or tool_name,
+            from tools.approval import (
+                request_tool_approval,
+                reset_current_observability_context,
+                set_current_observability_context,
             )
+
+            approval_tokens = None
+            try:
+                approval_tokens = set_current_observability_context(
+                    turn_id=turn_id,
+                    tool_call_id=tool_call_id,
+                )
+            except Exception:
+                pass
+            try:
+                result = request_tool_approval(
+                    tool_name,
+                    details.message or "",
+                    rule_key=details.rule_key or tool_name,
+                )
+            finally:
+                if approval_tokens is not None:
+                    try:
+                        reset_current_observability_context(approval_tokens)
+                    except Exception:
+                        pass
         except Exception:
             # Fail-closed: if the gate itself errors, block rather than
             # silently execute an action a plugin flagged for approval.

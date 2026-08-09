@@ -19,6 +19,7 @@ gateway:
   agents:
     active_agents: '**活跃代理：** {count}'
     async_jobs: '**网关异步任务：** {count}'
+    background_delegations: '**后台委派：** {count}'
     header: 🤖 **活跃代理与任务**
     more: '... 还有 {count} 个'
     none: 没有活跃的代理或运行中的任务。
@@ -97,7 +98,7 @@ gateway:
     full_request_no_fixed: after excludes system prompt + tool schemas (no resident agent to measure them); next live turn will show the full size.
     full_request_real: 'Full request size: {before:,} → ~{after:,} tokens (includes chat, system, tools, tool results; before = last live request, after = estimate of next)'
     full_request_unchanged: 'Full request size: {before} tokens (unchanged — next turn resends the same context)'
-    in_progress: '⏳ 正在压缩约 {count:,} 条消息… 大型会话可能需要几分钟。完成后我会把结果发到这里。'
+    in_progress: ⏳ 正在压缩约 {count:,} 条消息… 大型会话可能需要几分钟。完成后我会把结果发到这里。
     no_provider: 未配置提供方 — 无法压缩。
     not_enough: 对话内容不足，无法压缩（至少需要 4 条消息）。
     nothing_to_do: 暂无可压缩内容（对话记录仍全部为受保护上下文）。
@@ -105,6 +106,24 @@ gateway:
     summary_failed: ⚠️ 摘要生成失败（{error}）。{count} 条历史消息已被移除并替换为占位符；之前的上下文已无法恢复。建议检查 auxiliary.compression 模型配置。
   config_read_failed: ⚠️ 无法读取 config.yaml：{error}
   config_save_failed: ⚠️ 无法保存配置：{error}
+  context:
+    bar: '{bar}'
+    compressions: 'Compressions this session: {count}'
+    detail_after_first: _(Full compression and throughput stats available after the first agent response)_
+    estimated: 'Estimated context: ~{count} tokens across {messages} messages'
+    header: 🧠 **Context Window**
+    headroom: 'Headroom to limit: {headroom} tokens'
+    in_use: 'In use: {used} / {total} ({pct}%)'
+    last_savings: 'Last compression freed: {savings}% of context'
+    model: 'Model: `{model}`'
+    no_data: No context data available yet. Send a message to start a session.
+    over_threshold: ⚠️ **Over auto-compression threshold ({threshold}, {threshold_pct}%)**
+    threshold: 'Auto-compresses at: {threshold} ({threshold_pct}%) — {to_go} to go'
+    throughput_note: _Throughput, not context size — each call re-sends the window above._
+    total_billed: 'Total billed: {total}'
+    totals_header: Session totals (cumulative across {calls} API calls)
+    totals_line: Input {input} · Output {output} · Reasoning {reasoning}
+    window: 'Window: {total} tokens'
   credits:
     not_logged_in: 未登录 Nous Portal。登录后即可查看额度余额并充值。
   debug:
@@ -120,6 +139,10 @@ gateway:
     denied_singular: ❌ 命令已拒绝。
     no_pending: 没有待拒绝的命令。
     stale: ❌ 命令已拒绝（批准已过期）。
+  diff:
+    failed: '{error}'
+    no_changes: 没有更改。
+    not_enabled: "检查点未启用，因此没有会话基线。\n在 config.yaml 中启用:\n```\ncheckpoints:\n  enabled: true\n```\n普通 /diff 仍然可用 — 它直接使用 git。"
   draining: ⏳ 正在等待 {count} 个活跃代理结束后重启...
   fast:
     choice_fast: fast — 开启优先处理
@@ -344,11 +367,11 @@ gateway:
       **显示：** {display}
 
 
-      _用法：_ `/reasoning <none|minimal|low|medium|high|xhigh|max|reset|show|hide> [--global]`'
+      _用法：_ `/reasoning <none|minimal|low|medium|high|xhigh|max|ultra|reset|show|hide> [--global]`'
     unknown_arg: '⚠️ 未知参数：`{arg}`
 
 
-      **有效级别：** none, minimal, low, medium, high, xhigh, max
+      **有效级别：** none, minimal, low, medium, high, xhigh, max, ultra
 
       **显示：** show, hide
 
@@ -505,7 +528,7 @@ gateway:
     state_no: 否
     state_yes: 是 ⚡
     title: '**标题：** {title}'
-    tokens: '**Token 数：** {tokens}'
+    tokens: '**Lifetime tokens billed:** {tokens} _(not your current context size; use `/context`)_'
   stop:
     no_active: 没有可停止的活跃任务。
     stopped: ⚡ 已停止。你可以继续此会话。
@@ -581,7 +604,7 @@ gateway:
       message: the last message
       tool: a tool result
       user: your message
-    removed: "↩️ Undid {turns} half-turn(s) ({count} message(s))."
+    removed: ↩️ Undid {turns} half-turn(s) ({count} message(s)).
   update:
     hermes_cmd_not_found: ✗ 无法找到 `hermes` 命令。Hermes 正在运行，但更新命令无法在 PATH 上或通过当前 Python 解释器找到可执行文件。请尝试在终端中手动运行 `hermes update`。
     not_git_repo: ✗ 不是 git 仓库 — 无法更新。
