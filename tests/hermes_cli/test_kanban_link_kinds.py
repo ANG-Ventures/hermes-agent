@@ -232,6 +232,32 @@ def test_mixed_parents_gate_on_the_blocking_one_only(kanban_home):
         )
 
 
+def test_mixed_parents_do_not_attribute_stranding_to_derived_from_audit(
+    kanban_home,
+):
+    """A held child is not stranded by its provenance-only triage parent."""
+    with kb.connect() as conn:
+        audit = kb.create_task(conn, title="triaged discovery", triage=True)
+        dependency = kb.create_task(conn, title="unfinished dependency")
+        child = kb.create_task(conn, title="held child", parents=[dependency])
+        kb.link_tasks(conn, audit, child, kind="derived-from")
+
+        child_task = kb.get_task(conn, child)
+        assert child_task is not None and child_task.status == "todo"
+        assert dict(kb.parent_links(conn, child)) == {
+            audit: "derived-from",
+            dependency: "blocks",
+        }
+        assert kb.find_stranded_by_triage(conn) == []
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'triage' WHERE id = ?",
+                (dependency,),
+            )
+        assert kb.find_stranded_by_triage(conn) == [(child, dependency)]
+
+
 # ---------------------------------------------------------------------------
 # Validation / API surface
 # ---------------------------------------------------------------------------
@@ -359,12 +385,13 @@ def test_legacy_links_backfill_to_blocks_and_still_gate(tmp_path, monkeypatch):
         assert kb.claim_task(conn, "t_deploy") is None
 
 
-def test_null_kind_is_treated_as_blocks_by_the_scheduler(tmp_path, monkeypatch):
-    """Defense in depth: a hand-edited NULL must not read as non-gating.
+def test_null_kind_is_treated_as_blocks_everywhere(tmp_path, monkeypatch):
+    """Defense in depth: a hand-edited NULL must remain blocking everywhere.
 
     The migration backfills 'blocks', but the scheduling queries COALESCE too —
-    so a nullable column left behind by a manual repair still gates. Modelled
-    by writing the legacy (nullable, un-backfilled) shape directly.
+    so a nullable column left behind by a manual repair still gates and is
+    reported as stranding. Modelled by writing the legacy (nullable,
+    un-backfilled) shape directly.
     """
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -383,7 +410,7 @@ def test_null_kind_is_treated_as_blocks_by_the_scheduler(tmp_path, monkeypatch):
     )
     raw.execute(
         "INSERT INTO tasks (id, title, status, created_at) "
-        "VALUES ('t_parent', 'parent', 'running', 1000)"
+        "VALUES ('t_parent', 'parent', 'triage', 1000)"
     )
     raw.execute(
         "INSERT INTO tasks (id, title, status, created_at) "
@@ -405,6 +432,7 @@ def test_null_kind_is_treated_as_blocks_by_the_scheduler(tmp_path, monkeypatch):
         ok, _err = kb.promote_task(conn, "t_child", actor="test")
         assert ok is False
         assert kb.parent_links(conn, "t_child") == [("t_parent", "blocks")]
+        assert kb.find_stranded_by_triage(conn) == [("t_child", "t_parent")]
 
 
 def _link_columns(db_path: Path) -> set[str]:
