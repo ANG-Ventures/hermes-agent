@@ -170,6 +170,13 @@ def cron_list(show_all: bool = False):
             last_run = job.get("last_run_at", "?")
             if last_status == "ok":
                 status_display = color("ok", Colors.GREEN)
+            elif last_status == "unknown":
+                # Outcome undetermined (scheduler restarted mid-run) — NOT a
+                # failure. Yellow so it reads as "we don't know", not "it broke".
+                status_display = color(
+                    f"unknown: {job.get('last_error', 'outcome not recorded')}",
+                    Colors.YELLOW,
+                )
             else:
                 status_display = color(f"{last_status}: {job.get('last_error', '?')}", Colors.RED)
             print(f"    Last run:  {last_run}  {status_display}")

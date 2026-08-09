@@ -1750,7 +1750,8 @@ def remove_job(job_id: str) -> bool:
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None,
+                 status: Optional[str] = None):
     """
     Mark a job as having been run.
     
@@ -1759,6 +1760,15 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+
+    ``status`` overrides the derived ``"ok"``/``"error"`` for the case where the
+    outcome is genuinely UNDETERMINED rather than failed. The recovery
+    reconciler uses ``status="unknown"``: when a scheduler restart loses a run's
+    outcome, the script may well have completed (a ``no_agent`` script outlives
+    the gateway), so recording ``"error"`` asserts a failure nobody observed and
+    makes monitors page for a job that is fine. Callers that genuinely observed
+    a failure (an exception, a non-zero exit) keep passing ``success=False`` and
+    are unaffected.
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -1766,7 +1776,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
             if job["id"] == job_id:
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
-                job["last_status"] = "ok" if success else "error"
+                job["last_status"] = status or ("ok" if success else "error")
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error

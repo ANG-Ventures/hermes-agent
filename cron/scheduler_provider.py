@@ -161,6 +161,7 @@ class CronScheduler(ABC):
                 "outcome could be recorded. The script may have completed "
                 "(a no_agent script outlives the gateway) — check its own log "
                 "or output artifacts before assuming it failed.",
+                status="unknown",
             )
             reconciled += 1
         if reconciled:
