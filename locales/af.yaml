@@ -103,6 +103,7 @@ gateway:
     not_enough: Nie genoeg gesprek om saam te pers nie (ten minste 4 boodskappe nodig).
     nothing_to_do: Niks om saam te pers nie (die transkripsie is steeds heeltemal beskermde konteks).
     persist_failed: ⚠️ Kompressie het gewerk, maar die resultaat kon nie gestoor word nie — die sessie-databasis was besig (gesluit). Niks is verloor nie; jou transkripsie is onveranderd. Hardloop /compress weer oor 'n oomblik om te herprobeer.
+    timed_out: "⚠️ Kompressie kon nie voltooi nie — die opsommer het gaan staan en die poging het uitgetel voordat enigiets geproduseer is. Niks is verloor nie; jou transkripsie is onveranderd. Voer /compress oor 'n oomblik weer uit om te herprobeer."
     summary_failed: ⚠️ Opsomming kon nie gegenereer word nie ({error}). {count} historiese boodskap(pe) is verwyder en met 'n plekhouer vervang; vroeëre konteks kan nie meer herstel word nie. Oorweeg om jou auxiliary.compression-modelopstelling na te gaan.
   config_read_failed: '⚠️ Kon nie config.yaml lees nie: {error}'
   config_save_failed: '⚠️ Kon nie konfigurasie stoor nie: {error}'

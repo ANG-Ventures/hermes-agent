@@ -27531,6 +27531,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             cached[0], cached[1], _live, _snapshot_sid,
                         )
 
+    def _resolve_live_session_route(self, session_key: str):
+        """Return the resident agent's LIVE route as an aux ``main_runtime`` dict.
+
+        ``_resolve_session_agent_runtime`` rebuilds a route from config +
+        persisted ``/model`` preference. That misses the route a session
+        reached at RUNTIME — a mid-session provider fallback
+        (``Fallback activated: … (claude-apx-1)``) moves the live agent onto a
+        different provider without touching config or the persisted override.
+
+        The throwaway agent that ``/compress`` builds therefore starts on the
+        CONFIG default, and its compressor passes that pair to the auxiliary
+        client as ``main_runtime``. The summariser then runs on a provider the
+        live conversation is not using — observed 2026-08-08, where a session
+        that had served 184/184 calls on ``claude-apx-7`` had its summariser
+        cross onto a rate-limited ``claude-apr``, which stalled and killed the
+        compaction.
+
+        Source of truth is the same resident/cached agent
+        :meth:`_resolve_fixed_overhead` reads. Returns ``None`` when no agent
+        is resident (post-restart / evicted) so callers keep their existing
+        behaviour. Best-effort, never raises.
+        """
+        try:
+            agent = self._running_agents.get(session_key)
+            if not agent or agent is _AGENT_PENDING_SENTINEL:
+                _cl = getattr(self, "_agent_cache_lock", None)
+                _c = getattr(self, "_agent_cache", None)
+                if _cl is not None and _c is not None:
+                    with _cl:
+                        cached = _c.get(session_key)
+                        if cached:
+                            agent = cached[0]
+            if not agent or agent is _AGENT_PENDING_SENTINEL:
+                return None
+            resolver = getattr(agent, "_current_main_runtime", None)
+            if not callable(resolver):
+                return None
+            runtime = resolver()
+            if not isinstance(runtime, dict):
+                return None
+            # provider+model are a MATCHED PAIR; a partial dict would let the
+            # aux resolver cross this provider with a config model (the
+            # _resolve_auto pairing hazard). Only use a complete pair.
+            if not (runtime.get("provider") and runtime.get("model")):
+                return None
+            return runtime
+        except Exception:
+            return None
+
     def _resolve_fixed_overhead(self, session_key: str):
         """Return (system_prompt_str, tools_list) for the session's NEXT request.
 

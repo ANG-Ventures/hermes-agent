@@ -103,6 +103,7 @@ gateway:
     not_enough: 對話內容不足，無法壓縮（至少需要 4 則訊息）。
     nothing_to_do: 目前沒有可壓縮的內容（對話記錄仍全部為受保護的上下文）。
     persist_failed: ⚠️ 壓縮已執行，但結果無法儲存——工作階段資料庫正忙（已鎖定）。沒有遺失任何內容；你的記錄未變更。請稍後再次執行 /compress 重試。
+    timed_out: "⚠️ 壓縮未能完成 —— 摘要模型停滯，尚未產生任何內容便已逾時。沒有遺失任何內容；您的記錄未變更。請稍後重新執行 /compress 重試。"
     summary_failed: ⚠️ 摘要產生失敗（{error}）。{count} 則歷史訊息已被移除並以佔位符取代；先前的上下文已無法復原。建議檢查 auxiliary.compression 模型設定。
   config_read_failed: ⚠️ 無法讀取 config.yaml：{error}
   config_save_failed: ⚠️ 無法儲存設定：{error}

@@ -5168,6 +5168,43 @@ class GatewaySlashCommandsMixin:
                 chat_before_tokens = estimate_messages_tokens_rough(msgs)
 
                 compressor = tmp_agent.context_compressor
+                # Route the SUMMARISER at the session's LIVE provider, not the
+                # config default. The compressor passes its own
+                # provider/model/base_url as the auxiliary ``main_runtime``
+                # (see ContextCompressor._generate_summary), and this throwaway
+                # agent was built from config — so a session that moved onto a
+                # different provider at runtime (a mid-session fallback) would
+                # have its summariser cross onto the config route instead.
+                # Observed 2026-08-08: a session serving every call on
+                # claude-apx-7 had its summariser sent to a rate-limited
+                # claude-apr, which stalled and killed the compaction.
+                # No-op when no agent is resident (post-restart / evicted).
+                _live_route = self._resolve_live_session_route(session_key)
+                if _live_route:
+                    _live_model = str(_live_route.get("model") or "")
+                    _live_provider = str(_live_route.get("provider") or "")
+                    if (
+                        _live_provider
+                        and _live_model
+                        and (
+                            _live_provider != getattr(compressor, "provider", "")
+                            or _live_model != getattr(compressor, "model", "")
+                        )
+                    ):
+                        logger.info(
+                            "Manual /compress: routing the summarizer at the "
+                            "live session route %s (%s) instead of the "
+                            "config-resolved %s (%s).",
+                            _live_model,
+                            _live_provider,
+                            getattr(compressor, "model", ""),
+                            getattr(compressor, "provider", ""),
+                        )
+                        compressor.model = _live_model
+                        compressor.provider = _live_provider
+                        compressor.base_url = str(_live_route.get("base_url") or "")
+                        compressor.api_key = _live_route.get("api_key") or ""
+                        compressor.api_mode = str(_live_route.get("api_mode") or "")
                 if not compressor.has_content_to_compress(head):
                     return t("gateway.compress.nothing_to_do")
 
@@ -5237,6 +5274,17 @@ class GatewaySlashCommandsMixin:
                 _persist_failed = bool(
                     getattr(tmp_agent, "_last_compaction_persist_failed", False)
                 )
+                # Did the compaction ABORT before producing a compacted list at
+                # all (stalled summariser → no-progress watchdog)? Distinct from
+                # ``_persist_failed``: there, a list existed and the DB write was
+                # rolled back; here nothing was ever produced, so BOTH that flag
+                # and the session_id look exactly like a genuine no-op.
+                # ``is True`` (not truthiness): this reads a possibly-absent
+                # attribute off an agent object, and a permissive bool() would
+                # misclassify a persist-failure or a test double as an abort.
+                _aborted = (
+                    getattr(tmp_agent, "_last_compaction_aborted", False) is True
+                )
 
                 # Persist the compressed transcript BEFORE repointing the live
                 # session onto the new session_id. Order matters: if we
@@ -5285,12 +5333,47 @@ class GatewaySlashCommandsMixin:
                     # transcript inside _compress_context — nothing to do.
                     pass
                 else:
-                    logger.warning(
-                        "Manual /compress: session rotation did not occur "
-                        "(session_id unchanged) and in-place mode is off — "
-                        "preserving original transcript instead of overwriting "
-                        "it (#44794)."
+                    # Distinguish the two very different reasons this branch is
+                    # reached, because they send a triager to opposite places:
+                    #
+                    #  • the in-place CONFIG knob is genuinely off (legacy
+                    #    rotation mode) and the rotation could not complete;
+                    #  • in-place is ON but the compaction never COMPLETED
+                    #    (stalled summariser / no-progress abort), so the
+                    #    run-level ``_last_compaction_in_place`` outcome flag is
+                    #    False for a failure reason, not a config reason.
+                    #
+                    # Reading the outcome flag alone and reporting "in-place
+                    # mode is off" blames a config setting that is very often
+                    # correct — a real misdiagnosis trap observed 2026-08-08,
+                    # where compression.in_place was `true` the whole time.
+                    _in_place_configured = bool(
+                        getattr(tmp_agent, "compression_in_place", True)
                     )
+                    if _in_place_configured:
+                        logger.warning(
+                            "Manual /compress: the compaction did not complete "
+                            "(session_id unchanged, no in-place commit) — "
+                            "preserving original transcript instead of "
+                            "overwriting it (#44794). in-place mode is ON; "
+                            "this is a failed/aborted compaction, NOT a "
+                            "config issue. Reason: %s.",
+                            (
+                                getattr(
+                                    tmp_agent,
+                                    "_last_compaction_abort_reason",
+                                    "",
+                                )
+                                or "unknown"
+                            ),
+                        )
+                    else:
+                        logger.warning(
+                            "Manual /compress: session rotation did not occur "
+                            "(session_id unchanged) and in-place mode is off "
+                            "(compression.in_place=false) — preserving original "
+                            "transcript instead of overwriting it (#44794)."
+                        )
                 # Whether the STORED transcript actually changed. Downstream
                 # feedback must be computed on this basis — when no rewrite
                 # happened, the next request resends the ORIGINAL transcript
@@ -5540,6 +5623,30 @@ class GatewaySlashCommandsMixin:
             # report a before/after over, and the next request resends the same
             # context. Nothing was lost (the original transcript is untouched).
             # See #44794.
+            # CASE E: the compaction ABORTED before producing anything — the
+            # summariser stalled and the no-progress watchdog gave up. Unlike
+            # CASE D there is no compacted list at all, so
+            # ``_last_compaction_persist_failed`` is False and session_id is
+            # unchanged: on the surface this is indistinguishable from a
+            # genuine "nothing to compress" no-op, and pre-fix it rendered the
+            # bland "No changes: transcript preserved" for a run that actually
+            # died on a stalled provider (observed 2026-08-08). Report the real
+            # cause and tell the user it is retryable. Nothing was lost.
+            if _aborted and not _persist_failed and not _rewritten:
+                _fr_before = (
+                    f"{real_before_tokens:,}"
+                    if real_before_tokens > 0
+                    else f"~{approx_tokens:,}"
+                )
+                _ab_lines = [t("gateway.compress.timed_out")]
+                if focus_topic:
+                    _ab_lines.append(
+                        t("gateway.compress.focus_line", topic=focus_topic)
+                    )
+                _ab_lines.append(
+                    t("gateway.compress.full_request_unchanged", before=_fr_before)
+                )
+                return "\n".join(_ab_lines)
             if _persist_failed and not _rewritten:
                 _fr_before = (
                     f"{real_before_tokens:,}"

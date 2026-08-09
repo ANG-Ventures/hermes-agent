@@ -103,6 +103,7 @@ gateway:
     not_enough: Sıkıştırmak için yeterli konuşma yok (en az 4 mesaj gerekli).
     nothing_to_do: Henüz sıkıştırılacak bir şey yok (transkript hâlâ tamamen korunan bağlam).
     persist_failed: ⚠️ Sıkıştırma çalıştı, ancak sonuç kaydedilemedi — oturum veritabanı meşguldü (kilitli). Hiçbir şey kaybolmadı; dökümünüz değişmedi. Yeniden denemek için birazdan tekrar /compress çalıştırın.
+    timed_out: "⚠️ Sıkıştırma tamamlanamadı — özetleyici takıldı ve girişim hiçbir şey üretmeden zaman aşımına uğradı. Hiçbir şey kaybolmadı; dökümünüz değişmedi. Birazdan /compress komutunu yeniden çalıştırın."
     summary_failed: ⚠️ Özet oluşturma başarısız ({error}). {count} geçmiş mesaj kaldırılıp yer tutucuyla değiştirildi; önceki bağlam artık kurtarılamaz. auxiliary.compression model yapılandırmanızı kontrol edin.
   config_read_failed: '⚠️ config.yaml okunamadı: {error}'
   config_save_failed: '⚠️ Yapılandırma kaydedilemedi: {error}'

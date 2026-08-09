@@ -1054,6 +1054,7 @@ def resolve_context_compression_timeouts(
     """
     idle = DEFAULT_CONTEXT_TIMEOUT_SECONDS
     ceiling = DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS
+    explicit_idle = False
     cfg = compression_cfg
     if cfg is None:
         try:
@@ -1071,6 +1072,7 @@ def resolve_context_compression_timeouts(
                 parsed = float(raw_idle)
                 # Explicit 0/negative disables; positive values win.
                 idle = parsed
+                explicit_idle = True
             except (TypeError, ValueError):
                 pass
         raw_ceiling = cfg.get("context_total_ceiling_seconds")
@@ -1081,9 +1083,33 @@ def resolve_context_compression_timeouts(
                     ceiling = parsed
             except (TypeError, ValueError):
                 pass
-    if idle > 0:
-        ceiling = max(ceiling, idle)
-    return idle, ceiling
+
+    # The outer no-progress watchdog must never be TIGHTER than the inner
+    # auxiliary deadline it wraps.  When it is, the watchdog abandons the
+    # worker before the aux call can fail, ``call_llm`` never raises, and the
+    # configured ``fallback_providers`` chain — which only engages on an
+    # exception — becomes structurally unreachable.  An explicitly configured
+    # value is honoured verbatim (hermetic tests pin tiny values, and an
+    # operator who names a number means it); only the DEFAULT is lifted.
+    from agent.compression_timeout_floor import reconcile_timeouts
+
+    inner_deadline = None
+    try:
+        from agent.auxiliary_client import _effective_aux_timeout
+
+        inner_deadline = _effective_aux_timeout("compression", None)
+    except Exception:
+        # Never let aux-config discovery break timeout resolution; without a
+        # known inner deadline the reconciler is a no-op.
+        logger.debug(
+            "Could not resolve the auxiliary compression deadline; "
+            "leaving the no-progress budget at its resolved value.",
+            exc_info=True,
+        )
+
+    return reconcile_timeouts(
+        idle, ceiling, inner_deadline, explicit_idle=explicit_idle
+    )
 
 
 def run_compress_context_with_progress_timeout(
