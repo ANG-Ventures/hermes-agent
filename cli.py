@@ -18180,6 +18180,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         return
 
     max_turns = task.goal_max_turns or _DEF_TURNS
+    expected_run_id = _goal_loop_run_id(task_id)
 
     def _run_turn(prompt: str) -> str:
         result = cli.agent.run_conversation(
@@ -18201,7 +18202,14 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         c = _kb.connect()
         try:
             t = _kb.get_task(c, task_id)
-            return t.status if t is not None else None
+            if t is None:
+                return None
+            if (
+                expected_run_id is not None
+                and t.current_run_id != expected_run_id
+            ):
+                return "not_owner"
+            return t.status
         finally:
             try:
                 c.close()
@@ -18223,7 +18231,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             # id is supplied, so a stale run's write is refused instead of
             # silently winning.
             _kb.block_task(
-                c, task_id, reason=reason, expected_run_id=_goal_loop_run_id(task_id)
+                c, task_id, reason=reason, expected_run_id=expected_run_id
             )
         finally:
             try:

@@ -2018,7 +2018,7 @@ def run_kanban_goal_loop(
 
     Returns a decision dict: ``{"outcome", "turns_used", "reason"}`` where
     outcome is one of ``"completed_by_worker"``, ``"blocked_budget"``,
-    ``"blocked_by_worker"``, or ``"stopped"``.
+    ``"blocked_by_worker"``, ``"paused_judge_unreachable"``, or ``"stopped"``.
     """
 
     def _log(msg: str) -> None:
@@ -2036,6 +2036,7 @@ def run_kanban_goal_loop(
     # The first turn already consumed one unit of budget.
     turns_used = 1
     nudged_to_finalize = False
+    consecutive_transport_failures = 0
 
     while True:
         # Did the worker terminate the task itself this turn?
@@ -2060,10 +2061,36 @@ def run_kanban_goal_loop(
         # The kanban worker loop has no wait-barrier concept (workers finish
         # via kanban_complete / kanban_block, not by parking), so a WAIT
         # verdict is treated as CONTINUE here.
-        verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
+        verdict, reason, _parse_failed, _wait, transport_failed = judge_goal(goal_text, last_response)
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
+
+        if transport_failed:
+            consecutive_transport_failures += 1
+        else:
+            consecutive_transport_failures = 0
+
+        if consecutive_transport_failures >= DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES:
+            block_reason = (
+                "Goal-mode judge API was unreachable for "
+                f"{consecutive_transport_failures} consecutive evaluations. "
+                "Worker completion could not be evaluated; retry when the judge "
+                f"transport is healthy. Last judge error: {_truncate(reason, 300)}"
+            )
+            _log(
+                f"kanban goal loop: task {task_id} paused because the judge API "
+                f"was unreachable {consecutive_transport_failures} times; blocking"
+            )
+            try:
+                block_fn(block_reason)
+            except Exception as exc:
+                _log(f"kanban goal loop: block_fn failed ({exc})")
+            return {
+                "outcome": "paused_judge_unreachable",
+                "turns_used": turns_used,
+                "reason": "judge unreachable",
+            }
 
         if verdict == "done":
             if nudged_to_finalize:
