@@ -5017,6 +5017,65 @@ class GatewaySlashCommandsMixin:
                 source=source,
                 session_key=session_key,
             )
+
+            # A manual /compress runs between turns and builds a temporary
+            # AIAgent. The normal resolver above returns the configured primary
+            # route, but the resident session agent may currently be serving on
+            # a healthy fallback. Inherit that LIVE route as one atomic unit so
+            # the summarizer does not jump back onto the congested primary.
+            resident_agent = getattr(self, "_running_agents", {}).get(session_key)
+            if not callable(getattr(resident_agent, "_current_main_runtime", None)):
+                cache_lock = getattr(self, "_agent_cache_lock", None)
+                cache = getattr(self, "_agent_cache", None)
+                if cache_lock is not None and cache is not None:
+                    try:
+                        with cache_lock:
+                            cached = cache.get(session_key)
+                        if cached:
+                            resident_agent = cached[0]
+                    except Exception:
+                        resident_agent = None
+            current_runtime = getattr(resident_agent, "_current_main_runtime", None)
+            if callable(current_runtime):
+                try:
+                    runtime_candidate = current_runtime()
+                except Exception:
+                    runtime_candidate = None
+                live_runtime = (
+                    runtime_candidate if isinstance(runtime_candidate, dict) else {}
+                )
+                live_provider = str(live_runtime.get("provider") or "").strip()
+                live_model = str(live_runtime.get("model") or "").strip()
+                live_api_key = live_runtime.get("api_key")
+                if isinstance(live_api_key, str):
+                    live_api_key = live_api_key.strip()
+                if live_provider and live_model and live_api_key:
+                    model = live_model
+                    # Empty base_url/api_mode values are valid for built-in and
+                    # provider-catalog routes; the live provider id re-resolves
+                    # those defaults. Never retain either value from the stale
+                    # configured route just to make this snapshot look complete.
+                    # Rebuild rather than merge: requested_provider, ACP command
+                    # args, and credential pools may also belong to that stale
+                    # route. The temporary agent derives omitted defaults from
+                    # the live provider/model instead.
+                    runtime_kwargs = {"provider": live_provider, "api_key": live_api_key}
+                    for field in ("base_url", "api_mode"):
+                        value = live_runtime.get(field)
+                        if isinstance(value, str):
+                            value = value.strip()
+                        if value not in (None, ""):
+                            runtime_kwargs[field] = value
+                    live_max_tokens = getattr(resident_agent, "max_tokens", None)
+                    if live_max_tokens is not None:
+                        runtime_kwargs["max_tokens"] = live_max_tokens
+                    logger.info(
+                        "Manual /compress inheriting resident runtime: "
+                        "session=%s provider=%s model=%s",
+                        session_key,
+                        live_provider,
+                        live_model,
+                    )
             if not runtime_kwargs.get("api_key"):
                 return t("gateway.compress.no_provider")
 

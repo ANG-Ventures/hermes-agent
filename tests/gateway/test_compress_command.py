@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from collections import OrderedDict
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -272,6 +273,132 @@ async def test_compress_command_preserves_platform_and_gateway_session_key():
     # Stable gateway session key preserved, identical to a normal gateway turn.
     assert kwargs.get("gateway_session_key") == runner._session_key_for_source(_make_source())
     assert kwargs["gateway_session_key"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resident_state", "expect_live_route"),
+    (
+        ("cached", True),
+        ("running", True),
+        ("absent", False),
+        ("raises", False),
+        ("incomplete", False),
+        ("missing-key", False),
+    ),
+)
+async def test_compress_command_uses_complete_resident_route_or_config_fallback(
+    resident_state,
+    expect_live_route,
+):
+    """The one-shot compressor follows a complete live route, atomically.
+
+    A fallback can leave the resident agent on a healthy provider/model while
+    persisted config still names the congested primary. Building the temporary
+    compression agent from config crosses back to that stale route. Provider,
+    model, endpoint, and credential must move as one live-runtime unit; absent,
+    unreadable, or incomplete resident state keeps the resolved config pair.
+    """
+    history = _make_history()
+    runner = _make_runner(history)
+    session_key = runner._session_key_for_source(_make_source())
+
+    live_runtime = {
+        "provider": "claude-apx-7",
+        "model": "claude-fable-5",
+        "base_url": "http://127.0.0.1:18807/v1",
+        "api_key": "live-key",
+        "api_mode": "anthropic_messages",
+    }
+    resident_agent = MagicMock()
+    resident_agent.max_tokens = 8192
+    if resident_state == "raises":
+        resident_agent._current_main_runtime.side_effect = RuntimeError("stale agent")
+    elif resident_state == "incomplete":
+        resident_agent._current_main_runtime.return_value = {
+            **live_runtime,
+            "model": "",
+        }
+    elif resident_state == "missing-key":
+        resident_agent._current_main_runtime.return_value = {
+            **live_runtime,
+            "api_key": "",
+        }
+    else:
+        resident_agent._current_main_runtime.return_value = dict(live_runtime)
+    runner._running_agents = {}
+    runner._agent_cache = OrderedDict()
+    if resident_state == "running":
+        runner._running_agents[session_key] = resident_agent
+    elif resident_state != "absent":
+        runner._agent_cache[session_key] = (
+            resident_agent,
+            ("live-signature",),
+            len(history),
+            "sess-1",
+        )
+    runner._agent_cache_lock = threading.Lock()
+    runner._evict_cached_agent = MagicMock()
+
+    temp_agent = MagicMock()
+    temp_agent.shutdown_memory_provider = MagicMock()
+    temp_agent.close = MagicMock()
+    temp_agent._cached_system_prompt = ""
+    temp_agent.tools = None
+    temp_agent.context_compressor.has_content_to_compress.return_value = True
+    temp_agent.context_compressor._last_compress_aborted = False
+    temp_agent.context_compressor._last_summary_fallback_used = False
+    temp_agent.context_compressor._last_summary_dropped_count = 0
+    temp_agent.context_compressor._last_summary_error = None
+    temp_agent.context_compressor._last_aux_model_failure_model = None
+    temp_agent.context_compressor._last_aux_model_failure_error = None
+    temp_agent.session_id = "sess-1"
+    temp_agent._compress_context.return_value = (list(history), "")
+    temp_agent._compression_skipped_due_to_lock = False
+    temp_agent._last_compaction_in_place = False
+    temp_agent._last_compaction_persist_failed = False
+
+    stale_credential_pool = MagicMock(name="stale_config_credential_pool")
+    stale_route_fields = {
+        "requested_provider": "claude-apr",
+        "command": "stale-config-command",
+        "args": ["--stale-config-arg"],
+        "credential_pool": stale_credential_pool,
+    }
+    config_runtime = {
+        "provider": "claude-apr",
+        "base_url": "http://127.0.0.1:18801/v1",
+        "api_key": "config-key",
+        "api_mode": "anthropic_messages",
+        "max_tokens": 4096,
+        **stale_route_fields,
+    }
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value=config_runtime),
+        patch("gateway.run._resolve_gateway_model", return_value="claude-opus-5"),
+        patch("run_agent.AIAgent", return_value=temp_agent) as mock_agent,
+        patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
+    ):
+        await runner._handle_compress_command(_make_event())
+
+    _, kwargs = mock_agent.call_args
+    expected_runtime = live_runtime if expect_live_route else {
+        **config_runtime,
+        "model": "claude-opus-5",
+    }
+    assert (kwargs["provider"], kwargs["model"]) == (
+        expected_runtime["provider"],
+        expected_runtime["model"],
+    )
+    assert kwargs["base_url"] == expected_runtime["base_url"]
+    assert kwargs["api_key"] == expected_runtime["api_key"]
+    assert kwargs["api_mode"] == expected_runtime["api_mode"]
+    assert kwargs["max_tokens"] == (8192 if expect_live_route else 4096)
+    for field, value in stale_route_fields.items():
+        if expect_live_route:
+            assert field not in kwargs
+        else:
+            assert kwargs[field] == value
 
 
 @pytest.mark.asyncio
