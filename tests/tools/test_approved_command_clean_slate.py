@@ -226,11 +226,13 @@ def test_execute_code_non_approved_still_interrupts_on_stale_bit(monkeypatch):
     set_interrupt(True)
 
     result = json.loads(execute_code(
-        code='import time; time.sleep(0.5); print("CODE_DONE")',
+        code="import threading; threading.Event().wait(10)",
         task_id="test-clean-slate-2",
     ))
 
-    # Killed on the first poll before the script can print.
-    assert "CODE_DONE" not in result["output"], result
+    # Assert the interrupt state, not whether the child won a scheduling race
+    # and printed before the parent's first poll under heavy parallel load.
+    assert result["status"] == "interrupted", result
+    assert "execution interrupted" in result["output"], result
 
 
