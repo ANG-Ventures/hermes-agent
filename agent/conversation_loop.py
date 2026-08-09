@@ -37,7 +37,11 @@ from agent.conversation_compression import (
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
-from agent.error_classifier import FailoverReason, classify_api_error
+from agent.error_classifier import (
+    FailoverReason,
+    classify_api_error,
+    deterministic_error_signature,
+)
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
@@ -4156,6 +4160,31 @@ def run_conversation(
                     context_length=_ctx_len,
                     num_messages=len(api_messages) if api_messages else 0,
                 )
+                _deterministic_signature = deterministic_error_signature(
+                    api_error, classified
+                )
+                if _deterministic_signature is not None:
+                    _is_repeated_deterministic_error = (
+                        _deterministic_signature
+                        in _retry.deterministic_error_signatures
+                    )
+                    _retry.deterministic_error_signatures.add(
+                        _deterministic_signature
+                    )
+                    if _is_repeated_deterministic_error:
+                        # Defense in depth: a deterministic reason should
+                        # already be non-retryable on its first route. Preserve
+                        # the cross-route invariant even if a future classifier
+                        # change accidentally makes it retryable again.
+                        classified.retryable = False
+                        classified.should_fallback = True
+                        logger.warning(
+                            "Repeated deterministic API failure; circuit-breaking "
+                            "route retry budget reason=%s provider=%s model=%s",
+                            classified.reason.value,
+                            getattr(agent, "provider", "unknown"),
+                            getattr(agent, "model", "unknown"),
+                        )
                 logger.debug(
                     "Error classified: reason=%s status=%s retryable=%s compress=%s rotate=%s fallback=%s",
                     classified.reason.value, classified.status_code,
@@ -5486,6 +5515,8 @@ def run_conversation(
                     if _may_fallback and agent._has_pending_fallback():
                         if classified.reason == FailoverReason.content_policy_blocked:
                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
+                        elif classified.reason == FailoverReason.decode_error:
+                            agent._buffer_status("⚠️ Provider returned a corrupt response — trying fallback...")
                         elif classified.reason == FailoverReason.ssl_cert_verification:
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
@@ -5520,6 +5551,11 @@ def run_conversation(
                     if classified.reason == FailoverReason.content_policy_blocked:
                         agent._emit_status(
                             f"❌ Provider safety filter blocked this request: "
+                            f"{_nonretryable_summary}"
+                        )
+                    elif classified.reason == FailoverReason.decode_error:
+                        agent._emit_status(
+                            f"❌ Provider returned a corrupt response: "
                             f"{_nonretryable_summary}"
                         )
                     elif classified.reason == FailoverReason.malformed_conversation:

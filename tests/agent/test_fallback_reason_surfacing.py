@@ -55,6 +55,9 @@ class TestReasonLabel:
         # must read as "connection dropped", not the ambiguous bare "timeout".
         assert _fallback_reason_label(FailoverReason.timeout) == "connection dropped"
 
+    def test_content_decode_maps_to_corrupt_response(self):
+        assert _fallback_reason_label(FailoverReason.decode_error) == "corrupt response"
+
     def test_ssl_cert_maps(self):
         assert _fallback_reason_label(FailoverReason.ssl_cert_verification) == "TLS error"
 

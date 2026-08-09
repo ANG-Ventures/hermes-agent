@@ -54,7 +54,7 @@ class TestFailoverReason:
         expected = {
             "auth", "auth_permanent", "account_blocked", "billing", "rate_limit",
             "upstream_rate_limit", "pool_exhausted",
-            "overloaded", "server_error", "timeout",
+            "overloaded", "server_error", "timeout", "decode_error",
             "ssl_cert_verification",
             "decode_error",
             "context_overflow", "payload_too_large", "image_too_large",
