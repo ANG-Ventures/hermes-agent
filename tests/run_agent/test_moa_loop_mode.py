@@ -554,7 +554,6 @@ def test_references_parallel_interrupt_aborts_wait(monkeypatch):
     its own — mirroring the interrupt check agent.tool_executor already
     applies to its own concurrent tool batch."""
     import threading
-    import time
 
     from agent import moa_loop
 
@@ -563,9 +562,13 @@ def test_references_parallel_interrupt_aborts_wait(monkeypatch):
 
     fake_agent = SimpleNamespace(_interrupt_requested=False)
     release_wedged = threading.Event()
+    wedged_entered = threading.Event()
+    wedged_returned = threading.Event()
 
     def fake_call_llm(**kwargs):
         if kwargs["provider"] == "fast":
+            if not wedged_entered.wait(timeout=10):
+                raise RuntimeError("wedged reference never entered call_llm")
             # Simulate the interrupt arriving right after the fast reference
             # finishes, while the wedged one is still in flight.
             fake_agent._interrupt_requested = True
@@ -573,7 +576,11 @@ def test_references_parallel_interrupt_aborts_wait(monkeypatch):
         # "wedged" — never returns within the test unless released, standing
         # in for a reference whose own (possibly very long) timeout hasn't
         # elapsed yet.
-        release_wedged.wait(timeout=5)
+        wedged_entered.set()
+        try:
+            release_wedged.wait(timeout=10)
+        finally:
+            wedged_returned.set()
         return _response("should not be observed")
 
     monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
@@ -583,19 +590,22 @@ def test_references_parallel_interrupt_aborts_wait(monkeypatch):
         {"provider": "wedged", "model": "m2"},
     ]
     try:
-        start = time.monotonic()
         out = moa_loop._run_references_parallel(
-            refs, [{"role": "user", "content": "hi"}], agent=fake_agent,
+            refs,
+            [{"role": "user", "content": "hi"}],
+            agent=fake_agent,
         )
-        elapsed = time.monotonic() - start
 
-        # Must return promptly once interrupted, not block for the wedged
-        # reference's full (5s test-simulated) duration.
-        assert elapsed < 2.0, f"interrupt did not abort the wait (took {elapsed:.2f}s)"
+        assert not wedged_returned.is_set(), (
+            "interrupt did not abort the wait before the wedged reference returned"
+        )
         assert out[0][1] == "fast output"
         assert "interrupted" in out[1][1]
     finally:
         release_wedged.set()  # don't leak a blocked thread past the test
+        assert wedged_returned.wait(timeout=10), (
+            "wedged reference did not exit during cleanup"
+        )
 
 
 def _ref_config(home, fanout: str | None = None):
