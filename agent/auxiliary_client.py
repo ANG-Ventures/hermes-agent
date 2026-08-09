@@ -4829,6 +4829,11 @@ def _call_fallback_candidate_sync(
         )
         effective_timeout = fb_timeout
     destination = _fallback_destination(task, fb_client, fb_model, fb_label)
+    # Starting a fallback is real forward progress for a host-side inactivity
+    # watchdog. Reset its idle window before the fallback spends its own
+    # transport budget; otherwise a primary timeout can consume the entire
+    # outer window just as the fallback becomes reachable.
+    _notify_aux_progress()
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(
         messages,
         tools,
@@ -4864,6 +4869,7 @@ def _call_fallback_candidate_sync(
                 api_mode=destination.api_mode,
             )
             if retry_client is not None:
+                _notify_aux_progress()
                 retry_destination = _FallbackDestination(
                     fb_provider,
                     destination.base_url
@@ -4935,6 +4941,7 @@ async def _call_fallback_candidate_async(
         )
         effective_timeout = fb_timeout
     destination = _fallback_destination(task, fb_client, fb_model, fb_label)
+    _notify_aux_progress()
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(
         messages,
         tools,
@@ -4971,6 +4978,7 @@ async def _call_fallback_candidate_async(
                 api_mode=destination.api_mode,
             )
             if retry_client is not None:
+                _notify_aux_progress()
                 retry_destination = _FallbackDestination(
                     fb_provider,
                     destination.base_url
@@ -7737,7 +7745,7 @@ def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float
     return default
 
 
-def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
+def resolve_auxiliary_timeout(task: str, timeout: Optional[float]) -> float:
     """Resolve the effective timeout for an auxiliary LLM call.
 
     Uses the caller-provided ``timeout`` when given; otherwise reads
@@ -9009,7 +9017,7 @@ def _call_llm_impl(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
-    effective_timeout = _effective_aux_timeout(task, timeout)
+    effective_timeout = resolve_auxiliary_timeout(task, timeout)
     _set_relay_auxiliary_route(
         resolved_provider,
         final_model,
@@ -9489,6 +9497,10 @@ def _call_llm_impl(
             or _is_invalid_aux_response_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
+            # The inner deadline has handed control to fallback selection.
+            # Reset the host inactivity window now, before provider discovery
+            # or credential resolution can consume the handoff grace.
+            _notify_aux_progress()
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):
@@ -9780,7 +9792,7 @@ async def _async_call_llm_impl(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
-    effective_timeout = _effective_aux_timeout(task, timeout)
+    effective_timeout = resolve_auxiliary_timeout(task, timeout)
     _set_relay_auxiliary_route(
         resolved_provider,
         final_model,
@@ -10130,6 +10142,7 @@ async def _async_call_llm_impl(
             or _is_invalid_aux_response_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
+            _notify_aux_progress()
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):

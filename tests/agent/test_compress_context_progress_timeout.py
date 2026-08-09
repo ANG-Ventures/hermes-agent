@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import threading
 import time
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from agent.conversation_compression import (
+    CONTEXT_AUX_TIMEOUT_HANDOFF_GRACE_SECONDS,
     CompressionCommitFence,
     resolve_context_compression_timeouts,
     run_compress_context_with_progress_timeout,
@@ -22,14 +24,19 @@ from agent.conversation_compression import (
 
 
 class TestResolveContextCompressionTimeouts:
-    def test_defaults_when_empty_cfg(self):
+    def test_default_is_clamped_to_effective_aux_timeout(self, monkeypatch):
+        from agent import auxiliary_client as aux
+
+        resolve_aux_timeout = MagicMock(return_value=300.0)
+        monkeypatch.setattr(aux, "resolve_auxiliary_timeout", resolve_aux_timeout)
         idle, ceiling = resolve_context_compression_timeouts({})
-        assert idle == 120.0
+        resolve_aux_timeout.assert_called_once_with("compression", None)
+        assert idle == 300.0 + CONTEXT_AUX_TIMEOUT_HANDOFF_GRACE_SECONDS
         assert ceiling == 600.0
 
     def test_zero_idle_disables_wrapper(self):
         idle, ceiling = resolve_context_compression_timeouts(
-            {"context_timeout_seconds": 0}
+            {"context_timeout_seconds": 0}, auxiliary_timeout_seconds=300.0
         )
         assert idle == 0.0
         assert ceiling == 600.0
@@ -39,13 +46,161 @@ class TestResolveContextCompressionTimeouts:
             {
                 "context_timeout_seconds": 90,
                 "context_total_ceiling_seconds": 30,
-            }
+            },
+            auxiliary_timeout_seconds=60.0,
         )
         assert idle == 90.0
         assert ceiling == 90.0
 
+    def test_explicit_outer_timeout_cannot_undercut_inner_timeout(self):
+        idle, ceiling = resolve_context_compression_timeouts(
+            {
+                "context_timeout_seconds": 120,
+                "context_total_ceiling_seconds": 200,
+            },
+            auxiliary_timeout_seconds=300.0,
+        )
+        expected = 300.0 + CONTEXT_AUX_TIMEOUT_HANDOFF_GRACE_SECONDS
+        assert idle == expected
+        assert ceiling == expected
+
 
 class TestRunCompressContextWithProgressTimeout:
+    def test_stalled_primary_reaches_fallback_before_outer_timeout(self):
+        """The host watchdog must not abandon call_llm before its stalled
+        primary raises and the configured fallback chain gets control.
+
+        The scaled budgets preserve the production ordering that regressed:
+        outer=120s, effective auxiliary stream idle=300s. Before the fix this
+        returns the uncompressed transcript at ``outer_timeout`` and the
+        fallback starts only later on an already-detached worker.
+        """
+        from agent import auxiliary_client as aux
+
+        class APITimeoutError(Exception):
+            pass
+
+        original = [{"role": "user", "content": "keep-me"}]
+        compressed = [{"role": "assistant", "content": "fallback-summary"}]
+        primary = MagicMock()
+        primary.base_url = "https://primary.example/v1"
+        fallback = MagicMock()
+        fallback.base_url = "https://fallback.example/v1"
+        fallback_engaged = threading.Event()
+        worker_done = threading.Event()
+        # Leave enough scheduling slack for a heavily loaded CI runner while
+        # preserving the old outer < inner ordering (0.1s < 5.0s).
+        inner_timeout = 5.0
+
+        def stalled_stream_create(**kwargs):
+            assert kwargs.get("stream") is True
+
+            def _chunks():
+                time.sleep(0.25)
+                raise APITimeoutError("Request timed out.")
+                yield  # pragma: no cover - keeps this a generator
+
+            return _chunks()
+
+        primary.chat.completions.create.side_effect = stalled_stream_create
+
+        fallback_response = SimpleNamespace(
+            model="fallback-model",
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="fallback-summary"),
+                    finish_reason="stop",
+                )
+            ],
+        )
+
+        def call_fallback(*_args, **_kwargs):
+            fallback_engaged.set()
+            return fallback_response
+
+        fallback.chat.completions.create.side_effect = call_fallback
+
+        idle, ceiling = resolve_context_compression_timeouts(
+            {
+                "context_timeout_seconds": 0.1,
+                "context_total_ceiling_seconds": 15.0,
+            },
+            auxiliary_timeout_seconds=inner_timeout,
+        )
+
+        def worker(fence: CompressionCommitFence):
+            try:
+                with aux.aux_progress_hook(fence.touch_progress):
+                    response = aux.call_llm(
+                        task="compression",
+                        messages=[{"role": "user", "content": "summarize"}],
+                        timeout=inner_timeout,
+                    )
+                assert response is fallback_response
+                if not fence.begin_commit():
+                    return original, "cancelled"
+                try:
+                    return compressed, "fallback-prompt"
+                finally:
+                    fence.finish_commit()
+            finally:
+                worker_done.set()
+
+        with (
+            patch.object(
+                aux,
+                "_resolve_task_provider_model",
+                return_value=("openrouter", "primary-model", None, None, None),
+            ),
+            patch.object(
+                aux,
+                "_get_cached_client",
+                return_value=(primary, "primary-model"),
+            ),
+            patch.object(
+                aux,
+                "_try_configured_fallback_chain",
+                return_value=(
+                    fallback,
+                    "fallback-model",
+                    "fallback_chain[0](fallback)",
+                ),
+            ) as fallback_chain,
+            patch.object(
+                aux,
+                "_fallback_destination",
+                return_value=aux._FallbackDestination(
+                    "fallback",
+                    "https://fallback.example/v1",
+                    None,
+                    "fallback-model",
+                ),
+            ),
+            patch.object(aux, "_fallback_entry_timeout", return_value=None),
+            patch.object(
+                aux,
+                "_replan_synchronous_cache_sections",
+                side_effect=lambda messages, tools, **_kwargs: (messages, tools),
+            ),
+            patch.object(
+                aux, "_notify_aux_progress", wraps=aux._notify_aux_progress
+            ) as progress_notify,
+        ):
+            result = run_compress_context_with_progress_timeout(
+                worker=worker,
+                messages=original,
+                system_prompt_fallback="outer-timeout-prompt",
+                idle_timeout_seconds=idle,
+                total_ceiling_seconds=ceiling,
+            )
+            fallback_engaged_before_outer_return = fallback_engaged.is_set()
+            assert worker_done.wait(timeout=2), "detached worker did not unwind"
+
+        assert fallback_engaged_before_outer_return
+        fallback_chain.assert_called_once()
+        assert progress_notify.call_count >= 3
+        assert result == (compressed, "fallback-prompt")
+
     def test_silent_worker_times_out_and_preserves_messages(self):
         original = [{"role": "user", "content": "keep-me"}]
         started = threading.Event()

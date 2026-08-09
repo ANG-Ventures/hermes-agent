@@ -964,6 +964,10 @@ class CompressionCommitFence:
 # Mirror hermes_cli.config.DEFAULT_CONFIG["compression"] keys of the same name.
 DEFAULT_CONTEXT_TIMEOUT_SECONDS = 120.0
 DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS = 600.0
+# The host timer starts just before the auxiliary transport's own timeout.
+# Leave a small handoff window for the inner timeout to raise and enter the
+# existing fallback chain instead of racing the host fence at equal deadlines.
+CONTEXT_AUX_TIMEOUT_HANDOFF_GRACE_SECONDS = 1.0
 
 # Shared daemon pool for sync compress_context timeout wraps — analogous to
 # asyncio's default executor used by gateway session hygiene's
@@ -1045,12 +1049,17 @@ def _get_compress_timeout_executor():
 
 def resolve_context_compression_timeouts(
     compression_cfg: Optional[dict] = None,
+    *,
+    auxiliary_timeout_seconds: Optional[float] = None,
 ) -> Tuple[float, float]:
     """Return ``(idle_timeout_seconds, total_ceiling_seconds)``.
 
     ``idle_timeout_seconds <= 0`` disables the owned progress-aware wrapper.
-    The ceiling is clamped to at least one idle window when the idle budget
-    is positive, matching gateway hygiene semantics.
+    A positive idle timeout is clamped above the effective auxiliary
+    compression timeout so the inner transport can raise and engage its
+    fallback chain before the host fence cancels the compression worker. The
+    ceiling is then clamped to at least one idle window, matching gateway
+    hygiene semantics.
     """
     idle = DEFAULT_CONTEXT_TIMEOUT_SECONDS
     ceiling = DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS
@@ -1082,6 +1091,23 @@ def resolve_context_compression_timeouts(
             except (TypeError, ValueError):
                 pass
     if idle > 0:
+        if auxiliary_timeout_seconds is None:
+            # Reuse the auxiliary client's resolver rather than duplicating
+            # its compression-only timeout floor. This keeps the host budget
+            # aligned if that policy changes again.
+            from agent.auxiliary_client import resolve_auxiliary_timeout
+
+            auxiliary_timeout_seconds = resolve_auxiliary_timeout("compression", None)
+        if not isinstance(auxiliary_timeout_seconds, bool):
+            try:
+                inner_timeout = float(auxiliary_timeout_seconds)
+            except (TypeError, ValueError):
+                inner_timeout = 0.0
+            if math.isfinite(inner_timeout) and inner_timeout > 0:
+                idle = max(
+                    idle,
+                    inner_timeout + CONTEXT_AUX_TIMEOUT_HANDOFF_GRACE_SECONDS,
+                )
         ceiling = max(ceiling, idle)
     return idle, ceiling
 

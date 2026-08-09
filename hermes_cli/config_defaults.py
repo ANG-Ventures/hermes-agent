@@ -684,13 +684,15 @@ DEFAULT_CONFIG = {
                                       # (conversation loop, /compress, preflight, etc.).
                                       # Same progress-aware semantics as hygiene_timeout_seconds:
                                       # streamed summary tokens extend the wait; only a silent
-                                      # worker is cut off. 0 = disable the owned wrapper
+                                      # worker is cut off. Positive values are clamped above the
+                                      # effective auxiliary.compression timeout so inner timeout
+                                      # handling/fallbacks remain reachable. 0 = disable the wrapper
                                       # (callers that already pass commit_fence, e.g. gateway
                                       # hygiene, never use this path).
         "context_total_ceiling_seconds": 600,  # absolute cap on the *pre-commit*
                                       # in-agent compress_context wait (summary /
                                       # stream phase) even while tokens are still
-                                      # moving. Clamped to >= context_timeout_seconds
+                                      # moving. Clamped to >= the resolved context timeout
                                       # when the idle budget is > 0. Guarantee:
                                       # the summary phase is bounded by this
                                       # ceiling; an already-started SessionDB
