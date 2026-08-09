@@ -128,6 +128,141 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
     assert turns == []  # no extra turns
 
 
+def test_loop_pauses_when_judge_transport_stays_unreachable(monkeypatch):
+    """A judge outage must not masquerade as worker turn-budget exhaustion."""
+    judge_calls = []
+    turns = []
+    blocked = []
+
+    def _unreachable_judge(goal, response, **_kw):
+        judge_calls.append(response)
+        return (
+            "continue",
+            "judge error: InternalServerError",
+            False,
+            None,
+            True,
+        )
+
+    monkeypatch.setattr(goals, "judge_goal", _unreachable_judge)
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=lambda p: turns.append(p) or "still working",
+        task_status_fn=lambda: "running",
+        block_fn=blocked.append,
+        max_turns=10,
+        first_response="initial response",
+    )
+
+    assert res["outcome"] == "paused_judge_unreachable"
+    assert res["turns_used"] == goals.DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES
+    assert len(judge_calls) == goals.DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES
+    assert len(turns) == goals.DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES - 1
+    assert len(blocked) == 1
+    assert "judge" in blocked[0].lower()
+    assert "unreachable" in blocked[0].lower()
+    assert "turn budget" not in blocked[0].lower()
+
+
+def test_judge_transport_failure_streak_resets_after_a_usable_reply(monkeypatch):
+    """Only consecutive transport failures trip the judge-outage circuit."""
+    transport_failures = iter(
+        [True, True, False, True, True, True, True, True]
+    )
+    judge_calls = []
+    turns = []
+
+    def _scripted_judge(goal, response, **_kw):
+        transport_failed = next(transport_failures, True)
+        judge_calls.append(transport_failed)
+        return (
+            "continue",
+            "judge error: InternalServerError" if transport_failed else "keep going",
+            False,
+            None,
+            transport_failed,
+        )
+
+    monkeypatch.setattr(goals, "judge_goal", _scripted_judge)
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=lambda p: turns.append(p) or "still working",
+        task_status_fn=lambda: "running",
+        block_fn=lambda _reason: None,
+        max_turns=12,
+        first_response="initial response",
+    )
+
+    assert res["outcome"] == "paused_judge_unreachable"
+    assert len(judge_calls) == 8
+    assert len(turns) == 7
+
+
+def test_cli_goal_loop_stops_when_task_ownership_moves(monkeypatch):
+    """A reclaimed run must not receive another continuation or block its successor."""
+    import types
+    from typing import cast
+    import cli as _cli
+
+    task = types.SimpleNamespace(
+        title="Long merge",
+        body="Finish the merge",
+        goal_max_turns=2,
+        status="running",
+        current_run_id=41,
+    )
+    judge_calls = []
+    turn_prompts = []
+    block_calls = []
+
+    class _Conn:
+        def close(self):
+            return None
+
+    class _Agent:
+        session_id = "session-1"
+
+        def run_conversation(self, *, user_message, conversation_history):
+            turn_prompts.append(user_message)
+            task.current_run_id = 42  # dispatcher reclaimed and respawned the card
+            return {"final_response": "continuing"}
+
+    fake_cli = cast(
+        _cli.HermesCLI,
+        types.SimpleNamespace(
+            agent=_Agent(),
+            conversation_history=[],
+            session_id="session-1",
+        ),
+    )
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_owned")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "41")
+    monkeypatch.setattr(kb, "connect", lambda: _Conn())
+    monkeypatch.setattr(kb, "get_task", lambda _conn, _task_id: task)
+    monkeypatch.setattr(
+        kb,
+        "block_task",
+        lambda _conn, _task_id, **kw: block_calls.append(kw) or True,
+    )
+
+    def _continue_judge(goal, response, **_kw):
+        judge_calls.append(response)
+        return "continue", "not done", False, None, False
+
+    monkeypatch.setattr(goals, "judge_goal", _continue_judge)
+
+    _cli._run_kanban_goal_loop_q(fake_cli, "first response")
+
+    assert len(turn_prompts) == 1
+    assert len(judge_calls) == 1
+    assert block_calls == []
+
+
 
 
 
