@@ -56,6 +56,10 @@ class FailoverReason(enum.Enum):
 
     # Transport
     timeout = "timeout"                  # Connection/read timeout — rebuild client + retry
+    # Response body could not be decoded after transport succeeded (bad
+    # content-encoding header, corrupt gzip/brotli payload, etc.). Retrying the
+    # same bytes on the same route is deterministic; move to a fallback route.
+    content_decode = "content_decode"
     # TLS certificate verification failure — deterministic for the host
     # (TLS-inspecting proxy, missing/expired CA bundle, self-signed cert).
     # Retrying reproduces the identical handshake failure, so fail fast
@@ -729,6 +733,54 @@ _SSL_TRANSIENT_PATTERNS = [
 ]
 
 
+def _find_content_decode_error(error: Exception) -> Optional[Exception]:
+    """Return a recognized HTTP content-decoding error from an exception chain."""
+
+    current: Optional[BaseException] = error
+    seen: set[int] = set()
+    while isinstance(current, BaseException) and id(current) not in seen:
+        seen.add(id(current))
+        error_type = type(current).__name__
+        error_module = type(current).__module__
+        if (
+            (error_type == "DecodingError" and error_module.startswith("httpx"))
+            or (
+                error_type == "ContentDecodingError"
+                and error_module.startswith("requests")
+            )
+            or (
+                error_type == "DecodeError"
+                and error_module.startswith("urllib3")
+            )
+        ):
+            return current if isinstance(current, Exception) else error
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def deterministic_error_signature(
+    error: Exception,
+    classified: ClassifiedError,
+) -> Optional[tuple[str, str, str, str, str]]:
+    """Return an exact cross-route signature for deterministic API failures.
+
+    The message is deliberately not fuzzily normalized: the circuit breaker
+    should suppress only the same failure shape, never a genuinely different
+    decode failure that happens to share a few words.
+    """
+
+    if classified.reason != FailoverReason.content_decode:
+        return None
+    cause = _find_content_decode_error(error) or error
+    return (
+        classified.reason.value,
+        type(cause).__module__,
+        type(cause).__name__,
+        str(classified.status_code or ""),
+        str(cause),
+    )
+
+
 # ── Classification pipeline ─────────────────────────────────────────────
 
 def classify_api_error(
@@ -743,7 +795,7 @@ def classify_api_error(
     """Classify an API error into a structured recovery recommendation.
 
     Priority-ordered pipeline:
-      1. Special-case provider-specific patterns (thinking sigs, tier gates)
+      1. Deterministic response decoding and provider-specific patterns
       2. HTTP status code + message-aware refinement
       3. Error code classification (from body)
       4. Message pattern matching (billing vs rate_limit vs context vs auth)
@@ -825,6 +877,17 @@ def classify_api_error(
         }
         defaults.update(overrides)
         return ClassifiedError(**defaults)
+
+    # A corrupt or falsely content-encoded response has already arrived; the
+    # decoder will fail identically on every same-route retry. Match exception
+    # identity (including wrapped causes) before status/message heuristics so a
+    # provider SDK cannot downgrade it to the retryable ``unknown`` floor.
+    if _find_content_decode_error(error) is not None:
+        return _result(
+            FailoverReason.content_decode,
+            retryable=False,
+            should_fallback=True,
+        )
 
     # ── 1. Provider-specific patterns (highest priority) ────────────
 

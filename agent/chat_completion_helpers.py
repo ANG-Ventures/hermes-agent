@@ -2145,6 +2145,7 @@ _FALLBACK_REASON_LABELS = {
     "overloaded": "provider overloaded",
     "server_error": "provider error",
     "timeout": "connection dropped",
+    "content_decode": "corrupt response",
     "ssl_cert_verification": "TLS error",
     "auth": "auth refresh",
     "auth_permanent": "auth failed",

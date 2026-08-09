@@ -26,7 +26,7 @@ imported by the turn loop without an import cycle.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 
 
 @dataclass
@@ -66,6 +66,12 @@ class TurnRetryState:
     # ── Transport / rate-limit recovery ──────────────────────────────────
     primary_recovery_attempted: bool = False
     has_retried_429: bool = False
+    # Exact deterministic failure shapes already observed in this logical API
+    # call. Kept across fallback swaps so the next route cannot restart a full
+    # retry budget for the same byte-for-byte decoding failure.
+    deterministic_error_signatures: set[tuple[str, str, str, str, str]] = field(
+        default_factory=set
+    )
 
     # ── Auth-failure provider failover ───────────────────────────────────
     # Set once we've escalated a persistent 401/403 (after the per-provider
