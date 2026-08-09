@@ -43,6 +43,20 @@ class _Mixin:
     def __init__(self, ratio=0.0, threshold=750_000):
         self._config = _Cfg(ratio)
         self.threshold_tokens = threshold
+        # The warm-cache gate is a SECOND term inside _maintenance_pressure_met.
+        # These tests exercise the SIZE floor in isolation, so pin the cache term
+        # to its fail-open state (no metrics reported => no evidence to defer on).
+        # A dedicated suite covers the cache term:
+        # tests/context_engine/test_warm_cache_maintenance_gate.py
+        self.cache_metrics_available = False
+        self.cache_read_ratio = 0.0
+
+    def _maintenance_cache_cost_acceptable(self, observed_tokens):
+        from plugins.context_engine.lcm.compaction import CompactionMixin
+
+        return CompactionMixin._maintenance_cache_cost_acceptable(
+            self, observed_tokens
+        )
 
 
 def _pressure_met(engine, tokens):

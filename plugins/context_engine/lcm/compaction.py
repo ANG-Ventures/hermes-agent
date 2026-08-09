@@ -94,12 +94,70 @@ class CompactionMixin:
         if self.threshold_tokens <= 0:
             return True
         floor = int(self.threshold_tokens * ratio)
-        if observed_tokens >= floor:
+        if observed_tokens < floor:
+            logger.debug(
+                "LCM maintenance compaction deferred: %d tokens < %d floor "
+                "(%.0f%% of %d threshold)",
+                observed_tokens, floor, ratio * 100, self.threshold_tokens,
+            )
+            return False
+        if not self._maintenance_cache_cost_acceptable(observed_tokens):
+            return False
+        return True
+
+    def _maintenance_cache_cost_acceptable(self, observed_tokens: int) -> bool:
+        """Whether a maintenance compaction is worth its prompt-cache cost.
+
+        The size floor above answers "is the context big enough to be worth
+        compacting?". It cannot answer "is compacting worth it RIGHT NOW?".
+
+        A session running at a high cache-hit rate is in the CHEAPEST state it
+        can be in: only the delta since the last turn is uncached. Compacting
+        rewrites the prefix, so the next turn re-reads everything uncached AND
+        pays a summarizer call. Measured production case (2026-08-08, 21:01):
+        eight consecutive calls at 100% cache, ~1,221 uncached tokens/turn, then
+        a maintenance compaction at 61% of threshold — the next turn cost
+        ~129,202 uncached, 106x more, followed immediately by an HTTP 429.
+
+        AGENTS.md makes prompt caching sacred with compression as the one
+        sanctioned exception. That exception is for compaction that AVERTS AN
+        OVERFLOW. Below the real threshold there is no overflow to avert, so
+        burning a warm cache buys nothing.
+
+        Deliberately narrow — this gates ONLY the opportunistic maintenance
+        arms. Every other trigger is untouched: threshold crossings and overflow
+        recovery are checked before this on every path (overflow beats cache),
+        deterministic ingest-cleanup adoption returns earlier, and
+        session-hygiene / manual `/compress` never reach here. Measured over all
+        logged compactions, 9 of 9 fired at >=90% cache, so a bare "is the cache
+        warm?" check would block essentially everything — including the
+        legitimate 750,935-token threshold fire. The gate is the CONJUNCTION:
+        warm cache AND below threshold AND a maintenance trigger.
+
+        Fails OPEN. No cache metrics (provider doesn't report them, or no turn
+        has completed yet) means no evidence to defer on, so the compaction
+        proceeds exactly as it did before this gate existed.
+        """
+        warm_ratio = getattr(self._config, "maintenance_max_cache_hit_ratio", 0.0) or 0.0
+        if warm_ratio <= 0.0:
             return True
-        logger.debug(
-            "LCM maintenance compaction deferred: %d tokens < %d floor "
-            "(%.0f%% of %d threshold)",
-            observed_tokens, floor, ratio * 100, self.threshold_tokens,
+        if self.threshold_tokens > 0 and observed_tokens >= self.threshold_tokens:
+            return True
+        if not getattr(self, "cache_metrics_available", False):
+            return True
+        try:
+            observed_cache = float(self.cache_read_ratio)
+        except (TypeError, ValueError):
+            return True
+        if observed_cache < warm_ratio:
+            return True
+        logger.info(
+            "LCM maintenance compaction deferred: prompt cache is %.0f%% warm "
+            "(>= %.0f%% gate) at %d tokens, below the %d threshold — compacting "
+            "would discard a warm prefix to avert an overflow that is not "
+            "imminent",
+            observed_cache * 100, warm_ratio * 100, observed_tokens,
+            self.threshold_tokens,
         )
         return False
 

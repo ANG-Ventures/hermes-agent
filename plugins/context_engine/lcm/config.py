@@ -605,6 +605,17 @@ class LCMConfig:
     # adoption is NOT affected — it returns before this gate, costs no
     # summarizer spend, and must stay available at any size.
     maintenance_min_pressure_ratio: float = 0.0
+    # Cache-hit ceiling for the same opportunistic maintenance arms. A session
+    # at a high cache-hit rate is in its CHEAPEST state — only the delta since
+    # the last turn is uncached. Compacting rewrites the prefix, so the next
+    # turn re-reads everything uncached AND pays a summarizer call. Measured
+    # 2026-08-08: a fire at 61% of threshold on a 100%-warm cache made the next
+    # turn 106x more expensive (~1,221 -> ~129,202 uncached tokens).
+    #
+    # Only applies BELOW the real threshold; at or above it, overflow beats
+    # cache and the compaction always proceeds. Fails OPEN when the provider
+    # reports no cache metrics. 0.0 disables the gate (previous behavior).
+    maintenance_max_cache_hit_ratio: float = 0.0
     # Target frontier-summary size after a sweep (0 = derive one leaf budget).
     summary_prefix_target_tokens: int = 0
 
@@ -1014,6 +1025,16 @@ class LCMConfig:
             "LCM_MAINTENANCE_MIN_PRESSURE_RATIO",
             _hermes_compression_float(
                 "maintenance_min_pressure_ratio", c.maintenance_min_pressure_ratio
+            ),
+        )
+        # Explicit reader, NOT the uniform ENV_FIELD_SPECS loop — that loop has
+        # no config-file fallback, so a knob added there reads config.yaml as
+        # absent and ships INERT (PR #508 fixed exactly that for the sibling
+        # ratio above; do not "simplify" this back into the loop).
+        c.maintenance_max_cache_hit_ratio = _float(
+            "LCM_MAINTENANCE_MAX_CACHE_HIT_RATIO",
+            _hermes_compression_float(
+                "maintenance_max_cache_hit_ratio", c.maintenance_max_cache_hit_ratio
             ),
         )
         # Upstream source-tracked summary_timeout_ms (computed default + provenance).
