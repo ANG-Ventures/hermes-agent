@@ -148,6 +148,23 @@ _EXCLUDED_SUFFIXES = (
     ".db-wal",
     ".db-shm",
     ".db-journal",
+    # Disk images used as STAGING scratch by backup/sync lanes. These are
+    # containers for data whose real home is elsewhere, so archiving one into the
+    # backup both duplicates that data and dwarfs the agent state the backup
+    # exists to protect.
+    #
+    # Live case (2026-08-09): ``var/subvps-staging.sparseimage`` — a case-sensitive
+    # APFS sparse image that ``sub-vps-backup-pull.py`` auto-creates and attaches to
+    # stage a case-sensitive rsync from the Linux sub-VPS boxes (ordinary macOS APFS
+    # folds case and would silently lose one file of each colliding pair). Its
+    # contents come from those boxes and are backed up by restic; the image itself
+    # is pure scratch. It reached **42 GB** and drove the Sunday full-tier bundle
+    # from ~15.8 GB to ~30 GB per agent — 56 GB on the wire once both Apollo and
+    # Aegis shipped one, which at the measured ~9.7 Mbit/s upstream is ~13.8h of
+    # upload and wedged the offsite lane for a day.
+    ".sparseimage",
+    ".sparsebundle",
+    ".dmg",
 )
 
 # File names to skip (runtime state that's meaningless on another machine)
