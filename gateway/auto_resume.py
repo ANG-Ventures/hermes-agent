@@ -118,6 +118,54 @@ class InterruptedTurnAssessment:
     reason: str | None = None
 
 
+# A finish_reason that proves the assistant ended its turn on purpose. Every
+# other value (None, "tool_calls", "interrupt_close", "verification_required",
+# anything a future provider invents) is treated as unproven and therefore
+# resumable — this gate only ever SKIPS work on positive evidence.
+_COMPLETED_FINISH_REASONS = frozenset({"stop"})
+
+
+def has_resumable_work(messages: Iterable[dict[str, Any]]) -> bool:
+    """True when the persisted tail leaves work a boot-resume turn could continue.
+
+    ``resume_pending`` is a HEDGE, not a diagnosis: ``stop()`` marks every
+    running session before the drain so a SIGKILL mid-drain cannot lose
+    in-flight work, and ``suspend_recently_active()`` re-marks everything that
+    looked recently active after an unclean exit. Both are correct. What is
+    missing is the counterpart: when the process is killed before the drain's
+    clear-the-hedge pass runs, sessions whose turn had ALREADY finished keep
+    the marker, and the next boot spends a full LLM turn "recovering" a
+    conversation that ended with a delivered answer.
+
+    The persisted transcript is the ground truth the marker lacks. This answers
+    the only question that matters at schedule time — *is anything actually
+    unfinished?* — and it fails CLOSED: anything unrecognized, unreadable, or
+    ambiguous reports True and resumes exactly as before. A skip requires
+    positive proof of completion: the last row is an assistant message, with no
+    unanswered tool calls, non-empty content, and an explicit ``stop``.
+    """
+    rows = [row for row in messages if isinstance(row, dict)]
+    if not rows:
+        # No persisted transcript to reason about — keep today's behaviour.
+        return True
+
+    tail = rows[-1]
+    if tail.get("role") != "assistant":
+        # A trailing user/tool/other row means the assistant never answered it.
+        return True
+    if tail.get("tool_calls") not in (None, [], "", {}):
+        # Tool calls with no results after them: the turn was cut mid-flight.
+        return True
+    if tail.get("finish_reason") not in _COMPLETED_FINISH_REASONS:
+        return True
+
+    content = tail.get("content")
+    if isinstance(content, str):
+        return not content.strip()
+    # Non-string content (native blocks) counts as delivered when non-empty.
+    return content in (None, [], {}, "")
+
+
 def _message_id(row: dict[str, Any]) -> int | None:
     value = row.get("id")
     if isinstance(value, bool) or not isinstance(value, (int, str)):
