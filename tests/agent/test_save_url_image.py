@@ -79,18 +79,30 @@ def http_server(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     (tmp_path / ".hermes").mkdir()
 
-    # Force the constants/image cache helpers to re-read HERMES_HOME.
+    # Force the constants/image cache helpers to re-read HERMES_HOME, then
+    # RESTORE them. An unrestored purge hands every later importer a brand-new
+    # module object, so a subsequent test that captured a reference to (or
+    # monkeypatched) one of these silently operates on an orphaned copy — the
+    # bug class fixed in PR #538. Caught here by the sys.modules leak gate.
     import sys
-    for mod in list(sys.modules):
-        if mod.startswith("hermes_constants") or mod.startswith("agent.image_gen_provider"):
-            sys.modules.pop(mod, None)
+    _saved_modules = {
+        name: mod
+        for name, mod in sys.modules.items()
+        if name.startswith("hermes_constants")
+        or name.startswith("agent.image_gen_provider")
+    }
+    for mod in _saved_modules:
+        sys.modules.pop(mod, None)
 
     httpd = socketserver.TCPServer(("127.0.0.1", 0), _TinyImageHandler)
     port = httpd.server_address[1]
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
-    yield f"http://127.0.0.1:{port}", httpd
-    httpd.shutdown()
+    try:
+        yield f"http://127.0.0.1:{port}", httpd
+    finally:
+        httpd.shutdown()
+        sys.modules.update(_saved_modules)
 
 
 class TestSaveUrlImage:
