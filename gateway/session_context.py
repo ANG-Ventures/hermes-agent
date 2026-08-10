@@ -428,6 +428,56 @@ def get_session_env(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
+def resolve_current_session_id() -> str | None:
+    """Resolve the active session id contextvar-first, os.environ fallback.
+
+    THE single resolver for "which session is running right now", shared by
+    every consumer that has to answer that question (comment provenance in
+    ``tools.kanban_tools``, the ``execute_code`` child-env bridge). The rules
+    below are subtle and were previously carried in one private copy; a second
+    copy would drift.
+
+    In the GATEWAY (concurrent sessions in one process) the per-turn contextvar
+    is the only correct source — the process-global ``os.environ``
+    ``HERMES_SESSION_ID`` can be clobbered by a concurrent session (the v3-latch
+    bug class). In a single-process host (CLI, cron-standalone, ACP, a
+    dispatcher-spawned worker) there is no bound contextvar and
+    :func:`get_session_env` falls through to that process's correct
+    ``os.environ`` value.
+
+    🔴 Empty-contextvar fallthrough — GATED on ``not _HERMES_GATEWAY``: some
+    non-gateway callers bind the contextvar to ``""`` (e.g. ACP binds
+    ``set_session_vars(session_key=session_id)`` which leaves the session_id
+    contextvar at its ``""`` default while writing the real id to
+    ``os.environ``). A ``""`` contextvar is NOT ``_UNSET``, so
+    :func:`get_session_env` returns ``""`` and would NOT fall through. We treat
+    an empty contextvar value as "not bound" and consult ``os.environ`` — but
+    ONLY outside the gateway. Inside the gateway, :func:`clear_session_vars`
+    deliberately sets ``""`` to *suppress* the ``os.environ`` fallback (so a
+    cleared post-turn read returns ``None``, never a stale/clobbered global),
+    and the per-turn contextvar is authoritative — so we never fall through
+    there. This mirrors :func:`set_current_session_id`'s own
+    ``not _HERMES_GATEWAY`` guard and preserves both contracts. Returns ``None``
+    when neither has a value.
+    """
+    import os
+
+    try:
+        val = get_session_env("HERMES_SESSION_ID")
+        if val:
+            return val
+        # Empty/unset contextvar. Outside the gateway (ACP/CLI/worker — single
+        # process, os.environ authoritative) fall through to os.environ. Inside
+        # the gateway, "" means cleared-and-fallback-suppressed → return None
+        # (the per-turn contextvar is the only correct source; a "" here is
+        # never a missing bind because _set_session_env binds session_id).
+        if os.environ.get("_HERMES_GATEWAY") == "1":
+            return None
+        return os.environ.get("HERMES_SESSION_ID") or None
+    except Exception:
+        return os.environ.get("HERMES_SESSION_ID") or None
+
+
 # ---------------------------------------------------------------------------
 # Send-origin context (routing-only) — fixes the subagent send_message leak.
 # ---------------------------------------------------------------------------

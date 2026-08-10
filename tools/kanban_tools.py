@@ -44,41 +44,19 @@ logger = logging.getLogger(__name__)
 
 
 def _current_session_id() -> Optional[str]:
-    """Resolve the active session id contextvar-first, os.environ fallback.
+    """Resolve the active session id — see
+    ``gateway.session_context.resolve_current_session_id`` for the rules.
 
-    In the GATEWAY (concurrent sessions in one process) the per-turn contextvar
-    is the only correct source — the process-global os.environ HERMES_SESSION_ID
-    can be clobbered by a concurrent session (the v3-latch bug class). In a
-    dispatcher-spawned WORKER subprocess (single process, no bound contextvar)
-    get_session_env falls through to that process's correct os.environ value.
-
-    🔴 Empty-contextvar fallthrough — GATED on ``not _HERMES_GATEWAY``: some
-    non-gateway callers bind the contextvar to "" (e.g. ACP binds
-    ``set_session_vars(session_key=session_id)`` which leaves the session_id
-    contextvar at its "" default while writing the real id to os.environ). A ""
-    contextvar is NOT _UNSET, so get_session_env returns "" and would NOT fall
-    through. We treat an empty contextvar value as "not bound" and consult
-    os.environ — but ONLY outside the gateway. Inside the gateway,
-    ``clear_session_vars`` deliberately sets "" to *suppress* the os.environ
-    fallback (so a cleared post-turn read returns None, never a stale/clobbered
-    global), and the per-turn contextvar is authoritative — so we never fall
-    through there. This mirrors ``set_current_session_id``'s own
-    ``not _HERMES_GATEWAY`` guard and preserves both contracts. Returns None
-    when neither has a value.
+    Kept as a thin alias so this module's existing call sites (and their tests)
+    are unchanged while the logic lives in exactly one place. The
+    ``execute_code`` child-env bridge resolves the same value through the same
+    function, so a sandbox script that writes a comment cannot be attributed
+    differently from an in-process tool call in the same turn.
     """
     try:
-        from gateway.session_context import get_session_env
-        val = get_session_env("HERMES_SESSION_ID")
-        if val:
-            return val
-        # Empty/unset contextvar. Outside the gateway (ACP/CLI/worker — single
-        # process, os.environ authoritative) fall through to os.environ. Inside
-        # the gateway, "" means cleared-and-fallback-suppressed → return None
-        # (the per-turn contextvar is the only correct source; a "" here is
-        # never a missing bind because _set_session_env binds session_id).
-        if os.environ.get("_HERMES_GATEWAY") == "1":
-            return None
-        return os.environ.get("HERMES_SESSION_ID") or None
+        from gateway.session_context import resolve_current_session_id
+
+        return resolve_current_session_id()
     except Exception:
         return os.environ.get("HERMES_SESSION_ID") or None
 
