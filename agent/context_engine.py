@@ -26,6 +26,7 @@ Lifecycle:
 """
 
 from abc import ABC, abstractmethod
+import inspect
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -59,6 +60,60 @@ _SKEW_SCALE_UP_KEY = "skew_scale_up"
 # one anomalous (rough, real) pair can never drive a wildly premature
 # compaction. The existing skew_floor guards the other direction.
 _SKEW_SCALE_UP_MAX = 1.60
+
+# Config key for the minimum number of paired (rough, real) readings a CONTENT
+# CLASS must accumulate before its own ratio is trusted over the blended global
+# one. See ``_per_class_min_samples`` for the justification of the default.
+_SKEW_CLASS_MIN_SAMPLES_KEY = "skew_class_min_samples"
+_SKEW_CLASS_MIN_SAMPLES_DEFAULT = 3
+
+
+def _per_class_min_samples() -> int:
+    """Minimum per-class readings before a class ratio overrides the global one.
+
+    Why 3, and why it is a knob rather than a constant:
+
+    The per-class ratio is a MEDIAN of at most ``_SKEW_HISTORY`` (5) readings.
+    A median needs >= 3 samples to be a median at all — with 1 it is the single
+    reading (no outlier rejection whatsoever, so one anomalous pair fully owns
+    the correction) and with 2 it is a mean of two, which an outlier still drags
+    half the distance. At 3 a single anomalous reading is out-voted by the other
+    two and cannot move the median outside their range. That is the smallest
+    sample size at which the smoothing the calibration already relies on
+    actually functions, which is why it is the floor rather than a number picked
+    for how it scores.
+
+    It is deliberately NOT set higher: the calibration is per-conversation
+    (``reset_skew_calibration`` clears it at every session boundary), so a floor
+    of, say, 10 would mean most conversations never reach per-class calibration
+    at all and the feature would be inert in exactly the sessions that matter.
+
+    Operators who want the historical single-global-ratio behavior can set
+    ``compression.skew_class_min_samples`` to a value no class will reach (or
+    to ``0``/negative, which disables per-class correction outright); those who
+    want more smoothing can raise it toward ``_SKEW_HISTORY``. Read defensively
+    — a config failure must never change compaction behavior.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly()
+        if not isinstance(cfg, dict):
+            return _SKEW_CLASS_MIN_SAMPLES_DEFAULT
+        compression_cfg = cfg.get("compression")
+        if not isinstance(compression_cfg, dict):
+            return _SKEW_CLASS_MIN_SAMPLES_DEFAULT
+        raw = compression_cfg.get(
+            _SKEW_CLASS_MIN_SAMPLES_KEY, _SKEW_CLASS_MIN_SAMPLES_DEFAULT
+        )
+        value = int(raw)
+        # A ceiling above the retained history would make the class arm
+        # unreachable by construction; that is a legitimate way to disable it,
+        # so it is allowed, but it must not be negative-indexed anywhere.
+        return max(0, value)
+    except Exception:
+        logger.debug("per-class skew min-samples config read failed", exc_info=True)
+        return _SKEW_CLASS_MIN_SAMPLES_DEFAULT
 
 
 def _scale_up_calibration_enabled() -> bool:
@@ -106,6 +161,83 @@ def _below_threshold_announce_enabled() -> bool:
     except Exception:
         logger.debug("below-threshold announce config read failed", exc_info=True)
         return True
+
+
+def classify_request(messages) -> "str | None":
+    """Dominant content class of an outgoing request, or None. Never raises.
+
+    Module-level (not a method) so every engine — including duck-typed test
+    doubles and third-party plugins that do not subclass ContextEngine — gets
+    the same behavior without needing to grow a member.
+    """
+    if not messages:
+        return None
+    try:
+        from agent.content_class import dominant_content_class
+
+        return dominant_content_class(messages)
+    except Exception:
+        # Classification is an optimization: any failure falls back to the
+        # global calibration rather than perturbing the live turn.
+        logger.debug("content classification failed", exc_info=True)
+        return None
+
+
+def class_skew_ratio(by_class, content_class: "str | None") -> "float | None":
+    """Median skew for one content class, or ``None`` to defer to global.
+
+    ``None`` is returned whenever the class arm must not be trusted: no class,
+    no bucket, or fewer than ``compression.skew_class_min_samples`` readings in
+    it. That is the clean fallback to the pre-existing global behavior — a class
+    that has not been measured enough contributes nothing, it does not
+    contribute a bad number.
+    """
+    if not content_class or not isinstance(by_class, dict):
+        return None
+    bucket = by_class.get(content_class)
+    if not bucket:
+        return None
+    min_samples = _per_class_min_samples()
+    # A floor of 0 disables the per-class arm entirely (documented operator
+    # kill switch); it must not be read as "any single sample qualifies".
+    if min_samples <= 0 or len(bucket) < min_samples:
+        return None
+    ordered = sorted(bucket)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def call_with_messages(fn, rough_tokens, messages):
+    """Call a calibration entry point with ``messages``, tolerating old signatures.
+
+    The per-content-class calibration needs the request being estimated so it
+    can classify it. Third-party context-engine plugins ship their own
+    ``note_rough_sent`` / ``calibrated_tokens`` / ``should_compress_calibrated``
+    overrides that predate the parameter, so the host degrades to the
+    single-argument call rather than breaking them — those engines keep the
+    global-only behavior, which is exactly the documented fallback.
+
+    Only a signature mismatch falls back; any other exception propagates, so a
+    real bug inside the engine is not silently swallowed and retried.
+    """
+    if messages is None:
+        return fn(rough_tokens)
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        # Un-introspectable callable (C function, some mocks): try the new
+        # signature and fall back on the specific TypeError it would raise.
+        try:
+            return fn(rough_tokens, messages)
+        except TypeError:
+            return fn(rough_tokens)
+    try:
+        sig.bind(rough_tokens, messages)
+    except TypeError:
+        return fn(rough_tokens)
+    return fn(rough_tokens, messages)
 
 
 def sanitize_memory_context(memory_context: str) -> str:
@@ -464,7 +596,9 @@ class ContextEngine(ABC):
         process-global singleton, so a skew learned in one conversation must not leak
         into the next session's first preflight (Greptile #111)."""
         self._recent_skews = []
+        self._class_skews = {}
         self._last_rough_sent = 0
+        self._last_rough_class = None
         self.rough_at_last_real = 0
 
     def seed_skew_calibration(self, ratios: "list[float]") -> None:
@@ -587,12 +721,32 @@ class ContextEngine(ABC):
         self.seed_skew_calibration(persisted)
         return bool(getattr(self, "_recent_skews", None))
 
-    def note_rough_sent(self, rough_tokens: int) -> None:
+    def note_rough_sent(
+        self,
+        rough_tokens: int,
+        messages: "list | None" = None,
+    ) -> None:
         """Stash the rough estimate of the request about to be sent so the next
         ``record_skew_from_real``/``update_from_response`` pairs it with the real
-        prompt_tokens (the skew denominator). Same message set ⇒ correct ratio."""
+        prompt_tokens (the skew denominator). Same message set ⇒ correct ratio.
+
+        When ``messages`` is supplied the request is also CLASSIFIED (see
+        ``agent.content_class``) and the resulting ratio is filed under the
+        dominant content class as well as the global history — so a tool-output
+        heavy turn learns and applies the tool-class correction instead of one
+        blended across content that skews differently. ``messages`` is optional
+        so every existing caller (and every third-party engine host) keeps
+        working unchanged; without it the calibration is exactly the pre-existing
+        global-only behavior.
+        """
         if rough_tokens and rough_tokens > 0:
             self._last_rough_sent = int(rough_tokens)
+            self._last_rough_class = classify_request(messages)
+
+    @staticmethod
+    def _classify_request(messages: "list | None") -> "str | None":
+        """Dominant content class of an outgoing request, or None. Never raises."""
+        return classify_request(messages)
 
     def record_skew_from_real(self, real_prompt_tokens: int) -> None:
         """Pair a real provider ``prompt_tokens`` with the stashed rough (atomically,
@@ -638,10 +792,28 @@ class ContextEngine(ABC):
             hist.append(ratio)
             if len(hist) > self._SKEW_HISTORY:
                 self._recent_skews = hist[-self._SKEW_HISTORY:]
+            # Per-class arm: file the SAME (already-bounded) ratio under the
+            # dominant content class of the request it was measured on, so a
+            # tool-output-heavy turn learns the tool-class rate instead of one
+            # blended with prose. The global history above is unconditional —
+            # per-class is strictly additive and the global remains the fallback
+            # for any class below the sample floor.
+            cls = getattr(self, "_last_rough_class", None)
+            if cls:
+                by_class = getattr(self, "_class_skews", None)
+                if not isinstance(by_class, dict):
+                    by_class = {}
+                    self._class_skews = by_class
+                bucket = by_class.setdefault(cls, [])
+                bucket.append(ratio)
+                if len(bucket) > self._SKEW_HISTORY:
+                    by_class[cls] = bucket[-self._SKEW_HISTORY:]
             # T0: consume the stashed rough so the next real reading without a fresh
             # note_rough_sent records nothing (bounds cross-turn/session mispairing
-            # to ≤1 on the process-global singleton).
+            # to ≤1 on the process-global singleton). The class label is consumed
+            # with it — a stale label must not tag the next turn's reading.
             self._last_rough_sent = 0
+            self._last_rough_class = None
             # Persist the updated history so a process restart can seed the
             # calibration instead of reverting to skew=1.0 (raw rough) on the
             # first post-restart preflight (2026-07-10 false-fire incident).
@@ -653,9 +825,24 @@ class ContextEngine(ABC):
             # T1: skew telemetry — one COMPACTION_SKEW line per FRESH pair, so a skew
             # distribution is buildable from logs. Best-effort: a logging failure or a
             # missing attribute must NEVER propagate into the live turn (INV-2).
-            self._emit_skew_telemetry(last_rough, int(real_prompt_tokens), ratio)
+            try:
+                self._emit_skew_telemetry(
+                    last_rough, int(real_prompt_tokens), ratio, cls
+                )
+            except TypeError:
+                # An engine/test double overriding the pre-class 3-arg
+                # signature must not break on the added label.
+                self._emit_skew_telemetry(
+                    last_rough, int(real_prompt_tokens), ratio
+                )
 
-    def _emit_skew_telemetry(self, rough: int, real: int, ratio: float) -> None:
+    def _emit_skew_telemetry(
+        self,
+        rough: int,
+        real: int,
+        ratio: float,
+        content_class: "str | None" = None,
+    ) -> None:
         """Best-effort COMPACTION_SKEW telemetry (T1). Never raises into the hot path.
 
         Emits one ``info`` line per fresh (rough, real) pair and appends the same
@@ -670,7 +857,8 @@ class ContextEngine(ABC):
             model_str = f"{provider}/{model}" if provider else model
             line = (
                 f"COMPACTION_SKEW rough={rough} real={real} ratio={ratio:.3f} "
-                f"task={task} model={model_str} ctx={ctx}"
+                f"task={task} model={model_str} ctx={ctx} "
+                f"class={content_class or 'mixed'}"
             )
             logger.info(line)
             # Dedicated non-rotating sample sink (main-turn distribution only — the
@@ -700,29 +888,70 @@ class ContextEngine(ABC):
         with open(os.path.join(state_dir, "skew-samples.log"), "a", encoding="utf-8") as fh:
             fh.write(f"{stamp} {line}\n")
 
-    def _current_skew(self) -> float:
+    def _resolve_content_class(
+        self, messages: "list | None" = None
+    ) -> "str | None":
+        """Content class to calibrate THIS estimate against.
+
+        Prefers an explicitly supplied message list (classified live). Falls
+        back to the class stashed by the matching ``note_rough_sent`` for the
+        same request, so a host that wires only the recording side still gets
+        per-class reads. ``None`` ⇒ use the global blended calibration.
+        """
+        if messages:
+            cls = classify_request(messages)
+            if cls:
+                return cls
+        return getattr(self, "_last_rough_class", None)
+
+    def _class_skew_ratio(self, content_class: "str | None") -> "float | None":
+        """Median skew for this engine's ``content_class`` bucket, or None.
+
+        Delegates to the module-level :func:`class_skew_ratio` so an engine
+        (or test double) that never grew ``_class_skews`` degrades to the
+        global calibration instead of raising.
+        """
+        return class_skew_ratio(getattr(self, "_class_skews", None), content_class)
+
+    def _current_skew(self, content_class: "str | None" = None) -> float:
         """Median of the last-k real/rough ratios, clamped to [floor, ceiling].
         Returns 1.0 (no scaling = pre-P2 behavior) when no real reading has
         paired yet.
+
+        When ``content_class`` is supplied AND that class has at least
+        ``compression.skew_class_min_samples`` readings, the median is taken
+        over that class's readings only — the estimator's error is a RATE error
+        that differs by content (prose vs structured tool output vs media), so a
+        tool-output-heavy request is corrected by the tool-class ratio instead
+        of one blended across content that skews differently. Below the sample
+        floor (or with no class) the global history is used exactly as before.
 
         The upper clamp is 1.0 when scale-up is disabled (historical behavior:
         the estimate is only ever corrected DOWN). When ``compression.
         skew_scale_up`` is on (default) it rises to ``_SKEW_SCALE_UP_MAX`` so a
         measured UNDER-count can actually reach the trigger — otherwise
         record_skew_from_real's un-clamped ratio is silently re-clamped here and
-        the correction never takes effect.
+        the correction never takes effect. The per-class arm rides the SAME
+        clamp band: a class median may correct an under-count upward, bounded by
+        the same ceiling.
         """
-        hist = getattr(self, "_recent_skews", None)
-        if not hist:
-            return 1.0
-        ordered = sorted(hist)
-        mid = len(ordered) // 2
-        med = ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
+        med = class_skew_ratio(getattr(self, "_class_skews", None), content_class)
+        if med is None:
+            hist = getattr(self, "_recent_skews", None)
+            if not hist:
+                return 1.0
+            ordered = sorted(hist)
+            mid = len(ordered) // 2
+            med = (
+                ordered[mid]
+                if len(ordered) % 2
+                else (ordered[mid - 1] + ordered[mid]) / 2.0
+            )
         floor = getattr(self, "_skew_floor", self._SKEW_FLOOR_DEFAULT)
         ceiling = _SKEW_SCALE_UP_MAX if _scale_up_calibration_enabled() else 1.0
         return max(floor, min(ceiling, med))
 
-    def _trigger_skew(self) -> float:
+    def _trigger_skew(self, content_class: "str | None" = None) -> float:
         """Skew used for the compaction TRIGGER decision only (never for display).
 
         Identical to ``_current_skew`` once at least one real reading has paired.
@@ -735,6 +964,10 @@ class ContextEngine(ABC):
         min 0.10 across 5,268 samples, so an uncalibrated estimate can over-count
         badly on dense/schema-heavy sessions).
 
+        A class that has cleared the sample floor is itself a real reading, so
+        it satisfies the cold-start condition even if the global history were
+        somehow empty.
+
         This is trigger-ONLY: ``_current_skew`` deliberately stays identity (1.0)
         on empty history so the displayed/logged estimate remains an honest 'not
         yet measured' value (Greptile #111 display contract). Deferring here can
@@ -742,8 +975,10 @@ class ContextEngine(ABC):
         window hard-frac ceiling as a skew-independent 413 backstop.
         """
         hist = getattr(self, "_recent_skews", None)
-        if hist:
-            return self._current_skew()
+        if hist or class_skew_ratio(
+            getattr(self, "_class_skews", None), content_class
+        ) is not None:
+            return self._current_skew(content_class)
         floor = getattr(self, "_skew_floor", self._SKEW_FLOOR_DEFAULT)
         # Clamp defensively to a sane band; a misconfigured floor must not scale the
         # estimate UP (rough never under-counts) or so low it silently disables the
@@ -760,7 +995,9 @@ class ContextEngine(ABC):
             floor = self._SKEW_FLOOR_DEFAULT
         return max(self._TRIGGER_SKEW_MIN, min(1.0, floor))
 
-    def calibrated_tokens(self, rough_tokens: int) -> int:
+    def calibrated_tokens(
+        self, rough_tokens: int, messages: "list | None" = None
+    ) -> int:
         """``round(rough × skew)`` — the rough estimate scaled to the provider's
         measured accounting. Safe default (skew 1.0) ⇒ identical to raw rough.
 
@@ -768,20 +1005,30 @@ class ContextEngine(ABC):
         in the preflight status line and logged, so it must stay identity until a
         real reading pairs. The TRIGGER decision applies the cold-start prior
         separately via ``_trigger_calibrated_tokens`` inside
-        ``should_compress_calibrated``."""
+        ``should_compress_calibrated``.
+
+        ``messages`` (optional) is the request being estimated; when supplied it
+        is classified so the correction applied is the one measured on this
+        request's dominant content class."""
         if rough_tokens <= 0:
             return rough_tokens
-        return int(round(rough_tokens * self._current_skew()))
+        cls = self._resolve_content_class(messages)
+        return int(round(rough_tokens * self._current_skew(cls)))
 
-    def _trigger_calibrated_tokens(self, rough_tokens: int) -> int:
+    def _trigger_calibrated_tokens(
+        self, rough_tokens: int, messages: "list | None" = None
+    ) -> int:
         """``round(rough × trigger_skew)`` — the trigger-decision calibration.
         Identical to ``calibrated_tokens`` once history exists; applies the
         cold-start prior on empty history."""
         if rough_tokens <= 0:
             return rough_tokens
-        return int(round(rough_tokens * self._trigger_skew()))
+        cls = self._resolve_content_class(messages)
+        return int(round(rough_tokens * self._trigger_skew(cls)))
 
-    def should_compress_calibrated(self, rough_tokens: int) -> bool:
+    def should_compress_calibrated(
+        self, rough_tokens: int, messages: "list | None" = None
+    ) -> bool:
         """P2 trigger: compact when CALIBRATED rough ≥ threshold, OR when RAW rough
         reaches the window ceiling (skew-independent 413 / dense-paste guard — a
         dense in-turn paste raises raw rough so the ceiling fires even if a stale
@@ -791,12 +1038,17 @@ class ContextEngine(ABC):
         The calibrated compare uses the TRIGGER skew (cold-start prior on empty
         history) so a fresh/resumed large session does not false-fire; the window
         hard-frac ceiling below is skew-independent and remains the overflow
-        backstop, so the cold-start deferral can never cause a 413."""
+        backstop, so the cold-start deferral can never cause a 413.
+
+        ``messages`` (optional) is classified so a tool-output-heavy request is
+        compared against the tool-class correction rather than a blended one."""
         ctx_len = getattr(self, "context_length", 0) or 0
         hard_frac = getattr(self, "_hard_frac", self._HARD_FRAC_DEFAULT)
         if ctx_len > 0 and rough_tokens >= int(ctx_len * hard_frac):
             return self.should_compress(rough_tokens)
-        return self.should_compress(self._trigger_calibrated_tokens(rough_tokens))
+        return self.should_compress(
+            self._trigger_calibrated_tokens(rough_tokens, messages)
+        )
 
     def get_automatic_compaction_status_message(
         self,

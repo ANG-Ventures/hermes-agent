@@ -828,6 +828,25 @@ DEFAULT_CONFIG = {
                                       # produces a compaction the user cannot explain.
                                       # Set False to keep that arm quiet.
         "hygiene_threshold": 0.85,    # gateway session-hygiene token threshold (fraction of window); higher than compression.threshold (pre-turn backstop)
+        "skew_class_min_samples": 3,  # minimum paired (rough, real) readings a
+                                      # CONTENT CLASS (plain text / tool output /
+                                      # media -- see agent/content_class.py) must
+                                      # accumulate before its own measured skew
+                                      # ratio is applied instead of the blended
+                                      # global one. The class ratio is a median of
+                                      # at most 5 readings, and a median only
+                                      # rejects an outlier from 3 samples up (at 1
+                                      # it IS the outlier; at 2 an outlier still
+                                      # drags it half-way) -- so 3 is the smallest
+                                      # sample size at which the smoothing the
+                                      # calibration already relies on works. Set 0
+                                      # to disable per-class correction entirely
+                                      # (restores the single-global-ratio
+                                      # behavior); raise toward 5 for more
+                                      # smoothing at the cost of the class arm
+                                      # engaging later in a conversation.
+                                      # Read by agent/context_engine.py
+                                      # (_per_class_min_samples).
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).

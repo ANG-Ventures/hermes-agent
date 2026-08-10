@@ -2558,6 +2558,16 @@ class ContextCompressor(ContextEngine):
         self.rough_at_last_real = 0
         self._last_rough_sent = 0
         self._recent_skews: List[float] = []
+        # Per-CONTENT-CLASS skew histories (see agent/content_class.py). The
+        # estimator's miss is a RATE error that differs between prose, tool
+        # output, and media, so one blended ratio is wrong for each of them.
+        # Each class keeps its own last-k ratios; a class below
+        # compression.skew_class_min_samples falls back to the global history.
+        self._class_skews: Dict[str, List[float]] = {}
+        # Dominant content class of the request whose rough is currently
+        # stashed; consumed alongside _last_rough_sent so a stale label can
+        # never tag the next turn's reading.
+        self._last_rough_class: "str | None" = None
         # Skew floor: never scale the rough estimate below this fraction of itself —
         # the sole guard against compacting LATE when the recorded skew is stale vs
         # the current content. Conservative default 0.7 (rough must over-count by

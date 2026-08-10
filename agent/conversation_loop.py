@@ -35,7 +35,10 @@ from agent.conversation_compression import (
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
 )
-from agent.context_engine import automatic_compaction_status_message
+from agent.context_engine import (
+    automatic_compaction_status_message,
+    call_with_messages as _call_with_messages,
+)
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.turn_context import (
@@ -2168,6 +2171,11 @@ def run_conversation(
         # (schema overhead / post-compaction) defers, while a raw-rough window
         # ceiling still fires the 413/dense-paste guard. Fall back to the raw
         # ``should_compress`` only if a plugin engine lacks the calibrated API.
+        #
+        # `messages` is threaded through so the calibration can classify the
+        # request and apply the per-content-class correction (see
+        # agent/content_class.py); `call_with_messages` degrades to the
+        # single-argument call for engines predating the parameter.
         _should_compress_preflight = getattr(
             _compressor, "should_compress_calibrated", _compressor.should_compress
         )
@@ -2181,7 +2189,9 @@ def run_conversation(
             and not _preflight_compression_blocked
             and not _defer_preflight(request_pressure_tokens)
             and not _compression_cooldown
-            and _should_compress_preflight(request_pressure_tokens)
+            and _call_with_messages(
+                _should_compress_preflight, request_pressure_tokens, messages
+            )
         ):
             if _moa_prepared_request is not None:
                 pending_moa_prepared_request = _moa_prepared_request
