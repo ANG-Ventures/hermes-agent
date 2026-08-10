@@ -644,6 +644,33 @@ class ContextEngine(ABC):
         provider = (getattr(self, "provider", "") or "").strip()
         return (provider, model)
 
+    def bind_session_state(self, session_db: "Any" = None, session_id: str = "") -> None:
+        """Hand the engine the session store its persistence layer needs.
+
+        ``ContextCompressor`` overrides this with a much larger version that
+        also rehydrates cooldowns and failure streaks. The ABC needs its own
+        minimal default because ``agent_init`` binds via
+        ``getattr(engine, "bind_session_state", None)``: an engine that does
+        NOT define it (every plugin engine — LCM included) silently skips the
+        bind, leaves ``_session_db`` unset, and makes
+        ``_persist_skew_history()`` a permanent no-op.
+
+        That is not hypothetical. Measured 2026-08-09 on the live tree: the
+        calibration loop was running correctly (COMPACTION_SKEW lines with
+        ratios of 1.33-1.41 and per-class labels), while
+        ``compression_skew_calibration`` held ZERO rows — so every restart
+        threw the learned ratio away and started from raw-rough 1.0, which is
+        exactly the case the persistence was built for. Defining the default
+        here fixes the whole class rather than one engine: any future engine
+        inherits a working bind instead of failing silently the same way.
+
+        Deliberately minimal and side-effect-free beyond the two attributes:
+        seeding is the caller's business, and a plugin engine must not
+        inherit ContextCompressor's cooldown rehydration.
+        """
+        self._session_db = session_db
+        self._session_id = session_id or ""
+
     def _persist_skew_history(self) -> None:
         """Persist the current skew history (best-effort, never raises).
 
