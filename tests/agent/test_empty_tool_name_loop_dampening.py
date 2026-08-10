@@ -27,7 +27,9 @@ import shutil
 import sys
 import tempfile
 import threading
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from types import ModuleType
 
 import pytest
 
@@ -35,6 +37,76 @@ import pytest
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+
+
+_MISSING = object()
+
+
+def _is_reload_target(module_name: str) -> bool:
+    return (
+        module_name == "run_agent"
+        or module_name.startswith("agent.")
+        or module_name.startswith("tools.")
+        or module_name.startswith("hermes_")
+    )
+
+
+def _purge_reload_targets():
+    modules = {
+        name: module
+        for name, module in list(sys.modules.items())
+        if _is_reload_target(name)
+    }
+    parent_attrs = {}
+    for name in modules:
+        parent_name, separator, child_name = name.rpartition(".")
+        parent = sys.modules.get(parent_name) if separator else None
+        if parent is not None:
+            parent_attrs[(parent, child_name)] = parent.__dict__.get(
+                child_name, _MISSING
+            )
+
+    for name in sorted(modules, key=lambda value: value.count("."), reverse=True):
+        parent_name, separator, child_name = name.rpartition(".")
+        parent = sys.modules.get(parent_name) if separator else None
+        if parent is not None:
+            parent.__dict__.pop(child_name, None)
+        sys.modules.pop(name, None)
+    return modules, parent_attrs
+
+
+def _restore_reload_targets(modules, parent_attrs):
+    current_modules = {
+        name: module
+        for name, module in list(sys.modules.items())
+        if _is_reload_target(name)
+    }
+    for name, module in sorted(
+        current_modules.items(),
+        key=lambda item: item[0].count("."),
+        reverse=True,
+    ):
+        parent_name, separator, child_name = name.rpartition(".")
+        parent = sys.modules.get(parent_name) if separator else None
+        if parent is not None and parent.__dict__.get(child_name) is module:
+            parent.__dict__.pop(child_name, None)
+        sys.modules.pop(name, None)
+
+    sys.modules.update(modules)
+    for (parent, child_name), value in parent_attrs.items():
+        if value is _MISSING:
+            parent.__dict__.pop(child_name, None)
+        else:
+            parent.__dict__[child_name] = value
+
+
+@contextmanager
+def _fresh_reload_scope():
+    modules, parent_attrs = _purge_reload_targets()
+    try:
+        yield
+    finally:
+        _restore_reload_targets(modules, parent_attrs)
 
 
 class _MockHandler(BaseHTTPRequestHandler):
@@ -145,61 +217,63 @@ def agent_env():
     # object than the code under test imports — measured 2026-08-09 as ~11
     # downstream failures in tests/agent/test_title_generator.py, whose provider
     # configuration silently applied to an orphaned module copy.
-    _purged_modules = {
-        name: mod
-        for name, mod in sys.modules.items()
-        if name == "run_agent"
-        or name.startswith("agent.")
-        or name.startswith("tools.")
-        or name.startswith("hermes_")
-    }
-    for mod in _purged_modules:
-        del sys.modules[mod]
-    from run_agent import AIAgent
-
-    agent = AIAgent(
-        api_key="test-key", base_url=f"http://127.0.0.1:{port}/v1",
-        provider="openai-compat", model="test-model",
-        max_iterations=10, enabled_toolsets=[],
-        quiet_mode=True, skip_context_files=True, skip_memory=True,
-        save_trajectories=False, platform="cli",
-    )
-    agent.valid_tool_names = {"terminal", "read_file", "write_file", "execute_code", "session_search"}
-
     try:
-        yield agent, _MockHandler
+        with _fresh_reload_scope():
+            from run_agent import AIAgent
+
+            agent = AIAgent(
+                api_key="test-key", base_url=f"http://127.0.0.1:{port}/v1",
+                provider="openai-compat", model="test-model",
+                max_iterations=10, enabled_toolsets=[],
+                quiet_mode=True, skip_context_files=True, skip_memory=True,
+                save_trajectories=False, platform="cli",
+            )
+            setattr(
+                agent,
+                "valid_tool_names",
+                {"terminal", "read_file", "write_file", "execute_code", "session_search"},
+            )
+
+            try:
+                yield agent, _MockHandler
+            finally:
+                # Tear down async logging before the fresh hermes_logging module
+                # is removed or the temporary home is deleted. setup_logging()
+                # parks its real file handlers in the module-global queue, not
+                # on the public logger objects.
+                try:
+                    import hermes_logging as _hl
+
+                    _hl._reset_queued_handlers()
+                    _hl._logging_initialized = False
+                except Exception:
+                    pass
     finally:
         srv.shutdown()
-        # Tear down async logging BEFORE the temp home is deleted. Building a
-        # real AIAgent runs setup_logging(), which parks RotatingFileHandlers on
-        # <test_home>/.hermes/logs/*.log inside hermes_logging's module-global
-        # queue — NOT on any logger — so pytest's conftest handler-strip (which
-        # walks loggers looking for .baseFilename) cannot see them and they
-        # survive this fixture.
-        #
-        # This module also purges sys.modules of every `hermes_*`/`agent.*`
-        # module on each setup, so each test re-imports a FRESH hermes_logging
-        # with an empty handler list; the stale handlers from prior tests stay
-        # bound to already-deleted temp dirs. Every later log write in the same
-        # pytest process then raises
-        #   FileNotFoundError: .../hermes_e2e_*/.hermes/logs/agent.log
-        # which is how this file poisoned a large neighbourhood of unrelated
-        # tests in the full-suite run (measured 2026-08-09: ~11 downstream
-        # failures in tests/agent/test_title_generator.py alone).
-        try:
-            import hermes_logging as _hl
-            _hl._reset_queued_handlers()
-            _hl._logging_initialized = False
-        except Exception:
-            pass
         shutil.rmtree(test_home, ignore_errors=True)
         if prev_home is None:
             os.environ.pop("HERMES_HOME", None)
         else:
             os.environ["HERMES_HOME"] = prev_home
-        # Restore the modules this fixture purged, so later tests import the
-        # SAME module objects they had before — see the note at the purge site.
-        sys.modules.update(_purged_modules)
+
+
+def test_reload_scope_restores_modules_package_attrs_and_fresh_only_entries():
+    """The E2E reload must leave the pre-collected module graph unchanged."""
+    import agent
+    import agent.auxiliary_client as original_auxiliary_client
+
+    with _fresh_reload_scope():
+        import agent.auxiliary_client as fresh_auxiliary_client
+
+        assert fresh_auxiliary_client is not original_auxiliary_client
+        fresh_only = ModuleType("agent._pollution_probe")
+        sys.modules[fresh_only.__name__] = fresh_only
+        agent.__dict__["_pollution_probe"] = fresh_only
+
+    assert sys.modules["agent.auxiliary_client"] is original_auxiliary_client
+    assert agent.__dict__["auxiliary_client"] is original_auxiliary_client
+    assert "agent._pollution_probe" not in sys.modules
+    assert "_pollution_probe" not in agent.__dict__
 
 
 def _tool_results(handler) -> list[str]:

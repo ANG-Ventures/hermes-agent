@@ -14,22 +14,98 @@ gets stripped from the durable transcript. This test file verifies:
 
 import json
 import sys
+from contextlib import contextmanager
 from unittest.mock import MagicMock
 
 import pytest
 
 
-def _fresh_run_agent(hermes_home):
-    for mod in list(sys.modules):
-        if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):
-            del sys.modules[mod]
-    import run_agent  # noqa: F401
-    return sys.modules["run_agent"]
+_MISSING = object()
 
 
-def test_verification_flags_registered_as_ephemeral(tmp_path, monkeypatch):
+def _is_reload_target(module_name):
+    return (
+        module_name == "run_agent"
+        or module_name.startswith("agent.")
+        or module_name.startswith("tools.")
+        or module_name.startswith("hermes_")
+    )
+
+
+@contextmanager
+def _fresh_run_agent():
+    saved_modules = {
+        name: module
+        for name, module in list(sys.modules.items())
+        if _is_reload_target(name)
+    }
+    saved_parent_attrs = {}
+    for name in saved_modules:
+        parent_name, separator, child_name = name.rpartition(".")
+        parent = sys.modules.get(parent_name) if separator else None
+        if parent is not None:
+            saved_parent_attrs[(parent, child_name)] = parent.__dict__.get(
+                child_name, _MISSING
+            )
+
+    for name in sorted(saved_modules, key=lambda value: value.count("."), reverse=True):
+        parent_name, separator, child_name = name.rpartition(".")
+        parent = sys.modules.get(parent_name) if separator else None
+        if parent is not None:
+            parent.__dict__.pop(child_name, None)
+        sys.modules.pop(name, None)
+
+    try:
+        import run_agent
+
+        yield run_agent
+    finally:
+        current_modules = {
+            name: module
+            for name, module in list(sys.modules.items())
+            if _is_reload_target(name)
+        }
+        for name, module in sorted(
+            current_modules.items(),
+            key=lambda item: item[0].count("."),
+            reverse=True,
+        ):
+            parent_name, separator, child_name = name.rpartition(".")
+            parent = sys.modules.get(parent_name) if separator else None
+            if parent is not None and parent.__dict__.get(child_name) is module:
+                parent.__dict__.pop(child_name, None)
+            sys.modules.pop(name, None)
+        sys.modules.update(saved_modules)
+        for (parent, child_name), value in saved_parent_attrs.items():
+            if value is _MISSING:
+                parent.__dict__.pop(child_name, None)
+            else:
+                parent.__dict__[child_name] = value
+
+
+@pytest.fixture
+def fresh_run_agent(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-    ra = _fresh_run_agent(tmp_path)
+    with _fresh_run_agent() as run_agent:
+        yield run_agent
+
+
+def test_fresh_run_agent_restores_precollected_module_identity(tmp_path):
+    """Fresh imports must not replace modules held by later test files."""
+    import agent
+    import agent.transports.codex as original_codex
+
+    with pytest.MonkeyPatch.context() as scoped_patch:
+        scoped_patch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        with _fresh_run_agent():
+            assert sys.modules.get("agent.transports.codex") is not original_codex
+
+    assert sys.modules["agent.transports.codex"] is original_codex
+    assert agent.__dict__["transports"].__dict__["codex"] is original_codex
+
+
+def test_verification_flags_registered_as_ephemeral(fresh_run_agent):
+    ra = fresh_run_agent
 
     assert "_verification_stop_synthetic" in ra._EPHEMERAL_SCAFFOLDING_FLAGS
     assert "_pre_verify_synthetic" in ra._EPHEMERAL_SCAFFOLDING_FLAGS
@@ -65,11 +141,10 @@ def _make_agent(ra, session_id, tmp_path):
     return agent
 
 
-def test_db_flush_drops_only_nudge_keeps_candidate(tmp_path, monkeypatch):
+def test_db_flush_drops_only_nudge_keeps_candidate(tmp_path, fresh_run_agent):
     """The assistant candidate is NOT flagged synthetic, so it persists.
     Only the nudge (flagged synthetic) is dropped from the DB flush."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-    ra = _fresh_run_agent(tmp_path)
+    ra = fresh_run_agent
     agent = _make_agent(ra, "sess_db", tmp_path)
 
     messages = [
@@ -96,11 +171,10 @@ def test_db_flush_drops_only_nudge_keeps_candidate(tmp_path, monkeypatch):
     assert "[System: run tests]" not in persisted
 
 
-def test_json_log_drops_only_nudge_keeps_candidate(tmp_path, monkeypatch):
+def test_json_log_drops_only_nudge_keeps_candidate(tmp_path, fresh_run_agent):
     """The assistant candidate is NOT flagged synthetic, so it persists in the
     JSON log. Only the nudge (flagged synthetic) is dropped."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-    ra = _fresh_run_agent(tmp_path)
+    ra = fresh_run_agent
     agent = _make_agent(ra, "sess_json", tmp_path)
 
     messages = [
