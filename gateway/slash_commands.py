@@ -1979,6 +1979,65 @@ class GatewaySlashCommandsMixin:
         except Exception as exc:  # noqa: BLE001 — announce must never break the switch
             logger.debug("model-switch announce failed: %s", exc)
 
+    def _switch_reasoning_kwargs(
+        self,
+        *,
+        source: Any = None,
+        session_key: "str | None" = None,
+        model: str = "",
+    ) -> dict:
+        """Kwargs threading the session's resolved effort into ``switch_model``.
+
+        ``agent.agent_runtime_helpers.switch_model`` lives in ``agent/`` and has
+        no access to gateway session state, so it cannot see a ``/reasoning``
+        session override (which lives on ``SessionState.conversation``, not in
+        config.yaml). Left to itself it can only apply the #467 fallback rule
+        (per-model override, else keep the agent's current effort); handing it
+        the session-resolved value for the NEW model closes the last gap so the
+        full ratified ladder applies:
+
+            session ``/reasoning`` override > per-model ``reasoning_overrides``
+            for the new model > the effort already in effect.
+
+        Returns ``{}`` when resolution fails, which degrades to switch_model's
+        own keep-current behaviour — never to the global config default.
+        """
+        try:
+            return {
+                "session_reasoning_config": self._resolve_session_reasoning_config(
+                    source=source, session_key=session_key, model=model,
+                )
+            }
+        except Exception:  # noqa: BLE001
+            logger.debug("session reasoning resolution for /model failed", exc_info=True)
+            return {}
+
+    def _post_switch_reasoning_config(
+        self,
+        agent,
+        *,
+        source: Any = None,
+        session_key: "str | None" = None,
+        model: str = "",
+    ) -> "dict | None":
+        """The reasoning config the session ACTUALLY runs at after the switch.
+
+        #467 rule 3 — never compute the displayed effort from the field that
+        REQUESTED the change; read the post-swap state. Prefers the live
+        agent's ``reasoning_config`` (the value ``switch_model`` just settled),
+        falling back to the session resolver for the new model when there is no
+        cached agent to swap.
+        """
+        cfg = getattr(agent, "reasoning_config", None) if agent is not None else None
+        if isinstance(cfg, dict):
+            return cfg
+        try:
+            return self._resolve_session_reasoning_config(
+                source=source, session_key=session_key, model=model,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+
     def _fast_unavailable_model_switch_row(self, result: Any) -> Optional[str]:
         """Explain when an enabled Fast toggle cannot follow a new route."""
         if getattr(self, "_service_tier", None) != "priority":
@@ -2257,6 +2316,17 @@ class GatewaySlashCommandsMixin:
                                     api_key=result.api_key,
                                     base_url=result.base_url,
                                     api_mode=result.api_mode,
+                                    # Keep the session's /reasoning override
+                                    # across the route change (#467 contract);
+                                    # without this switch_model would fall back
+                                    # to its own keep-current rule, which is
+                                    # blind to a session override the gateway
+                                    # holds but config.yaml does not.
+                                    **_self._switch_reasoning_kwargs(
+                                        source=event.source,
+                                        session_key=_session_key,
+                                        model=result.new_model,
+                                    ),
                                 )
                             except Exception as exc:
                                 # The in-place swap rolled the agent back to the
@@ -2300,6 +2370,22 @@ class GatewaySlashCommandsMixin:
                                 )
                             except Exception:
                                 _sw_effort = None
+                            # #467 rule 3: the NEW side reads the agent's ACTUAL
+                            # post-switch reasoning_config, never the value that
+                            # requested the change — a per-model override for the
+                            # new model must show up here.
+                            _sw_new_effort = _sw_effort
+                            try:
+                                _sw_new_effort = _self._reasoning_effort_label(
+                                    _self._post_switch_reasoning_config(
+                                        cached_entry[0],
+                                        source=event.source,
+                                        session_key=_session_key,
+                                        model=result.new_model,
+                                    )
+                                )
+                            except Exception:
+                                _sw_new_effort = _sw_effort
                             _self._announce_model_switch(
                                 cached_entry[0],
                                 old_model=_cur_model,
@@ -2307,7 +2393,7 @@ class GatewaySlashCommandsMixin:
                                 old_provider=_cur_provider,
                                 new_provider=result.target_provider,
                                 old_effort=_sw_effort,
-                                new_effort=_sw_effort,
+                                new_effort=_sw_new_effort,
                                 old_window=_sw_old_window,
                                 new_window=_sw_new_window,
                             )
@@ -2446,8 +2532,17 @@ class GatewaySlashCommandsMixin:
                             lines.append(_fast_row)
                         lines.append(t("gateway.model.provider_label", provider=plabel))
                         try:
-                            _reasoning_label = self._reasoning_effort_label(
-                                self._resolve_session_reasoning_config(source=source)
+                            # Read the ACTUAL post-switch effort off the agent
+                            # (#467 rule 3) rather than re-resolving for the OLD
+                            # model, so the row can't advertise an effort the
+                            # session is not running at.
+                            _reasoning_label = _self._reasoning_effort_label(
+                                _self._post_switch_reasoning_config(
+                                    cached_entry[0] if cached_entry else None,
+                                    source=event.source,
+                                    session_key=_session_key,
+                                    model=result.new_model,
+                                )
                             )
                             if _reasoning_label:
                                 lines.append(t("gateway.model.reasoning_label", effort=_reasoning_label))
@@ -2630,6 +2725,13 @@ class GatewaySlashCommandsMixin:
                         api_key=result.api_key,
                         base_url=result.base_url,
                         api_mode=result.api_mode,
+                        # Keep the session's /reasoning override across the
+                        # route change (#467 contract) — see the picker path.
+                        **self._switch_reasoning_kwargs(
+                            source=source,
+                            session_key=session_key,
+                            model=result.new_model,
+                        ),
                     )
                 except Exception as exc:
                     # In-place swap rolled the agent back to the OLD working
@@ -2666,6 +2768,20 @@ class GatewaySlashCommandsMixin:
                     )
                 except Exception:
                     _sw_effort = None
+                # #467 rule 3: the NEW side reads the agent's ACTUAL post-switch
+                # reasoning_config, not the value that requested the change.
+                _sw_new_effort = _sw_effort
+                try:
+                    _sw_new_effort = self._reasoning_effort_label(
+                        self._post_switch_reasoning_config(
+                            cached_entry[0],
+                            source=source,
+                            session_key=session_key,
+                            model=result.new_model,
+                        )
+                    )
+                except Exception:
+                    _sw_new_effort = _sw_effort
                 self._announce_model_switch(
                     cached_entry[0],
                     old_model=current_model,
@@ -2673,7 +2789,7 @@ class GatewaySlashCommandsMixin:
                     old_provider=current_provider,
                     new_provider=result.target_provider,
                     old_effort=_sw_effort,
-                    new_effort=_sw_effort,
+                    new_effort=_sw_new_effort,
                     old_window=_sw_old_window,
                     new_window=_sw_new_window,
                 )
@@ -2832,11 +2948,18 @@ class GatewaySlashCommandsMixin:
                 lines.append(_fast_row)
 
             # Reasoning effort in effect after the switch. /model does NOT clear
-            # a /reasoning session override, so resolve the session-aware value
-            # (falls back to config.yaml) rather than the global default.
+            # a /reasoning session override, so read the agent's ACTUAL
+            # post-switch config (#467 rule 3), falling back to the
+            # session-aware resolver for the NEW model when no cached agent was
+            # swapped — never the global default.
             try:
                 _reasoning_label = self._reasoning_effort_label(
-                    self._resolve_session_reasoning_config(source=source)
+                    self._post_switch_reasoning_config(
+                        cached_entry[0] if cached_entry else None,
+                        source=source,
+                        session_key=session_key,
+                        model=result.new_model,
+                    )
                 )
                 if _reasoning_label:
                     lines.append(t("gateway.model.reasoning_label", effort=_reasoning_label))

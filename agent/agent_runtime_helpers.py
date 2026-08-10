@@ -2667,7 +2667,21 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     return client
 
 
-def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode=''):
+# Sentinel for switch_model's ``session_reasoning_config`` parameter.  A
+# caller that owns session state may legitimately pass ``None`` (nothing
+# configured → provider default), so "not supplied" needs its own value.
+_SESSION_REASONING_UNSET = object()
+
+
+def switch_model(
+    agent,
+    new_model,
+    new_provider,
+    api_key='',
+    base_url='',
+    api_mode='',
+    session_reasoning_config=_SESSION_REASONING_UNSET,
+):
     """Switch the model/provider in-place for a live agent.
 
     Called by the /model command handlers (CLI and gateway) after
@@ -2680,6 +2694,12 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     client-swap logic but also updates ``_primary_runtime`` so the
     change persists across turns (unlike fallback which is
     turn-scoped).
+
+    ``session_reasoning_config`` lets a caller that owns session state (the
+    gateway) hand in the effort the session actually runs at for the NEW
+    model.  Callers without session state (CLI, TUI, one-turn restore) omit
+    it and get the ``#467`` keep-current-unless-per-model behaviour.  See the
+    reasoning block below.
     """
     from hermes_cli.providers import determine_api_mode
 
@@ -3002,21 +3022,60 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             api_mode=agent.api_mode,
         )
 
-    # ── Re-resolve reasoning_config from per-model override ──
-    # The new model may have a different reasoning_effort override. Re-read
-    # config so the override takes effect immediately on /model switch —
-    # resolved through the shared chokepoint (per-model > global; YAML
-    # boolean False = disabled).
+    # ── Re-resolve reasoning_config under the #467 precedence contract ──
+    # Precedence (ratified 2026-08-06, PR #467 — a route change must never
+    # re-impose the GLOBAL default):
+    #
+    #   caller-supplied session effort  >  per-model ``agent.reasoning_overrides``
+    #   for the NEW model               >  KEEP the agent's current effort
+    #
+    # The global ``agent.reasoning_effort`` is deliberately NOT re-applied
+    # here.  It is already folded into the live ``agent.reasoning_config``
+    # when the user never overrode it, so re-resolving it only has an effect
+    # in the one case where it is WRONG: a live session override (/reasoning
+    # high) getting demoted to the config default for the rest of the
+    # switching turn.  ``switch_model`` lives in ``agent/`` and cannot see
+    # gateway session state, hence ``session_reasoning_config`` — an explicit
+    # parameter rather than a second ambient config read.
     try:
-        from hermes_constants import resolve_reasoning_config
         from hermes_cli.config import load_config as _sm_load_config
+        from hermes_constants import resolve_per_model_reasoning_effort
 
-        _reasoning_cfg = _sm_load_config() or {}
-        agent.reasoning_config = resolve_reasoning_config(_reasoning_cfg, agent.model)
-        logger.info(
-            "switch_model: reasoning_config resolved for %s: %s",
-            agent.model, agent.reasoning_config,
-        )
+        if session_reasoning_config is not _SESSION_REASONING_UNSET:
+            # The caller owns session state and already resolved the full
+            # ladder (session override > per-model > global) for the NEW
+            # model.  Trust it verbatim, including an explicit None (nothing
+            # configured → provider default).
+            agent.reasoning_config = (
+                dict(session_reasoning_config)
+                if isinstance(session_reasoning_config, dict)
+                else None
+            )
+            logger.info(
+                "switch_model: reasoning_config for %s from session: %s",
+                agent.model, agent.reasoning_config,
+            )
+        else:
+            _reasoning_cfg = _sm_load_config() or {}
+            _agent_cfg = (
+                _reasoning_cfg.get("agent")
+                if isinstance(_reasoning_cfg, dict) else None
+            )
+            _overrides = (
+                _agent_cfg.get("reasoning_overrides")
+                if isinstance(_agent_cfg, dict) else None
+            ) or {}
+            _resolved = resolve_per_model_reasoning_effort(agent.model, _overrides)
+            # None = no per-model override for the new model — keep the
+            # agent's current effort untouched (a session /reasoning override
+            # and an already-in-effect global default both survive).
+            if _resolved is not None:
+                agent.reasoning_config = _resolved
+                logger.info(
+                    "switch_model: reasoning_config resolved for %s via "
+                    "per-model override: %s",
+                    agent.model, agent.reasoning_config,
+                )
     except Exception as _reasoning_err:
         logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
 
