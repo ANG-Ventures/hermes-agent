@@ -50,6 +50,7 @@ from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli.kanban_identity import resolve_comment_provenance
 
 log = logging.getLogger(__name__)
 
@@ -192,6 +193,14 @@ def _comment_dict(c: kanban_db.Comment) -> dict[str, Any]:
         "id": c.id,
         "task_id": c.task_id,
         "author": c.author,
+        # Author WITH per-run / per-session provenance. Two concurrent sessions
+        # on the same profile render identically without this, which is how
+        # contradictory intent landed on one card unattributed.
+        "author_display": kanban_db.format_comment_author(
+            c.author, run_id=c.run_id, session_ref=c.session_ref
+        ),
+        "run_id": c.run_id,
+        "session_ref": c.session_ref,
         "body": c.body,
         "created_at": c.created_at,
     }
@@ -1160,6 +1169,10 @@ def _set_status_direct(
 class CommentBody(BaseModel):
     body: str
     author: Optional[str] = "dashboard"
+    # NOTE: run_id / session_ref are deliberately absent. Provenance is resolved
+    # from this process's own runtime context (see the endpoint below) so no
+    # client can attribute a comment to another run or session. Extra fields in
+    # the payload are ignored by pydantic's default config.
 
 
 @router.post("/tasks/{task_id}/comments")
@@ -1171,8 +1184,10 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
     try:
         if kanban_db.get_task(conn, task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        run_id, session_ref = resolve_comment_provenance(task_id)
         kanban_db.add_comment(
             conn, task_id, author=payload.author or "dashboard", body=payload.body,
+            run_id=run_id, session_ref=session_ref,
         )
         return {"ok": True}
     finally:

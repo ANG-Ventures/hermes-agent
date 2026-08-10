@@ -26,6 +26,7 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
+from hermes_cli.kanban_identity import resolve_comment_provenance
 
 
 # ---------------------------------------------------------------------------
@@ -1844,7 +1845,16 @@ def _cmd_show(args: argparse.Namespace) -> int:
                 {"id": cid, "kind": kind} for cid, kind in child_links
             ],
             "comments": [
-                {"author": c.author, "body": c.body, "created_at": c.created_at}
+                {
+                    "author": c.author,
+                    "author_display": kb.format_comment_author(
+                        c.author, run_id=c.run_id, session_ref=c.session_ref
+                    ),
+                    "run_id": c.run_id,
+                    "session_ref": c.session_ref,
+                    "body": c.body,
+                    "created_at": c.created_at,
+                }
                 for c in comments
             ],
             "events": [
@@ -1961,7 +1971,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print()
         print(f"Comments ({len(comments)}):")
         for c in comments:
-            print(f"  [{_fmt_ts(c.created_at)}] {c.author}: {c.body}")
+            author_disp = kb.format_comment_author(
+                c.author, run_id=c.run_id, session_ref=c.session_ref
+            )
+            print(f"  [{_fmt_ts(c.created_at)}] {author_disp}: {c.body}")
     if events:
         print()
         print(f"Events ({len(events)}):")
@@ -2294,8 +2307,12 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
     author = args.author or _profile_author()
+    run_id, session_ref = resolve_comment_provenance(args.task_id)
     with kb.connect_closing() as conn:
-        kb.add_comment(conn, args.task_id, author, body)
+        kb.add_comment(
+            conn, args.task_id, author, body,
+            run_id=run_id, session_ref=session_ref,
+        )
     print(f"Comment added to {args.task_id}")
     return 0
 
@@ -2555,7 +2572,11 @@ def _cmd_block(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         for tid in ids:
             if reason:
-                kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
+                _run_id, _sess_ref = resolve_comment_provenance(tid)
+                kb.add_comment(
+                    conn, tid, author, f"BLOCKED: {reason}",
+                    run_id=_run_id, session_ref=_sess_ref,
+                )
             if not kb.block_task(
                 conn,
                 tid,
@@ -2591,7 +2612,11 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         for tid in ids:
             if reason:
-                kb.add_comment(conn, tid, author, f"SCHEDULED: {reason}")
+                _run_id, _sess_ref = resolve_comment_provenance(tid)
+                kb.add_comment(
+                    conn, tid, author, f"SCHEDULED: {reason}",
+                    run_id=_run_id, session_ref=_sess_ref,
+                )
             if not kb.schedule_task(
                 conn,
                 tid,
@@ -2618,7 +2643,11 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         for tid in ids:
             if reason:
-                kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
+                _run_id, _sess_ref = resolve_comment_provenance(tid)
+                kb.add_comment(
+                    conn, tid, author, f"UNBLOCK: {reason}",
+                    run_id=_run_id, session_ref=_sess_ref,
+                )
             if not kb.unblock_task(conn, tid):
                 failed.append(tid)
                 print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)

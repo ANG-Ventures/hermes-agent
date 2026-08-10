@@ -1357,6 +1357,14 @@ class Comment:
     author: str
     body: str
     created_at: int
+    #: Dispatcher run that wrote this comment, when the writer was a worker
+    #: scoped to this task. NULL for CLI / dashboard / orchestrator writes and
+    #: for every pre-migration row.
+    run_id: Optional[int] = None
+    #: Bounded, non-reversible fingerprint of the writing session's id — what
+    #: makes two concurrent SAME-PROFILE sessions distinguishable. NULL when no
+    #: session id was in context, and on every pre-migration row.
+    session_ref: Optional[str] = None
 
 
 @dataclass
@@ -1497,11 +1505,17 @@ CREATE TABLE IF NOT EXISTS task_links (
 );
 
 CREATE TABLE IF NOT EXISTS task_comments (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id    TEXT NOT NULL,
-    author     TEXT NOT NULL,
-    body       TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id     TEXT NOT NULL,
+    author      TEXT NOT NULL,
+    body        TEXT NOT NULL,
+    -- Per-run / per-session provenance. Both NULL on legacy rows and on any
+    -- write with no trusted runtime context, which renders as an explicit
+    -- "unknown" (see ``format_comment_author``) rather than a bare author that
+    -- reads as attributed.
+    run_id      INTEGER,
+    session_ref TEXT,
+    created_at  INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS task_events (
@@ -2708,6 +2722,25 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "run_id" not in ev_cols:
         _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
 
+    # task_comments gained per-run / per-session provenance. Two concurrent
+    # sessions on the SAME profile used to be indistinguishable on the board
+    # (both rendered as their shared profile name), which let contradictory
+    # intent land on one card with no way to tell the writers apart.
+    #
+    # Existing rows stay readable and get NULL for both columns — the honest
+    # value, since their provenance was never recorded. Every read surface
+    # renders NULL as an explicit "unknown" marker rather than a bare author.
+    cm_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_comments)")}
+    if cm_cols:  # this function also runs against partially-built schemas
+        if "run_id" not in cm_cols:
+            _add_column_if_missing(
+                conn, "task_comments", "run_id", "run_id INTEGER"
+            )
+        if "session_ref" not in cm_cols:
+            _add_column_if_missing(
+                conn, "task_comments", "session_ref", "session_ref TEXT"
+            )
+
     # task_links gained a ``kind`` column (blocks | derived-from). Every
     # pre-existing edge was created under the single gating semantics, so the
     # backfill must be 'blocks' — anything else would silently un-gate live
@@ -2861,6 +2894,7 @@ _REBUILD_SPECS = {
         "CREATE TABLE task_comments ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, author TEXT NOT NULL, body TEXT NOT NULL,"
+        " run_id INTEGER, session_ref TEXT,"
         " created_at INTEGER NOT NULL)",
         ("CREATE INDEX idx_comments_task ON task_comments(task_id, created_at)",),
     ),
@@ -3958,13 +3992,112 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # Comments & events
 # ---------------------------------------------------------------------------
 
+#: Length of a comment ``session_ref``. Long enough that two live sessions
+#: colliding is not a practical concern, short enough to read at a glance in a
+#: chat bubble / terminal / card drawer.
+SESSION_REF_LEN = 12
+
+_SESSION_REF_RE = re.compile(rf"^[0-9a-f]{{{SESSION_REF_LEN}}}$")
+
+#: Rendered when a comment carries no provenance at all — every pre-migration
+#: row, plus any write with no trusted runtime context. Deliberately explicit:
+#: a bare author on a board with mixed attribution reads as "attributed to this
+#: profile's only session", which is the exact ambiguity this closes.
+LEGACY_PROVENANCE_LABEL = "provenance unknown"
+
+
+def derive_session_ref(session_id: Optional[str]) -> Optional[str]:
+    """Return a bounded, non-reversible fingerprint of ``session_id``.
+
+    The raw session id is NOT stored. It can embed routing identity that is
+    unpleasant to persist forever on a board row (``sms:+1555…``,
+    ``discord:<user>``), and it is unbounded in length. A truncated BLAKE2b
+    digest keeps rows small and fixed-width while still separating two
+    concurrent sessions of the same profile — which is all the board needs.
+
+    Returns ``None`` for a missing / blank id so callers store NULL rather than
+    a fabricated value.
+    """
+    if not session_id or not str(session_id).strip():
+        return None
+    digest = hashlib.blake2b(
+        str(session_id).strip().encode("utf-8"), digest_size=SESSION_REF_LEN // 2
+    )
+    return digest.hexdigest()
+
+
+def format_comment_author(
+    author: str,
+    *,
+    run_id: Optional[int] = None,
+    session_ref: Optional[str] = None,
+) -> str:
+    """Render a comment's author WITH its provenance, for every read surface.
+
+    One formatter so the CLI, the agent tool, the dashboard API and the worker
+    prompt context cannot drift apart on how a comment is attributed::
+
+        apollo (run 327, sess 3f2a9c1b0d44)
+        apollo (sess 3f2a9c1b0d44)
+        daedalus (run 327)
+        apollo (provenance unknown)
+    """
+    parts: list[str] = []
+    if run_id is not None:
+        parts.append(f"run {int(run_id)}")
+    if session_ref:
+        parts.append(f"sess {session_ref}")
+    if not parts:
+        parts.append(LEGACY_PROVENANCE_LABEL)
+    return f"{author} ({', '.join(parts)})"
+
+
+def _validate_comment_provenance(
+    run_id: Optional[int], session_ref: Optional[str]
+) -> tuple[Optional[int], Optional[str]]:
+    """Validate the provenance pair at the single write choke point.
+
+    Rejects anything outside the expected shapes so no caller — tool arg,
+    dashboard payload, or future code path — can smuggle a long, structured or
+    identity-bearing value into a durable board row. ``session_ref`` must be a
+    :func:`derive_session_ref` output; ``run_id`` a positive int.
+    """
+    if run_id is not None:
+        if isinstance(run_id, bool) or not isinstance(run_id, int):
+            raise ValueError("comment run_id must be an int")
+        if run_id <= 0:
+            raise ValueError("comment run_id must be positive")
+    if session_ref is not None:
+        if not isinstance(session_ref, str) or not _SESSION_REF_RE.match(session_ref):
+            raise ValueError(
+                "comment session_ref must be a "
+                f"{SESSION_REF_LEN}-char lowercase hex digest "
+                "(use kanban_db.derive_session_ref)"
+            )
+    return run_id, session_ref
+
+
 def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    *,
+    run_id: Optional[int] = None,
+    session_ref: Optional[str] = None,
 ) -> int:
+    """Append a comment, recording who wrote it and from which run/session.
+
+    ``run_id`` / ``session_ref`` must come from trusted runtime context (see
+    ``hermes_cli.kanban_identity.resolve_comment_provenance``), never from
+    caller-supplied tool args or comment text — the same rule ``author`` already
+    follows.
+    """
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
+    run_id, session_ref = _validate_comment_provenance(run_id, session_ref)
     now = int(time.time())
     with write_txn(conn):
         if not conn.execute(
@@ -3972,12 +4105,64 @@ def add_comment(
         ).fetchone():
             raise ValueError(f"unknown task {task_id}")
         cur = conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (task_id, author.strip(), body.strip(), now),
+            "INSERT INTO task_comments "
+            "(task_id, author, body, run_id, session_ref, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (task_id, author.strip(), body.strip(), run_id, session_ref, now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+        _append_event(
+            conn,
+            task_id,
+            "commented",
+            {
+                "author": author,
+                "len": len(body),
+                # Non-secret fingerprint only, so the event log stays
+                # attributable even if a comment row is later pruned.
+                **({"session_ref": session_ref} if session_ref else {}),
+            },
+            run_id=run_id,
+        )
         return int(cur.lastrowid or 0)
+
+
+def _inline_comment_provenance(task_id: str) -> tuple[Optional[int], Optional[str]]:
+    """Provenance for the audit comments written inline inside a write_txn.
+
+    ``specify_triage_task`` / ``resolve_triage_task`` / ``decompose_triage_task``
+    each INSERT their audit comment directly rather than calling
+    :func:`add_comment` (they are already inside an IMMEDIATE txn, and a nested
+    ``BEGIN IMMEDIATE`` would raise). They must still be attributable, or the
+    same-profile ambiguity just moves to the workflow lanes. Best-effort: any
+    resolution failure degrades to NULL/NULL, which renders as
+    ``provenance unknown`` — never a guess.
+    """
+    try:
+        from hermes_cli.kanban_identity import resolve_comment_provenance
+
+        return _validate_comment_provenance(*resolve_comment_provenance(task_id))
+    except Exception:
+        _log.debug("kanban: comment provenance resolution failed", exc_info=True)
+        return None, None
+
+
+def _comment_from_row(r: sqlite3.Row) -> Comment:
+    """Build a ``Comment`` tolerating a pre-migration row shape.
+
+    ``list_comments`` uses ``SELECT *``, so a DB opened by an older Hermes
+    (columns absent) must not raise — legacy rows simply carry NULL provenance.
+    """
+    keys = r.keys()
+    run_id = r["run_id"] if "run_id" in keys else None
+    return Comment(
+        id=r["id"],
+        task_id=r["task_id"],
+        author=r["author"],
+        body=r["body"],
+        created_at=r["created_at"],
+        run_id=int(run_id) if run_id is not None else None,
+        session_ref=(r["session_ref"] if "session_ref" in keys else None) or None,
+    )
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
@@ -3985,16 +4170,7 @@ def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
         "SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at ASC",
         (task_id,),
     ).fetchall()
-    return [
-        Comment(
-            id=r["id"],
-            task_id=r["task_id"],
-            author=r["author"],
-            body=r["body"],
-            created_at=r["created_at"],
-        )
-        for r in rows
-    ]
+    return [_comment_from_row(r) for r in rows]
 
 
 def list_comments_after(
@@ -4008,20 +4184,11 @@ def list_comments_after(
     ``tools.kanban_tools.inject_new_comments_from_env``).
     """
     rows = conn.execute(
-        "SELECT id, task_id, author, body, created_at FROM task_comments "
+        "SELECT * FROM task_comments "
         "WHERE task_id = ? AND id > ? ORDER BY id ASC",
         (task_id, int(after_id)),
     ).fetchall()
-    return [
-        Comment(
-            id=r["id"],
-            task_id=r["task_id"],
-            author=r["author"],
-            body=r["body"],
-            created_at=r["created_at"],
-        )
-        for r in rows
-    ]
+    return [_comment_from_row(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -6440,15 +6607,19 @@ def specify_triage_task(
             # IMMEDIATE would raise OperationalError. We also skip the
             # 'commented' event that ``add_comment`` emits, since the
             # 'specified' event below already records the change.
+            _run_id, _sess_ref = _inline_comment_provenance(task_id)
             conn.execute(
-                "INSERT INTO task_comments (task_id, author, body, created_at) "
-                "VALUES (?, ?, ?, ?)",
+                "INSERT INTO task_comments "
+                "(task_id, author, body, run_id, session_ref, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     task_id,
                     author.strip(),
                     "Specified — updated "
                     + ", ".join(changed_fields)
                     + " and promoted to todo.",
+                    _run_id,
+                    _sess_ref,
                     int(time.time()),
                 ),
             )
@@ -6565,10 +6736,15 @@ def triage_resolve_task(
         if actor and actor.strip():
             # Inline INSERT: we're already inside this function's write_txn and
             # ``add_comment`` would open a nested BEGIN IMMEDIATE.
+            _run_id, _sess_ref = _inline_comment_provenance(task_id)
             conn.execute(
-                "INSERT INTO task_comments (task_id, author, body, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (task_id, actor.strip(), f"TRIAGE-RESOLVE -> {to}: {reason}", now),
+                "INSERT INTO task_comments "
+                "(task_id, author, body, run_id, session_ref, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    task_id, actor.strip(), f"TRIAGE-RESOLVE -> {to}: {reason}",
+                    _run_id, _sess_ref, now,
+                ),
             )
         _append_event(
             conn, task_id, "triage_resolved",
@@ -6814,15 +6990,19 @@ def decompose_triage_task(
 
         # Audit comment + event on the root so the timeline shows the fan-out.
         if author and author.strip():
+            _run_id, _sess_ref = _inline_comment_provenance(task_id)
             conn.execute(
-                "INSERT INTO task_comments (task_id, author, body, created_at) "
-                "VALUES (?, ?, ?, ?)",
+                "INSERT INTO task_comments "
+                "(task_id, author, body, run_id, session_ref, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     task_id,
                     author.strip(),
                     "Decomposed into "
                     + ", ".join(child_ids)
                     + ". Root will wake when all children complete.",
+                    _run_id,
+                    _sess_ref,
                     now,
                 ),
             )
@@ -10605,8 +10785,17 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             # directive above the (attacker-influenceable) comment body.
             # Defense-in-depth — the LLM-controlled author-forgery surface
             # was already closed in #22435. See #22452.
+            #
+            # The run/session provenance rides inside the same code span so two
+            # concurrent SAME-PROFILE sessions read as different writers. It is
+            # appended AFTER the backtick strip because it comes from trusted
+            # runtime context and is shape-validated at the write path — only
+            # the author is operator-controlled text.
             safe_author = (c.author or "").replace("`", "")
-            lines.append(f"comment from worker `{safe_author}` at {ts_disp}:")
+            author_disp = format_comment_author(
+                safe_author, run_id=c.run_id, session_ref=c.session_ref
+            )
+            lines.append(f"comment from worker `{author_disp}` at {ts_disp}:")
             lines.append(_cap(c.body, _CTX_MAX_COMMENT_BYTES))
             lines.append("")
 

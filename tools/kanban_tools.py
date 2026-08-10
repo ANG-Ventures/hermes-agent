@@ -36,6 +36,7 @@ from typing import Any, Optional
 from agent.redact import redact_sensitive_text
 from hermes_constants import VALID_REASONING_EFFORTS
 from hermes_cli.goals import judge_goal
+from hermes_cli.kanban_identity import resolve_comment_provenance
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
@@ -440,7 +441,14 @@ def inject_new_comments_from_env(agent: Any) -> bool:
     if not fresh:
         return False
 
-    lines = [f"- {c.author or 'operator'}: {c.body.strip()}" for c in fresh]
+    lines = [
+        "- "
+        + kb.format_comment_author(
+            c.author or "operator", run_id=c.run_id, session_ref=c.session_ref
+        )
+        + f": {c.body.strip()}"
+        for c in fresh
+    ]
     note = (
         "New note"
         + ("s" if len(fresh) > 1 else "")
@@ -594,7 +602,13 @@ def _handle_show(args: dict, **kw) -> str:
                     for cid, kind in kb.child_links(conn, tid)
                 ],
                 "comments": [
-                    {"author": c.author, "body": c.body,
+                    {"author": c.author,
+                     "author_display": kb.format_comment_author(
+                         c.author, run_id=c.run_id, session_ref=c.session_ref
+                     ),
+                     "run_id": c.run_id,
+                     "session_ref": c.session_ref,
+                     "body": c.body,
                      "created_at": c.created_at}
                     for c in comments
                 ],
@@ -1010,8 +1024,8 @@ def _handle_comment(args: dict, **kw) -> str:
     if not body or not str(body).strip():
         return tool_error("body is required")
     body = redact_sensitive_text(str(body), force=True)
-    # Author is intentionally derived from the worker's own runtime
-    # identity, NOT from caller-supplied args. Comments are injected
+    # Author AND provenance are intentionally derived from the worker's own
+    # runtime identity, NOT from caller-supplied args. Comments are injected
     # into the next worker's system prompt by ``build_worker_context``
     # as ``**{author}** (timestamp): {body}`` — accepting an
     # ``args["author"]`` override let a worker forge a comment from
@@ -1019,12 +1033,21 @@ def _handle_comment(args: dict, **kw) -> str:
     # the future-worker context with what reads as a system directive.
     # Cross-task commenting itself remains unrestricted (see #19713) —
     # comments are the deliberate handoff channel between tasks.
+    #
+    # ``run_id`` / ``session_ref`` follow the same rule: they come from
+    # ``resolve_comment_provenance`` (env + session contextvar) so a model
+    # cannot attribute its write to a different run or session, and the DB
+    # write path re-validates their shape.
     author = os.environ.get("HERMES_PROFILE") or "worker"
+    run_id, session_ref = resolve_comment_provenance(str(tid))
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
         try:
-            cid = kb.add_comment(conn, tid, author=author, body=str(body))
+            cid = kb.add_comment(
+                conn, tid, author=author, body=str(body),
+                run_id=run_id, session_ref=session_ref,
+            )
             return _ok(task_id=tid, comment_id=cid)
         finally:
             conn.close()

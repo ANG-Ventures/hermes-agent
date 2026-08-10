@@ -3706,7 +3706,12 @@
           : comments.map(function (c) {
               return h("div", { key: c.id, className: "hermes-kanban-comment" },
                 h("div", { className: "hermes-kanban-comment-head" },
-                  h("span", { className: "hermes-kanban-comment-author" }, c.author || "anon"),
+                  // author_display carries per-run / per-session provenance so
+                  // two concurrent sessions on the SAME profile are visibly
+                  // different writers. Falls back to the bare author for a
+                  // pre-migration board or an older backend.
+                  h("span", { className: "hermes-kanban-comment-author" },
+                    c.author_display || c.author || "anon"),
                   h("span", { className: "hermes-kanban-comment-ago" },
                     timeAgo ? timeAgo(c.created_at) : ""),
                 ),
