@@ -824,12 +824,24 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
             _remaining = dict(answered_counts)
             answered_flags = []  # parallel to ``calls``: True = this entry answered
             for tc in calls:
-                _cid = tc.get("id") if isinstance(tc, dict) else None
-                if _cid and _remaining.get(_cid, 0) > 0:
-                    _remaining[_cid] -= 1
-                    answered_flags.append(True)
-                else:
-                    answered_flags.append(False)
+                # Match on the SUPERSET of ``id`` and ``call_id`` -- the same
+                # tolerance Pass 1 applies when registering the answer budget
+                # (#58168). Resolving against ``id`` ALONE made a tool_call
+                # carrying only ``call_id`` (or a Codex-Responses call whose
+                # ``id`` and ``call_id`` differ) read as unanswered, so the
+                # "none answered" branch below DELETED an assistant turn that
+                # was in fact answered by the following ``tool`` message --
+                # leaving a stray tool result and the very 400 this pass
+                # exists to prevent.
+                _matched = False
+                if isinstance(tc, dict):
+                    for _key in ("id", "call_id"):
+                        _cid = tc.get(_key)
+                        if _cid and _remaining.get(_cid, 0) > 0:
+                            _remaining[_cid] -= 1
+                            _matched = True
+                            break
+                answered_flags.append(_matched)
             unanswered_calls = [
                 tc for tc, ok in zip(calls, answered_flags) if not ok
             ]
