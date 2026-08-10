@@ -1724,6 +1724,16 @@ class ContextCompressor(ContextEngine):
                     self.seed_skew_calibration(getter(self._session_id))
         except Exception:
             pass
+        # Fall back to the DURABLE (provider, model) calibration when the
+        # session row gave nothing — the fresh-session case, which is exactly
+        # when the engine has no readings of its own. seed_skew_calibration_for_model
+        # is a no-op once a history exists (live > persisted) and returns
+        # False for an UNSEEN pair, so a new model starts honestly at 1.0
+        # instead of inheriting another tokenizer's ratio.
+        try:
+            self.seed_skew_calibration_for_model(session_db)
+        except Exception:
+            logger.debug("model-keyed skew seed failed", exc_info=True)
         self._load_fallback_compression_streak()
         self._load_ineffective_compression_count()
         self._load_proactive_prune_rearm_tokens()

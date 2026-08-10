@@ -94,6 +94,38 @@ logger = logging.getLogger(__name__)
 _COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
 
 
+# Structural sanity bound for a persisted skew ratio. Deliberately WIDER than
+# the policy band enforced by ``seed_skew_calibration`` (``_SKEW_SCALE_UP_MAX``,
+# or 1.0 when scale-up is disabled): the storage layer must not silently drop
+# readings that the live config would accept. Before this bound existed the
+# reader hard-filtered to ``<= 1.0``, so every scale-up ratio the recorder
+# wrote was discarded on read and the persist/seed round trip shipped inert.
+_SKEW_RATIO_SANITY_MAX = 100.0
+
+
+def _sane_skew_ratio(value: float) -> bool:
+    """Whether a persisted ratio is structurally usable (not policy-accepted)."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return False
+    if f != f or f in (float("inf"), float("-inf")):  # NaN / +-inf
+        return False
+    return 0.0 < f <= _SKEW_RATIO_SANITY_MAX
+
+
+def _model_skew_key(provider: str, model: str):
+    """Normalize a (provider, model) calibration key, or None if unusable."""
+    try:
+        p = (provider or "").strip()
+        m = (model or "").strip()
+    except (AttributeError, TypeError):
+        return None
+    if not m:
+        return None
+    return (p, m)
+
+
 def _system_prompt_hash(system_prompt: str) -> str:
     return hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
 
@@ -4798,7 +4830,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f = float(v)
             except (TypeError, ValueError):
                 continue
-            if 0.0 < f <= 1.0:
+            if _sane_skew_ratio(f):
                 out.append(f)
         return out
 
@@ -4818,6 +4850,130 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except sqlite3.Error as exc:
             logger.debug(
                 "clear_compression_skew_history(%s) failed: %s", session_id, exc,
+            )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # (provider, model)-keyed skew calibration
+    # ──────────────────────────────────────────────────────────────────────
+    # The session-keyed history above dies with the session: a brand-new
+    # conversation starts at skew=1.0 (raw rough) — exactly the moment it has
+    # no readings of its own and needs a prior most. But the ratio is a
+    # property of the TOKENIZER, not of the conversation: a ratio learned on
+    # claude-opus-5 says nothing about gpt-5.6-sol. So the durable calibration
+    # is keyed by (provider, model), and an UNSEEN pair deliberately reads
+    # empty so it starts uncalibrated rather than inheriting a wrong prior.
+
+    def record_model_skew_history(
+        self,
+        provider: str,
+        model: str,
+        skew_history: "list[float]",
+    ) -> None:
+        """Persist the skew history for one (provider, model) pair.
+
+        Best-effort by contract: calibration is an optimization, never a
+        correctness requirement, so every failure path is swallowed. An empty
+        ``model`` is not a usable key (the ratio would be unattributable) and
+        is dropped; an empty ``provider`` is legal and normalizes to "".
+        """
+        key = _model_skew_key(provider, model)
+        if key is None:
+            return
+        try:
+            payload = json.dumps(
+                [round(float(r), 6) for r in (skew_history or [])]
+            )
+        except (TypeError, ValueError):
+            return
+
+        def _do(conn):
+            conn.execute(
+                "INSERT INTO compression_skew_calibration "
+                "(provider, model, skew_history, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(provider, model) DO UPDATE SET "
+                "skew_history = excluded.skew_history, "
+                "updated_at = excluded.updated_at",
+                (key[0], key[1], payload, time.time()),
+            )
+
+        try:
+            self._execute_write(_do)
+        except sqlite3.Error as exc:
+            logger.debug(
+                "record_model_skew_history(%s/%s) failed: %s",
+                provider, model, exc,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(
+                "record_model_skew_history(%s/%s) failed (non-sqlite): %s",
+                provider, model, exc,
+            )
+
+    def get_model_skew_history(self, provider: str, model: str) -> "list[float]":
+        """Return the learned skew history for ``(provider, model)``.
+
+        Returns ``[]`` for an UNSEEN pair — the negative control that keeps a
+        fresh session on a new model uncalibrated (1.0) instead of inheriting
+        another model's tokenizer skew.
+
+        Storage stays policy-free: it filters only structurally-impossible
+        values and leaves the accept BAND (``_SKEW_SCALE_UP_MAX`` vs the 1.0
+        ceiling when scale-up is disabled) to ``seed_skew_calibration``, which
+        is the single place that knows the live config.
+        """
+        key = _model_skew_key(provider, model)
+        if key is None:
+            return []
+        try:
+            with self._lock:
+                conn = self._conn
+                if conn is None:
+                    return []
+                row = conn.execute(
+                    "SELECT skew_history FROM compression_skew_calibration "
+                    "WHERE provider = ? AND model = ?",
+                    key,
+                ).fetchone()
+        except sqlite3.Error:
+            return []
+        if row is None:
+            return []
+        raw = row["skew_history"] if isinstance(row, sqlite3.Row) else row[0]
+        if not raw:
+            return []
+        try:
+            vals = json.loads(raw)
+        except (TypeError, ValueError):
+            return []
+        out = []
+        for v in vals if isinstance(vals, list) else []:
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            if _sane_skew_ratio(f):
+                out.append(f)
+        return out
+
+    def clear_model_skew_history(self, provider: str, model: str) -> None:
+        """Drop the learned calibration for one (provider, model) pair."""
+        key = _model_skew_key(provider, model)
+        if key is None:
+            return
+
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM compression_skew_calibration "
+                "WHERE provider = ? AND model = ?",
+                key,
+            )
+
+        try:
+            self._execute_write(_do)
+        except sqlite3.Error as exc:
+            logger.debug(
+                "clear_model_skew_history(%s/%s) failed: %s", provider, model, exc,
             )
 
     def refresh_compression_lock(

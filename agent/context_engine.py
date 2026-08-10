@@ -498,20 +498,94 @@ class ContextEngine(ABC):
         if clean:
             self._recent_skews = clean[-self._SKEW_HISTORY:]
 
-    def _persist_skew_history(self) -> None:
-        """Write the current skew history to the bound session row (best-effort).
+    def skew_calibration_key(self) -> "tuple[str, str] | None":
+        """The ``(provider, model)`` this engine's skew readings belong to.
 
-        Uses the same session binding as the durable compression-failure
-        cooldown (``bind_session_state``). No binding → silently skip.
+        ``None`` when the model is unknown — a ratio with no model attached is
+        unattributable, and guessing would be worse than staying uncalibrated.
+        """
+        model = (getattr(self, "model", "") or "").strip()
+        if not model:
+            return None
+        provider = (getattr(self, "provider", "") or "").strip()
+        return (provider, model)
+
+    def _persist_skew_history(self) -> None:
+        """Persist the current skew history (best-effort, never raises).
+
+        Writes to BOTH stores, for two different jobs:
+
+        * the ``(provider, model)`` calibration table — the DURABLE one. The
+          skew ratio is a property of the model's tokenizer, so it is valid for
+          every future session on that same pair and invalid for any other. A
+          fresh session on a model we have measured before therefore starts
+          calibrated instead of at raw-rough 1.0, which is precisely when it
+          has no readings of its own.
+        * the session row — kept for same-session restart resume, which is
+          strictly narrower (it also survives a model switch mid-session, where
+          the model-keyed row correctly would not apply).
+
+        Fail-safe by contract: calibration is an optimization, so a failure in
+        either writer must not prevent the other and must never touch the turn.
         """
         session_db = getattr(self, "_session_db", None)
+        if not session_db:
+            return
+        history = list(getattr(self, "_recent_skews", []) or [])
+
+        key = None
+        try:
+            key = self.skew_calibration_key()
+        except Exception:
+            logger.debug("skew calibration key resolution failed", exc_info=True)
+        if key is not None:
+            model_writer = getattr(session_db, "record_model_skew_history", None)
+            if model_writer is not None:
+                try:
+                    model_writer(key[0], key[1], history)
+                except Exception:
+                    logger.debug("model-keyed skew persist failed", exc_info=True)
+
         session_id = getattr(self, "_session_id", "")
-        if not session_db or not session_id:
+        if not session_id:
             return
         writer = getattr(session_db, "record_compression_skew_history", None)
         if writer is None:
             return
-        writer(session_id, list(getattr(self, "_recent_skews", []) or []))
+        try:
+            writer(session_id, history)
+        except Exception:
+            logger.debug("session-keyed skew persist failed", exc_info=True)
+
+    def seed_skew_calibration_for_model(self, session_db: "Any" = None) -> bool:
+        """Seed from this engine's ``(provider, model)`` learned calibration.
+
+        Returns True iff a persisted prior was found AND accepted. An UNSEEN
+        pair returns False and leaves the history empty, so the engine starts
+        uncalibrated (skew 1.0) rather than inheriting another model's
+        tokenizer ratio. Honors the same live-history-wins and accept-band
+        rules as ``seed_skew_calibration`` — it delegates to it.
+        """
+        if getattr(self, "_recent_skews", None):
+            return False
+        db = session_db if session_db is not None else getattr(self, "_session_db", None)
+        if not db:
+            return False
+        getter = getattr(db, "get_model_skew_history", None)
+        if getter is None:
+            return False
+        try:
+            key = self.skew_calibration_key()
+            if key is None:
+                return False
+            persisted = getter(key[0], key[1])
+        except Exception:
+            logger.debug("model-keyed skew seed read failed", exc_info=True)
+            return False
+        if not persisted:
+            return False
+        self.seed_skew_calibration(persisted)
+        return bool(getattr(self, "_recent_skews", None))
 
     def note_rough_sent(self, rough_tokens: int) -> None:
         """Stash the rough estimate of the request about to be sent so the next
