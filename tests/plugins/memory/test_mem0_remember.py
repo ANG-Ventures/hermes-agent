@@ -372,3 +372,84 @@ def test_tier2_two_band(monkeypatch, tmp_path, top_cos, expect_write, expect_tag
     writes = [c for c in calls if c[0] == "POST" and c[1] == "/memories"]
     assert (len(writes) == 1) == expect_write, f"cos={top_cos} writes={len(writes)} out={out}"
     assert out.get("dedup") == expect_tag, out
+
+
+# ---------------------------------------------------------------------------
+# D-7 interlock: the ABSENT-capture fail-safe (card t_760693df)
+#
+# A profile that ships a mem0.json WITHOUT a `capture` key (every non-root
+# profile in this fleet) must still resolve capture ON, so the D-7 interlock
+# ENGAGES rather than silently opening the background write path. The
+# fail-safe lives in exactly one line -- resolve_capture()'s final
+# ``return "auto", "default"`` -- and nothing asserted it: flipping that
+# literal to "off" left the whole mem0 suite green (measured 28/28 pass
+# against the mutant), while disarming the interlock everywhere at once.
+#
+# These tests pin the resolved VALUE, its SOURCE, and the resulting interlock
+# decision, so that mutation is caught.
+# ---------------------------------------------------------------------------
+
+def test_resolve_capture_defaults_on_when_absent():
+    """No env var and no config key => capture ON from the "default" source.
+
+    RED against ``return "off", "default"``. This is the fleet-wide fail-safe:
+    a profile mem0.json with no `capture` key must not read as capture-off.
+    """
+    from plugins.memory.mem0 import resolve_capture, capture_is_on
+
+    value, source = resolve_capture(None, None)
+    assert source == "default"
+    assert capture_is_on(value), (
+        f"absent capture config resolved to {value!r} (off) — the D-7 interlock "
+        "would be silently disarmed on every profile lacking a `capture` key"
+    )
+    # An empty/whitespace value must fall through to the same default, not be
+    # taken literally as a capture mode.
+    assert resolve_capture("", "") == (value, "default")
+    assert resolve_capture("   ", None) == (value, "default")
+
+
+def test_interlock_engages_when_profile_config_omits_capture(monkeypatch, tmp_path):
+    """End-to-end: a profile home whose mem0.json has NO `capture` key must
+    still suppress the background write (interlock engaged).
+
+    Exercises the real provider against a profile-shaped HERMES_HOME, so the
+    assertion covers the resolution path as a whole rather than the resolver
+    in isolation.
+    """
+    profile_home = tmp_path / "profiles" / "daedalus"
+    profile_home.mkdir(parents=True)
+    # A profile mem0.json exactly as this fleet ships it: host/keys, NO capture.
+    (profile_home / "mem0.json").write_text(json.dumps({
+        "host": "http://mem0.test",
+        "admin_api_key": "admin-key",
+        "pin_user_id": True,
+    }), encoding="utf-8")
+
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("MEM0_HOST", "http://mem0.test")
+    monkeypatch.setenv("MEM0_ADMIN_API_KEY", "admin-key")
+    monkeypatch.setenv("MEM0_USER_ID", "ace")
+    monkeypatch.setenv("MEM0_AGENT_ID", "daedalus")
+    monkeypatch.delenv("MEM0_API_KEY", raising=False)
+    # No MEM0_CAPTURE: the env must not be what saves us here.
+    monkeypatch.delenv("MEM0_CAPTURE", raising=False)
+
+    calls = []
+
+    def fake_urlopen(request, timeout=0, context=None):
+        calls.append((request.get_method(), urlparse(request.full_url).path))
+        return _HTTPResponse({"results": []})
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    p = Mem0MemoryProvider()
+    p.initialize("test-session")
+
+    assert p._live_capture() == "auto"
+    assert p._capture_source == "default"
+
+    out = json.loads(p.handle_tool_call("mem0_remember", {"fact": "Ace's DNS is AdGuard."}))
+    assert out.get("status") == "skipped", out
+    assert "interlock" in out.get("reason", "").lower(), out
+    # The write must never have reached the store.
+    assert not any(m == "POST" and pth == "/memories" for m, pth in calls), calls
