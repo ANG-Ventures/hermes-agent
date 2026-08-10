@@ -82,9 +82,22 @@ def _reset_mcp_startup_state():
 def test_acp_background_discovery_does_not_block_startup(monkeypatch):
     """start_background_mcp_discovery must return immediately even if discovery hangs."""
     block = threading.Event()
+    # ORDERING WITNESSES — replace `assert elapsed < 0.2`, which made the OS
+    # scheduler part of the assertion (a loaded box can miss a 200ms budget
+    # with nothing wrong in the code under test). The fact the bound stood in
+    # for is: discovery is still *inside* its blocking call at the moment
+    # start_background_mcp_discovery() returns. If discovery ran inline, it
+    # would have returned before the caller did.
+    entered = threading.Event()
+    discover_returned = threading.Event()
 
     def _blocking_discover():
-        block.wait(timeout=5.0)
+        entered.set()
+        try:
+            block.wait(timeout=10.0)
+        finally:
+            # EVERY exit path, so an inline call is always witnessed.
+            discover_returned.set()
 
     monkeypatch.setitem(
         sys.modules,
@@ -105,18 +118,25 @@ def test_acp_background_discovery_does_not_block_startup(monkeypatch):
         _mod("tools.mcp_tool", discover_mcp_tools=_blocking_discover),
     )
 
-    start = time.monotonic()
     mcp_startup.start_background_mcp_discovery(
         logger=SimpleNamespace(debug=lambda *_a, **_k: None),
         thread_name="test-acp-discovery",
     )
-    elapsed = time.monotonic() - start
 
-    assert elapsed < 0.2, "start_background_mcp_discovery blocked for {:.3f}s".format(elapsed)
+    assert not discover_returned.is_set(), (
+        "start_background_mcp_discovery blocked on discovery — it ran inline "
+        "instead of on a background thread"
+    )
     assert mcp_startup._mcp_discovery_thread is not None
     assert mcp_startup._mcp_discovery_thread.is_alive()
+    # The witness above is only meaningful if discovery actually started; this
+    # keeps the test honest about *where* it ran rather than merely that it
+    # hadn't finished.
+    assert entered.wait(timeout=10.0), "discovery never ran on the background thread"
+    assert not discover_returned.is_set()
     block.set()
-    mcp_startup._mcp_discovery_thread.join(timeout=2.0)
+    mcp_startup._mcp_discovery_thread.join(timeout=10.0)
+    assert discover_returned.wait(timeout=10.0)
 
 
 # ---------------------------------------------------------------------------

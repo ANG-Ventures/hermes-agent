@@ -6,7 +6,6 @@ from argparse import Namespace
 from contextlib import nullcontext
 import sys
 import threading
-import time
 import types
 
 import pytest
@@ -48,10 +47,20 @@ def _agent_args(**overrides) -> Namespace:
 def test_prepare_agent_startup_backgrounds_blocking_mcp_for_chat(monkeypatch):
     stop = threading.Event()
     calls = {"mcp": 0}
+    # ORDERING WITNESSES — replace `assert elapsed < 0.2`. The bound made the
+    # OS scheduler part of the assertion; the fact it stood in for is that
+    # discovery is still *inside* its blocking call when
+    # _prepare_agent_startup() returns (i.e. it did not run inline).
+    entered = threading.Event()
+    discover_returned = threading.Event()
 
     def _blocking_discover():
         calls["mcp"] += 1
-        stop.wait()
+        entered.set()
+        try:
+            stop.wait()
+        finally:
+            discover_returned.set()
 
     monkeypatch.setitem(
         sys.modules,
@@ -88,14 +97,14 @@ def test_prepare_agent_startup_backgrounds_blocking_mcp_for_chat(monkeypatch):
     )
 
     try:
-        start = time.monotonic()
         main_mod._prepare_agent_startup(_agent_args())
-        elapsed = time.monotonic() - start
-        assert elapsed < 0.2
-        deadline = time.monotonic() + 3.0
-        while calls["mcp"] == 0 and time.monotonic() < deadline:
-            time.sleep(0.01)
+        assert not discover_returned.is_set(), (
+            "_prepare_agent_startup blocked on MCP discovery — it ran inline "
+            "instead of on the background thread"
+        )
+        assert entered.wait(timeout=10.0), "discovery never ran off-thread"
         assert calls["mcp"] == 1
+        assert not discover_returned.is_set()
         assert mcp_startup._mcp_discovery_thread is not None
         assert mcp_startup._mcp_discovery_thread.is_alive()
     finally:
