@@ -811,24 +811,46 @@ class TestZaiParallelProbe:
     def test_early_exit_does_not_wait_for_slow_losers(self, monkeypatch):
         """When the highest-priority endpoint succeeds fast, the caller must
         return without waiting for slow lower-priority probes to finish."""
-        import time as _time
+        import threading as _threading
 
         from hermes_cli.auth import ZAI_ENDPOINTS, detect_zai_endpoint
 
         first = ZAI_ENDPOINTS[0]
         inner = self._mock_post({(first[1], first[2][0]): True})
 
+        # ORDERING WITNESS — replaces `assert elapsed < 1.5` against a 2.0s
+        # sleep. A 0.5s margin made the OS scheduler part of the assertion.
+        # The fact it stood in for is that the slow lower-priority probes are
+        # still IN FLIGHT when detect_zai_endpoint returns; if the caller
+        # waited them out, they would all have returned first.
+        release = _threading.Event()
+        losers_entered = _threading.Event()
+        losers_returned = _threading.Event()
+
         def _slow_losers(url, headers=None, json=None, timeout=None):
             if not url.startswith(first[1]):
-                _time.sleep(2.0)  # slow lower-priority endpoints
+                losers_entered.set()
+                try:
+                    release.wait(timeout=10.0)  # slow lower-priority endpoints
+                finally:
+                    losers_returned.set()
             return inner(url, headers=headers, json=json, timeout=timeout)
 
         monkeypatch.setattr("hermes_cli.auth.httpx.post", _slow_losers)
-        t0 = _time.perf_counter()
-        result = detect_zai_endpoint("test-key", timeout=5.0)
-        elapsed = _time.perf_counter() - t0
-        assert result is not None and result["id"] == first[0]
-        assert elapsed < 1.5, f"early exit failed: waited {elapsed:.2f}s for losers"
+        try:
+            result = detect_zai_endpoint("test-key", timeout=5.0)
+            assert result is not None and result["id"] == first[0]
+            assert losers_entered.wait(timeout=10.0), (
+                "the slow lower-priority probes never started — the test did "
+                "not exercise the early-exit path"
+            )
+            assert not losers_returned.is_set(), (
+                "detect_zai_endpoint waited for the slow losers instead of "
+                "returning as soon as the top-priority endpoint won"
+            )
+        finally:
+            release.set()
+            losers_returned.wait(timeout=10.0)
 
 
 # =============================================================================

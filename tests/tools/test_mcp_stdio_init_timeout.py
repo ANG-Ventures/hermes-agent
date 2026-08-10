@@ -17,12 +17,20 @@ This test drives the *real* ``_run_stdio`` with a fake transport whose
 ``connect_timeout`` rather than blocking forever. It is fully hermetic — no real
 subprocess, no network (the drain-to-zero behaviour was additionally verified
 manually against the reporter's live repro).
+
+The bound is asserted as an **ordering fact**, not a stopwatch reading: the
+coroutine must unwind *on its own* (via the inner ``connect_timeout``) rather
+than only when the test's outer hang-guard gives up on it. The previous form
+(``assert elapsed < 2.0``) made the OS scheduler part of the assertion and
+failed on a loaded box with nothing wrong in the code under test. Profiling the
+measured window showed **2.34s of the 2.35s was ``_snapshot_child_pids``** (a
+``ps``-based child scan run before the handshake) — the threshold was dominated
+by setup cost it was never meant to measure.
 """
 
 from __future__ import annotations
 
 import asyncio
-import time
 from unittest.mock import patch
 
 import pytest
@@ -33,8 +41,19 @@ pytest.importorskip("mcp")
 class _HangingSession:
     """Stand-in ClientSession whose handshake never completes."""
 
+    def __init__(self):
+        # Set only when the handshake is torn down by a cancellation — which
+        # is exactly what an ``asyncio.wait_for`` timeout does to the
+        # coroutine it wraps. This is the witness that the bound was applied
+        # *here*, rather than the whole connect merely being abandoned.
+        self.handshake_cancelled = False
+
     async def initialize(self):
-        await asyncio.sleep(3600)
+        try:
+            await asyncio.Event().wait()  # never set — a genuine hang
+        except asyncio.CancelledError:
+            self.handshake_cancelled = True
+            raise
 
 
 class _FakeAsyncCM:
@@ -55,9 +74,12 @@ def _fake_stdio_client(*_args, **_kwargs):
     return _FakeAsyncCM((object(), object()))
 
 
-def _fake_client_session(*_args, **_kwargs):
-    # `async with ClientSession(...) as session` -> a session that hangs.
-    return _FakeAsyncCM(_HangingSession())
+def _make_fake_client_session(session):
+    def _fake_client_session(*_args, **_kwargs):
+        # `async with ClientSession(...) as session` -> a session that hangs.
+        return _FakeAsyncCM(session)
+
+    return _fake_client_session
 
 
 class TestStdioInitializeTimeout:
@@ -70,25 +92,47 @@ class TestStdioInitializeTimeout:
         config = {"command": "fake-mcp", "args": [], "connect_timeout": 0.2}
 
         async def drive():
+            session = _HangingSession()
             with patch.object(mcp_tool, "stdio_client", _fake_stdio_client), \
-                 patch.object(mcp_tool, "ClientSession", _fake_client_session), \
+                 patch.object(mcp_tool, "ClientSession",
+                              _make_fake_client_session(session)), \
                  patch.object(mcp_tool, "_resolve_stdio_command", lambda c, e: (c, e)), \
                  patch.object(mcp_tool, "_write_stderr_log_header", lambda *_a, **_k: None), \
                  patch.object(mcp_tool, "_get_mcp_stderr_log", lambda: None), \
                  patch("tools.osv_check.check_package_for_malware",
                        lambda *_a, **_k: None):
-                start = time.monotonic()
-                # The outer 5s guard exists ONLY so a regression can't hang the
-                # whole suite. With the fix, the inner connect_timeout (0.2s)
-                # fires first; the elapsed assertion below is what actually
-                # distinguishes "bounded" (fixed) from "hung" (regressed).
-                with pytest.raises(asyncio.TimeoutError):
-                    await asyncio.wait_for(server._run_stdio(config), timeout=5.0)
-                return time.monotonic() - start
+                task = asyncio.ensure_future(server._run_stdio(config))
+                # ORDERING WITNESS (not a stopwatch): with the fix,
+                # ``_run_stdio`` unwinds BY ITSELF via the inner
+                # ``connect_timeout``. Without it the coroutine hangs forever
+                # and is still pending when this bounded wait returns. The 10s
+                # is a hang-guard 50x the 0.2s connect_timeout so a regression
+                # fails fast instead of wedging the suite — it is not what is
+                # being asserted, and no realistic scheduling delay approaches
+                # it.
+                done, pending = await asyncio.wait({task}, timeout=10.0)
+                for stuck in pending:
+                    stuck.cancel()
+                    try:
+                        await stuck
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                return task, done, session
 
-        elapsed = asyncio.run(drive())
-        assert elapsed < 2.0, (
-            f"_run_stdio blocked {elapsed:.1f}s on a hanging initialize() — the "
-            f"connect_timeout ({config['connect_timeout']}s) bound was not applied; "
-            f"the #59349 subprocess/FD leak has regressed."
-        )
+        async def check():
+            task, done, session = await drive()
+            assert task in done, (
+                "_run_stdio never unwound on its own — the connect_timeout "
+                "bound was not applied to session.initialize(); the #59349 "
+                "subprocess/FD leak has regressed."
+            )
+            # It unwound because the handshake TIMED OUT, not because the
+            # connect somehow succeeded or failed for an unrelated reason.
+            with pytest.raises(asyncio.TimeoutError):
+                task.result()
+            assert session.handshake_cancelled, (
+                "the hanging initialize() was never torn down — "
+                "connect_timeout did not wrap the handshake"
+            )
+
+        asyncio.run(check())

@@ -54,16 +54,35 @@ def test_prefetch_non_blocking():
     banner._update_result = None
     banner._update_check_done = threading.Event()
 
-    with patch.object(banner, "check_for_updates", return_value=5):
-        start = time.monotonic()
+    # ORDERING WITNESSES — replace `assert elapsed < 1.0`, which made the OS
+    # scheduler part of the assertion. The fact it stood in for is that the
+    # check is still *running* when prefetch_update_check() returns, i.e. the
+    # caller did not wait for it.
+    release = threading.Event()
+    entered = threading.Event()
+    check_returned = threading.Event()
+
+    def _blocking_check():
+        entered.set()
+        try:
+            release.wait(timeout=10.0)
+            return 5
+        finally:
+            check_returned.set()
+
+    with patch.object(banner, "check_for_updates", side_effect=_blocking_check):
         banner.prefetch_update_check()
-        elapsed = time.monotonic() - start
 
-        # Should return almost immediately (well under 1 second)
-        assert elapsed < 1.0
+        assert not check_returned.is_set(), (
+            "prefetch_update_check blocked on check_for_updates — it ran "
+            "inline instead of on the background thread"
+        )
+        assert entered.wait(timeout=10.0), "the update check never ran off-thread"
+        assert not check_returned.is_set()
 
-        # Wait for the background thread to finish
-        banner._update_check_done.wait(timeout=5)
+        # Let the background thread finish and confirm it published its result.
+        release.set()
+        assert banner._update_check_done.wait(timeout=10)
         assert banner._update_result == 5
 
 
