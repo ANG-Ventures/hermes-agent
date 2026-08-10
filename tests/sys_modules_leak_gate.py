@@ -66,8 +66,17 @@ def _watched(name: str) -> bool:
 
 
 def snapshot_watched() -> set:
-    """Watched modules currently in ``sys.modules`` (the 'before' half)."""
-    return {name for name in sys.modules if _watched(name)}
+    """Watched modules currently in ``sys.modules`` (the 'before' half).
+
+    Iterate a LIST copy, never ``sys.modules`` itself. Tests in this suite spawn
+    background threads (and the gateway/MCP fixtures import lazily), so a
+    concurrent import can insert into ``sys.modules`` mid-comprehension and
+    raise ``RuntimeError: dictionary changed size during iteration`` — which
+    fails the gate for a reason that has nothing to do with module leaks.
+    Observed on CI slice 11/12. ``list(sys.modules)`` snapshots the keys under
+    the GIL in one step, so the comprehension can no longer observe a resize.
+    """
+    return {name for name in list(sys.modules) if _watched(name)}
 
 
 def leak_failure_message(nodeid: str, removed: set) -> str:
