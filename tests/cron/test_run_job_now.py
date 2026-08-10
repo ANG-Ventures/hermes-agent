@@ -117,6 +117,31 @@ class TestRunJobNow:
         scheduler.run_job_now("abc123", verbose=False)
         assert called["due"] == 0, "run_job_now must not consult the due-list"
 
+    def test_completed_oneshot_is_replayed_and_updates_status(self, monkeypatch):
+        """An explicit --wait run is real work, not a false-success no-op."""
+        job = {
+            "id": "once123",
+            "name": "completed-check",
+            "enabled": False,
+            "state": "completed",
+            "schedule": {"kind": "once", "run_at": "2026-01-01T00:00:00+00:00"},
+            "repeat": {"times": 1, "completed": 1},
+            "last_run_at": "2026-01-01T00:00:01+00:00",
+            "last_status": "error",
+        }
+        calls = _patch_pipeline(
+            monkeypatch, success=True, final_response="recovered", job=job,
+        )
+        monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: False)
+
+        result = scheduler.run_job_now("completed-check", verbose=False)
+
+        assert result["success"] is True
+        assert result["final_response"] == "recovered"
+        assert calls["run_job"] == 1
+        assert calls["save"] == 1
+        assert calls["mark"][0][:3] == ("once123", True, None)
+
 
 class TestRunJobNowAcceptsName:
     """`hermes cron run <name> --wait` must work, not just `<id>` (2026-08-08).

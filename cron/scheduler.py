@@ -4617,7 +4617,14 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
-def _process_one_job(job: dict, *, verbose: bool = True, adapters=None, loop=None) -> dict:
+def _process_one_job(
+    job: dict,
+    *,
+    verbose: bool = True,
+    adapters=None,
+    loop=None,
+    enforce_dispatch_limit: bool = True,
+) -> dict:
     """Run one job end-to-end: execute → save → deliver → mark.
 
     Shared by the scheduler tick (parallel/sequential passes) and by
@@ -4643,10 +4650,12 @@ def _process_one_job(job: dict, *, verbose: bool = True, adapters=None, loop=Non
         # mid-execution (gateway kill, OOM, segfault, hard-timeout) cannot
         # re-fire the job forever on restart. No-op for recurring jobs (they
         # use advance_next_run) and infinite/no-repeat jobs. This lives in the
-        # shared body so every dispatch path through the built-in ticker
-        # (tick → _process_one_job) and run_job_now gets at-most-times
-        # semantics — the external-provider path claims in run_one_job.
-        if not claim_dispatch(job["id"]):
+        # shared body so every scheduled dispatch path through the built-in
+        # ticker (tick → _process_one_job) gets at-most-times semantics — the
+        # external-provider path claims in run_one_job. Explicit operator runs
+        # bypass this limit: `cron run --wait` must really execute a completed
+        # one-shot instead of reporting a false-success no-op.
+        if enforce_dispatch_limit and not claim_dispatch(job["id"]):
             logger.info(
                 "Job '%s': one-shot dispatch limit reached — skipping",
                 job.get("name", job["id"]),
@@ -4802,7 +4811,14 @@ def run_job_now(job_id: str, *, verbose: bool = True, adapters=None, loop=None) 
         logger.info("Running job '%s' (%s) synchronously now", job.get("name", job_id), job_id)
     # Preserve scheduler-scoped ContextVar state, mirroring the tick passes.
     _ctx = contextvars.copy_context()
-    return _ctx.run(_process_one_job, job, verbose=verbose, adapters=adapters, loop=loop)
+    return _ctx.run(
+        _process_one_job,
+        job,
+        verbose=verbose,
+        adapters=adapters,
+        loop=loop,
+        enforce_dispatch_limit=False,
+    )
 
 
 
