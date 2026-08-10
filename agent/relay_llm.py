@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from agent import relay_runtime
+from agent.message_sanitization import _splice_surrogates
 
 logger = logging.getLogger(__name__)
 
@@ -465,7 +466,7 @@ class ManagedLlmStream(Iterator[Any]):
                         chunk,
                     ):
                         break
-                    encoded_chunk = _jsonable(chunk)
+                    encoded_chunk = _repair_relay_stream_surrogates(_jsonable(chunk))
                     self._raw_chunks.append((encoded_chunk, chunk))
                     yield encoded_chunk
                 self._provider_completed = True
@@ -1206,6 +1207,27 @@ def _jsonable(value: Any) -> Any:
     except (TypeError, AttributeError):
         return str(value)
     return _jsonable(attributes) if attributes else str(value)
+
+
+def _repair_relay_stream_surrogates(value: Any) -> Any:
+    """Make a JSONable stream-chunk copy safe for Relay's UTF-8 encoder.
+
+    The raw provider chunk remains in ``ManagedLlmStream._raw_chunks`` and is
+    returned to Hermes when Relay leaves it unchanged. Hermes's existing
+    stateful splicers can therefore rejoin a pair split across adjacent chunks,
+    while the per-chunk copy crossing Relay never contains an unencodable lone
+    surrogate.
+    """
+    if isinstance(value, str):
+        return _splice_surrogates(value)
+    if isinstance(value, dict):
+        return {
+            _splice_surrogates(str(key)): _repair_relay_stream_surrogates(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_repair_relay_stream_surrogates(item) for item in value]
+    return value
 
 
 def _namespace(value: Any) -> Any:

@@ -6,6 +6,7 @@ import asyncio
 import contextvars
 import json
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,49 @@ import pytest
 pytest.importorskip("nemo_relay")
 
 from agent import relay_llm, relay_runtime
+from agent.message_sanitization import _SurrogateSplicer
+
+
+SPLIT_SURROGATE_FIXTURE = (
+    Path(__file__).parents[1] / "fixtures" / "anthropic_split_surrogate_stream.json"
+)
+
+
+def _load_split_surrogate_fixture() -> dict:
+    return json.loads(SPLIT_SURROGATE_FIXTURE.read_text(encoding="utf-8"))
+
+
+def _field(value, name: str, default=None):
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _chat_completions_content(chunk) -> str | None:
+    choices = _field(chunk, "choices", []) or []
+    if not choices:
+        return None
+    return _field(_field(choices[0], "delta"), "content")
+
+
+def _collect_anthropic_text(events) -> str:
+    splicer = _SurrogateSplicer()
+    parts = []
+    for event in events:
+        delta = _field(event, "delta")
+        if _field(delta, "type") == "text_delta":
+            parts.append(splicer.feed(_field(delta, "text", "")))
+    parts.append(splicer.flush())
+    return "".join(parts)
+
+
+def _collect_chat_completions_text(chunks) -> str:
+    splicer = _SurrogateSplicer()
+    parts = []
+    for chunk in chunks:
+        parts.append(splicer.feed(_chat_completions_content(chunk) or ""))
+    parts.append(splicer.flush())
+    return "".join(parts)
 
 
 @pytest.fixture()
@@ -143,14 +187,114 @@ def test_stream_uses_rewritten_request_and_post_intercept_chunks(relay_turn):
     assert turn.logical_llm_calls == {}
 
 
+def test_managed_anthropic_stream_replays_split_surrogate_fixture(relay_turn):
+    del relay_turn
+    fixture = _load_split_surrogate_fixture()
+    events = fixture["events"]
+    first_text = events[2]["delta"]["text"]
+
+    with pytest.raises(UnicodeEncodeError) as caught:
+        first_text.encode(fixture["reported_error"]["encoding"])
+    assert caught.value.start == fixture["reported_error"]["start"]
+    assert caught.value.end == fixture["reported_error"]["end"]
+    assert caught.value.reason == fixture["reported_error"]["runtime_reason"]
+
+    relay_copy = relay_llm._repair_relay_stream_surrogates(events[2])
+    json.dumps(relay_copy, ensure_ascii=False).encode("utf-8")
+    assert relay_copy != events[2]
+
+    accumulator = relay_llm.AnthropicStreamAccumulator()
+    stream = relay_llm.stream(
+        {
+            "model": "claude-opus-5",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        lambda _request: iter(events),
+        session_id="session-1",
+        name="anthropic",
+        model_name="claude-opus-5",
+        finalizer=accumulator.finalize,
+        on_chunk=accumulator.observe,
+        metadata={
+            "api_mode": "anthropic_messages",
+            "api_request_id": "request-split-surrogate-anthropic",
+        },
+    )
+
+    delivered_events = list(stream)
+    delivered_parts = [
+        _field(_field(event, "delta"), "text")
+        for event in delivered_events
+        if _field(_field(event, "delta"), "type") == "text_delta"
+    ]
+    assert delivered_parts == [
+        event["delta"]["text"] for event in fixture["events"][2:4]
+    ]
+    assert _collect_anthropic_text(delivered_events) == fixture["expected_text"]
+    assert stream.output_modified is False
 
 
-
-
-
-
-
-
+def test_managed_chat_completions_stream_replays_split_surrogate_fixture(
+    relay_turn,
+):
+    del relay_turn
+    fixture = _load_split_surrogate_fixture()
+    raw_parts = [event["delta"]["text"] for event in fixture["events"][2:4]]
+    chunks = [
+        {
+            "id": "chatcmpl_split_surrogate",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "claude-opus-5",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": part},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        for part in raw_parts
+    ]
+    chunks.append({
+        "id": "chatcmpl_split_surrogate",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "claude-opus-5",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    })
+    stream = relay_llm.stream(
+        {"model": "claude-opus-5", "messages": []},
+        lambda _request: iter(chunks),
+        session_id="session-1",
+        name="openai-compatible",
+        model_name="claude-opus-5",
+        finalizer=lambda: {
+            "model": "claude-opus-5",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+        },
+        metadata={
+            "api_mode": "chat_completions",
+            "api_request_id": "request-split-surrogate-chat-completions",
+        },
+    )
+    delivered_chunks = list(stream)
+    delivered_parts = [
+        _chat_completions_content(chunk)
+        for chunk in delivered_chunks[:2]
+    ]
+    assert delivered_parts == raw_parts
+    assert _collect_chat_completions_text(delivered_chunks) == fixture["expected_text"]
+    assert stream.output_modified is False
 
 
 def test_anthropic_stream_accumulator_merges_plain_provider_object():
