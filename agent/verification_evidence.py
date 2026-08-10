@@ -233,6 +233,12 @@ def _strip_command_prefix(tokens: list[str]) -> list[str]:
     remaining = list(tokens)
     if remaining and remaining[0] == "env":
         remaining = remaining[1:]
+        while remaining and remaining[0] in {"-i", "-u"}:
+            option = remaining.pop(0)
+            if option == "-u":
+                if not remaining:
+                    return []
+                remaining.pop(0)
     while remaining and "=" in remaining[0] and not remaining[0].startswith("-"):
         remaining = remaining[1:]
     while remaining and remaining[0] in {"command", "time", "noglob"}:
@@ -273,8 +279,9 @@ def _find_canonical_match(command: str, canonical_commands: list[str]) -> Option
             continue
         for tokens in segments:
             candidate_tokens = _strip_command_prefix(tokens)
+            comparable_tokens = [_clean_token(token) for token in candidate_tokens]
             for candidate in _equivalent_needles(needle):
-                if candidate_tokens[:len(candidate)] == candidate:
+                if comparable_tokens[: len(candidate)] == candidate:
                     return canonical, candidate_tokens[len(candidate):]
     return None
 
