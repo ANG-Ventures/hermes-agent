@@ -929,10 +929,17 @@ class AIAgent:
             return_load_result=True,
         )
 
-    def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
-        """Forwarder — see ``agent.agent_runtime_helpers.switch_model``."""
+    def switch_model(self, new_model, new_provider, api_key='', base_url='',
+                     api_mode='', **kwargs):
+        """Forwarder — see ``agent.agent_runtime_helpers.switch_model``.
+
+        ``**kwargs`` carries the optional ``session_reasoning_config`` through
+        without pinning its sentinel default in two places.
+        """
         from agent.agent_runtime_helpers import switch_model
-        return switch_model(self, new_model, new_provider, api_key, base_url, api_mode)
+        return switch_model(
+            self, new_model, new_provider, api_key, base_url, api_mode, **kwargs
+        )
 
     def _safe_print(self, *args, **kwargs):
         """Print that silently handles broken pipes / closed stdout.
