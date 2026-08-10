@@ -388,6 +388,14 @@ CREATE TABLE IF NOT EXISTS gateway_routing (
     PRIMARY KEY (scope, session_key)
 );
 
+CREATE TABLE IF NOT EXISTS compression_skew_calibration (
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    skew_history TEXT,
+    updated_at REAL,
+    PRIMARY KEY (provider, model)
+);
+
 CREATE TABLE IF NOT EXISTS compression_locks (
     session_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
