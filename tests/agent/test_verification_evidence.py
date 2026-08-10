@@ -4,6 +4,8 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from agent.verification_evidence import (
     _effective_cwd,
     classify_verification_command,
@@ -81,6 +83,79 @@ def test_shell_wrappers_match_but_echo_does_not(tmp_path, monkeypatch):
     assert wrapped.canonical_command == "scripts/run_tests.sh"
     assert wrapped.scope == "targeted"
     assert echoed is None
+
+
+@pytest.mark.parametrize(
+    ("command_template", "cwd_source", "canonical"),
+    [
+        ("bash scripts/run_tests.sh tests/x.py", "repo", "scripts/run_tests.sh"),
+        (
+            "cd {repo} && bash scripts/run_tests.sh tests/x.py",
+            "outside",
+            "scripts/run_tests.sh",
+        ),
+        (
+            "cd ~/repo && ./scripts/run_tests.sh tests/x.py",
+            "outside",
+            "scripts/run_tests.sh",
+        ),
+        (
+            "env -u FOO bash scripts/run_tests.sh tests/x.py",
+            "repo",
+            "scripts/run_tests.sh",
+        ),
+        (
+            "cd ~/repo && env -u FOO bash scripts/run_tests.sh tests/x.py",
+            "outside",
+            "scripts/run_tests.sh",
+        ),
+        (
+            "cd {repo} && env -u FOO -u BAR ./scripts/run_tests.sh tests/x.py",
+            "outside",
+            "scripts/run_tests.sh",
+        ),
+        ("env TZ=UTC pytest tests/x.py", "repo", "pytest"),
+        ("env -i TZ=UTC pytest tests/x.py", "repo", "pytest"),
+        ("env HERMES_HOME=/tmp pytest tests/x.py", "repo", "pytest"),
+    ],
+)
+def test_classifier_unwraps_cd_and_env_prefixes(
+    tmp_path,
+    monkeypatch,
+    command_template,
+    cwd_source,
+    canonical,
+):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _node_project(repo)
+    _python_project(repo)
+
+    evidence = classify_verification_command(
+        command_template.format(repo=repo),
+        cwd=repo if cwd_source == "repo" else home,
+        session_id="s1",
+        exit_code=0,
+    )
+
+    assert evidence is not None
+    assert evidence.canonical_command == canonical
+    assert evidence.kind == "test"
+    assert evidence.scope == "targeted"
+    assert Path(evidence.root) == repo.resolve()
+
+
+@pytest.mark.parametrize("command", ["env", "env -i", "env -u FOO", "grep env foo"])
+def test_classifier_does_not_treat_literal_env_as_a_prefix(
+    tmp_path, monkeypatch, command
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _python_project(tmp_path)
+
+    assert classify_verification_command(command, cwd=tmp_path) is None
 
 
 
