@@ -1406,6 +1406,17 @@ def _live_system_guard(request, monkeypatch):
     except Exception:
         _psutil = None
         _initial_children = set()
+    _spawned_children = {}
+
+    def _remember_spawned_child(pid: int) -> None:
+        """Remember a child even after it exits and is reparented under load."""
+        started_at = None
+        if _psutil is not None:
+            try:
+                started_at = _psutil.Process(pid).create_time()
+            except Exception:
+                pass
+        _spawned_children[pid] = started_at
 
     def _is_own_subtree(pid: int) -> bool:
         # PID 0 means "our own process group"; -1 means "every process we
@@ -1418,6 +1429,21 @@ def _live_system_guard(request, monkeypatch):
             return False
         if pid == test_pid or pid in _initial_children:
             return True
+        if pid in _spawned_children:
+            if _psutil is None:
+                return True
+            try:
+                walker = _psutil.Process(pid)
+            except Exception:
+                # The recorded child is gone, so the signal is a no-op.
+                return True
+            started_at = _spawned_children[pid]
+            if started_at is not None:
+                if walker.create_time() == started_at:
+                    return True
+                # PID was recycled onto a process the test did not spawn.
+                return False
+            # Without a recorded identity, retain the parent-chain check below.
         if _psutil is None:
             return False
         try:
@@ -1644,6 +1670,7 @@ def _live_system_guard(request, monkeypatch):
             def __init__(self, cmd, *args, **kwargs):
                 _check_subprocess_cmd("Popen", cmd)
                 super().__init__(cmd, *args, **kwargs)
+                _remember_spawned_child(self.pid)
 
         _GuardedPopen.__name__ = "Popen"
         _GuardedPopen.__qualname__ = "Popen"
@@ -1716,11 +1743,15 @@ def _live_system_guard(request, monkeypatch):
             _check_subprocess_cmd(
                 "asyncio.create_subprocess_exec", [program, *args]
             )
-            return await real_async_exec(program, *args, **kwargs)
+            proc = await real_async_exec(program, *args, **kwargs)
+            _remember_spawned_child(proc.pid)
+            return proc
 
         async def _guarded_async_shell(cmd, *args, **kwargs):
             _check_subprocess_cmd("asyncio.create_subprocess_shell", cmd)
-            return await real_async_shell(cmd, *args, **kwargs)
+            proc = await real_async_shell(cmd, *args, **kwargs)
+            _remember_spawned_child(proc.pid)
+            return proc
 
         monkeypatch.setattr(_asyncio, "create_subprocess_exec", _guarded_async_exec)
         monkeypatch.setattr(
