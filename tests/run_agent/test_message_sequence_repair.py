@@ -108,25 +108,6 @@ def test_repair_drops_stray_tool_with_unknown_tool_call_id():
     assert all(m.get("role") != "tool" for m in messages)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "INHERITED fork/main defect, NOT parity-merge damage -- see card t_08cca32f. "
-        "Pass 1.5 of repair_message_sequence (agent/agent_runtime_helpers.py, "
-        "fork-only code from PR #196 / aaa34311e0) resolves a tool_call's answered "
-        "budget against tc.get('id') ONLY, while Pass 1 correctly matches the "
-        "id||call_id superset per PR #58168. A tool_call carrying only call_id (or a "
-        "Codex-Responses call whose id and call_id differ) therefore reads as "
-        "unanswered, and the 'none answered' branch deletes an assistant turn that "
-        "WAS answered. Evidence: reproduced identically on a clean detached worktree "
-        "at fork/main ee2fce2876 (repairs=1, expected 0); the merge's diff over the "
-        "Pass 1.5 region is empty; 'Pass 1.5' appears 6x at fork/main HEAD and 0x at "
-        "both merge-base a7a696ba and upstream target 1e5b5074. These tests exist at "
-        "the merge base and upstream but were dropped from fork/main -- the merge "
-        "restored them, which is how the bug surfaced. strict=False so this xpasses "
-        "and flags itself for deletion once t_08cca32f lands."
-    ),
-    strict=False,
-)
 def test_repair_keeps_tool_matching_codex_call_id():
     """A valid tool result must survive when the assistant tool_call carries a
     Codex-format ``call_id`` distinct from ``id`` and the result matches on
@@ -157,25 +138,6 @@ def test_repair_keeps_tool_matching_codex_call_id():
     assert messages[2]["tool_call_id"] == "call_ABC"
 
 
-@pytest.mark.xfail(
-    reason=(
-        "INHERITED fork/main defect, NOT parity-merge damage -- see card t_08cca32f. "
-        "Pass 1.5 of repair_message_sequence (agent/agent_runtime_helpers.py, "
-        "fork-only code from PR #196 / aaa34311e0) resolves a tool_call's answered "
-        "budget against tc.get('id') ONLY, while Pass 1 correctly matches the "
-        "id||call_id superset per PR #58168. A tool_call carrying only call_id (or a "
-        "Codex-Responses call whose id and call_id differ) therefore reads as "
-        "unanswered, and the 'none answered' branch deletes an assistant turn that "
-        "WAS answered. Evidence: reproduced identically on a clean detached worktree "
-        "at fork/main ee2fce2876 (repairs=1, expected 0); the merge's diff over the "
-        "Pass 1.5 region is empty; 'Pass 1.5' appears 6x at fork/main HEAD and 0x at "
-        "both merge-base a7a696ba and upstream target 1e5b5074. These tests exist at "
-        "the merge base and upstream but were dropped from fork/main -- the merge "
-        "restored them, which is how the bug surfaced. strict=False so this xpasses "
-        "and flags itself for deletion once t_08cca32f lands."
-    ),
-    strict=False,
-)
 def test_repair_keeps_tool_matching_only_call_id():
     """Same as above but the assistant tool_call carries ONLY ``call_id`` (no
     ``id``). The result keyed on ``call_id`` must still be recognized (#58168).

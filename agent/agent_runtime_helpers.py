@@ -819,12 +819,20 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                     answered_counts[tc_id] += 1
                 j += 1
             # Consume the answered budget left-to-right: a call is "answered"
-            # only while its id still has an unconsumed result. Calls with no id
-            # are unanswerable (can't be matched to a result) → unanswered.
+            # only while one of its identifiers has an unconsumed result. Calls
+            # with no id/call_id are unanswerable (can't be matched to a result)
+            # → unanswered.
             _remaining = dict(answered_counts)
             answered_flags = []  # parallel to ``calls``: True = this entry answered
             for tc in calls:
-                _cid = tc.get("id") if isinstance(tc, dict) else None
+                _cid = None
+                if isinstance(tc, dict):
+                    for _key in ("id", "call_id"):
+                        if tc.get(_key) and _remaining.get(tc[_key], 0) > 0:
+                            _cid = tc[_key]
+                            break
+                    else:
+                        _cid = tc.get("id") or tc.get("call_id")
                 if _cid and _remaining.get(_cid, 0) > 0:
                     _remaining[_cid] -= 1
                     answered_flags.append(True)
