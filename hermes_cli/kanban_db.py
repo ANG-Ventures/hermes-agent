@@ -93,7 +93,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -10998,6 +10998,30 @@ def add_notify_sub(
                 """,
                 (notifier_profile, task_id, platform, chat_id, thread_id or ""),
             )
+        if user_id:
+            # Self-heal the participant identity, same fill-a-hole rule as
+            # chat_type / notifier_profile above. Load-bearing beyond tidiness:
+            # the wake injector rebuilds the creator's scope from this column
+            # (gateway/kanban_watchers.py), and build_session_key() omits the
+            # participant segment when it is absent. An identity-less row
+            # therefore wakes a SECOND session key for the same chat — one no
+            # human can send to, so /reasoning and /model overrides set by the
+            # user never reach it. Because this INSERT is OR IGNORE, a later
+            # subscribe from a turn that DOES carry an identity is the only
+            # chance to repair a row written before the identity was plumbed.
+            #
+            # Fill-a-hole ONLY: never repoint a sub that already names a
+            # participant, or a second user subscribing in the same chat would
+            # hijack the first user's notification lane.
+            conn.execute(
+                """
+                UPDATE kanban_notify_subs
+                   SET user_id = ?
+                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                   AND (user_id IS NULL OR user_id = '')
+                """,
+                (user_id, task_id, platform, chat_id, thread_id or ""),
+            )
         if metadata_json:
             # A duplicate subscribe from the same chat/thread should refresh
             # the routing anchor. Telegram DM-topic notifications need the
@@ -11040,6 +11064,86 @@ def _notify_profile_filter(
     if not clauses:
         return "0", []
     return "(" + ") OR (".join(clauses) + ")", params
+
+
+def backfill_notify_sub_user_ids(
+    conn: sqlite3.Connection,
+    resolve_user_id: "Callable[[dict], Optional[str]]",
+    *,
+    dry_run: bool = False,
+) -> list[dict]:
+    """Backfill ``user_id`` on identity-less subscription rows.
+
+    Rows written before the participant identity was plumbed through wake the
+    WRONG session: ``gateway/kanban_watchers.py`` rebuilds the creator's scope
+    from this column, and ``gateway.session.build_session_key`` drops the
+    participant segment when it is absent — so the notification lands in a
+    second, chat-unreachable session key for the same chat. ``add_notify_sub``
+    is ``INSERT OR IGNORE``, so a row nobody re-subscribes to never self-heals;
+    this is the explicit repair path for those.
+
+    ``resolve_user_id`` is given the row dict and returns the participant id
+    the origin chat actually had, or ``None``. Returning ``None`` MUST leave
+    the row untouched: a cron / CLI / home-channel subscription is legitimately
+    user-less, and inventing an identity for one would route a system
+    notification into some human's private per-user session. The caller owns
+    the evidence (the gateway routing index); this function owns the write.
+
+    Idempotent: rows that already name a participant are never re-pointed, so
+    a second run over the same board is a no-op. Returns one record per row
+    considered, each with ``task_id`` / ``platform`` / ``chat_id`` /
+    ``thread_id`` / ``user_id`` / ``action`` (``"backfilled"`` or
+    ``"skipped_no_evidence"``).
+    """
+    rows = conn.execute(
+        """
+        SELECT task_id, platform, chat_id, chat_type, thread_id, user_id,
+               notifier_profile, delivery_metadata
+          FROM kanban_notify_subs
+         WHERE user_id IS NULL OR user_id = ''
+        """
+    ).fetchall()
+
+    results: list[dict] = []
+    pending: list[tuple] = []
+    for row in rows:
+        item = dict(row)
+        if "delivery_metadata" in item:
+            item["delivery_metadata"] = _decode_notify_delivery_metadata(
+                item.get("delivery_metadata")
+            )
+        try:
+            resolved = resolve_user_id(item)
+        except Exception:
+            resolved = None
+        resolved = str(resolved).strip() if resolved else ""
+        record = {
+            "task_id": item["task_id"],
+            "platform": item["platform"],
+            "chat_id": item["chat_id"],
+            "thread_id": item.get("thread_id") or "",
+            "user_id": resolved or None,
+            "action": "backfilled" if resolved else "skipped_no_evidence",
+        }
+        results.append(record)
+        if resolved:
+            pending.append((
+                resolved, item["task_id"], item["platform"], item["chat_id"],
+                item.get("thread_id") or "",
+            ))
+
+    if pending and not dry_run:
+        with write_txn(conn):
+            conn.executemany(
+                """
+                UPDATE kanban_notify_subs
+                   SET user_id = ?
+                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                   AND (user_id IS NULL OR user_id = '')
+                """,
+                pending,
+            )
+    return results
 
 
 def list_notify_subs(

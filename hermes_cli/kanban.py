@@ -904,6 +904,31 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_nrm.add_argument("--chat-id", required=True)
     p_nrm.add_argument("--thread-id", default=None)
 
+    p_nrepair = sub.add_parser(
+        "notify-repair",
+        help="Backfill the creator identity on identity-less notify subscriptions",
+        description=(
+            "Repairs notify-sub rows whose user_id is empty. Such a row makes "
+            "the wake injector rebuild the creator's scope without a "
+            "participant id, so build_session_key() omits the participant "
+            "segment and the notification lands in a SECOND session key for "
+            "the same chat — one no human can send to, which therefore never "
+            "receives the /reasoning or /model overrides the user set. The "
+            "creator identity is read from the gateway routing index: a row is "
+            "repaired only when exactly ONE per-user session key exists for "
+            "that chat, so the participant is unambiguous. A chat with no "
+            "per-user session (cron / CLI / home-channel origins, which are "
+            "legitimately user-less) is left alone — an identity is never "
+            "invented. Idempotent: rows that already name a participant are "
+            "never re-pointed."
+        ),
+    )
+    p_nrepair.add_argument(
+        "--dry-run", action="store_true",
+        help="Report what would change without writing",
+    )
+    p_nrepair.add_argument("--json", action="store_true")
+
     # --- log ---
     p_log = sub.add_parser(
         "log",
@@ -1191,6 +1216,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "notify-subscribe":   _cmd_notify_subscribe,
             "notify-list":        _cmd_notify_list,
             "notify-unsubscribe": _cmd_notify_unsubscribe,
+            "notify-repair":      _cmd_notify_repair,
             "context":  _cmd_context,
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
@@ -3252,6 +3278,130 @@ def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
         print("(no such subscription)", file=sys.stderr)
         return 1
     print(f"Unsubscribed from {args.task_id}")
+    return 0
+
+
+def _routing_participant_index() -> dict[tuple[str, str], set[str]]:
+    """Map ``(platform, chat_id) -> {participant ids seen for that chat}``.
+
+    Built from the gateway routing index (``state.db``'s ``gateway_routing``
+    table), which is the durable record of every session key the gateway has
+    resolved. A per-user group session key ends in the participant id, and each
+    entry also carries its ``origin`` — that origin is the creator identity a
+    notify-sub row written from the same chat should have captured.
+
+    Returns a SET per chat, deliberately: the caller repairs only chats with
+    exactly one known participant. A shared channel with several humans has no
+    single right answer, and guessing would route one person's notifications
+    into another's private session.
+    """
+    index: dict[tuple[str, str], set[str]] = {}
+    try:
+        from hermes_state import SessionDB
+    except Exception:
+        return index
+    try:
+        db = SessionDB()
+    except Exception:
+        return index
+    try:
+        loader = getattr(db, "load_gateway_routing_entries", None)
+        if not callable(loader):
+            return index
+        scopes = {""}
+        try:
+            from hermes_constants import get_hermes_home
+
+            scopes.add(str((get_hermes_home() / "sessions").resolve()))
+        except Exception:
+            pass
+        seen: dict[str, str] = {}
+        for scope in scopes:
+            try:
+                entries = loader(scope=scope)
+            except Exception:
+                continue
+            if isinstance(entries, dict):
+                seen.update({str(k): str(v) for k, v in entries.items()})
+        for entry_json in seen.values():
+            try:
+                entry = json.loads(entry_json)
+            except Exception:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            origin = entry.get("origin")
+            if not isinstance(origin, dict):
+                continue
+            platform = str(origin.get("platform") or "").strip().lower()
+            chat_id = str(origin.get("chat_id") or "").strip()
+            user_id = str(origin.get("user_id") or "").strip()
+            if not platform or not chat_id or not user_id:
+                continue
+            index.setdefault((platform, chat_id), set()).add(user_id)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+    return index
+
+
+def _cmd_notify_repair(args: argparse.Namespace) -> int:
+    """Backfill the creator identity on identity-less notify subscriptions.
+
+    See the subparser description for why an empty ``user_id`` splits a chat
+    into two sessions. Evidence comes from the gateway routing index; a chat
+    with no unambiguous participant is reported and left untouched.
+    """
+    index = _routing_participant_index()
+
+    def _resolve(row: dict) -> "str | None":
+        platform = str(row.get("platform") or "").strip().lower()
+        chat_id = str(row.get("chat_id") or "").strip()
+        candidates = index.get((platform, chat_id)) or set()
+        if len(candidates) != 1:
+            # 0 => a genuinely user-less origin (cron / CLI / home channel).
+            # >1 => a shared chat; picking one would hijack another user's lane.
+            return None
+        return next(iter(candidates))
+
+    with kb.connect_closing() as conn:
+        results = kb.backfill_notify_sub_user_ids(
+            conn, _resolve, dry_run=bool(getattr(args, "dry_run", False)),
+        )
+
+    repaired = [r for r in results if r["action"] == "backfilled"]
+    skipped = [r for r in results if r["action"] != "backfilled"]
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "dry_run": bool(getattr(args, "dry_run", False)),
+            "considered": len(results),
+            "backfilled": len(repaired),
+            "skipped_no_evidence": len(skipped),
+            "rows": results,
+        }, indent=2, ensure_ascii=False))
+        return 0
+
+    if not results:
+        print("No identity-less notify subscriptions — nothing to repair.")
+        return 0
+
+    verb = "Would backfill" if getattr(args, "dry_run", False) else "Backfilled"
+    print(f"{verb} {len(repaired)} of {len(results)} identity-less subscription(s).")
+    for row in repaired:
+        thr = f":{row['thread_id']}" if row.get("thread_id") else ""
+        print(f"  {row['task_id']:12s} {row['platform']}:{row['chat_id']}{thr}"
+              f"  -> user_id={row['user_id']}")
+    if skipped:
+        print(f"\nLeft untouched ({len(skipped)}) — no unambiguous creator identity.")
+        print("  These are cron / CLI / home-channel origins, or shared chats with")
+        print("  several participants. A user-less subscription is legitimate: it")
+        print("  delivers to the shared per-chat session. No identity is invented.")
+        for row in skipped:
+            thr = f":{row['thread_id']}" if row.get("thread_id") else ""
+            print(f"  {row['task_id']:12s} {row['platform']}:{row['chat_id']}{thr}")
     return 0
 
 
