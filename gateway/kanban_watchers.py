@@ -16,7 +16,7 @@ import os
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from agent.i18n import t
 
@@ -55,6 +55,52 @@ def _resolve_auto_decompose_settings(
     if per_tick < 1:
         per_tick = 1
     return enabled, per_tick
+
+
+def resolve_wake_participant(
+    sub_user_id: Optional[str],
+    live_participants: Iterable[str],
+) -> Optional[str]:
+    """Pick the participant a kanban wake should be delivered as.
+
+    This is the *prevention* half of the phantom-session fix. #555 made an
+    identity-less ``kanban_notify_subs`` row RECOVERABLE (``add_notify_sub``
+    backfills, ``notify-repair`` collapses existing rows); it did not stop the
+    wake itself from opening a user-less session key in the meantime. Every
+    identity-less row still mints the bare key on its FIRST wake, before any
+    repair can run.
+
+    So resolve at the point of harm instead: when the row names no participant
+    but the gateway's own live routing index shows exactly ONE per-user session
+    for that chat, wake as that participant — the key the human's own messages
+    already resolve to. One session for the channel, not two.
+
+    Rules, in order:
+
+    * ``sub_user_id`` set  -> always wins, untouched. The row's own identity is
+      authoritative; a second human subscribing in the same chat must never be
+      able to repoint the first one's lane.
+    * exactly one live participant -> adopt it. This is evidence, not a guess:
+      the gateway resolved that key from a real inbound message in this chat.
+    * zero participants -> ``None``. A cron / CLI / home-channel origin is
+      legitimately user-less and must keep delivering to the shared per-chat
+      session. Never fabricate an identity.
+    * two or more -> ``None``. A shared channel has no single right answer, and
+      picking one would route a system notification into some human's private
+      per-user session. Same refusal ``notify-repair`` already makes.
+
+    Pure and side-effect free so the decision is testable without a gateway;
+    the caller owns the evidence (``_live_chat_participants``) and the write.
+    """
+    existing = str(sub_user_id or "").strip()
+    if existing:
+        return existing
+    candidates = {
+        str(p).strip() for p in live_participants if str(p or "").strip()
+    }
+    if len(candidates) != 1:
+        return None
+    return next(iter(candidates))
 
 
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
@@ -182,6 +228,73 @@ def _stall_streak_is_bad(ready_pending, any_spawned, results) -> bool:
 
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
+
+    def _live_chat_participants(
+        self, platform: Any, chat_id: str, thread_id: Optional[str] = None,
+    ) -> set:
+        """Participant ids the gateway has actually resolved for this chat.
+
+        Evidence for :func:`resolve_wake_participant`. Read from the live
+        ``session_store`` routing index — the same structure ``notify-repair``
+        mines out of ``state.db``'s ``gateway_routing`` table, except in-process
+        and current, so a wake can use it BEFORE a repair pass ever runs.
+
+        Only per-user *group/channel* entries count. Deliberately narrow:
+
+        * ``origin.user_id`` must be present — an entry with no participant is
+          exactly the phantom we're refusing to feed.
+        * the entry's own chat must match, so a participant in another channel
+          can never be adopted here.
+        * the entry must be keyed per-user (``key.endswith(":" + user_id)``).
+          A shared thread session legitimately has no participant segment; if
+          the wake adopted an identity for it, it would route into a per-user
+          key nobody in that thread is reading. The key's own shape is the only
+          honest test of whether this chat IS per-user — reading the config flag
+          would ignore ``thread_sessions_per_user`` and the DM/thread branches
+          of ``build_session_key``.
+
+        Returns a SET, never a pick: the caller refuses on 0 and on >1. Never
+        raises — a routing-index read failure degrades to "no evidence", which
+        preserves the pre-change behaviour exactly.
+        """
+        store = getattr(self, "session_store", None)
+        if store is None or not chat_id:
+            return set()
+        platform_value = getattr(platform, "value", platform)
+        want_chat = str(chat_id)
+        want_thread = str(thread_id or "")
+        found: set = set()
+        try:
+            with store._lock:  # noqa: SLF001 -- documented private access
+                store._ensure_loaded_locked()  # noqa: SLF001
+                entries = dict(store._entries)  # noqa: SLF001
+        except Exception as exc:
+            logger.debug(
+                "kanban notifier: routing index unavailable for %s/%s: %s",
+                platform_value, want_chat, exc,
+            )
+            return set()
+        for key, entry in entries.items():
+            origin = getattr(entry, "origin", None)
+            if origin is None:
+                continue
+            user_id = str(getattr(origin, "user_id", "") or "").strip()
+            if not user_id:
+                continue
+            origin_platform = getattr(origin, "platform", None)
+            if str(getattr(origin_platform, "value", origin_platform)) != str(
+                platform_value
+            ):
+                continue
+            if str(getattr(origin, "chat_id", "") or "") != want_chat:
+                continue
+            if str(getattr(origin, "thread_id", "") or "") != want_thread:
+                continue
+            # Per-user keying is what makes this participant adoptable.
+            if not str(key).endswith(f":{user_id}"):
+                continue
+            found.add(user_id)
+        return found
 
     def _owns_kanban_dispatcher_lock(self) -> bool:
         """Return whether this gateway currently owns the singleton lock."""
@@ -807,12 +920,42 @@ class GatewayKanbanWatchersMixin:
                                             _delivery_meta.get("chat_type") or ""
                                         ).strip()
                                 _chat_type = _chat_type or "group"
+                                # PREVENTION (card 5 / #555 follow-up): a row
+                                # with no participant makes build_session_key()
+                                # drop the participant segment, so the wake
+                                # opens a SECOND, chat-unreachable session key
+                                # for this chat — the phantom. #555 can only
+                                # repair such a row after the fact; by then the
+                                # phantom already exists. Resolve it here
+                                # instead, from the gateway's own live routing
+                                # index, before the key is ever built. Refuses
+                                # (leaves user_id None, delivering to the shared
+                                # per-chat session) unless exactly one per-user
+                                # participant is known for this chat — see
+                                # resolve_wake_participant.
+                                _wake_user_id = resolve_wake_participant(
+                                    sub.get("user_id"),
+                                    self._live_chat_participants(
+                                        plat,
+                                        sub["chat_id"],
+                                        sub.get("thread_id") or None,
+                                    ),
+                                )
+                                if _wake_user_id and not sub.get("user_id"):
+                                    logger.info(
+                                        "kanban notifier: identity-less sub for "
+                                        "%s on %s/%s resolved to participant %s "
+                                        "from live routing (phantom session "
+                                        "prevented)",
+                                        sub["task_id"], platform_str,
+                                        sub["chat_id"], _wake_user_id,
+                                    )
                                 _source = SessionSource(
                                     platform=plat,
                                     chat_id=sub["chat_id"],
                                     chat_type=_chat_type,
                                     thread_id=sub.get("thread_id") or None,
-                                    user_id=sub.get("user_id"),
+                                    user_id=_wake_user_id,
                                     profile=sub_profile or None,
                                 )
                                 # deliver_wake preserves the synthetic
