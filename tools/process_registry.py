@@ -30,6 +30,7 @@ Usage:
 """
 
 import codecs
+import errno as _errno
 import json
 import logging
 import os
@@ -1012,13 +1013,26 @@ class ProcessRegistry:
             if fd is not None:
                 import select as _select
 
+                # ``poll()`` NOT ``select()``: select(2) cannot handle a file
+                # descriptor at or above FD_SETSIZE (1024) and raises
+                # ``ValueError: filedescriptor out of range in select()``. In a
+                # long-lived gateway that accumulates fds, a background
+                # process's stdout pipe eventually lands above that ceiling and
+                # this loop would break immediately, silently capturing NOTHING
+                # from an otherwise-healthy process. poll() has no such limit.
                 idle_after_exit = 0
+                _poller = _select.poll()
+                _poller.register(fd, _select.POLLIN | _select.POLLHUP | _select.POLLERR)
                 while True:
                     try:
-                        ready, _, _ = _select.select([fd], [], [], 0.2)
-                    except (ValueError, OSError):
+                        _events = _poller.poll(200)  # milliseconds
+                    except OSError as _exc:
+                        if getattr(_exc, "errno", None) == _errno.EINTR:
+                            continue  # interrupted by a signal — keep draining
+                        break
+                    except ValueError:
                         break  # fd already closed
-                    if ready:
+                    if _events:
                         raw = raw_read(4096)
                         if not raw:
                             break  # true EOF — all writers closed
