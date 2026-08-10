@@ -2298,6 +2298,26 @@ def _cmd_claim(args: argparse.Namespace) -> int:
 
 
 def _cmd_comment(args: argparse.Namespace) -> int:
+    """Append a comment, attributed to the session that invoked this CLI.
+
+    Provenance policy for this entry point (decided deliberately, not by
+    omission):
+
+    * Invoked **from inside a Hermes session** — an agent shelling out from
+      ``terminal`` or ``execute_code``, which is how most CLI comments are
+      actually written — the spawn path bridges ``HERMES_SESSION_ID`` into this
+      process's env, so ``safe_comment_provenance`` resolves it and the row is
+      attributed exactly like an in-process ``kanban_comment`` tool call.
+    * Invoked **by a human in a bare shell**, with no Hermes session anywhere in
+      the ancestry, there is genuinely no session to name. The comment is still
+      written, with NULL provenance, and every read surface renders it
+      ``<author> (provenance unknown)``. We deliberately do NOT synthesize a
+      per-invocation id: a fresh uuid per ``hermes kanban comment`` call would
+      make two comments from one operator look like two distinct sessions,
+      which is the *same* ambiguity this field exists to remove, inverted.
+      Saying "unknown" is the honest answer, and it is what the tri-state
+      contract elsewhere in this codebase already does.
+    """
     body = " ".join(args.text).strip()
     if args.max_len is not None:
         if args.max_len < 1:

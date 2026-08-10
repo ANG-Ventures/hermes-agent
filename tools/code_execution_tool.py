@@ -206,6 +206,61 @@ _WINDOWS_ESSENTIAL_ENV_VARS = frozenset({
 })
 
 
+def _resolved_session_id(source_env=None):
+    """Return the session id to stamp on a sandbox child, or ``None``.
+
+    Contextvar-first via ``gateway.session_context.resolve_current_session_id``
+    — the SAME resolver ``tools.kanban_tools`` uses for comment provenance, so a
+    comment written by a sandbox script and one written by an in-process tool
+    call in the same turn carry the same ``session_ref``. An ``os.environ`` read
+    would be wrong inside the gateway, where that mirror is last-writer-wins
+    across concurrent sessions.
+    """
+    try:
+        from gateway.session_context import resolve_current_session_id
+
+        resolved = resolve_current_session_id()
+    except Exception:
+        resolved = (source_env if source_env is not None else os.environ).get(
+            "HERMES_SESSION_ID"
+        ) or None
+    return str(resolved) if resolved else None
+
+
+def _inject_session_id(scrubbed, source_env):
+    """Bridge the live ``HERMES_SESSION_ID`` into the sandbox child's env.
+
+    ``HERMES_SESSION_ID`` is a per-turn identity, not user shell state, so it
+    is deliberately NOT in ``_HERMES_CHILD_ALLOWED``: passing it by exact name
+    would copy it straight out of ``os.environ``, which is the wrong source
+    inside the gateway (see ``_resolved_session_id``).
+
+    Why the child needs it at all: sandbox scripts routinely shell out to
+    ``hermes kanban comment`` (and other Hermes CLI entry points), which resolve
+    provenance from their own process env. Without this bridge those writes land
+    with NULL provenance — the concurrent-same-profile ambiguity that comment
+    provenance exists to remove — while an identical in-process tool call in the
+    same turn is attributed correctly.
+
+    Fail-open and non-secret by construction: the id is an opaque conversation
+    handle, it is hashed to a bounded fingerprint before it ever reaches a
+    durable row (``kanban_db.derive_session_ref``), and an unresolvable id
+    simply leaves the var absent — the child still runs, the comment is still
+    written, provenance is just NULL. ``scrubbed`` is mutated in place.
+
+    The var is REMOVED (not left inherited from ``source_env``) when nothing
+    resolves. Inside a concurrent host an inherited process-global is precisely
+    the foreign-identity leak this bridge exists to prevent; the same policy the
+    terminal spawn path applies via ``_inject_session_context_env``.
+    """
+    resolved = _resolved_session_id(source_env)
+    if resolved:
+        scrubbed["HERMES_SESSION_ID"] = resolved
+    else:
+        scrubbed.pop("HERMES_SESSION_ID", None)
+    return scrubbed
+
+
 def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     """Produce the scrubbed child-process env for execute_code.
 
@@ -297,6 +352,8 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
             scrubbed = scrub_kanban_env(scrubbed)
     except Exception:
         pass
+
+    _inject_session_id(scrubbed, source_env)
     return scrubbed
 
 
@@ -1149,6 +1206,14 @@ def _execute_remote(
         tz = os.getenv("HERMES_TIMEZONE", "").strip()
         if tz:
             env_prefix += f" TZ={shlex.quote(tz)}"
+        # Same per-turn identity bridge as the local path (_inject_session_id):
+        # a remote sandbox script that shells out to a Hermes CLI resolves its
+        # comment provenance from its own env. Resolved contextvar-first so a
+        # concurrent gateway session cannot attribute this sandbox to itself;
+        # absent when unresolvable (fail-open → NULL provenance, never a guess).
+        _session_id = _resolved_session_id()
+        if _session_id:
+            env_prefix += f" HERMES_SESSION_ID={shlex.quote(_session_id)}"
 
         # Execute the script on the remote backend
         logger.info("Executing code on %s backend (task %s)...",
