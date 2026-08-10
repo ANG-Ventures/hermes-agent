@@ -13,6 +13,15 @@ from unittest.mock import patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_terminal_task_state(monkeypatch):
+    """Keep terminal task/session registries from leaking between tests."""
+    from tools import terminal_tool
+
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+
+
 def register_all_web_providers():
     """Register all bundled web-search providers into the global registry.
 
