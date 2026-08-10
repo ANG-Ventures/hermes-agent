@@ -6564,6 +6564,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # before scheduling; the selected mode remains attached only for that
         # synthetic turn.
         self._auto_resume_decisions: Dict[str, Any] = {}
+        # session_key -> False when the persisted tail proves the previous turn
+        # already completed (nothing to recover). Absent means "unknown", which
+        # schedules as before — the gate only ever skips on positive evidence.
+        self._boot_resume_has_work: Dict[str, bool] = {}
         self._startup_resume_modes: Dict[str, Dict[str, Any]] = {}
         self._auto_resume_attempt_store = None
         # LRU cache of live SessionSources keyed by session_key. Used by
@@ -12276,6 +12280,80 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         return reconciled
 
+    async def _prepare_boot_resume_work_check(self, platform=None) -> int:
+        """Record which resume-pending sessions still have UNFINISHED work.
+
+        ``resume_pending`` is marked as a pre-drain HEDGE for every running
+        session (``_mark_resume_pending_for_shutdown``) and re-marked for
+        everything recently active after an unclean exit
+        (``suspend_recently_active``). Both are correct as hedges. But the
+        clear-the-hedge pass only runs when ``stop()`` gets to complete: a
+        SIGKILL mid-drain, an OOM, or a VM death leaves the marker on sessions
+        whose turn had ALREADY delivered its answer. The next boot then spends
+        a real LLM turn "recovering" a finished conversation, and demotes that
+        channel's ``busy_input_mode`` behind a banner claiming the user's work
+        was interrupted.
+
+        The persisted transcript is the ground truth the marker lacks, so read
+        it here — async, off the gateway loop, in the same prepare phase that
+        already classifies tails — and let the synchronous scheduler consult
+        the result. Runs in BOTH prompt and auto mode: the wasted turn is paid
+        regardless of which continuation wording it would have used.
+
+        Fails OPEN in every direction (unreadable DB, missing transcript,
+        exception): a session absent from this map is scheduled exactly as
+        before.
+        """
+        decisions: Dict[str, bool] = {}
+        self._boot_resume_has_work = decisions
+        try:
+            entries = await self.async_session_store.snapshot_entries()
+        except Exception:
+            logger.warning(
+                "Boot-resume work check unavailable; scheduling every "
+                "resume-pending session as before",
+                exc_info=True,
+            )
+            return 0
+
+        from gateway.auto_resume import RESUME_KIND_SELF, has_resumable_work
+
+        checked = 0
+        for entry in entries:
+            if not getattr(entry, "resume_pending", False):
+                continue
+            source = getattr(entry, "origin", None)
+            if platform is not None and getattr(source, "platform", None) != platform:
+                continue
+            # A deliberate SELF resume-handoff is NOT a hedge: the session asked
+            # for the restart and left a handoff note describing what to do on
+            # the other side. Its tail is SUPPOSED to be a completed turn, so
+            # the transcript cannot answer "is there work?" — the handoff is the
+            # work. Never gate those.
+            if (
+                getattr(entry, "resume_kind", None) == RESUME_KIND_SELF
+                and getattr(entry, "resume_handoff", None)
+            ):
+                continue
+            session_id = getattr(entry, "session_id", None)
+            if self._session_db is None or not session_id:
+                continue
+            try:
+                messages = await self._session_db.get_messages(
+                    session_id,
+                    preserve_unparseable_tool_calls=True,
+                )
+                decisions[entry.session_key] = has_resumable_work(messages)
+            except Exception as exc:
+                logger.warning(
+                    "Boot-resume work check failed for %s; resuming as before: %s",
+                    entry.session_key,
+                    exc,
+                )
+                continue
+            checked += 1
+        return checked
+
     async def _prepare_auto_resume_decisions(self, platform=None) -> int:
         """Read and classify candidate transcript tails off the gateway loop.
 
@@ -12286,14 +12364,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         self._auto_resume_decisions = {}
         self._reconcile_deferred_restarts_at_boot()
+        # The finished-work check is mode-independent: a bystander resume costs
+        # a full LLM turn in prompt mode exactly as it does in auto mode, so it
+        # must run before the auto-only early return below.
+        self._sweep_resume_requests()
+        await self._prepare_boot_resume_work_check(platform=platform)
         if _resume_interrupted_turns_mode() != "auto":
             return 0
-
-        # Safe-restart requests are delivered through a dropbox and become
-        # resume_pending only during this sweep. Sweep before the snapshot so
-        # those real restart-interrupted turns receive a schedule-time tail
-        # classification rather than an automatic prompt fallback.
-        self._sweep_resume_requests()
 
         try:
             entries = await self.async_session_store.snapshot_entries()
@@ -13059,6 +13136,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         now = datetime.now()
         scheduled = 0
+        skipped = 0
         requested_mode = _resume_interrupted_turns_mode()
         prepared = getattr(self, "_auto_resume_decisions", {})
         startup_modes = getattr(self, "_startup_resume_modes", None)
@@ -13104,6 +13182,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Skipping auto-resume for %s: authorization check failed: %s",
                     entry.session_key, exc,
                 )
+                continue
+
+            # Nothing left to resume? Then do not spawn a turn at all.
+            #
+            # This is the source-level fix for the bystander-resume class: the
+            # pre-drain resume_pending HEDGE is marked for every running session
+            # and only cleared when stop() survives long enough to run its
+            # clear pass. A SIGKILL mid-drain (or an OOM / VM death) leaves the
+            # marker on sessions whose turn had ALREADY delivered its answer,
+            # and every one of those cost a full LLM turn here — while also
+            # demoting the channel's busy_input_mode behind a banner telling
+            # the user their work had been interrupted when it had not.
+            #
+            # Skipping is safe because resume_pending is CLEARED here too: the
+            # marker exists to preserve the transcript across a restart, and a
+            # session whose last turn completed has nothing to preserve. The
+            # transcript itself is untouched, so the next real user message
+            # continues the same conversation exactly as before.
+            #
+            # Fails OPEN: _prepare_boot_resume_work_check only records a
+            # decision when it positively read the tail, so an unreadable
+            # transcript, a missing session DB, or a SELF handoff is absent
+            # from the map and resumes exactly as it does today.
+            if getattr(self, "_boot_resume_has_work", {}).get(
+                entry.session_key, True
+            ) is False:
+                logger.warning(
+                    "PHASE=boot_resume_skipped key=%s reason=%s platform=%s "
+                    "kind=%s cause=no_unfinished_work",
+                    entry.session_key,
+                    getattr(entry, "resume_reason", None),
+                    getattr(getattr(source, "platform", None), "value", None),
+                    getattr(entry, "resume_kind", None),
+                )
+                try:
+                    self.session_store.clear_resume_pending(entry.session_key)
+                except Exception as exc:
+                    logger.debug(
+                        "clear_resume_pending after boot-resume skip failed "
+                        "for %s: %s",
+                        entry.session_key,
+                        exc,
+                    )
+                skipped += 1
                 continue
 
             resume_mode = "prompt"
@@ -13224,6 +13346,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._startup_restore_tasks = tasks
                 tasks.append(task)
             scheduled += 1
+        if skipped:
+            logger.info(
+                "Skipped auto-resume for %d session(s) whose last turn had "
+                "already completed (no unfinished work to recover)",
+                skipped,
+            )
         if scheduled:
             logger.info(
                 "Scheduled auto-resume for %d restart-interrupted session(s)",
