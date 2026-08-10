@@ -36,6 +36,16 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
+# ── sys.modules leak gate ───────────────────────────────────────────────────
+# Fails a test that purges sys.modules of watched modules (run_agent, agent.*,
+# tools.*, hermes_*, gateway.*, plugins.*) without restoring them. That bug class
+# cost ~46 suite failures from ONE fixture (PR #538) and ~20 more from a second:
+# later importers get a brand-new module object, so a subsequent test patches an
+# orphaned copy while the code under test imports a different one.
+# Opt out with @pytest.mark.allow_sys_modules_purge (and say why).
+pytest_plugins = ["tests.sys_modules_leak_gate"]
+
+
 def _strip_nonsandbox_file_handlers(sandbox_prefix=None):
     """Remove any logging file handler (root + named loggers) whose target file
     lives OUTSIDE the per-test sandbox — chiefly the real ``~/.hermes/logs/
@@ -1296,6 +1306,11 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
         # still runs per-file under CI where the default limit suffices.
         pass
 
+    config.addinivalue_line(
+        "markers",
+        "allow_sys_modules_purge: test intentionally leaves sys.modules purged "
+        "(opts out of the sys.modules leak gate — say why in a comment)",
+    )
     config.addinivalue_line(
         "markers",
         f"{_LIVE_SYSTEM_GUARD_BYPASS_MARK}: bypass the live-system guard "

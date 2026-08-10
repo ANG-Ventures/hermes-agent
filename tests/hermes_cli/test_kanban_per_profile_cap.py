@@ -21,11 +21,25 @@ def isolated_kanban_home_with_profiles(monkeypatch):
     for prof in ("alpha", "beta", "default"):
         os.makedirs(os.path.join(test_home, "profiles", prof), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
+    # Purge so `from hermes_cli import kanban_db` re-resolves against the fresh
+    # HERMES_HOME. RESTORE afterwards: an unrestored purge hands every later
+    # importer a brand-new module object, so a subsequent test that captured a
+    # reference to (or monkeypatched) one of these silently operates on an
+    # orphaned copy — the bug class fixed in PR #538.
+    _saved_modules = {
+        name: mod
+        for name, mod in sys.modules.items()
+        if name.startswith("hermes_cli")
+        or name.startswith("hermes_state")
+        or name == "hermes_constants"
+    }
+    for mod in _saved_modules:
+        del sys.modules[mod]
     from hermes_cli import kanban_db
-    yield kanban_db
+    try:
+        yield kanban_db
+    finally:
+        sys.modules.update(_saved_modules)
 
 
 def _fake_spawn(*args, **kwargs):
