@@ -36,7 +36,7 @@ from typing import Any, Optional
 from agent.redact import redact_sensitive_text
 from hermes_constants import VALID_REASONING_EFFORTS
 from hermes_cli.goals import judge_goal
-from hermes_cli.kanban_identity import resolve_comment_provenance
+from hermes_cli.kanban_identity import safe_comment_provenance
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
@@ -1035,11 +1035,11 @@ def _handle_comment(args: dict, **kw) -> str:
     # comments are the deliberate handoff channel between tasks.
     #
     # ``run_id`` / ``session_ref`` follow the same rule: they come from
-    # ``resolve_comment_provenance`` (env + session contextvar) so a model
+    # ``safe_comment_provenance`` (env + session contextvar) so a model
     # cannot attribute its write to a different run or session, and the DB
     # write path re-validates their shape.
     author = os.environ.get("HERMES_PROFILE") or "worker"
-    run_id, session_ref = resolve_comment_provenance(str(tid))
+    run_id, session_ref = safe_comment_provenance(str(tid))
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)

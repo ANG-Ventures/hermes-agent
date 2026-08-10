@@ -50,7 +50,7 @@ from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
-from hermes_cli.kanban_identity import resolve_comment_provenance
+from hermes_cli.kanban_identity import safe_comment_provenance
 
 log = logging.getLogger(__name__)
 
@@ -1184,7 +1184,7 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
     try:
         if kanban_db.get_task(conn, task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-        run_id, session_ref = resolve_comment_provenance(task_id)
+        run_id, session_ref = safe_comment_provenance(task_id)
         kanban_db.add_comment(
             conn, task_id, author=payload.author or "dashboard", body=payload.body,
             run_id=run_id, session_ref=session_ref,

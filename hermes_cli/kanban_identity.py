@@ -12,9 +12,12 @@ Two concerns live here:
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Mapping
 from typing import Optional
+
+_log = logging.getLogger(__name__)
 
 
 def resolve_kanban_worker_chat_identity(
@@ -89,3 +92,27 @@ def resolve_comment_provenance(
     else:
         session_id = source.get("HERMES_SESSION_ID") or None
     return run_id, derive_session_ref(session_id)
+
+
+def safe_comment_provenance(
+    task_id: str,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> tuple[Optional[int], Optional[str]]:
+    """:func:`resolve_comment_provenance`, but it can never fail a write.
+
+    Provenance is an ANNOTATION on a comment, never an admission gate. Comments
+    are the coordination channel this whole change exists to protect, so if
+    resolution raises for any reason — a trimmed install, a contextvar backend
+    change, an unexpected env shape — the correct outcome is an unattributed
+    comment, not a lost one. Degrades to ``(None, None)``, which every read
+    surface renders as an explicit unknown rather than a guess.
+
+    Use this at call sites. Use :func:`resolve_comment_provenance` when you
+    actually want the failure.
+    """
+    try:
+        return resolve_comment_provenance(task_id, env=env)
+    except Exception:
+        _log.debug("kanban: comment provenance resolution failed", exc_info=True)
+        return None, None

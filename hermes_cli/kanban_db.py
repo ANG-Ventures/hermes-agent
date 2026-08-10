@@ -4138,9 +4138,9 @@ def _inline_comment_provenance(task_id: str) -> tuple[Optional[int], Optional[st
     ``provenance unknown`` — never a guess.
     """
     try:
-        from hermes_cli.kanban_identity import resolve_comment_provenance
+        from hermes_cli.kanban_identity import safe_comment_provenance
 
-        return _validate_comment_provenance(*resolve_comment_provenance(task_id))
+        return _validate_comment_provenance(*safe_comment_provenance(task_id))
     except Exception:
         _log.debug("kanban: comment provenance resolution failed", exc_info=True)
         return None, None

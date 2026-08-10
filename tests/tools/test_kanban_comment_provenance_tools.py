@@ -285,3 +285,47 @@ def test_absurdly_long_session_id_is_bounded(worker_env, monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", "x" * 100_000)
     kt._handle_comment({"task_id": worker_env, "body": "hi"})
     assert len(_only_comment(worker_env).session_ref) == 12
+
+
+# ---------------------------------------------------------------------------
+# Fail-open — provenance is an ANNOTATION, never an admission gate
+# ---------------------------------------------------------------------------
+
+
+def test_comment_survives_a_provenance_resolution_failure(worker_env, monkeypatch):
+    """Attribution must never cost a comment.
+
+    ``resolve_comment_provenance`` reads a gateway contextvar and the env. If
+    that resolution raises for any reason (a trimmed install, a contextvar
+    backend change, an unexpected env shape), the comment must still land with
+    NULL provenance — losing the label is an annotation regression, losing the
+    write is a coordination failure, and this whole change exists to protect
+    coordination. Fail-open, in the one direction that matters.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_identity as ki
+    from tools import kanban_tools as kt
+
+    def boom(*_a, **_k):
+        raise RuntimeError("session backend unavailable")
+
+    # Inject the fault at the REAL failure source — the underlying resolver
+    # that reads the contextvar/env — not at the fail-open wrapper the call
+    # site uses. Patching the wrapper would test a fault that cannot occur.
+    monkeypatch.setattr(ki, "resolve_comment_provenance", boom)
+    assert kt.safe_comment_provenance is ki.safe_comment_provenance, (
+        "call site must route through the fail-open wrapper"
+    )
+
+    out = json.loads(
+        kt._handle_comment({"task_id": worker_env, "body": "must not be lost"})
+    )
+    assert out.get("ok") is True, f"comment was rejected: {out}"
+
+    c = _only_comment(worker_env)
+    assert c.body == "must not be lost"
+    assert c.run_id is None and c.session_ref is None
+    # And it still renders honestly rather than claiming an attribution.
+    assert "unknown" in kb.format_comment_author(
+        c.author, run_id=c.run_id, session_ref=c.session_ref
+    )

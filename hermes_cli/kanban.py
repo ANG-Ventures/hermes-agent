@@ -26,7 +26,7 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
-from hermes_cli.kanban_identity import resolve_comment_provenance
+from hermes_cli.kanban_identity import safe_comment_provenance
 
 
 # ---------------------------------------------------------------------------
@@ -2307,7 +2307,7 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
     author = args.author or _profile_author()
-    run_id, session_ref = resolve_comment_provenance(args.task_id)
+    run_id, session_ref = safe_comment_provenance(args.task_id)
     with kb.connect_closing() as conn:
         kb.add_comment(
             conn, args.task_id, author, body,
@@ -2572,7 +2572,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         for tid in ids:
             if reason:
-                _run_id, _sess_ref = resolve_comment_provenance(tid)
+                _run_id, _sess_ref = safe_comment_provenance(tid)
                 kb.add_comment(
                     conn, tid, author, f"BLOCKED: {reason}",
                     run_id=_run_id, session_ref=_sess_ref,
@@ -2612,7 +2612,7 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         for tid in ids:
             if reason:
-                _run_id, _sess_ref = resolve_comment_provenance(tid)
+                _run_id, _sess_ref = safe_comment_provenance(tid)
                 kb.add_comment(
                     conn, tid, author, f"SCHEDULED: {reason}",
                     run_id=_run_id, session_ref=_sess_ref,
@@ -2643,7 +2643,7 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         for tid in ids:
             if reason:
-                _run_id, _sess_ref = resolve_comment_provenance(tid)
+                _run_id, _sess_ref = safe_comment_provenance(tid)
                 kb.add_comment(
                     conn, tid, author, f"UNBLOCK: {reason}",
                     run_id=_run_id, session_ref=_sess_ref,
