@@ -479,8 +479,23 @@ _SNAPSHOT_EXCLUDED_ENV_REGEX = (
     # HERMES_HOME is matched EXACTLY (``=`` anchored), not as a prefix:
     # HERMES_HOME_BACKUP and friends are ordinary user vars and must survive
     # the snapshot. The SESSION_/CRON_ entries stay prefix matches by design.
+    #
+    # HERMES_DELEGATED_CHILD_CONTEXT and HERMES_KANBAN_* are per-EXECUTION
+    # identity, not user shell state, and they leak the same way: a
+    # delegate_task child (or a dispatcher-owned Kanban worker) runs one
+    # command through the shared backend, ``export -p`` captures its marker
+    # into the snapshot, and every LATER command in that long-lived
+    # environment sources it back — including commands belonging to the
+    # ordinary parent session. The marker then outlives the child that set
+    # it and cannot be cleared by unsetting it in the caller's env, because
+    # the snapshot re-exports it on the next source. Observed live: an
+    # orchestrator session's own shell reported
+    # HERMES_DELEGATED_CHILD_CONTEXT=1 hours after the child finished, so
+    # `hermes kanban comment/complete` refused every write with "delegate_task
+    # child contexts cannot mutate Kanban tasks via the CLI".
     "^(declare -x |export )(HERMES_SESSION_|HERMES_UI_SESSION_ID"
-    "|HERMES_CRON_AUTO_DELIVER_|HERMES_CRON_SESSION|HERMES_HOME=)"
+    "|HERMES_CRON_AUTO_DELIVER_|HERMES_CRON_SESSION|HERMES_HOME="
+    "|HERMES_DELEGATED_CHILD_CONTEXT=|HERMES_KANBAN_)"
 )
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -531,6 +546,10 @@ def _export_dump_excluding_session_vars(
         # grep-based filter to this name/prefix unset (#71296 — safer for values
         # containing newlines) kept the SESSION_ half and dropped HOME.
         "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
+        # Per-execution identity markers: see _SNAPSHOT_EXCLUDED_ENV_REGEX.
+        # ${!HERMES_KANBAN_*} covers the dispatcher's task/run/workspace vars;
+        # the delegated-child marker is a fixed name.
+        "${!HERMES_KANBAN_*} HERMES_DELEGATED_CHILD_CONTEXT "
         f"HERMES_UI_SESSION_ID HERMES_HOME{extra_unset} 2>/dev/null; "
         "export -p; "
         ") || true; } "
