@@ -612,6 +612,38 @@ DEFAULT_CONFIG = {
                                       # threshold and this token count. Clamped to
                                       # the model's context length at apply-time.
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
+        # -- Context-engine plugin knobs -------------------------------
+        # Read by the LCM plugin's own config loader
+        # (plugins/context_engine/lcm/config.py) via its explicit
+        # `_hermes_compression_float` bridge, NOT by the core compressor.
+        # They are declared here so `hermes config set compression.<knob>`
+        # validates instead of emitting a spurious "not a recognized config
+        # key -- Hermes may not read it" warning: the runtime DOES read them.
+        # A warning that is wrong by construction trains users to ignore the
+        # one time it is right.
+        #
+        # Values here are the plugin's own defaults; a None/absent entry in
+        # config.yaml leaves the plugin default untouched.
+        "skew_floor": 0.55,           # lower clamp on the measured real/rough
+                                      # token-estimate skew (never scale an
+                                      # estimate below this fraction).
+        "calibration_hard_frac": 0.95,  # fraction of the budget treated as a
+                                      # hard ceiling during calibration.
+        "maintenance_min_pressure_ratio": 0.0,  # minimum fraction of the
+                                      # compaction threshold before an
+                                      # OPPORTUNISTIC maintenance compaction
+                                      # may run. 0.0 = no floor (upstream
+                                      # behavior); 1.0 = maintenance only at
+                                      # the threshold itself. Does NOT change
+                                      # the threshold, and never makes
+                                      # compaction fire earlier.
+        "maintenance_max_cache_hit_ratio": 0.0,  # skip an opportunistic
+                                      # maintenance compaction while the
+                                      # prompt cache is at least this warm AND
+                                      # the context is below the threshold --
+                                      # rewriting the prefix would discard a
+                                      # warm cache to avert an overflow that
+                                      # is not imminent. 0.0 = disabled.
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
         "min_tail_user_messages": 1,  # REAL (actionable) user messages guaranteed to
                                       # survive in the uncompressed tail. 1 = existing
