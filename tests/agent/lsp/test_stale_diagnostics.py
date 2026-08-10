@@ -57,11 +57,18 @@ async def test_slow_push_is_waited_for(tmp_path: Path):
     f = tmp_path / "x.py"
     f.write_text("bad code\n")
 
+    # 0.8s server-side delay. The budgets below are hang guards, not timing
+    # assertions: this test proves "a slow-but-in-budget push IS waited for",
+    # and the inverse ("an out-of-budget push must NOT satisfy the wait") is
+    # owned by test_service_reports_no_data_not_stale_errors, which pins its own
+    # wait_timeout=1.0 against a server that never re-publishes. The old 2.0s
+    # ceiling left only 1.2s of slack while spawning a real subprocess, so it
+    # failed under 12-way parallel CI load and passed 5/5 in isolation.
     client = _client(tmp_path, "slow_push", MOCK_LSP_PUSH_DELAY="0.8")
     await client.start()
     try:
         v0 = await client.open_file(str(f), language_id="python")
-        assert await client.wait_for_diagnostics(str(f), v0, mode="document", timeout=2.0)
+        assert await client.wait_for_diagnostics(str(f), v0, mode="document", timeout=15.0)
         assert len(client.diagnostics_for(str(f), fresh_only=True)) == 1
 
         f.write_text("good code\n")

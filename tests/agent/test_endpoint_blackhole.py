@@ -23,7 +23,14 @@ import httpx
 import pytest
 import requests
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# Repo ROOT, not tests/. `tests/` contains packages whose names shadow real
+# top-level ones (tests/hermes_cli/, tests/gateway/, ...), so putting tests/ on
+# sys.path makes `from hermes_cli import __version__` resolve to the TEST
+# package and raise ImportError deep inside agent.auxiliary_client -- surfacing
+# as 22 collection errors that look nothing like a sys.path bug.
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
 
 
 @pytest.fixture(autouse=True)
