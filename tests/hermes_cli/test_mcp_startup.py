@@ -58,7 +58,10 @@ def test_prepare_agent_startup_backgrounds_blocking_mcp_for_chat(monkeypatch):
         calls["mcp"] += 1
         entered.set()
         try:
-            stop.wait()
+            # Finite: if discovery ever runs INLINE, the caller unblocks here
+            # and the `discover_returned` witness below fails fast instead of
+            # wedging the suite forever.
+            stop.wait(timeout=10.0)
         finally:
             discover_returned.set()
 
