@@ -1055,6 +1055,8 @@ def resolve_context_compression_timeouts(
     idle = DEFAULT_CONTEXT_TIMEOUT_SECONDS
     ceiling = DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS
     explicit_idle = False
+    from agent.config_provenance import is_operator_set
+
     cfg = compression_cfg
     if cfg is None:
         try:
@@ -1072,7 +1074,20 @@ def resolve_context_compression_timeouts(
                 parsed = float(raw_idle)
                 # Explicit 0/negative disables; positive values win.
                 idle = parsed
-                explicit_idle = True
+                # ...but only count it as EXPLICIT when the operator actually
+                # chose it. load_config() deep-merges DEFAULT_CONFIG, which
+                # ships context_timeout_seconds=120, so the key is ALWAYS
+                # present — inferring intent from presence made every default
+                # look operator-set and left reconcile_idle_timeout()'s
+                # explicit-honoured branch permanently engaged. That is what
+                # made PR #528's timeout floor inert in production (measured
+                # 2026-08-10: resolved 120.0 where the reconciler computes
+                # 360.0, so the outer guard still pre-empted the 300s inner
+                # aux deadline and the fallback chain stayed unreachable).
+                explicit_idle = is_operator_set(
+                    cfg, "context_timeout_seconds",
+                    "compression", "context_timeout_seconds",
+                )
             except (TypeError, ValueError):
                 pass
         raw_ceiling = cfg.get("context_total_ceiling_seconds")
