@@ -40,7 +40,10 @@ from agent.conversation_compression import (
     conversation_history_after_compression,
     recover_rotated_compression_session,
 )
-from agent.context_engine import automatic_compaction_status_message
+from agent.context_engine import (
+    automatic_compaction_status_message,
+    call_with_messages as _call_with_messages,
+)
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.memory_provider import is_trivial_prompt
@@ -827,8 +830,17 @@ def build_turn_context(
         # compacts when calibrated rough crosses threshold OR raw rough hits the
         # window ceiling (dense-paste / 413 guard). Replaces the removed
         # should_defer_preflight_to_real_usage ratchet.
-        _compressor.note_rough_sent(_preflight_tokens)
-        _calibrated = _compressor.calibrated_tokens(_preflight_tokens)
+        #
+        # `messages` is threaded through so the calibration can CLASSIFY this
+        # request (prose vs tool output vs media) and apply the ratio measured
+        # on that content class rather than one blended across all of them —
+        # the estimator's miss is a rate error that differs by content. Engines
+        # predating the kwarg are called with the old signature by
+        # `_call_with_messages`, so the class arm is additive, never required.
+        _call_with_messages(_compressor.note_rough_sent, _preflight_tokens, messages)
+        _calibrated = _call_with_messages(
+            _compressor.calibrated_tokens, _preflight_tokens, messages
+        )
         # Cold-start observability (Greptile PR #392 P2): on an empty skew history the
         # DISPLAY calibration (_calibrated, via _current_skew=1.0 identity) can read
         # >= threshold while the TRIGGER decision correctly DEFERS using the
@@ -838,7 +850,9 @@ def build_turn_context(
         # a deferral (empty history); a normal below-threshold skip stays quiet. Pure
         # logging — no effect on the decision below (INV: never perturb control flow).
         try:
-            _trig_cal = _compressor._trigger_calibrated_tokens(_preflight_tokens)
+            _trig_cal = _call_with_messages(
+                _compressor._trigger_calibrated_tokens, _preflight_tokens, messages
+            )
             _thr = _compressor.threshold_tokens
             if _calibrated >= _thr and _trig_cal < _thr:
                 logger.debug(
@@ -946,7 +960,9 @@ def build_turn_context(
         else:
             # Fork P2: trigger on the skew-CALIBRATED estimate (raw rough scaled
             # by the provider's measured rough/real ratio) instead of raw rough.
-            _should_compress_now = _compressor.should_compress_calibrated(_preflight_tokens)
+            _should_compress_now = _call_with_messages(
+                _compressor.should_compress_calibrated, _preflight_tokens, messages
+            )
             if not _should_compress_now:
                 # Context is over threshold but compression is blocked
                 # (summary-LLM cooldown or anti-thrashing). Ask should_compress_info
@@ -1052,8 +1068,12 @@ def build_turn_context(
                 agent._mute_post_response = False
                 # Fork P2 calibrated re-check (replaces should_defer ratchet): note this
                 # pass's rough so skew pairs correctly, then re-check on the calibrated value.
-                _compressor.note_rough_sent(_preflight_tokens)
-                if not _compressor.should_compress_calibrated(_preflight_tokens):
+                _call_with_messages(
+                    _compressor.note_rough_sent, _preflight_tokens, messages
+                )
+                if not _call_with_messages(
+                    _compressor.should_compress_calibrated, _preflight_tokens, messages
+                ):
                     break
                 if not _compression_warrants_another_preflight_pass(
                     _orig_tokens,
