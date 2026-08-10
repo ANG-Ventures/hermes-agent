@@ -7,6 +7,7 @@ or a temp file (local).
 """
 
 import codecs
+import errno
 import json
 import logging
 import os
@@ -985,7 +986,7 @@ class BaseEnvironment(ABC):
                 spill_path = None
         output = _BoundedOutputCollector(capture_limit, spill_path=spill_path)
 
-        # Non-blocking drain via select().
+        # Non-blocking drain via poll().
         #
         # The old pattern — ``for line in proc.stdout`` — blocks on
         # ``readline()`` until the pipe reaches EOF.  When the user's command
@@ -997,10 +998,27 @@ class BaseEnvironment(ABC):
         # the grandchild (issue #8340: users reported indefinite hangs when
         # restarting uvicorn with ``setsid ... & disown``).
         #
-        # The fix: select() with a short poll interval, and stop draining
-        # shortly after ``bash`` exits even if the pipe hasn't EOF'd yet.
-        # Any output the grandchild writes after that point goes to an
-        # orphaned pipe (harmless — the kernel reaps it when our end closes).
+        # The fix: poll() with a short interval, and stop draining shortly
+        # after ``bash`` exits even if the pipe hasn't EOF'd yet.  Any output
+        # the grandchild writes after that point goes to an orphaned pipe
+        # (harmless — the kernel reaps it when our end closes).
+        #
+        # ``poll()`` NOT ``select()``: select(2) is limited to file
+        # descriptors below ``FD_SETSIZE`` (1024 on Linux and macOS) and
+        # raises ``ValueError: filedescriptor out of range in select()`` for
+        # anything above it.  A long-lived gateway that accumulates fds
+        # (sockets, MCP stdio pipes, plugin handles) eventually spawns a
+        # subprocess whose stdout pipe lands at fd >= 1024 — from that point
+        # EVERY command's drain died instantly on that ValueError, and the
+        # bare ``break`` that swallowed it produced ``{"output": "",
+        # "returncode": 0}``: a silent, total output blackout that looks
+        # exactly like a command that legitimately printed nothing.  Because
+        # ``file_operations._exec`` runs through this same path, ``write_file``
+        # post-write verification read back "" in the same window and reported
+        # a bogus "the write did not persist".  ``poll()`` takes an array of
+        # pollfd structs and has no such ceiling, so the whole failure mode
+        # cannot recur.  Windows has no ``poll()`` for pipes; it keeps the
+        # blocking-read path below.
         #
         # Decoding: we ``os.read()`` raw bytes in fixed-size chunks (4096)
         # so a single multibyte UTF-8 character can split across reads.  An
@@ -1010,6 +1028,11 @@ class BaseEnvironment(ABC):
         # ``Popen``) so binary or mis-encoded output is preserved with
         # U+FFFD substitution rather than clobbering the whole buffer.
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        # Set by the drain thread when it aborts for a reason that is NOT a
+        # normal EOF/closed-fd.  ``_finalize_wait_result`` turns a non-empty
+        # value into a LOUD marker in the returned output instead of letting
+        # the caller see a silent empty capture (the failure class above).
+        drain_error: list[str] = []
 
         def _drain_iterable(stream):
             # Fallback path: ``stream`` is not backed by a real OS file
@@ -1055,9 +1078,9 @@ class BaseEnvironment(ABC):
             if not isinstance(fd, int) or fd < 0:
                 _drain_iterable(stream)
                 return
-            # select.select does NOT work on pipe fds on Windows (only sockets).
-            # Use blocking os.read in a daemon thread instead — safe because
-            # EOF arrives promptly when bash exits.
+            # Neither select() nor poll() works on pipe fds on Windows (only
+            # sockets). Use blocking os.read in a daemon thread instead — safe
+            # because EOF arrives promptly when bash exits.
             if os.name == "nt":
                 try:
                     while True:
@@ -1076,13 +1099,31 @@ class BaseEnvironment(ABC):
                         pass
                 return
             idle_after_exit = 0
+            poller = select.poll()
+            try:
+                poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+            except (ValueError, OSError) as exc:
+                # Registration failing is NOT a normal end-of-stream. Record
+                # it so the result carries a loud marker rather than looking
+                # like a command that printed nothing.
+                drain_error.append(f"{type(exc).__name__}: {exc}")
+                return
             try:
                 while True:
                     try:
-                        ready, _, _ = select.select([fd], [], [], 0.1)
-                    except (ValueError, OSError):
-                        break  # fd already closed
-                    if ready:
+                        events = poller.poll(100)  # milliseconds
+                    except OSError as exc:
+                        if getattr(exc, "errno", None) == errno.EINTR:
+                            continue  # interrupted by a signal — keep draining
+                        drain_error.append(f"{type(exc).__name__}: {exc}")
+                        break
+                    except ValueError as exc:
+                        # fd closed underneath us. Benign only if we already
+                        # saw the process exit; otherwise it is a real fault.
+                        if proc.poll() is None:
+                            drain_error.append(f"{type(exc).__name__}: {exc}")
+                        break
+                    if events:
                         try:
                             chunk = os.read(fd, 4096)
                         except (ValueError, OSError):
@@ -1099,6 +1140,10 @@ class BaseEnvironment(ABC):
                         if idle_after_exit >= 3:
                             break
             finally:
+                try:
+                    poller.unregister(fd)
+                except (KeyError, ValueError, OSError):
+                    pass
                 # Flush any bytes buffered mid-sequence.  With ``errors="replace"``
                 # this emits U+FFFD for any final incomplete sequence rather than
                 # raising.
@@ -1154,6 +1199,7 @@ class BaseEnvironment(ABC):
                         output,
                         output.render(suffix="\n[Command interrupted]"),
                         130,
+                        drain_error,
                     )
                 if time.monotonic() > deadline:
                     if _DEBUG_INTERRUPT:
@@ -1171,6 +1217,7 @@ class BaseEnvironment(ABC):
                         if output.total_chars == 0
                         else output.render(suffix=timeout_msg),
                         124,
+                        drain_error,
                     )
                 # Periodic activity touch so the gateway knows we're alive
                 touch_activity_if_due(_activity_state, "terminal command running")
@@ -1245,13 +1292,42 @@ class BaseEnvironment(ABC):
                 proc.returncode,
             )
 
-        return self._finalize_wait_result(output, output.render(), proc.returncode)
+        return self._finalize_wait_result(
+            output, output.render(), proc.returncode, drain_error
+        )
 
     @staticmethod
     def _finalize_wait_result(collector: "_BoundedOutputCollector",
-                              rendered: str, returncode: int | None) -> dict:
-        """Assemble a wait result, attaching spill metadata when overflow occurred."""
+                              rendered: str, returncode: int | None,
+                              drain_error: "list[str] | None" = None) -> dict:
+        """Assemble a wait result, attaching spill metadata when overflow occurred.
+
+        ``drain_error`` carries any abnormal reason the drain thread stopped
+        early (see ``_wait_for_process``).  When present we FAIL LOUD: the
+        marker is prepended to the output and ``drain_error`` is exposed on
+        the result dict.  Silently returning an empty capture here is what
+        made the fd >= FD_SETSIZE blackout so expensive to diagnose — a
+        command that produced nothing and a capture we failed to read looked
+        identical to every caller.
+        """
+        if drain_error:
+            reason = drain_error[0]
+            marker = (
+                "[hermes] OUTPUT CAPTURE FAILED — the drain thread aborted "
+                f"({reason}). Any output below is INCOMPLETE and the exit code "
+                "may not reflect the command's real result. This is a Hermes "
+                "bug, not a result: re-run the command, and if it repeats use "
+                "execute_code as a bypass.\n"
+            )
+            rendered = marker + rendered
+            logger.error(
+                "terminal drain aborted abnormally (%s); returning a loud "
+                "capture-failure marker instead of a silent empty result",
+                reason,
+            )
         result = {"output": rendered, "returncode": returncode}
+        if drain_error:
+            result["drain_error"] = drain_error[0]
         spill = collector.close_spill()
         if spill:
             result["output_total_chars"] = collector.total_chars
