@@ -568,6 +568,168 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
         assert len(kb.list_runs(conn, t)) == 0
 
 
+def _running_task_with_pid(conn, pid: int) -> str:
+    """Create a task in ``running`` state whose ``worker_pid`` is ``pid``."""
+    t = kb.create_task(conn, title="live worker", assignee="alice")
+    assert kb.claim_task(conn, t) is not None
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (pid, t))
+    return t
+
+
+def test_delete_task_refuses_running_task_with_live_pid(kanban_home):
+    with kb.connect() as conn:
+        # os.getpid() is by definition alive, so this is a real liveness
+        # check rather than a mocked one.
+        t = _running_task_with_pid(conn, os.getpid())
+        with pytest.raises(kb.TaskRunningError) as exc:
+            kb.delete_task(conn, t)
+        assert exc.value.task_id == t
+        assert exc.value.worker_pid == os.getpid()
+        # Distinguishable from the "not found -> False" path, and the row
+        # plus its forensic trail must survive the refusal.
+        survived = kb.get_task(conn, t)
+        assert survived is not None and survived.status == "running"
+        assert len(kb.list_runs(conn, t)) == 1
+        assert len(kb.list_events(conn, t)) > 0
+
+
+def test_delete_task_force_deletes_running_task(kanban_home):
+    with kb.connect() as conn:
+        t = _running_task_with_pid(conn, os.getpid())
+        assert kb.delete_task(conn, t, force=True) is True
+        assert kb.get_task(conn, t) is None
+
+
+def test_delete_task_allows_running_task_with_dead_pid(kanban_home):
+    """The guard keys on a LIVE pid — a crashed worker stays cleanable."""
+    with kb.connect() as conn:
+        t = _running_task_with_pid(conn, os.getpid())
+        with unittest.mock.patch.object(kb, "_pid_alive", return_value=False):
+            assert kb.delete_task(conn, t) is True
+        assert kb.get_task(conn, t) is None
+
+
+def test_delete_task_missing_returns_false_not_running_error(kanban_home):
+    """A missing id must not be reported as a live-claim refusal."""
+    with kb.connect() as conn:
+        assert kb.delete_task(conn, "t_nonexistent") is False
+        assert kb.delete_task(conn, "t_nonexistent", force=True) is False
+
+
+# --- HERMES_KANBAN_SANDBOX -------------------------------------------------
+#
+# Same incident, upstream cause: ``HERMES_KANBAN_DB`` outranks anything
+# ``HERMES_HOME``-derived, and the dispatcher pins it into every worker env.
+# A worker that redirected only HERMES_HOME believed it was sandboxed and
+# wrote six real cards to the production board.
+
+def test_kanban_db_override_outranks_hermes_home_without_sandbox(tmp_path, monkeypatch):
+    """Documents the trap: HERMES_HOME alone does NOT sandbox kanban."""
+    live = tmp_path / "live" / "kanban.db"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "scratch"))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    assert kb.kanban_db_path() == live
+
+
+def test_sandbox_flag_makes_hermes_home_win_over_every_path_pin(tmp_path, monkeypatch):
+    live_root = tmp_path / "live"
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(scratch))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live_root / "kanban.db"))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(live_root))
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(live_root / "workspaces"))
+    monkeypatch.setenv("HERMES_KANBAN_ATTACHMENTS_ROOT", str(live_root / "attachments"))
+    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")
+
+    assert kb.kanban_sandbox_enabled() is True
+    resolved = [
+        kb.kanban_db_path(),
+        kb.kanban_home(),
+        kb.workspaces_root(),
+        kb.attachments_root(),
+    ]
+    # Nothing may reach the pinned "live" root.
+    for path in resolved:
+        assert live_root not in path.parents and path != live_root, path
+    # And the db must land under the redirected HERMES_HOME.
+    assert kb.kanban_db_path() == scratch / "kanban.db"
+
+
+def test_sandbox_flag_covers_every_declared_path_pin(tmp_path, monkeypatch):
+    """Every var in the declared pin list must actually be neutralised.
+
+    Guards against a new pin being added to the module without being
+    routed through ``_kanban_path_override``.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")
+    for name in kb._KANBAN_PATH_PIN_ENV_VARS:
+        monkeypatch.setenv(name, str(tmp_path / "live"))
+        assert kb._kanban_path_override(name) == "", name
+
+
+def test_sandboxed_worker_env_cannot_reach_live_board(tmp_path, monkeypatch):
+    """The exact incident shape: full worker env + redirected HERMES_HOME."""
+    live_board = tmp_path / "live" / "boards" / "ban-forensics" / "kanban.db"
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    # Stock dispatched-worker env.
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live_board))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "ban-forensics")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(tmp_path / "live" / "workspaces"))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_live")
+    # The "documented" hermeticity move, plus the new flag.
+    monkeypatch.setenv("HERMES_HOME", str(scratch))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")
+
+    resolved = kb.kanban_db_path()
+    assert resolved != live_board
+    assert str(resolved).startswith(str(scratch))
+
+    # Write for real and prove the live path was never created.
+    kb.init_db()
+    with kb.connect() as conn:
+        kb.create_task(conn, title="fixture card")
+    assert not live_board.exists()
+
+
+def test_override_escaping_hermes_home_warns_once(tmp_path, monkeypatch, caplog):
+    """The escape is loud, not silent — but only once per (root, target)."""
+    live = tmp_path / "live" / "kanban.db"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "scratch"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
+
+    with caplog.at_level("WARNING", logger=kb.__name__):
+        assert kb.kanban_db_path() == live
+        assert kb.kanban_db_path() == live
+    warnings = [r for r in caplog.records if "did NOT" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "HERMES_KANBAN_SANDBOX=1" in warnings[0].getMessage()
+
+
+def test_no_warning_when_override_lives_inside_hermes_home(tmp_path, monkeypatch, caplog):
+    """The dispatcher's normal pin (inside the root) must not warn."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    inside = kb.kanban_home() / "kanban" / "boards" / "b" / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(inside))
+    monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
+
+    with caplog.at_level("WARNING", logger=kb.__name__):
+        assert kb.kanban_db_path() == inside
+    assert [r for r in caplog.records if "did NOT" in r.getMessage()] == []
+
+
 # ---------------------------------------------------------------------------
 # Comments / events / worker context
 # ---------------------------------------------------------------------------

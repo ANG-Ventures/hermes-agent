@@ -1004,11 +1004,22 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 # ---------------------------------------------------------------------------
 
 @router.delete("/tasks/{task_id}")
-def delete_task(task_id: str, board: Optional[str] = Query(None)):
+def delete_task(
+    task_id: str,
+    board: Optional[str] = Query(None),
+    force: bool = Query(False),
+):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        ok = kanban_db.delete_task(conn, task_id)
+        try:
+            ok = kanban_db.delete_task(conn, task_id, force=force)
+        except kanban_db.TaskRunningError as e:
+            # A live worker owns this row. Deleting it amputates that
+            # worker mid-run (its row, run history and event log all
+            # vanish). 409 so the UI can offer archive / force instead of
+            # reporting a phantom success or a misleading 404.
+            raise HTTPException(status_code=409, detail=str(e))
         if not ok:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
         return {"deleted": True, "task_id": task_id}

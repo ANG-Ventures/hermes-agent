@@ -282,6 +282,56 @@ def test_delete_task(client):
     assert r.status_code == 404
 
 
+def test_delete_task_not_found(client):
+    r = client.delete("/api/plugins/kanban/tasks/t_nonexistent")
+    assert r.status_code == 404
+    assert "not found" in r.json()["detail"]
+
+
+def _claim_with_live_pid(kanban_home, task_id: str) -> None:
+    """Put ``task_id`` into ``running`` with this process as its worker."""
+    with kb.connect() as conn:
+        assert kb.claim_task(conn, task_id) is not None
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+                (os.getpid(), task_id),
+            )
+
+
+def test_delete_running_task_with_live_worker_returns_409(client, kanban_home):
+    """One dashboard click must not amputate a live worker (2026-08-08)."""
+    t = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "live", "assignee": "alice"},
+    ).json()["task"]
+    client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "ready"},
+    )
+    _claim_with_live_pid(kanban_home, t["id"])
+
+    r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
+    assert r.status_code == 409
+    assert "running" in r.json()["detail"]
+    # Not a phantom success: the task is still there.
+    assert client.get(f"/api/plugins/kanban/tasks/{t['id']}").status_code == 200
+
+
+def test_delete_running_task_with_force_succeeds(client, kanban_home):
+    """Cleanup of a genuinely wedged card must remain possible."""
+    t = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "wedged", "assignee": "alice"},
+    ).json()["task"]
+    client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "ready"},
+    )
+    _claim_with_live_pid(kanban_home, t["id"])
+
+    r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}?force=true")
+    assert r.status_code == 200
+    assert r.json()["deleted"] is True
+    assert client.get(f"/api/plugins/kanban/tasks/{t['id']}").status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # Comments + Links
 # ---------------------------------------------------------------------------
