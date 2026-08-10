@@ -8377,6 +8377,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 resolved_session_key = None
 
         if resolved_session_key:
+            self._rehydrate_session_reasoning_override(resolved_session_key)
             _r_state = self._peek_session_state(resolved_session_key)
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
@@ -8395,6 +8396,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # overrides; a SessionState field reset cannot cross sessions.
         self._session_state(session_key).conversation.reasoning_override = (
             None if reasoning_config is None else dict(reasoning_config)
+        )
+        # Write-through to the session store so the effort survives a gateway
+        # restart, matching the /model half of the pair.  This is the single
+        # door for every in-memory reasoning-override write (/reasoning <level>
+        # and /reasoning reset), so a clear nulls the persisted value too.
+        # Conversation boundaries (/new, /resume, auto-reset, expiry) drop it
+        # via the session entry itself, exactly as they do for /model.
+        store = getattr(self, "session_store", None)
+        if store is None:
+            return
+        try:
+            store.set_reasoning_override(session_key, reasoning_config)
+        except Exception:
+            logger.debug(
+                "Failed to persist session reasoning override", exc_info=True
+            )
+
+    def _rehydrate_session_reasoning_override(self, session_key: str) -> None:
+        """Lazily restore a persisted /reasoning override after a restart.
+
+        The runner's copy is in-memory only, so before persistence a restart
+        silently reverted every session to the config default effort. The
+        override is written through when /reasoning runs (and cleared on
+        /reasoning reset and at conversation boundaries); here we read it back
+        on first use.
+
+        No-op when an in-memory override already exists (live state wins) or
+        when the store has nothing persisted.
+        """
+        if not session_key:
+            return
+        _rehydrate_state = self._peek_session_state(session_key)
+        if (
+            _rehydrate_state is not None
+            and _rehydrate_state.conversation.reasoning_override is not None
+        ):
+            return
+        store = getattr(self, "session_store", None)
+        if store is None:
+            return
+        try:
+            persisted = store.get_reasoning_override(session_key)
+        except Exception:
+            logger.debug(
+                "Failed to read persisted session reasoning override", exc_info=True
+            )
+            return
+        if not persisted:
+            return
+        self._session_state(session_key).conversation.reasoning_override = persisted
+        logger.info(
+            "Rehydrated persisted /reasoning override for session=%s: %s",
+            session_key, persisted,
         )
 
     def _resolve_session_service_tier(
@@ -12285,7 +12339,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 failures, entry.session_id, e,
                             )
                             await self.async_session_store.set_expiry_finalized(
-                                entry, clear_model_override=False
+                                entry, clear_session_overrides=False
                             )
                             _finalize_failures.pop(entry.session_id, None)
                         else:
