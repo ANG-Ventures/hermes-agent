@@ -489,3 +489,144 @@ def test_severity_at_or_above_uses_threshold_semantics():
     assert kd.severity_at_or_above("error", "critical") is False
     assert kd.severity_at_or_above("mystery", "warning") is False
     assert kd.severity_at_or_above("warning", None) is True
+
+
+# ---------------------------------------------------------------------------
+# stale_quantity_in_body — a COUNT in prose is a timestamped claim
+#
+# Regression origin (2026-08-10): a card titled "Finish the parity merge: 48
+# unresolved conflicts" was quoted to a human twice (48, then 45) as remaining
+# work. Ground truth: working tree clean, no MERGE_HEAD, 0 unmerged files. The
+# merge was already done — the quantity had no referent at all.
+# ---------------------------------------------------------------------------
+
+_HOUR = 3600
+
+
+def _stale_cfg(**over):
+    cfg = dict(kd.DEFAULT_CONFIG)
+    cfg.update(over)
+    return cfg
+
+
+def test_stale_quantity_fires_on_aged_conflict_count():
+    """The exact incident shape: a conflict count aged past the window."""
+    now = 100 * _HOUR
+    task = _task(
+        status="blocked",
+        title="Finish the 2026-08-10 parity merge: 48 unresolved conflicts",
+        body="48 files still unresolved (UU); ~791 M / 315 A already staged.",
+        created_at=now - 10 * _HOUR,
+    )
+    diags = kd.compute_task_diagnostics(task, [], [], now=now, config=_stale_cfg())
+    kinds = [d.kind for d in diags]
+    assert "stale_quantity_in_body" in kinds
+    d = [x for x in diags if x.kind == "stale_quantity_in_body"][0]
+    assert d.severity == "warning"
+    assert d.data["age_hours"] == 10.0
+    # It must name what it saw, so the reader knows which number to re-derive.
+    assert any("48" in q for q in d.data["quantities"])
+
+
+def test_stale_quantity_fires_on_comma_grouped_magnitude():
+    """"3,466 commits" is the other half of the incident's prose."""
+    now = 100 * _HOUR
+    task = _task(
+        status="ready",
+        title="parity sync",
+        body="every subsequent sync re-offers ~3,466 already-ingested commits",
+        created_at=now - 24 * _HOUR,
+    )
+    diags = kd.compute_task_diagnostics(task, [], [], now=now, config=_stale_cfg())
+    assert "stale_quantity_in_body" in [d.kind for d in diags]
+
+
+# --- must NOT fire -------------------------------------------------------
+
+
+def test_stale_quantity_silent_while_fresh():
+    """A card written an hour ago is still current — no warning."""
+    now = 100 * _HOUR
+    task = _task(
+        status="blocked",
+        title="48 unresolved conflicts",
+        body="48 files still unresolved",
+        created_at=now - 1 * _HOUR,
+    )
+    diags = kd.compute_task_diagnostics(task, [], [], now=now, config=_stale_cfg())
+    assert "stale_quantity_in_body" not in [d.kind for d in diags]
+
+
+def test_stale_quantity_silent_without_a_quantity():
+    """Prose with no count of mutable state must stay quiet.
+
+    This is the anti-noise control: most cards are aged, so a rule that
+    fires on age alone would fire on nearly the whole board.
+    """
+    now = 100 * _HOUR
+    task = _task(
+        status="blocked",
+        title="Rework the external-pricing fallback",
+        body="The fallback defeats the cache. Redesign it and re-PR upstream.",
+        created_at=now - 500 * _HOUR,
+    )
+    diags = kd.compute_task_diagnostics(task, [], [], now=now, config=_stale_cfg())
+    assert "stale_quantity_in_body" not in [d.kind for d in diags]
+
+
+def test_stale_quantity_silent_on_terminal_cards():
+    """A done card is an archive; nobody plans against its numbers."""
+    now = 100 * _HOUR
+    for status in ("done", "archived", "cancelled"):
+        task = _task(
+            status=status,
+            title="48 unresolved conflicts",
+            body="48 files still unresolved",
+            created_at=now - 50 * _HOUR,
+        )
+        diags = kd.compute_task_diagnostics(task, [], [], now=now, config=_stale_cfg())
+        assert "stale_quantity_in_body" not in [d.kind for d in diags], status
+
+
+def test_stale_quantity_cleared_by_a_recent_comment():
+    """Auto-clearing: somebody re-grounded the card, so trust it again."""
+    now = 100 * _HOUR
+    task = _task(
+        status="blocked",
+        title="48 unresolved conflicts",
+        body="48 files still unresolved",
+        created_at=now - 50 * _HOUR,
+    )
+    events = [_event("commented", ts=now - 1 * _HOUR)]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now, config=_stale_cfg())
+    assert "stale_quantity_in_body" not in [d.kind for d in diags]
+
+    # ...but a comment older than the window does NOT clear it.
+    old = [_event("commented", ts=now - 40 * _HOUR)]
+    diags2 = kd.compute_task_diagnostics(task, old, [], now=now, config=_stale_cfg())
+    assert "stale_quantity_in_body" in [d.kind for d in diags2]
+
+
+def test_stale_quantity_registered_in_public_kind_list():
+    """A rule missing from DIAGNOSTIC_KINDS is invisible to the UI filter."""
+    assert "stale_quantity_in_body" in kd.DIAGNOSTIC_KINDS
+    assert kd._rule_stale_quantity_in_body in kd._RULES
+
+
+def test_stale_quantity_threshold_covers_the_real_incident_age():
+    """Regression pin: the incident card was ~3.6h old when its count was
+    quoted and already wrong. A window wider than that is silent through the
+    exact failure this rule exists to catch, so pin the default here — not
+    just in the rule's own docstring.
+    """
+    assert kd.DEFAULT_CONFIG["body_quantity_stale_hours"] <= 3.0
+
+    now = 100 * _HOUR
+    task = _task(
+        status="blocked",
+        title="Finish the 2026-08-10 parity merge: 48 unresolved conflicts",
+        body="48 files still unresolved (UU)",
+        created_at=int(now - 3.6 * _HOUR),
+    )
+    diags = kd.compute_task_diagnostics(task, [], [], now=now, config=kd.DEFAULT_CONFIG)
+    assert "stale_quantity_in_body" in [d.kind for d in diags]
