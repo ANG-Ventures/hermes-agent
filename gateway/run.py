@@ -8121,7 +8121,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running_agent_count()
             + self._active_cron_job_count()
             + self._active_api_run_count()
+            + self._active_compaction_count()
         )
+
+    def _active_compaction_count(self) -> int:
+        """Count context compactions currently running in this process.
+
+        A compaction is expensive, user-visible work that can run for minutes
+        on a large session — but it does NOT appear in ``_running_agents``:
+        ``/compress`` builds a throwaway ``AIAgent`` and runs it on an
+        executor. So this drain was structurally blind to it, exactly as it
+        was once blind to in-flight cron work (#60432).
+
+        Measured 2026-08-10: a /compress on a 792-message session started at
+        21:35:18; a restart armed by an UNRELATED session delivered SIGTERM at
+        21:36:31 — 73s in. The session append could not complete, and the user
+        was told session storage failed and to check for a full disk (on a box
+        with 6.1 TiB free).
+
+        Best-effort: returns 0 if the module can't be imported (e.g. a minimal
+        test double for this class), matching _active_cron_job_count.
+        """
+        try:
+            from agent.conversation_compression import compactions_in_flight
+            return int(compactions_in_flight())
+        except Exception:
+            return 0
 
     def _active_cron_job_count(self) -> int:
         """Count of cron jobs currently executing, from the cron scheduler's
