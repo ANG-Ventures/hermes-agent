@@ -25152,6 +25152,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             chat_name=source.chat_name or "",
             thread_id=str(source.thread_id) if source.thread_id else "",
             user_id=str(source.user_id) if source.user_id else "",
+            # Also carry the two OTHER identity fields build_session_key
+            # consumes — the canonical participant on alt-keyed platforms
+            # (feishu/signal/dingtalk) and the Slack workspace scope. Consumers
+            # that persist a routing identity for later replay (the kanban
+            # notify-sub writer) cannot reconstruct the creator's session key
+            # from user_id alone, so they must see these too.
+            user_id_alt=(
+                str(source.user_id_alt) if source.user_id_alt else ""
+            ),
+            scope_id=str(source.scope_id) if source.scope_id else "",
             user_name=str(source.user_name) if source.user_name else "",
             session_key=session_key or "",
             session_id=session_id or "",

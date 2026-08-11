@@ -1584,6 +1584,16 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     chat_type     TEXT,
     thread_id     TEXT NOT NULL DEFAULT '',
     user_id       TEXT,
+    -- Canonical participant on platforms that key sessions on a STABLE
+    -- alternate id (feishu union_id, signal uuid, dingtalk staff_id).
+    -- ``build_session_key`` keys the participant segment on
+    -- ``user_id_alt or user_id``, so a row that stores only ``user_id``
+    -- rebuilds a DIFFERENT key than the creator's on those platforms.
+    user_id_alt   TEXT,
+    -- Platform-neutral scope discriminator (Slack workspace/team id).
+    -- ``build_session_key`` inserts it BEFORE chat_id on both the DM and
+    -- group branches for Slack, so a row without it drops that segment.
+    scope_id      TEXT,
     notifier_profile TEXT,
     delivery_metadata TEXT,
     created_at    INTEGER NOT NULL,
@@ -2792,6 +2802,27 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "delivery_metadata", "delivery_metadata TEXT"
             )
+        if "user_id_alt" not in notify_cols:
+            # Canonical participant on alt-keyed platforms (feishu union_id,
+            # signal uuid, dingtalk staff_id). ``build_session_key`` derives the
+            # participant segment from ``user_id_alt or user_id``; a row that
+            # can only store ``user_id`` therefore rebuilds a DIFFERENT key than
+            # the creator's session on those platforms, so the wake lands in a
+            # second, chat-unreachable session. Legacy rows get NULL, which
+            # falls back to ``user_id`` — byte-identical to the behaviour they
+            # have today.
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "user_id_alt", "user_id_alt TEXT"
+            )
+        if "scope_id" not in notify_cols:
+            # Slack workspace/team id. ``build_session_key`` inserts the Slack
+            # scope BEFORE chat_id on both the DM and the group branch, so a row
+            # without it drops that segment and mints a second key. NULL on
+            # legacy rows and on every platform that doesn't scope by workspace,
+            # which is exactly their current behaviour.
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "scope_id", "scope_id TEXT"
+            )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -2916,6 +2947,7 @@ _REBUILD_SPECS = {
         "CREATE TABLE kanban_notify_subs ("
         " task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,"
         " chat_type TEXT, thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,"
+        " user_id_alt TEXT, scope_id TEXT,"
         " notifier_profile TEXT, delivery_metadata TEXT, created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
@@ -3620,9 +3652,10 @@ def _inherit_notify_subs(
     conn.execute(
         f"""
         INSERT OR IGNORE INTO kanban_notify_subs
-            (task_id, platform, chat_id, thread_id, user_id,
-             notifier_profile, created_at, last_event_id)
-        SELECT ?, platform, chat_id, thread_id, user_id, notifier_profile, ?, ?
+            (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
+             scope_id, notifier_profile, created_at, last_event_id)
+        SELECT ?, platform, chat_id, thread_id, user_id, user_id_alt,
+               scope_id, notifier_profile, ?, ?
           FROM kanban_notify_subs
          WHERE task_id IN ({placeholders})
         """,
@@ -10936,6 +10969,8 @@ def add_notify_sub(
     chat_type: Optional[str] = None,
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
+    user_id_alt: Optional[str] = None,
+    scope_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
     delivery_metadata: Optional[Mapping[str, Any]] = None,
 ) -> None:
@@ -10950,6 +10985,12 @@ def add_notify_sub(
     messages (issue #29905). Subscribers only want events that occur
     AFTER they subscribe; the gateway/tool auto-subscribe paths run at
     task creation, where the snapshot is 0 anyway.
+
+    ``user_id_alt`` and ``scope_id`` carry the two remaining session-key
+    inputs that ``user_id`` alone cannot express (see the wake site in
+    ``gateway/kanban_watchers.py``). Both are pure routing DATA copied off
+    the creating turn's own ``SessionSource`` — never inferred, never
+    defaulted — so a row written without them behaves exactly as before.
     """
     now = int(time.time())
     metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
@@ -10958,8 +10999,9 @@ def add_notify_sub(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
                 (task_id, platform, chat_id, chat_type, thread_id, user_id,
+                 user_id_alt, scope_id,
                  notifier_profile, delivery_metadata, created_at, last_event_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
             """,
             (
@@ -10969,6 +11011,8 @@ def add_notify_sub(
                 chat_type,
                 thread_id or "",
                 user_id,
+                user_id_alt,
+                scope_id,
                 notifier_profile,
                 metadata_json,
                 now,
@@ -11021,6 +11065,45 @@ def add_notify_sub(
                    AND (user_id IS NULL OR user_id = '')
                 """,
                 (user_id, task_id, platform, chat_id, thread_id or ""),
+            )
+        if user_id_alt:
+            # Same fill-a-hole rule, one level deeper. ``build_session_key``
+            # keys the participant on ``user_id_alt or user_id``, so on an
+            # alt-keyed platform this column — not ``user_id`` — is what the
+            # wake must reproduce.
+            #
+            # Gated on the row being identity-less in BOTH columns rather than
+            # just this one. Backfilling the alt id onto a row that already
+            # names a DIFFERENT ``user_id`` would repoint that row's lane to
+            # another participant, which is precisely the hijack the ``user_id``
+            # guard above exists to prevent: the pair is one identity and must
+            # be healed as a unit, never interleaved.
+            conn.execute(
+                """
+                UPDATE kanban_notify_subs
+                   SET user_id_alt = ?
+                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                   AND (user_id_alt IS NULL OR user_id_alt = '')
+                   AND (user_id IS NULL OR user_id = '' OR user_id = ?)
+                """,
+                (user_id_alt, task_id, platform, chat_id, thread_id or "",
+                 user_id or ""),
+            )
+        if scope_id:
+            # Workspace scope is a property of the CHAT, not of a participant,
+            # so healing it can never repoint someone's lane — but keep it
+            # fill-a-hole anyway: a row that already names a scope came from a
+            # real turn in that workspace, and a differing value means the
+            # chat_id is ambiguous across workspaces, which is a condition to
+            # preserve for diagnosis rather than silently overwrite.
+            conn.execute(
+                """
+                UPDATE kanban_notify_subs
+                   SET scope_id = ?
+                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                   AND (scope_id IS NULL OR scope_id = '')
+                """,
+                (scope_id, task_id, platform, chat_id, thread_id or ""),
             )
         if metadata_json:
             # A duplicate subscribe from the same chat/thread should refresh

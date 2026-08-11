@@ -1521,6 +1521,13 @@ def subscribe_calling_session(
             chat_id = session_key
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
+        # build_session_key derives the participant segment from
+        # ``user_id_alt or user_id`` and prefixes the Slack workspace scope
+        # before chat_id, so a row storing only user_id cannot reproduce the
+        # creating session's key on those platforms — the wake then opens a
+        # second, chat-unreachable session. Persist them as data.
+        user_id_alt = get_session_env("HERMES_SESSION_USER_ID_ALT", "") or None
+        scope_id = get_session_env("HERMES_SESSION_SCOPE_ID", "") or None
         chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
         message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
         notifier_profile = (
@@ -1561,6 +1568,7 @@ def subscribe_calling_session(
             platform=platform, chat_id=chat_id,
             chat_type=chat_type,
             thread_id=thread_id, user_id=user_id,
+            user_id_alt=user_id_alt, scope_id=scope_id,
             notifier_profile=notifier_profile,
             delivery_metadata=delivery_metadata or None,
         )

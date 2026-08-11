@@ -956,6 +956,37 @@ class GatewayKanbanWatchersMixin:
                                     chat_type=_chat_type,
                                     thread_id=sub.get("thread_id") or None,
                                     user_id=_wake_user_id,
+                                    # The two remaining session-key inputs that
+                                    # user_id alone cannot express. Both are
+                                    # pure DATA off the creating turn's own
+                                    # SessionSource (see add_notify_sub) — this
+                                    # is the "carry the creator's identity as
+                                    # data" half that no routing-index
+                                    # heuristic can substitute for:
+                                    #
+                                    # * user_id_alt — build_session_key derives
+                                    #   the participant from `user_id_alt or
+                                    #   user_id`, so on feishu / signal /
+                                    #   dingtalk the ALT id is the key segment.
+                                    #   Passing only user_id built
+                                    #   `...:<chat>:<user_id>` while the human's
+                                    #   own session is `...:<chat>:<alt>` — a
+                                    #   phantom on EVERY wake, warm routing
+                                    #   index or not, because a row that names
+                                    #   a participant short-circuits
+                                    #   resolve_wake_participant (correctly)
+                                    #   and an identity-less one can never
+                                    #   satisfy its `key.endswith(":"+user_id)`
+                                    #   evidence guard on an alt-keyed key.
+                                    # * scope_id — Slack keys the workspace
+                                    #   BEFORE chat_id on both the DM and group
+                                    #   branches, so dropping it minted a
+                                    #   second key for every Slack wake.
+                                    #
+                                    # Legacy rows carry NULL for both, which
+                                    # reproduces today's behaviour exactly.
+                                    user_id_alt=sub.get("user_id_alt") or None,
+                                    scope_id=sub.get("scope_id") or None,
                                     profile=sub_profile or None,
                                 )
                                 # deliver_wake preserves the synthetic
