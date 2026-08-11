@@ -1608,6 +1608,24 @@ def _default_session_cwd() -> str:
     return _launch_configured_cwd() or os.getenv("TERMINAL_CWD") or os.getcwd()
 
 
+def _headless_server_log_frame(obj: dict) -> dict:
+    """Return a log-safe copy of a headless server's fallback frame."""
+    if not os.getenv("HERMES_SERVE_HEADLESS") or obj.get("method") != "event":
+        return obj
+    params = obj.get("params")
+    if not isinstance(params, dict) or params.get("type") != "session.info":
+        return obj
+    payload = params.get("payload")
+    if not isinstance(payload, dict) or "system_prompt" not in payload:
+        return obj
+
+    safe_payload = dict(payload)
+    safe_payload["system_prompt"] = "[redacted from hermes serve log]"
+    safe_params = dict(params)
+    safe_params["payload"] = safe_payload
+    return {**obj, "params": safe_params}
+
+
 def write_json(obj: dict) -> bool:
     """Emit one JSON frame. Routes via the most-specific transport available.
 
@@ -1626,7 +1644,13 @@ def write_json(obj: dict) -> bool:
         if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
             return t.write(obj)
 
-    return (current_transport() or _stdio_transport).write(obj)
+    if (transport := current_transport()) is not None:
+        return transport.write(obj)
+
+    # In `hermes serve`, stdio is a server log sink (systemd persists it in
+    # journald), not the authenticated client transport. Keep the original
+    # frame intact for WS clients while making this last-resort log path safe.
+    return _stdio_transport.write(_headless_server_log_frame(obj))
 
 
 def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
