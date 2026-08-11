@@ -11151,44 +11151,62 @@ def _notify_profile_filter(
 
 def backfill_notify_sub_user_ids(
     conn: sqlite3.Connection,
-    resolve_user_id: "Callable[[dict], Optional[str]]",
+    resolve_identity: "Callable[[dict], Optional[Mapping[str, Any]]]",
     *,
     dry_run: bool = False,
+    evidence_unavailable: bool = False,
 ) -> list[dict]:
-    """Backfill ``user_id`` on identity-less subscription rows.
+    """Backfill missing session-key identity on legacy subscription rows.
 
-    Rows written before the participant identity was plumbed through wake the
-    WRONG session: ``gateway/kanban_watchers.py`` rebuilds the creator's scope
-    from this column, and ``gateway.session.build_session_key`` drops the
-    participant segment when it is absent — so the notification lands in a
-    second, chat-unreachable session key for the same chat. ``add_notify_sub``
-    is ``INSERT OR IGNORE``, so a row nobody re-subscribes to never self-heals;
-    this is the explicit repair path for those.
+    The wake rebuilds its :class:`SessionSource` from ``user_id``,
+    ``user_id_alt``, and ``scope_id``. Rows written before those fields were
+    fully plumbed can therefore wake the WRONG session: alt-keyed adapters use
+    ``user_id_alt or user_id`` for the participant segment, while Slack inserts
+    ``scope_id`` before the chat id.
 
-    ``resolve_user_id`` is given the row dict and returns the participant id
-    the origin chat actually had, or ``None``. Returning ``None`` MUST leave
-    the row untouched: a cron / CLI / home-channel subscription is legitimately
-    user-less, and inventing an identity for one would route a system
-    notification into some human's private per-user session. The caller owns
-    the evidence (the gateway routing index); this function owns the write.
+    ``resolve_identity`` receives a row dict and returns a mapping containing
+    the complete identity observed in durable gateway routing, or ``None``.
+    Returning ``None`` MUST leave the row untouched. A cron / CLI / home-channel
+    subscription is legitimately user-less, and inventing an identity would
+    route a system notification into some human's private session. The caller
+    owns that evidence and refuses chats with zero or multiple candidates; this
+    function owns the fill-a-hole-only write. ``evidence_unavailable``
+    distinguishes an empty but readable index from a failed index read, so even
+    named-but-incomplete rows remain visible in the operator report.
 
-    Idempotent: rows that already name a participant are never re-pointed, so
-    a second run over the same board is a no-op. Returns one record per row
-    considered, each with ``task_id`` / ``platform`` / ``chat_id`` /
-    ``thread_id`` / ``user_id`` / ``action`` (``"backfilled"`` or
-    ``"skipped_no_evidence"``).
+    Existing values are authoritative and are never overwritten. In particular,
+    an alt id is added to a named row only when the routing entry's raw
+    ``user_id`` agrees, preventing a different participant's alt id from being
+    grafted onto the row. Rows for platforms that legitimately have no alt or
+    scope stay idempotent: if the resolver supplies no missing value, the row is
+    omitted from the result instead of being reported forever.
+
+    Returns records for rows changed (or changeable under ``dry_run``) and for
+    incomplete rows that could not be repaired safely. Each record includes all
+    fields, ``backfilled_fields``, and ``action`` (``"backfilled"``,
+    ``"skipped_no_evidence"``, ``"skipped_evidence_unavailable"``, or
+    ``"skipped_raced"``).
     """
     rows = conn.execute(
         """
-        SELECT task_id, platform, chat_id, chat_type, thread_id, user_id,
-               notifier_profile, delivery_metadata
-          FROM kanban_notify_subs
-         WHERE user_id IS NULL OR user_id = ''
+        SELECT n.task_id, n.platform, n.chat_id, n.chat_type, n.thread_id,
+               n.user_id, n.user_id_alt, n.scope_id, n.notifier_profile,
+               n.delivery_metadata, t.session_id AS creator_session_id
+          FROM kanban_notify_subs AS n
+          LEFT JOIN tasks AS t ON t.id = n.task_id
+         WHERE n.user_id IS NULL OR n.user_id = ''
+            OR n.user_id_alt IS NULL OR n.user_id_alt = ''
+            OR n.scope_id IS NULL OR n.scope_id = ''
         """
     ).fetchall()
 
+    fields = ("user_id", "user_id_alt", "scope_id")
+
+    def _clean(value: Any) -> str:
+        return str(value or "").strip()
+
     results: list[dict] = []
-    pending: list[tuple] = []
+    pending: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
         if "delivery_metadata" in item:
@@ -11196,36 +11214,152 @@ def backfill_notify_sub_user_ids(
                 item.get("delivery_metadata")
             )
         try:
-            resolved = resolve_user_id(item)
+            raw_identity = resolve_identity(item)
         except Exception:
-            resolved = None
-        resolved = str(resolved).strip() if resolved else ""
-        record = {
+            raw_identity = None
+        if isinstance(raw_identity, Mapping):
+            resolved = {
+                field: _clean(raw_identity.get(field)) for field in fields
+            }
+        else:
+            # Compatibility with the original user-id-only callback contract.
+            resolved = {
+                "user_id": _clean(raw_identity),
+                "user_id_alt": "",
+                "scope_id": "",
+            }
+        existing = {field: _clean(item.get(field)) for field in fields}
+        row_key = {
             "task_id": item["task_id"],
             "platform": item["platform"],
             "chat_id": item["chat_id"],
             "thread_id": item.get("thread_id") or "",
-            "user_id": resolved or None,
-            "action": "backfilled" if resolved else "skipped_no_evidence",
         }
-        results.append(record)
-        if resolved:
-            pending.append((
-                resolved, item["task_id"], item["platform"], item["chat_id"],
-                item.get("thread_id") or "",
-            ))
 
-    if pending and not dry_run:
+        if not any(resolved.values()):
+            # A readable index with no matching creator evidence is still an
+            # incomplete row, not "nothing to repair". Keep it visible while
+            # refusing to invent identity.
+            results.append({
+                **row_key,
+                **{field: existing[field] or None for field in fields},
+                "backfilled_fields": [],
+                "action": (
+                    "skipped_evidence_unavailable"
+                    if evidence_unavailable else "skipped_no_evidence"
+                ),
+            })
+            continue
+
+        conflicts = any(
+            existing[field]
+            and resolved[field]
+            and existing[field] != resolved[field]
+            for field in fields
+        )
+        # ``user_id_alt`` outranks ``user_id`` in build_session_key. Never graft
+        # an alt id onto a named row unless the same routing entry proves its
+        # lower-priority raw id is the row's existing owner.
+        if (
+            resolved["user_id_alt"]
+            and existing["user_id"]
+            and resolved["user_id"] != existing["user_id"]
+        ):
+            conflicts = True
+        if conflicts:
+            if not existing["user_id"] and not existing["user_id_alt"]:
+                results.append({
+                    **row_key,
+                    **{field: existing[field] or None for field in fields},
+                    "backfilled_fields": [],
+                    "action": "skipped_no_evidence",
+                })
+            continue
+
+        backfilled_fields = [
+            field for field in fields if not existing[field] and resolved[field]
+        ]
+        if not backfilled_fields:
+            continue
+        final_identity = {
+            field: existing[field] or resolved[field] or None for field in fields
+        }
+        result = {
+            **row_key,
+            **final_identity,
+            "backfilled_fields": backfilled_fields,
+            "action": "backfilled",
+        }
+        if dry_run:
+            results.append(result)
+        else:
+            pending.append({
+                "identity": {**row_key, **resolved},
+                "result": result,
+            })
+
+    if pending:
         with write_txn(conn):
-            conn.executemany(
-                """
-                UPDATE kanban_notify_subs
-                   SET user_id = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                   AND (user_id IS NULL OR user_id = '')
-                """,
-                pending,
-            )
+            for change in pending:
+                identity = change["identity"]
+                row_params = (
+                    identity["task_id"], identity["platform"],
+                    identity["chat_id"], identity["thread_id"],
+                )
+                cursor = conn.execute(
+                    """
+                    UPDATE kanban_notify_subs
+                       SET user_id = CASE
+                               WHEN user_id IS NULL OR user_id = ''
+                               THEN COALESCE(NULLIF(?, ''), user_id)
+                               ELSE user_id END,
+                           user_id_alt = CASE
+                               WHEN user_id_alt IS NULL OR user_id_alt = ''
+                               THEN COALESCE(NULLIF(?, ''), user_id_alt)
+                               ELSE user_id_alt END,
+                           scope_id = CASE
+                               WHEN scope_id IS NULL OR scope_id = ''
+                               THEN COALESCE(NULLIF(?, ''), scope_id)
+                               ELSE scope_id END
+                     WHERE task_id = ? AND platform = ?
+                       AND chat_id = ? AND thread_id = ?
+                       AND (user_id IS NULL OR user_id = '' OR user_id = ?)
+                       AND (user_id_alt IS NULL OR user_id_alt = ''
+                            OR user_id_alt = ?)
+                       AND (scope_id IS NULL OR scope_id = '' OR scope_id = ?)
+                    """,
+                    (
+                        identity["user_id"], identity["user_id_alt"],
+                        identity["scope_id"], *row_params,
+                        identity["user_id"], identity["user_id_alt"],
+                        identity["scope_id"],
+                    ),
+                )
+                if cursor.rowcount:
+                    results.append(change["result"])
+                    continue
+
+                # Another writer changed or deleted the row after the scan. The
+                # tuple guards correctly refused a partial/interleaved repair;
+                # report that refusal instead of claiming a write that did not
+                # commit.
+                current = conn.execute(
+                    """
+                    SELECT user_id, user_id_alt, scope_id
+                      FROM kanban_notify_subs
+                     WHERE task_id = ? AND platform = ?
+                       AND chat_id = ? AND thread_id = ?
+                    """,
+                    row_params,
+                ).fetchone()
+                raced = dict(change["result"])
+                raced.update({
+                    field: (_clean(current[field]) or None) if current else None
+                    for field in fields
+                })
+                raced["backfilled_fields"] = []
+                raced["action"] = "skipped_raced"
+                results.append(raced)
     return results
 
 

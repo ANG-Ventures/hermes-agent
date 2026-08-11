@@ -16,9 +16,13 @@ import os
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, NamedTuple, Optional
 
 from agent.i18n import t
+from gateway.routing_identity import (
+    effective_routing_lane,
+    routing_key_carries_identity,
+)
 
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
@@ -57,6 +61,59 @@ def _resolve_auto_decompose_settings(
     return enabled, per_tick
 
 
+class _WakeRoutingIdentity(NamedTuple):
+    """One coherent routing identity from a live session entry."""
+
+    user_id: str
+    user_id_alt: str
+    scope_id: str
+
+    @property
+    def participant(self) -> str:
+        return self.user_id_alt or self.user_id
+
+
+def resolve_wake_identity(
+    sub_user_id: Optional[str],
+    sub_user_id_alt: Optional[str],
+    sub_scope_id: Optional[str],
+    live_identities: Iterable[_WakeRoutingIdentity],
+) -> _WakeRoutingIdentity:
+    """Resolve one coherent wake identity without repointing a named row.
+
+    A subscription that already names a participant is authoritative. Otherwise
+    exactly one complete live identity may fill the missing participant and
+    scope together. Ambiguity is measured over the complete tuple so two Slack
+    workspaces carrying the same user id cannot collapse into one candidate.
+    An existing scope-only row narrows evidence to that scope. Zero or multiple
+    candidates preserve the row as-is, degrading to the shared key.
+    """
+    existing = _WakeRoutingIdentity(
+        str(sub_user_id or "").strip(),
+        str(sub_user_id_alt or "").strip(),
+        str(sub_scope_id or "").strip(),
+    )
+    if existing.participant:
+        return existing
+    candidates = {
+        _WakeRoutingIdentity(
+            str(identity.user_id or "").strip(),
+            str(identity.user_id_alt or "").strip(),
+            str(identity.scope_id or "").strip(),
+        )
+        for identity in live_identities
+        if str(identity.participant or "").strip()
+    }
+    if existing.scope_id:
+        candidates = {
+            identity for identity in candidates
+            if identity.scope_id == existing.scope_id
+        }
+    if len(candidates) != 1:
+        return existing
+    return next(iter(candidates))
+
+
 def resolve_wake_participant(
     sub_user_id: Optional[str],
     live_participants: Iterable[str],
@@ -92,15 +149,16 @@ def resolve_wake_participant(
     Pure and side-effect free so the decision is testable without a gateway;
     the caller owns the evidence (``_live_chat_participants``) and the write.
     """
-    existing = str(sub_user_id or "").strip()
-    if existing:
-        return existing
-    candidates = {
-        str(p).strip() for p in live_participants if str(p or "").strip()
-    }
-    if len(candidates) != 1:
-        return None
-    return next(iter(candidates))
+    identity = resolve_wake_identity(
+        sub_user_id,
+        None,
+        None,
+        (
+            _WakeRoutingIdentity(str(p or "").strip(), "", "")
+            for p in live_participants
+        ),
+    )
+    return identity.participant or None
 
 
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
@@ -231,31 +289,41 @@ class GatewayKanbanWatchersMixin:
 
     def _live_chat_participants(
         self, platform: Any, chat_id: str, thread_id: Optional[str] = None,
-    ) -> set:
-        """Participant ids the gateway has actually resolved for this chat.
+        chat_type: Optional[str] = None,
+        creator_session_key: Optional[str] = None,
+    ) -> set[_WakeRoutingIdentity]:
+        """Complete identities the gateway has resolved for this chat.
 
         Evidence for :func:`resolve_wake_participant`. Read from the live
         ``session_store`` routing index — the same structure ``notify-repair``
         mines out of ``state.db``'s ``gateway_routing`` table, except in-process
         and current, so a wake can use it BEFORE a repair pass ever runs.
 
-        Only per-user *group/channel* entries count. Deliberately narrow:
+        Only entries whose key shape proves the required identity count.
+        Deliberately narrow:
 
-        * ``origin.user_id`` must be present — an entry with no participant is
-          exactly the phantom we're refusing to feed.
-        * the entry's own chat must match, so a participant in another channel
-          can never be adopted here.
-        * the entry must be keyed per-user (``key.endswith(":" + user_id)``).
-          A shared thread session legitimately has no participant segment; if
-          the wake adopted an identity for it, it would route into a per-user
-          key nobody in that thread is reading. The key's own shape is the only
-          honest test of whether this chat IS per-user — reading the config flag
-          would ignore ``thread_sessions_per_user`` and the DM/thread branches
-          of ``build_session_key``.
+        * ``origin.user_id_alt or origin.user_id`` must be present — that is the
+          participant segment selected by ``build_session_key``. An entry with
+          neither is exactly the phantom we're refusing to feed.
+        * the entry's own chat and chat type must match, so a participant in
+          another channel or a group entry sharing a DM id can never be adopted.
+        * group/channel and no-chat DM entries must be keyed per-user
+          (``key.endswith(":" + participant)``). A shared thread session
+          legitimately has no participant segment; adopting one would route to
+          a per-user key nobody in that thread reads.
+        * Slack DMs with a chat id intentionally omit the participant from the
+          key. Their exact ``slack:dm:<scope>:<chat>[:<thread>]`` tail instead
+          proves the workspace scope the wake needs to reconstruct that key.
 
-        Returns a SET, never a pick: the caller refuses on 0 and on >1. Never
-        raises — a routing-index read failure degrades to "no evidence", which
-        preserves the pre-change behaviour exactly.
+        The key's own shape is the honest test — reading config flags would
+        ignore ``thread_sessions_per_user`` and the DM/thread branches of
+        ``build_session_key``.
+
+        Returns complete ``(user_id, user_id_alt, scope_id)`` tuples rather than
+        participant strings so alternate ids and Slack workspace scope cannot be
+        selected from different entries. Returns a SET, never a pick: the caller
+        refuses on 0 and on >1. Never raises — a routing-index read failure
+        degrades to "no evidence", preserving the pre-change behaviour exactly.
         """
         store = getattr(self, "session_store", None)
         if store is None or not chat_id:
@@ -263,7 +331,9 @@ class GatewayKanbanWatchersMixin:
         platform_value = getattr(platform, "value", platform)
         want_chat = str(chat_id)
         want_thread = str(thread_id or "")
-        found: set = set()
+        want_chat_type = str(chat_type or "")
+        want_creator_key = str(creator_session_key or "")
+        found: set[_WakeRoutingIdentity] = set()
         try:
             with store._lock:  # noqa: SLF001 -- documented private access
                 store._ensure_loaded_locked()  # noqa: SLF001
@@ -275,25 +345,60 @@ class GatewayKanbanWatchersMixin:
             )
             return set()
         for key, entry in entries.items():
+            if want_creator_key and str(key) != want_creator_key:
+                continue
             origin = getattr(entry, "origin", None)
             if origin is None:
                 continue
             user_id = str(getattr(origin, "user_id", "") or "").strip()
-            if not user_id:
+            user_id_alt = str(
+                getattr(origin, "user_id_alt", "") or ""
+            ).strip()
+            scope_id = str(
+                getattr(origin, "scope_id", "")
+                or getattr(origin, "guild_id", "")
+                or ""
+            ).strip()
+            participant = user_id_alt or user_id
+            if not participant:
                 continue
             origin_platform = getattr(origin, "platform", None)
             if str(getattr(origin_platform, "value", origin_platform)) != str(
                 platform_value
             ):
                 continue
-            if str(getattr(origin, "chat_id", "") or "") != want_chat:
+            origin_chat_type = str(
+                getattr(origin, "chat_type", "") or ""
+            )
+            origin_lane = effective_routing_lane(
+                platform=origin_platform,
+                chat_id=getattr(origin, "chat_id", None),
+                chat_type=origin_chat_type,
+                thread_id=getattr(origin, "thread_id", None),
+                prospective_thread_id=getattr(
+                    origin, "prospective_thread_id", None
+                ),
+            )
+            want_lane = (
+                str(platform_value), want_chat, want_chat_type, want_thread,
+            )
+            if origin_lane != want_lane:
                 continue
-            if str(getattr(origin, "thread_id", "") or "") != want_thread:
+            if not routing_key_carries_identity(
+                key,
+                platform=origin_platform,
+                chat_id=want_chat,
+                chat_type=origin_chat_type,
+                thread_id=want_thread,
+                prospective_thread_id=getattr(
+                    origin, "prospective_thread_id", None
+                ),
+                user_id=user_id,
+                user_id_alt=user_id_alt,
+                scope_id=scope_id,
+            ):
                 continue
-            # Per-user keying is what makes this participant adoptable.
-            if not str(key).endswith(f":{user_id}"):
-                continue
-            found.add(user_id)
+            found.add(_WakeRoutingIdentity(user_id, user_id_alt, scope_id))
         return found
 
     def _owns_kanban_dispatcher_lock(self) -> bool:
@@ -933,29 +1038,36 @@ class GatewayKanbanWatchersMixin:
                                 # per-chat session) unless exactly one per-user
                                 # participant is known for this chat — see
                                 # resolve_wake_participant.
-                                _wake_user_id = resolve_wake_participant(
+                                _wake_identity = resolve_wake_identity(
                                     sub.get("user_id"),
+                                    sub.get("user_id_alt"),
+                                    sub.get("scope_id"),
                                     self._live_chat_participants(
                                         plat,
                                         sub["chat_id"],
                                         sub.get("thread_id") or None,
+                                        _chat_type,
+                                        _session_key,
                                     ),
                                 )
-                                if _wake_user_id and not sub.get("user_id"):
+                                _wake_participant = _wake_identity.participant
+                                if _wake_participant and not (
+                                    sub.get("user_id") or sub.get("user_id_alt")
+                                ):
                                     logger.info(
                                         "kanban notifier: identity-less sub for "
                                         "%s on %s/%s resolved to participant %s "
                                         "from live routing (phantom session "
                                         "prevented)",
                                         sub["task_id"], platform_str,
-                                        sub["chat_id"], _wake_user_id,
+                                        sub["chat_id"], _wake_participant,
                                     )
                                 _source = SessionSource(
                                     platform=plat,
                                     chat_id=sub["chat_id"],
                                     chat_type=_chat_type,
                                     thread_id=sub.get("thread_id") or None,
-                                    user_id=_wake_user_id,
+                                    user_id=_wake_identity.user_id or None,
                                     # The two remaining session-key inputs that
                                     # user_id alone cannot express. Both are
                                     # pure DATA off the creating turn's own
@@ -985,8 +1097,8 @@ class GatewayKanbanWatchersMixin:
                                     #
                                     # Legacy rows carry NULL for both, which
                                     # reproduces today's behaviour exactly.
-                                    user_id_alt=sub.get("user_id_alt") or None,
-                                    scope_id=sub.get("scope_id") or None,
+                                    user_id_alt=_wake_identity.user_id_alt or None,
+                                    scope_id=_wake_identity.scope_id or None,
                                     profile=sub_profile or None,
                                 )
                                 # deliver_wake preserves the synthetic
