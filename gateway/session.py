@@ -44,6 +44,15 @@ def _now() -> datetime:
     return datetime.now()
 
 
+# Routing is persisted before the matching session row is created.  Leave a
+# full day for that normally-synchronous write (including DB contention and
+# restart recovery) before an otherwise untouched missing-row route can be
+# classified as a failed create.  This is deliberately conservative, not a
+# proof: an ancient empty pre-SQLite route can have the same shape, so the
+# activity checks below remain the primary protection for real legacy routes.
+_NEVER_PERSISTED_STUB_GRACE = timedelta(hours=24)
+
+
 # Default auto-continue freshness window in seconds (1 hour).  A session
 # interrupted by a restart is only auto-resumed — and only returned by
 # ``get_or_create_session`` — while it stays within this window of when
@@ -1537,13 +1546,15 @@ class SessionStore:
         self._prune_stale_sessions_locked()
 
     def _prune_stale_sessions_locked(self) -> None:
-        """Remove sessions.json entries whose session has ended in state.db.
+        """Remove ended routes and old inert routes that never reached state.db.
 
         Called once during startup (from ``_ensure_loaded_locked``, lock held).
         A ``session_id`` is stale when state.db reports ``end_reason IS NOT
-        NULL`` for it. Sessions absent from the DB (never persisted / pre-SQLite
-        legacy) are left alone, and a ``None`` DB handle (SQLite unavailable) is
-        a no-op. DB errors are non-fatal — startup must never fail here.
+        NULL`` for it, or when the row is absent and the routing metadata proves
+        no activity before the conservative grace window elapsed. Missing rows
+        with any legacy activity are retained. A ``None`` DB handle (SQLite
+        unavailable) is a no-op. DB errors are non-fatal — startup must never
+        fail here.
         """
         db = getattr(self, "_db", None)
         if not db or not self._entries:
@@ -1554,10 +1565,21 @@ class SessionStore:
         try:
             for key, entry in self._entries.items():
                 row = db.get_session(entry.session_id)
-                # row is None        -> not in DB (legacy / pre-SQLite) — keep
+                # row is None        -> keep active/recent legacy; reap only an
+                #                       old route with no evidence of activity
                 # end_reason is None  -> session alive — keep
                 # end_reason not None -> session ended — prune
-                if row is not None and row.get("end_reason") is not None:
+                if row is None:
+                    if self._is_never_persisted_stub(entry):
+                        logger.warning(
+                            "gateway.session: pruning old inert routing entry "
+                            "%r -> %s; session row was never persisted",
+                            key,
+                            entry.session_id,
+                        )
+                        stale_keys.append(key)
+                    continue
+                if row.get("end_reason") is not None:
                     recovered_entry = None
                     recovery_lookup_failed = False
                     if entry.origin is not None:
@@ -2388,19 +2410,16 @@ class SessionStore:
     def _is_session_ended_in_db(self, session_id: str) -> bool:
         """Return True iff state.db has this session with a non-null end_reason.
 
-        Mirrors the staleness test in ``_prune_stale_sessions_locked``:
+        Implements the ended-row half of the routing staleness test:
           - no DB handle / no session_id -> False (can't tell — keep)
           - row absent (legacy / not yet persisted) -> False (keep)
           - end_reason is None -> False (alive — keep)
           - end_reason not None -> True (ended — stale)
 
-        Used by ``get_or_create_session`` to self-heal at routing time:
-        ``_prune_stale_sessions_locked`` only runs at startup, so a session
-        ended in the DB while the gateway stays alive (any path that finalizes
-        the row without clearing sessions.json) would otherwise be reused as a
-        live routing key and silently swallow every subsequent message until
-        the next restart (#54878 — the live-gateway variant of #52804/FM9).
-        DB errors are non-fatal — never block routing on a failed lookup.
+        Used by the gateway agent-cache guard. ``get_or_create_session`` uses
+        ``_routing_entry_staleness_in_db`` so it can additionally distinguish
+        an old inert missing-row stub from an active legacy route. DB errors are
+        non-fatal — never block routing on a failed lookup.
         """
         db = getattr(self, "_db", None)
         if not db or not session_id:
@@ -2410,6 +2429,56 @@ class SessionStore:
         except Exception:
             return False
         return bool(row is not None and row.get("end_reason") is not None)
+
+    @staticmethod
+    def _is_never_persisted_stub(
+        entry: SessionEntry, *, now: Optional[datetime] = None
+    ) -> bool:
+        """Return whether a missing-row route has only failed-create evidence.
+
+        ``had_any_turn`` is the durable message-activity signal. Token counters
+        and timestamp movement cover older routing entries that predate it.
+        The age threshold protects the transient interval between the routing
+        UPSERT and the following session-row INSERT.
+        """
+        if entry.updated_at != entry.created_at or entry.had_any_turn:
+            return False
+        if any(
+            (
+                entry.input_tokens,
+                entry.output_tokens,
+                entry.cache_read_tokens,
+                entry.cache_write_tokens,
+                entry.total_tokens,
+                entry.last_prompt_tokens,
+            )
+        ):
+            return False
+        current = now or _now()
+        try:
+            age_seconds = current.timestamp() - entry.created_at.timestamp()
+        except (AttributeError, OSError, OverflowError, TypeError, ValueError):
+            return False
+        return age_seconds >= _NEVER_PERSISTED_STUB_GRACE.total_seconds()
+
+    def _routing_entry_staleness_in_db(
+        self, entry: SessionEntry
+    ) -> Optional[str]:
+        """Classify a route as ended, never-persisted, or not known stale."""
+        db = getattr(self, "_db", None)
+        if not db or not entry.session_id:
+            return None
+        try:
+            row = db.get_session(entry.session_id)
+        except Exception:
+            return None
+        if row is None:
+            return (
+                "never_persisted_stub"
+                if self._is_never_persisted_stub(entry)
+                else None
+            )
+        return "ended" if row.get("end_reason") is not None else None
 
     def _should_reset(self, entry: SessionEntry, source: SessionSource) -> Optional[str]:
         """
@@ -2660,10 +2729,10 @@ class SessionStore:
                 _stale_session_id = _entry_for_checks.session_id
 
         # ---- Phase 1b: no-lock I/O -- stale check + reset policy ----
-        _is_stale = False
+        _stale_reason = None
         _reset_reason = None
         if _entry_for_checks is not None and _stale_session_id is not None:
-            _is_stale = self._is_session_ended_in_db(_stale_session_id)
+            _stale_reason = self._routing_entry_staleness_in_db(_entry_for_checks)
             if _entry_for_checks.suspended:
                 _reset_reason = "suspended"
             elif _entry_for_checks.resume_pending:
@@ -2716,21 +2785,31 @@ class SessionStore:
                     entry, existing_session_id, canonical_existing_session_id
                 )
 
-                if _is_stale and entry.session_id == _stale_session_id:
+                if _stale_reason and entry.session_id == _stale_session_id:
                     # Stale routing self-heal (#54878): the in-memory entry
-                    # points at a session that has ALREADY been ended in
-                    # state.db.  Drop it and fall through to recovery/create.
+                    # points at a session already ended in state.db or at an
+                    # old inert session row that was never created. Drop it and
+                    # fall through to recovery/create.
                     # Recovery finder reopens ``agent_close`` and mistaken
                     # ``ws_orphan_reap`` rows (preserving the transcript) but
                     # returns None for other end_reasons (e.g. /new), starting
                     # a fresh session.
-                    logger.warning(
-                        "gateway.session: routing key %r -> %s is ended in "
-                        "state.db but still live in sessions.json; dropping "
-                        "stale entry and recovering/recreating the session "
-                        "(#54878)",
-                        session_key, entry.session_id,
-                    )
+                    if _stale_reason == "never_persisted_stub":
+                        logger.warning(
+                            "gateway.session: routing key %r -> %s is old and "
+                            "inert but absent from state.db; dropping failed-create "
+                            "stub and recovering/recreating the session",
+                            session_key,
+                            entry.session_id,
+                        )
+                    else:
+                        logger.warning(
+                            "gateway.session: routing key %r -> %s is ended in "
+                            "state.db but still live in sessions.json; dropping "
+                            "stale entry and recovering/recreating the session "
+                            "(#54878)",
+                            session_key, entry.session_id,
+                        )
                     self._entries.pop(session_key, None)
                     # If an expiry watcher (daily/idle reset) already finalized
                     # this session, honour the reset decision instead of silently
