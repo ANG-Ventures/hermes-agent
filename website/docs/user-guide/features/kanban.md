@@ -88,6 +88,55 @@ Per-board isolation is absolute:
   you really need cross-project refs, use free-text mentions and look
   them up by id manually).
 
+### Canonical on-disk layout (which file is authoritative)
+
+There are exactly **two** authoritative DB paths. Anything else that looks
+like a board DB is not one:
+
+```
+~/.hermes/kanban.db                          # the 'default' board (legacy path)
+~/.hermes/kanban/boards/<slug>/kanban.db     # every named board
+~/.hermes/kanban/boards/<slug>/board.json    # that board's metadata
+~/.hermes/kanban/boards/<slug>/workspaces/   # scratch workspaces
+~/.hermes/kanban/boards/<slug>/logs/         # per-task worker logs
+~/.hermes/kanban/current                     # one line: the active slug
+```
+
+Note the asymmetry that trips people up: the `default` board's DB is
+**not** under `boards/` — it sits at `~/.hermes/kanban.db`, one level
+*above* the `boards/` directory, for back-compat with pre-boards installs.
+So `~/.hermes/kanban.db` and `~/.hermes/kanban/boards/<slug>/kanban.db`
+are two different live stores with plausibly similar names. Reading the
+wrong one returns real data for the **wrong board**, which is worse than
+an error because it looks correct.
+
+:::warning A zero-byte `.db` reads as an EMPTY BOARD, not as an error
+`sqlite3.connect()` creates a missing file, and opening an existing
+zero-byte file — even with `mode=ro` — succeeds and reports an empty
+`sqlite_master`. A reader then concludes "this board has no tasks" when
+the truth is "I opened the wrong path".
+
+Use `kanban_db.connect_readonly()` for read-only access instead of a bare
+`sqlite3.connect(...?mode=ro)`. It raises `KanbanDbNotABoardError` (naming
+the path, and the likely correct path) when the file has no `tasks` table,
+and `FileNotFoundError` when the path does not exist.
+
+Never "fix" a zero-byte board file by initialising the schema into it —
+that manufactures a real-looking empty board and makes the confusion
+permanent. Delete the stray file and use the canonical path.
+
+Two habits that generate these stubs:
+
+- **Quote your globs.** An unquoted `boards/*.db` that matches nothing is
+  passed through *literally* by bash, and a command that opens it for
+  writing creates a file whose name is the three characters `*.db`. Board
+  DBs are one level deeper, so the correct glob is `boards/*/kanban.db`.
+- **Don't point `HERMES_KANBAN_HOME` at the kanban directory.** It is the
+  Hermes *root* (`~/.hermes`), and `kanban/boards/...` is joined onto it.
+  Setting it to `~/.hermes/kanban` yields a doubled
+  `~/.hermes/kanban/kanban/boards/...` tree and an unrelated, empty board.
+:::
+
 ### Managing boards from the CLI
 
 ```bash

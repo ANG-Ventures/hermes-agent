@@ -1972,6 +1972,148 @@ class KanbanDbCorruptError(RuntimeError):
         )
 
 
+class KanbanDbNotABoardError(RuntimeError):
+    """Raised when a path opens as SQLite but holds no kanban board.
+
+    ``sqlite3.connect()`` — including ``mode=ro`` on an **existing**
+    zero-byte file — succeeds silently and reports an empty
+    ``sqlite_master``. A read-only caller then sees ``0 tasks`` and
+    concludes "this board is empty" when the truth is "I opened the wrong
+    file". That fail-OPEN turned a mistyped path into a wrong answer that
+    looks like a right one.
+
+    Read-only probes raise this instead. It is deliberately **not** raised
+    by :func:`connect`, which legitimately creates and initializes a fresh
+    board. Never auto-create the schema in an unexpected empty file to
+    "resolve" this — that manufactures a real-looking empty board and makes
+    the confusion permanent.
+    """
+
+    def __init__(self, db_path: Path, *, hint: Optional[str] = None):
+        self.db_path = db_path
+        self.hint = hint
+        try:
+            size = db_path.stat().st_size
+            size_str = f"{size} bytes"
+        except OSError:
+            size_str = "unreadable"
+        message = (
+            f"{db_path} is not a kanban board: it opened as SQLite but has no "
+            f"'tasks' table ({size_str}). This is the zero-byte fail-open — a "
+            f"reader would otherwise see an EMPTY board instead of an error."
+        )
+        if hint:
+            message += f" Did you mean: {hint}?"
+        super().__init__(message)
+
+
+def _canonical_db_path_hint(db_path: Path) -> Optional[str]:
+    """Best-effort "did you mean" for a path that is not a board DB.
+
+    Only the two shapes that are actually canonical are suggested, and only
+    when the suggested file exists and is non-empty:
+
+    * ``<...>/boards/<slug>.db``  → ``<...>/boards/<slug>/kanban.db``
+    * ``<...>/boards/<slug>/board.db`` (or any other name in a board dir)
+      → ``<...>/boards/<slug>/kanban.db``
+
+    Returns ``None`` when nothing better can be pointed at — a wrong guess
+    is worse than no guess.
+    """
+    try:
+        candidates: list[Path] = []
+        parent = db_path.parent
+        # boards/<slug>.db → boards/<slug>/kanban.db
+        if parent.name == "boards" and db_path.name != "kanban.db":
+            candidates.append(parent / db_path.stem / "kanban.db")
+        # boards/<slug>/<other>.db → boards/<slug>/kanban.db
+        if parent.parent.name == "boards" and db_path.name != "kanban.db":
+            candidates.append(parent / "kanban.db")
+        for candidate in candidates:
+            if candidate != db_path and candidate.is_file() and candidate.stat().st_size > 0:
+                return str(candidate)
+    except OSError:
+        return None
+    return None
+
+
+def assert_is_board_db(db_path: Path, conn: sqlite3.Connection) -> None:
+    """Raise :class:`KanbanDbNotABoardError` unless ``conn`` holds a board.
+
+    The check is the presence of the ``tasks`` table — the one table every
+    kanban board has had since the schema existed, so this stays true for
+    legacy boards that predate later tables. Call it on **read-only**
+    opens, right after connecting and before running any query whose empty
+    result would be mistaken for an empty board.
+    """
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'"
+    ).fetchone()
+    if row is None:
+        raise KanbanDbNotABoardError(
+            db_path, hint=_canonical_db_path_hint(db_path)
+        )
+
+
+def connect_readonly(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+) -> sqlite3.Connection:
+    """Open an existing kanban board read-only, failing LOUD on non-boards.
+
+    The safe counterpart to :func:`connect` for readers (diagnostics,
+    audits, dashboards, ad-hoc queries). Unlike a bare
+    ``sqlite3.connect('file:...?mode=ro', uri=True)``:
+
+    * a MISSING file raises ``FileNotFoundError`` naming the path, instead
+      of sqlite's opaque ``unable to open database file``;
+    * a file that opens but has no ``tasks`` table raises
+      :class:`KanbanDbNotABoardError` — this is the zero-byte fail-open
+      the function exists to close.
+
+    Never creates a file, never writes schema, never migrates.
+    """
+    path = db_path if db_path is not None else kanban_db_path(board=board)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"no kanban DB at {path} — nothing to read. Boards live at "
+            f"<root>/kanban/boards/<slug>/kanban.db (or <root>/kanban.db "
+            f"for the '{DEFAULT_BOARD}' board)."
+        )
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        assert_is_board_db(path, conn)
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+def _discard_stub_db(path: Path) -> None:
+    """Remove a just-created ``.db`` that never got its schema.
+
+    ``sqlite3.connect()`` creates the file the moment it opens, before any
+    of the WAL/pragma/schema work runs. When that work then raises, the
+    caller sees the error — but a **zero-byte .db is left on disk**, and
+    every later read-only reader opens it happily and reports an EMPTY
+    board rather than an error. That is how 14 decoy stubs accumulated
+    under one fleet's ``~/.hermes/kanban``.
+
+    Only ever called on the failure path for a file this ``connect()``
+    created, and only when the file is still empty — a non-empty file is
+    somebody's data and is never touched. Best-effort by design: cleanup
+    must not mask the original init error the caller is about to see.
+    """
+    for candidate in (path, path.with_name(path.name + "-wal"),
+                      path.with_name(path.name + "-shm")):
+        try:
+            if candidate.is_file() and candidate.stat().st_size == 0:
+                candidate.unlink()
+        except OSError:
+            pass
+
+
 def _prune_corrupt_backups(
     parent: Path, base_name: str, keep: Optional[Path] = None,
 ) -> None:
@@ -2455,6 +2597,12 @@ def connect(
         # via _INITIALIZED_PATHS so it only runs once per process per path.
         _guard_existing_db_is_healthy(path)
         resolved = str(path.resolve())
+        # Whether this connect is the one CREATING the file. If init below
+        # fails partway, sqlite has already made a 0-byte file that no
+        # schema ever landed in — and a 0-byte .db is indistinguishable
+        # from an empty board to every read-only reader. Remember so the
+        # error path can clean it up instead of leaving a decoy behind.
+        creating = not path.exists() or path.stat().st_size == 0
         conn = _sqlite_connect(path)
         try:
             conn.row_factory = sqlite3.Row
@@ -2491,6 +2639,8 @@ def connect(
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
+            if creating:
+                _discard_stub_db(path)
             raise
     return conn
 
