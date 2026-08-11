@@ -1242,6 +1242,70 @@ def _auto_continue_freshness_window() -> float:
 _RESUME_FLAG_STALE_CLEAR_MIN_SECONDS = 24 * 60 * 60
 _RESUME_FLAG_STALE_CLEAR_FRESHNESS_MULTIPLIER = 6
 
+# Bounds on how long an undeliverable post-update notification is retried.
+#
+# The notifier deliberately preserves its markers when the target adapter is
+# missing, so a platform still reconnecting after `hermes update` restarts the
+# gateway does not silently lose its completion message. That has no exit for
+# "this platform is not configured and will never connect": a marker addressed
+# to an unconfigured platform re-deferred every 2s across reboots for 3.2 days
+# and produced 60% of the gateway log.
+#
+# Two ceilings, because the two states deserve different patience:
+#   * the platform IS enabled in config -> it can plausibly still come back, so
+#     retry for a long time and only expire on absurd age.
+#   * the platform is NOT enabled anywhere we can see -> only allow the short
+#     window where adapters may still be mid-startup, then abandon.
+_UPDATE_NOTIFY_MAX_AGE_SECONDS = 24 * 60 * 60
+_UPDATE_NOTIFY_UNCONFIGURED_GRACE_SECONDS = 5 * 60
+
+
+def _update_marker_age_seconds(pending: Dict[str, Any], marker_path: Path) -> Optional[float]:
+    """Age of an update notification marker, or None when it can't be known.
+
+    Prefers the ``timestamp`` written by ``/update``; falls back to the file
+    mtime. Returning None means "unknown", and every caller must treat unknown
+    as young — an unreadable age must never shorten someone's retry window.
+    """
+    raw = pending.get("timestamp")
+    if raw:
+        try:
+            return max(0.0, (datetime.now() - datetime.fromisoformat(str(raw))).total_seconds())
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(0.0, time.time() - marker_path.stat().st_mtime)
+    except OSError:
+        return None
+
+
+def _update_notify_platform_is_configured(config: Any, platform_str: Optional[str]) -> bool:
+    """True when ``platform_str`` is enabled in this gateway's config.
+
+    Fail-open: anything we cannot positively determine to be unconfigured
+    counts as configured, so an unknown shape only costs a longer retry window
+    and never discards a deliverable notification.
+
+    Under ``multiplex_profiles`` a platform may be enabled solely in a
+    secondary profile's config.yaml, which is not visible here — treat every
+    platform as configured in that mode.
+    """
+    if not platform_str:
+        return True
+    try:
+        if bool(getattr(config, "multiplex_profiles", False)):
+            return True
+        platforms = getattr(config, "platforms", None)
+        if not platforms:
+            return True
+        for platform, platform_config in platforms.items():
+            if getattr(platform, "value", str(platform)) == platform_str:
+                return bool(getattr(platform_config, "enabled", True))
+        return False
+    except Exception:
+        logger.debug("Could not resolve configured platforms", exc_info=True)
+        return True
+
 
 async def _clear_stale_resume_pending_flags(async_session_store: Any) -> int:
     """Clear dead resume markers during hourly session maintenance."""
@@ -24872,6 +24936,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             message_id = pending.get("message_id")
 
             if not exit_code_path.exists():
+                # Same shape as the missing-adapter deferral below, same fix:
+                # within one boot the watcher bounds this (its 30-minute
+                # deadline writes exit_code=124 itself), but across boots it
+                # does not — a gateway restarting more often than that deadline
+                # re-arms the watcher every time and never reaches the write.
+                # A marker whose update process died therefore defers forever.
+                # `hermes update` does not run for a day.
+                _running_age = _update_marker_age_seconds(pending, claimed_path)
+                if (
+                    _running_age is not None
+                    and _running_age > _UPDATE_NOTIFY_MAX_AGE_SECONDS
+                ):
+                    logger.warning(
+                        "Abandoning post-update notification for %s:%s — update "
+                        "still reported running after %.1fh (limit %.1fh); the "
+                        "update process is gone and never wrote an exit code.",
+                        platform_str,
+                        chat_id,
+                        _running_age / 3600.0,
+                        _UPDATE_NOTIFY_MAX_AGE_SECONDS / 3600.0,
+                    )
+                    # cleanup stays True — the finally block clears the markers.
+                    self._update_notify_deferred_key = None
+                    return True
                 logger.info("Update notification deferred: update still running")
                 cleanup = False
                 active_pending_path = pending_path
@@ -24899,15 +24987,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # update succeeded or timed out. Preserve the markers instead so
                 # a later retry (the watcher poll loop, or the next gateway
                 # startup) can deliver the result once the adapter is back.
-                logger.info(
-                    "Update notification deferred: %s adapter not connected yet",
-                    platform_str,
+                #
+                # But "not connected yet" and "not configured at all" are
+                # different states, and only the first deserves a retry. Without
+                # a ceiling on the second, a marker addressed to a platform that
+                # can never connect is re-deferred every 2s forever, across
+                # reboots. Bound both states — generously when the platform is
+                # configured, tightly when it is not — so an undeliverable
+                # notification always reaches a terminal state.
+                configured = _update_notify_platform_is_configured(
+                    getattr(self, "config", None), platform_str
                 )
+                age = _update_marker_age_seconds(pending, claimed_path)
+                max_age = (
+                    _UPDATE_NOTIFY_MAX_AGE_SECONDS
+                    if configured
+                    else _UPDATE_NOTIFY_UNCONFIGURED_GRACE_SECONDS
+                )
+                if age is not None and age > max_age:
+                    logger.warning(
+                        "Abandoning post-update notification for %s:%s — "
+                        "%s adapter unavailable for %.1fh (%s; limit %.1fh). "
+                        "The update itself finished with exit=%s.",
+                        platform_str,
+                        chat_id,
+                        platform_str,
+                        age / 3600.0,
+                        "configured" if configured else "platform not configured",
+                        max_age / 3600.0,
+                        exit_code,
+                    )
+                    # cleanup stays True: the finally block clears every marker,
+                    # which is what makes this a terminal state.
+                    self._update_notify_deferred_key = None
+                    return True
+
+                # Log once per (platform, chat) deferral streak. The retry loop
+                # polls every 2s; repeating this line at 0.5Hz drowns the log
+                # that a human reads during an incident. The streak resets on
+                # any other outcome, so a genuinely new deferral is still
+                # reported at INFO — this throttles the message, it does not
+                # silence it.
+                _defer_key = (platform_str, chat_id)
+                if getattr(self, "_update_notify_deferred_key", None) != _defer_key:
+                    self._update_notify_deferred_key = _defer_key
+                    logger.info(
+                        "Update notification deferred: %s adapter not connected yet "
+                        "(further deferrals for this target are not logged; "
+                        "gives up after %.1fh)",
+                        platform_str,
+                        max_age / 3600.0,
+                    )
                 cleanup = False
                 active_pending_path = pending_path
                 claimed_path.replace(pending_path)
                 return False
 
+            self._update_notify_deferred_key = None
             if adapter and chat_id:
                 metadata = self._thread_metadata_for_target(
                     platform,
