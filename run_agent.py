@@ -3888,7 +3888,10 @@ class AIAgent:
         return True  # safe default: explainer on
 
     @staticmethod
-    def _format_turn_completion_explanation(turn_exit_reason: str) -> str:
+    def _format_turn_completion_explanation(
+        turn_exit_reason: str,
+        agent: "Any" = None,
+    ) -> str:
         """Render a user-facing explanation for an abnormal turn ending.
 
         Maps the internal ``turn_exit_reason`` to a short, actionable
@@ -3977,12 +3980,53 @@ class AIAgent:
                 "let it summarize."
             )
         if reason == "session_persistence_failed":
-            return (
+            # Do NOT assert a cause we did not measure. This message used to
+            # say "This is often a full disk — free some space (or fix state.db
+            # permissions)" unconditionally. On 2026-08-10 it fired during a
+            # gateway restart that landed mid-compaction on a box with 6.1 TiB
+            # free and zero sqlite errors, sending the operator hunting a
+            # disk/permissions problem that did not exist.
+            #
+            # Prefer, in order: a REAL disk-full signal (is_disk_full_error, the
+            # same detector the TUI gateway uses), then a restart landing
+            # mid-turn, then an honest "cause not identified".
+            base = (
                 prefix
                 + "the turn was stopped because session storage could not be "
                 "written (the transcript would have been lost on restart). "
-                "This is often a full disk — free some space (or fix state.db "
-                "permissions), then send your message again."
+            )
+            exc = getattr(agent, "_session_persistence_error", None)
+            try:
+                from hermes_state import is_disk_full_error
+                disk_full = is_disk_full_error(exc)
+            except Exception:
+                disk_full = False
+            if disk_full:
+                return base + (
+                    "The disk is full — free some space, then send your "
+                    "message again."
+                )
+            if bool(getattr(agent, "_shutdown_landed_mid_turn", False)):
+                return base + (
+                    "The gateway shut down or restarted mid-turn, so the "
+                    "append could not complete. Nothing was lost — send your "
+                    "message again now that it is back up."
+                )
+            try:
+                from gateway.shutdown_forensics import shutdown_landed_within
+                if shutdown_landed_within(300.0):
+                    return base + (
+                        "The gateway shut down or restarted mid-turn, so the "
+                        "append could not complete. Nothing was lost — send "
+                        "your message again now that it is back up."
+                    )
+            except Exception:
+                pass
+            detail = f" ({type(exc).__name__}: {exc})" if exc is not None else ""
+            return base + (
+                f"The cause was not identified{detail}. Check the disk "
+                "(`df -h`), state.db permissions, and whether the gateway "
+                "restarted mid-turn, then send your message again."
             )
         # Unknown/diagnostic-only reasons (e.g. "unknown", guardrail_halt
         # which already surfaces its own message) — don't second-guess.
