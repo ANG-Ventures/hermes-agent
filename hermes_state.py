@@ -3921,20 +3921,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchall()
         return {r["session_key"]: r["entry_json"] for r in rows}
 
-    def delete_gateway_routing_entries(
-        self, session_keys: List[str], *, scope: str = ""
-    ) -> None:
-        """Remove routing entries for the given session keys in *scope*."""
-        if not session_keys:
-            return
-
-        def _do(conn):
-            conn.executemany(
-                "DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?",
-                [(scope, k) for k in session_keys],
-            )
-
-        self._execute_write(_do)
+    # NOTE: there is deliberately no public ``delete_gateway_routing_entries``.
+    # One shipped with #59203 and never gained a caller — a removal API that
+    # keys on ``(scope, session_key)`` reads like the answer to "retire this
+    # session's route" and is the wrong tool twice over: the layer that retires
+    # a session (:meth:`set_session_archived`) knows session *ids*, not the
+    # gateway's sessions_dir scope, and two profiles sharing one state.db
+    # produce the same key in different scopes for different sessions. It also
+    # has to run in the SAME transaction as the flag flip, or a crash between
+    # the two statements re-creates the orphan it exists to prevent. The routing
+    # delete therefore lives inside that write callback, keyed on the mapped
+    # session_id.
 
     def list_gateway_sessions(
         self,
@@ -6862,6 +6859,44 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             row = cursor.fetchone()
         return row["title"] if row else None
 
+    #: Lineage of a session across compression continuations — the unit every
+    #: whole-conversation flag (archive, pin) is applied to. Prefixes a
+    #: statement that selects ``FROM lineage``; binds ``(session_id,
+    #: session_id)``.
+    _SESSION_LINEAGE_CTE = """
+        WITH RECURSIVE
+          ancestors(id) AS (
+            SELECT ?
+            UNION
+            SELECT parent.id
+            FROM ancestors a
+            JOIN sessions child ON child.id = a.id
+            JOIN sessions parent ON parent.id = child.parent_session_id
+            WHERE parent.end_reason = 'compression'
+          ),
+          descendants(id) AS (
+            SELECT ?
+            UNION
+            SELECT child.id
+            FROM descendants d
+            JOIN sessions parent ON parent.id = d.id
+            JOIN sessions child ON child.parent_session_id = parent.id
+            WHERE parent.end_reason = 'compression'
+          ),
+          lineage(id) AS (
+            SELECT id FROM ancestors
+            UNION
+            SELECT id FROM descendants
+          )
+    """
+
+    #: ``end_reason`` written by :meth:`set_session_archived` when it retires a
+    #: still-live row. Deliberately absent from the recoverable set in
+    #: ``find_latest_gateway_session_for_peer`` (``agent_close`` /
+    #: ``ws_orphan_reap``) so gateway stale-route recovery starts a fresh
+    #: session instead of silently reopening an archived conversation.
+    ARCHIVE_END_REASON = "archived"
+
     def set_session_archived(self, session_id: str, archived: bool) -> bool:
         """Archive or unarchive a session.
 
@@ -6871,43 +6906,84 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         roots projected forward to their latest continuation; updating only the
         displayed tip lets the still-unarchived root resurrect it on refresh.
         Returns True when at least one row was updated.
+
+        Archiving is also a **routing-affecting** operation. Flipping the flag
+        alone left the gateway's ``gateway_routing`` key for that session
+        orphaned forever: every in-memory eviction path in
+        ``gateway/session.py`` gates on the row being *ended*, so a row with
+        ``end_reason IS NULL`` was unreachable by all of them and the key was
+        rewritten from the live index on every full persist. So archiving:
+
+        * retires still-live rows with ``end_reason = 'archived'`` (COALESCE,
+          so ``'compression'`` and every other explicit reason survive — the
+          lineage edges above depend on them), which is what re-enables the
+          existing startup prune and routing-time self-heal; and
+        * drops the durable routing rows that map to the archived lineage, so
+          an install with no live gateway is clean immediately rather than at
+          the next restart.
+
+        Unarchiving reverses exactly what archiving wrote (rows still carrying
+        ``end_reason = 'archived'``); a session ended for a real reason stays
+        ended, and no routing entry is resurrected — the next message rebuilds
+        it through the normal create path.
+
+        Consequence worth naming: a session archived while still live is now an
+        *ended* row, so the retention sweep (``sessions.auto_prune``, off by
+        default) can eventually reap it. Rows archived by
+        :meth:`archive_sessions` were already ended and already eligible.
         """
         def _do(conn):
-            cursor = conn.execute(
-                """
-                WITH RECURSIVE
-                  ancestors(id) AS (
-                    SELECT ?
-                    UNION
-                    SELECT parent.id
-                    FROM ancestors a
-                    JOIN sessions child ON child.id = a.id
-                    JOIN sessions parent ON parent.id = child.parent_session_id
-                    WHERE parent.end_reason = 'compression'
-                  ),
-                  descendants(id) AS (
-                    SELECT ?
-                    UNION
-                    SELECT child.id
-                    FROM descendants d
-                    JOIN sessions parent ON parent.id = d.id
-                    JOIN sessions child ON child.parent_session_id = parent.id
-                    WHERE parent.end_reason = 'compression'
-                  ),
-                  lineage(id) AS (
-                    SELECT id FROM ancestors
-                    UNION
-                    SELECT id FROM descendants
-                  )
-                UPDATE sessions
-                SET archived = ?
-                WHERE id IN (SELECT id FROM lineage)
-                """,
-                (session_id, session_id, 1 if archived else 0),
-            )
+            now = time.time()
+            if archived:
+                cursor = conn.execute(
+                    self._SESSION_LINEAGE_CTE
+                    + """
+                    UPDATE sessions
+                    SET archived = 1,
+                        ended_at = COALESCE(ended_at, ?),
+                        end_reason = COALESCE(end_reason, ?)
+                    WHERE id IN (SELECT id FROM lineage)
+                    """,
+                    (session_id, session_id, now, self.ARCHIVE_END_REASON),
+                )
+            else:
+                cursor = conn.execute(
+                    self._SESSION_LINEAGE_CTE
+                    + """
+                    UPDATE sessions
+                    SET archived = 0,
+                        ended_at = CASE WHEN end_reason = ? THEN NULL
+                                        ELSE ended_at END,
+                        end_reason = CASE WHEN end_reason = ? THEN NULL
+                                          ELSE end_reason END
+                    WHERE id IN (SELECT id FROM lineage)
+                    """,
+                    (
+                        session_id,
+                        session_id,
+                        self.ARCHIVE_END_REASON,
+                        self.ARCHIVE_END_REASON,
+                    ),
+                )
             rowcount = cursor.rowcount
             if rowcount is None or rowcount < 0:
                 rowcount = conn.execute("SELECT changes()").fetchone()[0]
+            if archived:
+                # Match on the mapped session_id, not on (scope, session_key):
+                # two profiles sharing one state.db produce the same key in
+                # different scopes for *different* sessions, and only this
+                # lineage's mapping is orphaned. json_valid guards the delete
+                # so one corrupt routing row cannot fail the archive.
+                conn.execute(
+                    self._SESSION_LINEAGE_CTE
+                    + """
+                    DELETE FROM gateway_routing
+                    WHERE json_valid(entry_json)
+                      AND json_extract(entry_json, '$.session_id')
+                          IN (SELECT id FROM lineage)
+                    """,
+                    (session_id, session_id),
+                )
             return rowcount
         rowcount = self._execute_write(_do)
         return rowcount > 0
