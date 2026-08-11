@@ -143,6 +143,15 @@ class TestSubprocessChildCovered:
         env-activated (PYTEST_CURRENT_TEST / PYTEST_VERSION are inherited),
         so the child's argless SessionDB() must fail hard instead of
         opening the developer's real state.db.
+
+        Residual boundary: a child that constructs a fresh environment and
+        drops both pytest markers is indistinguishable here from a legitimate
+        production process. In-tree Python/Hermes child targets either inherit
+        a marker, retain the sandbox HERMES_HOME, or launch pytest (which
+        recreates PYTEST_VERSION). Refusing every unmarked production-root open
+        would also refuse ordinary CLI/gateway persistence, so arbitrary
+        marker-scrubbing children remain outside this guard's prevention
+        contract.
         """
         env = {
             k: v
