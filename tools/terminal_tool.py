@@ -108,7 +108,14 @@ def _safe_parse_import_env(
         return default
 
 
-# Hard cap on foreground timeout; override via TERMINAL_MAX_FOREGROUND_TIMEOUT env var.
+# Hard cap on foreground timeout.
+#
+# Set via ``terminal.max_foreground_timeout`` in config.yaml (bridged to
+# TERMINAL_MAX_FOREGROUND_TIMEOUT for child processes). The module-level value
+# is the IMPORT-time snapshot; read it through ``_foreground_max_timeout()``,
+# never directly, because the config→env bridge (_ensure_terminal_env_bridged)
+# runs on first tool use — AFTER this module is imported. Reading the constant
+# at a call site would pin the pre-bridge value and make the config key inert.
 FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env(
     "TERMINAL_MAX_FOREGROUND_TIMEOUT",
     600,
@@ -116,13 +123,43 @@ FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env(
     "integer",
 )
 
-# Disk usage warning threshold (in GB)
+
+def _foreground_max_timeout() -> int:
+    """Current foreground cap, re-read after the config→env bridge has run.
+
+    NOTE: ``TERMINAL_SCHEMA`` is a module-level constant built at import, so
+    the cap quoted in its ``timeout`` description is the import-time value.
+    That is cosmetic — the ENFORCEMENT path calls this function, so a
+    config-set cap is always the one actually applied. Do not "fix" the
+    schema by reading the constant at the enforcement site; that would
+    reintroduce the inert-config bug this function exists to prevent.
+    """
+    return _safe_parse_import_env(
+        "TERMINAL_MAX_FOREGROUND_TIMEOUT",
+        FOREGROUND_MAX_TIMEOUT,
+        int,
+        "integer",
+    )
+
+
+# Disk usage warning threshold (in GB). Same import-vs-bridge timing caveat as
+# above — read via ``_disk_warning_gb()``.
 DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env(
     "TERMINAL_DISK_WARNING_GB",
     500.0,
     float,
     "number",
 )
+
+
+def _disk_warning_gb() -> float:
+    """Current low-disk warning threshold, re-read after the bridge has run."""
+    return _safe_parse_import_env(
+        "TERMINAL_DISK_WARNING_GB",
+        DISK_USAGE_WARNING_THRESHOLD_GB,
+        float,
+        "number",
+    )
 _VERCEL_SANDBOX_DEFAULT_CWD = "/vercel/sandbox"
 _SUPPORTED_VERCEL_RUNTIMES = ("node24", "node22", "python3.13")
 
@@ -223,10 +260,11 @@ def _check_disk_usage_warning():
         
         total_gb = total_bytes / (1024 ** 3)
         
-        exceeded = total_gb > DISK_USAGE_WARNING_THRESHOLD_GB
+        _disk_threshold = _disk_warning_gb()
+        exceeded = total_gb > _disk_threshold
         if exceeded:
             logger.warning("Disk usage (%.1fGB) exceeds threshold (%.0fGB). Consider running cleanup_all_environments().",
-                           total_gb, DISK_USAGE_WARNING_THRESHOLD_GB)
+                           total_gb, _disk_threshold)
         _disk_usage_cache["timestamp"] = _time_mod.monotonic()
         _disk_usage_cache["result"] = exceeded
         return exceeded
@@ -2353,11 +2391,12 @@ def terminal_tool(
         effective_timeout = timeout or default_timeout
 
         # Reject foreground commands where the model explicitly requests
-        # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
-        if not background and timeout and timeout > FOREGROUND_MAX_TIMEOUT:
+        # a timeout above the foreground cap — nudge it toward background.
+        _fg_max = _foreground_max_timeout()
+        if not background and timeout and timeout > _fg_max:
             return tool_error(
                 f"Foreground timeout {timeout}s exceeds the maximum of "
-                f"{FOREGROUND_MAX_TIMEOUT}s. Use background=true with "
+                f"{_fg_max}s. Use background=true with "
                 f"notify_on_complete=true for long-running commands."
             )
 

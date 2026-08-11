@@ -3222,6 +3222,12 @@ TERMINAL_CONFIG_ENV_MAP = {
     "docker_orphan_reaper": "TERMINAL_DOCKER_ORPHAN_REAPER",
     "sandbox_dir": "TERMINAL_SANDBOX_DIR",
     "persistent_shell": "TERMINAL_PERSISTENT_SHELL",
+    # Behavioral limits that were previously env-ONLY, contradicting the
+    # project rule that .env is for secrets and behavioral settings live in
+    # config.yaml. Bridged here like every other terminal.* knob so users can
+    # set them in config.yaml; the env vars keep working for child processes.
+    "max_foreground_timeout": "TERMINAL_MAX_FOREGROUND_TIMEOUT",
+    "disk_warning_gb": "TERMINAL_DISK_WARNING_GB",
 }
 
 

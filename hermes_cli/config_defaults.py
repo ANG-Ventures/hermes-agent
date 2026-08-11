@@ -294,6 +294,15 @@ DEFAULT_CONFIG = {
         # it here without patching the built desktop app.
         "font_family": "",
         "timeout": 180,
+        # Hard cap on a FOREGROUND terminal call's `timeout` argument. A
+        # longer-running command must use background=true. Raise this when
+        # legitimate foreground work (a full test suite, a long build) is
+        # being truncated; lower it to force background discipline.
+        # Bridged to TERMINAL_MAX_FOREGROUND_TIMEOUT for child processes.
+        "max_foreground_timeout": 600,
+        # Free-disk threshold (GB) below which terminal output carries a
+        # low-disk warning. Bridged to TERMINAL_DISK_WARNING_GB.
+        "disk_warning_gb": 500.0,
         # Bounded grace period (seconds) between SIGTERM and an escalated
         # SIGKILL when terminating a host process tree (browser daemons, etc.).
         # A daemon that stalls in its SIGTERM handler is force-killed after this
