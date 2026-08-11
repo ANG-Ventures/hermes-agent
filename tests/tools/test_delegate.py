@@ -210,6 +210,135 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.assertIn("assertion failed", prompt)
 
 class TestStripBlockedTools(unittest.TestCase):
+    def _build_enabled_toolsets(
+        self,
+        parent,
+        *,
+        toolsets=None,
+        role="leaf",
+        max_spawn_depth=1,
+    ):
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch(
+                "tools.delegate_tool._get_orchestrator_enabled",
+                return_value=True,
+            ),
+            patch(
+                "tools.delegate_tool._get_max_spawn_depth",
+                return_value=max_spawn_depth,
+            ),
+        ):
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Resolve child toolsets",
+                context=None,
+                toolsets=toolsets,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                role=role,
+            )
+
+        return MockAgent.call_args.kwargs["enabled_toolsets"]
+
+    def test_explicit_toolsets_strip_parent_only_surfaces(self):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = [
+            "terminal",
+            "delegation",
+            "clarify",
+            "memory",
+            "code_execution",
+        ]
+
+        enabled = self._build_enabled_toolsets(
+            parent,
+            toolsets=list(parent.enabled_toolsets),
+        )
+
+        self.assertEqual(enabled, ["terminal", "code_execution"])
+
+    def test_explicit_toolsets_keep_role_granted_delegation_for_orchestrator(self):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = [
+            "terminal",
+            "delegation",
+            "clarify",
+            "memory",
+            "code_execution",
+        ]
+
+        enabled = self._build_enabled_toolsets(
+            parent,
+            toolsets=list(parent.enabled_toolsets),
+            role="orchestrator",
+            max_spawn_depth=2,
+        )
+
+        self.assertEqual(enabled, ["terminal", "code_execution", "delegation"])
+
+    def test_inherited_and_fallback_paths_remain_filtered(self):
+        from tools.delegate_tool import DEFAULT_TOOLSETS
+        import model_tools
+
+        parent_enabled = _make_mock_parent()
+        parent_enabled.enabled_toolsets = [
+            "terminal",
+            "delegation",
+            "clarify",
+            "memory",
+            "code_execution",
+        ]
+
+        parent_derived = _make_mock_parent()
+        parent_derived.enabled_toolsets = None
+        parent_derived.valid_tool_names = [
+            "terminal",
+            "delegate_task",
+            "clarify",
+            "memory",
+            "execute_code",
+        ]
+        derived_toolsets = sorted(
+            {
+                toolset
+                for name in parent_derived.valid_tool_names
+                if (toolset := model_tools.get_toolset_for_tool(name)) is not None
+            }
+        )
+
+        parent_fallback = _make_mock_parent()
+        parent_fallback.enabled_toolsets = None
+        parent_fallback.valid_tool_names = []
+
+        cases = (
+            (
+                "parent enabled toolsets",
+                parent_enabled,
+                _strip_blocked_tools(parent_enabled.enabled_toolsets),
+            ),
+            (
+                "toolsets derived from parent tools",
+                parent_derived,
+                _strip_blocked_tools(derived_toolsets),
+            ),
+            (
+                "default fallback toolsets",
+                parent_fallback,
+                _strip_blocked_tools(DEFAULT_TOOLSETS),
+            ),
+        )
+
+        for label, parent, expected in cases:
+            with self.subTest(label):
+                self.assertEqual(
+                    self._build_enabled_toolsets(parent),
+                    expected,
+                )
+
     def test_removes_blocked_toolsets(self):
         result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "memory", "code_execution"])
         self.assertEqual(sorted(result), ["code_execution", "file", "terminal"])

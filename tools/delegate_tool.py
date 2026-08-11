@@ -1004,12 +1004,13 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
 
 
 def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
-    """Remove toolsets that are blocked from default subagent inheritance.
+    """Remove toolsets that must never reach a subagent.
 
-    Applied only when toolsets are *inherited* from the parent or fall back
-    to DEFAULT_TOOLSETS — *explicit* caller requests at the ``delegate_task()``
-    call site bypass this strip. Rationale: silent deletion of explicitly
-    requested toolsets is a footgun; user intent wins.
+    Applied on every path: inherited from the parent, fallen back to
+    DEFAULT_TOOLSETS, and explicitly requested at the ``delegate_task()`` call
+    site. ``delegation`` is granted by role (the orchestrator re-add in
+    ``_build_child_agent``), never by request. ``clarify`` and ``memory`` are
+    likewise parent-only surfaces.
 
     The strip set is DERIVED from DELEGATE_BLOCKED_TOOLS (upstream #43466: a new
     blocked tool can't silently leak through as a toolset name) plus the explicit
@@ -1017,7 +1018,9 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     the blocklist and the strip set in lockstep and strips e.g. ``cronjob``.
 
     Fork exemption: ``code_execution`` inheritance is allowed even though the
-    raw ``execute_code`` tool remains blocked.
+    raw ``execute_code`` tool remains blocked. Removing it from the strip set is
+    what lets an explicit request obtain it without unblocking parent-only
+    surfaces alongside it.
     """
     _stripped = strip_blocked_delegate_toolsets(
         toolsets,
@@ -1500,9 +1503,12 @@ def _build_child_agent(
             child_toolsets = _preserve_parent_mcp_toolsets(
                 child_toolsets, parent_toolsets
             )
-        # Explicit caller requests bypass the default block list (memory,
-        # clarify, delegation): user intent wins over implicit safety
-        # defaults.  See _strip_blocked_tools() docstring for rationale.
+        # Explicit requests still lose parent-only toolsets. ``code_execution``
+        # is exempt from the strip set, so callers can request it without also
+        # granting ``delegation``/``clarify``/``memory``. Delegation is granted
+        # by role through the orchestrator re-add below, never by request.
+        # Caught by @liuhao1024 while reviewing upstream #34294.
+        child_toolsets = _strip_blocked_tools(child_toolsets)
     elif parent_agent and parent_enabled is not None:
         child_toolsets = _strip_blocked_tools(parent_enabled)
     elif parent_toolsets:
