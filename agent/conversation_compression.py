@@ -1739,6 +1739,30 @@ def _supported_compression_kwargs(
     return {name: value for name, value in candidates.items() if name in parameters}
 
 
+_COMPACTIONS_IN_FLIGHT = 0
+_COMPACTIONS_IN_FLIGHT_LOCK = threading.Lock()
+
+
+def compactions_in_flight() -> int:
+    """Number of context compactions currently running in THIS process.
+
+    Consumed by the gateway's restart drain. A compaction is real, expensive,
+    user-visible work that can run for minutes on a large session, but it does
+    NOT appear in ``_running_agents``: ``/compress`` builds a throwaway agent
+    and runs it on an executor, so the drain's ``_active_work_count()`` saw
+    zero and a restart armed by an unrelated session amputated it.
+
+    Measured 2026-08-10: a /compress on a 792-message session started
+    21:35:18; a sibling session's restart delivered SIGTERM at 21:36:31, 73s
+    in. The session append could not complete and the user got an error
+    blaming a full disk on a box with 6.1 TiB free.
+
+    Same bug shape as in-flight cron work (#60432), which was fixed by giving
+    the drain a counter it could actually see.
+    """
+    return _COMPACTIONS_IN_FLIGHT
+
+
 class _CompressionActivityHeartbeat:
     """Refresh the agent inactivity tracker while compression blocks in an aux call."""
 
@@ -1750,6 +1774,8 @@ class _CompressionActivityHeartbeat:
     ) -> None:
         self._agent = agent
         self._commit_fence = commit_fence
+        # Set True while this episode is counted in _COMPACTIONS_IN_FLIGHT.
+        self._counted = False
         # Latched once host cancel/timeout wins or a terminal stamp is observed,
         # so a later UNKNOWN rewrite cannot re-arm a detached zombie heartbeat.
         self._suppressed = False
@@ -1773,11 +1799,31 @@ class _CompressionActivityHeartbeat:
         # A new compression episode always republishes agent.compression even
         # if a prior timeout/cooldown stamp is still on the agent.
         self._suppressed = False
+        # Make this compaction visible to the gateway's restart drain. Bracketed
+        # by start/stop so it covers exactly the window where a restart would
+        # amputate real work. ``_counted`` guards against a double-decrement if
+        # stop() is called more than once (it is, on some timeout paths).
+        global _COMPACTIONS_IN_FLIGHT
+        with _COMPACTIONS_IN_FLIGHT_LOCK:
+            _COMPACTIONS_IN_FLIGHT += 1
+            self._counted = True
         self._touch("context compression started", allow_terminal_overwrite=True)
         self._thread.start()
         return self
 
+    def _release_in_flight(self) -> None:
+        """Drop this compaction from the in-flight count, exactly once."""
+        global _COMPACTIONS_IN_FLIGHT
+        with _COMPACTIONS_IN_FLIGHT_LOCK:
+            if getattr(self, "_counted", False):
+                self._counted = False
+                _COMPACTIONS_IN_FLIGHT = max(0, _COMPACTIONS_IN_FLIGHT - 1)
+
     def stop(self, desc: str = "context compression completed") -> None:
+        # Release BEFORE any early return below — a suppressed/detached stop
+        # must still clear the count, or a restart would wait out the full cap
+        # on a compaction that already finished.
+        self._release_in_flight()
         self._stop.set()
         if self._thread.is_alive() and threading.current_thread() is not self._thread:
             self._thread.join(timeout=1.0)
