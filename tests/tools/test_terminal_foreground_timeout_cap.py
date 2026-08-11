@@ -144,9 +144,28 @@ class TestForegroundMaxTimeoutConstant:
     """Verify the FOREGROUND_MAX_TIMEOUT constant and schema."""
 
     def test_default_value_is_600(self):
-        """Default FOREGROUND_MAX_TIMEOUT is 600 when env var is not set."""
-        from tools.terminal_tool import FOREGROUND_MAX_TIMEOUT
-        assert FOREGROUND_MAX_TIMEOUT == 600
+        """Default FOREGROUND_MAX_TIMEOUT is 600 when the env var is not set.
+
+        Hermeticity: this asserts the DEFAULT, so it must not read whatever the
+        developer's own config.yaml/.env happens to publish. Before this guard
+        it failed on unmodified main for anyone who had set
+        ``terminal.max_foreground_timeout`` (the bridge exports the env var
+        process-wide, so it leaks into the test run). Re-derive the default by
+        re-importing with the variable removed.
+        """
+        import importlib
+        import os
+
+        prev = os.environ.pop("TERMINAL_MAX_FOREGROUND_TIMEOUT", None)
+        try:
+            import tools.terminal_tool as tt
+            importlib.reload(tt)
+            assert tt.FOREGROUND_MAX_TIMEOUT == 600
+        finally:
+            if prev is not None:
+                os.environ["TERMINAL_MAX_FOREGROUND_TIMEOUT"] = prev
+            import tools.terminal_tool as tt
+            importlib.reload(tt)
 
     def test_schema_mentions_max(self):
         """Tool schema description should mention the max timeout."""

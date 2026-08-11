@@ -127,12 +127,14 @@ FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env(
 def _foreground_max_timeout() -> int:
     """Current foreground cap, re-read after the config→env bridge has run.
 
-    NOTE: ``TERMINAL_SCHEMA`` is a module-level constant built at import, so
-    the cap quoted in its ``timeout`` description is the import-time value.
-    That is cosmetic — the ENFORCEMENT path calls this function, so a
-    config-set cap is always the one actually applied. Do not "fix" the
-    schema by reading the constant at the enforcement site; that would
-    reintroduce the inert-config bug this function exists to prevent.
+    Never read ``FOREGROUND_MAX_TIMEOUT`` directly at an enforcement or
+    description site — that constant is the IMPORT-time snapshot, taken before
+    the bridge publishes ``terminal.max_foreground_timeout`` from config.yaml,
+    and using it makes the config key inert.
+
+    ``TERMINAL_SCHEMA``'s cap-dependent text is re-rendered from this value by
+    ``_refresh_terminal_schema_limits()`` at the end of the bridge, so the
+    advertised cap and the enforced cap cannot drift apart.
     """
     return _safe_parse_import_env(
         "TERMINAL_MAX_FOREGROUND_TIMEOUT",
@@ -1494,6 +1496,47 @@ def _ensure_terminal_env_bridged() -> None:
         # Never let a config problem take the terminal tool down — the
         # historical local default still applies.
         logger.debug("terminal config → env fallback bridge failed", exc_info=True)
+    finally:
+        # Re-render cap-dependent schema text now that the bridge has run.
+        # In `finally` so a partial/failed bridge still leaves the schema
+        # agreeing with whatever the enforcement path will actually apply —
+        # the two must never disagree, in either direction.
+        _refresh_terminal_schema_limits()
+
+
+def _timeout_param_description(cap: "int | None" = None) -> str:
+    """Build the ``timeout`` parameter description against the CURRENT cap.
+
+    Kept as a function so the schema can be refreshed after the config→env
+    bridge runs. Quoting a stale cap here is not cosmetic: the description is
+    the only thing the model reads when choosing a timeout, so a schema saying
+    600 while enforcement allows 3600 silently caps the model's own behavior
+    at the old value and makes a config change look inert.
+    """
+    if cap is None:
+        cap = _foreground_max_timeout()
+    return (
+        f"Max seconds to wait (default: 180, foreground max: {cap}). Returns "
+        f"INSTANTLY when command finishes — set high for long tasks, you won't "
+        f"wait unnecessarily. Foreground timeout above {cap}s is rejected; use "
+        f"background=true for longer commands."
+    )
+
+
+def _refresh_terminal_schema_limits() -> None:
+    """Re-render cap-dependent schema text after the config→env bridge.
+
+    ``TERMINAL_SCHEMA`` is built at import, before ``_ensure_terminal_env_bridged``
+    has had a chance to publish ``terminal.max_foreground_timeout`` from
+    config.yaml. Mutating the dict in place is what makes the refresh visible:
+    the registry holds a REFERENCE to this same object, so rebinding the name
+    would leave the registered copy stale.
+    """
+    try:
+        props = TERMINAL_SCHEMA["parameters"]["properties"]
+        props["timeout"]["description"] = _timeout_param_description()
+    except Exception:
+        logger.debug("terminal schema limit refresh failed", exc_info=True)
 
 
 def _get_env_config() -> Dict[str, Any]:
@@ -3418,7 +3461,7 @@ TERMINAL_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). Returns INSTANTLY when command finishes — set high for long tasks, you won't wait unnecessarily. Foreground timeout above {FOREGROUND_MAX_TIMEOUT}s is rejected; use background=true for longer commands.",
+                "description": _timeout_param_description(FOREGROUND_MAX_TIMEOUT),
                 "minimum": 1
             },
             "workdir": {
