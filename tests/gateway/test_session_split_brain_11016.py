@@ -37,6 +37,8 @@ from gateway.session import SessionSource, build_session_key
 
 
 class _StubAdapter(BasePlatformAdapter):
+    response_sent: asyncio.Event
+
     async def connect(self, *, is_reconnect: bool = False):
         pass
 
@@ -55,9 +57,11 @@ def _make_adapter():
     adapter = _StubAdapter(config, Platform.TELEGRAM)
     adapter._busy_text_mode = ""
     adapter.sent_responses = []
+    adapter.response_sent = asyncio.Event()
 
     async def _mock_send_retry(chat_id, content, **kwargs):
         adapter.sent_responses.append(content)
+        adapter.response_sent.set()
 
     adapter._send_with_retry = _mock_send_retry
     return adapter
@@ -152,11 +156,11 @@ class TestAdapterSessionCancellation:
         assert any(f"handled:{expected}" in r for r in adapter.sent_responses)
 
         # Follow-up must go through normally now that the session is clean.
+        adapter.response_sent.clear()
         await adapter.handle_message(
             _make_event("/model xiaomi/mimo-v2-pro --provider nous")
         )
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+        await asyncio.wait_for(adapter.response_sent.wait(), timeout=10.0)
 
         assert any("handled:model" in r for r in adapter.sent_responses), (
             f"follow-up /model stayed blocked after {command_text}"
@@ -198,13 +202,7 @@ class TestStaleSessionLockSelfHeal:
         # An ordinary message should heal the stale lock, then fall through
         # to normal dispatch.  User gets a reply instead of a busy ack.
         await adapter.handle_message(_make_event("hello"))
-        # Drain any spawned background tasks. Real sleeps, not bare yields:
-        # the delivery ledger hops to worker threads around the send, so a
-        # zero-delay yield loop can finish before the reply lands.
-        for _ in range(40):
-            if any("handled:text" in r for r in adapter.sent_responses):
-                break
-            await asyncio.sleep(0.05)
+        await asyncio.wait_for(adapter.response_sent.wait(), timeout=10.0)
 
         assert any("handled:text" in r for r in adapter.sent_responses), (
             "stale lock trapped a normal message — split-brain not healed"
