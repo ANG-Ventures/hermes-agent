@@ -906,21 +906,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     p_nrepair = sub.add_parser(
         "notify-repair",
-        help="Backfill the creator identity on identity-less notify subscriptions",
+        help="Backfill missing key identity on legacy notify subscriptions",
         description=(
-            "Repairs notify-sub rows whose user_id is empty. Such a row makes "
-            "the wake injector rebuild the creator's scope without a "
-            "participant id, so build_session_key() omits the participant "
-            "segment and the notification lands in a SECOND session key for "
-            "the same chat — one no human can send to, which therefore never "
-            "receives the /reasoning or /model overrides the user set. The "
-            "creator identity is read from the gateway routing index: a row is "
-            "repaired only when exactly ONE per-user session key exists for "
-            "that chat, so the participant is unambiguous. A chat with no "
+            "Repairs legacy notify-sub rows missing user_id, user_id_alt, or "
+            "scope_id. Without the same identity fields as the creator, the "
+            "wake injector can rebuild a SECOND session key for the same chat "
+            "— one no human can send to, which therefore never receives the "
+            "/reasoning or /model overrides the user set. The complete creator "
+            "identity is read from the gateway routing index: a row is repaired "
+            "only when exactly ONE routing identity exists for that chat, so "
+            "the participant and workspace scope are unambiguous. A chat with no "
             "per-user session (cron / CLI / home-channel origins, which are "
             "legitimately user-less) is left alone — an identity is never "
-            "invented. Idempotent: rows that already name a participant are "
-            "never re-pointed."
+            "invented. Idempotent and fill-a-hole only: existing identity fields "
+            "are never re-pointed."
         ),
     )
     p_nrepair.add_argument(
@@ -3281,33 +3280,52 @@ def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
     return 0
 
 
-def _routing_participant_index() -> dict[tuple[str, str], set[str]]:
-    """Map ``(platform, chat_id) -> {participant ids seen for that chat}``.
+_RoutingIdentity = tuple[str, str, str]
+"""``(user_id, user_id_alt, scope_id)`` from one durable routing entry."""
+_RoutingEvidence = tuple[str, str, str, str]
+"""Complete identity plus the exact creator session key that proves it."""
+_RoutingLane = tuple[str, str, str, str]
+"""``(platform, chat_id, chat_type, thread_id)`` evidence boundary."""
+
+
+def _routing_participant_index(
+) -> "dict[_RoutingLane, set[_RoutingEvidence]] | None":
+    """Map one exact routing lane to complete identities seen in that lane.
 
     Built from the gateway routing index (``state.db``'s ``gateway_routing``
     table), which is the durable record of every session key the gateway has
-    resolved. A per-user group session key ends in the participant id, and each
-    entry also carries its ``origin`` — that origin is the creator identity a
-    notify-sub row written from the same chat should have captured.
+    resolved. Each entry carries its ``origin`` — including the three fields a
+    notify-sub row needs to reproduce its creator's key. The participant
+    segment is ``user_id_alt or user_id``; retaining both raw fields lets the
+    repair write the row faithfully rather than putting an alt id into the
+    lower-priority ``user_id`` slot. ``scope_id`` carries Slack's workspace key.
 
-    Returns a SET per chat, deliberately: the caller repairs only chats with
-    exactly one known participant. A shared channel with several humans has no
-    single right answer, and guessing would route one person's notifications
-    into another's private session.
+    Chat type and thread id are part of the evidence boundary. A per-user thread
+    entry cannot identify an adjacent group subscription merely because both
+    share the same platform/chat id.
+
+    Returns a SET per lane, deliberately: the caller repairs only after existing
+    row fields narrow that set to exactly one identity. ``None`` means the
+    durable index could not be read completely; acting on partial evidence could
+    hide a second candidate, so callers must fail closed.
     """
-    index: dict[tuple[str, str], set[str]] = {}
+    index: dict[_RoutingLane, set[_RoutingEvidence]] = {}
     try:
         from hermes_state import SessionDB
+        from gateway.routing_identity import (
+            effective_routing_lane,
+            routing_key_carries_identity,
+        )
     except Exception:
-        return index
+        return None
     try:
         db = SessionDB()
     except Exception:
-        return index
+        return None
     try:
         loader = getattr(db, "load_gateway_routing_entries", None)
         if not callable(loader):
-            return index
+            return None
         scopes = {""}
         try:
             from hermes_constants import get_hermes_home
@@ -3320,25 +3338,55 @@ def _routing_participant_index() -> dict[tuple[str, str], set[str]]:
             try:
                 entries = loader(scope=scope)
             except Exception:
-                continue
+                return None
             if isinstance(entries, dict):
                 seen.update({str(k): str(v) for k, v in entries.items()})
-        for entry_json in seen.values():
+        for session_key, entry_json in seen.items():
             try:
                 entry = json.loads(entry_json)
             except Exception:
-                continue
+                return None
             if not isinstance(entry, dict):
-                continue
+                return None
             origin = entry.get("origin")
             if not isinstance(origin, dict):
-                continue
+                return None
             platform = str(origin.get("platform") or "").strip().lower()
             chat_id = str(origin.get("chat_id") or "").strip()
+            chat_type = str(origin.get("chat_type") or "").strip().lower()
+            thread_id = str(origin.get("thread_id") or "").strip()
+            prospective_thread_id = str(
+                origin.get("prospective_thread_id") or ""
+            ).strip()
             user_id = str(origin.get("user_id") or "").strip()
-            if not platform or not chat_id or not user_id:
+            user_id_alt = str(origin.get("user_id_alt") or "").strip()
+            scope_id = str(
+                origin.get("scope_id") or origin.get("guild_id") or ""
+            ).strip()
+            if not platform or not chat_id or not (user_id_alt or user_id):
                 continue
-            index.setdefault((platform, chat_id), set()).add(user_id)
+            if not routing_key_carries_identity(
+                session_key,
+                platform=platform,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                thread_id=thread_id,
+                prospective_thread_id=prospective_thread_id,
+                user_id=user_id,
+                user_id_alt=user_id_alt,
+                scope_id=scope_id,
+            ):
+                continue
+            lane = effective_routing_lane(
+                platform=platform,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                thread_id=thread_id,
+                prospective_thread_id=prospective_thread_id,
+            )
+            index.setdefault(lane, set()).add((
+                user_id, user_id_alt, scope_id, session_key,
+            ))
     finally:
         try:
             db.close()
@@ -3348,60 +3396,98 @@ def _routing_participant_index() -> dict[tuple[str, str], set[str]]:
 
 
 def _cmd_notify_repair(args: argparse.Namespace) -> int:
-    """Backfill the creator identity on identity-less notify subscriptions.
+    """Backfill missing key identity on legacy notify subscriptions.
 
-    See the subparser description for why an empty ``user_id`` splits a chat
-    into two sessions. Evidence comes from the gateway routing index; a chat
-    with no unambiguous participant is reported and left untouched.
+    See the subparser description for why a partial identity splits a chat into
+    two sessions. Evidence comes from the gateway routing index; a chat with no
+    unambiguous identity is reported and left untouched.
     """
     index = _routing_participant_index()
+    evidence_unavailable = index is None
 
-    def _resolve(row: dict) -> "str | None":
+    def _resolve(row: dict) -> "dict[str, str | None] | None":
         platform = str(row.get("platform") or "").strip().lower()
         chat_id = str(row.get("chat_id") or "").strip()
-        candidates = index.get((platform, chat_id)) or set()
+        chat_type = str(row.get("chat_type") or "").strip().lower()
+        thread_id = str(row.get("thread_id") or "").strip()
+        creator_session_id = str(row.get("creator_session_id") or "").strip()
+        if not creator_session_id:
+            return None
+        evidence = set((index or {}).get(
+            (platform, chat_id, chat_type, thread_id), set()
+        ))
+        candidates = {
+            item[:3] for item in evidence if item[3] == creator_session_id
+        }
+        for position, field in enumerate(("user_id", "user_id_alt", "scope_id")):
+            existing = str(row.get(field) or "").strip()
+            if existing:
+                candidates = {
+                    identity for identity in candidates
+                    if identity[position] == existing
+                }
         if len(candidates) != 1:
             # 0 => a genuinely user-less origin (cron / CLI / home channel).
             # >1 => a shared chat; picking one would hijack another user's lane.
             return None
-        return next(iter(candidates))
+        user_id, user_id_alt, scope_id = next(iter(candidates))
+        return {
+            "user_id": user_id or None,
+            "user_id_alt": user_id_alt or None,
+            "scope_id": scope_id or None,
+        }
 
     with kb.connect_closing() as conn:
         results = kb.backfill_notify_sub_user_ids(
             conn, _resolve, dry_run=bool(getattr(args, "dry_run", False)),
+            evidence_unavailable=evidence_unavailable,
         )
 
     repaired = [r for r in results if r["action"] == "backfilled"]
     skipped = [r for r in results if r["action"] != "backfilled"]
 
     if getattr(args, "json", False):
+        action_counts = {
+            action: sum(r["action"] == action for r in results)
+            for action in (
+                "skipped_no_evidence", "skipped_evidence_unavailable",
+                "skipped_raced",
+            )
+        }
         print(json.dumps({
             "dry_run": bool(getattr(args, "dry_run", False)),
             "considered": len(results),
             "backfilled": len(repaired),
-            "skipped_no_evidence": len(skipped),
+            **action_counts,
             "rows": results,
         }, indent=2, ensure_ascii=False))
         return 0
 
     if not results:
-        print("No identity-less notify subscriptions — nothing to repair.")
+        print("No incomplete notify-subscription identities — nothing to repair.")
         return 0
 
     verb = "Would backfill" if getattr(args, "dry_run", False) else "Backfilled"
-    print(f"{verb} {len(repaired)} of {len(results)} identity-less subscription(s).")
+    print(f"{verb} {len(repaired)} of {len(results)} incomplete subscription(s).")
     for row in repaired:
         thr = f":{row['thread_id']}" if row.get("thread_id") else ""
         print(f"  {row['task_id']:12s} {row['platform']}:{row['chat_id']}{thr}"
-              f"  -> user_id={row['user_id']}")
+              f"  -> user_id={row['user_id']}"
+              f" user_id_alt={row['user_id_alt']} scope_id={row['scope_id']}"
+              f" ({', '.join(row['backfilled_fields'])})")
     if skipped:
-        print(f"\nLeft untouched ({len(skipped)}) — no unambiguous creator identity.")
-        print("  These are cron / CLI / home-channel origins, or shared chats with")
-        print("  several participants. A user-less subscription is legitimate: it")
-        print("  delivers to the shared per-chat session. No identity is invented.")
+        print(f"\nLeft untouched ({len(skipped)}).")
+        if any(r["action"] == "skipped_evidence_unavailable" for r in skipped):
+            print("  Routing evidence was unavailable; repair failed closed.")
+        if any(r["action"] == "skipped_raced" for r in skipped):
+            print("  A row changed during repair; no partial identity was written.")
+        if any(r["action"] == "skipped_no_evidence" for r in skipped):
+            print("  No unambiguous creator identity. User-less origins and shared")
+            print("  chats remain on their legitimate shared per-chat session.")
         for row in skipped:
             thr = f":{row['thread_id']}" if row.get("thread_id") else ""
-            print(f"  {row['task_id']:12s} {row['platform']}:{row['chat_id']}{thr}")
+            print(f"  {row['task_id']:12s} {row['platform']}:{row['chat_id']}{thr}"
+                  f"  [{row['action']}]")
     return 0
 
 

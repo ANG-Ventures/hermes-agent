@@ -121,7 +121,10 @@ def test_repairing_a_legacy_row_collapses_two_keys_into_one(kanban_home, monkeyp
     acceptance criterion stated as a before/after differential."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="legacy row", assignee="worker")
+        tid = kb.create_task(
+            conn, title="legacy row", assignee="worker",
+            session_id=_creator_key(),
+        )
         kb.add_notify_sub(
             conn, task_id=tid, platform="discord", chat_id=CHAT, chat_type="group",
         )
@@ -133,7 +136,10 @@ def test_repairing_a_legacy_row_collapses_two_keys_into_one(kanban_home, monkeyp
     assert not before.endswith(f":{USER}")
 
     monkeypatch.setattr(
-        kc, "_routing_participant_index", lambda: {("discord", CHAT): {USER}},
+        kc, "_routing_participant_index",
+        lambda: {("discord", CHAT, "group", ""): {(
+            USER, "", "", _creator_key(),
+        )}},
     )
     assert kc._cmd_notify_repair(
         argparse.Namespace(dry_run=False, json=False)

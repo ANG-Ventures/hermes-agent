@@ -32,7 +32,9 @@ from hermes_state import SessionDB
 
 CHAT = "1535189663533506600"
 HUMAN = "117431298246705156"
+HUMAN_ALT = "uuid-1174-3129"
 OTHER_HUMAN = "220000000000000001"
+SLACK_TEAM = "T_WORKSPACE"
 
 
 class RecordingAdapter:
@@ -80,17 +82,19 @@ async def _run_one_notifier_tick(monkeypatch, runner):
     await runner._kanban_notifier_watcher(interval=1)
 
 
-def _make_runner(store, adapter):
+def _make_runner(store, adapter, platform=Platform.DISCORD):
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._running = True
-    runner.adapters = {Platform.DISCORD: adapter}
+    runner.adapters = {platform: adapter}
     runner._kanban_sub_fail_counts = {}
     runner._kanban_dispatcher_lock_handle = object()
     runner.session_store = store
     return runner
 
 
-def _subscribed_completed_task(session_key: str, **sub_kw) -> str:
+def _subscribed_completed_task(
+    session_key: str, *, platform: str = "discord", chat_id: str = CHAT, **sub_kw,
+) -> str:
     """A card whose terminal event the notifier will wake ``session_key`` for."""
     conn = kb.connect()
     try:
@@ -100,7 +104,7 @@ def _subscribed_completed_task(session_key: str, **sub_kw) -> str:
         kw: dict = {"chat_type": "group"}
         kw.update(sub_kw)
         kb.add_notify_sub(
-            conn, task_id=tid, platform="discord", chat_id=CHAT, **kw,
+            conn, task_id=tid, platform=platform, chat_id=chat_id, **kw,
         )
         kb.complete_task(conn, tid, summary="done")
         return tid
@@ -157,6 +161,198 @@ def test_identity_less_wake_lands_in_the_humans_own_session(env, monkeypatch):
     assert human.session_key.endswith(f":{HUMAN}")
 
 
+@pytest.mark.parametrize(("platform", "participant_alt"), [
+    (Platform.SIGNAL, "uuid-1174-3129"),
+    (Platform.FEISHU, "union-1174-3129"),
+    (Platform.DINGTALK, "staff-1174-3129"),
+])
+def test_identity_less_alt_keyed_wake_lands_in_the_humans_own_session(
+    env, monkeypatch, platform, participant_alt,
+):
+    """Alt-keyed platforms select the participant from user_id_alt. Evidence
+    must validate and return THAT segment, not reject the entry because its key
+    does not end in the lower-priority user_id."""
+    store = env
+    human_source = SessionSource(
+        platform=platform,
+        chat_id=CHAT,
+        chat_type="group",
+        user_id=HUMAN,
+        user_id_alt=participant_alt,
+    )
+    human = store.get_or_create_session(human_source)
+    assert human.session_key.endswith(f":{participant_alt}")
+    assert not human.session_key.endswith(f":{HUMAN}")
+    _subscribed_completed_task(human.session_key, platform=platform.value)
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(store, adapter, platform)
+    source = _wake_source(monkeypatch, store, adapter, runner)
+
+    # Live evidence retains the complete source identity rather than collapsing
+    # the effective participant into user_id. Repair and wake therefore agree on
+    # which raw and alternate ids belong together.
+    assert source.user_id == HUMAN
+    assert source.user_id_alt == participant_alt
+    woken = _resolve(store, source)
+    assert woken.session_key == human.session_key
+    assert woken.session_id == human.session_id
+
+
+@pytest.mark.parametrize(("chat_id", "chat_type"), [
+    ("C1", "group"),
+    ("D1", "dm"),
+])
+def test_identity_less_slack_wake_adopts_user_and_workspace_as_one_identity(
+    env, monkeypatch, chat_id, chat_type,
+):
+    """Slack's scope_id is part of the key before chat/user. Live evidence must
+    carry it with the participant or the wake still mints an unscoped phantom."""
+    store = env
+    human_source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        user_id=HUMAN,
+        scope_id=SLACK_TEAM,
+    )
+    human = store.get_or_create_session(human_source)
+    assert SLACK_TEAM in human.session_key
+    _subscribed_completed_task(
+        human.session_key,
+        platform=Platform.SLACK.value,
+        chat_id=chat_id,
+        chat_type=chat_type,
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(store, adapter, Platform.SLACK)
+    source = _wake_source(monkeypatch, store, adapter, runner)
+
+    assert source.user_id == HUMAN
+    assert source.scope_id == SLACK_TEAM
+    woken = _resolve(store, source)
+    assert woken.session_key == human.session_key
+    assert woken.session_id == human.session_id
+
+
+def test_live_slack_evidence_refuses_same_participant_in_two_workspaces(
+    env, monkeypatch,
+):
+    """Candidate uniqueness is over the complete identity, not just user_id."""
+    store = env
+    for scope_id in ("T_WORKSPACE_A", "T_WORKSPACE_B"):
+        store.get_or_create_session(SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C1",
+            chat_type="group",
+            user_id=HUMAN,
+            scope_id=scope_id,
+        ))
+    _subscribed_completed_task(
+        "agent:main:slack:group:C1",
+        platform=Platform.SLACK.value,
+        chat_id="C1",
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(store, adapter, Platform.SLACK)
+    source = _wake_source(monkeypatch, store, adapter, runner)
+
+    assert source.user_id is None
+    assert source.scope_id is None
+
+
+def test_scope_only_slack_row_narrows_live_identity_to_one_workspace(
+    env, monkeypatch,
+):
+    store = env
+    expected = None
+    for user_id, scope_id in (
+        (HUMAN, "T_WORKSPACE_A"),
+        (OTHER_HUMAN, "T_WORKSPACE_B"),
+    ):
+        session = store.get_or_create_session(SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C1",
+            chat_type="group",
+            user_id=user_id,
+            scope_id=scope_id,
+        ))
+        if scope_id == "T_WORKSPACE_A":
+            expected = session
+    assert expected is not None
+    _subscribed_completed_task(
+        expected.session_key,
+        platform=Platform.SLACK.value,
+        chat_id="C1",
+        scope_id="T_WORKSPACE_A",
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(store, adapter, Platform.SLACK)
+    source = _wake_source(monkeypatch, store, adapter, runner)
+
+    assert source.user_id == HUMAN
+    assert source.scope_id == "T_WORKSPACE_A"
+    woken = _resolve(store, source)
+    assert woken.session_id == expected.session_id
+
+
+def test_alt_keyed_shared_thread_is_still_not_adopted(env):
+    """A shared key is not evidence even when its thread-id suffix happens to
+    equal the alternate participant bytes."""
+    store = env
+    threaded = store.get_or_create_session(
+        SessionSource(
+            platform=Platform.SIGNAL,
+            chat_id=CHAT,
+            chat_type="thread",
+            # Collision control: build_session_key appends only this shared
+            # thread id, not a participant segment, yet endswith(participant)
+            # is still true.
+            thread_id=HUMAN_ALT,
+            user_id=HUMAN,
+            user_id_alt=HUMAN_ALT,
+        )
+    )
+    assert threaded.session_key.endswith(f":{HUMAN_ALT}")
+    runner = _make_runner(store, RecordingAdapter(), Platform.SIGNAL)
+    assert runner._live_chat_participants(
+        Platform.SIGNAL, CHAT, HUMAN_ALT, "thread",
+    ) == set()
+
+
+def test_prospective_thread_origin_is_not_group_lane_evidence(env):
+    from gateway.routing_identity import effective_routing_lane
+
+    assert effective_routing_lane(
+        platform=Platform.SIGNAL,
+        chat_id=CHAT,
+        chat_type="group",
+        prospective_thread_id="99",
+    ) == ("signal", CHAT, "thread", "99")
+    store = env
+    prospective = store.get_or_create_session(SessionSource(
+        platform=Platform.SIGNAL,
+        chat_id=CHAT,
+        chat_type="group",
+        prospective_thread_id="99",
+        user_id=HUMAN,
+        user_id_alt=HUMAN_ALT,
+    ))
+    assert ":thread:" in prospective.session_key
+
+    runner = _make_runner(store, RecordingAdapter(), Platform.SIGNAL)
+    assert runner._live_chat_participants(
+        Platform.SIGNAL,
+        CHAT,
+        None,
+        "group",
+        prospective.session_key,
+    ) == set()
+
+
 def test_the_unfixed_path_would_have_minted_a_bare_key(env):
     """FIXTURE CONTROL: prove the phantom is real, i.e. that passing the row's
     NULL user_id straight through (the pre-fix behaviour) produces a DIFFERENT
@@ -182,10 +378,10 @@ def test_the_unfixed_path_would_have_minted_a_bare_key(env):
 def test_userless_chat_still_delivers_and_no_identity_is_fabricated(
     env, monkeypatch,
 ):
-    """A genuinely user-less chat (cron / CLI / home-channel origin): nobody
-    has ever spoken, so there is no evidence. The wake must still DELIVER, to
-    the shared per-chat session, and must NOT invent a participant."""
+    """A genuinely user-less subscription remains shared even when one human
+    has an unrelated per-user session in the same lane."""
     store = env
+    _human_turn(store, user_id=HUMAN)
     _subscribed_completed_task("agent:main:discord:group:" + CHAT)
 
     adapter = RecordingAdapter()
@@ -207,7 +403,7 @@ def test_shared_channel_with_two_humans_refuses_to_pick(env, monkeypatch):
     a = _human_turn(store, user_id=HUMAN)
     b = _human_turn(store, user_id=OTHER_HUMAN)
     assert a.session_key != b.session_key
-    _subscribed_completed_task(a.session_key)
+    _subscribed_completed_task("agent:main:discord:group:" + CHAT)
 
     adapter = RecordingAdapter()
     runner = _make_runner(store, adapter)
@@ -224,9 +420,9 @@ def test_a_row_that_names_a_participant_is_never_repointed(env, monkeypatch):
     """The row's own identity is authoritative. A second human speaking in the
     chat must not steal the first one's notification lane."""
     store = env
-    _human_turn(store, user_id=OTHER_HUMAN)
+    other = _human_turn(store, user_id=OTHER_HUMAN)
     _subscribed_completed_task(
-        "agent:main:discord:group:" + CHAT, user_id=HUMAN,
+        other.session_key, user_id=HUMAN,
     )
 
     adapter = RecordingAdapter()
