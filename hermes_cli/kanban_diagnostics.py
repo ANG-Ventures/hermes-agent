@@ -32,6 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 import json
+import re
 import time
 
 
@@ -1028,6 +1029,106 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
 
 # Registry — order matters: rules higher on the list render first when
 # severity ties. Add new rules here.
+_STALE_QUANTITY_RE = re.compile(
+    r"""(?ix)
+    (?:
+        \b\d{1,3}(?:,\d{3})+\b            # 1,234 / 3,466
+      | \b\d+\s*(?:unresolved|conflicts?|conflicted|remaining|pending|failing|
+                  behind|ahead|open|stale|missing|broken|red|dirty)\b
+      | \b(?:unresolved|conflicts?|remaining|pending|behind|ahead)\s*[:=]\s*\d+\b
+    )
+    """
+)
+
+
+def _rule_stale_quantity_in_body(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Card body quotes a COUNT of mutable state, and the card has aged.
+
+    A number written into a card body is a *timestamped claim*, not current
+    state. Conflict counts, queue depth, "N commits behind", failing-test
+    counts and open-PR counts all drift — often to zero, and sometimes the
+    whole premise evaporates (the merge gets finished, the queue drains).
+
+    Measured 2026-08-10: a card titled "Finish the parity merge: 48 unresolved
+    conflicts" was quoted twice (as 48, then 45) to a human as remaining work.
+    Ground truth at the time: ``git status`` = "working tree clean",
+    ``.git/MERGE_HEAD`` absent, ``git diff --diff-filter=U`` = 0 files. The
+    merge was already resolved and committed; the reported *quantity* had no
+    referent at all.
+
+    This does NOT try to verify the number — it cannot know what the number
+    means. It flags that a quantity is being carried in prose past its
+    freshness window so the reader re-derives it instead of quoting it.
+
+    Threshold: cfg["body_quantity_stale_hours"] (default 2). Deliberately
+    very short. In the incident that motivated this rule the card was only
+    ~2h old when its count was quoted to a human and was ALREADY wrong — the
+    merge had been resolved in the interim. Anything longer would have stayed
+    silent through the exact failure it exists to catch.
+    """
+    hours = float(cfg.get("body_quantity_stale_hours", 2))
+    status = _task_field(task, "status")
+    # Terminal cards are archives; nobody acts on their numbers.
+    if status in {"done", "archived", "cancelled"}:
+        return []
+
+    body = _task_field(task, "body") or ""
+    title = _task_field(task, "title") or ""
+    haystack = f"{title}\n{body}"
+    if not haystack.strip():
+        return []
+
+    matches = _STALE_QUANTITY_RE.findall(haystack)
+    if not matches:
+        return []
+
+    created = int(_task_field(task, "created_at", 0) or 0)
+    if not created:
+        return []
+    age_hours = (now - created) / 3600.0
+    if age_hours < hours:
+        return []
+
+    # A comment newer than the freshness window means somebody has already
+    # revisited this card recently — treat the numbers as re-grounded.
+    newest_comment = 0.0
+    for ev in events:
+        if _event_kind(ev) == "commented":
+            newest_comment = max(newest_comment, float(_event_ts(ev) or 0))
+    if newest_comment and (now - newest_comment) / 3600.0 < hours:
+        return []
+
+    sample = ", ".join(sorted({m.strip() for m in matches if m.strip()})[:4])
+    return [Diagnostic(
+        kind="stale_quantity_in_body",
+        severity="warning",
+        title=f"Body quotes counts written {int(age_hours)}h ago — re-derive before using",
+        detail=(
+            f"This card's text carries at least one COUNT of mutable state "
+            f"({sample}) recorded {int(age_hours)}h ago. A number in a card "
+            f"body is a timestamped claim, not current state — conflicts get "
+            f"resolved, queues drain, branches move. Re-derive it from the "
+            f"system before quoting it to anyone or planning against it, and "
+            f"verify the PREMISE first (is a merge still in progress at all?), "
+            f"not just the magnitude."
+        ),
+        actions=[
+            DiagnosticAction(
+                kind="comment",
+                label="Re-derive the numbers and comment the current values",
+                suggested=True,
+            ),
+        ],
+        first_seen_at=created,
+        last_seen_at=now,
+        count=1,
+        data={
+            "age_hours": round(age_hours, 1),
+            "quantities": sorted({m.strip() for m in matches if m.strip()})[:8],
+        },
+    )]
+
+
 _RULES: list[RuleFn] = [
     _rule_hallucinated_cards,
     _rule_triage_aux_unavailable,
@@ -1037,6 +1138,7 @@ _RULES: list[RuleFn] = [
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
+    _rule_stale_quantity_in_body,
 ]
 
 
@@ -1051,6 +1153,7 @@ DIAGNOSTIC_KINDS = (
     "stuck_in_blocked",
     "block_unblock_cycling",
     "stranded_in_ready",
+    "stale_quantity_in_body",
 )
 
 
@@ -1066,6 +1169,12 @@ DEFAULT_CONFIG = {
     # signal is dominated by tasks that are about to be claimed on the
     # next dispatcher tick (default 60s) and would just be noise.
     "stranded_threshold_seconds": 30 * 60,
+    # Freshness window for COUNTS quoted in a card's own prose (conflict
+    # counts, "N behind", queue depth). Deliberately very short: in the
+    # 2026-08-10 incident the card was ~2h old when its count was quoted to
+    # a human and was already wrong. A longer window stays silent through
+    # exactly the failure this rule exists to catch.
+    "body_quantity_stale_hours": 2,
 }
 
 
