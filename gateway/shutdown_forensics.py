@@ -101,6 +101,41 @@ def _proc_summary(pid: int) -> Dict[str, Any]:
     return summary
 
 
+_SHUTDOWN_SIGNAL_AT: Optional[float] = None
+
+
+def shutdown_signal_seen_at() -> Optional[float]:
+    """Return the monotonic time a shutdown signal was observed, else None.
+
+    Process-global because the consumer is not the gateway object: a running
+    AGENT turn needs to know a restart landed mid-turn so it can explain
+    itself honestly. Before this existed, a turn whose session append was
+    interrupted by a restart reported "This is often a full disk — free some
+    space (or fix state.db permissions)" — measured 2026-08-10 on a box with
+    6.1 TiB free and zero sqlite errors, which sent the operator hunting a
+    problem that did not exist.
+
+    Read via ``shutdown_landed_within(seconds)`` rather than directly.
+    """
+    return _SHUTDOWN_SIGNAL_AT
+
+
+def shutdown_landed_within(seconds: float = 300.0) -> bool:
+    """True when a shutdown signal was seen in the last *seconds*.
+
+    Bounded so a long-lived process that survived an earlier drain (a
+    cancelled restart, a signal the gateway rode out) does not attribute an
+    unrelated failure minutes or hours later to that old signal.
+    """
+    at = _SHUTDOWN_SIGNAL_AT
+    if at is None:
+        return False
+    try:
+        return (time.monotonic() - at) <= float(seconds)
+    except Exception:
+        return False
+
+
 def snapshot_shutdown_context(received_signal: Any = None) -> Dict[str, Any]:
     """Fast (<10ms) snapshot of who/what is asking us to shut down.
 
@@ -119,6 +154,15 @@ def snapshot_shutdown_context(received_signal: Any = None) -> Dict[str, Any]:
     monotonic = time.monotonic()
     pid = os.getpid()
     ppid = os.getppid()
+
+    # Record that a shutdown signal landed, for consumers outside the gateway
+    # object (see shutdown_landed_within). Set here rather than in the signal
+    # handler so every path that snapshots a shutdown — handler, drain,
+    # forensics-only calls — marks it exactly once, and so a caller passing
+    # received_signal=None (a non-signal snapshot) does not falsely arm it.
+    global _SHUTDOWN_SIGNAL_AT
+    if received_signal is not None:
+        _SHUTDOWN_SIGNAL_AT = monotonic
 
     ctx: Dict[str, Any] = {
         "ts": now,

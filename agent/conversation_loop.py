@@ -6768,6 +6768,16 @@ def run_conversation(
                     )
                 except Exception as exc:
                     _tool_turn_persisted = False
+                    # Keep the cause so the user-facing exit message can name
+                    # what actually happened. Without this the reason string
+                    # is forced to guess, and it guessed "full disk" during a
+                    # mid-turn gateway restart on a box with 6.1 TiB free
+                    # (2026-08-10) — sending the operator after a non-existent
+                    # disk/permissions problem.
+                    try:
+                        agent._session_persistence_error = exc
+                    except Exception:
+                        pass
                     logger.warning(
                         "Incremental tool-call persistence failed before execution "
                         "(session=%s): %s",

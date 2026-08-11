@@ -548,7 +548,8 @@ def finalize_turn(
                     or _is_partial_stream_recovery
                 ):
                     _explanation = agent._format_turn_completion_explanation(
-                        _turn_exit_reason
+                        _turn_exit_reason,
+                        agent,
                     )
                     if _explanation:
                         if _is_empty_terminal:
