@@ -725,6 +725,17 @@ class GatewaySlashCommandsMixin:
                     chat_type = str(getattr(source, "chat_type", "") or "") or None
                     thread_id = str(getattr(source, "thread_id", "") or "")
                     user_id = str(getattr(source, "user_id", "") or "") or None
+                    # The two session-key inputs user_id cannot express:
+                    # build_session_key keys the participant on
+                    # ``user_id_alt or user_id`` (feishu/signal/dingtalk carry
+                    # the canonical id in the alt slot) and prefixes the Slack
+                    # workspace scope before chat_id. Persisting them is what
+                    # lets the wake rebuild the creator's OWN key instead of a
+                    # second, chat-unreachable one.
+                    user_id_alt = (
+                        str(getattr(source, "user_id_alt", "") or "") or None
+                    )
+                    scope_id = str(getattr(source, "scope_id", "") or "") or None
                     delivery_metadata = self._thread_metadata_for_source(
                         source, self._reply_anchor_for_event(event)
                     ) or None
@@ -743,6 +754,8 @@ class GatewaySlashCommandsMixin:
                                     chat_type=chat_type,
                                     thread_id=thread_id or None,
                                     user_id=user_id,
+                                    user_id_alt=user_id_alt,
+                                    scope_id=scope_id,
                                     notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
                                     delivery_metadata=delivery_metadata,
                                 )
