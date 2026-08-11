@@ -129,16 +129,56 @@ class ChronosCronScheduler(CronScheduler):
 
     # -- arming -----------------------------------------------------------
 
+    @classmethod
+    def _is_past(cls, fire_at: str) -> bool:
+        """True if fire_at is more than the grace window in the past.
+
+        Fails OPEN: an unparseable timestamp returns False (arm it). Dropping it
+        would silently unschedule the job, and reconcile is the only thing that
+        re-arms -- so a raise here would also stop every later job in the loop.
+        """
+        from datetime import datetime, timezone
+
+        try:
+            t = datetime.fromisoformat(str(fire_at))
+        except Exception:
+            return False
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        delta = (datetime.now(timezone.utc) - t).total_seconds()
+        return delta > cls._PAST_FIRE_GRACE_SECONDS
+
+    # A fire_at this far in the past is treated as clock skew / in-flight
+    # latency rather than a missed fire, so a provision racing its own deadline
+    # is not silently dropped.
+    _PAST_FIRE_GRACE_SECONDS = 60
+
     def _arm_one_shot(self, job: Dict[str, Any]) -> None:
         """Ask NAS to arm exactly one one-shot at the job's next_run_at.
 
         The agent computes the time; NAS+its scheduler are the dumb executor.
         Idempotent per (job_id, fire_at) via dedup_key, so re-arming the same
         fire is a no-op NAS-side.
+
+        A fire_at already in the PAST is never armed. ``reconcile()`` runs on
+        gateway boot, and an external scheduler handed a past deadline fires it
+        immediately -- so a stale next_run_at made a scheduled job re-run within
+        seconds of a restart. A past one-shot is a MISSED fire, not a due one:
+        the next legitimate fire is already described by the schedule, so arming
+        the stale one only duplicates it. Observed live 2026-08-11 on an
+        ``0 */8`` report that delivered 7 messages in ~17h, 3 of them re-fires
+        minutes after a real run.
         """
         job_id = job["id"]
         fire_at = job.get("next_run_at")
         if not fire_at:
+            return
+        if self._is_past(fire_at):
+            logger.info(
+                "Chronos not arming job %s: fire_at %s is in the past "
+                "(missed fire, not due) -- the schedule already describes the "
+                "next one", job_id, fire_at,
+            )
             return
         dedup_key = f"{job_id}:{fire_at}"
         self._get_client().provision(
@@ -185,11 +225,26 @@ class ChronosCronScheduler(CronScheduler):
     def reconcile(self) -> None:
         """Converge the NAS-armed one-shots toward jobs.json (desired state):
         arm missing / re-arm changed-time, cancel orphaned."""
-        from cron.jobs import load_jobs
+        from cron.jobs import advance_next_runs, load_jobs
 
+        jobs = load_jobs()
+        missed_recurring = [
+            job["id"]
+            for job in jobs
+            if job.get("enabled")
+            and job.get("state") != "paused"
+            and job.get("schedule", {}).get("kind") in {"cron", "interval"}
+            and job.get("next_run_at")
+            and self._is_past(job["next_run_at"])
+        ]
+        if missed_recurring:
+            # Skipping a stale one-shot without advancing its recurring schedule
+            # would prevent this scale-to-zero provider from ever waking again.
+            advance_next_runs(missed_recurring)
+            jobs = load_jobs()
         desired: Dict[str, str] = {
             j["id"]: j["next_run_at"]
-            for j in load_jobs()
+            for j in jobs
             if j.get("enabled") and j.get("next_run_at") and j.get("state") != "paused"
         }
         observed = self._list_armed()
