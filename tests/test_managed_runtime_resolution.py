@@ -70,6 +70,11 @@ _ALLOWED: dict[tuple[str, str], str] = {
         "WSL diagnostic: deliberately inspects what PATH resolves so it can "
         "warn that the only reachable npm is the Windows one."
     ),
+    ("tools/browser_use_cli.py", "uv"): (
+        "Fallback rung only: ensure_uv() (managed bootstrap) is tried first; "
+        "which() runs when the managed install is unavailable, mirroring "
+        "tools/lazy_deps.py."
+    ),
     ("tools/lazy_deps.py", "uv"): (
         "Fallback after resolve_uv(), plus the except-branch for the "
         "hermes_cli import guard."
