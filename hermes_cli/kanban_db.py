@@ -6589,6 +6589,90 @@ def block_task(
 
 
 
+def reopen_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    reason: str,
+    to_status: str = "ready",
+) -> tuple[bool, Optional[str]]:
+    """Void a terminal completion and return the task to the queue.
+
+    Recovery path for a FALSE terminal state — most importantly one written by
+    a process that was never the run owner (an ordinary nested process that
+    inherited a worker's ``HERMES_KANBAN_*`` env and called ``kanban_complete``
+    on its parent's card, 2026-08-12). Comments cannot fix that: the card still
+    reads ``done`` and carries the impostor's summary as its durable result, and
+    every downstream consumer — dependent children, ``build_worker_context``,
+    the board UI — trusts those fields.
+
+    ``edit_completed_task_result`` is deliberately not enough here. It backfills
+    the result of a task that is legitimately done; it cannot express "this
+    completion never happened", leaves the task terminal, and so cannot let the
+    real work be re-dispatched.
+
+    The false result is CLEARED rather than overwritten, and the closing run is
+    marked ``outcome='voided'`` so the audit trail keeps the fact that a bogus
+    completion occurred instead of silently rewriting history. ``reason`` is
+    mandatory and recorded on the ``reopened`` event: a terminal state being
+    reversed is exactly the kind of mutation that must never be anonymous.
+
+    Returns ``(True, None)`` on success, ``(False, reason)`` if refused.
+    """
+    if to_status not in ("ready", "todo"):
+        return False, f"invalid target status {to_status!r} (use 'ready' or 'todo')"
+    if not (reason or "").strip():
+        return False, "a reason is required to reverse a terminal state"
+
+    row = conn.execute(
+        "SELECT status, result FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False, f"task {task_id} not found"
+    if row["status"] != "done":
+        return False, (
+            f"task {task_id} is {row['status']!r}; reopen only applies to "
+            f"'done' tasks (use unblock/promote for other states)"
+        )
+
+    with write_txn(conn):
+        upd = conn.execute(
+            "UPDATE tasks "
+            "   SET status = ?, result = NULL, completed_at = NULL, "
+            "       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "       current_run_id = NULL "
+            " WHERE id = ? AND status = 'done'",
+            (to_status, task_id),
+        )
+        if upd.rowcount != 1:
+            return False, f"task {task_id} changed state concurrently; retry"
+        run_id = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+            "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        voided_run = int(run_id["id"]) if run_id else None
+        if voided_run is not None:
+            conn.execute(
+                "UPDATE task_runs SET outcome = 'voided' WHERE id = ?",
+                (voided_run,),
+            )
+        _append_event(
+            conn,
+            task_id,
+            "reopened",
+            {
+                "actor": actor,
+                "reason": reason,
+                "to_status": to_status,
+                "voided_run_id": voided_run,
+                "voided_result": (row["result"] or "")[:500] or None,
+            },
+        )
+    return True, None
+
+
 def promote_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -10474,6 +10558,18 @@ def _default_spawn(
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
+    # Bind this grant to the ONE process we are about to spawn. Popen cannot
+    # know the child's pid before it execs, so stamp the single-use sentinel;
+    # the child's CLI startup rewrites it to its own pid. Without this, every
+    # ordinary subprocess the worker later launches (a nested `hermes chat`,
+    # a script that shells out) inherits HERMES_KANBAN_* and is indistinguishable
+    # from the worker itself — one such child completed its parent's card with
+    # an unrelated summary while the owner was still running (2026-08-12).
+    from agent.delegation_context import (
+        KANBAN_OWNER_PID_ENV,
+        KANBAN_OWNER_PID_PENDING,
+    )
+    env[KANBAN_OWNER_PID_ENV] = KANBAN_OWNER_PID_PENDING
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is

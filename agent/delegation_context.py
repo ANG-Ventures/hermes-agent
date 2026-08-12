@@ -34,6 +34,19 @@ _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar(
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
 
+# Records WHICH process the dispatcher's Kanban grant belongs to. See
+# ``owns_kanban_worker_authority`` — this is the anchor that makes worker
+# authorization non-transitive across an ordinary subprocess boundary.
+KANBAN_OWNER_PID_ENV = "HERMES_KANBAN_OWNER_PID"
+
+# Single-use sentinel the dispatcher stamps instead of a pid. ``Popen`` cannot
+# know the child's pid before it execs, so the dispatcher writes this and the
+# first Hermes CLI process to boot rewrites it to its own pid
+# (``claim_kanban_worker_authority``). Because the grant is consumed on the way
+# in, every LATER process in that tree inherits a resolved pid that is not its
+# own and therefore cannot re-claim it.
+KANBAN_OWNER_PID_PENDING = "pending"
+
 KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_TASK",
     "HERMES_KANBAN_RUN_ID",
@@ -42,6 +55,7 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_BOARD",
     "HERMES_KANBAN_DB",
+    KANBAN_OWNER_PID_ENV,
 )
 
 
@@ -94,16 +108,82 @@ def non_dispatcher_owned_context() -> Iterator[None]:
         _NON_DISPATCHER_OWNED_CONTEXT.reset(token)
 
 
+def owns_kanban_worker_authority() -> bool:
+    """Return True only when THIS process is the dispatcher's granted worker.
+
+    The dispatcher's ``HERMES_KANBAN_*`` vars are ambient process environment,
+    and ambient environment is inherited by *every* child process. That makes
+    them proof that a Kanban grant exists somewhere in this process tree — not
+    proof that it belongs to the process reading them. An ordinary nested
+    ``hermes chat`` launched from a worker's own shell inherited the whole set
+    and completed its parent's card with an unrelated summary while the owning
+    worker was still running (2026-08-12, card ``t_09b90233``).
+
+    ``HERMES_KANBAN_OWNER_PID`` closes that hole. The dispatcher stamps the pid
+    it is about to spawn, and this predicate requires that pid to equal
+    ``os.getpid()``. A child inherits the *grant* but cannot inherit the
+    *identity the grant names*: its pid necessarily differs, so authority stops
+    at exactly one process. Authorization becomes explicit and non-transitive
+    instead of ambient.
+
+    Fails OPEN when the marker is absent so pre-existing surfaces keep working:
+    a hand-driven ``HERMES_KANBAN_TASK=... hermes chat``, an older dispatcher
+    that predates the stamp, and every test that sets only the task var. Those
+    callers are unchanged. Once the stamp IS present it is authoritative, which
+    is what makes a dispatcher-spawned worker's children fail closed.
+    """
+    import os
+
+    owner = (os.environ.get(KANBAN_OWNER_PID_ENV) or "").strip()
+    if not owner:
+        return True
+    if owner == KANBAN_OWNER_PID_PENDING:
+        # The grant was issued but never claimed by a booting CLI. Treat it as
+        # unowned rather than as everyone's: an unclaimed grant must not become
+        # a second authority for an inheriting child.
+        return False
+    try:
+        return int(owner) == os.getpid()
+    except (TypeError, ValueError):
+        # A corrupt marker is not a grant. Refuse rather than guess.
+        return False
+
+
+def claim_kanban_worker_authority() -> bool:
+    """Bind a pending dispatcher grant to THIS process. Idempotent.
+
+    Called once during CLI startup. Converts the dispatcher's single-use
+    ``pending`` sentinel into this process's concrete pid, so the grant is
+    consumed exactly once by the process the dispatcher actually spawned.
+    Every later process in the tree inherits the resolved pid, sees it is not
+    its own, and is refused.
+
+    Returns True when this call bound the grant. Re-entrant calls from the
+    owning process return True without rewriting; any other state is left
+    untouched so a non-worker CLI can never mint authority for itself.
+    """
+    import os
+
+    owner = (os.environ.get(KANBAN_OWNER_PID_ENV) or "").strip()
+    if owner == KANBAN_OWNER_PID_PENDING:
+        os.environ[KANBAN_OWNER_PID_ENV] = str(os.getpid())
+        return True
+    return owner == str(os.getpid())
+
+
 def is_dispatcher_owned_worker_context() -> bool:
     """Return True only when this execution owns the dispatcher's Kanban task.
 
     The single predicate every ``HERMES_KANBAN_*`` identity gate should use
-    before trusting those vars.  False for delegate_task children and for cron
-    jobs fired in-process from a worker.
+    before trusting those vars.  False for delegate_task children, for cron
+    jobs fired in-process from a worker, and for ordinary child processes that
+    merely inherited a worker's environment.
     """
     if _DELEGATED_CHILD_CONTEXT.get():
         return False
-    return not _NON_DISPATCHER_OWNED_CONTEXT.get()
+    if _NON_DISPATCHER_OWNED_CONTEXT.get():
+        return False
+    return owns_kanban_worker_authority()
 
 
 def enter_non_dispatcher_owned_context() -> Token[bool]:
