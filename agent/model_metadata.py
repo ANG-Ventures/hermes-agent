@@ -613,6 +613,13 @@ DEFAULT_CONTEXT_LENGTHS = {
     "grok-2-vision": 8192,      # grok-2-vision, -1212, -latest
     "grok-4-fast": 2000000,     # grok-4-fast-(non-)reasoning, also matches -reasoning
     "grok-4.20": 2000000,       # grok-4.20-0309-(non-)reasoning, -multi-agent-0309
+    # grok-4.6 (GA 2026-08-12) — 500K, ground-truthed against the live API:
+    # a 600,207-token prompt returns "This model's maximum prompt length is
+    # 500000". Without this key it fell through to the "grok-4" catch-all and
+    # silently resolved at 256,000 — a HALF-SIZE window that never errors, it
+    # just compacts ~2x too early forever. Keep each new frontier grok here on
+    # the day it ships; the "grok-4" entry is for grok-4/grok-4-0709 only.
+    "grok-4.6": 500000,         # grok-4.6, grok-4.6-latest
     "grok-4.5": 500000,         # grok-4.5, grok-4.5-latest — 500K context per docs.x.ai
     "grok-4.3": 1000000,        # grok-4.3, grok-4.3-latest — 1M context per docs.x.ai
     "grok-4": 256000,           # grok-4, grok-4-0709
@@ -687,6 +694,11 @@ _GROK_EFFORT_CAPABLE_PREFIXES = (
     # "none" ("This model does not support `reasoning_effort` value `none`"),
     # unlike grok-4.3. models.dev agrees: effort values [low, medium, high].
     "grok-4.5",
+    # grok-4.6: verified live against /v1/responses 2026-08-12 — same shape as
+    # grok-4.5 (low/medium/high ACCEPTED, "none" 400s). Without this entry the
+    # conservative default sends no effort dial at all, silently dropping
+    # reasoning-effort control for every 4.6 lane.
+    "grok-4.6",
 )
 
 
