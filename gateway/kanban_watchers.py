@@ -22,6 +22,7 @@ from agent.i18n import t
 from gateway.routing_identity import (
     effective_routing_lane,
     routing_key_carries_identity,
+    routing_key_is_bare_lane,
 )
 
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
@@ -302,9 +303,10 @@ class GatewayKanbanWatchersMixin:
         Only entries whose key shape proves the required identity count.
         Deliberately narrow:
 
-        * ``origin.user_id_alt or origin.user_id`` must be present — that is the
-          participant segment selected by ``build_session_key``. An entry with
-          neither is exactly the phantom we're refusing to feed.
+        * ``origin.user_id_alt or origin.user_id`` must be present for an entry
+          to count as a participant. The one exception is the exact creator key:
+          a canonical participant-less group key marks the already-minted
+          phantom so it can be ignored instead of poisoning the sole human.
         * the entry's own chat and chat type must match, so a participant in
           another channel or a group entry sharing a DM id can never be adopted.
         * group/channel and no-chat DM entries must be keyed per-user
@@ -321,9 +323,10 @@ class GatewayKanbanWatchersMixin:
 
         Returns complete ``(user_id, user_id_alt, scope_id)`` tuples rather than
         participant strings so alternate ids and Slack workspace scope cannot be
-        selected from different entries. Returns a SET, never a pick: the caller
-        refuses on 0 and on >1. Never raises — a routing-index read failure
-        degrades to "no evidence", preserving the pre-change behaviour exactly.
+        selected from different entries. When the creator key is a bare phantom,
+        returns the sole per-user identity in the same lane; two real humans
+        remain ambiguous. Never raises — a routing-index read failure degrades to
+        "no evidence", preserving the pre-change behaviour exactly.
         """
         store = getattr(self, "session_store", None)
         if store is None or not chat_id:
@@ -334,6 +337,8 @@ class GatewayKanbanWatchersMixin:
         want_chat_type = str(chat_type or "")
         want_creator_key = str(creator_session_key or "")
         found: set[_WakeRoutingIdentity] = set()
+        creator_found: set[_WakeRoutingIdentity] = set()
+        creator_is_bare = False
         try:
             with store._lock:  # noqa: SLF001 -- documented private access
                 store._ensure_loaded_locked()  # noqa: SLF001
@@ -345,8 +350,6 @@ class GatewayKanbanWatchersMixin:
             )
             return set()
         for key, entry in entries.items():
-            if want_creator_key and str(key) != want_creator_key:
-                continue
             origin = getattr(entry, "origin", None)
             if origin is None:
                 continue
@@ -360,8 +363,6 @@ class GatewayKanbanWatchersMixin:
                 or ""
             ).strip()
             participant = user_id_alt or user_id
-            if not participant:
-                continue
             origin_platform = getattr(origin, "platform", None)
             if str(getattr(origin_platform, "value", origin_platform)) != str(
                 platform_value
@@ -384,22 +385,51 @@ class GatewayKanbanWatchersMixin:
             )
             if origin_lane != want_lane:
                 continue
-            if not routing_key_carries_identity(
-                key,
-                platform=origin_platform,
-                chat_id=want_chat,
-                chat_type=origin_chat_type,
-                thread_id=want_thread,
-                prospective_thread_id=getattr(
-                    origin, "prospective_thread_id", None
-                ),
-                user_id=user_id,
-                user_id_alt=user_id_alt,
-                scope_id=scope_id,
-            ):
+            prospective_thread_id = getattr(
+                origin, "prospective_thread_id", None
+            )
+            if participant:
+                if not routing_key_carries_identity(
+                    key,
+                    platform=origin_platform,
+                    chat_id=want_chat,
+                    chat_type=origin_chat_type,
+                    thread_id=want_thread,
+                    prospective_thread_id=prospective_thread_id,
+                    user_id=user_id,
+                    user_id_alt=user_id_alt,
+                    scope_id=scope_id,
+                ):
+                    continue
+                identity = _WakeRoutingIdentity(user_id, user_id_alt, scope_id)
+                found.add(identity)
+                if want_creator_key and str(key) == want_creator_key:
+                    creator_found.add(identity)
                 continue
-            found.add(_WakeRoutingIdentity(user_id, user_id_alt, scope_id))
-        return found
+            if (
+                want_creator_key
+                and str(key) == want_creator_key
+                and routing_key_is_bare_lane(
+                    key,
+                    platform=origin_platform,
+                    chat_id=want_chat,
+                    chat_type=origin_chat_type,
+                    thread_id=want_thread,
+                    prospective_thread_id=prospective_thread_id,
+                    scope_id=scope_id,
+                )
+            ):
+                creator_is_bare = True
+        if not want_creator_key:
+            return found
+        if creator_found:
+            return creator_found
+        if creator_is_bare and len(found) == 1:
+            # The creator key itself is the participant-less phantom. It is not
+            # a second human identity and must not poison the sole per-user
+            # route forever. Two real participants remain ambiguous.
+            return found
+        return set()
 
     def _owns_kanban_dispatcher_lock(self) -> bool:
         """Return whether this gateway currently owns the singleton lock."""

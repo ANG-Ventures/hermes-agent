@@ -919,7 +919,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "per-user session (cron / CLI / home-channel origins, which are "
             "legitimately user-less) is left alone — an identity is never "
             "invented. Idempotent and fill-a-hole only: existing identity fields "
-            "are never re-pointed."
+            "are never re-pointed. By default every existing board database is "
+            "swept; pass the global --board option to target one board."
         ),
     )
     p_nrepair.add_argument(
@@ -1169,6 +1170,11 @@ def kanban_command(args: argparse.Namespace) -> int:
         # without ever reaching the repair path.
         if action == "repair":
             return _cmd_repair(args)
+        # Default notify-repair discovers existing DB files across all boards.
+        # Dispatch it before auto-init so merely being the active metadata-only
+        # board does not create a new kanban.db during that read/repair sweep.
+        if action == "notify-repair":
+            return _cmd_notify_repair(args)
         try:
             kb.init_db()
         except Exception as exc:
@@ -3304,10 +3310,13 @@ def _routing_participant_index(
     entry cannot identify an adjacent group subscription merely because both
     share the same platform/chat id.
 
-    Returns a SET per lane, deliberately: the caller repairs only after existing
-    row fields narrow that set to exactly one identity. ``None`` means the
-    durable index could not be read completely; acting on partial evidence could
-    hide a second candidate, so callers must fail closed.
+    A canonical participant-less group key is retained as an empty identity.
+    That marker is not a human candidate; it lets repair recognize that a task's
+    creator key is the already-minted phantom and consider the per-user evidence
+    beside it. Returns a SET per lane, deliberately: the caller repairs only
+    after existing row fields narrow that set to exactly one identity. ``None``
+    means the durable index could not be read completely; acting on partial
+    evidence could hide a second candidate, so callers must fail closed.
     """
     index: dict[_RoutingLane, set[_RoutingEvidence]] = {}
     try:
@@ -3315,6 +3324,7 @@ def _routing_participant_index(
         from gateway.routing_identity import (
             effective_routing_lane,
             routing_key_carries_identity,
+            routing_key_is_bare_lane,
         )
     except Exception:
         return None
@@ -3363,19 +3373,31 @@ def _routing_participant_index(
             scope_id = str(
                 origin.get("scope_id") or origin.get("guild_id") or ""
             ).strip()
-            if not platform or not chat_id or not (user_id_alt or user_id):
+            if not platform or not chat_id:
                 continue
-            if not routing_key_carries_identity(
-                session_key,
-                platform=platform,
-                chat_id=chat_id,
-                chat_type=chat_type,
-                thread_id=thread_id,
-                prospective_thread_id=prospective_thread_id,
-                user_id=user_id,
-                user_id_alt=user_id_alt,
-                scope_id=scope_id,
-            ):
+            if user_id_alt or user_id:
+                valid_evidence = routing_key_carries_identity(
+                    session_key,
+                    platform=platform,
+                    chat_id=chat_id,
+                    chat_type=chat_type,
+                    thread_id=thread_id,
+                    prospective_thread_id=prospective_thread_id,
+                    user_id=user_id,
+                    user_id_alt=user_id_alt,
+                    scope_id=scope_id,
+                )
+            else:
+                valid_evidence = routing_key_is_bare_lane(
+                    session_key,
+                    platform=platform,
+                    chat_id=chat_id,
+                    chat_type=chat_type,
+                    thread_id=thread_id,
+                    prospective_thread_id=prospective_thread_id,
+                    scope_id=scope_id,
+                )
+            if not valid_evidence:
                 continue
             lane = effective_routing_lane(
                 platform=platform,
@@ -3416,9 +3438,21 @@ def _cmd_notify_repair(args: argparse.Namespace) -> int:
         evidence = set((index or {}).get(
             (platform, chat_id, chat_type, thread_id), set()
         ))
-        candidates = {
-            item[:3] for item in evidence if item[3] == creator_session_id
+        creator_evidence = {
+            item for item in evidence if item[3] == creator_session_id
         }
+        candidates = {
+            item[:3] for item in creator_evidence if item[0] or item[1]
+        }
+        if not candidates and any(
+            not item[0] and not item[1] for item in creator_evidence
+        ):
+            # A creator key with no participant is the phantom itself, not a
+            # second human. Ignore it and consider the per-user identities in
+            # the same exact lane; uniqueness below still refuses two humans.
+            candidates = {
+                item[:3] for item in evidence if item[0] or item[1]
+            }
         for position, field in enumerate(("user_id", "user_id_alt", "scope_id")):
             existing = str(row.get(field) or "").strip()
             if existing:
@@ -3437,11 +3471,35 @@ def _cmd_notify_repair(args: argparse.Namespace) -> int:
             "scope_id": scope_id or None,
         }
 
-    with kb.connect_closing() as conn:
-        results = kb.backfill_notify_sub_user_ids(
-            conn, _resolve, dry_run=bool(getattr(args, "dry_run", False)),
-            evidence_unavailable=evidence_unavailable,
-        )
+    explicit_board = getattr(args, "board", None)
+    if explicit_board:
+        targets = [(str(explicit_board), kb.kanban_db_path(board=explicit_board))]
+    else:
+        targets = []
+        default_path = kb.kanban_home() / "kanban.db"
+        if default_path.is_file():
+            targets.append((kb.DEFAULT_BOARD, default_path))
+        root = kb.boards_root()
+        if root.is_dir():
+            for path in sorted(root.glob("*/kanban.db")):
+                try:
+                    slug = kb._normalize_board_slug(path.parent.name)
+                except ValueError:
+                    continue
+                if slug and path.is_file():
+                    targets.append((slug, path))
+
+    results = []
+    for board, db_path in targets:
+        with kb.connect_closing(db_path=db_path) as conn:
+            board_results = kb.backfill_notify_sub_user_ids(
+                conn, _resolve,
+                dry_run=bool(getattr(args, "dry_run", False)),
+                evidence_unavailable=evidence_unavailable,
+            )
+        for row in board_results:
+            row["board"] = board
+        results.extend(board_results)
 
     repaired = [r for r in results if r["action"] == "backfilled"]
     skipped = [r for r in results if r["action"] != "backfilled"]
@@ -3471,7 +3529,8 @@ def _cmd_notify_repair(args: argparse.Namespace) -> int:
     print(f"{verb} {len(repaired)} of {len(results)} incomplete subscription(s).")
     for row in repaired:
         thr = f":{row['thread_id']}" if row.get("thread_id") else ""
-        print(f"  {row['task_id']:12s} {row['platform']}:{row['chat_id']}{thr}"
+        print(f"  [{row['board']}] {row['task_id']:12s} "
+              f"{row['platform']}:{row['chat_id']}{thr}"
               f"  -> user_id={row['user_id']}"
               f" user_id_alt={row['user_id_alt']} scope_id={row['scope_id']}"
               f" ({', '.join(row['backfilled_fields'])})")
@@ -3486,7 +3545,8 @@ def _cmd_notify_repair(args: argparse.Namespace) -> int:
             print("  chats remain on their legitimate shared per-chat session.")
         for row in skipped:
             thr = f":{row['thread_id']}" if row.get("thread_id") else ""
-            print(f"  {row['task_id']:12s} {row['platform']}:{row['chat_id']}{thr}"
+            print(f"  [{row['board']}] {row['task_id']:12s} "
+                  f"{row['platform']}:{row['chat_id']}{thr}"
                   f"  [{row['action']}]")
     return 0
 

@@ -98,3 +98,47 @@ def routing_key_carries_identity(
         parts.append(effective_thread)
     parts.append(participant)
     return key.endswith(":" + ":".join(parts))
+
+
+def routing_key_is_bare_lane(
+    session_key: Any,
+    *,
+    platform: Any,
+    chat_id: Any,
+    chat_type: Any,
+    thread_id: Optional[Any] = None,
+    prospective_thread_id: Optional[Any] = None,
+    scope_id: Optional[Any] = None,
+) -> bool:
+    """Whether ``session_key`` is the participant-less key for a group lane.
+
+    A bare group/channel key is the phantom produced when an identity-less
+    notify subscription is woken. DMs and threads are excluded: their canonical
+    keys legitimately omit a participant, so they are not phantom evidence.
+    """
+
+    def clean(value: Any) -> str:
+        return str(value or "").strip()
+
+    key = clean(session_key)
+    platform_value, chat, kind, thread = effective_routing_lane(
+        platform=platform,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        thread_id=thread_id,
+        prospective_thread_id=prospective_thread_id,
+    )
+    if (
+        not key
+        or not platform_value
+        or not chat
+        or kind not in {"group", "channel"}
+        or thread
+    ):
+        return False
+    parts = [platform_value, kind]
+    scope = clean(scope_id) if platform_value == "slack" else ""
+    if scope:
+        parts.append(scope)
+    parts.append(chat)
+    return key.endswith(":" + ":".join(parts))

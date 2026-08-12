@@ -129,6 +129,163 @@ def test_backfills_the_unambiguous_creator_identity(kanban_home, monkeypatch, ca
     assert "Backfilled 1 of 1" in capsys.readouterr().out
 
 
+def test_backfills_when_creator_is_the_bare_phantom_key(
+    kanban_home, monkeypatch,
+):
+    """A bare creator key plus one per-user key is not two humans. The bare
+    route is the previously minted phantom and must not poison repair forever."""
+    bare_key = f"agent:main:discord:group:{CHAT}"
+    user_key = f"{bare_key}:{USER}"
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="self-sustaining phantom", assignee="worker",
+        )
+        _sub(conn, tid, creator_session_id=bare_key)
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(kc, "_routing_participant_index", lambda: {
+        ("discord", CHAT, "group", ""): {
+            ("", "", "", bare_key),
+            (USER, "", "", user_key),
+        },
+    })
+
+    assert _run() == 0
+    assert _user_id_of(tid) == USER
+
+
+def test_real_routing_index_backfills_past_an_existing_bare_phantom(
+    kanban_home, monkeypatch, tmp_path,
+):
+    import hermes_state
+
+    bare_key = f"agent:main:discord:group:{CHAT}"
+    user_key = f"{bare_key}:{USER}"
+    state_path = tmp_path / "routing-state.db"
+    real_db = hermes_state.SessionDB(db_path=state_path)
+    for session_key, user_id in ((bare_key, ""), (user_key, USER)):
+        real_db.save_gateway_routing_entry(
+            session_key,
+            json.dumps({
+                "origin": {
+                    "platform": "discord",
+                    "chat_id": CHAT,
+                    "chat_type": "group",
+                    "user_id": user_id,
+                },
+            }),
+        )
+    real_db.close()
+    real_session_db = hermes_state.SessionDB
+    monkeypatch.setattr(
+        hermes_state, "SessionDB", lambda: real_session_db(db_path=state_path),
+    )
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="real phantom", assignee="worker")
+        _sub(conn, tid, creator_session_id=bare_key)
+    finally:
+        conn.close()
+
+    assert _run() == 0
+    assert _user_id_of(tid) == USER
+
+
+def test_bare_phantom_plus_two_humans_is_not_repaired(
+    kanban_home, monkeypatch,
+):
+    bare_key = f"agent:main:discord:group:{CHAT}"
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="real ambiguity", assignee="worker")
+        _sub(conn, tid, creator_session_id=bare_key)
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(kc, "_routing_participant_index", lambda: {
+        ("discord", CHAT, "group", ""): {
+            ("", "", "", bare_key),
+            (USER, "", "", f"{bare_key}:{USER}"),
+            (OTHER_USER, "", "", f"{bare_key}:{OTHER_USER}"),
+        },
+    })
+
+    assert _run() == 0
+    assert not _user_id_of(tid)
+
+
+def test_default_repair_sweeps_every_board_database(
+    kanban_home, monkeypatch,
+):
+    task_ids: dict[str, str] = {}
+    for board in ("default", "ban-forensics", "session-scope-fixes"):
+        kb.init_db(board=board)
+        with kb.connect_closing(board=board) as conn:
+            tid = kb.create_task(
+                conn,
+                title=f"legacy row on {board}",
+                assignee="worker",
+            )
+            _sub(conn, tid, creator_session_id=CREATOR_SESSION)
+            task_ids[board] = tid
+
+    _routing(monkeypatch, {("discord", CHAT): [USER]})
+    assert _run() == 0
+
+    for board, tid in task_ids.items():
+        with kb.connect_closing(board=board) as conn:
+            sub = kb.list_notify_subs(conn, tid)[0]
+        assert sub["user_id"] == USER, board
+
+
+def test_explicit_board_repairs_only_that_board(kanban_home, monkeypatch):
+    task_ids: dict[str, str] = {}
+    for board in ("default", "ban-forensics"):
+        kb.init_db(board=board)
+        with kb.connect_closing(board=board) as conn:
+            tid = kb.create_task(
+                conn, title=f"targeting {board}", assignee="worker",
+            )
+            _sub(conn, tid)
+            task_ids[board] = tid
+
+    _routing(monkeypatch, {("discord", CHAT): [USER]})
+    with kb.scoped_current_board("ban-forensics"):
+        assert _run(board="ban-forensics") == 0
+
+    with kb.connect_closing(board="default") as conn:
+        default_sub = kb.list_notify_subs(conn, task_ids["default"])[0]
+    with kb.connect_closing(board="ban-forensics") as conn:
+        target_sub = kb.list_notify_subs(conn, task_ids["ban-forensics"])[0]
+    assert not default_sub["user_id"]
+    assert target_sub["user_id"] == USER
+
+
+def test_command_sweep_does_not_initialize_a_metadata_only_active_board(
+    kanban_home, monkeypatch,
+):
+    empty_board = "metadata-only"
+    empty_dir = kb.board_dir(empty_board)
+    empty_dir.mkdir(parents=True)
+    (empty_dir / "board.json").write_text("{}", encoding="utf-8")
+    empty_db = empty_dir / "kanban.db"
+    assert not empty_db.exists()
+    monkeypatch.setattr(kb, "get_current_board", lambda: empty_board)
+    monkeypatch.setattr(kc, "_routing_participant_index", lambda: {})
+
+    args = argparse.Namespace(
+        kanban_action="notify-repair",
+        board=None,
+        dry_run=False,
+        json=False,
+    )
+    assert kc.kanban_command(args) == 0
+    assert not empty_db.exists()
+
+
 def test_dry_run_reports_without_writing(kanban_home, monkeypatch, capsys):
     conn = kb.connect()
     try:

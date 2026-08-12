@@ -161,6 +161,54 @@ def test_identity_less_wake_lands_in_the_humans_own_session(env, monkeypatch):
     assert human.session_key.endswith(f":{HUMAN}")
 
 
+def test_existing_bare_phantom_does_not_poison_the_only_human_identity(
+    env, monkeypatch,
+):
+    """Regression: once the first bad wake has created the bare group key, the
+    routing index contains both that non-human phantom and the human's per-user
+    key. The bare key must not turn one human into ambiguous evidence forever."""
+    store = env
+    human = _human_turn(store)
+    phantom = store.get_or_create_session(SessionSource(
+        platform=Platform.DISCORD,
+        chat_id=CHAT,
+        chat_type="group",
+    ))
+    assert phantom.session_key != human.session_key
+    assert phantom.session_key.endswith(CHAT)
+    _subscribed_completed_task(phantom.session_key)
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(store, adapter)
+    source = _wake_source(monkeypatch, store, adapter, runner)
+
+    assert source.user_id == HUMAN
+    woken = _resolve(store, source)
+    assert woken.session_id == human.session_id
+
+
+def test_bare_phantom_plus_two_humans_remains_ambiguous(env, monkeypatch):
+    """Ignoring one bare phantom must not turn a genuinely shared chat into a
+    guessed participant: bare + two humans is still ambiguous."""
+    store = env
+    a = _human_turn(store, user_id=HUMAN)
+    b = _human_turn(store, user_id=OTHER_HUMAN)
+    phantom = store.get_or_create_session(SessionSource(
+        platform=Platform.DISCORD,
+        chat_id=CHAT,
+        chat_type="group",
+    ))
+    _subscribed_completed_task(phantom.session_key)
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(store, adapter)
+    source = _wake_source(monkeypatch, store, adapter, runner)
+
+    assert source.user_id is None
+    woken = _resolve(store, source)
+    assert woken.session_key not in {a.session_key, b.session_key}
+
+
 @pytest.mark.parametrize(("platform", "participant_alt"), [
     (Platform.SIGNAL, "uuid-1174-3129"),
     (Platform.FEISHU, "union-1174-3129"),
@@ -351,6 +399,19 @@ def test_prospective_thread_origin_is_not_group_lane_evidence(env):
         "group",
         prospective.session_key,
     ) == set()
+
+
+@pytest.mark.parametrize("chat_type", ["dm", "thread", "home"])
+def test_only_bare_group_or_channel_keys_are_phantom_evidence(chat_type):
+    from gateway.routing_identity import routing_key_is_bare_lane
+
+    assert not routing_key_is_bare_lane(
+        f"agent:main:discord:{chat_type}:{CHAT}",
+        platform=Platform.DISCORD,
+        chat_id=CHAT,
+        chat_type=chat_type,
+        thread_id="thread-1" if chat_type == "thread" else None,
+    )
 
 
 def test_the_unfixed_path_would_have_minted_a_bare_key(env):
