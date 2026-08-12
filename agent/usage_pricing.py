@@ -322,6 +322,17 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     ),
     (
         "xai",
+        "grok-4.6",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("6.00"),
+        cache_read_cost_per_million=Decimal("0.50"),
+        source="official_docs_snapshot",
+        source_url="https://openrouter.ai/x-ai/grok-4.6",
+        pricing_version="xai-pricing-2026-08",
+    ),
+    (
+        "xai",
         "grok-4.5",
     ): PricingEntry(
         input_cost_per_million=Decimal("2.00"),
