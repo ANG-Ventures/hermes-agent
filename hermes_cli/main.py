@@ -689,6 +689,27 @@ def _apply_profile_override() -> None:
 
 _apply_profile_override()
 
+# ---------------------------------------------------------------------------
+# Kanban worker authority — consume the dispatcher's single-use grant.
+#
+# The dispatcher stamps HERMES_KANBAN_OWNER_PID=pending on the worker it
+# spawns; the FIRST hermes CLI process to boot binds it to its own pid. This
+# must run before anything resolves the kanban toolset, and before this process
+# can spawn children of its own, so that only the dispatcher's actual worker
+# is ever authorized. Ordinary nested `hermes` processes started later from
+# that worker inherit a pid that is not theirs and are refused.
+#
+# Best-effort by design: a trimmed install without the agent package must still
+# start a normal CLI. Absent the marker the predicate fails open, so this is a
+# no-op for every non-worker invocation.
+# ---------------------------------------------------------------------------
+try:
+    from agent.delegation_context import claim_kanban_worker_authority
+
+    claim_kanban_worker_authority()
+except Exception:
+    pass
+
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 from hermes_cli.config import get_hermes_home

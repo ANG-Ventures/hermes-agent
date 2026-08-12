@@ -215,6 +215,16 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     tasks or reopen blocked ones. Workers are narrowly scoped to their
     one task.
 
+    Presence of ``HERMES_KANBAN_TASK`` proves a grant exists in this process
+    TREE, not that it belongs to the process reading it: ordinary child
+    processes inherit the whole ``HERMES_KANBAN_*`` set, as do cron jobs fired
+    in-process from a worker. Matching ``tid == env_tid`` is therefore not
+    sufficient — an inheriting child matches trivially, which is how a nested
+    ``hermes chat`` completed its parent's card (2026-08-12). Non-owners are
+    refused outright: the schema gate already hides these tools from them, and
+    this is the write-side choke point that holds even when a handler is
+    invoked directly.
+
     Returns ``None`` when the call is allowed, or a tool-error string
     when it must be rejected. Callers should ``return`` the error
     verbatim.
@@ -223,6 +233,14 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     if not env_tid:
         # Orchestrator or CLI context — no task-scope restriction.
         return None
+    if not _is_dispatcher_owned_worker():
+        return tool_error(
+            f"refusing to mutate {tid}: this process inherited the Kanban "
+            f"environment for task {env_tid} but does not own it. Worker "
+            "authority belongs to the single dispatcher-spawned process and "
+            "is not inherited by nested processes, delegate_task children, or "
+            "in-process cron jobs. Report results to the owning worker instead."
+        )
     if tid != env_tid:
         return tool_error(
             f"worker is scoped to task {env_tid}; refusing to mutate "

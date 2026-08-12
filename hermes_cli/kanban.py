@@ -737,6 +737,33 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_unblock.add_argument("task_ids", nargs="+")
 
+    p_reopen = sub.add_parser(
+        "reopen",
+        help=(
+            "Void a FALSE completion on a done task and requeue it "
+            "(recovery path when a non-owner wrote a terminal result)"
+        ),
+    )
+    p_reopen.add_argument("task_id")
+    p_reopen.add_argument(
+        "reason",
+        nargs="+",
+        help="Required audit-trail reason (recorded on the task_events row)",
+    )
+    p_reopen.add_argument(
+        "--to",
+        dest="to_status",
+        choices=("ready", "todo"),
+        default="ready",
+        help="Status to return the task to (default: ready)",
+    )
+    p_reopen.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        help="Emit machine-readable JSON result",
+    )
+
     p_promote = sub.add_parser(
         "promote",
         help="Manually move one or more todo/blocked tasks to ready (recovery path)",
@@ -1200,6 +1227,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
+            "reopen":   _cmd_reopen,
             "promote":  _cmd_promote,
             "triage-resolve": _cmd_triage_resolve,
             "archive":  _cmd_archive,
@@ -1267,6 +1295,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "block",
     "schedule",
     "unblock",
+    "reopen",
     "promote",
     "triage-resolve",
     "archive",
@@ -2699,6 +2728,42 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+def _cmd_reopen(args: argparse.Namespace) -> int:
+    """Reverse a false completion so the real work can be re-dispatched."""
+    reason = " ".join(args.reason).strip() if args.reason else ""
+    author = _profile_author()
+    as_json = getattr(args, "json", False)
+    to_status = getattr(args, "to_status", "ready")
+
+    with kb.connect_closing() as conn:
+        ok, err = kb.reopen_task(
+            conn,
+            args.task_id,
+            actor=author,
+            reason=reason,
+            to_status=to_status,
+        )
+
+    if as_json:
+        print(json.dumps({
+            "task_id": args.task_id,
+            "reopened": ok,
+            "to_status": to_status,
+            "reason": reason,
+            "error": err,
+        }, indent=2, ensure_ascii=False))
+        return 0 if ok else 1
+
+    if not ok:
+        print(f"cannot reopen {args.task_id}: {err}", file=sys.stderr)
+        return 1
+    print(
+        f"Reopened {args.task_id} -> {to_status} "
+        f"(previous completion voided): {reason}"
+    )
+    return 0
 
 
 def _cmd_promote(args: argparse.Namespace) -> int:
