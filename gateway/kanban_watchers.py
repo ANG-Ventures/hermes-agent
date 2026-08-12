@@ -344,9 +344,28 @@ class GatewayKanbanWatchersMixin:
                 platform_value, want_chat, exc,
             )
             return set()
+        creator_found: set[_WakeRoutingIdentity] = set()
+        # ``tasks.session_id`` holds the creating turn's session KEY for
+        # gateway-created tasks (always contains ':') but a RAW session id for
+        # worker/CLI-created ones (never does). #568 compared it against
+        # routing-index keys unconditionally, so every worker card got empty
+        # evidence and the #562 prevention became dead code (the 2026-08-12
+        # phantom regression). Discriminate:
+        # * key-shaped creator -> strict binding stands (#568 intent): only
+        #   the creator's own entry is evidence; a creator entry without an
+        #   identity (the shared per-chat session) correctly yields none.
+        # * raw-id creator -> match entries by their session_id; when the
+        #   creator is unknown to the index (worker sessions never route),
+        #   fall back to the lane-wide exactly-one rule (#562), which still
+        #   refuses on 0 or >1 participants.
+        creator_is_key = ":" in want_creator_key
         for key, entry in entries.items():
-            if want_creator_key and str(key) != want_creator_key:
-                continue
+            is_creator = bool(want_creator_key) and (
+                str(key) == want_creator_key
+                if creator_is_key
+                else str(getattr(entry, "session_id", "") or "")
+                == want_creator_key
+            )
             origin = getattr(entry, "origin", None)
             if origin is None:
                 continue
@@ -398,8 +417,18 @@ class GatewayKanbanWatchersMixin:
                 scope_id=scope_id,
             ):
                 continue
-            found.add(_WakeRoutingIdentity(user_id, user_id_alt, scope_id))
-        return found
+            identity = _WakeRoutingIdentity(user_id, user_id_alt, scope_id)
+            found.add(identity)
+            if is_creator:
+                creator_found.add(identity)
+        if creator_is_key:
+            # Gateway-created task: the creator's own entry is the ONLY valid
+            # evidence (#568). A shared-session creator yields none — correct.
+            return creator_found
+        # Worker/CLI-created (raw id) or unstamped task: bind to the creator's
+        # entry when the index knows it, else the lane-wide exactly-one rule
+        # (#562) — the caller still refuses on 0 or >1.
+        return creator_found or found
 
     def _owns_kanban_dispatcher_lock(self) -> bool:
         """Return whether this gateway currently owns the singleton lock."""

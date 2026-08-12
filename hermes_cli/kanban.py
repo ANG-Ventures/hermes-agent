@@ -926,6 +926,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--dry-run", action="store_true",
         help="Report what would change without writing",
     )
+    p_nrepair.add_argument(
+        "--all-boards", action="store_true",
+        help="Sweep every board DB (default + boards/*/kanban.db), "
+             "not just the active board",
+    )
     p_nrepair.add_argument("--json", action="store_true")
 
     # --- log ---
@@ -3282,8 +3287,14 @@ def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
 
 _RoutingIdentity = tuple[str, str, str]
 """``(user_id, user_id_alt, scope_id)`` from one durable routing entry."""
-_RoutingEvidence = tuple[str, str, str, str]
-"""Complete identity plus the exact creator session key that proves it."""
+_RoutingEvidence = tuple[str, str, str, str, str]
+"""Complete identity plus the creator's session key AND session id.
+
+``tasks.session_id`` holds the creating turn's session KEY for
+gateway-created tasks but a raw session ID for worker/CLI-created ones, so
+evidence must carry both representations to bind either kind of creator
+(the 2026-08-12 phantom regression: key-only equality returned empty
+evidence for every worker card)."""
 _RoutingLane = tuple[str, str, str, str]
 """``(platform, chat_id, chat_type, thread_id)`` evidence boundary."""
 
@@ -3386,6 +3397,7 @@ def _routing_participant_index(
             )
             index.setdefault(lane, set()).add((
                 user_id, user_id_alt, scope_id, session_key,
+                str(entry.get("session_id") or "").strip(),
             ))
     finally:
         try:
@@ -3412,13 +3424,33 @@ def _cmd_notify_repair(args: argparse.Namespace) -> int:
         thread_id = str(row.get("thread_id") or "").strip()
         creator_session_id = str(row.get("creator_session_id") or "").strip()
         if not creator_session_id:
+            # No creator provenance at all: repair is a PERMANENT write, so
+            # never adopt on lane evidence alone (negative-control contract —
+            # cron/CLI/home-channel origins are legitimately user-less).
             return None
         evidence = set((index or {}).get(
             (platform, chat_id, chat_type, thread_id), set()
         ))
-        candidates = {
-            item[:3] for item in evidence if item[3] == creator_session_id
-        }
+        # ``tasks.session_id`` holds the creating turn's session KEY for
+        # gateway-created tasks (always contains ':') but a RAW session id
+        # for worker/CLI-created ones (never does). #568 compared it against
+        # index keys unconditionally, so worker cards always yielded empty
+        # evidence (the 2026-08-12 phantom regression). Discriminate:
+        # key-shaped -> strict creator binding (the #568 intent); raw-id or
+        # unstamped -> bind when the index knows the creator, else fall back
+        # to the lane-wide evidence; the exactly-one rule below still
+        # refuses on 0 or >1 candidates either way.
+        if ":" in creator_session_id:
+            bound = {
+                item for item in evidence if item[3] == creator_session_id
+            }
+        else:
+            creator_bound = {
+                item for item in evidence
+                if creator_session_id and item[4] == creator_session_id
+            }
+            bound = creator_bound or evidence
+        candidates = {item[:3] for item in bound}
         for position, field in enumerate(("user_id", "user_id_alt", "scope_id")):
             existing = str(row.get(field) or "").strip()
             if existing:
@@ -3437,11 +3469,31 @@ def _cmd_notify_repair(args: argparse.Namespace) -> int:
             "scope_id": scope_id or None,
         }
 
-    with kb.connect_closing() as conn:
-        results = kb.backfill_notify_sub_user_ids(
-            conn, _resolve, dry_run=bool(getattr(args, "dry_run", False)),
-            evidence_unavailable=evidence_unavailable,
-        )
+    if getattr(args, "all_boards", False):
+        results = []
+        for meta in kb.list_boards():
+            slug = str(meta.get("slug") or "").strip()
+            if not slug:
+                continue
+            try:
+                with kb.connect_closing(board=slug) as conn:
+                    board_rows = kb.backfill_notify_sub_user_ids(
+                        conn, _resolve,
+                        dry_run=bool(getattr(args, "dry_run", False)),
+                        evidence_unavailable=evidence_unavailable,
+                    )
+            except Exception as exc:
+                print(f"  (board {slug!r}: skipped — {exc})", file=sys.stderr)
+                continue
+            for r in board_rows:
+                r["board"] = slug
+            results.extend(board_rows)
+    else:
+        with kb.connect_closing() as conn:
+            results = kb.backfill_notify_sub_user_ids(
+                conn, _resolve, dry_run=bool(getattr(args, "dry_run", False)),
+                evidence_unavailable=evidence_unavailable,
+            )
 
     repaired = [r for r in results if r["action"] == "backfilled"]
     skipped = [r for r in results if r["action"] != "backfilled"]
