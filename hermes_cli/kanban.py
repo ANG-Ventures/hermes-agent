@@ -3481,6 +3481,13 @@ def _cmd_notify_repair(args: argparse.Namespace) -> int:
     """
     index = _routing_participant_index()
     evidence_unavailable = index is None
+    try:
+        from gateway.routing_identity import (
+            creator_stamp_is_session_key as _stamp_is_key,
+        )
+    except Exception:  # pragma: no cover - same guard as the index import
+        def _stamp_is_key(stamp):
+            return ":" in str(stamp or "")
 
     def _resolve(row: dict) -> "dict[str, str | None] | None":
         platform = str(row.get("platform") or "").strip().lower()
@@ -3505,7 +3512,7 @@ def _cmd_notify_repair(args: argparse.Namespace) -> int:
         # unstamped -> bind when the index knows the creator, else fall back
         # to the lane-wide evidence; the exactly-one rule below still
         # refuses on 0 or >1 candidates either way.
-        if ":" in creator_session_id:
+        if _stamp_is_key(creator_session_id):
             bound = {
                 item for item in evidence if item[3] == creator_session_id
             }
