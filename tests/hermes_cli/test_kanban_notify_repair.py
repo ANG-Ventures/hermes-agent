@@ -317,13 +317,15 @@ def test_real_routing_index_repairs_alt_key_and_scope_on_a_named_legacy_row(
         hermes_state, "SessionDB", lambda: real_session_db(db_path=state_path),
     )
     assert kc._routing_participant_index() == {
-        ("signal", CHAT, "group", ""): {(USER, alt_id, scope_id, creator_key)},
+        ("signal", CHAT, "group", ""): {
+            (USER, alt_id, scope_id, creator_key, ""),
+        },
         ("signal", CHAT, "thread", "42"): {(
             USER, "uuid-thread-user", "",
-            f"agent:main:signal:thread:{CHAT}:42:uuid-thread-user",
+            f"agent:main:signal:thread:{CHAT}:42:uuid-thread-user", "",
         )},
         ("signal", CHAT, "thread", "99"): {(
-            USER, "uuid-prospective-user", "", prospective_key,
+            USER, "uuid-prospective-user", "", prospective_key, "",
         )},
     }
 
