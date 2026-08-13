@@ -20,6 +20,7 @@ from typing import Any, Callable, Iterable, NamedTuple, Optional
 
 from agent.i18n import t
 from gateway.routing_identity import (
+    creator_stamp_is_session_key,
     effective_routing_lane,
     routing_key_carries_identity,
 )
@@ -358,7 +359,7 @@ class GatewayKanbanWatchersMixin:
         #   creator is unknown to the index (worker sessions never route),
         #   fall back to the lane-wide exactly-one rule (#562), which still
         #   refuses on 0 or >1 participants.
-        creator_is_key = ":" in want_creator_key
+        creator_is_key = creator_stamp_is_session_key(want_creator_key)
         for key, entry in entries.items():
             is_creator = bool(want_creator_key) and (
                 str(key) == want_creator_key
