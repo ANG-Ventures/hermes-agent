@@ -7870,6 +7870,26 @@ DEFAULT_FAILURE_LIMIT = 2
 # Legacy alias — callers / tests still reference the old name.
 DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
 
+# A blocked card with a recent handoff can still own unmerged files. Keep it
+# in the pre-dispatch collision scan for one week; older blocked cards are too
+# stale to be useful collision evidence and create false-positive noise.
+DISPATCH_COLLISION_RECENT_BLOCKED_SECONDS = 7 * 24 * 60 * 60
+_DISPATCH_CHANGED_FILES_KEY_RE = re.compile(r"[\"']changed_files[\"']\s*:")
+_DISPATCH_CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
+_DISPATCH_PATH_TOKEN_RE = re.compile(
+    r"(?<![\w@])(?:~?/|\.{1,2}/|(?:[A-Za-z0-9_.-]+/)+)"
+    r"[A-Za-z0-9_.@%+=~/-]+(?::\d+(?::\d+)?)?"
+)
+_DISPATCH_BARE_FILE_RE = re.compile(
+    r"(?<![\w./-])[A-Za-z0-9_.-]+\.[A-Za-z][A-Za-z0-9_-]*"
+    r"(?::\d+(?::\d+)?)?"
+)
+_DISPATCH_EXTENSIONLESS_PATH_ROOTS = {
+    "app", "apps", "bin", "config", "configs", "docs", "gateway",
+    "hermes_cli", "lib", "packages", "plugins", "scripts", "skills-shared",
+    "src", "templates", "tests", "tools", "website",
+}
+
 # Max bytes to keep in a single worker log file. The dispatcher truncates
 # and rotates on spawn if the file is larger than this at spawn time.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
@@ -8269,6 +8289,24 @@ class DispatchResult:
     sat idle for hours behind a triaged parent and nobody was told. Surfacing
     the pairs makes the stranding LOUD; ``hermes kanban triage-resolve`` is the
     exit."""
+    collision_warnings: list[tuple[str, str, list[str]]] = field(default_factory=list)
+    """Warning-only file overlaps found before spawn, as
+    ``(new_task_id, existing_task_id, overlapping_paths)`` triples. The
+    dispatcher still spawns the new task; this bucket makes the collision
+    visible without turning legitimate shared-file work into an approval
+    gate."""
+    collision_scope_unknown: list[str] = field(default_factory=list)
+    """Task ids whose body exposed no explicit file path, so the dispatcher
+    could not compare their likely scope. This is reported rather than
+    silently presenting the collision scan as complete."""
+    collision_scope_unreported: list[tuple[str, list[str]]] = field(default_factory=list)
+    """``(new_task_id, existing_task_ids)`` entries for in-flight or recently
+    blocked cards that reported no ``changed_files``. The scan is intentionally
+    partial in this case and says so rather than guessing from prose."""
+    collision_check_failed: list[str] = field(default_factory=list)
+    """Task ids whose warning-only collision check raised unexpectedly. The
+    failure is logged loudly and dispatch continues (fail-open), preserving
+    the rule that this diagnostic must never become an approval gate."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -9659,6 +9697,346 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def _normalize_dispatch_file_path(value: Any) -> Optional[str]:
+    """Return a cheap, filesystem-free path representation for comparison."""
+    if not isinstance(value, str):
+        return None
+    path = value.strip().strip("`'\"<>()[]{}").rstrip(",;")
+    if not path or any(ch.isspace() for ch in path) or "://" in path:
+        return None
+    path = path.replace("\\", "/")
+    path = re.sub(r":\d+(?::\d+)?$", "", path)
+    path = re.sub(r"#L\d+(?:-L\d+)?$", "", path)
+    while "//" in path:
+        path = path.replace("//", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    parts = [part for part in path.split("/") if part not in {"", ".", "~"}]
+    if not parts:
+        return None
+    leaf = parts[-1]
+    # Extensionless paths are accepted only when they have a directory shape.
+    # This keeps real script paths such as scripts/claude-cpx while rejecting
+    # lane vocabulary such as APX/BPX as fake file scope.
+    if "." not in leaf:
+        has_explicit_root = value.strip().startswith(("/", "~/", "./", "../"))
+        if (
+            len(parts) < 2
+            or any(part.isupper() for part in parts)
+            or (
+                not has_explicit_root
+                and parts[0] not in _DISPATCH_EXTENSIONLESS_PATH_ROOTS
+            )
+        ):
+            return None
+    return path
+
+
+def _extract_explicit_dispatch_file_paths(body: Optional[str]) -> set[str]:
+    """Extract only explicit path-like tokens from a new card body.
+
+    This deliberately does not infer files from prose or symbols. Partial
+    coverage is preferable to a broad heuristic that creates false confidence.
+    """
+    text = body or ""
+    candidates: list[str] = []
+    candidates.extend(match.group(1) for match in _DISPATCH_CODE_SPAN_RE.finditer(text))
+    candidates.extend(match.group(0) for match in _DISPATCH_PATH_TOKEN_RE.finditer(text))
+    candidates.extend(match.group(0) for match in _DISPATCH_BARE_FILE_RE.finditer(text))
+    return {
+        normalized
+        for candidate in candidates
+        if (normalized := _normalize_dispatch_file_path(candidate)) is not None
+    }
+
+
+def _changed_files_from_value(value: Any) -> set[str]:
+    if not isinstance(value, (list, tuple)):
+        return set()
+    return {
+        normalized
+        for item in value
+        if (normalized := _normalize_dispatch_file_path(item)) is not None
+    }
+
+
+def _extract_reported_changed_files(text: Optional[str]) -> set[str]:
+    """Read structured ``changed_files`` arrays from handoff comment text."""
+    if not text:
+        return set()
+    decoder = json.JSONDecoder()
+    files: set[str] = set()
+    for match in _DISPATCH_CHANGED_FILES_KEY_RE.finditer(text):
+        tail = text[match.end():].lstrip()
+        try:
+            value, _end = decoder.raw_decode(tail)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        files.update(_changed_files_from_value(value))
+    return files
+
+
+def _load_dispatch_collision_scopes(
+    conn: sqlite3.Connection,
+) -> dict[str, set[str]]:
+    """Load reported file scopes for active/recently-blocked cards in 3 reads."""
+    cutoff = int(time.time()) - DISPATCH_COLLISION_RECENT_BLOCKED_SECONDS
+    rows = conn.execute(
+        "SELECT t.id FROM tasks t "
+        "WHERE t.status IN ('running', 'review') "
+        "OR (t.status = 'blocked' AND EXISTS ("
+        "    SELECT 1 FROM task_events e "
+        "    WHERE e.task_id = t.id AND e.kind = 'blocked' "
+        "      AND e.created_at >= ?"
+        "))",
+        (cutoff,),
+    ).fetchall()
+    scopes: dict[str, set[str]] = {row["id"]: set() for row in rows}
+    if not scopes:
+        return scopes
+    for row in conn.execute(
+        "SELECT r.task_id, r.metadata FROM task_runs r "
+        "JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.metadata IS NOT NULL AND ("
+        "    t.status IN ('running', 'review') "
+        "    OR (t.status = 'blocked' AND EXISTS ("
+        "        SELECT 1 FROM task_events e "
+        "        WHERE e.task_id = t.id AND e.kind = 'blocked' "
+        "          AND e.created_at >= ?"
+        "    ))"
+        ")",
+        (cutoff,),
+    ):
+        try:
+            metadata = json.loads(row["metadata"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(metadata, dict):
+            scope = scopes.get(row["task_id"])
+            if scope is None:
+                continue
+            scope.update(
+                _changed_files_from_value(metadata.get("changed_files"))
+            )
+    for row in conn.execute(
+        "SELECT c.task_id, c.body FROM task_comments c "
+        "JOIN tasks t ON t.id = c.task_id "
+        "WHERE t.status IN ('running', 'review') "
+        "OR (t.status = 'blocked' AND EXISTS ("
+        "    SELECT 1 FROM task_events e "
+        "    WHERE e.task_id = t.id AND e.kind = 'blocked' "
+        "      AND e.created_at >= ?"
+        "))",
+        (cutoff,),
+    ):
+        scope = scopes.get(row["task_id"])
+        if scope is not None:
+            scope.update(_extract_reported_changed_files(row["body"]))
+    return scopes
+
+
+def _dispatch_paths_overlap(left: str, right: str) -> bool:
+    """Compare normalized paths, allowing repo-relative suffix matches."""
+    left_parts = tuple(
+        part for part in left.split("/") if part not in {"", ".", "~"}
+    )
+    right_parts = tuple(
+        part for part in right.split("/") if part not in {"", ".", "~"}
+    )
+    if not left_parts or not right_parts:
+        return False
+    if left_parts == right_parts:
+        return True
+    # A bare filename such as ``config.py`` is too weak to correlate with
+    # every reported ``*/config.py`` path on the board. Exact bare-name
+    # equality remains useful, but suffix matching needs directory context.
+    if len(left_parts) < 2 or len(right_parts) < 2:
+        return False
+    short, long = (
+        (left_parts, right_parts)
+        if len(left_parts) <= len(right_parts)
+        else (right_parts, left_parts)
+    )
+    return long[-len(short):] == short
+
+
+def _dispatch_event_payload_seen(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kind: str,
+    payload: dict,
+) -> bool:
+    for row in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 20",
+        (task_id, kind),
+    ):
+        try:
+            if json.loads(row["payload"] or "null") == payload:
+                return True
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return False
+
+
+def _insert_dispatcher_comment(
+    conn: sqlite3.Connection,
+    task_id: str,
+    body: str,
+) -> None:
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO task_comments "
+        "(task_id, author, body, run_id, session_ref, created_at) "
+        "VALUES (?, 'kanban-dispatcher', ?, NULL, NULL, ?)",
+        (task_id, body, now),
+    )
+    _append_event(
+        conn,
+        task_id,
+        "commented",
+        {"author": "kanban-dispatcher", "len": len(body)},
+    )
+
+
+def _record_dispatch_collision_warning(
+    conn: sqlite3.Connection,
+    task_id: str,
+    collisions: list[tuple[str, list[str]]],
+) -> None:
+    payload = {
+        "collisions": [
+            {"task_id": other_id, "paths": paths}
+            for other_id, paths in collisions
+        ]
+    }
+    with write_txn(conn):
+        if _dispatch_event_payload_seen(
+            conn, task_id, "dispatch_collision_warning", payload
+        ):
+            return
+        details = "; ".join(
+            f"{other_id} on {', '.join(paths)}"
+            for other_id, paths in collisions
+        )
+        _insert_dispatcher_comment(
+            conn,
+            task_id,
+            "⚠️ DISPATCH COLLISION WARNING: "
+            f"{task_id} overlaps {details}. Dispatch continues by design; "
+            "coordinate before editing the shared file(s).",
+        )
+        _append_event(conn, task_id, "dispatch_collision_warning", payload)
+        for other_id, paths in collisions:
+            peer_payload = {"task_id": task_id, "paths": paths}
+            if _dispatch_event_payload_seen(
+                conn, other_id, "dispatch_collision_peer_warning", peer_payload
+            ):
+                continue
+            _insert_dispatcher_comment(
+                conn,
+                other_id,
+                "⚠️ DISPATCH COLLISION WARNING: newly dispatching card "
+                f"{task_id} overlaps this card {other_id} on "
+                f"{', '.join(paths)}. Dispatch continues by design; "
+                "coordinate before editing the shared file(s).",
+            )
+            _append_event(
+                conn,
+                other_id,
+                "dispatch_collision_peer_warning",
+                peer_payload,
+            )
+
+
+def _record_dispatch_scope_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kind: str,
+    payload: dict,
+) -> None:
+    with write_txn(conn):
+        if not _dispatch_event_payload_seen(conn, task_id, kind, payload):
+            _append_event(conn, task_id, kind, payload)
+
+
+def _check_dispatch_file_collisions(
+    conn: sqlite3.Connection,
+    result: DispatchResult,
+    *,
+    task_id: str,
+    body: Optional[str],
+    reported_scopes: Mapping[str, set[str]],
+    dry_run: bool,
+) -> None:
+    """Warn on reported file overlap without preventing dispatch."""
+    new_scope = _extract_explicit_dispatch_file_paths(body)
+    candidates = {
+        other_id: paths
+        for other_id, paths in reported_scopes.items()
+        if other_id != task_id
+    }
+    if not new_scope:
+        result.collision_scope_unknown.append(task_id)
+        _log.info(
+            "KANBAN DISPATCH SCOPE UNKNOWN: %s has no explicit file paths; "
+            "collision comparison was not possible",
+            task_id,
+        )
+        if not dry_run:
+            _record_dispatch_scope_event(
+                conn,
+                task_id,
+                "dispatch_scope_unknown",
+                {"reason": "no_explicit_file_paths"},
+            )
+        return
+
+    unreported = sorted(
+        other_id for other_id, paths in candidates.items() if not paths
+    )
+    if unreported:
+        result.collision_scope_unreported.append((task_id, unreported))
+        _log.info(
+            "KANBAN DISPATCH COLLISION CHECK PARTIAL: %s could not be compared "
+            "with cards lacking reported changed_files: %s",
+            task_id,
+            ", ".join(unreported),
+        )
+        if not dry_run:
+            _record_dispatch_scope_event(
+                conn,
+                task_id,
+                "dispatch_scope_partial",
+                {"unchecked_task_ids": unreported},
+            )
+
+    collisions: list[tuple[str, list[str]]] = []
+    for other_id, changed_files in candidates.items():
+        overlap = sorted(
+            changed_path
+            for changed_path in changed_files
+            if any(
+                _dispatch_paths_overlap(new_path, changed_path)
+                for new_path in new_scope
+            )
+        )
+        if overlap:
+            collisions.append((other_id, overlap))
+    collisions.sort(key=lambda item: item[0])
+    for other_id, paths in collisions:
+        result.collision_warnings.append((task_id, other_id, paths))
+        _log.warning(
+            "KANBAN DISPATCH COLLISION WARNING: %s overlaps %s on %s; "
+            "dispatch continues",
+            task_id,
+            other_id,
+            ", ".join(paths),
+        )
+    if collisions and not dry_run:
+        _record_dispatch_collision_warning(conn, task_id, collisions)
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -9829,7 +10207,7 @@ def _dispatch_once_locked(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, body FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -9847,6 +10225,11 @@ def _dispatch_once_locked(
         remaining = max_in_progress - in_progress
         if max_spawn is None or max_spawn > remaining:
             max_spawn = remaining
+    # Lazily populated only when a ready card reaches the point where it would
+    # actually spawn. A queue containing only unassigned, capped, guarded, or
+    # control-plane cards pays zero collision-scan queries on every idle tick.
+    reported_collision_scopes: Optional[dict[str, set[str]]] = None
+    collision_scope_load_failed = False
     spawned = 0
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
@@ -9992,6 +10375,34 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        if reported_collision_scopes is None and not collision_scope_load_failed:
+            try:
+                reported_collision_scopes = _load_dispatch_collision_scopes(conn)
+            except Exception:
+                collision_scope_load_failed = True
+                _log.exception(
+                    "KANBAN DISPATCH COLLISION CHECK FAILED OPEN: could not "
+                    "load reported scopes; dispatch continues"
+                )
+        if collision_scope_load_failed:
+            result.collision_check_failed.append(row["id"])
+        else:
+            try:
+                _check_dispatch_file_collisions(
+                    conn,
+                    result,
+                    task_id=row["id"],
+                    body=row["body"],
+                    reported_scopes=reported_collision_scopes or {},
+                    dry_run=dry_run,
+                )
+            except Exception:
+                result.collision_check_failed.append(row["id"])
+                _log.exception(
+                    "KANBAN DISPATCH COLLISION CHECK FAILED OPEN for %s; "
+                    "dispatch continues",
+                    row["id"],
+                )
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             # Increment per-profile counter even in dry_run so the cap
