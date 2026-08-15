@@ -508,6 +508,76 @@ class TestForgetVelocity:
 
 
 # ---------------------------------------------------------------------------
+# Pagination — by-filter resolution must see the FULL scope, not a server page
+# ---------------------------------------------------------------------------
+
+class _PagingClient:
+    """Simulates the self-hosted server: GET /memories returns a 20-row page
+    unless the caller passes limit=N (mem0-core get_all top_k=20 default)."""
+
+    PAGE = 20
+
+    def __init__(self, n=500, user_id="ace"):
+        self._store = {}
+        for i in range(n):
+            mid = f"m{i:04d}"
+            self._store[mid] = {"id": mid, "user_id": user_id,
+                                "memory": f"needle-{i}" if i == n - 1 else f"hay {i}"}
+
+    def get_all(self, filters=None, limit=None, **kwargs):
+        uid = (filters or {}).get("user_id")
+        items = [dict(m) for m in self._store.values()
+                 if uid is None or m["user_id"] == uid]
+        cap = int(limit) if limit else self.PAGE
+        return {"results": items[:cap]}
+
+    def get(self, memory_id):
+        return dict(self._store[memory_id])
+
+    def search(self, query=None, filters=None, **kwargs):
+        return {"results": []}
+
+    def update(self, memory_id, **kwargs):
+        self._store[memory_id].update({k: v for k, v in kwargs.items() if v is not None})
+        return dict(self._store[memory_id])
+
+    def delete(self, memory_id):
+        del self._store[memory_id]
+
+
+class TestByFilterPagination:
+    """Regression for the 2026-08-14 bug: _resolve_filter/_in_scope_total ran
+    over the server's default 20-row page, so forget-by-filter could NEVER
+    match a fact outside the most recent page, and the C8a mass-guard
+    denominator (total_in_scope) read 20 instead of the true store size."""
+
+    def test_resolve_filter_reaches_past_first_page(self, monkeypatch, tmp_path):
+        client = _PagingClient(n=500)
+        prov = _provider(monkeypatch, tmp_path, client)
+        # the needle is the LAST row — invisible on a 20-row page
+        matches = prov._resolve_filter(client, "needle-499")
+        assert len(matches) == 1, (
+            "by-filter resolution must list the full scope (limit=...), "
+            "not the server's 20-row default page")
+
+    def test_in_scope_total_is_store_size_not_page(self, monkeypatch, tmp_path):
+        client = _PagingClient(n=500)
+        prov = _provider(monkeypatch, tmp_path, client)
+        assert prov._in_scope_total(client) == 500
+
+    def test_client_without_limit_support_degrades_gracefully(self, monkeypatch, tmp_path):
+        """A client whose get_all ignores limit (old server) must not crash —
+        by-filter falls back to page-scope reach (documented degraded mode)."""
+        class _LegacyClient(_PagingClient):
+            def get_all(self, filters=None, **kwargs):  # swallows limit via kwargs
+                return super().get_all(filters=filters, limit=None)
+
+        client = _LegacyClient(n=500)
+        prov = _provider(monkeypatch, tmp_path, client)
+        assert prov._in_scope_total(client) == 20  # page-limited, but functional
+
+
+# ---------------------------------------------------------------------------
 # C9 — recall-hiding single choke point (source guard)
 # ---------------------------------------------------------------------------
 
@@ -524,7 +594,9 @@ class TestChokePointGuard:
         # Allowed unwrapped call sites: destructive internals that operate on the
         # RAW store on purpose (resolve/total/restore-history/_seed are not recall).
         ALLOW_SUBSTR = (
-            "self._unwrap_results(client.get_all(filters=self._read_filters()))",  # _resolve_filter / _in_scope_total raw scope
+            # _resolve_filter / _in_scope_total raw scope (full-store listing
+            # with the destructive limit — see _DESTRUCTIVE_LIST_LIMIT)
+            "self._unwrap_results(client.get_all(",
         )
         offenders = []
         for i, line in enumerate(lines):
