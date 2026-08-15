@@ -1192,6 +1192,57 @@ class TestLifecycleGuardDataArgumentExemption:
         check_gateway_lifecycle(prompt, str(script))
 
 
+class TestLifecycleGuardCdAwareResolution:
+    """`cd /dir && ./script` must resolve ./script against /dir, not the
+    original cwd. Reproduces the live false positive (Aug 2026): the gbrain
+    launcher at ~/gbrain/gbrain invoked as `cd ~/gbrain && ./gbrain ...`
+    resolved ./gbrain to the DIRECTORY ~/gbrain (non-regular file -> fail
+    closed) and hard-blocked every invocation."""
+
+    def _scan(self, command, **kwargs):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        return contains_gateway_lifecycle_command_or_referenced_script(
+            command, **kwargs
+        )
+
+    def test_launcher_named_like_its_directory_not_blocked(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        launcher = proj / "proj"
+        launcher.write_text("#!/usr/bin/env bash\nexec echo ok\n")
+        assert self._scan(f"cd {proj} && ./proj stats", cwd=str(tmp_path)) is False
+
+    def test_cd_then_unsafe_relative_script_still_blocked(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        bad = proj / "restart.sh"
+        bad.write_text("launchctl kickstart -k gui/501/ai.hermes.gateway\n")
+        assert self._scan(f"cd {proj} && bash ./restart.sh", cwd=str(tmp_path)) is True
+
+    def test_cd_relative_hop_chain_resolves(self, tmp_path):
+        (tmp_path / "a" / "b").mkdir(parents=True)
+        bad = tmp_path / "a" / "b" / "x.sh"
+        bad.write_text("hermes gateway restart\n")
+        assert self._scan("cd a && cd b && bash ./x.sh", cwd=str(tmp_path)) is True
+
+    def test_cd_dash_falls_back_to_untracked_cwd(self, tmp_path):
+        # `cd -` is untrackable; the guard must not resolve subsequent
+        # relative refs against a wrong directory. Absolute refs still scan.
+        bad = tmp_path / "y.sh"
+        bad.write_text("launchctl kickstart -k gui/501/ai.hermes.gateway\n")
+        assert self._scan(f"cd - && bash {bad}", cwd=str(tmp_path)) is True
+
+    def test_directory_fail_closed_contract_unchanged(self, tmp_path):
+        # The existing non-regular-file contract stays: an explicit `bash
+        # <directory>` is still fail-closed (TestLifecycleGuardNeverRaises
+        # asserts this too; kept here to pin that cd-awareness did not
+        # loosen it).
+        assert self._scan(f"bash {tmp_path}") is True
+
+
+
 class TestLifecycleGuardNeverRaises:
     """The guard must return a verdict for every input — binary referenced
     paths, NUL bytes, non-UTF-8, /dev/* nodes, directories, missing files —

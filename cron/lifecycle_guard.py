@@ -481,7 +481,17 @@ def _iter_referenced_shell_scripts(
     *,
     cwd: Optional[str] = None,
 ) -> Iterator[Path]:
-    """Yield scripts executed directly or through a POSIX shell."""
+    """Yield scripts executed directly or through a POSIX shell.
+
+    Tracks ``cd`` segments so a relative script reference after a
+    directory change resolves against the directory the shell would
+    actually be in. Without this, ``cd /path/proj && ./proj ...``
+    resolved ``./proj`` against the *original* cwd, landing on the
+    project directory ``/path/proj`` itself — a non-regular file — and
+    the fail-closed read hard-blocked every launcher-script invocation
+    of that common shape with a bogus gateway-lifecycle error.
+    """
+    effective_cwd = cwd
     for segment in _iter_command_segments(command):
         index = _command_token_index(segment)
         if index is None:
@@ -489,9 +499,32 @@ def _iter_referenced_shell_scripts(
         executable = segment[index]
         executable_name = Path(executable).name
 
+        if executable_name == "cd":
+            # Model the directory change for subsequent segments. `cd` with
+            # no argument goes $HOME; `cd -` is untrackable (previous dir
+            # unknown) so conservatively stop trusting the cwd from here on.
+            if len(segment) <= index + 1:
+                effective_cwd = str(Path.home())
+            else:
+                target = segment[index + 1]
+                if target == "-":
+                    effective_cwd = None
+                else:
+                    resolved_target = _resolve_terminal_script_path(
+                        target, effective_cwd
+                    )
+                    effective_cwd = (
+                        str(resolved_target)
+                        if resolved_target is not None
+                        else None
+                    )
+            continue
+
         if executable_name in {".", "source"}:
             if len(segment) > index + 1:
-                resolved = _resolve_terminal_script_path(segment[index + 1], cwd)
+                resolved = _resolve_terminal_script_path(
+                    segment[index + 1], effective_cwd
+                )
                 if resolved is not None:
                     yield resolved
             continue
@@ -517,7 +550,9 @@ def _iter_referenced_shell_scripts(
                 "-c",
                 "--command",
             }:
-                resolved = _resolve_terminal_script_path(arguments[arg_index], cwd)
+                resolved = _resolve_terminal_script_path(
+                    arguments[arg_index], effective_cwd
+                )
                 if resolved is not None:
                     yield resolved
             continue
@@ -529,7 +564,7 @@ def _iter_referenced_shell_scripts(
         # (#77131). Skip pure-separator tokens.
         if executable.strip("/"):
             if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
-                resolved = _resolve_terminal_script_path(executable, cwd)
+                resolved = _resolve_terminal_script_path(executable, effective_cwd)
                 if resolved is not None:
                     yield resolved
 
