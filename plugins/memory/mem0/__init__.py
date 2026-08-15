@@ -387,10 +387,22 @@ class _DirectRestMem0Client:
         body = {"query": q, "user_id": self._user_id, "filters": filters, "top_k": top_k}
         return self._request("POST", "/search", body=body)
 
-    def get_all(self, filters=None, **kwargs):
+    def get_all(self, filters=None, limit=None, **kwargs):
         # reads scope to user_id only (see search) — agent-scoped recall would drop
         # historical agent-without-user memories.
-        return self._request("GET", "/memories", params=self._scope(filters, scope_agent=False))
+        #
+        # limit (2026-08-14): the self-hosted server's GET /memories delegates to
+        # mem0-core get_all(top_k=20) — a silent 20-row page. Destructive
+        # by-filter resolution (_resolve_filter / _in_scope_total) needs the
+        # FULL in-scope set or forget-by-filter can never match store-wide
+        # facts and the C8a mass-guard denominator reads 20 instead of the
+        # real store size. Servers without the `limit` param ignore it (query
+        # params are pass-through), degrading to the old page behavior.
+        params = self._scope(filters, scope_agent=False)
+        if limit:
+            params = dict(params or {})
+            params["limit"] = int(limit)
+        return self._request("GET", "/memories", params=params)
 
     def get(self, memory_id):
         mid = urllib.parse.quote(str(memory_id), safe="")
@@ -2374,6 +2386,12 @@ class Mem0MemoryProvider(MemoryProvider):
 
     # --- scope + filter resolution (C7) -------------------------------------
 
+    # Full-scope listing ceiling for destructive by-filter resolution. The
+    # server's default GET /memories page is 20 rows — useless as a match
+    # universe (see get_all). 100k bounds memory/response size while covering
+    # any realistic personal store.
+    _DESTRUCTIVE_LIST_LIMIT = 100_000
+
     def _resolve_filter(self, client, filter_arg: str) -> list:
         """Resolve a filter to an in-scope memory list (C7 scope-lock).
 
@@ -2383,7 +2401,8 @@ class Mem0MemoryProvider(MemoryProvider):
         floor C8a is the real guard, so over-matching is safe — it just refuses).
         An empty/whitespace filter matches the WHOLE in-scope set (→ C8a refuses).
         """
-        allm = self._unwrap_results(client.get_all(filters=self._read_filters()))
+        allm = self._unwrap_results(client.get_all(
+            filters=self._read_filters(), limit=self._DESTRUCTIVE_LIST_LIMIT))
         f = (filter_arg or "").strip().lower()
         if not f or f in ("*", "all", "everything"):
             return list(allm)
@@ -2391,7 +2410,8 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def _in_scope_total(self, client) -> int:
         """C8a denominator: ALWAYS the full configured user-wide scope count."""
-        return len(self._unwrap_results(client.get_all(filters=self._read_filters())))
+        return len(self._unwrap_results(client.get_all(
+            filters=self._read_filters(), limit=self._DESTRUCTIVE_LIST_LIMIT)))
 
     def _mass_check(self, matched: int, total: int):
         """C8a: refuse (no token) if matched is a mass fraction of the store.
