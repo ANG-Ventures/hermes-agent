@@ -111,6 +111,10 @@ _LOOPBACK_HOST_RE = re.compile(
 # ``ssh``, so such a match falls back to blocked rather than allowed.
 _SEGMENT_SPLIT_RE = re.compile(r"(?:\|\||&&|;|\||&|\$\(|`)")
 
+# Command substitution INSIDE a double-quoted region still executes, so a
+# lifecycle verb wrapped in `$(…)` or backticks is an invocation, not data.
+_COMMAND_SUBSTITUTION_RE = re.compile(r"\$\(|`")
+
 
 def _match_is_ssh_remote(text: str, match_start: int) -> bool:
     """Return True if the lifecycle match at *match_start* sits inside an
@@ -134,7 +138,16 @@ def _match_is_ssh_remote(text: str, match_start: int) -> bool:
 # stay blocked. Anchored at the start of the segment (optional leading path).
 _TEXT_CONSUMER_RE = re.compile(
     r"(?i)(?:^|\s)(?:/\S*/)?(?:echo|printf|grep|egrep|fgrep|rg|cat|head|tail|"
-    r"less|more|comm|diff|sed\s+-n|awk|jq|tee|column|sort|uniq|wc)\b"
+    r"less|more|comm|diff|sed\s+-n|awk|jq|tee|column|sort|uniq|wc|"
+    # Message-carrying VCS verbs. A commit/tag/stash message that merely
+    # *documents* the lifecycle command (e.g. a fix whose commit body says
+    # "run `hermes gateway restart` from a separate shell") is data, not an
+    # invocation — the shell never executes the message text. Both conditions
+    # in `_match_is_quoted_data` still apply, so this stays fail-closed:
+    # `git commit -m "msg" && hermes gateway restart` keeps the lifecycle verb
+    # OUTSIDE any open quote region and remains BLOCKED.
+    r"git\s+(?:commit|tag|stash|notes|revert|merge|cherry-pick)"
+    r")\b"
 )
 
 # Shell quote chars that open a data region. A `'` or `"` region makes the
@@ -170,21 +183,48 @@ def _match_is_quoted_data(text: str, match_start: int, match_str: str) -> bool:
       2. The enclosing shell segment's leading command is a text-only consumer
          and NOT a shell interpreter (bash -c "…" stays blocked).
 
+    The quote scan runs over the WHOLE text, not the match's line. A shell
+    quote region spans newlines (`git commit -m "line1<NL><NL>line3"`), so a
+    line-scoped scan sees no open quote on line 3 and mis-reads genuine quoted
+    data as an executed command. That produced a real false positive: a commit
+    whose message documented the lifecycle command was blocked (#papercut
+    2026-08-16). Scanning the whole text mirrors what the shell actually does.
+
     Only applied to Branch A. The launchctl/systemctl/pkill branches are not
     exempted here — their command identifiers are distinctive enough that a
     quoted-data occurrence is vanishingly rare and not worth the bypass risk.
     """
-    line_start = text.rfind("\n", 0, match_start) + 1
-    line_end = text.find("\n", match_start)
-    if line_end == -1:
-        line_end = len(text)
-    prefix = text[line_start:match_start]
-    suffix = text[match_start + len(match_str):line_end]
+    prefix = text[:match_start]
+    suffix = text[match_start + len(match_str):]
 
     # Condition 1: a single/double quote region is OPEN at the match, and it
     # closes somewhere in the suffix (data is bounded, not a trailing dangle).
     open_q = _open_quote_at(prefix)
     if open_q is None or open_q not in suffix:
+        return False
+
+    # Condition 1b: no COMMAND SUBSTITUTION between the opening quote and the
+    # match. Inside a double-quoted region `$(…)` still executes, so
+    # `git commit -m "$(hermes gateway restart)"` is an invocation wearing a
+    # message's clothes. Single quotes suppress substitution, so only `"` needs
+    # the check.
+    #
+    # BACKTICKS ARE DELIBERATELY NOT TREATED AS SUBSTITUTION HERE, and that is
+    # a measured tradeoff rather than an oversight. Measured 2026-08-16, these
+    # two are textually IDENTICAL by every local signal — same backtick count
+    # before the match (1) and after it (1):
+    #     prose : git commit -m "Run `hermes gateway restart` from a shell."
+    #     subst : git commit -m "`hermes gateway restart`"
+    # No parity or counting rule can separate them without a real shell parse.
+    # Blocking both resurrects the false positive this fix exists to remove
+    # (documenting a lifecycle command in a commit message is extremely common;
+    # wrapping one in backticks *inside a commit message* to execute it is not
+    # a way anyone actually restarts a gateway — and `$(…)`, the form someone
+    # would reach for, IS blocked). The residual risk is bounded: reaching this
+    # branch already requires the segment command to be a text-only consumer
+    # from the allowlist, so a bare `` `cmd` `` at a shell prompt is unaffected.
+    quoted_region = prefix[prefix.rfind(open_q) + 1:]
+    if open_q == '"' and "$(" in quoted_region:
         return False
 
     # Condition 2: the segment's command is a text-only consumer, not an
