@@ -3341,6 +3341,36 @@ def select_provider_and_model(args=None):
         ]
     else:
         _visible_slugs = [p.slug for p in CANONICAL_PROVIDERS]
+
+    # Hide the numeric failover lanes (``claude-apx-7``, ``claude-bpx-15``, …)
+    # exactly as ``list_picker_providers`` (CLI/Discord) and
+    # ``build_models_payload`` (desktop/TUI) already do. This surface was the
+    # third and only unfiltered one: it rendered 69 rows, 32 of them lanes.
+    #
+    # Filtering here rather than via ``model_catalog.excluded_providers`` is
+    # deliberate — a hand-enumerated list of lanes goes stale the moment a new
+    # ``claude-{a,b}px-N`` box is provisioned, whereas the shared regex covers
+    # future lanes by construction and keeps all three surfaces on one rule.
+    #
+    # The lanes stay fully reachable by exact name (``/model claude-bpx-7/…``)
+    # and as failover routing targets; this only affects the dropdown. The
+    # ACTIVE provider is never hidden, so a user already on a lane can still
+    # see and change it.
+    try:
+        from hermes_cli.model_switch import _PICKER_HIDDEN_FAILOVER_LANE_RE
+
+        _active_slug = str(active or "").strip().lower()
+        _visible_slugs = [
+            s
+            for s in _visible_slugs
+            if not _PICKER_HIDDEN_FAILOVER_LANE_RE.match(str(s).strip().lower())
+            or str(s).strip().lower() == _active_slug
+        ]
+    except Exception:
+        # Best-effort, mirroring inventory.py: a filtering failure must never
+        # take down the picker itself.
+        pass
+
     grouped_rows = group_providers(_visible_slugs)
 
     # The group/slug that should be pre-selected: the active provider's group
