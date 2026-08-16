@@ -529,3 +529,160 @@ class TestProbeApiModelsUserAgent:
         assert req.get_header("Authorization") is None
 
 
+
+
+# -- probe_api_models — transient-failure retry + honest failure kind --------
+
+class TestProbeApiModelsTransientRetry:
+    """A single transient fault (timeout / connection error) must not mislabel
+    a working endpoint.  The probe retries transient faults once per candidate
+    URL and reports an honest ``failure`` kind so callers can word the warning
+    correctly (a timeout is NOT "the endpoint does not expose /v1/models")."""
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b'{"data": [{"id": "claude-fable-5"}]}'
+
+    def test_timeout_then_success_recovers(self):
+        import socket
+
+        calls = []
+
+        def _fake_urlopen(req, timeout=5.0):
+            calls.append(req.full_url)
+            if len(calls) == 1:
+                raise socket.timeout("timed out")
+            return self._Resp()
+
+        with patch("hermes_cli.models._urlopen_model_catalog_request", side_effect=_fake_urlopen):
+            probe = probe_api_models("key", "http://localhost:18810/anthropic/v1")
+
+        # Same URL retried once, then succeeded — no /v1 fallback needed.
+        assert calls == [
+            "http://localhost:18810/anthropic/v1/models",
+            "http://localhost:18810/anthropic/v1/models",
+        ]
+        assert probe["models"] == ["claude-fable-5"]
+        assert probe["failure"] is None
+
+    def test_http_error_is_not_retried(self):
+        import urllib.error
+
+        calls = []
+
+        def _fake_urlopen(req, timeout=5.0):
+            calls.append(req.full_url)
+            raise urllib.error.HTTPError(req.full_url, 404, "not found", {}, None)
+
+        with patch("hermes_cli.models._urlopen_model_catalog_request", side_effect=_fake_urlopen):
+            probe = probe_api_models("key", "http://localhost:8000")
+
+        # Each candidate (base + /v1 fallback) tried exactly once — 404 is
+        # deterministic; retrying would double every probe's latency.
+        assert calls == [
+            "http://localhost:8000/models",
+            "http://localhost:8000/v1/models",
+        ]
+        assert probe["models"] is None
+        assert probe["failure"] == "http"
+
+    def test_persistent_timeout_reports_timeout_kind(self):
+        import socket
+
+        calls = []
+
+        def _fake_urlopen(req, timeout=5.0):
+            calls.append(req.full_url)
+            raise socket.timeout("timed out")
+
+        with patch("hermes_cli.models._urlopen_model_catalog_request", side_effect=_fake_urlopen):
+            probe = probe_api_models("key", "http://localhost:8000/v1")
+
+        # 2 candidates x (1 try + 1 retry) = 4 attempts.
+        assert len(calls) == 4
+        assert probe["models"] is None
+        assert probe["failure"] == "timeout"
+
+    def test_urlerror_wrapped_timeout_classified_as_timeout(self):
+        import socket
+        import urllib.error
+
+        def _fake_urlopen(req, timeout=5.0):
+            raise urllib.error.URLError(socket.timeout("timed out"))
+
+        with patch("hermes_cli.models._urlopen_model_catalog_request", side_effect=_fake_urlopen):
+            probe = probe_api_models("key", "http://localhost:8000/v1")
+
+        assert probe["failure"] == "timeout"
+
+
+# -- validate_requested_model — anthropic_messages honest warning ------------
+
+class TestAnthropicMessagesWarningHonesty:
+    """The accept-without-verification warning must state what actually
+    happened.  A timed-out probe of an endpoint that DOES implement
+    /v1/models must not claim the endpoint 'does not expose GET /v1/models'."""
+
+    def _probe(self, models=None, failure=None):
+        return {
+            "models": models,
+            "probed_url": "http://127.0.0.1:18810/anthropic/v1/models",
+            "resolved_base_url": "http://127.0.0.1:18810/anthropic/v1",
+            "suggested_base_url": None,
+            "used_fallback": models is not None,
+            "failure": failure,
+        }
+
+    def _validate_anthropic_mode(self, probe_payload):
+        with patch("hermes_cli.models.probe_api_models", return_value=probe_payload):
+            return validate_requested_model(
+                "claude-fable-5",
+                "claude-apr",
+                api_key="k",
+                base_url="http://127.0.0.1:18810/anthropic",
+                api_mode="anthropic_messages",
+            )
+
+    def test_listed_model_verifies_silently(self):
+        result = self._validate_anthropic_mode(self._probe(models=["claude-fable-5"]))
+        assert result["accepted"] is True
+        assert result["recognized"] is True
+        assert result["message"] is None
+
+    def test_timeout_says_timeout_not_unimplemented(self):
+        result = self._validate_anthropic_mode(self._probe(failure="timeout"))
+        assert result["accepted"] is True
+        assert result["recognized"] is False
+        msg = result["message"]
+        assert "timeout" in msg
+        assert "retried once" in msg
+        assert "does not appear to expose" not in msg
+        assert "often does not expose" not in msg
+
+    def test_connection_error_says_connection_error(self):
+        result = self._validate_anthropic_mode(self._probe(failure="connection"))
+        msg = result["message"]
+        assert "connection error" in msg
+        assert "does not appear to expose" not in msg
+
+    def test_http_failure_keeps_unimplemented_wording(self):
+        result = self._validate_anthropic_mode(self._probe(failure="http"))
+        msg = result["message"]
+        assert "does not appear to expose GET /v1/models" in msg
+        assert "accepted without verification" in msg
+
+    def test_unlisted_model_names_the_listing(self):
+        result = self._validate_anthropic_mode(
+            self._probe(models=["claude-opus-5"])
+        )
+        assert result["accepted"] is True
+        assert result["recognized"] is False
+        msg = result["message"]
+        assert "does not include it" in msg
+        assert "18810/anthropic/v1/models" in msg

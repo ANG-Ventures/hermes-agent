@@ -4484,6 +4484,31 @@ def github_model_reasoning_efforts(
     return _github_reasoning_efforts_for_model_id(str(model_id or normalized))
 
 
+def _classify_probe_failure(exc: Exception) -> tuple[str, bool]:
+    """Classify a /models probe failure as (kind, transient).
+
+    kind is one of ``"http"`` (server answered with an error status),
+    ``"timeout"``, ``"connection"``, or ``"other"``.  transient=True means a
+    single immediate retry is worthwhile (the endpoint may exist but was
+    momentarily slow/unreachable); HTTP errors are deterministic and are
+    never retried.
+    """
+    import socket
+
+    if isinstance(exc, urllib.error.HTTPError):
+        return "http", False
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return "timeout", True
+    if isinstance(exc, urllib.error.URLError):
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, (socket.timeout, TimeoutError)):
+            return "timeout", True
+        return "connection", True
+    if isinstance(exc, (ConnectionError, OSError)):
+        return "connection", True
+    return "other", False
+
+
 def probe_api_models(
     api_key: Optional[str],
     base_url: Optional[str],
@@ -4506,6 +4531,7 @@ def probe_api_models(
             "resolved_base_url": "",
             "suggested_base_url": None,
             "used_fallback": False,
+            "failure": None,
         }
 
     if _is_github_models_base_url(normalized):
@@ -4516,6 +4542,7 @@ def probe_api_models(
             "resolved_base_url": COPILOT_BASE_URL,
             "suggested_base_url": None,
             "used_fallback": False,
+            "failure": None,
         }
 
     if normalized.endswith("/v1"):
@@ -4545,29 +4572,49 @@ def probe_api_models(
 
         headers.update(normalize_extra_headers(request_headers))
 
+    failures: list[str] = []
     for candidate_base, is_fallback in candidates:
         url = candidate_base.rstrip("/") + "/models"
         tried.append(url)
-        req = urllib.request.Request(url, headers=headers)
-        try:
-            with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode())
-                return {
-                    "models": [m.get("id", "") for m in data.get("data", [])],
-                    "probed_url": url,
-                    "resolved_base_url": candidate_base.rstrip("/"),
-                    "suggested_base_url": alternate_base if alternate_base != candidate_base else normalized,
-                    "used_fallback": is_fallback,
-                }
-        except Exception:
-            continue
+        # One retry, but only on TRANSIENT transport faults (timeout /
+        # connection failure).  A busy local relay can stall one probe and
+        # answer the next; without the retry a single slow response used to
+        # mislabel a working endpoint as "does not expose GET /v1/models".
+        # HTTP errors (404 etc.) are deterministic — never retried.
+        for attempt in range(2):
+            req = urllib.request.Request(url, headers=headers)
+            try:
+                with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
+                    data = json.loads(resp.read().decode())
+                    return {
+                        "models": [m.get("id", "") for m in data.get("data", [])],
+                        "probed_url": url,
+                        "resolved_base_url": candidate_base.rstrip("/"),
+                        "suggested_base_url": alternate_base if alternate_base != candidate_base else normalized,
+                        "used_fallback": is_fallback,
+                        "failure": None,
+                    }
+            except Exception as exc:
+                kind, transient = _classify_probe_failure(exc)
+                if transient and attempt == 0:
+                    continue
+                failures.append(kind)
+                break
 
+    # Prefer the transient classification for the overall verdict: a timeout
+    # on one candidate means the endpoint may exist, which callers should
+    # word differently from a clean 404.
+    overall_failure = next(
+        (f for f in failures if f in ("timeout", "connection")),
+        failures[-1] if failures else None,
+    )
     return {
         "models": None,
         "probed_url": tried[0] if tried else normalized.rstrip("/") + "/models",
         "resolved_base_url": normalized,
         "suggested_base_url": alternate_base if alternate_base != normalized else None,
         "used_fallback": False,
+        "failure": overall_failure,
     }
 
 
@@ -5125,15 +5172,23 @@ def validate_requested_model(
                 "message": message,
             }
 
-        message = (
-            f"Note: could not reach this custom endpoint's model listing at `{probe.get('probed_url')}`. "
-            f"Hermes will still save `{requested}`, but the endpoint should expose `/models` for verification."
-        )
-        if api_mode == "anthropic_messages":
-            message += (
-                "\n  Many Anthropic-compatible proxies do not implement the Models API "
-                "(GET /v1/models).  The model name has been accepted without verification."
+        _failure = probe.get("failure")
+        if _failure in ("timeout", "connection"):
+            message = (
+                f"Note: the probe of this custom endpoint's model listing at `{probe.get('probed_url')}` "
+                f"failed with a {'timeout' if _failure == 'timeout' else 'connection error'} (retried once). "
+                f"Hermes will still save `{requested}`, but it could not be verified — the endpoint may be busy or unreachable."
             )
+        else:
+            message = (
+                f"Note: could not reach this custom endpoint's model listing at `{probe.get('probed_url')}`. "
+                f"Hermes will still save `{requested}`, but the endpoint should expose `/models` for verification."
+            )
+            if api_mode == "anthropic_messages":
+                message += (
+                    "\n  Many Anthropic-compatible proxies do not implement the Models API "
+                    "(GET /v1/models).  The model name has been accepted without verification."
+                )
         if probe.get("suggested_base_url"):
             message += f"\n  If this server expects `/v1`, try base URL: `{probe.get('suggested_base_url')}`"
 
@@ -5311,7 +5366,8 @@ def validate_requested_model(
     # Anthropic Messages API: many proxies don't implement /v1/models.
     # Try probing with correct auth; if it fails, accept with a warning.
     if api_mode == "anthropic_messages":
-        api_models = fetch_api_models(api_key, base_url, api_mode=api_mode)
+        probe = probe_api_models(api_key, base_url, api_mode=api_mode)
+        api_models = probe.get("models")
         if api_models is not None:
             if requested_for_lookup in set(api_models):
                 return {
@@ -5329,18 +5385,39 @@ def validate_requested_model(
                     "corrected_model": auto[0],
                     "message": f"Auto-corrected `{requested}` → `{auto[0]}`",
                 }
-        # Probe failed or model not found — accept anyway (proxy likely
-        # doesn't implement the Anthropic Models API).
+        # Probe failed or model not found — accept anyway, but say WHY
+        # honestly: a timeout/connection failure means the endpoint may well
+        # implement /v1/models and simply didn't answer in time, which is a
+        # different situation from an endpoint that doesn't expose it.
         provider_label_str = provider_label(provider) or (provider or "the active provider")
         endpoint_str = (base_url or "").strip() or "the configured endpoint"
+        failure = probe.get("failure")
+        if api_models is not None:
+            # Endpoint answered and listed models, but the requested one
+            # wasn't among them.
+            reason = (
+                f"The endpoint's model listing ({probe.get('probed_url')}) does not "
+                f"include it; it may still work if the server supports hidden or "
+                f"aliased models."
+            )
+        elif failure in ("timeout", "connection"):
+            reason = (
+                f"The probe of {probe.get('probed_url')} failed with a "
+                f"{'timeout' if failure == 'timeout' else 'connection error'} "
+                f"(retried once) — the endpoint may be busy or unreachable."
+            )
+        else:
+            reason = (
+                f"That endpoint speaks the Anthropic Messages API and does not "
+                f"appear to expose GET /v1/models."
+            )
         return {
             "accepted": True,
             "persist": True,
             "recognized": False,
             "message": (
                 f"Note: could not verify `{requested}` against `{provider_label_str}` "
-                f"at {endpoint_str}.  That endpoint speaks the Anthropic Messages API, "
-                f"which often does not expose GET /v1/models.  The model name has been "
+                f"at {endpoint_str}.  {reason}  The model name has been "
                 f"accepted without verification."
             ),
         }
