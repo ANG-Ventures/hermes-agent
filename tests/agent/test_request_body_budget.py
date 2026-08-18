@@ -98,9 +98,9 @@ def test_provider_profiles_default_to_no_request_body_cap():
     assert ProviderProfile(name="test").get_max_request_body_bytes("model") is None
 
 
-def test_custom_anthropic_transport_inherits_protocol_body_cap():
+def test_unregistered_anthropic_transport_inherits_protocol_body_cap():
     cap = request_body_limit_for_provider(
-        "claude-apx-1",
+        "custom-anthropic-relay",
         "claude-opus-5",
         api_mode="anthropic_messages",
     )
@@ -109,12 +109,76 @@ def test_custom_anthropic_transport_inherits_protocol_body_cap():
     assert 9 * 1024 * 1024 < cap < 10 * 1024 * 1024
     assert (
         request_body_limit_for_provider(
-            "claude-apx-1",
+            "custom-anthropic-relay",
             "claude-opus-5",
             api_mode="chat_completions",
         )
         is None
     )
+
+
+def test_named_anthropic_relays_without_explicit_cap_inherit_protocol_limit(
+    monkeypatch,
+):
+    anthropic = get_provider_profile("anthropic")
+    assert anthropic is not None
+    profiles = {
+        "anthropic": anthropic,
+        "claude-apr": ProviderProfile(
+            name="claude-apr",
+            api_mode="anthropic_messages",
+        ),
+        "claude-apx-1": ProviderProfile(
+            name="claude-apx-1",
+            api_mode="anthropic_messages",
+        ),
+    }
+    monkeypatch.setattr(
+        "providers.get_provider_profile",
+        lambda name: profiles.get(name),
+    )
+    expected = anthropic.get_max_request_body_bytes("claude-opus-5")
+
+    assert (
+        request_body_limit_for_provider(
+            "claude-apr",
+            "claude-opus-5",
+            api_mode="anthropic_messages",
+        )
+        == expected
+    )
+    assert (
+        request_body_limit_for_provider(
+            "claude-apx-1",
+            "claude-opus-5",
+            api_mode="anthropic_messages",
+        )
+        == expected
+    )
+
+
+def test_claude_bridge_profiles_deliberately_remain_without_harness_body_cap(
+    monkeypatch,
+):
+    profiles = {
+        name: ProviderProfile(name=name, api_mode="chat_completions")
+        for name in ("claude-bpr", "claude-bpx-1")
+    }
+    monkeypatch.setattr(
+        "providers.get_provider_profile",
+        lambda name: profiles.get(name),
+    )
+
+    # t_99b07271: the real claude binary owns these lanes' wire assembly.
+    for provider in profiles:
+        assert (
+            request_body_limit_for_provider(
+                provider,
+                "claude-opus-5",
+                api_mode="chat_completions",
+            )
+            is None
+        )
 
 
 def test_anthropic_error_cap_parser_retains_headroom():
