@@ -72,6 +72,16 @@ def _mock_response(content="Hello", finish_reason="stop", tool_calls=None, usage
     return resp
 
 
+def _mock_anthropic_response(content="Hello"):
+    return SimpleNamespace(
+        content=[SimpleNamespace(type="text", text=content)],
+        stop_reason="end_turn",
+        stop_sequence=None,
+        model="claude-opus-4-6",
+        usage=None,
+    )
+
+
 def _make_413_error(*, use_status_code=True, message="Request entity too large"):
     """Create an exception that mimics a 413 HTTP error."""
     err = Exception(message)
@@ -309,6 +319,133 @@ class TestHTTP413Compression:
         assert provider_body_sizes and len(provider_body_sizes) == 1
         assert agent.client.chat.completions.create.call_count == 1
         assert all(message["content"][1]["type"] == "image_url" for message in prefill)
+        mock_compress.assert_not_called()
+
+    def test_rebuilt_anthropic_relay_preflights_multimodal_tool_history(self, agent):
+        """A rebuilt request cannot replay four stale screenshots above the relay cap."""
+        from agent.request_body_budget import (
+            request_body_limit_for_provider,
+            serialized_request_body_size,
+        )
+
+        agent.provider = "claude-apx-1"
+        agent.model = "claude-opus-4-6"
+        agent.api_mode = "anthropic_messages"
+        agent.base_url = "https://claude-apx-1.invalid/anthropic"
+        agent._anthropic_base_url = agent.base_url
+        agent._anthropic_api_key = "test-key"  # gitleaks:allow
+        agent._anthropic_client = MagicMock()
+        agent._is_anthropic_oauth = False
+
+        cap = request_body_limit_for_provider(
+            agent.provider,
+            agent.model,
+            api_mode=agent.api_mode,
+        )
+        assert cap is not None
+
+        image_urls = [
+            "data:image/png;base64," + (marker * 3_500_000)
+            for marker in "abcd"
+        ]
+        prefill: list[dict] = [
+            {"role": "user", "content": "Inspect these screenshots."}
+        ]
+        for index in range(4):
+            call_id = f"call_vision_{index}"
+            prefill.extend(
+                [
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": "vision_analyze",
+                                    "arguments": "{}",
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "name": "vision_analyze",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"Screenshot {index} text summary",
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": image_urls[index]},
+                            },
+                        ],
+                    },
+                ]
+            )
+
+        assert serialized_request_body_size({"messages": prefill}) > cap
+
+        captured_requests = []
+
+        def _provider_call(kwargs, *, client=None):
+            captured_requests.append(kwargs)
+            assert serialized_request_body_size(kwargs) <= cap
+            return _mock_anthropic_response("Recovered before relay dispatch")
+
+        with (
+            patch.object(agent, "_model_supports_vision", return_value=True),
+            patch.object(agent, "_create_request_anthropic_client", return_value=MagicMock()),
+            patch.object(agent, "_anthropic_messages_create", side_effect=_provider_call) as create,
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("continue", conversation_history=prefill)
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered before relay dispatch"
+        create.assert_called_once()
+        assert len(captured_requests) == 1
+        request_text = str(captured_requests[0]["messages"])
+        for index in range(4):
+            assert f"Screenshot {index} text summary" in request_text
+
+        def _anthropic_image_payloads(value):
+            if isinstance(value, dict):
+                source = value.get("source")
+                if (
+                    value.get("type") == "image"
+                    and isinstance(source, dict)
+                    and isinstance(source.get("data"), str)
+                ):
+                    return [source["data"]]
+                return [
+                    payload
+                    for child in value.values()
+                    for payload in _anthropic_image_payloads(child)
+                ]
+            if isinstance(value, list):
+                return [
+                    payload
+                    for child in value
+                    for payload in _anthropic_image_payloads(child)
+                ]
+            return []
+
+        remaining_images = _anthropic_image_payloads(captured_requests[0]["messages"])
+        assert 0 < len(remaining_images) < 4
+        assert not any(payload.startswith("a" * 100) for payload in remaining_images)
+        assert any(payload.startswith("d" * 100) for payload in remaining_images)
+        assert all(
+            message["content"][1]["type"] == "image_url"
+            for message in prefill
+            if message.get("role") == "tool"
+        )
         mock_compress.assert_not_called()
 
     def test_byte_preflight_without_images_fails_before_provider_attempt(
