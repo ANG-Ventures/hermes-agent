@@ -257,6 +257,17 @@ _POOL_EXHAUSTED_PATTERNS = [
     "no eligible sub",
 ]
 
+# The pool now distinguishes the two exhaustion SCOPES, because they lead to
+# opposite conclusions and the flat label conflated them (2026-08-17):
+#   * model-scoped — this model's budget is capped on every sub, other models
+#     are fine. Reading "sub pool capped" here is actively misleading: it names
+#     no model, so the only available inference is a fleet outage, which is
+#     false and is the wrong mental model to hand an operator.
+#   * fleet-wide  — nothing can serve anything right now.
+# Substring of the pool's model-scoped body; the generic pattern above still
+# matches it, so CLASSIFICATION is unchanged and only the LABEL narrows.
+_POOL_MODEL_SCOPED_PATTERN = "no eligible sub for the requested model"
+
 # Account/organization ENTITLEMENT block (2026-08-08, sub-vps-10). A lapsed
 # subscription makes Anthropic answer EVERY request with
 #   403 permission_error "OAuth authentication is currently not allowed for this

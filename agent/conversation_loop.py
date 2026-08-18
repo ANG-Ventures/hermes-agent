@@ -4285,6 +4285,18 @@ def run_conversation(
                         "quota_window": error_context.get("quota_window"),
                         "quota_window_reset": error_context.get("quota_window_reset"),
                     }
+                # Stamp pool-exhaustion SCOPE the same way. The pool tells us
+                # whether only THIS MODEL is capped or the whole pool is out;
+                # without it the announce can only say "sub pool capped", which
+                # reads as a fleet outage even when every other model is fine.
+                try:
+                    from agent.error_classifier import (
+                        _POOL_MODEL_SCOPED_PATTERN as _pool_model_pat,
+                    )
+                    if _pool_model_pat in str(api_error).lower():
+                        agent._pending_pool_scope = "model"
+                except Exception:  # noqa: BLE001
+                    pass
 
                 # ── Classify the error for structured recovery decisions ──
                 _compressor = getattr(agent, "context_compressor", None)
