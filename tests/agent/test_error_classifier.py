@@ -57,7 +57,7 @@ class TestFailoverReason:
             "overloaded", "server_error", "timeout",
             "ssl_cert_verification",
             "decode_error",
-            "context_overflow", "payload_too_large", "image_too_large",
+            "context_overflow", "body_too_large", "payload_too_large", "image_too_large",
             "model_not_found", "format_error",
             "malformed_conversation",
             "invalid_encrypted_content",
@@ -610,6 +610,16 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.payload_too_large
         assert result.should_compress is True
 
+    def test_anthropic_413_request_body_too_large_is_not_token_overflow(self):
+        e = MockAPIError(
+            "Request rejected",
+            status_code=413,
+            body={"error": {"type": "request_too_large"}},
+        )
+        result = classify_api_error(e, provider="anthropic")
+        assert result.reason == FailoverReason.body_too_large
+        assert result.should_compress is False
+
     # ── Context overflow ──
 
 
@@ -1133,7 +1143,7 @@ class TestExpandedOverflowPatterns:
         assert result.reason == FailoverReason.context_overflow
         assert result.should_compress is True
 
-    def test_request_too_large_message_only_is_payload_too_large(self):
+    def test_request_too_large_message_only_is_body_too_large(self):
         # Anthropic's structured 413 type re-wrapped by a proxy with no
         # status attribute — was falling through to `unknown`.
         e = Exception(
@@ -1141,8 +1151,8 @@ class TestExpandedOverflowPatterns:
             '"message":"Request exceeds the maximum size"}}'
         )
         result = classify_api_error(e, provider="anthropic", model="m")
-        assert result.reason == FailoverReason.payload_too_large
-        assert result.should_compress is True
+        assert result.reason == FailoverReason.body_too_large
+        assert result.should_compress is False
 
     def test_longer_than_context_length_still_overflow(self):
         # Regression guard for wordings that already matched.

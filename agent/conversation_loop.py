@@ -23,7 +23,7 @@ import random
 import re
 import ssl
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, cast, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import (
@@ -2348,6 +2348,31 @@ def run_conversation(
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
 
+        def _body_budget_failure(error_message: str) -> Dict[str, Any]:
+            nonlocal thinking_spinner
+            if thinking_spinner:
+                thinking_spinner.stop("")
+                thinking_spinner = None
+            if agent.thinking_callback:
+                agent.thinking_callback("")
+            agent._flush_status_buffer()
+            agent._vprint(
+                f"{agent.log_prefix}❌ {error_message}",
+                force=True,
+            )
+            logger.error("%s%s", agent.log_prefix, error_message)
+            agent._persist_session(messages, conversation_history)
+            return {
+                "final_response": error_message,
+                "messages": messages,
+                "completed": False,
+                "api_calls": api_call_count,
+                "error": error_message,
+                "partial": True,
+                "failed": True,
+                "body_too_large": True,
+            }
+
         while retry_count < max_retries:
             # ── Interrupt checkpoint (top of the retry/fallback loop) ──
             # A /stop sets the cooperative `_interrupt_requested` flag. The
@@ -2498,6 +2523,63 @@ def run_conversation(
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
 
+                # Token occupancy does not model base64/JSON bytes. Providers
+                # with a declared HTTP body ceiling get a final serialized-size
+                # preflight after request middleware, before any provider call.
+                # Remediation is request-copy-only and can reach images inside
+                # the protected fresh tail; text compaction is deliberately not
+                # involved in byte overflow recovery.
+                try:
+                    from agent.request_body_budget import (
+                        body_budget_error,
+                        format_byte_count,
+                        remediate_request_body,
+                        request_body_limit_for_provider,
+                    )
+
+                    _body_cap = request_body_limit_for_provider(
+                        getattr(agent, "provider", None),
+                        getattr(agent, "model", None),
+                        api_mode=getattr(agent, "api_mode", None),
+                    )
+                    if _body_cap is not None:
+                        _body_result = remediate_request_body(
+                            api_kwargs,
+                            max_body_bytes=_body_cap,
+                        )
+                        if _body_result.before_bytes > _body_cap:
+                            if _body_result.fits:
+                                api_kwargs = _body_result.request_kwargs
+                                agent._buffer_status(
+                                    "📐 Request body exceeded provider byte cap — "
+                                    f"resized {_body_result.resized_images} and evicted "
+                                    f"{_body_result.evicted_images} image(s) "
+                                    f"({format_byte_count(_body_result.before_bytes)} → "
+                                    f"{format_byte_count(_body_result.after_bytes)})."
+                                )
+                                logger.info(
+                                    "%srequest-body preflight remediated %d -> %d bytes "
+                                    "(cap=%d, resized=%d, evicted=%d)",
+                                    agent.log_prefix,
+                                    _body_result.before_bytes,
+                                    _body_result.after_bytes,
+                                    _body_cap,
+                                    _body_result.resized_images,
+                                    _body_result.evicted_images,
+                                )
+                            else:
+                                _body_error = body_budget_error(_body_result)
+                                return _body_budget_failure(_body_error)
+                except (TypeError, ValueError) as exc:
+                    # A provider profile should never brick a request because a
+                    # middleware injected a non-JSON SDK object. The provider's
+                    # own serializer remains authoritative in that rare case.
+                    logger.warning(
+                        "%srequest-body preflight skipped: %s",
+                        agent.log_prefix,
+                        exc,
+                    )
+
                 try:
                     from hermes_cli.lifecycle import (
                         has_hook,
@@ -2620,6 +2702,54 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    # Execution middleware may replace the payload after the
+                    # regular request preflight. Re-check at the terminal edge
+                    # so the measured object is exactly what the SDK receives.
+                    try:
+                        from agent.request_body_budget import (
+                            RequestBodyBudgetExceeded,
+                            format_byte_count,
+                            remediate_request_body,
+                            request_body_limit_for_provider,
+                        )
+
+                        _terminal_body_cap = request_body_limit_for_provider(
+                            getattr(agent, "provider", None),
+                            getattr(agent, "model", None),
+                            api_mode=getattr(agent, "api_mode", None),
+                        )
+                        _terminal_body_result = (
+                            remediate_request_body(
+                                next_api_kwargs,
+                                max_body_bytes=_terminal_body_cap,
+                            )
+                            if _terminal_body_cap is not None
+                            else None
+                        )
+                    except (TypeError, ValueError) as exc:
+                        logger.warning(
+                            "%srequest-body terminal preflight skipped: %s",
+                            agent.log_prefix,
+                            exc,
+                        )
+                        _terminal_body_result = None
+
+                    if (
+                        _terminal_body_result is not None
+                        and _terminal_body_result.before_bytes
+                        > _terminal_body_result.max_body_bytes
+                    ):
+                        if not _terminal_body_result.fits:
+                            raise RequestBodyBudgetExceeded(_terminal_body_result)
+                        next_api_kwargs = _terminal_body_result.request_kwargs
+                        agent._buffer_status(
+                            "📐 Execution middleware exceeded the provider byte cap — "
+                            f"resized {_terminal_body_result.resized_images} and evicted "
+                            f"{_terminal_body_result.evicted_images} image(s) "
+                            f"({format_byte_count(_terminal_body_result.before_bytes)} → "
+                            f"{format_byte_count(_terminal_body_result.after_bytes)})."
+                        )
+
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -4213,6 +4343,106 @@ def run_conversation(
                 )
                 if recovered_with_pool:
                     continue
+
+                # Whole-body byte overflow is distinct from token/context
+                # overflow. A structured Anthropic ``request_too_large`` 413
+                # must never enter text compaction: retained images can live in
+                # the protected fresh tail, where summarization is a no-op.
+                if classified.reason == FailoverReason.body_too_large:
+                    from agent.request_body_budget import (
+                        RequestBodyBudgetExceeded,
+                        body_budget_error,
+                        remediate_request_body,
+                        request_body_limit_for_provider,
+                        request_body_limit_from_error,
+                        serialized_request_body_size,
+                    )
+
+                    if isinstance(api_error, RequestBodyBudgetExceeded):
+                        return _body_budget_failure(str(api_error))
+
+                    _configured_body_cap = request_body_limit_for_provider(
+                        getattr(agent, "provider", None),
+                        getattr(agent, "model", None),
+                        api_mode=getattr(agent, "api_mode", None),
+                    )
+                    _reported_body_cap = request_body_limit_from_error(api_error)
+                    _body_caps = [
+                        cap
+                        for cap in (_configured_body_cap, _reported_body_cap)
+                        if cap is not None
+                    ]
+                    _recovery_body_cap = min(_body_caps) if _body_caps else None
+
+                    if _recovery_body_cap is not None:
+                        _rejected_body_result = remediate_request_body(
+                            cast(Dict[str, Any], api_kwargs),
+                            max_body_bytes=_recovery_body_cap,
+                        )
+                        if (
+                            not _retry.body_byte_retry_attempted
+                            and _rejected_body_result.fits
+                            and _rejected_body_result.image_count > 0
+                        ):
+                            _retry.body_byte_retry_attempted = True
+                            # ``api_kwargs`` may already be Anthropic-native
+                            # (images nested under tool_result.content). Apply
+                            # the same byte reduction to the pre-transport
+                            # message copy so the normal retry rebuild keeps it.
+                            _required_reduction = max(
+                                1,
+                                _rejected_body_result.before_bytes
+                                - _rejected_body_result.after_bytes,
+                            )
+                            _message_wrapper = {"messages": api_messages}
+                            _message_bytes = serialized_request_body_size(
+                                _message_wrapper
+                            )
+                            _message_target = max(
+                                1,
+                                _message_bytes - _required_reduction - 1024,
+                            )
+                            _message_result = remediate_request_body(
+                                _message_wrapper,
+                                max_body_bytes=_message_target,
+                            )
+                            if (
+                                _message_result.resized_images
+                                or _message_result.evicted_images
+                            ):
+                                api_messages = _message_result.request_kwargs[
+                                    "messages"
+                                ]
+                                agent._buffer_status(
+                                    "📐 Provider rejected the serialized request body — "
+                                    "remediated retained images and retrying once..."
+                                )
+                                continue
+
+                        _body_error = body_budget_error(
+                            _rejected_body_result
+                        ).replace(
+                            "before provider dispatch",
+                            "after provider rejection",
+                        )
+                    else:
+                        _actual_body_bytes = serialized_request_body_size(
+                            cast(Dict[str, Any], api_kwargs)
+                        )
+                        _body_probe = remediate_request_body(
+                            cast(Dict[str, Any], api_kwargs),
+                            max_body_bytes=max(1, _actual_body_bytes),
+                        )
+                        _body_error = (
+                            "Request body too large after provider rejection: "
+                            f"body={_actual_body_bytes} bytes, cap=unknown "
+                            "(provider/profile did not report one), "
+                            f"images={_body_probe.image_bytes} bytes across "
+                            f"{_body_probe.image_count} images. Reduce image attachments "
+                            "or start a new session."
+                        )
+
+                    return _body_budget_failure(_body_error)
 
                 # Image-too-large recovery: shrink oversized native image
                 # parts in-place and retry once.  Triggered by Anthropic's
