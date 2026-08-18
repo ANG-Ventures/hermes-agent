@@ -81,14 +81,17 @@ def _delete_direct_snapshot(task_id: str, snapshot_id: str | None = None) -> Non
 
 
 def _ensure_modal_sdk() -> None:
-    """Lazy-install modal on demand. Idempotent — fast no-op once installed."""
+    """Lazy-install modal on demand. Idempotent — fast no-op once installed.
+
+    Falls back to plain importability when the install is refused: an
+    off-pin (or metadata-less) modal that already imports still runs the
+    backend fine. See ``lazy_deps.ensure_importable``.
+    """
     try:
-        from tools.lazy_deps import ensure as _lazy_ensure
-        _lazy_ensure("terminal.modal", prompt=False)
+        from tools.lazy_deps import ensure_importable as _ensure_importable
     except ImportError:
-        pass
-    except Exception as e:
-        raise ImportError(str(e))
+        return
+    _ensure_importable("terminal.modal", "modal")
 
 
 def _resolve_modal_image(image_spec: Any) -> Any:
