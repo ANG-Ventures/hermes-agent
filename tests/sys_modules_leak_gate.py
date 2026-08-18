@@ -42,8 +42,11 @@ ones is the hazard.
 from __future__ import annotations
 
 import sys
+from contextlib import contextmanager
 
 import pytest
+
+_MISSING = object()
 
 
 # Only these prefixes can realistically poison a sibling test in this repo. A
@@ -133,3 +136,57 @@ def _sys_modules_leak_gate(request):
     message = leak_failure_message(request.node.nodeid, removed)
     if message:
         pytest.fail(message)
+
+
+@contextmanager
+def purged_modules(predicate):
+    """Purge every ``sys.modules`` entry matching ``predicate``, then restore.
+
+    This is the executable form of the recipe :func:`leak_failure_message`
+    prints. A fixture that wants a *fresh* import (to pick up a new
+    ``HERMES_HOME`` or a patched module) wraps its purge in this instead of
+    hand-rolling the save/restore — the hand-rolled version is what leaked
+    three times already.
+
+    The subtlety that a naive ``saved = {...}; purge; sys.modules.update(saved)``
+    misses: **a purged namespace can contain a leaf that the re-import does not
+    pull back.** ``hermes_cli._subprocess_compat`` is imported at COLLECTION
+    time by ``agent.skill_preprocessing`` — a different parent entirely — so
+    purging the ``hermes_cli`` prefix evicts it while the fixture's
+    ``from hermes_cli import kanban_db`` re-import has no reason to re-import
+    it. ``update(saved)`` alone still restores it, but only because the leaf
+    was in ``saved``; the case that actually bites is the *fresh* module
+    objects created during the test, which ``update`` leaves behind pointing at
+    orphaned copies. So restoration here is symmetric: drop everything the
+    predicate matches (fresh copies included), reinstate the saved objects, and
+    put parent-package attributes back the way they were.
+
+    Restoring parent attributes matters because ``import a.b`` binds ``b`` onto
+    package ``a``. Reinstating ``sys.modules['a.b']`` without fixing ``a.b``
+    leaves ``from a import b`` handing out the orphaned copy.
+    """
+    saved = {name: module for name, module in list(sys.modules.items()) if predicate(name)}
+    saved_attrs = {}
+    for name in saved:
+        parent_name, separator, child_name = name.rpartition(".")
+        parent = sys.modules.get(parent_name) if separator else None
+        if parent is not None:
+            saved_attrs[(parent, child_name)] = parent.__dict__.get(child_name, _MISSING)
+
+    # Deepest-first so a package is never removed before its submodules.
+    for name in sorted(saved, key=lambda value: value.count("."), reverse=True):
+        sys.modules.pop(name, None)
+
+    try:
+        yield
+    finally:
+        # Evict every match, including modules imported fresh during the test —
+        # those are the orphaned copies a bare update() would strand.
+        for name in [n for n in list(sys.modules) if predicate(n)]:
+            sys.modules.pop(name, None)
+        sys.modules.update(saved)
+        for (parent, child_name), value in saved_attrs.items():
+            if value is _MISSING:
+                parent.__dict__.pop(child_name, None)
+            else:
+                parent.__dict__[child_name] = value

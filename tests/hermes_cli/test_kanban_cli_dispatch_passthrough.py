@@ -10,12 +10,21 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 import tempfile
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+from tests.sys_modules_leak_gate import purged_modules
+
+
+def _reload_target(name: str) -> bool:
+    return (
+        name.startswith("hermes_cli")
+        or name.startswith("hermes_state")
+        or name == "hermes_constants"
+    )
 
 
 @pytest.fixture()
@@ -24,10 +33,12 @@ def isolated_kanban_home(monkeypatch):
     test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
-    yield test_home
+    # Purge so the fresh HERMES_HOME is picked up, and RESTORE afterwards.
+    # `hermes_cli._subprocess_compat` is imported at collection time by
+    # `agent.skill_preprocessing`, so the purge evicts it but the re-import
+    # below never pulls it back — an unrestored removal the leak gate fails on.
+    with purged_modules(_reload_target):
+        yield test_home
 
 
 def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, monkeypatch):
