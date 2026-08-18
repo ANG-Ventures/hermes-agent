@@ -150,13 +150,15 @@ def test_desktop_session_search_merges_id_matches_before_content_matches(monkeyp
 class _FakeTitleSessionDB:
     """Fake proving title matches rank above content matches (and dedupe)."""
 
+    opened_read_only = None
+
     # fork-parity: upstream's _open_session_db_at_path bootstraps a missing
     # store via SessionDB(db_path=..., read_only=False), and its search handler
     # passes source/sources/exclude_sources (+ fields on search_messages). This
     # fork-authored fake predates both, so it needs the permissive ctor its
     # sibling _FakeSessionDB already has and the widened kwargs.
     def __init__(self, *args, **kwargs):
-        pass
+        type(self).opened_read_only = kwargs.get("read_only")
 
     def search_sessions_by_id(
         self,
@@ -223,6 +225,7 @@ class _FakeTitleSessionDB:
 
 
 def test_desktop_session_search_ranks_title_matches_before_content_matches(monkeypatch):
+    _FakeTitleSessionDB.opened_read_only = None
     monkeypatch.setattr("hermes_state.SessionDB", _FakeTitleSessionDB)
 
     response = asyncio.run(web_server.search_sessions(q="portal", limit=5))
@@ -235,4 +238,4 @@ def test_desktop_session_search_ranks_title_matches_before_content_matches(monke
     assert results[0]["snippet"] == "first user message"
     # The duplicate content hit on titled_session did not double-list it.
     assert len(results) == 2
-    assert _FakeSessionDB.opened_read_only is True
+    assert _FakeTitleSessionDB.opened_read_only is True

@@ -12,13 +12,15 @@ Currently:
   Windows path that works.
 """
 
+from types import SimpleNamespace
+
 
 class TestMatrixHiddenOnWindows:
     def test_matrix_present_on_linux(self, monkeypatch):
         """Sanity: matrix is still in the picker on Linux/macOS."""
         import hermes_cli.gateway as gateway_mod
 
-        monkeypatch.setattr(gateway_mod.sys, "platform", "linux")
+        monkeypatch.setattr(gateway_mod, "sys", SimpleNamespace(platform="linux"))
         platforms = gateway_mod._all_platforms()
         keys = {p["key"] for p in platforms}
         assert "matrix" in keys, "matrix must be available on Linux"
@@ -28,7 +30,7 @@ class TestMatrixHiddenOnWindows:
         """Gating must only drop matrix, not collateral damage."""
         import hermes_cli.gateway as gateway_mod
 
-        monkeypatch.setattr(gateway_mod.sys, "platform", "win32")
+        monkeypatch.setattr(gateway_mod, "sys", SimpleNamespace(platform="win32"))
         platforms = gateway_mod._all_platforms()
         keys = {p["key"] for p in platforms}
         # A representative sample of platforms that have no Windows
