@@ -8,6 +8,8 @@ Verifies that:
 
 import base64
 import io
+import json
+import logging
 import random
 
 import pytest
@@ -567,6 +569,57 @@ class TestHTTP413Compression:
         assert provider_body_sizes[0] > recovery_cap
         assert provider_body_sizes[1] <= recovery_cap
         mock_compress.assert_not_called()
+
+    def test_provider_body_413_without_images_fails_once_with_actionable_telemetry(
+        self, agent, caplog
+    ):
+        """A byte overflow with no evictable images fails on the first attempt."""
+        hard_cap = 500_000
+        agent.provider = "openrouter"
+        agent._compression_attempt_id = "stale-text-compression-attempt"
+        agent.context_compressor._last_summary_fallback_used = True
+        agent.context_compressor._last_aux_model_failure_model = "stale-aux-model"
+        agent.client.chat.completions.create.side_effect = _make_413_error(
+            message=(
+                "request_too_large: request body too large "
+                f"(max {hard_cap} bytes)"
+            )
+        )
+
+        with (
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            caplog.at_level(logging.INFO, logger="agent.conversation_compression"),
+        ):
+            result = agent.run_conversation("x" * 600_000, conversation_history=[])
+
+        assert result["failed"] is True
+        assert result["body_too_large"] is True
+        assert result["api_calls"] == 1
+        assert agent.client.chat.completions.create.call_count == 1
+        assert "Request body too large after provider rejection" in result["error"]
+        assert "body=" in result["error"]
+        assert "cap=" in result["error"]
+        assert "images=0 B across 0 images" in result["error"]
+        assert "/new" in result["error"]
+        assert "max compression attempts" not in result["error"]
+        mock_compress.assert_not_called()
+
+        telemetry = [
+            record.getMessage()
+            for record in caplog.records
+            if "context compression attempt telemetry:" in record.getMessage()
+        ]
+        assert len(telemetry) == 1
+        telemetry_payload = json.loads(
+            telemetry[0].split("context compression attempt telemetry: ", 1)[1]
+        )
+        assert telemetry_payload["failure_class"] == "no_progress"
+        assert telemetry_payload["remediation"] == "image_eviction"
+        assert telemetry_payload["fallback_used"] is False
+        assert telemetry_payload["attempt_id"] != "stale-text-compression-attempt"
 
     def test_413_clears_conversation_history_on_persist(self, agent):
         """After 413-triggered compression, _persist_session must receive None history.

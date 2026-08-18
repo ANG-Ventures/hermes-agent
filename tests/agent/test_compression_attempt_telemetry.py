@@ -149,3 +149,34 @@ def test_aux_call_telemetry_records_durations_without_content(caplog):
     raw_log = json.dumps(payload)
     assert "TOPSECRET_TRANSCRIPT_TEXT" not in raw_log
     assert "SANITIZED SUMMARY" not in raw_log
+
+
+def test_no_progress_telemetry_identifies_text_compression(caplog):
+    with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+        compressor = ContextCompressor(
+            model="test/main-model",
+            provider="test-provider",
+            threshold_percent=0.50,
+            quiet_mode=True,
+            config_context_length=100_000,
+        )
+    agent = _Agent(compressor)
+    messages = _messages()
+
+    with (
+        patch.object(compressor, "compress", side_effect=lambda value, **_kwargs: value),
+        caplog.at_level(logging.INFO, logger="agent.conversation_compression"),
+    ):
+        returned, _system_prompt = compress_context(
+            agent,
+            messages,
+            "system prompt",
+            approx_tokens=75_000,
+            force=True,
+            trigger_reason="payload_too_large",
+        )
+
+    assert returned == messages
+    payload = _extract_telemetry(caplog)
+    assert payload["failure_class"] == "no_progress"
+    assert payload["remediation"] == "text_compression"
