@@ -7,7 +7,10 @@ Verifies that:
 """
 
 import base64
+import copy
 import io
+import json
+import logging
 import random
 
 import pytest
@@ -248,6 +251,10 @@ class TestHTTP413Compression:
         ]
 
         with (
+            patch(
+                "agent.turn_context._degrade_prior_turn_multimodal_messages",
+                side_effect=lambda messages: (list(messages), 0),
+            ),
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -269,10 +276,10 @@ class TestHTTP413Compression:
         assert "Screenshot of the dashboard" in str(retried_tool["content"])
         assert not getattr(agent, "_no_list_tool_content_models", set())
 
-    def test_byte_preflight_resizes_images_before_single_provider_call(
-        self, agent, monkeypatch
+    def test_request_preflight_warns_and_remediates_prior_image_escape(
+        self, agent, monkeypatch, caplog
     ):
-        """N oversized images are remediated locally; the provider sees no 413."""
+        """The byte backstop repairs and exposes lifecycle invariant failures."""
         from agent.request_body_budget import serialized_request_body_size
         from providers import get_provider_profile
 
@@ -306,11 +313,16 @@ class TestHTTP413Compression:
         assert serialized_request_body_size({"messages": prefill}) > cap
 
         with (
+            patch(
+                "agent.turn_context._degrade_prior_turn_multimodal_messages",
+                side_effect=lambda messages: (list(messages), 0),
+            ),
             patch.object(agent, "_model_supports_vision", return_value=True),
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
+            caplog.at_level(logging.WARNING, logger="agent.conversation_loop"),
         ):
             result = agent.run_conversation("continue", conversation_history=prefill)
 
@@ -319,10 +331,11 @@ class TestHTTP413Compression:
         assert provider_body_sizes and len(provider_body_sizes) == 1
         assert agent.client.chat.completions.create.call_count == 1
         assert all(message["content"][1]["type"] == "image_url" for message in prefill)
+        assert "image lifecycle invariant violated" in caplog.text.lower()
         mock_compress.assert_not_called()
 
-    def test_rebuilt_anthropic_relay_preflights_multimodal_tool_history(self, agent):
-        """A rebuilt request cannot replay four stale screenshots above the relay cap."""
+    def test_live_and_rebuilt_anthropic_history_share_prior_image_projection(self, agent):
+        """Live and persisted rebuilds send byte-identical prior-turn summaries."""
         from agent.request_body_budget import (
             request_body_limit_for_provider,
             serialized_request_body_size,
@@ -373,6 +386,9 @@ class TestHTTP413Compression:
                         "role": "tool",
                         "tool_call_id": call_id,
                         "name": "vision_analyze",
+                        "_multimodal_text_summary": (
+                            f"Screenshot {index} exact lifecycle summary"
+                        ),
                         "content": [
                             {
                                 "type": "text",
@@ -388,6 +404,12 @@ class TestHTTP413Compression:
             )
 
         assert serialized_request_body_size({"messages": prefill}) > cap
+
+        rebuilt_prefill = copy.deepcopy(prefill)
+        for message in rebuilt_prefill:
+            summary = message.pop("_multimodal_text_summary", None)
+            if summary is not None:
+                message["content"] = summary
 
         captured_requests = []
 
@@ -405,15 +427,32 @@ class TestHTTP413Compression:
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            result = agent.run_conversation("continue", conversation_history=prefill)
+            live_result = agent.run_conversation("continue", conversation_history=prefill)
+            rebuilt_result = agent.run_conversation(
+                "continue", conversation_history=rebuilt_prefill
+            )
+            turn_three_result = agent.run_conversation(
+                "turn three", conversation_history=live_result["messages"]
+            )
 
-        assert result["completed"] is True
-        assert result["final_response"] == "Recovered before relay dispatch"
-        create.assert_called_once()
-        assert len(captured_requests) == 1
+        assert live_result["completed"] is True
+        assert rebuilt_result["completed"] is True
+        assert turn_three_result["completed"] is True
+        assert live_result["final_response"] == "Recovered before relay dispatch"
+        assert rebuilt_result["final_response"] == "Recovered before relay dispatch"
+        assert turn_three_result["final_response"] == "Recovered before relay dispatch"
+        assert create.call_count == 3
+        assert len(captured_requests) == 3
+        live_wire_bytes = json.dumps(
+            captured_requests[0]["messages"], ensure_ascii=False, separators=(",", ":")
+        ).encode()
+        rebuilt_wire_bytes = json.dumps(
+            captured_requests[1]["messages"], ensure_ascii=False, separators=(",", ":")
+        ).encode()
+        assert live_wire_bytes == rebuilt_wire_bytes
         request_text = str(captured_requests[0]["messages"])
         for index in range(4):
-            assert f"Screenshot {index} text summary" in request_text
+            assert f"Screenshot {index} exact lifecycle summary" in request_text
 
         def _anthropic_image_payloads(value):
             if isinstance(value, dict):
@@ -438,9 +477,8 @@ class TestHTTP413Compression:
             return []
 
         remaining_images = _anthropic_image_payloads(captured_requests[0]["messages"])
-        assert 0 < len(remaining_images) < 4
-        assert not any(payload.startswith("a" * 100) for payload in remaining_images)
-        assert any(payload.startswith("d" * 100) for payload in remaining_images)
+        assert remaining_images == []
+        assert _anthropic_image_payloads(captured_requests[2]["messages"]) == []
         assert all(
             message["content"][1]["type"] == "image_url"
             for message in prefill
@@ -553,6 +591,10 @@ class TestHTTP413Compression:
         ]
 
         with (
+            patch(
+                "agent.turn_context._degrade_prior_turn_multimodal_messages",
+                side_effect=lambda messages: (list(messages), 0),
+            ),
             patch.object(agent, "_model_supports_vision", return_value=True),
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),

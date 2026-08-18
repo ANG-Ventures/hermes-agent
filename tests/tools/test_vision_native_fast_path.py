@@ -107,13 +107,10 @@ class TestVisionAnalyzeNative:
     def test_oversized_image_resized_under_embed_cap(self, tmp_path):
         """Regression for the wedged-session incident (May 2026).
 
-        A vision tool-result image is baked into conversation history and
-        re-sent on every subsequent turn.  Anthropic rejects any single
-        base64 image over 5 MB with a 400, and immutable history means the
-        bad bytes can't be cleared by retrying — the session is permanently
-        wedged.  The native fast path must proactively resize down to the
-        embed cap (well under 5 MB) BEFORE embedding, not just at the 20 MB
-        hard ceiling.  Skips if Pillow isn't available (resize is a no-op).
+        Anthropic rejects any single base64 image over 5 MB. The native fast
+        path must proactively resize below that limit so the current-turn
+        request succeeds; the following user-turn boundary then expires its
+        pixels. Skips if Pillow isn't available (resize is a no-op).
         """
         pytest = __import__("pytest")
         try:

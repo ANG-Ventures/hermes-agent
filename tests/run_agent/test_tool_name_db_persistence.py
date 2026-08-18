@@ -43,3 +43,25 @@ def test_tool_name_persisted_to_session_db():
     tool_rows = [m for m in batch if m.get("role") == "tool"]
     assert len(tool_rows) == 1
     assert tool_rows[0]["tool_name"] == "terminal"
+
+
+def test_multimodal_tool_result_persists_exact_lifecycle_summary():
+    session_db = MagicMock()
+    agent = _make_agent(session_db)
+    message = make_tool_result_message(
+        "vision_analyze",
+        [
+            {"type": "text", "text": "Immediate-turn native image text."},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,pixels"},
+            },
+        ],
+        "call_vision",
+        multimodal_text_summary="Exact persisted vision summary.",
+    )
+
+    agent._flush_messages_to_session_db([message])
+
+    batch = session_db.append_messages_batch.call_args.kwargs["messages"]
+    assert batch[0]["content"] == "Exact persisted vision summary."

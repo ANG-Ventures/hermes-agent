@@ -359,6 +359,10 @@ def _is_multimodal_tool_result(value: Any) -> bool:
     )
 
 
+_MULTIMODAL_TEXT_SUMMARY_KEY = "_multimodal_text_summary"
+_MULTIMODAL_IMAGE_PART_TYPES = frozenset({"image", "image_url", "input_image"})
+
+
 def _multimodal_text_summary(value: Any) -> str:
     """Extract a plain text view of a multimodal tool result.
 
@@ -382,6 +386,104 @@ def _multimodal_text_summary(value: Any) -> str:
         return json.dumps(value, default=str)
     except Exception:
         return str(value)
+
+
+def _count_multimodal_image_parts(messages: Any) -> int:
+    """Count native image parts recursively without decoding their payloads."""
+
+    count = 0
+
+    def walk(value: Any) -> None:
+        nonlocal count
+        if isinstance(value, dict):
+            if value.get("type") in _MULTIMODAL_IMAGE_PART_TYPES:
+                count += 1
+                return
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                walk(child)
+
+    walk(messages)
+    return count
+
+
+def _multimodal_message_text_projection(msg: Any) -> Optional[str]:
+    """Return the canonical text-only projection of an image-bearing message.
+
+    Tool execution keeps the producer envelope's exact ``text_summary`` in an
+    internal sidecar after unwrapping its image parts for the active turn.  That
+    summary is authoritative.  Older/synthetic image lists without a sidecar
+    use the same text-plus-``[screenshot]`` projection as session persistence.
+    ``None`` means the message has no image payload to expire.
+    """
+
+    if not isinstance(msg, dict):
+        return None
+    content = msg.get("content")
+    if _count_multimodal_image_parts(content) == 0:
+        return None
+
+    sidecar = msg.get(_MULTIMODAL_TEXT_SUMMARY_KEY)
+    if isinstance(sidecar, str) and sidecar:
+        return sidecar
+    if _is_multimodal_tool_result(content):
+        return _multimodal_text_summary(content)
+
+    projected: List[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            part_type = value.get("type")
+            if part_type in {"text", "input_text"}:
+                text = value.get("text")
+                if text is not None:
+                    projected.append(str(text))
+                return
+            if part_type in _MULTIMODAL_IMAGE_PART_TYPES:
+                projected.append("[screenshot]")
+                return
+            if _is_multimodal_tool_result(value):
+                projected.append(_multimodal_text_summary(value))
+                return
+            nested = value.get("content")
+            if isinstance(nested, (dict, list, tuple)):
+                collect(nested)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                collect(child)
+
+    collect(content)
+    return "\n".join(projected) if projected else "[screenshot]"
+
+
+def _degrade_prior_turn_multimodal_messages(
+    messages: List[Any],
+) -> tuple[List[Any], int]:
+    """Expire prior-turn pixels on a copy while preserving exact text context.
+
+    The caller passes only history that predates the new user turn.  Changed
+    message dictionaries are copied, so caller-owned history and the just-ended
+    turn remain untouched.  The returned count is image parts removed.
+    """
+
+    projected_messages: List[Any] = []
+    degraded_images = 0
+    for msg in messages:
+        projection = _multimodal_message_text_projection(msg)
+        if projection is None:
+            projected_messages.append(msg)
+            continue
+        image_count = _count_multimodal_image_parts(msg.get("content"))
+        projected = dict(msg)
+        projected["content"] = projection
+        projected.pop(_MULTIMODAL_TEXT_SUMMARY_KEY, None)
+        # A pre-rewrite wire sidecar would override this projection on replay.
+        projected.pop("api_content", None)
+        projected_messages.append(projected)
+        degraded_images += image_count
+    return projected_messages, degraded_images
 
 
 def _append_subdir_hint_to_multimodal(value: Dict[str, Any], hint: str) -> None:
@@ -536,10 +638,15 @@ def make_tool_result_message(
     tool_call_id: str,
     *,
     effect_disposition: str | None = None,
+    multimodal_text_summary: str | None = None,
 ) -> dict:
     """Build a tool-result message dict with both the OpenAI-format ``name``
     field (required by the wire format and provider adapters) and the internal
     ``tool_name`` field (written to the session DB messages table).
+
+    ``multimodal_text_summary`` is internal lifecycle metadata: the current
+    turn keeps native pixels in ``content`` while persistence and later turns
+    use this exact producer-supplied projection.
 
     Content from high-risk tools (``web_extract``, ``web_search``, ``browser_*``,
     ``mcp_*``) gets wrapped in semantic delimiters telling the model the content
@@ -573,6 +680,8 @@ def make_tool_result_message(
             message["_tool_output_risk"] = risk_metadata
     if effect_disposition is not None:
         message["effect_disposition"] = effect_disposition
+    if isinstance(multimodal_text_summary, str) and multimodal_text_summary:
+        message[_MULTIMODAL_TEXT_SUMMARY_KEY] = multimodal_text_summary
     return message
 
 

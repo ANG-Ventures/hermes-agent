@@ -41,6 +41,7 @@ from agent.fork_ext.tool_gate import (
     resolve_tool_search_unwrap,
 )
 from agent.tool_dispatch_helpers import (
+    _count_multimodal_image_parts,
     _is_destructive_command,
     _is_multimodal_tool_result,
     _multimodal_text_summary,
@@ -1638,12 +1639,20 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # Text-only servers get a string-safe fallback here so a rejected
         # image tool result never poisons canonical session history.
         # String results pass through unchanged.
+        _multimodal_summary = (
+            _multimodal_text_summary(function_result)
+            if _is_multimodal_tool_result(function_result)
+            else None
+        )
         _tool_content = agent._tool_result_content_for_active_model(name, function_result)
+        if not _count_multimodal_image_parts(_tool_content):
+            _multimodal_summary = None
         tool_message = make_tool_result_message(
             name,
             _tool_content,
             tc.id,
             effect_disposition=effect_disposition,
+            multimodal_text_summary=_multimodal_summary,
         )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
@@ -2369,8 +2378,20 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.
+        _multimodal_summary = (
+            _multimodal_text_summary(function_result)
+            if _is_multimodal_tool_result(function_result)
+            else None
+        )
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
-        tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
+        if not _count_multimodal_image_parts(_tool_content):
+            _multimodal_summary = None
+        tool_message = make_tool_result_message(
+            function_name,
+            _tool_content,
+            tool_call.id,
+            multimodal_text_summary=_multimodal_summary,
+        )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
         if not _flush_session_db_after_tool_progress(

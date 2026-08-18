@@ -216,6 +216,7 @@ from agent.tool_dispatch_helpers import (
     _paths_overlap,  # noqa: F401  # re-exported for tests that `from run_agent import _paths_overlap`
     _is_multimodal_tool_result,
     _multimodal_text_summary,
+    _multimodal_message_text_projection,
     _append_subdir_hint_to_multimodal,  # noqa: F401  # re-exported for tests that `from run_agent import _append_subdir_hint_to_multimodal`
     _extract_file_mutation_targets,
     _extract_landed_file_mutation_paths,
@@ -2496,11 +2497,15 @@ class AIAgent:
                     and sanitize_context(content).strip() != content.strip()
                 ):
                     _row_api_content = content
-                # Persist multimodal tool results as their text summary only —
-                # base64 images would bloat the session DB and aren't useful
-                # for cross-session replay.
-                if _is_multimodal_tool_result(content):
-                    content = _multimodal_text_summary(content)
+                # Persist the same image-free projection used at the next turn
+                # boundary. This keeps live-history and rebuilt requests
+                # byte-identical instead of accounting for a tiny text row while
+                # the in-memory request silently retains base64 pixels.
+                _multimodal_projection = _multimodal_message_text_projection(
+                    {**msg, "content": content}
+                )
+                if _multimodal_projection is not None:
+                    content = _multimodal_projection
                 elif isinstance(content, list):
                     # List of OpenAI-style content parts: strip images, keep text.
                     _txt = []

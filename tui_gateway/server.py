@@ -7413,9 +7413,10 @@ def _build_persist_user_message(user_text: str, image_paths: list[str], run_mess
     ``_flush_messages_to_session_db`` deliberately ignores a plain-string
     override for a list payload (a text override must not erase a turn's
     image/audio summary). So mirror the shape: replace only the text part with
-    the ``@image:`` ref form and keep the image parts, so the model still has
-    the pixels for the rest of the session. Any API-only text part (the
-    barge-in note) is dropped along the way, which is the point of the override.
+    the ``@image:`` ref form and keep the image parts for the active turn. The
+    next user-turn boundary expires those pixels to this text projection. Any
+    API-only text part (the barge-in note) is dropped along the way, which is
+    the point of the override.
     """
     persist_text = _build_persist_message_with_image_refs(user_text, image_paths)
     if not isinstance(run_message, list):

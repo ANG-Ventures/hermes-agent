@@ -51,6 +51,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
 )
+from agent.tool_dispatch_helpers import _degrade_prior_turn_multimodal_messages
 
 logger = logging.getLogger(__name__)
 
@@ -568,8 +569,18 @@ def build_turn_context(
         _msg_preview,
     )
 
-    # Initialize conversation (copy to avoid mutating the caller's list).
-    messages = list(conversation_history) if conversation_history else []
+    # Initialize conversation without mutating caller-owned history. Native
+    # image bytes live for exactly the turn that loaded them; at the next user
+    # boundary they become the same text projection written to SessionDB.
+    messages, degraded_prior_images = _degrade_prior_turn_multimodal_messages(
+        list(conversation_history) if conversation_history else []
+    )
+    if degraded_prior_images:
+        logger.info(
+            "expired %d prior-turn image payload(s) to text summaries (session=%s)",
+            degraded_prior_images,
+            agent.session_id or "none",
+        )
 
     # The CLI may already have staged this input outside the history passed to
     # ``run_conversation``. Reuse it only when its clean transcript text matches
