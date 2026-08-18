@@ -29,6 +29,11 @@ _NON_BODY_KWARGS = frozenset(
     }
 )
 
+# Subscription relays that forward the native Anthropic Messages wire exactly.
+# Bridge relays (claude-bpr / claude-bpx-N) are deliberately excluded because
+# the real claude binary owns their Chat Completions request assembly.
+_CLAUDE_ANTHROPIC_RELAY_RE = re.compile(r"^claude-(?:apr|apx-\d+)$")
+
 
 @dataclass(frozen=True)
 class RequestBodyRemediation:
@@ -111,13 +116,23 @@ def request_body_limit_for_provider(
         profile = get_provider_profile(provider or "")
         # Named custom relays do not have a ProviderProfile. When they use the
         # native Anthropic Messages protocol, inherit that protocol's declared
-        # body ceiling rather than waiting for the upstream 413. Known profiles
-        # (MiniMax, OpenCode, etc.) retain their own explicit None/override.
+        # body ceiling rather than waiting for the upstream 413.
         if profile is None and api_mode == "anthropic_messages":
             profile = get_provider_profile("anthropic")
         if profile is None:
             return None
         cap = profile.get_max_request_body_bytes(model)
+        # APR/APX profiles are out-of-tree fleet configuration and may predate
+        # this field. They proxy Anthropic's exact wire, so an unset cap inherits
+        # the native protocol limit. Other named profiles retain their own None.
+        if (
+            cap is None
+            and api_mode == "anthropic_messages"
+            and _CLAUDE_ANTHROPIC_RELAY_RE.fullmatch(provider or "")
+        ):
+            anthropic = get_provider_profile("anthropic")
+            if anthropic is not None:
+                cap = anthropic.get_max_request_body_bytes(model)
         if cap is None:
             return None
         cap = int(cap)
