@@ -21,6 +21,8 @@ Two gates:
 """
 
 import ast
+import inspect
+import textwrap
 import types
 import weakref
 
@@ -111,8 +113,6 @@ def _find_defs(tree, names):
 
 
 def test_side_channel_closures_late_bind_the_adapter():
-    import inspect
-
     import gateway.run as run_mod
 
     tree = ast.parse(inspect.getsource(run_mod))
@@ -142,4 +142,22 @@ def test_side_channel_closures_late_bind_the_adapter():
         "snapshot directly — a mid-turn platform reconnect replaces that "
         "object and sends through it are silently dropped. Route through "
         f"_current_status_adapter() instead. Offenders: {offenders}"
+    )
+
+
+def test_extracted_status_callback_late_binds_the_adapter():
+    """The TurnRunner extraction must not reopen the stale snapshot path."""
+    from gateway.run import TurnRunner
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(TurnRunner._status_callback_sync)))
+    attrs = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+    }
+
+    assert "_current_status_adapter" in attrs
+    assert "_status_adapter" not in attrs, (
+        "TurnRunner._status_callback_sync bypasses the per-send adapter resolver "
+        "and can send failover announcements through a replaced adapter"
     )

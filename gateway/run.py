@@ -878,6 +878,12 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     return text
 
 
+def _is_model_route_change_status(message: str) -> bool:
+    """Return whether ``message`` is a durable failover/recovery announcement."""
+    text = str(message or "").lstrip()
+    return text.startswith("🔄 Model fallback") or text.startswith("🔄 Model recovery")
+
+
 def render_notice_line(notice) -> str:
     """Render an AgentNotice to a single plaintext line for messaging platforms.
 
@@ -893,13 +899,20 @@ def render_notice_line(notice) -> str:
     return str(getattr(notice, "text", "") or "").strip()
 
 
-async def _send_or_update_status_coro(adapter, chat_id, status_key, content, metadata):
+async def _send_or_update_status_coro(
+    adapter, chat_id, status_key, content, metadata, *, durable=False
+):
     """Route a status message through adapter.send_or_update_status when supported.
 
-    Issue #30045: adapters that implement send_or_update_status (currently
+    Durable route-change announcements always use a fresh message. They must
+    not be hidden by editing an old status bubble or overwritten by a later
+    lifecycle update. Other statuses preserve issue #30045 behavior: adapters
+    that implement send_or_update_status (currently
     Telegram) edit the previous bubble for the same status_key instead of
     appending a new one. Adapters without the method fall back to plain send.
     """
+    if durable:
+        return await adapter.send(chat_id, content, metadata=metadata)
     sender = getattr(adapter, "send_or_update_status", None)
     if callable(sender):
         return await sender(chat_id, status_key, content, metadata=metadata)
@@ -4826,41 +4839,96 @@ class TurnRunner:
         except Exception as _e:
             logger.debug("event_callback hook error: %s", _e)
 
-    def _status_callback_sync(self, event_type: str, message: str) -> None:
+    def _status_callback_sync(
+        self, event_type: str, message: str
+    ) -> Optional[bool]:
         ctx = self._ctx
-        if not ctx._status_adapter or not ctx._run_still_current():
-            return
+        is_route_change = _is_model_route_change_status(message)
+
+        def _warn_route_drop(reason: str, detail: str = "") -> None:
+            if not is_route_change:
+                return
+            platform = getattr(ctx.source.platform, "value", ctx.source.platform)
+            safe_message = _redact_gateway_user_facing_secrets(
+                str(message or "")
+            )[:160]
+            logger.warning(
+                "route-change status dropped: reason=%s platform=%s chat=%s "
+                "event_type=%s message=%s%s",
+                reason,
+                platform or "unknown",
+                ctx._status_chat_id,
+                event_type,
+                safe_message,
+                f" detail={detail}" if detail else "",
+            )
+
+        resolver = ctx._current_status_adapter
+        try:
+            adapter = resolver() if callable(resolver) else None
+        except Exception as exc:
+            _warn_route_drop("adapter_resolution_failed", type(exc).__name__)
+            return False if is_route_change else None
+        if not adapter:
+            _warn_route_drop("no_status_adapter")
+            return False if is_route_change else None
+        if not ctx._run_still_current():
+            _warn_route_drop("run_not_current")
+            return False if is_route_change else None
         prepared_message = _prepare_gateway_status_message(
             ctx.source.platform,
             event_type,
             message,
         )
         if prepared_message is None:
-            logger.debug(
-                "status_callback suppressed for %s/%s: %s",
-                ctx.source.platform.value if ctx.source.platform else "unknown",
-                event_type,
-                _redact_gateway_user_facing_secrets(str(message or ""))[:160],
-            )
-            return
+            if is_route_change:
+                _warn_route_drop("status_filtered")
+            else:
+                logger.debug(
+                    "status_callback suppressed for %s/%s: %s",
+                    ctx.source.platform.value if ctx.source.platform else "unknown",
+                    event_type,
+                    _redact_gateway_user_facing_secrets(str(message or ""))[:160],
+                )
+            return False if is_route_change else None
         _fut = safe_schedule_threadsafe(
-            _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, event_type, prepared_message, ctx._status_thread_metadata),
+            _send_or_update_status_coro(
+                adapter,
+                ctx._status_chat_id,
+                event_type,
+                prepared_message,
+                ctx._status_thread_metadata,
+                durable=is_route_change,
+            ),
             ctx._loop_for_step,
             logger=logger,
             log_message=f"status_callback ({event_type}) scheduling error",
         )
         if _fut is None:
-            return
-        if ctx._cleanup_progress:
-            def _track_status_id(fut) -> None:
-                try:
-                    res = fut.result()
-                except Exception:
-                    return
+            _warn_route_drop("schedule_failed")
+            return False if is_route_change else None
+
+        def _track_status_result(fut) -> None:
+            try:
+                res = fut.result()
+            except Exception as exc:
+                _warn_route_drop("adapter_send_exception", type(exc).__name__)
+                return
+            if is_route_change and not getattr(res, "success", False):
+                error = _redact_gateway_user_facing_secrets(
+                    str(getattr(res, "error", "") or type(res).__name__)
+                )[:160]
+                _warn_route_drop("adapter_send_failed", error)
+                return
+            # Route announcements are durable messages, not temporary progress.
+            if ctx._cleanup_progress and not is_route_change:
                 mid = getattr(res, "message_id", None)
                 if getattr(res, "success", False) and mid:
                     ctx._cleanup_msg_ids.append(str(mid))
-            _fut.add_done_callback(_track_status_id)
+
+        if is_route_change or ctx._cleanup_progress:
+            _fut.add_done_callback(_track_status_result)
+        return True if is_route_change else None
 
     def run_sync(self):
         ctx = self._ctx
@@ -29525,6 +29593,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # status wiring computed above onto the shared TurnContext at the
         # exact original binding site.
         turn_ctx._status_adapter = _status_adapter
+        turn_ctx._current_status_adapter = _current_status_adapter
         turn_ctx._status_chat_id = _status_chat_id
         turn_ctx._status_thread_metadata = _status_thread_metadata
         turn_ctx._status_callback_sync = turn_runner._status_callback_sync

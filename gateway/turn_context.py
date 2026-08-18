@@ -118,6 +118,7 @@ class TurnContext:
     _loop_for_step: Any = None
     _hooks_ref: Any = None
     _status_adapter: Any = None
+    _current_status_adapter: Optional[Callable[[], Any]] = None
     _status_chat_id: Any = None
     _status_thread_metadata: Optional[dict] = None
 
