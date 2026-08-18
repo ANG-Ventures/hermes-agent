@@ -24,7 +24,9 @@ from urllib.parse import urlparse
 from hermes_constants import get_hermes_home
 from typing import Any, Dict, List, Optional, Tuple
 from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_vars
+from agent.errors import ProviderStreamParseError
 from agent.secret_scope import get_secret as _get_secret
+from agent.stream_diag import is_provider_stream_parse_error
 
 
 def _getenv(name: str, default: str = "") -> str:
@@ -3235,27 +3237,39 @@ def create_anthropic_message(
         stream_kwargs.pop("stream", None)
         try:
             with stream_fn(**stream_kwargs) as stream:
-                if callable(on_response):
-                    try:
-                        on_response(getattr(stream, "response", None))
-                    except Exception:
-                        logger.debug(
-                            "%son_response callback failed",
-                            log_prefix, exc_info=True,
-                        )
-                if callable(on_stream_event):
-                    # Consume the event stream manually so each event can
-                    # tick the caller's progress callback; get_final_message
-                    # then returns the accumulated snapshot.
-                    for _event in stream:
+                stream_response = getattr(stream, "response", None)
+                http_status = getattr(stream_response, "status_code", None)
+                try:
+                    if callable(on_response):
                         try:
-                            on_stream_event(_event)
+                            on_response(stream_response)
                         except Exception:
                             logger.debug(
-                                "%son_stream_event callback failed",
+                                "%son_response callback failed",
                                 log_prefix, exc_info=True,
                             )
-                return stream.get_final_message()
+                    if callable(on_stream_event):
+                        # Consume the event stream manually so each event can
+                        # tick the caller's progress callback; get_final_message
+                        # then returns the accumulated snapshot.
+                        for _event in stream:
+                            try:
+                                on_stream_event(_event)
+                            except Exception:
+                                logger.debug(
+                                    "%son_stream_event callback failed",
+                                    log_prefix, exc_info=True,
+                                )
+                    return stream.get_final_message()
+                except Exception as exc:
+                    # Only classify after stream.__enter__ exposed a successful
+                    # response. ValueError from request construction/opening must
+                    # remain a non-retryable local client error.
+                    if is_provider_stream_parse_error(
+                        "anthropic_messages", exc, http_status=http_status
+                    ):
+                        raise ProviderStreamParseError(str(exc)) from exc
+                    raise
         except Exception as exc:
             if not _is_stream_unavailable_error(exc):
                 raise

@@ -391,16 +391,6 @@ def test_malformed_200_stream_retries_then_fails_over(monkeypatch):
     ):
         result = asyncio.run(_run_with_gateway_status(agent, adapter, []))
 
-    if (
-        primary._stream_calls == 1
-        and result.get("failed") is True
-        and "expected value at line 2 column 1" in result.get("error", "")
-    ):
-        pytest.xfail(
-            "t_0d8363e9: a bare ValueError from a 200 + malformed provider "
-            "stream is still classified as terminal instead of retryable"
-        )
-
     assert primary._stream_calls >= 2
     assert result["completed"] is True
     assert result["final_response"] == "Recovered through the fallback route"
