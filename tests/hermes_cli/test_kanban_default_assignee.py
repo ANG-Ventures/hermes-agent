@@ -8,10 +8,19 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import tempfile
 
 import pytest
+
+from tests.sys_modules_leak_gate import purged_modules
+
+
+def _reload_target(name: str) -> bool:
+    return (
+        name.startswith("hermes_cli")
+        or name.startswith("hermes_state")
+        or name == "hermes_constants"
+    )
 
 
 @pytest.fixture()
@@ -19,12 +28,15 @@ def isolated_kanban_home(monkeypatch):
     """Spin up a fresh HERMES_HOME with a clean kanban DB."""
     test_home = tempfile.mkdtemp(prefix="kanban_default_assignee_test_")
     monkeypatch.setenv("HERMES_HOME", test_home)
-    # Force-reimport so the fresh HERMES_HOME is picked up.
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
-    from hermes_cli import kanban_db
-    yield kanban_db, test_home
+    # Force-reimport so the fresh HERMES_HOME is picked up, and RESTORE after.
+    # `hermes_cli._subprocess_compat` is imported at collection time by
+    # `agent.skill_preprocessing`, so the purge evicts it but the `kanban_db`
+    # re-import never pulls it back — an unrestored removal the leak gate
+    # fails on. `purged_modules` also evicts the fresh module objects created
+    # here, so no later test can bind to an orphaned copy.
+    with purged_modules(_reload_target):
+        from hermes_cli import kanban_db
+        yield kanban_db, test_home
     # Cleanup is best-effort; tempfile dir survives but pytest isolation
     # gives each test its own monkeypatched HERMES_HOME so no cross-test
     # contamination.
