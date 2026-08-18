@@ -6,6 +6,10 @@ Verifies that:
 - Preflight compression proactively compresses oversized sessions before API calls
 """
 
+import base64
+import io
+import random
+
 import pytest
 #pytestmark = pytest.mark.skip(reason="Hangs in non-interactive environments")
 
@@ -74,6 +78,17 @@ def _make_413_error(*, use_status_code=True, message="Request entity too large")
     if use_status_code:
         err.status_code = 413
     return err
+
+
+def _noisy_png_data_url(seed: int, *, dimension: int = 256) -> str:
+    """Build a deterministic, valid PNG large enough to exercise resizing."""
+    from PIL import Image
+
+    pixels = random.Random(seed).randbytes(dimension * dimension * 3)
+    image = Image.frombytes("RGB", (dimension, dimension), pixels)
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(output.getvalue()).decode()
 
 
 @pytest.fixture()
@@ -243,6 +258,178 @@ class TestHTTP413Compression:
         assert "data:image" not in str(retried_tool["content"])
         assert "Screenshot of the dashboard" in str(retried_tool["content"])
         assert not getattr(agent, "_no_list_tool_content_models", set())
+
+    def test_byte_preflight_resizes_images_before_single_provider_call(
+        self, agent, monkeypatch
+    ):
+        """N oversized images are remediated locally; the provider sees no 413."""
+        from agent.request_body_budget import serialized_request_body_size
+        from providers import get_provider_profile
+
+        cap = 300_000
+        agent.provider = "openrouter"
+        profile = get_provider_profile(agent.provider)
+        assert profile is not None
+        monkeypatch.setattr(profile, "max_request_body_bytes", cap, raising=False)
+
+        provider_body_sizes = []
+
+        def _provider_call(**kwargs):
+            provider_body_sizes.append(serialized_request_body_size(kwargs))
+            assert provider_body_sizes[-1] <= cap
+            return _mock_response(content="Recovered before dispatch", finish_reason="stop")
+
+        agent.client.chat.completions.create.side_effect = _provider_call
+        prefill = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"Screenshot {index}"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": _noisy_png_data_url(index)},
+                    },
+                ],
+            }
+            for index in range(3)
+        ]
+        assert serialized_request_body_size({"messages": prefill}) > cap
+
+        with (
+            patch.object(agent, "_model_supports_vision", return_value=True),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("continue", conversation_history=prefill)
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered before dispatch"
+        assert provider_body_sizes and len(provider_body_sizes) == 1
+        assert agent.client.chat.completions.create.call_count == 1
+        assert all(message["content"][1]["type"] == "image_url" for message in prefill)
+        mock_compress.assert_not_called()
+
+    def test_byte_preflight_without_images_fails_before_provider_attempt(
+        self, agent, monkeypatch
+    ):
+        """A text-only body over the byte cap fails immediately and actionably."""
+        from providers import get_provider_profile
+
+        cap = 5_000
+        agent.provider = "openrouter"
+        profile = get_provider_profile(agent.provider)
+        assert profile is not None
+        monkeypatch.setattr(profile, "max_request_body_bytes", cap, raising=False)
+
+        with (
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("x" * 50_000, conversation_history=[])
+
+        assert result["failed"] is True
+        assert result["api_calls"] == 1
+        assert agent.client.chat.completions.create.call_count == 0
+        assert "Request body too large before provider dispatch" in result["error"]
+        assert "body=" in result["error"]
+        assert "cap=4.9 KB" in result["error"]
+        assert "images=0 B across 0 images" in result["error"]
+        mock_compress.assert_not_called()
+
+    def test_byte_preflight_measures_execution_middleware_payload(
+        self, agent, monkeypatch
+    ):
+        """The terminal preflight measures a payload replaced by middleware."""
+        from providers import get_provider_profile
+
+        cap = 5_000
+        agent.provider = "openrouter"
+        profile = get_provider_profile(agent.provider)
+        assert profile is not None
+        monkeypatch.setattr(profile, "max_request_body_bytes", cap, raising=False)
+
+        def _replace_at_execution(request, next_call, **_context):
+            replaced = dict(request)
+            replaced["messages"] = [{"role": "user", "content": "x" * 50_000}]
+            return next_call(replaced)
+
+        monkeypatch.setattr(
+            "hermes_cli.middleware.run_llm_execution_middleware",
+            _replace_at_execution,
+        )
+
+        with (
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("short", conversation_history=[])
+
+        assert result["failed"] is True
+        assert agent.client.chat.completions.create.call_count == 0
+        assert "Request body too large before provider dispatch" in result["error"]
+        assert "body=" in result["error"]
+        assert "cap=4.9 KB" in result["error"]
+        assert "images=0 B across 0 images" in result["error"]
+        mock_compress.assert_not_called()
+
+    def test_provider_body_413_routes_to_image_remediation_not_compression(self, agent):
+        """A provider-reported byte cap gets one image-aware retry."""
+        from agent.request_body_budget import serialized_request_body_size
+
+        hard_cap = 500_000
+        recovery_cap = int(hard_cap * 0.95)
+        agent.provider = "openrouter"
+        err_413 = _make_413_error(
+            message=(
+                "request_too_large: request body too large "
+                f"(max {hard_cap} bytes)"
+            )
+        )
+        provider_body_sizes = []
+
+        def _provider_call(**kwargs):
+            provider_body_sizes.append(serialized_request_body_size(kwargs))
+            if len(provider_body_sizes) == 1:
+                raise err_413
+            assert provider_body_sizes[-1] <= recovery_cap
+            return _mock_response(content="Recovered after byte eviction")
+
+        agent.client.chat.completions.create.side_effect = _provider_call
+        prefill = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"Screenshot {index}"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": _noisy_png_data_url(index)},
+                    },
+                ],
+            }
+            for index in range(3)
+        ]
+
+        with (
+            patch.object(agent, "_model_supports_vision", return_value=True),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("continue", conversation_history=prefill)
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered after byte eviction"
+        assert len(provider_body_sizes) == 2
+        assert provider_body_sizes[0] > recovery_cap
+        assert provider_body_sizes[1] <= recovery_cap
+        mock_compress.assert_not_called()
 
     def test_413_clears_conversation_history_on_persist(self, agent):
         """After 413-triggered compression, _persist_session must receive None history.

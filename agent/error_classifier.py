@@ -75,7 +75,8 @@ class FailoverReason(enum.Enum):
 
     # Context / payload
     context_overflow = "context_overflow"  # Context too large — compress, not failover
-    payload_too_large = "payload_too_large"  # 413 — compress payload
+    body_too_large = "body_too_large"      # Serialized HTTP body exceeds byte cap — image remediation
+    payload_too_large = "payload_too_large"  # Token/context payload exceeds model capacity — compress
     image_too_large = "image_too_large"   # Native image part exceeds provider's per-image limit — shrink and retry
 
     # Model / provider policy
@@ -296,18 +297,21 @@ _USAGE_LIMIT_TRANSIENT_SIGNALS = [
     "window",
 ]
 
-# Payload-too-large patterns detected from message text (no status_code attr).
-# Proxies and some backends embed the HTTP status in the error message.
+# Serialized request-body patterns. These are byte-limit failures, not token
+# window failures; text compression cannot remove base64 images in the fresh
+# tail. Anthropic normally returns the structured ``request_too_large`` type.
+_BODY_TOO_LARGE_PATTERNS = [
+    "request_too_large",
+    "request body too large",
+    "request exceeds the maximum size",
+]
+
+# Token/context payload-too-large patterns detected from message text (no
+# status_code attr). Proxies and some backends embed status in the message.
 _PAYLOAD_TOO_LARGE_PATTERNS = [
     "request entity too large",
     "payload too large",
     "error code: 413",
-    # Anthropic's structured 413 error type.  Normally arrives with an HTTP
-    # 413 status (handled by the status path), but aggregators/proxies can
-    # re-wrap it into a plain message with no status attribute — route it to
-    # the same compression recovery.  (port of anomalyco/opencode#37848)
-    "request_too_large",
-    "request exceeds the maximum size",
 ]
 
 # Image-size patterns.  Matched against 400 bodies (not 413) because most
@@ -1025,6 +1029,15 @@ def classify_api_error(
             should_fallback=True,
         )
 
+    # Anthropic's structured error type is authoritative even when an SDK or
+    # proxy omits the provider's body-size wording from ``str(error)``.
+    if error_code.strip().lower() == "request_too_large":
+        return _result(
+            FailoverReason.body_too_large,
+            retryable=True,
+            should_compress=False,
+        )
+
     # ── 2. HTTP status code classification ──────────────────────────
 
     if status_code is not None:
@@ -1317,6 +1330,12 @@ def _classify_by_status(
         )
 
     if status_code == 413:
+        if any(p in error_msg for p in _BODY_TOO_LARGE_PATTERNS):
+            return result_fn(
+                FailoverReason.body_too_large,
+                retryable=True,
+                should_compress=False,
+            )
         return result_fn(
             FailoverReason.payload_too_large,
             retryable=True,
@@ -1767,7 +1786,15 @@ def _classify_by_message(
 ) -> Optional[ClassifiedError]:
     """Classify based on error message patterns when no status code is available."""
 
-    # Payload-too-large patterns (from message text when no status_code)
+    # Serialized request-body patterns must win over generic 413/payload text.
+    if any(p in error_msg for p in _BODY_TOO_LARGE_PATTERNS):
+        return result_fn(
+            FailoverReason.body_too_large,
+            retryable=True,
+            should_compress=False,
+        )
+
+    # Token/context payload-too-large patterns (from message text without status)
     if any(p in error_msg for p in _PAYLOAD_TOO_LARGE_PATTERNS):
         return result_fn(
             FailoverReason.payload_too_large,

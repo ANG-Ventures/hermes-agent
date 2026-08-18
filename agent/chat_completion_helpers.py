@@ -2165,6 +2165,7 @@ _FALLBACK_REASON_LABELS = {
     "auth_permanent": "auth failed",
     "account_blocked": "account blocked",
     "model_not_found": "model unavailable",
+    "body_too_large": "request body too large",
     "payload_too_large": "payload too large",
     "image_too_large": "image too large",
     "format_error": "bad request",

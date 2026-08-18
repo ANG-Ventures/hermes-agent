@@ -94,6 +94,9 @@ class ProviderProfile:
     # Temperature: None = use caller's default, OMIT_TEMPERATURE = don't send
     fixed_temperature: Any = None
     default_max_tokens: int | None = None
+    # Serialized HTTP request-body ceiling. None means this provider has no
+    # declared limit; profiles with a hard byte cap opt in explicitly.
+    max_request_body_bytes: int | None = None
     default_aux_model: str = (
         ""  # cheap model for auxiliary tasks (compression, vision, etc.)
     )
@@ -206,6 +209,14 @@ class ProviderProfile:
         per-model.
         """
         return self.default_max_tokens
+
+    def get_max_request_body_bytes(self, model: str | None) -> int | None:
+        """Return the serialized request-body byte cap for *model*.
+
+        Override this hook when one provider fronts models with different HTTP
+        body limits. The default uses the static profile field.
+        """
+        return self.max_request_body_bytes
 
     def fetch_models(
         self,

@@ -49,6 +49,9 @@ anthropic = AnthropicProfile(
     base_url="https://api.anthropic.com",
     auth_type="api_key",
     default_aux_model="claude-haiku-4-5-20251001",
+    # Anthropic rejects request bodies at 10 MiB. Keep 0.5 MiB of headroom for
+    # SDK/provider serialization differences and proxy-added fields.
+    max_request_body_bytes=int(9.5 * 1024 * 1024),
 )
 
 register_provider(anthropic)
