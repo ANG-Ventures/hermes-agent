@@ -16837,7 +16837,8 @@ def test_native_vision_turn_persists_a_renderable_image_ref(tmp_path):
     written = agent._session_db.append_messages_batch.call_args.kwargs["messages"][0]["content"]
     assert f"@image:`{img}`" in written
     assert "what is in this photo?" in written
-    # The model keeps the pixels for the rest of the session.
+    # Persistence does not mutate the active turn's native payload. The next
+    # turn boundary projects this caller-owned list to text before replay.
     assert any(part.get("type") == "image_url" for part in agent._persist_user_message_override)
 
 

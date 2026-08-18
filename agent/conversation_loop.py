@@ -49,6 +49,10 @@ from agent.turn_context import (
     reanchor_current_turn_user_idx,
 )
 from agent.turn_retry_state import TurnRetryState
+from agent.tool_dispatch_helpers import (
+    _count_multimodal_image_parts,
+    _MULTIMODAL_TEXT_SUMMARY_KEY,
+)
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
@@ -1572,6 +1576,7 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
+    _prior_image_invariant_warned = False
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
@@ -1737,6 +1742,20 @@ def run_conversation(
                 agent.session_id or "-",
             )
 
+        if not _prior_image_invariant_warned:
+            _stale_prior_images = _count_multimodal_image_parts(
+                messages[:current_turn_user_idx]
+            )
+            if _stale_prior_images:
+                _prior_image_invariant_warned = True
+                logger.warning(
+                    "%simage lifecycle invariant violated: %d image part(s) "
+                    "remained before the current-turn boundary (session=%s)",
+                    agent.log_prefix,
+                    _stale_prior_images,
+                    agent.session_id or "none",
+                )
+
         # Defensive: repair malformed role-alternation before API call.
         # Catches cases where the history got wedged into a
         # ``tool → user`` or ``user → user`` tail (e.g. after empty-
@@ -1779,6 +1798,7 @@ def run_conversation(
             # Bookkeeping, never a provider field — only the chat-completions
             # transport strips underscore keys, so drop it centrally here.
             api_msg.pop("_row_id", None)
+            api_msg.pop(_MULTIMODAL_TEXT_SUMMARY_KEY, None)
 
             # Inject ephemeral context into the current turn's user message.
             # Sources: memory manager prefetch + plugin pre_llm_call hooks

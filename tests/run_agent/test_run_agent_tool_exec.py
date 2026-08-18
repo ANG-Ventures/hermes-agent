@@ -39,6 +39,43 @@ class TestExecuteToolCalls:
         assert messages[0]["role"] == "tool"
         assert "search result" in messages[0]["content"]
 
+    def test_multimodal_tool_result_retains_pixels_and_summary_for_current_turn(
+        self, agent
+    ):
+        tc = _mock_tool_call(
+            name="vision_analyze", arguments='{"image_url":"test.png"}', call_id="c1"
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+        result = {
+            "_multimodal": True,
+            "content": [
+                {"type": "text", "text": "Image loaded for native inspection."},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,pixels"},
+                },
+            ],
+            "text_summary": "Exact summary for later turns.",
+        }
+
+        with (
+            patch("run_agent.handle_function_call", return_value=result),
+            patch.object(agent, "_model_supports_vision", return_value=True),
+            patch.object(
+                agent,
+                "_append_guardrail_observation",
+                side_effect=lambda _name, _args, value, **_kwargs: value,
+            ),
+        ):
+            agent._execute_tool_calls(mock_msg, messages, "task-1")
+
+        assert messages[0]["content"][1]["type"] == "image_url"
+        assert (
+            messages[0]["_multimodal_text_summary"]
+            == "Exact summary for later turns."
+        )
+
     def test_keyboard_interrupt_emits_cancelled_post_tool_hook(self, agent, monkeypatch):
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])

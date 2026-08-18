@@ -572,11 +572,11 @@ _MAX_BASE64_BYTES = 20 * 1024 * 1024
 
 # Proactive embed cap (4 MB).  This is the size we resize an image DOWN to
 # before embedding it into conversation history, regardless of the 20 MB hard
-# ceiling.  Anthropic's per-image base64 limit is 5 MB; once an oversized image
-# is baked into history (e.g. a vision tool-result), it is re-sent on every
-# subsequent turn and permanently wedges the session with a 400 that retries
-# can't clear (the bad bytes are immutable history).  Capping at embed time —
-# with headroom under 5 MB — is the only durable fix.  Matches the post-failure
+# ceiling. Anthropic's per-image base64 limit is 5 MB, so current-turn images
+# still need headroom below that limit. At the next user-turn boundary, native
+# image parts expire to their text summaries rather than becoming immutable,
+# repeatedly re-sent history. This cap remains the first-line current-request
+# defense, with request-body byte remediation as the final backstop. Matches the
 # shrink target in agent.conversation_compression so behaviour is consistent
 # whether we resize proactively or reactively.
 _EMBED_TARGET_BYTES = 4 * 1024 * 1024
@@ -1006,8 +1006,8 @@ async def _vision_analyze_native(
 
         # Normalize unsupported formats (SVG, BMP, ...) to PNG BEFORE embedding.
         # Anthropic only accepts jpeg/png/gif/webp; an unsupported media_type
-        # baked into immutable history wedges the session with a 400 on every
-        # resume.  Convert here so it can never enter history. Offloaded — the
+        # still rejects the current-turn request before lifecycle expiration can
+        # help. Convert here so it can never reach the provider. Offloaded — the
         # rasterizers/Pillow are blocking.
         normalized_path, detected_mime_type, _norm_err = await asyncio.to_thread(
             _normalize_to_supported_image, temp_image_path, detected_mime_type,
@@ -1032,14 +1032,12 @@ async def _vision_analyze_native(
             temp_image_path, mime_type=detected_mime_type,
         )
 
-        # Proactive embed cap: this image gets baked into conversation
-        # history and re-sent on every subsequent turn.  Anthropic rejects
-        # any single base64 image over 5 MB OR over 8000px per side with a
-        # 400, and because history is immutable, an oversized embed
-        # permanently wedges the session — retries can't clear bytes (or
-        # pixels) that are already in the request.  Resize DOWN to the embed
-        # target (4 MB / 7900px, headroom under both ceilings) whenever the
-        # payload exceeds either limit, not just at the 20 MB hard ceiling.
+        # Proactive embed cap: Anthropic rejects any single base64 image over
+        # 5 MB OR over 8000px per side with a 400. Turn-boundary expiration
+        # prevents subsequent-turn replay, but it cannot rescue the immediate
+        # tool continuation that must inspect these pixels. Resize DOWN to the
+        # embed target (4 MB / 7900px, headroom under both ceilings) whenever
+        # the payload exceeds either limit, not just at the 20 MB hard ceiling.
         _over_bytes = len(image_data_url) > _EMBED_TARGET_BYTES
         _over_dims = await _run_encode_on_cpu_executor(
             _image_exceeds_dimension, temp_image_path, _EMBED_MAX_DIMENSION,
@@ -1053,7 +1051,7 @@ async def _vision_analyze_native(
             )
             # If even resizing can't get under the absolute hard ceiling,
             # there's nothing more we can do — reject rather than embed a
-            # session-wedging payload.
+            # current-turn request-wedging payload.
             if len(image_data_url) > _MAX_BASE64_BYTES:
                 return tool_error(
                     f"Image too large for vision API: base64 payload is "
