@@ -2993,6 +2993,28 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, reason) in res.respawn_guarded
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "collision_warnings": [
+                {
+                    "task_id": task_id,
+                    "existing_task_id": existing_task_id,
+                    "paths": paths,
+                }
+                for task_id, existing_task_id, paths in getattr(
+                    res, "collision_warnings", []
+                )
+            ],
+            "collision_scope_unknown": getattr(
+                res, "collision_scope_unknown", []
+            ),
+            "collision_scope_unreported": [
+                {"task_id": task_id, "unchecked_task_ids": unchecked_ids}
+                for task_id, unchecked_ids in getattr(
+                    res, "collision_scope_unreported", []
+                )
+            ],
+            "collision_check_failed": getattr(
+                res, "collision_check_failed", []
+            ),
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -3013,6 +3035,33 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
+    collision_warnings = getattr(res, "collision_warnings", [])
+    if collision_warnings:
+        print("WARNING — pre-dispatch file collision(s); dispatch continued:")
+        for task_id, existing_task_id, paths in collision_warnings:
+            print(
+                f"  - {task_id} overlaps {existing_task_id}: "
+                f"{', '.join(paths)}"
+            )
+    collision_scope_unknown = getattr(res, "collision_scope_unknown", [])
+    if collision_scope_unknown:
+        print(
+            "WARNING — collision scope unknown (no explicit file paths): "
+            f"{', '.join(collision_scope_unknown)}"
+        )
+    for task_id, unchecked_ids in getattr(
+        res, "collision_scope_unreported", []
+    ):
+        print(
+            f"WARNING — collision check partial for {task_id}; no reported "
+            f"changed_files from: {', '.join(unchecked_ids)}"
+        )
+    collision_check_failed = getattr(res, "collision_check_failed", [])
+    if collision_check_failed:
+        print(
+            "WARNING — collision check failed open; dispatch continued for: "
+            f"{', '.join(collision_check_failed)}"
+        )
     if spawned_unwatched:
         print(
             f"{len(spawned_unwatched)} spawned card(s) have no notify "
