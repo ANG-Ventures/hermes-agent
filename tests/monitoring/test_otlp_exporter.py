@@ -7,6 +7,8 @@ the optional otlp extra is not installed.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 otel = pytest.importorskip("opentelemetry.sdk.trace", reason="otlp extra not installed")
@@ -102,3 +104,45 @@ def test_failing_streamer_never_breaks_emitter(monkeypatch):
     em.flush()
     em.close()
     assert len(seen) == 1
+
+
+def test_span_export_failure_warns_once_and_stays_fail_open(monkeypatch, caplog):
+    """A broken OTel install must be VISIBLE (WARNING) and still never raise.
+
+    Regression guard: a partially-upgraded OpenTelemetry install (SDK newer
+    than API) makes every start_span raise, so export silently drops 100% of
+    spans while only logging at DEBUG — an invisible total outage.
+    """
+    class _BoomTracer:
+        def start_span(self, *a, **kw):
+            raise AttributeError("type object 'TraceFlags' has no attribute 'X'")
+
+    class _BoomProvider:
+        def get_tracer(self, *a, **kw):
+            return _BoomTracer()
+
+    monkeypatch.setattr(OE, "_export_failure_warned", False)
+
+    batch = [{"event": "gateway_health", "name": "gateway.lifecycle"}] * 3
+    with caplog.at_level(logging.WARNING, logger=OE.__name__):
+        # Fail-open: reports zero spans created, never raises.
+        assert OE.export_batch(_BoomProvider(), batch) == 0
+        # Second call: outage already announced, no additional warning.
+        assert OE.export_batch(_BoomProvider(), batch) == 0
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, "export outage must warn exactly once per process"
+    msg = warnings[0].getMessage()
+    assert "OTLP span export failed" in msg
+    assert "AttributeError" in msg
+
+
+def test_successful_export_does_not_warn(caplog):
+    """The visibility warning must not fire on the healthy path."""
+    provider, mem = _mem_provider()
+    with caplog.at_level(logging.WARNING, logger=OE.__name__):
+        assert OE.export_batch(
+            provider, [{"event": "gateway_health", "name": "gateway.lifecycle"}]
+        ) == 1
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+    assert len(mem.get_finished_spans()) == 1

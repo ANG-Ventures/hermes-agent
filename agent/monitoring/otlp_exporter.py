@@ -165,8 +165,23 @@ def _span_attrs(ev: Dict[str, Any]) -> Dict[str, Any]:
     return attrs
 
 
+# One WARNING per process the first time a span fails to map/record, so a
+# total export outage is visible in errors.log (WARNING+) instead of only under
+# DEBUG. Subsequent failures stay at debug level — this runs in the emitter's
+# dispatch thread on every batch, and an outage is usually every span forever.
+#
+# Thread safety: a module-level bool mutated without a lock. export_batch can
+# run from concurrent dispatch threads; the race is benign (at worst two
+# threads both log the first warning). This matches the lock-free style used
+# by tools/wake_word.py's _warned_onnx_coerced rather than a locked pattern,
+# because the worst case is one duplicate log line.
+_export_failure_warned = False
+
+
 def export_batch(provider, batch: List[Dict[str, Any]]) -> int:
     """Map a batch of events to OTel spans. Returns spans created."""
+    global _export_failure_warned
+
     tracer = provider.get_tracer("hermes.monitoring")
     n = 0
     for ev in batch:
@@ -175,7 +190,17 @@ def export_batch(provider, batch: List[Dict[str, Any]]) -> int:
             span = tracer.start_span(name, attributes=_span_attrs(ev))
             span.end()
             n += 1
-        except Exception:
+        except Exception as e:
+            if not _export_failure_warned:
+                _export_failure_warned = True
+                logger.warning(
+                    "OTLP span export failed (%s: %s); monitoring spans are "
+                    "being dropped. A partially-upgraded OpenTelemetry install "
+                    "is a common cause — reinstall the pinned set with "
+                    "\"pip install 'hermes-agent[otlp]'\". Further failures log "
+                    "at debug level.",
+                    type(e).__name__, e,
+                )
             logger.debug("OTLP span map failed", exc_info=True)
     return n
 
