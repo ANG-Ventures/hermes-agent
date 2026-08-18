@@ -30,7 +30,7 @@ from typing import Any, Dict, Optional
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
-from agent.errors import EmptyStreamError
+from agent.errors import EmptyStreamError, ProviderStreamParseError
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint, _ceil_chars_to_tokens
@@ -2159,6 +2159,7 @@ _FALLBACK_REASON_LABELS = {
     "overloaded": "provider overloaded",
     "server_error": "provider error",
     "timeout": "connection dropped",
+    "stream_parse": "malformed stream",
     "decode_error": "corrupt response",
     "ssl_cert_verification": "TLS error",
     "auth": "auth refresh",
@@ -4912,7 +4913,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _is_conn_err = isinstance(
                         e, (_httpx.ConnectError, _httpx.RemoteProtocolError, ConnectionError)
                     )
-                    _is_stream_parse_err = agent._is_provider_stream_parse_error(e)
+                    _stream_diag = request_client_holder.get("diag")
+                    _stream_http_status = (
+                        _stream_diag.get("http_status")
+                        if isinstance(_stream_diag, dict)
+                        else None
+                    )
+                    _is_stream_parse_err = agent._is_provider_stream_parse_error(
+                        e,
+                        http_status=_stream_http_status,
+                    )
                     _is_empty_stream = isinstance(e, EmptyStreamError)
 
                     # If the stream died AFTER some tokens were delivered:
@@ -5170,7 +5180,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     # richer recovery: credential rotation, provider fallback,
                     # backoff, and — for "stream not supported" — will switch
                     # to non-streaming on the next attempt via _disable_streaming.
-                    result["error"] = e
+                    if _is_stream_parse_err:
+                        # Preserve response-side provenance across the worker
+                        # thread boundary.  The outer conversation loop treats
+                        # arbitrary ValueError as local request validation, so
+                        # propagating the SDK's raw parser exception would abort
+                        # on attempt one instead of retrying/failing over.
+                        _stream_error = ProviderStreamParseError(str(e))
+                        _stream_error.__cause__ = e
+                        result["error"] = _stream_error
+                    else:
+                        result["error"] = e
                     return
         except InterruptedError as e:
             # The interrupt may be noticed inside the worker thread before

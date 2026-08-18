@@ -1323,7 +1323,12 @@ class AIAgent:
         from agent.stream_diag import flatten_exception_chain
         return flatten_exception_chain(error)
 
-    def _is_provider_stream_parse_error(self, error: BaseException) -> bool:
+    def _is_provider_stream_parse_error(
+        self,
+        error: BaseException,
+        *,
+        http_status: Optional[int] = None,
+    ) -> bool:
         """Return True for malformed provider streaming data from SDK parsers.
 
         Some Anthropic-compatible streaming providers can send a malformed
@@ -1345,7 +1350,18 @@ class AIAgent:
         if isinstance(error, json.JSONDecodeError):
             return False
         message = str(error).strip().lower()
-        return "expected ident at line" in message
+        if "expected ident at line" in message:
+            return True
+        # pydantic-core/jiter raises a plain ValueError for a non-JSON SSE
+        # body as ``expected value at line 2 column 1``. Unlike the established
+        # ``expected ident`` SDK signature above, this wording is broad enough
+        # to require a successful opened response: an identical request-side
+        # ValueError must not be mistaken for provider wire corruption.
+        return (
+            http_status is not None
+            and 200 <= http_status < 300
+            and "expected value at line" in message
+        )
 
     def _log_stream_retry(
         self,

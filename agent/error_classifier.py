@@ -16,6 +16,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
+from agent.errors import ProviderStreamParseError
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,6 +58,10 @@ class FailoverReason(enum.Enum):
 
     # Transport
     timeout = "timeout"                  # Connection/read timeout — rebuild client + retry
+    # An HTTP response stream opened successfully but contained malformed
+    # JSON/SSE data. Retry because another provider box may return valid bytes,
+    # then fail over with an honest user-facing reason if the fault persists.
+    stream_parse = "stream_parse"
     # TLS certificate verification failure — deterministic for the host
     # (TLS-inspecting proxy, missing/expired CA bundle, self-signed cert).
     # Retrying reproduces the identical handshake failure, so fail fast
@@ -878,6 +884,14 @@ def classify_api_error(
         return ClassifiedError(**defaults)
 
     # ── 1. Provider-specific patterns (highest priority) ────────────
+
+    if isinstance(error, ProviderStreamParseError):
+        return _result(
+            FailoverReason.stream_parse,
+            retryable=True,
+            should_rotate_credential=False,
+            should_fallback=True,
+        )
 
     # Provider content-policy / safety-filter block. The provider has made a
     # deterministic refusal decision about THIS prompt — retrying unchanged

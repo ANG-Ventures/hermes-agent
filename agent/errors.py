@@ -9,5 +9,11 @@ class EmptyStreamError(RuntimeError):
     pass
 
 
+class ProviderStreamParseError(RuntimeError):
+    """Raised when an opened provider response stream contains malformed data."""
+
+    pass
+
+
 class MoAPresetNotFoundError(ValueError):
     """Raised when a persisted MoA preset no longer exists in config."""
