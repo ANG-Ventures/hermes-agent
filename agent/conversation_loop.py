@@ -34,6 +34,7 @@ from agent.conversation_compression import (
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
+    emit_image_eviction_attempt_telemetry,
 )
 from agent.context_engine import (
     automatic_compaction_status_message,
@@ -4349,6 +4350,8 @@ def run_conversation(
                 # must never enter text compaction: retained images can live in
                 # the protected fresh tail, where summarization is a no-op.
                 if classified.reason == FailoverReason.body_too_large:
+                    _remediation_started_at = time.monotonic()
+                    _remediation_made_progress = False
                     from agent.request_body_budget import (
                         RequestBodyBudgetExceeded,
                         body_budget_error,
@@ -4379,6 +4382,10 @@ def run_conversation(
                             cast(Dict[str, Any], api_kwargs),
                             max_body_bytes=_recovery_body_cap,
                         )
+                        _remediation_made_progress = (
+                            _rejected_body_result.after_bytes
+                            < _rejected_body_result.before_bytes
+                        )
                         if (
                             not _retry.body_byte_retry_attempted
                             and _rejected_body_result.fits
@@ -4406,6 +4413,11 @@ def run_conversation(
                                 _message_wrapper,
                                 max_body_bytes=_message_target,
                             )
+                            _remediation_made_progress = bool(
+                                _remediation_made_progress
+                                or _message_result.after_bytes
+                                < _message_result.before_bytes
+                            )
                             if (
                                 _message_result.resized_images
                                 or _message_result.evicted_images
@@ -4416,6 +4428,10 @@ def run_conversation(
                                 agent._buffer_status(
                                     "📐 Provider rejected the serialized request body — "
                                     "remediated retained images and retrying once..."
+                                )
+                                emit_image_eviction_attempt_telemetry(
+                                    agent,
+                                    started_at=_remediation_started_at,
                                 )
                                 continue
 
@@ -4433,15 +4449,27 @@ def run_conversation(
                             cast(Dict[str, Any], api_kwargs),
                             max_body_bytes=max(1, _actual_body_bytes),
                         )
+                        _remediation_made_progress = (
+                            _body_probe.after_bytes < _body_probe.before_bytes
+                        )
                         _body_error = (
                             "Request body too large after provider rejection: "
                             f"body={_actual_body_bytes} bytes, cap=unknown "
                             "(provider/profile did not report one), "
                             f"images={_body_probe.image_bytes} bytes across "
                             f"{_body_probe.image_count} images. Reduce image attachments "
-                            "or start a new session."
+                            "or run /new to start a new session."
                         )
 
+                    emit_image_eviction_attempt_telemetry(
+                        agent,
+                        started_at=_remediation_started_at,
+                        failure_class=(
+                            "insufficient_progress"
+                            if _remediation_made_progress
+                            else "no_progress"
+                        ),
+                    )
                     return _body_budget_failure(_body_error)
 
                 # Image-too-large recovery: shrink oversized native image

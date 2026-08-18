@@ -164,9 +164,9 @@ def body_budget_error(result: RequestBodyRemediation) -> str:
         + f"{result.image_count} {image_word}"
     )
     if result.image_count == 0:
-        action = "No image payloads are available to resize or evict. Reduce text/tool output or start a new session."
+        action = "No image payloads are available to resize or evict. Reduce text/tool output or run /new to start a new session."
     else:
-        action = "Image resizing and oldest-first eviction could not make the request fit. Reduce attachments or start a new session."
+        action = "Image resizing and oldest-first eviction could not make the request fit. Reduce attachments or run /new to start a new session."
     return f"Request body too large before provider dispatch: {detail}. {action}"
 
 

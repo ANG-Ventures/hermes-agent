@@ -1467,34 +1467,73 @@ def _emit_compression_attempt_telemetry(
     commit_status: str,
     split_status: str,
     failure_class: str | None = None,
+    remediation: str = "text_compression",
+    attempt_metadata: dict[str, Any] | None = None,
 ) -> None:
     """Emit one content-free JSON log line for a compression attempt."""
     try:
-        telemetry = getattr(agent.context_compressor, "_last_compression_telemetry", None)
+        use_compressor_state = attempt_metadata is None
+        telemetry = attempt_metadata
+        if telemetry is None:
+            telemetry = getattr(agent.context_compressor, "_last_compression_telemetry", None)
         if not isinstance(telemetry, dict):
             telemetry = {}
         payload = dict(telemetry)
         payload.setdefault("event", "compression_attempt")
-        payload.setdefault("attempt_id", getattr(agent, "_compression_attempt_id", "") or uuid.uuid4().hex)
+        payload.setdefault(
+            "attempt_id",
+            (
+                getattr(agent, "_compression_attempt_id", "")
+                if use_compressor_state
+                else ""
+            )
+            or uuid.uuid4().hex,
+        )
         payload.setdefault("session_id", getattr(agent, "session_id", "") or "")
         payload["total_duration_ms"] = int((time.monotonic() - started_at) * 1000)
         payload["commit_status"] = commit_status
         payload["split_status"] = split_status
         if failure_class:
             payload["failure_class"] = failure_class
+        payload["remediation"] = remediation
         payload.setdefault("chunking", False)
         payload.setdefault("chunk_count", 0)
-        payload["fallback_used"] = bool(
-            payload.get("fallback_used")
-            or getattr(agent.context_compressor, "_last_summary_fallback_used", False)
-            or getattr(agent.context_compressor, "_last_aux_model_failure_model", None)
-        )
+        if use_compressor_state:
+            payload["fallback_used"] = bool(
+                payload.get("fallback_used")
+                or getattr(agent.context_compressor, "_last_summary_fallback_used", False)
+                or getattr(agent.context_compressor, "_last_aux_model_failure_model", None)
+            )
+        else:
+            payload["fallback_used"] = bool(payload.get("fallback_used"))
         logger.info(
             "context compression attempt telemetry: %s",
             json.dumps(payload, sort_keys=True, separators=(",", ":")),
         )
     except Exception as exc:
         logger.debug("failed to emit compression attempt telemetry: %s", exc)
+
+
+def emit_image_eviction_attempt_telemetry(
+    agent: Any,
+    *,
+    started_at: float,
+    failure_class: str | None = None,
+) -> None:
+    """Emit byte-remediation telemetry without stale compression metadata.
+
+    ``commit_status=committed`` means the request-only image rewrite is ready
+    for retry; it does not claim that the subsequent provider call succeeded.
+    """
+    _emit_compression_attempt_telemetry(
+        agent,
+        started_at=started_at,
+        commit_status="aborted" if failure_class else "committed",
+        split_status="not_applicable",
+        failure_class=failure_class,
+        remediation="image_eviction",
+        attempt_metadata={"trigger_source": "provider_413"},
+    )
 
 
 def compression_skipped_due_to_lock(agent: Any) -> bool:
