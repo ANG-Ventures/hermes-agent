@@ -1,6 +1,7 @@
 """Tests for agent.error_classifier — structured API error classification."""
 
 import pytest
+from agent.errors import ProviderStreamParseError
 from agent.error_classifier import (
     ClassifiedError,
     FailoverReason,
@@ -54,7 +55,7 @@ class TestFailoverReason:
         expected = {
             "auth", "auth_permanent", "account_blocked", "billing", "rate_limit",
             "upstream_rate_limit", "pool_exhausted",
-            "overloaded", "server_error", "timeout",
+            "overloaded", "server_error", "timeout", "stream_parse",
             "ssl_cert_verification",
             "decode_error",
             "context_overflow", "body_too_large", "payload_too_large", "image_too_large",
@@ -681,6 +682,15 @@ class TestClassifyApiError:
         e = TimeoutError("timed out")
         result = classify_api_error(e)
         assert result.reason == FailoverReason.timeout
+
+    def test_provider_stream_parse_error_is_retryable_failover(self):
+        result = classify_api_error(
+            ProviderStreamParseError("expected value at line 2 column 1")
+        )
+        assert result.reason == FailoverReason.stream_parse
+        assert result.retryable is True
+        assert result.should_fallback is True
+        assert result.should_rotate_credential is False
 
 
     # ── Error code classification ──
