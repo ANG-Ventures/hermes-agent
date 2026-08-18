@@ -1338,30 +1338,12 @@ class AIAgent:
         is provider wire-format trouble, not local request validation, so it
         should follow the same retry path as a truncated JSON body.
         """
-        if getattr(self, "api_mode", None) != "anthropic_messages":
-            return False
-        if not isinstance(error, ValueError):
-            return False
-        if isinstance(error, UnicodeEncodeError):
-            obj = getattr(error, "object", "")
-            if isinstance(obj, str):
-                segment = obj[getattr(error, "start", 0):getattr(error, "end", len(obj))]
-                return bool(_SURROGATE_RE.search(segment))
-            return False
-        if isinstance(error, json.JSONDecodeError):
-            return False
-        message = str(error).strip().lower()
-        if "expected ident at line" in message:
-            return True
-        # pydantic-core/jiter raises a plain ValueError for a non-JSON SSE
-        # body as ``expected value at line 2 column 1``. Unlike the established
-        # ``expected ident`` SDK signature above, this wording is broad enough
-        # to require a successful opened response: an identical request-side
-        # ValueError must not be mistaken for provider wire corruption.
-        return (
-            http_status is not None
-            and 200 <= http_status < 300
-            and "expected value at line" in message
+        from agent.stream_diag import is_provider_stream_parse_error
+
+        return is_provider_stream_parse_error(
+            getattr(self, "api_mode", None),
+            error,
+            http_status=http_status,
         )
 
     def _log_stream_retry(

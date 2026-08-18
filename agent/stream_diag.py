@@ -14,9 +14,12 @@ tests that patch ``run_agent.<helper>`` keep working.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Any, Dict, List, Optional
+
+from agent.message_sanitization import _SURROGATE_RE
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +39,39 @@ STREAM_DIAG_HEADERS = (
     "server",
     "x-forwarded-for",
 )
+
+
+def is_provider_stream_parse_error(
+    api_mode: Optional[str],
+    error: BaseException,
+    *,
+    http_status: Optional[int] = None,
+) -> bool:
+    """Return True for malformed provider streaming data from SDK parsers."""
+    if api_mode != "anthropic_messages":
+        return False
+    if not isinstance(error, ValueError):
+        return False
+    if isinstance(error, UnicodeEncodeError):
+        obj = getattr(error, "object", "")
+        if isinstance(obj, str):
+            segment = obj[
+                getattr(error, "start", 0):getattr(error, "end", len(obj))
+            ]
+            return bool(_SURROGATE_RE.search(segment))
+        return False
+    if isinstance(error, json.JSONDecodeError):
+        return False
+    message = str(error).strip().lower()
+    if "expected ident at line" in message:
+        return True
+    # pydantic-core/jiter's broader ``expected value`` wording is only
+    # response-side evidence after a successful provider response opened.
+    return (
+        http_status is not None
+        and 200 <= http_status < 300
+        and "expected value at line" in message
+    )
 
 
 def stream_diag_init() -> Dict[str, Any]:
