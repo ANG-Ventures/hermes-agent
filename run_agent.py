@@ -1029,9 +1029,12 @@ class AIAgent:
         This helper never raises — exceptions are swallowed so it cannot
         interrupt the retry/fallback logic.
 
-        Returns ``True`` when the gateway-delivery leg succeeded (a
-        ``status_callback`` exists and did not raise); ``False`` when there is no
-        callback (CLI-only context / throwaway agent) or the callback raised.
+        Returns ``True`` when the gateway-delivery leg accepted the message (a
+        ``status_callback`` exists, did not raise, and did not explicitly reject
+        it); ``False`` when there is no callback (CLI-only context / throwaway
+        agent), the callback raised, or it returned ``False``.
+        ``True`` means accepted/scheduled, not adapter-confirmed: gateway sends
+        complete asynchronously and log a WARNING if that later leg fails.
         This return is purely additive — existing callers ignore it — and lets a
         caller that NEEDS delivery (the compaction announce) detect a lost send.
         """
@@ -1039,10 +1042,11 @@ class AIAgent:
             self._vprint(f"{self.log_prefix}{message}", force=True)
         except Exception:
             pass
-        if self.status_callback:
+        status_callback = getattr(self, "status_callback", None)
+        if status_callback:
             try:
-                self.status_callback("lifecycle", message)
-                return True
+                accepted = status_callback("lifecycle", message)
+                return accepted is not False
             except Exception:
                 logger.debug("status_callback error in _emit_status", exc_info=True)
                 return False
