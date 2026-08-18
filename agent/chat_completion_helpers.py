@@ -2221,6 +2221,32 @@ def _quota_window_suffix(agent) -> str:
     return detail
 
 
+def _pool_scope_label(agent, old_model: str) -> "str | None":
+    """Narrow the pool-exhaustion label to the MODEL when the pool said so.
+
+    ``sub pool capped`` names neither the model nor the fact that caps are
+    per-(sub x model), so the only inference available to a reader is "the whole
+    pool is out" — which is false whenever a single model's budget is the thing
+    that ran out, and is exactly the wrong mental model to hand an operator.
+
+    Returns a replacement label, or None to keep the flat one. Consume-once,
+    mirroring ``_quota_window_suffix``: the stamp is cleared unconditionally so
+    a stale scope can never leak onto a later, unrelated failover.
+    """
+    scope = getattr(agent, "_pending_pool_scope", None)
+    try:
+        agent._pending_pool_scope = None
+    except Exception:
+        pass
+    if scope != "model":
+        return None
+    model = (old_model or "").strip()
+    if not model:
+        # Scope known, model not — still better than implying a fleet outage.
+        return "this model capped pool-wide, other models unaffected"
+    return f"{model} capped pool-wide, other models unaffected"
+
+
 def _fallback_reason_label(reason: "Any | None") -> "str | None":
     """Map a FailoverReason (enum or its .value string) to a short user-facing
     label. A known reason maps to its specific label; an unknown/unclassifiable
@@ -2384,6 +2410,14 @@ def _emit_fallback_announce(
         _reason_suffix = f" ({recovery_via})" if recovery_via else ""
     else:
         _reason_label = _fallback_reason_label(reason)
+        # For a POOL exhaustion, say WHICH model ran out when the pool scoped it
+        # that way. Unconditionally consume the stamp so it can't leak onto a
+        # later failover, but only override the label for pool_exhausted.
+        # Compare on .value like _fallback_reason_label does: FailoverReason is
+        # NOT a str-enum, so callers passing the bare string would silently miss.
+        _scope_label = _pool_scope_label(agent, old_model)
+        if _scope_label and getattr(reason, "value", reason) == "pool_exhausted":
+            _reason_label = _scope_label
         # For a quota 429, name WHICH window bound (5h vs 7d) and when it
         # clears — those are opposite decisions ("wait an hour" vs "this sub is
         # gone for two days") that both used to render as a flat "rate limit".
