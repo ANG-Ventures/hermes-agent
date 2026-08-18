@@ -54,13 +54,14 @@ def _ensure_vercel_sdk() -> None:
     # module loads — we only set the default, never override an explicit
     # user value.
     os.environ.setdefault("VERCEL_TELEMETRY_DISABLED", "1")
+    # Falls back to plain importability when the install is refused: an
+    # off-pin (or metadata-less) SDK that already imports still runs the
+    # backend fine. See ``lazy_deps.ensure_importable``.
     try:
-        from tools.lazy_deps import ensure as _lazy_ensure
-        _lazy_ensure("terminal.vercel", prompt=False)
+        from tools.lazy_deps import ensure_importable as _ensure_importable
     except ImportError:
-        pass
-    except Exception as e:
-        raise ImportError(str(e))
+        return
+    _ensure_importable("terminal.vercel", "vercel.sandbox")
 
 
 _CREATE_RETRY_ATTEMPTS = 3

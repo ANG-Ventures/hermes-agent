@@ -27,6 +27,20 @@ from tools.environments.file_sync import (
 logger = logging.getLogger(__name__)
 
 
+def _ensure_daytona_sdk() -> None:
+    """Lazy-install the daytona SDK on demand. Idempotent.
+
+    Falls back to plain importability when the install is refused: an
+    off-pin (or metadata-less) SDK that already imports still runs the
+    backend fine. See ``lazy_deps.ensure_importable``.
+    """
+    try:
+        from tools.lazy_deps import ensure_importable as _ensure_importable
+    except ImportError:
+        return
+    _ensure_importable("terminal.daytona", "daytona")
+
+
 class DaytonaEnvironment(BaseEnvironment):
     """Daytona cloud sandbox execution backend.
 
@@ -51,13 +65,7 @@ class DaytonaEnvironment(BaseEnvironment):
         requested_cwd = cwd
         super().__init__(cwd=cwd, timeout=timeout)
 
-        try:
-            from tools.lazy_deps import ensure as _lazy_ensure
-            _lazy_ensure("terminal.daytona", prompt=False)
-        except ImportError:
-            pass
-        except Exception as e:
-            raise ImportError(str(e))
+        _ensure_daytona_sdk()
         from daytona import (
             Daytona,
             CreateSandboxFromImageParams,

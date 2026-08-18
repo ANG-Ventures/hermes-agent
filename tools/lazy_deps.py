@@ -1155,6 +1155,50 @@ def refresh_active_features(*, prompt: bool = False) -> dict[str, str]:
     return results
 
 
+def ensure_importable(feature: str, module: str, *, prompt: bool = False) -> None:
+    """Best-effort :func:`ensure`, then fall back to "can we import it?".
+
+    :func:`ensure` answers the *install* question: does an installed
+    distribution satisfy the pinned spec? A backend asks a different one:
+    can I import the SDK right now? Those answers diverge whenever the
+    module is importable but the distribution check says otherwise —
+
+    * an off-pin version is installed (``modal==1.5.1`` against a
+      ``modal==1.3.4`` pin), or
+    * the module was injected into ``sys.modules`` (test fakes), or
+    * the package ships without the metadata ``importlib.metadata`` reads.
+
+    With installs gated off (``security.allow_lazy_installs=false``, a
+    sealed venv, an unsupported/managed host) ``ensure`` then raises
+    ``FeatureUnavailable`` for an SDK sitting right there on ``sys.path``.
+    Callers that escalate that into ``ImportError`` break a backend that
+    would have worked.
+
+    So: run ``ensure`` for its install side effect, and if it refuses,
+    only surface the refusal when ``module`` genuinely cannot be imported.
+    Raises :class:`ImportError` carrying the original remediation hint in
+    that case.
+    """
+    try:
+        ensure(feature, prompt=prompt)
+        return
+    except ImportError:
+        # lazy_deps itself unavailable (partial install) — the import
+        # attempt below is the real answer.
+        pass
+    except Exception as exc:  # FeatureUnavailable and any install failure
+        import importlib
+
+        try:
+            importlib.import_module(module)
+        except Exception:
+            raise ImportError(str(exc)) from exc
+        logger.debug(
+            "lazy feature %r reported unavailable (%s) but %r imports — continuing",
+            feature, exc, module,
+        )
+
+
 def ensure_and_bind(
     feature: str,
     importer: Callable[[], dict[str, Any]],
