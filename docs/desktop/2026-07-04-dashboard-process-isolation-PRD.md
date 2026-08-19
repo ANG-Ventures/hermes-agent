@@ -1,7 +1,7 @@
 # PRD: Dashboard Process Isolation — agent turns out of the serving process
 
 - **Status:** v1.5 — CONVERGED. Pass-9 verified the folds physically present, zero blockers; 3 operational RCs folded (pipe HOL fan-out + spike, deploy-respawn reason tag, resume reads version from state.db). 9 review passes; NONE of the residuals gate Phase 0. **BUILD UNBLOCKED — Phase 0 re-dispatched.**
-- **v1.6 (2026-07-05):** folded INV-7 + AC-13 (client-disconnect cancels the turn) — empirically forced when a kill-9'd certify client left ~20 orphaned turns that wedged the live dashboard during Phase-3. Serving process sends client_gone{sid} on ws close; host interrupts that turn. NEW work isolation introduces (in-process turns die with the connection handler; isolated turns outlive the client). Needs a review pass before Phase-1 build picks it up.
+- **v1.6 (2026-07-05; reviewed against current teardown 2026-08-19):** folded INV-7 + AC-13 (client-disconnect cancels the turn) — empirically forced when a kill-9'd certify client left ~20 orphaned turns that wedged the live dashboard during Phase-3. The serving process waits the existing WS-orphan reconnect grace, then emits `client_gone{sid}` through the session's normal interrupt path (compute-host control channel when isolated, in-process interrupt otherwise). A reattached session cancels the action; active delegations defer it. The earlier claim that in-process turns die with the connection handler was stale: both paths run outside `handle_ws` and require explicit interruption.
 - **Author:** Apollo, 2026-07-04 · **Requested:** Ace ("spec it out, prd review and build it with daedalus")
 - **Repo:** `Kyzcreig/hermes-agent` (fork). Surfaces: `tui_gateway/`, `hermes_cli/web_server.py`.
 - **Prior art:** `docs/desktop/2026-07-02-dashboard-eventloop-starvation-PRD.md` (shipped PRs
@@ -176,10 +176,11 @@ their in-memory histories) moved wholesale behind a pipe:
   vs `"crash"` (pass-9 RC-2) so alerting suppresses deploy blips without masking a crash-loop.**
   (Land before Phase-3 cutover.)
 - **Client-disconnect containment (INV-7, v1.6):** distinct from HOST death — when a *client*
-  disconnects (or is `kill -9`'d) mid-turn, the serving process detects the ws close and sends
-  `client_gone{sid}` to the host, which interrupts that sid's turn. Without this, an isolated
-  turn outlives its dead client and leaks compute (the 2026-07-05 orphaned-turn wedge). See INV-7
-  + AC-13.
+  disconnects (or is `kill -9`'d) mid-turn, the serving process detects the ws close and, after
+  the existing reconnect grace, sends `client_gone{sid}` through the same interrupt seam used by
+  `session.interrupt`. Reattachment cancels it; active delegations defer it. Without this, either
+  an isolated or in-process turn outlives its dead client and leaks compute (the 2026-07-05
+  orphaned-turn wedge). See INV-7 + AC-13.
 - **Feature flag:** `dashboard.turn_isolation: false` default. Gates ONLY the dispatch site
   (`:1134`'s run() → local pool vs host frame). Keys land in `DEFAULT_CONFIG` + the gateway raw
   YAML loader (pass-1 config-drift note): `turn_isolation`, `compute_host_heartbeat_secs`,
@@ -238,18 +239,22 @@ their in-memory histories) moved wholesale behind a pipe:
   `turn.end{N}` relays, a relay-before-persist race is structurally impossible.
 - **INV-7 (client-disconnect cancels the turn — added v1.6, empirically forced 2026-07-05):** when
   the ws client that submitted a turn DISCONNECTS (clean close, dropped socket, OR the process is
-  `kill -9`'d), the turn it launched MUST be cancelled — the compute host receives a
-  `client_gone{sid}` signal (from the serving process detecting the ws disconnect) and interrupts
-  the turn, and any turn whose submitting connection is gone is reaped, not left running. *Why this
+  `kill -9`'d), the serving process starts the existing WS-orphan grace timer. If the session is
+  still transport-detached and running when grace expires, it emits `client_gone{sid}` through the
+  same mechanism as `session.interrupt`: the compute-host control channel for an isolated turn, or
+  the in-process hard-interrupt seam otherwise. A reconnect/`session.resume` within grace leaves
+  the turn untouched. Active delegations defer interruption and re-schedule the same check;
+  `close_on_disconnect` sidecars retain their immediate-close path. The interrupted turn persists
+  partial work under the existing user-interrupt semantics, then the settled orphan session is
+  reaped. *Why this
   is load-bearing:* discovered when the certify harness was `kill -9`'d and its in-flight turns
   KEPT RUNNING server-side — ~20 orphaned turn processes pegged the machine and wedged the live
   dashboard. A SIGKILL client can't run its own cleanup, so the SERVER must cancel on disconnect;
   otherwise any crashed/killed client (desktop force-quit, network drop, OOM) leaks compute that
-  starves the box. Without turn isolation the in-process turn dies with the connection handler;
-  WITH isolation the turn lives in the host and outlives the client unless explicitly cancelled —
-  so this invariant is NEW work the isolation architecture introduces, not a pre-existing property.
-  *Proof:* AC-13 — submit a turn, drop/`kill -9` the client, assert (out-of-band `ps`) the host's
-  turn worker reaps within a bounded window and host RSS/CPU returns to idle.
+  starves the box. Current in-process turns already run on their own thread and isolated turns run
+  in the host; both outlive `handle_ws`, so both require this explicit cancellation. *Proof:* AC-13
+  — submit a turn, drop/`kill -9` the client, assert the `client_gone` interrupt journal record
+  arrives within grace + epsilon and the host reports zero orphaned turns after settlement.
 
 ## 7. Phases
 
@@ -361,10 +366,13 @@ their in-memory histories) moved wholesale behind a pipe:
   test, pass-3 RC-3)**, silent during healthy soak.
 - AC-13 (INV-7 client-disconnect cancels the turn — added v1.6): submit a real turn to an
   isolated session, then (a) cleanly close the ws client, and separately (b) `kill -9` the client
-  process mid-turn. In BOTH cases an out-of-band `ps` checker asserts the host's turn worker for
-  that sid reaps within a bounded window (≤ heartbeat_secs × 2) and host CPU/RSS returns to idle —
-  the turn does NOT keep running orphaned. Negative guard: a still-connected sibling session's
-  turn on the same host is UNAFFECTED (disconnect cancels only the gone client's turn). This is
+  process mid-turn. In BOTH cases the gateway journal records `client_gone{sid}` interrupt dispatch
+  within WS-orphan grace + epsilon; after normal interrupt settlement, the serving registry and
+  compute host report zero orphaned turns for that sid and host CPU/RSS returns to idle. Repeat the
+  kill-9 case with `turn_isolation=false` to prove the in-process branch. Negative guards: reconnect
+  within grace leaves the turn untouched; an active delegation defers interruption; a still-connected
+  sibling session's turn on the same host is UNAFFECTED (disconnect cancels only the gone client's turn).
+  This is
   the invariant whose ABSENCE let a `kill -9`'d certify client leave ~20 orphaned turns that
   wedged the live dashboard (2026-07-05).
 
