@@ -96,11 +96,23 @@ def _warn_if_gateway_not_running() -> None:
     print(color("     Check status:  hermes cron status", Colors.DIM))
 
 
-def cron_list(show_all: bool = False):
-    """List all scheduled jobs."""
+def cron_list(show_all: bool = False, as_json: bool = False):
+    """List all scheduled jobs.
+
+    ``as_json`` emits the raw job records as a JSON array on stdout instead of
+    the human table. Agents and scripts inspecting cron state previously had to
+    scrape the box-drawing table (or read ``cron/jobs.json`` directly, coupling
+    to the on-disk layout) because the CLI exposed table output only.
+    """
     from cron.jobs import list_jobs
 
     jobs = list_jobs(include_disabled=show_all)
+
+    if as_json:
+        import json as _json
+
+        print(_json.dumps(jobs, indent=2, ensure_ascii=False, default=str))
+        return
 
     if not jobs:
         print(color("No scheduled jobs.", Colors.DIM))
@@ -503,7 +515,7 @@ def cron_command(args):
 
     if subcmd is None or subcmd == "list":
         show_all = getattr(args, 'all', False)
-        cron_list(show_all)
+        cron_list(show_all, as_json=getattr(args, 'json', False))
         return 0
 
     if subcmd == "status":
