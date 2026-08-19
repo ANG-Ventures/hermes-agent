@@ -29,7 +29,18 @@ def scrub_and_truncate(text: Any, n: int = 2000) -> str:
     if text is None:
         return ""
     scrubbed = redact_sensitive_text(str(text), force=True)
-    return scrubbed[:n]
+    scrubbed = scrubbed[:n]
+    # Lone UTF-16 surrogates (relay-split emoji halves that reached the
+    # transcript) make sqlite3's UTF-8 encode raise inside conn.execute(),
+    # and insert_turn's fail-open catch then silently DROPS the whole turn
+    # record. Splice pairs / floor orphans so telemetry always persists.
+    try:
+        scrubbed.encode("utf-8")
+    except UnicodeEncodeError:
+        from agent.message_sanitization import _splice_surrogates
+
+        scrubbed = _splice_surrogates(scrubbed)
+    return scrubbed
 
 
 def _connect() -> sqlite3.Connection:

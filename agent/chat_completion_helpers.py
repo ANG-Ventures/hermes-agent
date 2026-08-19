@@ -4693,7 +4693,19 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
             manager = request_client.messages.stream(**final_kwargs)
             _stream_context["manager"] = manager
-            return manager.__enter__()
+            opened = manager.__enter__()
+            # Repair split UTF-16 surrogates in tool-input JSON fragments
+            # BENEATH the SDK accumulator. accumulate_event() does
+            # ``bytes(partial_json, "utf-8")`` on every input_json_delta
+            # before our event loop sees it, so a relay-split emoji in
+            # tool arguments raised UnicodeEncodeError inside the SDK
+            # iterator and killed the stream after partial delivery
+            # (the recurring "connection issue" fallback). Fail-open.
+            from agent.anthropic_stream_repair import (
+                install_tool_json_surrogate_repair,
+            )
+            install_tool_json_surrogate_repair(opened)
+            return opened
 
         def _anthropic_stream_created(raw_stream: Any) -> None:
             _stream_context["stream"] = raw_stream
@@ -4766,8 +4778,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     block = getattr(event, "content_block", None)
                     if block and getattr(block, "type", None) == "tool_use":
                         has_tool_use = True
+                        # Mirror the chat_completions lane's bookkeeping so
+                        # the outer retry gate knows a tool call was
+                        # in-flight if this stream dies mid-generation.
+                        # Without these, an Anthropic-lane stream death
+                        # during tool-JSON generation silently discarded
+                        # the attempted action (no silent retry, no
+                        # user-visible "tool dropped" warning).
+                        provider_tool_in_flight["yes"] = True
                         tool_name = getattr(block, "name", None)
                         if tool_name:
+                            result["partial_tool_names"].append(tool_name)
                             _fire_first_delta()
                             agent._fire_tool_gen_started(tool_name)
                 elif event_type == "content_block_delta":
@@ -4983,7 +5004,21 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             logger.warning(
                                 "Streaming failed after partial delivery, not retrying: %s", e
                             )
-                            result["error"] = e
+                            if _is_stream_parse_err and not isinstance(
+                                e, ProviderStreamParseError
+                            ):
+                                # Preserve response-side provenance (same as
+                                # the before-delivery branch below): a raw
+                                # UnicodeEncodeError/ValueError classifies to
+                                # the unknown floor and the fallback banner
+                                # lies "connection issue" for what is wire
+                                # corruption. Wrap so downstream labeling
+                                # reads "malformed stream".
+                                _wrapped = ProviderStreamParseError(str(e))
+                                _wrapped.__cause__ = e
+                                result["error"] = _wrapped
+                            else:
+                                result["error"] = e
                             return
                         # Tool call was in-flight AND error is transient:
                         # retry silently.  Clear per-attempt state so the
