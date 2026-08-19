@@ -836,6 +836,20 @@ class Mem0MemoryProvider(MemoryProvider):
     # Config-gated (default OFF), fails OPEN (a missing rerank_score → keep all), exact-token
     # queries bypass (rerank unreliable for IP/email/port, same carve-out as Gate B).
     _PREFETCH_RERANK_DEFAULT_MIN = 0.0
+    # Specificity-tiered relaxation (2026-08-19): live near-miss triage showed the single
+    # floor conflates two classes. Terse/context-dependent turns ("Yes do both") produce
+    # borderline candidates at rr −0.1..−0.5 that are correctly trimmed, but SPECIFIC
+    # queries (a named torrent, "claude-bpx or claude-bpr?") had directly-relevant
+    # memories trimmed at rr −0.12..−0.20 — genuine misses. Measured separation over the
+    # 08-16..08-19 window: genuine misses sat at −0.12..−0.20 while several vague-turn
+    # near-misses also reached −0.12..−0.15, so score alone cannot split them — QUERY
+    # SPECIFICITY does. A query counting ≥ `specific_min_content_tokens` Gate-A content
+    # tokens (default 3) uses `min_rerank_specific` (default −0.35, recovering all
+    # observed genuine misses with margin); below that, the strict `min_rerank` holds.
+    # Fail-open direction matches Gate A: an uncountable query reads as substantive
+    # (999 tokens → relaxed floor = more recall; an error never blanks recall).
+    _PREFETCH_RERANK_DEFAULT_MIN_SPECIFIC = -0.35
+    _PREFETCH_RERANK_DEFAULT_SPECIFIC_TOKENS = 3
 
     # Pure acknowledgment / politeness / filler tokens ONLY (INV-7: never a domain verb/noun,
     # never a ≤2-char filter — "ac","tv","ip" are real content). A message that reduces to
@@ -1054,6 +1068,41 @@ class Mem0MemoryProvider(MemoryProvider):
         except (TypeError, ValueError):
             return self._PREFETCH_RERANK_DEFAULT_MIN
 
+    def _rerank_gate_min_specific(self) -> float:
+        """Relaxed threshold for SPECIFIC queries (default −0.35). Clamped to never sit ABOVE
+        the strict floor — a config typo must not make specific queries stricter than vague
+        ones (that inverts the design)."""
+        cfg = self._prefetch_cfg_block("prefetch_rerank_gate")
+        try:
+            v = float(cfg.get("min_rerank_specific", self._PREFETCH_RERANK_DEFAULT_MIN_SPECIFIC))
+        except (TypeError, ValueError):
+            v = self._PREFETCH_RERANK_DEFAULT_MIN_SPECIFIC
+        return min(v, self._rerank_gate_min())
+
+    def _rerank_specific_tokens(self) -> int:
+        """Content-token count (Gate-A tokenizer) at/above which a query is 'specific'.
+        Default 3; floor 1 (0/negative would mark pure-filler turns specific)."""
+        cfg = self._prefetch_cfg_block("prefetch_rerank_gate")
+        try:
+            v = int(cfg.get("specific_min_content_tokens",
+                            self._PREFETCH_RERANK_DEFAULT_SPECIFIC_TOKENS))
+            return v if v >= 1 else self._PREFETCH_RERANK_DEFAULT_SPECIFIC_TOKENS
+        except (TypeError, ValueError):
+            return self._PREFETCH_RERANK_DEFAULT_SPECIFIC_TOKENS
+
+    def _rerank_effective_floor(self, query):
+        """Resolve (floor, tier) for this query. tier ∈ {strict, specific}. A specific query
+        (enough Gate-A content tokens to carry real recall intent) gets the relaxed floor;
+        anything else keeps the strict one. _content_token_count fails open to 999 →
+        an uncountable query lands in the RELAXED tier (more recall, matching Gate A's
+        treat-as-substantive-on-error direction)."""
+        try:
+            if self._content_token_count(query) >= self._rerank_specific_tokens():
+                return self._rerank_gate_min_specific(), "specific"
+        except Exception:
+            return self._rerank_gate_min_specific(), "specific"
+        return self._rerank_gate_min(), "strict"
+
     def _apply_rerank_gate(self, query, results):
         """Drop candidates whose server-provided `rerank_score` is below `min_rerank`. Returns
         (kept, outcome). ALWAYS fails OPEN (returns full `results`) when disabled, on an
@@ -1076,13 +1125,13 @@ class Mem0MemoryProvider(MemoryProvider):
                                 len(results))
                     return results, "rr_failed_open"
                 scores.append(float(rs))
-            floor = self._rerank_gate_min()
+            floor, tier = self._rerank_effective_floor(query)
             kept = [r for r, s in zip(results, scores) if s >= floor]
             ordered = sorted(scores, reverse=True)
             logger.info(
-                "mem0.prefetch_rerank outcome=kept_%d_of_%d min=%.2f "
+                "mem0.prefetch_rerank outcome=kept_%d_of_%d min=%.2f tier=%s "
                 "rr_max=%.2f rr_min=%.2f rr=%s q=%s qtext=%s",
-                len(kept), len(results), floor, ordered[0], ordered[-1],
+                len(kept), len(results), floor, tier, ordered[0], ordered[-1],
                 ",".join(f"{s:.2f}" for s in ordered),
                 self._prefetch_query_hash(query),
                 self._prefetch_query_text(query),

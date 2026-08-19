@@ -552,7 +552,7 @@ def test_rerank_telemetry_carries_full_query_text(monkeypatch, tmp_path, caplog)
     import logging
     p = _provider(monkeypatch, tmp_path)
     _write_cfg_block(tmp_path, "prefetch_rerank_gate", {"enabled": True, "min_rerank": 0.0})
-    results = [{"memory": "m1", "rerank_score": -0.18},
+    results = [{"memory": "m1", "rerank_score": -0.48},
                {"memory": "m2", "rerank_score": -7.4}]
     caplog.set_level(logging.INFO)
     kept, outcome = p._apply_rerank_gate("which query\nwas near miss", results)
@@ -562,3 +562,95 @@ def test_rerank_telemetry_carries_full_query_text(monkeypatch, tmp_path, caplog)
     assert "qtext=which query was near miss" in line
     # the stable hash stays alongside for dedup
     assert " q=" + p._prefetch_query_hash("which query\nwas near miss") in line
+
+
+# ---------------------------------------------------------------------------
+# L2 rerank gate — specificity-tiered floor (2026-08-19)
+# ---------------------------------------------------------------------------
+
+def test_rerank_tier_specific_query_uses_relaxed_floor(monkeypatch, tmp_path):
+    """A specific query (>=3 content tokens) gets the relaxed floor: the real observed
+    genuine-miss class. Replays the live 2026-08-18 PTP/DMT turn shape: rr_max=-0.19
+    trimmed at floor 0.0 despite a directly-relevant memory existing."""
+    p = _provider(monkeypatch, tmp_path)
+    _write_cfg_block(tmp_path, "prefetch_rerank_gate", {"enabled": True})
+    results = _rr_results(("dmt-webrip-fact", -0.19), ("near", -0.87), ("mid", -1.33),
+                          ("far", -1.41), ("junk", -2.04))
+    kept, outcome = p._apply_rerank_gate(
+        "PTP says it's not seeding qBittorrent DMT torrent RARBG release", results)
+    assert [r["memory"] for r in kept] == ["dmt-webrip-fact"]
+    assert outcome == "rr_kept_1_of_5"
+
+
+def test_rerank_tier_vague_query_keeps_strict_floor(monkeypatch, tmp_path):
+    """A terse ack-ish turn (<3 content tokens) keeps the strict 0.0 floor: replays the
+    live 'Yes do both' near-miss (rr_max=-0.12) which must STAY trimmed."""
+    p = _provider(monkeypatch, tmp_path)
+    _write_cfg_block(tmp_path, "prefetch_rerank_gate", {"enabled": True})
+    results = _rr_results(("borderline", -0.12), ("j1", -1.32), ("j2", -2.14))
+    kept, outcome = p._apply_rerank_gate("Yes do both", results)
+    assert kept == []
+    assert outcome == "rr_kept_0_of_3"
+
+
+def test_rerank_tier_specific_still_drops_below_relaxed_floor(monkeypatch, tmp_path):
+    """Relaxed != open: a specific query still trims candidates under -0.35."""
+    p = _provider(monkeypatch, tmp_path)
+    _write_cfg_block(tmp_path, "prefetch_rerank_gate", {"enabled": True})
+    results = _rr_results(("keep", -0.20), ("drop1", -0.54), ("drop2", -7.19))
+    kept, _ = p._apply_rerank_gate(
+        "should we fix similar issues for claude-bpx or claude-bpr", results)
+    assert [r["memory"] for r in kept] == ["keep"]
+
+
+def test_rerank_tier_telemetry_stamps_tier(monkeypatch, tmp_path, caplog):
+    """The rerank line carries tier= so the digest/triage can attribute the floor used."""
+    p = _provider(monkeypatch, tmp_path)
+    _write_cfg_block(tmp_path, "prefetch_rerank_gate", {"enabled": True})
+    with caplog.at_level(logging.INFO):
+        p._apply_rerank_gate("what port does the mem0 postgres clone listen on", _rr_results(("a", 1.0)))
+        p._apply_rerank_gate("ok do it", _rr_results(("a", 1.0)))
+    msgs = [r.getMessage() for r in caplog.records if "prefetch_rerank" in r.getMessage()]
+    assert any("tier=specific" in m for m in msgs)
+    assert any("tier=strict" in m for m in msgs)
+
+
+def test_rerank_tier_thresholds_configurable(monkeypatch, tmp_path):
+    p = _provider(monkeypatch, tmp_path)
+    _write_cfg_block(tmp_path, "prefetch_rerank_gate",
+                     {"enabled": True, "min_rerank_specific": -1.0,
+                      "specific_min_content_tokens": 2})
+    results = _rr_results(("a", -0.9), ("b", -1.1))
+    kept, _ = p._apply_rerank_gate("mem0 clone", results)  # 2 content tokens -> specific
+    assert [r["memory"] for r in kept] == ["a"]
+
+
+def test_rerank_tier_specific_floor_clamped_below_strict(monkeypatch, tmp_path):
+    """A config typo putting the specific floor ABOVE the strict one must not make
+    specific queries stricter than vague ones: clamp to min(specific, strict)."""
+    p = _provider(monkeypatch, tmp_path)
+    _write_cfg_block(tmp_path, "prefetch_rerank_gate",
+                     {"enabled": True, "min_rerank": 0.0, "min_rerank_specific": 2.0})
+    assert p._rerank_gate_min_specific() == 0.0
+    results = _rr_results(("a", 0.5), ("b", -0.5))
+    kept, _ = p._apply_rerank_gate("mem0 postgres clone rebuild steps", results)
+    assert [r["memory"] for r in kept] == ["a"]  # strict 0.0 applied, not 2.0
+
+
+def test_rerank_tier_garbage_config_falls_to_defaults(monkeypatch, tmp_path):
+    p = _provider(monkeypatch, tmp_path)
+    _write_cfg_block(tmp_path, "prefetch_rerank_gate",
+                     {"enabled": True, "min_rerank_specific": "nope",
+                      "specific_min_content_tokens": "zilch"})
+    assert p._rerank_gate_min_specific() == p._PREFETCH_RERANK_DEFAULT_MIN_SPECIFIC
+    assert p._rerank_specific_tokens() == p._PREFETCH_RERANK_DEFAULT_SPECIFIC_TOKENS
+
+
+def test_rerank_tier_uncountable_query_reads_specific(monkeypatch, tmp_path):
+    """Fail-open direction: a non-string query counts as 999 tokens -> relaxed tier
+    (more recall on error, matching Gate A's treat-as-substantive rule)."""
+    p = _provider(monkeypatch, tmp_path)
+    _write_cfg_block(tmp_path, "prefetch_rerank_gate", {"enabled": True})
+    floor, tier = p._rerank_effective_floor(None)
+    assert tier == "specific"
+    assert floor == p._PREFETCH_RERANK_DEFAULT_MIN_SPECIFIC
