@@ -411,21 +411,22 @@ def _(rid, params: dict) -> dict:
         return payload
 
     def _reuse_live_response(sid: str, session: dict) -> dict:
-        # Grace expiry atomically claims client-gone interruption under
-        # _session_resume_lock. A resume that won the lock earlier already
-        # rebound the transport and cancelled the timer; one that arrives after
-        # the claim must wait for normal interrupt settlement instead of
-        # reattaching in the dispatch gap and having its fresh connection
-        # cancelled.
-        if session.get("_client_gone_interrupt_requested"):
-            return _err(rid, 4009, "session disconnect interrupt settling")
-        return _ok(rid, _reuse_live_payload(sid, session))
+        # The helper owns the resume lock because slow-path claim races can
+        # discover a live winner and return it after releasing their own lock.
+        # Keeping the client-gone check and transport rebind in one critical
+        # section makes grace expiry atomic across every reuse path.
+        with _session_resume_lock:
+            if _sessions.get(sid) is not session:
+                return _err(rid, 4007, "session no longer live; retry resume")
+            if session.get("_client_gone_interrupt_requested"):
+                return _err(rid, 4009, "session disconnect interrupt settling")
+            return _ok(rid, _reuse_live_payload(sid, session))
 
     # Fast path: if the session is already live, reuse it under the lock.
     with _session_resume_lock:
         live = _find_live_session_by_key(target)
-        if live is not None:
-            return _reuse_live_response(*live)
+    if live is not None:
+        return _reuse_live_response(*live)
 
     # Lazy/watch resume: register the live session WITHOUT building an agent.
     # Used by the desktop's subagent windows — the child runs inside the
