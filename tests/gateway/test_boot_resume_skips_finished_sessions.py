@@ -263,6 +263,79 @@ async def test_self_resume_handoff_is_exempt_from_the_finished_work_gate(
 
 
 @pytest.mark.asyncio
+async def test_self_resume_without_handoff_is_also_exempt(tmp_path, monkeypatch):
+    """2026-08-18 incident: the exemption required kind=self AND a handoff.
+
+    The dropbox sweep stamped neither (kind=None), and even after stamping
+    kind=self a legacy watcher payload carries no handoff — so a by-the-book
+    safe-restart self-resume was skipped as no_unfinished_work and degraded
+    to the inert plain-message fallback. kind=self ALONE must exempt: hedge
+    marks never carry it, so the bystander class is unaffected.
+    """
+    monkeypatch.delenv("HERMES_RESUME_INTERRUPTED_TURNS", raising=False)
+    runner, _adapter, db = _runner(tmp_path, monkeypatch)
+    entry = runner.session_store.get_or_create_session(_source())
+    _seed(db, entry, _COMPLETED_TAIL)
+    assert runner.session_store.mark_resume_pending(
+        entry.session_key,
+        "restart_interrupted",
+        resume_kind="self",
+        resume_handoff=None,
+    )
+
+    await runner._prepare_boot_resume_work_check()
+    assert entry.session_key not in runner._boot_resume_has_work
+    assert runner._schedule_resume_pending_sessions() == 1
+    await asyncio.gather(*runner._background_tasks)
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_dropbox_request_resumes_a_cleanly_completed_session(
+    tmp_path, monkeypatch, caplog
+):
+    """End-to-end for the 2026-08-18 class: watcher drops a request, the
+    session's tail is a COMPLETED turn (the safe-restart protocol), and the
+    boot sweep + work check + scheduler must still produce a resume turn —
+    with the handoff riding the payload onto the session entry."""
+    from gateway import resume_requests as rr
+
+    monkeypatch.delenv("HERMES_RESUME_INTERRUPTED_TURNS", raising=False)
+    runner, _adapter, db = _runner(tmp_path, monkeypatch)
+    entry = runner.session_store.get_or_create_session(_source())
+    _seed(db, entry, _COMPLETED_TAIL)
+
+    rr.submit_resume_request(
+        tmp_path,
+        entry.session_key,
+        "restart_interrupted",
+        handoff="verify PR #610 is live and report closeout",
+    )
+    runner._draining = False
+    runner._shutdown_event = asyncio.Event()
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        gateway_run.GatewayRunner._sweep_resume_requests(runner)
+
+    refreshed = runner.session_store._entries[entry.session_key]
+    assert refreshed.resume_pending is True
+    assert refreshed.resume_kind == "self"
+    assert refreshed.resume_handoff == "verify PR #610 is live and report closeout"
+
+    await runner._prepare_boot_resume_work_check()
+    assert entry.session_key not in runner._boot_resume_has_work
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        assert runner._schedule_resume_pending_sessions() == 1
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("PHASE=dropbox_resume " in m and "kind=self" in m for m in messages)
+    assert not any("cause=no_unfinished_work" in m for m in messages)
+    await asyncio.gather(*runner._background_tasks)
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_gate_runs_in_prompt_mode_not_only_auto(tmp_path, monkeypatch):
     """The wasted turn is paid in prompt mode too, so the check must run there.
 
