@@ -19,7 +19,7 @@ MARKER = "apollo-certify-DISPOSABLE"
 _MAX_DRIVERS = 4  # INV-3: bounded concurrency, never the 6+ that wedged the box
 
 def _creds():
-    env = open(os.path.expanduser("~/.hermes/.env")).read()
+    env = open(os.path.expanduser("~/.hermes/.env"), encoding="utf-8").read()
     U = re.search(r"HERMES_DASHBOARD_BASIC_AUTH_USERNAME=(.*)", env).group(1).strip().strip('"\'')
     P = re.search(r"HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=(.*)", env).group(1).strip().strip('"\'')
     return U, P
@@ -206,7 +206,7 @@ def main():
     gate = (not args.dry_run and not tripped.is_set()
             and rest_s['p99'] is not None and rest_s['p99']<1.0
             and rest_s['drops']==0 and left==0)
-    json.dump({"dry_run":args.dry_run,"tripped":tripped.is_set(),"rest":rest_s,"ws_list":ws_s,"disposables_left":left}, open(args.json_out,"w"), default=str)
+    json.dump({"dry_run":args.dry_run,"tripped":tripped.is_set(),"rest":rest_s,"ws_list":ws_s,"disposables_left":left}, open(args.json_out,"w",encoding="utf-8"), default=str)
     if args.dry_run:
         print("\nDRY-RUN: plumbing + safety wiring OK")
     elif tripped.is_set():
