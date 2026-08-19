@@ -157,12 +157,35 @@ class _BatchAbandoned(BaseException):
 
 
 def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
-    """Parse model-emitted arguments without repairing or coercing them."""
+    """Parse model-emitted arguments without repairing or coercing them.
+
+    One deliberate exception to "no repair": lone UTF-16 surrogates. A
+    relay/proxy that JSON-decodes ``\\ud83d`` and ``\\udd34`` in separate
+    stream fragments leaves invalid surrogate code points inside argument
+    strings. json.loads accepts them, but any downstream UTF-8 boundary
+    (file writes, sqlite, subprocess pipes) raises UnicodeEncodeError and
+    the tool dies mid-execution with a confusing codec traceback. Splice
+    valid pairs back into real characters and floor orphans to U+FFFD at
+    this single choke point so every tool receives encodable arguments.
+    """
+    if isinstance(raw_arguments, str):
+        try:
+            raw_arguments.encode("utf-8")
+        except UnicodeEncodeError:
+            from agent.message_sanitization import _splice_surrogates
+
+            raw_arguments = _splice_surrogates(raw_arguments)
     try:
         arguments = json.loads(raw_arguments)
     except (json.JSONDecodeError, TypeError):
         arguments = None
     if isinstance(arguments, dict):
+        from agent.message_sanitization import _sanitize_structure_surrogates
+
+        try:
+            _sanitize_structure_surrogates(arguments)
+        except Exception:
+            pass
         return arguments, None
     return {}, json.dumps(
         {
