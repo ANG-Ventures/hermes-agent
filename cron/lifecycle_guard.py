@@ -304,6 +304,27 @@ _PIPE_TO_INTERPRETER = re.compile(
     r"\|\s*&?\s*(?:sudo\s+)?(?:sh|bash|dash|ksh|zsh|xargs|eval|source)\b"
 )
 
+# Heredoc opener: `<<EOF`, `<<-EOF`, `<<'EOF'`, `<<"EOF"`. The delimiter's
+# quoting matters — a QUOTED delimiter means the shell performs no expansion on
+# the body at all, so `$(…)`/backticks in it are inert literal text.
+_HEREDOC_OPEN_RE = re.compile(
+    r"<<-?\s*(?:'(?P<q1>[A-Za-z_][A-Za-z0-9_]*)'"
+    r"|\"(?P<q2>[A-Za-z_][A-Za-z0-9_]*)\""
+    r"|(?P<bare>[A-Za-z_][A-Za-z0-9_]*))"
+)
+
+
+def _heredoc_delimiter(match: "re.Match[str]") -> str:
+    return match.group("q1") or match.group("q2") or match.group("bare") or ""
+
+
+# A heredoc whose RECEIVING command is a shell/interpreter executes its body
+# (`bash <<EOF` / `sh <<'EOF'`), so such a body is code, never data.
+_HEREDOC_TO_INTERPRETER = re.compile(
+    r"(?i)(?:^|[|;&]|\s)(?:sudo\s+)?(?:/\S*/)?"
+    r"(?:sh|bash|dash|ksh|zsh|eval|source)\b[^\n]*<<"
+)
+
 # Executable-image magic numbers: ELF, PE/COFF, Mach-O (universal + thin,
 # both endiannesses). A referenced file starting with one of these is a
 # compiled binary, never a shell script — don't read or scan it at all.
@@ -457,18 +478,93 @@ def _mask_data_sink_arguments(text: str) -> str:
     return "\n".join(lines_out)
 
 
+def _mask_heredoc_bodies(text: str) -> str:
+    """Replace HEREDOC BODY lines with a neutral placeholder, fail-closed.
+
+    A heredoc body is DATA being fed to a command's stdin — a README being
+    written, a Python program's string literals, a commit message. When the
+    delimiter is quoted (``<<'EOF'``) the shell performs no expansion at all, and
+    even unquoted the body is still just stdin bytes. So a lifecycle phrase that
+    appears only inside a heredoc body is prose, not an invocation::
+
+        python3 - <<'PYEOF'
+        s = "you may still need to restart the gateway"
+        PYEOF
+
+    That exact shape was blocked in production (papercut pc-fccd2771: patching a
+    README through a python heredoc was refused because the literal WORDS
+    "restart"/"stop" appeared in the quoted document text).
+
+    STRICTLY FAIL-CLOSED — masking is skipped, leaving the original
+    regex-matching text in place, whenever the body could actually be EXECUTED:
+
+    * the heredoc feeds a shell/interpreter (``bash <<EOF``, ``sh <<EOF``), or
+    * the opening line pipes the heredoc into one (``cat <<EOF | bash``), or
+    * the delimiter is UNQUOTED and the body contains command substitution
+      (``$(…)`` / backticks), which the shell WOULD expand before delivery.
+
+    Like `_mask_data_sink_arguments`, this can only ever ALLOW something the
+    plain regex would have blocked — never block something it would have allowed
+    — so it runs solely as a second-pass exemption check.
+    """
+    if "<<" not in text:
+        return text
+    lines = text.splitlines()
+    out: list[str] = []
+    changed = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        match = _HEREDOC_OPEN_RE.search(line)
+        if not match:
+            continue
+        quoted = bool(match.group("q1") or match.group("q2"))
+        delimiter = _heredoc_delimiter(match)
+        if not delimiter:
+            continue
+
+        # Collect the body up to the terminator (or EOF if never terminated).
+        body: list[str] = []
+        end = i
+        while end < len(lines) and lines[end].strip() != delimiter:
+            body.append(lines[end])
+            end += 1
+        terminator = lines[end] if end < len(lines) else None
+
+        # Fail-closed conditions: the body may actually be executed.
+        feeds_interpreter = bool(_HEREDOC_TO_INTERPRETER.search(line))
+        piped_to_interpreter = bool(_PIPE_TO_INTERPRETER.search(line))
+        expands = (not quoted) and any(
+            marker in "\n".join(body) for marker in ("$(", "`")
+        )
+        if feeds_interpreter or piped_to_interpreter or expands:
+            out.extend(body)
+        else:
+            changed = changed or bool(body)
+            out.extend("heredoc-data" for _ in body)
+        if terminator is not None:
+            out.append(terminator)
+        i = end + 1 if terminator is not None else end
+    if not changed:
+        return text
+    return "\n".join(out)
+
+
 def _lifecycle_command_scan_with_data_exemption(text: str) -> bool:
     """Lifecycle-regex scan that exempts matches living inside data arguments.
 
     Two-pass: the cheap regex first (the overwhelmingly common no-match case
-    pays nothing extra); on a raw match, re-scan with data-sink arguments
-    masked out. Only a match that survives masking — i.e. one in actual
-    command position — blocks.
+    pays nothing extra); on a raw match, re-scan with data-sink arguments and
+    heredoc bodies masked out. Only a match that survives masking — i.e. one in
+    actual command position — blocks.
     """
     if not contains_gateway_lifecycle_command(text):
         return False
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
-    return contains_gateway_lifecycle_command(_mask_data_sink_arguments(normalized))
+    masked = _mask_data_sink_arguments(_mask_heredoc_bodies(normalized))
+    return contains_gateway_lifecycle_command(masked)
 
 
 def _direct_lifecycle_scan(command: str) -> bool:
