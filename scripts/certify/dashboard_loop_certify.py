@@ -215,7 +215,7 @@ def _certify_client_gone(op, ctl, args):
                 states.append(state)
             time.sleep(0.25)
 
-        kill_confirmed = child_exit == -signal.SIGKILL
+        kill_confirmed = child_exit == -getattr(signal, "SIGKILL", signal.SIGTERM)
         passed = kill_confirmed and reaped_after_s is not None
         result.update(
             gate="PASS" if passed else "FAIL",
