@@ -119,7 +119,15 @@ _PATTERNS: List[Tuple[str, str, str]] = [
     # ── Exfiltration via curl/wget/cat with secrets (applies everywhere) ──
     (r'curl\s+[^\n]{0,2048}\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)', "exfil_curl", "all"),
     (r'wget\s+[^\n]{0,2048}\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)', "exfil_wget", "all"),
-    (r'cat\s+[^\n]{0,2048}(\.env|credentials|\.netrc|\.pgpass|\.npmrc|\.pypirc)', "read_secrets", "all"),
+    # `cat` needs a WORD BOUNDARY and a same-line gap. Without `\b`, any word
+    # ENDING in "cat" matches — "pipecat", "concat", "tomcat", "bobcat". A repo
+    # whose name ends in cat (pipecat-house-voice) had its AGENTS.md blocked
+    # wholesale because the prose "…pipecat\n  `server/tests/fixtures/observer-map.env`"
+    # matched: "pipe[cat]" + a newline-spanning gap + a legitimate .env FIXTURE
+    # filename. The `\s` in the old gap allowed the match to cross lines, so two
+    # unrelated lines combined into a fake "read secrets" hit and the worker lost
+    # its entire coding-conventions file (papercut pc-49dc8417).
+    (r'\bcat[ \t]+[^\n]{0,2048}(\.env|credentials|\.netrc|\.pgpass|\.npmrc|\.pypirc)', "read_secrets", "all"),
     (r'(send|post|upload|transmit)\s+[^\n]{0,2048}\s+(to|at)\s+https?://', "send_to_url", "strict"),
     (rf'(include|output|print|share)\s+{_FILLER}(conversation|chat\s+history|previous\s+messages|full\s+context|entire\s+context)', "context_exfil", "strict"),
 
