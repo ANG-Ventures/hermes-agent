@@ -826,6 +826,13 @@ def run_doctor(args):
     
     _section("Python Environment")
     py_version = sys.version_info
+    # Surface the ABSOLUTE interpreter path, not just the version. Agents and
+    # scripts writing a cron/launchd job need the canonical runtime interpreter
+    # and otherwise guess it from an old layout (`~/.hermes/venv/bin/python` is a
+    # common stale guess that does not exist), then debug a missing-path error.
+    # `sys.executable` is authoritative: it is the interpreter doctor is running
+    # under, which is by construction the one the CLI uses.
+    check_ok(f"Interpreter: {sys.executable}")
     if py_version >= (3, 11):
         check_ok(f"Python {py_version.major}.{py_version.minor}.{py_version.micro}")
     elif py_version >= (3, 10):
