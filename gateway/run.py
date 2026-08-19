@@ -12482,15 +12482,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source = getattr(entry, "origin", None)
             if platform is not None and getattr(source, "platform", None) != platform:
                 continue
-            # A deliberate SELF resume-handoff is NOT a hedge: the session asked
-            # for the restart and left a handoff note describing what to do on
-            # the other side. Its tail is SUPPOSED to be a completed turn, so
-            # the transcript cannot answer "is there work?" — the handoff is the
-            # work. Never gate those.
-            if (
-                getattr(entry, "resume_kind", None) == RESUME_KIND_SELF
-                and getattr(entry, "resume_handoff", None)
-            ):
+            # A deliberate SELF resume is NOT a hedge: the session asked for
+            # the restart (safe-restart/safe-reboot watcher via the dropbox,
+            # or the typed deferred-restart rail) and its tail is SUPPOSED to
+            # be a completed turn — ending the turn cleanly is the protocol's
+            # precondition, so the transcript cannot answer "is there work?".
+            # Gate on the KIND alone: the dropbox sweep stamps kind=self on
+            # every request it honors, but older vendored watchers do not
+            # send a handoff, and requiring one here skipped every
+            # by-the-book self-restart as no_unfinished_work and degraded it
+            # to the inert plain-message fallback (2026-08-18). Hedge marks
+            # (pre-drain, suspend_recently_active) never carry kind=self, so
+            # the bystander-resume class this check exists for is unaffected.
+            if getattr(entry, "resume_kind", None) == RESUME_KIND_SELF:
                 continue
             session_id = getattr(entry, "session_id", None)
             if self._session_db is None or not session_id:
@@ -13031,16 +13035,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from gateway import resume_requests as _resume_requests
 
-            for request_key, request_reason in _resume_requests.sweep_resume_requests(
-                _hermes_home
-            ):
+            for (
+                request_key,
+                request_reason,
+                request_handoff,
+            ) in _resume_requests.sweep_resume_requests(_hermes_home):
                 try:
-                    if self.session_store.mark_resume_pending(request_key, request_reason):
+                    # A dropbox request is by contract a DELIBERATE external
+                    # ask (the safe-restart/reboot watchers submitting a
+                    # self-resume for the initiating session) — never a
+                    # pre-drain hedge. Stamp kind=self so downstream gates
+                    # (the boot-resume finished-work check's SELF exemption,
+                    # auto-mode selection) can tell it apart from hedge
+                    # marks. Without this the mark carried kind=None, the
+                    # exemption never fired, and every by-the-book
+                    # safe-restart self-resume was skipped as
+                    # no_unfinished_work (2026-08-18).
+                    if self.session_store.mark_resume_pending(
+                        request_key,
+                        request_reason,
+                        resume_kind="self",
+                        resume_handoff=request_handoff,
+                    ):
                         logger.warning(
-                            "PHASE=dropbox_resume key=%s reason=%s (external "
-                            "resume request honored)",
+                            "PHASE=dropbox_resume key=%s reason=%s kind=self "
+                            "handoff=%s (external resume request honored)",
                             request_key,
                             request_reason,
+                            "yes" if request_handoff else "no",
                         )
                     else:
                         logger.warning(

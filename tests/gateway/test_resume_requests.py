@@ -22,10 +22,42 @@ def test_submit_then_sweep_roundtrip(tmp_path: Path) -> None:
     path = _submit(tmp_path, "agent:main:discord:thread:1:1")
     assert path.exists()
     got = rr.sweep_resume_requests(tmp_path)
-    assert got == [("agent:main:discord:thread:1:1", "restart_interrupted")]
+    assert got == [("agent:main:discord:thread:1:1", "restart_interrupted", None)]
     # Consumed: file gone, second sweep empty.
     assert not path.exists()
     assert rr.sweep_resume_requests(tmp_path) == []
+
+
+def test_handoff_rides_the_dropbox(tmp_path: Path) -> None:
+    """2026-08-18: the handoff must ride the request payload so the gateway
+    can stamp resume_kind=self + resume_handoff on the session entry. A
+    handoff living only in the transcript is invisible to the resume gates
+    (and the transcript-append leg can miss entirely on a bogus session_id)."""
+    rr.submit_resume_request(
+        tmp_path,
+        "agent:main:discord:thread:9:9",
+        handoff="was deploying PR #610; verify it's live",
+    )
+    got = rr.sweep_resume_requests(tmp_path)
+    assert got == [(
+        "agent:main:discord:thread:9:9",
+        "restart_interrupted",
+        "was deploying PR #610; verify it's live",
+    )]
+
+
+def test_legacy_payload_without_handoff_still_sweeps(tmp_path: Path) -> None:
+    """Older vendored watchers (safe-reboot pre-parity) omit the handoff key —
+    the sweep must keep honoring their requests with handoff=None."""
+    directory = rr.dropbox_dir(tmp_path)
+    directory.mkdir(parents=True)
+    (directory / "legacy.json").write_text(json.dumps({
+        "session_key": "agent:main:telegram:dm:1:1",
+        "reason": "reboot_interrupted",
+        "requested_at": time.time(),
+    }))
+    got = rr.sweep_resume_requests(tmp_path)
+    assert got == [("agent:main:telegram:dm:1:1", "reboot_interrupted", None)]
 
 
 def test_sweep_missing_dir_fast_path(tmp_path: Path) -> None:
@@ -89,8 +121,8 @@ def test_boot_sweep_marks_and_gates_via_session_store(tmp_path: Path, monkeypatc
     calls = []
 
     class _Store:
-        def mark_resume_pending(self, key, reason):
-            calls.append((key, reason))
+        def mark_resume_pending(self, key, reason, *, resume_kind=None, resume_handoff=None):
+            calls.append((key, reason, resume_kind, resume_handoff))
             # Emulate the real gate: known+active session True; else False.
             return key == "agent:main:discord:thread:6:6"
 
@@ -103,11 +135,15 @@ def test_boot_sweep_marks_and_gates_via_session_store(tmp_path: Path, monkeypatc
     # against a stub store (the full _schedule_resume_pending_sessions needs
     # a live runner; the sweep block's contract is what we lock here).
     store = _Store()
-    for key, reason in rr.sweep_resume_requests(run_mod._hermes_home):
-        store.mark_resume_pending(key, reason)
+    for key, reason, handoff in rr.sweep_resume_requests(run_mod._hermes_home):
+        store.mark_resume_pending(
+            key, reason, resume_kind="self", resume_handoff=handoff
+        )
 
-    assert ("agent:main:discord:thread:6:6", "restart_interrupted") in calls
-    assert ("agent:main:discord:thread:GONE:0", "restart_interrupted") in calls
+    # kind=self is the 2026-08-18 contract: a dropbox request is a deliberate
+    # external ask, never a hedge — the finished-work boot guard exempts it.
+    assert ("agent:main:discord:thread:6:6", "restart_interrupted", "self", None) in calls
+    assert ("agent:main:discord:thread:GONE:0", "restart_interrupted", "self", None) in calls
     assert rr.sweep_resume_requests(tmp_path) == []  # consumed either way
 
 
@@ -128,7 +164,7 @@ def test_draining_gateway_defers_dropbox_to_successor(tmp_path: Path, monkeypatc
     consumed = []
 
     class _Store:
-        def mark_resume_pending(self, key, reason):
+        def mark_resume_pending(self, key, reason, *, resume_kind=None, resume_handoff=None):
             consumed.append((key, reason))
             return True
 

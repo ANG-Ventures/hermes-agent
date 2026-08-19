@@ -52,12 +52,20 @@ def submit_resume_request(
     hermes_home: Path,
     session_key: str,
     reason: str = "restart_interrupted",
+    handoff: str | None = None,
 ) -> Path:
     """Write a resume request for *session_key*. For EXTERNAL writers.
 
     Atomic (tmp+rename) and collision-free (pid+monotonic suffix). Duplicate
     requests for the same key are harmless — the sweep dedups. Never touches
     sessions.json.
+
+    ``handoff`` (optional) carries the initiating session's state note
+    durably: the transcript-append leg can silently miss (a wrong
+    ``--session-id`` writes an orphan row nothing reads — 2026-08-18), and a
+    handoff that only exists in the transcript is invisible to the resume
+    gates. Riding the dropbox makes the gateway itself stamp it on the
+    session entry.
     """
     if not session_key:
         raise ValueError("session_key is required")
@@ -68,6 +76,8 @@ def submit_resume_request(
         "reason": str(reason),
         "requested_at": time.time(),
     }
+    if handoff:
+        payload["handoff"] = str(handoff)
     stem = _KEY_SANITIZE_RE.sub("_", str(session_key))[:120]
     final = directory / f"{stem}-{os.getpid()}-{time.monotonic_ns()}.json"
     fd, tmp_name = tempfile.mkstemp(prefix=".resume-req-", dir=str(directory))
@@ -87,14 +97,14 @@ def sweep_resume_requests(
     hermes_home: Path,
     *,
     max_age_seconds: float = MAX_AGE_SECONDS,
-) -> List[Tuple[str, str]]:
+) -> List[Tuple[str, str, "str | None"]]:
     """Consume all pending requests. For the GATEWAY (single consumer).
 
-    Returns deduped ``[(session_key, reason)]`` (first reason wins per key).
-    Consumed files are deleted; malformed files are renamed ``*.rejected`` so
-    they are never re-parsed; stale files (older than *max_age_seconds*) are
-    deleted without being returned. Fail-open: any per-file error skips that
-    file, never raises out of the sweep.
+    Returns deduped ``[(session_key, reason, handoff_or_None)]`` (first
+    request wins per key). Consumed files are deleted; malformed files are
+    renamed ``*.rejected`` so they are never re-parsed; stale files (older
+    than *max_age_seconds*) are deleted without being returned. Fail-open:
+    any per-file error skips that file, never raises out of the sweep.
     """
     directory = dropbox_dir(hermes_home)
     try:
@@ -106,7 +116,7 @@ def sweep_resume_requests(
         return []
 
     now = time.time()
-    results: List[Tuple[str, str]] = []
+    results: List[Tuple[str, str, "str | None"]] = []
     seen: set[str] = set()
     for name in names:
         if not name.endswith(".json"):
@@ -122,6 +132,8 @@ def sweep_resume_requests(
             session_key = str(payload["session_key"])
             reason = str(payload.get("reason") or "restart_interrupted")
             requested_at = float(payload.get("requested_at") or 0.0)
+            raw_handoff = payload.get("handoff")
+            handoff = str(raw_handoff) if raw_handoff else None
         except Exception as exc:  # noqa: BLE001 — quarantine, don't crash
             logger.warning("resume request %s malformed (%s) — quarantining", name, exc)
             try:
@@ -143,5 +155,5 @@ def sweep_resume_requests(
         if session_key in seen:
             continue
         seen.add(session_key)
-        results.append((session_key, reason))
+        results.append((session_key, reason, handoff))
     return results
