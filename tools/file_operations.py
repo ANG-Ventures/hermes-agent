@@ -777,6 +777,39 @@ def normalize_search_pagination(offset: Any = DEFAULT_SEARCH_OFFSET,
 _REGEX_NEWLINE_ESCAPE_RE = re.compile(r"(?<!\\)(?:\\\\)*\\n")
 
 
+_LOOKAROUND_RE = re.compile(r"\(\?<[=!]|\(\?<\w+>|\\K|\(\?[=!]")
+
+_PCRE2_ONLY_ERROR_MARKERS = (
+    "look-around, including look-ahead and look-behind, is not supported",
+    "unrecognized flag",
+    "backreferences are not supported",
+)
+
+
+def _pattern_needs_pcre2(pattern: str) -> bool:
+    """Return True when a regex uses syntax only rg's PCRE2 engine supports.
+
+    rg's default engine is Rust `regex`, which is finite-automata based and has
+    NO look-around or backreferences — a lookbehind like ``(?<!def )foo`` fails
+    with a hard "regex parse error / unrecognized flag" instead of searching, so
+    the caller burns a turn on a query that is perfectly valid PCRE.
+
+    rg ships a `--pcre2` engine that supports exactly this syntax, so detect the
+    constructs and switch engines up front rather than erroring.
+    """
+    return bool(_LOOKAROUND_RE.search(pattern))
+
+
+def _is_pcre2_only_syntax_error(text: Optional[str]) -> bool:
+    """Return True for rg's error when a pattern needs the PCRE2 engine."""
+    if not text:
+        return False
+    lowered = text.lower()
+    if "regex parse error" not in lowered and "error:" not in lowered:
+        return False
+    return any(marker in lowered for marker in _PCRE2_ONLY_ERROR_MARKERS)
+
+
 def _pattern_has_regex_newline(pattern: str) -> bool:
     """Return True when a content-search regex tries to match a newline.
 
@@ -2634,6 +2667,14 @@ class ShellFileOperations(FileOperations):
         if multiline:
             cmd_parts.append("--multiline")
 
+        # Auto-PCRE2: rg's default engine (Rust `regex`) has no look-around or
+        # backreferences, so a perfectly valid PCRE like `(?<!def )foo` hard
+        # errors ("unrecognized flag") instead of searching and costs the caller
+        # a turn. Switch engines up front when the pattern needs it — same shape
+        # as the auto-multiline handling above.
+        if _pattern_needs_pcre2(pattern):
+            cmd_parts.append("--pcre2")
+
         # Add context if requested
         if context > 0:
             cmd_parts.extend(["-C", str(context)])
@@ -2665,6 +2706,20 @@ class ShellFileOperations(FileOperations):
         # introduce false errors on a successful-but-truncated search.
         cmd = "set -o pipefail; " + " ".join(cmd_parts)
         result = self._exec(cmd, timeout=60)
+
+        # Belt-and-braces: if rg still rejected the pattern as PCRE2-only syntax
+        # (a construct `_pattern_needs_pcre2` does not yet recognize), retry once
+        # with the PCRE2 engine rather than surfacing a parse error. This makes
+        # the fix cover the CLASS, not just the syntax the detector knows about.
+        if "--pcre2" not in cmd_parts and _is_pcre2_only_syntax_error(
+            getattr(result, "stdout", "") or ""
+        ):
+            retry_parts = list(cmd_parts)
+            retry_parts.insert(1, "--pcre2")
+            result = self._exec(
+                "set -o pipefail; " + " ".join(retry_parts), timeout=60
+            )
+
         stdout, limit_reason = _search_stdout_and_limit(result)
 
         # _exec merges stderr into stdout (stderr=subprocess.STDOUT), so rg's
