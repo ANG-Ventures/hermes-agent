@@ -2155,6 +2155,7 @@ _FALLBACK_REASON_LABELS = {
     "rate_limit": "rate limit",
     "upstream_rate_limit": "rate limit",
     "pool_exhausted": "sub pool capped",
+    "pool_stalled": "pool sub stalled mid-turn",
     "billing": "credit exhausted",
     "overloaded": "provider overloaded",
     "server_error": "provider error",

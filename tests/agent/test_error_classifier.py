@@ -54,7 +54,7 @@ class TestFailoverReason:
     def test_enum_members_exist(self):
         expected = {
             "auth", "auth_permanent", "account_blocked", "billing", "rate_limit",
-            "upstream_rate_limit", "pool_exhausted",
+            "upstream_rate_limit", "pool_exhausted", "pool_stalled",
             "overloaded", "server_error", "timeout", "tailscale_down", "stream_parse",
             "ssl_cert_verification",
             "decode_error",

@@ -51,6 +51,20 @@ class FailoverReason(enum.Enum):
     # reads honestly ("sub pool capped") instead of "provider overloaded" /
     # "connection issue".
     pool_exhausted = "pool_exhausted"
+    # Local multi-sub pool relay READ-PHASE stall (claude-apr/-bpr 504
+    # "upstream attempt timed out" / "pool deadline exceeded"): a box ACCEPTED
+    # the request and then stalled past the pool's per-attempt/turn budget, so
+    # the pool terminally 504'd without rotating (rotating mid-generation
+    # would re-bill the same expensive turn on a second sub — pool policy,
+    # claude-pool 77a755a; connect-phase failures now rotate internally and
+    # surface as synthetic 429s instead). By the time the harness sees this
+    # the response is unrecoverable and its cost is sunk; the pool just spent
+    # its ENTIRE internal retry budget failing to serve this turn, so
+    # re-hitting it is the least useful response available (measured
+    # 2026-08-19: three kanban runs died after 3/3 identical 504s, 251-311s
+    # each). Fail over to the next provider on the FIRST hit. Never rotate a
+    # credential — the keys are healthy; the sub stalled.
+    pool_stalled = "pool_stalled"
 
     # Server-side
     overloaded = "overloaded"            # 503/529 — provider overloaded, backoff
@@ -277,6 +291,37 @@ _POOL_EXHAUSTED_PATTERNS = [
 # Substring of the pool's model-scoped body; the generic pattern above still
 # matches it, so CLASSIFICATION is unchanged and only the LABEL narrows.
 _POOL_MODEL_SCOPED_PATTERN = "no eligible sub for the requested model"
+
+# Local pool-relay READ-PHASE stall (2026-08-19, Option A of the rotation
+# ruling; pool-side half shipped as claude-pool 77a755a). The pool splits its
+# timeout by phase:
+#   * connect-phase (box never accepted) -> synthetic 429 + x-pool-unreachable,
+#     pool rotates internally; the harness normally never sees these any more.
+#   * read-phase (box accepted, may be mid-generation) -> terminal 504, NO pool
+#     rotation, deliberately: rotating would re-generate the same expensive
+#     turn on a second sub (double cost, double bill).
+# So a 504 with one of these bodies means: this provider accepted the request,
+# stalled past its per-attempt (default 120s) or whole-turn (default 300s)
+# budget, and terminally gave up. The turn's upstream cost is sunk either way;
+# retrying the SAME provider both re-bills a fresh generation attempt AND
+# usually re-enters the same stall (the stalled box stays eligible and
+# session-affine — measured 2026-08-19: three kanban runs burned 3/3 retries,
+# 251-311s each, 123/6,724 routed attempts = 1.83% fleet rate). Fail over on
+# the first hit instead.
+#
+# Matched on the pool's EXACT body strings (not on status 504, not on
+# provider): the pools are reached through custom-provider configs whose
+# ``provider`` label is not stable, and — same two-surface split as
+# pool_exhausted above — the 504 code doesn't always survive onto the
+# exception object while the body text does. A non-pool 504 (a real gateway
+# timeout from some other upstream) carries neither phrase and keeps its
+# historical classification: generic retryable server_error via the 5xx
+# floor when the code is extractable, or the timeout bucket when only the
+# message survives.
+_POOL_STALLED_PATTERNS = [
+    "upstream attempt timed out",
+    "pool deadline exceeded",
+]
 
 # Account/organization ENTITLEMENT block (2026-08-08, sub-vps-10). A lapsed
 # subscription makes Anthropic answer EVERY request with
@@ -923,6 +968,35 @@ def classify_api_error(
         return _result(
             FailoverReason.pool_exhausted,
             retryable=True,
+            should_rotate_credential=False,
+            should_fallback=True,
+        )
+
+    # Local pool-relay READ-PHASE stall (504 "upstream attempt timed out" /
+    # "pool deadline exceeded"). Checked HERE, before status-code
+    # classification, for the same two-surface reason as pool exhaustion above
+    # (the 504 doesn't always survive onto the exception object; the body
+    # string does). The pool ACCEPTED the request and then terminally gave up
+    # without rotating — its read-phase policy (claude-pool 77a755a): rotating
+    # mid-generation would re-bill the same expensive turn on a second sub.
+    # The harness retrying the SAME provider just re-buys the same stall:
+    # session affinity re-picks the stalled box and every attempt costs up to
+    # the pool's whole-turn deadline (measured 2026-08-19: three kanban runs x
+    # 3/3 identical 504 retries x 251-311s, all fatal). Non-retryable +
+    # should_fallback so the chain advances on the FIRST hit — the same shape
+    # as the stale-call circuit breaker (7b) and decode_error (7c). Fallback
+    # does NOT double-bill relative to retry: the stalled generation's output
+    # is unreachable either way, so ANY recovery path re-generates the turn
+    # exactly once — fallback just does it on a provider that is answering.
+    # Both stall bodies get the same treatment: per-attempt stall vs
+    # whole-turn deadline differ only in WHERE the pool's budget went; in both
+    # cases the pool has already spent its entire internal retry budget on
+    # this turn and terminally failed it. Credential rotation is explicitly
+    # OFF: the keys are healthy, the sub stalled.
+    if any(p in error_msg for p in _POOL_STALLED_PATTERNS):
+        return _result(
+            FailoverReason.pool_stalled,
+            retryable=False,
             should_rotate_credential=False,
             should_fallback=True,
         )
