@@ -77,7 +77,8 @@ def test_confirmed_tailscale_stop_skips_every_tailnet_rung_and_uses_cross_transp
     assert all(client.close.called for client in clients[:3])
     buffered = [message for _kind, message in agent._retry_status_buffer]
     assert sum("Tailscale down" in message for message in buffered) == 1
-    assert any("4 tailnet routes" in message for message in buffered)
+    assert buffered.count("⚠️ Tailscale down") == 1
+    assert not any("tailnet routes" in message for message in buffered)
     assert not any("Primary model failed" in message for message in buffered)
 
 
@@ -164,10 +165,7 @@ def test_confirmed_stop_fails_before_any_model_request(monkeypatch):
     agent.client.chat.completions.create.assert_not_called()
     agent._anthropic_client.messages.stream.assert_not_called()
     assert agent._retry_status_buffer == []
-    assert result["final_response"] == (
-        "Tailscale is down on the gateway host. Reconnect Tailscale or use a "
-        "non-tailnet provider."
-    )
+    assert result["final_response"] == "Tailscale down"
 
 
 def test_repeat_outage_reports_once_per_turn_with_fresh_route_count(monkeypatch):

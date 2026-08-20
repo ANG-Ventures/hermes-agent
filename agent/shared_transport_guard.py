@@ -188,11 +188,9 @@ def emit_unavailable_summary(agent, *, evidence: str) -> None:
 
     agent._shared_transport_summary_emitted = True
     count = len(routes)
-    noun = "route" if count == 1 else "routes"
-    agent._buffer_status(
-        f"⚠️ Model routing degraded (Tailscale down): {count} tailnet {noun} "
-        "affected. Reconnect Tailscale or use a non-tailnet provider."
-    )
+    # Chat gets the terse causal label. Route count, affected routes, session,
+    # evidence, and remediation remain available in the diagnostic below.
+    agent._buffer_status("⚠️ Tailscale down")
     logger.warning(
         "Shared transport unavailable: transport=tailscale evidence=%s "
         "affected_routes=%d routes=%s session=%s remediation=%s",

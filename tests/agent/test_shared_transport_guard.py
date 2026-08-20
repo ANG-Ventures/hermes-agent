@@ -96,7 +96,7 @@ def test_uncached_probe_executes_status_json_and_parses_stopped(monkeypatch):
     assert observed["kwargs"]["timeout"] == guard._TAILSCALE_STATUS_TIMEOUT_S
 
 
-def test_summary_is_one_actionable_line_with_count_and_remediation():
+def test_summary_is_one_terse_causal_label():
     agent = MagicMock()
     agent.session_id = "session-1"
     agent._shared_transport_affected_routes = set()
@@ -108,9 +108,4 @@ def test_summary_is_one_actionable_line_with_count_and_remediation():
     guard.emit_unavailable_summary(agent, evidence="backend_state=Stopped")
     guard.emit_unavailable_summary(agent, evidence="backend_state=Stopped")
 
-    agent._buffer_status.assert_called_once()
-    message = agent._buffer_status.call_args.args[0]
-    assert "Tailscale down" in message
-    assert "3 tailnet routes" in message
-    assert "Reconnect Tailscale or use a non-tailnet provider" in message
-    assert "\n" not in message
+    agent._buffer_status.assert_called_once_with("⚠️ Tailscale down")
