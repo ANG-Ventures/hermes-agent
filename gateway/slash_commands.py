@@ -65,16 +65,11 @@ _RESET_CLEANUP_TIMEOUT_S = 30.0
 # below the sessions that actually go slow.
 _COMPRESS_PROGRESS_ACK_MIN_MESSAGES = 200
 
-# Trigger attribution for the manual /compress result banner. Every AUTOMATIC
-# compaction names its trigger in the announce head (via
-# _compaction_reason_clause: threshold, hygiene, overflow, ...), but the manual
-# path never did — so a user-invoked /compress rendered a stats block that was
-# indistinguishable on the surface from the system compacting on its own
-# (reported 2026-08-20: "why did you compress here, there was no reason
-# stated"). The reason existed (trigger=manual_compress_command in the logs);
-# it just wasn't rendered. Contract: every compaction banner names its
-# initiator, manual or not.
-_MANUAL_COMPRESS_TRIGGER_CLAUSE = " (you ran /compress)"
+# Manual-compress trigger attribution lives in
+# agent.manual_compression_feedback.MANUAL_TRIGGER_CLAUSE — the chokepoint
+# summarize_manual_compression appends it to every headline, covering this
+# gateway path AND the TUI RPC / TUI slash-mirror / CLI surfaces uniformly.
+# Do not re-append it here (double attribution).
 
 
 def _clean_str(value: Any) -> str:
@@ -5740,8 +5735,7 @@ class GatewaySlashCommandsMixin:
                                     else "engine: lcm"
                                 )
                             _granular = _format_granular_announce(
-                                f"🗜️ {summary['headline']}"
-                                f"{_MANUAL_COMPRESS_TRIGGER_CLAUSE}",
+                                f"🗜️ {summary['headline']}",
                                 _stats,
                                 _model_part,
                                 False,
@@ -5881,9 +5875,7 @@ class GatewaySlashCommandsMixin:
                 if focus_topic:
                     lines.append(t("gateway.compress.focus_line", topic=focus_topic))
             else:
-                lines = [
-                    f"🗜️ {summary['headline']}{_MANUAL_COMPRESS_TRIGGER_CLAUSE}"
-                ]
+                lines = [f"🗜️ {summary['headline']}"]
                 if focus_topic:
                     lines.append(t("gateway.compress.focus_line", topic=focus_topic))
 
