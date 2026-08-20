@@ -6,6 +6,19 @@ from typing import Any, Optional, Sequence
 
 from agent.redact import redact_sensitive_text
 
+# Trigger attribution for every manual-compression banner. Automatic
+# compactions name their trigger in the announce head (threshold, hygiene,
+# overflow, ... via _compaction_reason_clause); the manual surfaces
+# historically did not, so a user-invoked /compress rendered a stats block
+# indistinguishable from the system compacting on its own (reported
+# 2026-08-20: "why did you compress here, there was no reason stated" about a
+# compress the user ran minutes earlier). This module is the chokepoint every
+# manual surface (gateway /compress, TUI session.compress RPC, TUI slash
+# mirror, CLI) routes through, so the clause is appended to the headline HERE
+# — callers must NOT append their own copy or the banner double-attributes.
+# Wording mirrors _compaction_reason_clause's 'manual' arm.
+MANUAL_TRIGGER_CLAUSE = " (you ran /compress)"
+
 
 def describe_compression_lock_skip(lock_signal: Any) -> str:
     """User-facing text for a manual /compress skipped by the compression lock.
@@ -220,7 +233,8 @@ def summarize_manual_compression(
         "noop": noop,
         "aborted": aborted,
         "fallback_used": fallback_used,
-        "headline": headline,
+        # Chokepoint attribution: every manual banner names its initiator.
+        "headline": f"{headline}{MANUAL_TRIGGER_CLAUSE}",
         "token_line": token_line,
         "note": note,
         "enhanced": enhanced,
