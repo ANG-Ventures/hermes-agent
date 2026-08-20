@@ -5053,6 +5053,12 @@ def validate_requested_model(
             requested,
             api_key=api_key,
         ) or requested
+    elif requested.startswith("name:") and "/" in requested:
+        # Relay/pool routing prefix: `name:<subscription>/<model-id>` pins WHICH
+        # upstream subscription serves the request; only the segment after the
+        # final `/` is the model id the endpoint's listing actually contains.
+        # Compare the bare id so a listed model doesn't warn as "not found".
+        requested_for_lookup = requested.rsplit("/", 1)[-1] or requested
 
     if not requested:
         return {

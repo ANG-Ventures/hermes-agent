@@ -686,3 +686,55 @@ class TestAnthropicMessagesWarningHonesty:
         msg = result["message"]
         assert "does not include it" in msg
         assert "18810/anthropic/v1/models" in msg
+
+
+# -- validate_requested_model — relay sub-routing prefix ---------------------
+
+class TestSubRoutingPrefixStripped:
+    """A relay/pool routing prefix (`name:<sub>/<model>`) selects WHICH upstream
+    subscription serves the request; the part after the final `/` is the actual
+    model id the endpoint lists.  Comparing the whole routed string against the
+    listing produces a false 'not found' warning for a model that IS listed."""
+
+    def _probe(self, models):
+        return {
+            "models": models,
+            "probed_url": "http://127.0.0.1:18810/anthropic/v1/models",
+            "resolved_base_url": "http://127.0.0.1:18810/anthropic/v1",
+            "suggested_base_url": None,
+            "used_fallback": False,
+            "failure": None,
+        }
+
+    def _validate(self, requested):
+        with patch(
+            "hermes_cli.models.probe_api_models",
+            return_value=self._probe(["claude-fable-5", "claude-opus-5"]),
+        ):
+            return validate_requested_model(
+                requested,
+                "claude-apr",
+                api_key="k",
+                base_url="http://127.0.0.1:18810/anthropic",
+                api_mode="anthropic_messages",
+            )
+
+    def test_routed_model_verifies_silently(self):
+        """`name:claude-apx-0/claude-fable-5` must verify against a listing
+        containing the bare `claude-fable-5` — no spurious warning."""
+        result = self._validate("name:claude-apx-0/claude-fable-5")
+        assert result["accepted"] is True
+        assert result["recognized"] is True
+        assert result["message"] is None
+
+    def test_routed_model_not_in_listing_still_warns(self):
+        """The prefix strip must not become a blanket accept: a routed model
+        whose BARE id is genuinely absent must still warn."""
+        result = self._validate("name:claude-apx-0/claude-nonexistent-9")
+        assert result["recognized"] is False
+        assert "does not include it" in (result["message"] or "")
+
+    def test_bare_model_unaffected(self):
+        result = self._validate("claude-fable-5")
+        assert result["recognized"] is True
+        assert result["message"] is None
