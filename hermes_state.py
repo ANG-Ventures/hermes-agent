@@ -3073,6 +3073,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
                 raise
+            except SystemError as exc:
+                # CPython's sqlite3 layer raises a bare SystemError
+                # ("<Connection> returned NULL without setting an exception")
+                # when a statement on the shared writer connection races a
+                # statement another thread is running on the SAME connection
+                # object (check_same_thread=False makes this reachable; an
+                # unlocked reader on self._conn was the 2026-08-20 incident).
+                # It is transient — the identical write succeeds on retry —
+                # but it is NOT a sqlite3.Error, so without this handler it
+                # escaped the whole retry net and destroyed the user's turn
+                # as session_persistence_failed. Retry like locked/busy;
+                # patience exhaustion still propagates.
+                if "returned null without setting an exception" in str(exc).lower() \
+                        and self._sleep_before_write_retry(deadline, patience_s):
+                    logger.warning(
+                        "Transient sqlite3 SystemError on the shared writer "
+                        "connection (cross-thread statement race); retrying: %s",
+                        exc,
+                    )
+                    continue
+                raise
 
     def _sleep_before_write_retry(
         self, deadline: float, patience_s: float
@@ -5141,11 +5162,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not session_id:
             return None
         now = time.time()
-        row = self._conn.execute(
-            "SELECT holder FROM compression_locks "
-            "WHERE session_id = ? AND expires_at >= ?",
-            (session_id, now),
-        ).fetchone()
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT holder FROM compression_locks "
+                "WHERE session_id = ? AND expires_at >= ?",
+                (session_id, now),
+            ).fetchone()
         if row is None:
             return None
         return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
@@ -5219,11 +5241,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # No-op fast path: skip the transaction when there is nothing to
         # clear. Read-only, no write lock.
         try:
-            row = self._conn.execute(
-                "SELECT last_activity_description, last_activity_provenance "
-                "FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
+            with self._read_ctx() as conn:
+                row = conn.execute(
+                    "SELECT last_activity_description, last_activity_provenance "
+                    "FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
         except sqlite3.Error:
             row = None
         if row is not None:
@@ -11653,12 +11676,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         no handoff record.
         """
         try:
-            cur = self._conn.execute(
-                "SELECT handoff_state, handoff_platform, handoff_error "
-                "FROM sessions WHERE id = ?",
-                (session_id,),
-            )
-            row = cur.fetchone()
+            with self._read_ctx() as conn:
+                cur = conn.execute(
+                    "SELECT handoff_state, handoff_platform, handoff_error "
+                    "FROM sessions WHERE id = ?",
+                    (session_id,),
+                )
+                row = cur.fetchone()
             if not row:
                 return None
             return {
@@ -11675,15 +11699,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Used by the gateway's handoff watcher.
         """
         try:
-            cur = self._conn.execute(
-                "SELECT s.*, "
-                "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
-                "FROM sessions s "
-                "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
-                "WHERE s.handoff_state = 'pending' "
-                "ORDER BY s.started_at ASC"
-            )
-            return [self._session_row_dict(r) for r in cur.fetchall()]
+            with self._read_ctx() as conn:
+                cur = conn.execute(
+                    "SELECT s.*, "
+                    "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
+                    "FROM sessions s "
+                    "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
+                    "WHERE s.handoff_state = 'pending' "
+                    "ORDER BY s.started_at ASC"
+                )
+                return [self._session_row_dict(r) for r in cur.fetchall()]
         except Exception:
             return []
 
