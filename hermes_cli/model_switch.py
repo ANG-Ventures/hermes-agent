@@ -1910,6 +1910,35 @@ def switch_model(
     )
     new_model = normalize_model_for_provider(new_model, target_provider)
 
+    # A model-list probe cannot make a route usable when its explicit local
+    # transport prerequisite is stopped. Fail before the probe so /model does
+    # not spend its timeout and then claim a dead APR/APX route was switched
+    # "without verification" (2026-08-19 incident). Ambiguous CLI state keeps
+    # the historical validation path.
+    try:
+        from agent.shared_transport_guard import (
+            route_uses_tailscale,
+            tailscale_status_down,
+        )
+
+        if route_uses_tailscale(target_provider, base_url):
+            tailscale_down, _tailscale_evidence = tailscale_status_down()
+            if tailscale_down is True:
+                return ModelSwitchResult(
+                    success=False,
+                    new_model=new_model,
+                    target_provider=target_provider,
+                    provider_label=provider_label,
+                    is_global=is_global,
+                    error_message=(
+                        "Tailscale is down on the gateway host; "
+                        f"`{target_provider}/{new_model}` is unavailable. "
+                        "Reconnect Tailscale or use a non-tailnet provider."
+                    ),
+                )
+    except Exception:
+        logger.debug("Model-switch Tailscale preflight failed open", exc_info=True)
+
     # --- Validate ---
     try:
         validation = validate_requested_model(

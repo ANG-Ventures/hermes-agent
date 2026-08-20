@@ -2159,6 +2159,7 @@ _FALLBACK_REASON_LABELS = {
     "overloaded": "provider overloaded",
     "server_error": "provider error",
     "timeout": "connection dropped",
+    "tailscale_down": "Tailscale down",
     "stream_parse": "malformed stream",
     "decode_error": "corrupt response",
     "ssl_cert_verification": "TLS error",
@@ -2645,6 +2646,17 @@ def try_activate_fallback(
                 backoff_count, backoff_seconds, backoff_seconds / 60, backoff_count + 1,
             )
     if agent._fallback_index >= len(agent._fallback_chain):
+        try:
+            from agent.shared_transport_guard import emit_unavailable_summary
+
+            emit_unavailable_summary(
+                agent,
+                evidence=getattr(
+                    agent, "_shared_transport_evidence", "backend_state=Stopped"
+                ),
+            )
+        except Exception:
+            logger.debug("Could not emit shared-transport fallback summary", exc_info=True)
         # Chain exhausted.  If we actually walked a non-empty chain and the
         # failure was NOT a rate-limit/billing event (those already armed
         # their own 60s cooldown above), arm a short cooldown so the next
@@ -2754,6 +2766,60 @@ def try_activate_fallback(
         # Determine api_mode from provider / base URL / model
         fb_api_mode = "chat_completions"
         fb_base_url = str(fb_client.base_url)
+        try:
+            from agent.shared_transport_guard import (
+                emit_unavailable_summary,
+                record_unavailable_route,
+                route_uses_tailscale,
+                tailscale_status_down,
+            )
+
+            if route_uses_tailscale(fb_provider, fb_base_url):
+                tailscale_down, tailscale_evidence = tailscale_status_down()
+                if tailscale_down is True:
+                    source_uses_tailscale = route_uses_tailscale(
+                        getattr(agent, "provider", ""),
+                        getattr(agent, "base_url", ""),
+                    )
+                    if source_uses_tailscale:
+                        record_unavailable_route(
+                            agent,
+                            getattr(agent, "provider", ""),
+                            getattr(agent, "model", ""),
+                        )
+                    record_unavailable_route(agent, fb_provider, fb_model)
+                    agent._shared_transport_evidence = tailscale_evidence
+                    unavailable.add(fb_key)
+                    try:
+                        fb_client.close()
+                    except Exception:
+                        pass
+                    logger.warning(
+                        "Fallback skip: %s/%s shares unavailable Tailscale "
+                        "transport (%s); suppressing for this session",
+                        fb_provider,
+                        fb_model,
+                        tailscale_evidence,
+                    )
+                    next_reason = (
+                        FailoverReason.tailscale_down
+                        if source_uses_tailscale
+                        or reason == FailoverReason.tailscale_down
+                        else reason
+                    )
+                    return agent._try_activate_fallback(
+                        next_reason, error_context=error_context
+                    )
+            emit_unavailable_summary(
+                agent,
+                evidence=getattr(
+                    agent, "_shared_transport_evidence", "backend_state=Stopped"
+                ),
+            )
+        except Exception:
+            # Availability detection is an optimization. An unavailable or
+            # malformed local Tailscale CLI must preserve historical routing.
+            logger.debug("Shared-transport fallback preflight failed open", exc_info=True)
         _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
         if fb_provider == "openai-codex":
             fb_api_mode = "codex_responses"
@@ -3071,10 +3137,11 @@ def try_activate_fallback(
         # answering, so "what model are you?" doesn't report the primary.
         rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
-        agent._buffer_status(
-            f"🔄 Primary model failed — switching to fallback: "
-            f"{fb_model} via {fb_provider}"
-        )
+        # Deliberately do NOT buffer a second generic "Primary model failed"
+        # line here. ``_emit_fallback_announce`` below is the authoritative
+        # human-facing hop and the durable sink remains unconditional. The old
+        # buffered copy flushed only on terminal failure, duplicating every hop
+        # and falsely calling APX-N a primary after the first transition.
         # Deliberately do NOT set ``agent._pending_fallback_notice`` here.  It
         # used to record a second, plainer "Switched to fallback model: ..."
         # line that ``_emit_pending_fallback_notice`` surfaced later, on the
@@ -3090,10 +3157,8 @@ def try_activate_fallback(
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,
         )
-        # Always-recorded route-change AUDIT + gated chat ANNOUNCE (separate
-        # from the suppress-on-recovery _buffer_status above, which only flushes
-        # on a TERMINAL turn failure — so a fallback that SUCCEEDS was invisible,
-        # the 2026-06-19 opus->gpt-5.5 case). The chat line reaches the gateway
+        # Always-recorded route-change AUDIT + gated chat ANNOUNCE. The chat line
+        # reaches the gateway
         # status_callback (Discord/Telegram), not just the CLI, via _emit_status.
         # Deduped on the ((old_provider,old_model),(new_provider,new_model))
         # transition so a re-entrant chain bouncing to the same destination in

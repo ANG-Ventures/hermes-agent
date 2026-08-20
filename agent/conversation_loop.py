@@ -2420,6 +2420,72 @@ def run_conversation(
                     effective_task_id=effective_task_id,
                     close_tail=True,
                 )
+            # ── Shared host-transport preflight ───────────────────────
+            # APR/BPR and direct 100.64/10 routes all depend on the local
+            # Tailscale client. If the host-local CLI explicitly says it is
+            # stopped, do not issue a request that can only consume the relay's
+            # full upstream timeout, then walk every route sharing the same
+            # prerequisite. Unknown/ambiguous CLI state fails open, so a lone
+            # provider timeout retains the normal retry and reason label.
+            try:
+                from agent.shared_transport_guard import (
+                    emit_unavailable_summary,
+                    record_unavailable_route,
+                    route_uses_tailscale,
+                    tailscale_status_down,
+                )
+
+                _route_uses_tailscale = route_uses_tailscale(
+                    getattr(agent, "provider", ""),
+                    getattr(agent, "base_url", ""),
+                )
+                _tailscale_down, _tailscale_evidence = (
+                    tailscale_status_down()
+                    if _route_uses_tailscale
+                    else (None, "not_applicable")
+                )
+                if _route_uses_tailscale and _tailscale_down is True:
+                    record_unavailable_route(agent, agent.provider, agent.model)
+                    agent._shared_transport_evidence = _tailscale_evidence
+                    if agent._try_activate_fallback(
+                        reason=FailoverReason.tailscale_down
+                    ):
+                        active_system_prompt = _sync_failover_system_message(
+                            agent, api_messages, active_system_prompt
+                        )
+                        retry_count = 0
+                        compression_attempts = 0
+                        _retry.primary_recovery_attempted = False
+                        continue
+
+                    emit_unavailable_summary(
+                        agent, evidence=_tailscale_evidence
+                    )
+                    # The terminal result below is the single human-facing
+                    # error. Drop the buffered aggregate here rather than send
+                    # the same Tailscale diagnosis twice; route count/session
+                    # detail remains in the WARNING diagnostic.
+                    agent._clear_status_buffer()
+                    _transport_error = (
+                        "Tailscale is down on the gateway host. Reconnect "
+                        "Tailscale or use a non-tailnet provider."
+                    )
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": _transport_error,
+                        "messages": messages,
+                        "completed": False,
+                        "api_calls": api_call_count,
+                        "error": _transport_error,
+                        "partial": True,
+                        "failed": True,
+                        "shared_transport_unavailable": "tailscale",
+                    }
+            except Exception:
+                logger.debug(
+                    "Shared-transport request preflight failed open",
+                    exc_info=True,
+                )
             # ── Nous Portal rate limit guard ──────────────────────
             # If another session already recorded that Nous is rate-
             # limited, skip the API call entirely.  Each attempt
