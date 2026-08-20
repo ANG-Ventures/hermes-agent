@@ -11398,6 +11398,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     None,
                     approx_tokens=approx_tokens,
                     focus_topic=focus_topic or None,
+                    # Attribution (2026-08-20 audit): manual /compress from the
+                    # CLI carries the same trigger label as the gateway path.
+                    trigger_reason="manual_compress_command",
                     force=True,
                     defer_context_engine_notification=True,
                 )

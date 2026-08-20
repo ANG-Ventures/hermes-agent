@@ -111,12 +111,28 @@ def _compaction_reason_clause(
         return " (context length exceeded)"
     if trigger_reason == "tier_reduction":
         return " (long-context tier window reduction)"
-    if trigger_reason == "manual":
+    if trigger_reason == "idle_resume":
+        return " (deferred maintenance on idle resume)"
+    if trigger_reason == "engine_preflight_maintenance":
+        return " (context-engine preflight maintenance)"
+    if trigger_reason == "pre_api_pressure":
+        return " (context pressure before API call)"
+    if trigger_reason == "session_hygiene":
+        # Un-normalized inner label for the gateway hygiene valve; the gateway
+        # announce passes the split hygiene_messages/hygiene_tokens above, but
+        # the in-turn announce sees this raw value.
+        return " (session-hygiene maintenance)"
+    if trigger_reason in ("manual", "manual_compress_command"):
         # Keep in lockstep with manual_compression_feedback.MANUAL_TRIGGER_CLAUSE:
         # the word "manual" must appear literally — "(you ran /compress)" alone
         # was missed by the reader it was written for (2026-08-20).
+        # "manual_compress_command" is what the live producers actually pass;
+        # "manual" is kept for compatibility.
         return " (manual — you ran /compress)"
-    return ""
+    # Class guard (2026-08-20 audit): an unrecognized reason must NEVER render
+    # as an empty clause — that recreates the "no reason stated" bug for the
+    # next new trigger. Render the raw label instead of silence.
+    return f" (trigger: {trigger_reason})"
 
 
 def _is_no_change_pass(

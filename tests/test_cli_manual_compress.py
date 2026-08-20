@@ -37,6 +37,7 @@ class DummyAgent:
         approx_tokens=None,
         focus_topic=None,
         force=False,
+        trigger_reason=None,
         defer_context_engine_notification=False,
     ):
         self.calls.append(
@@ -46,6 +47,7 @@ class DummyAgent:
                 "approx_tokens": approx_tokens,
                 "focus_topic": focus_topic,
                 "force": force,
+                "trigger_reason": trigger_reason,
                 "defer_context_engine_notification": (
                     defer_context_engine_notification
                 ),

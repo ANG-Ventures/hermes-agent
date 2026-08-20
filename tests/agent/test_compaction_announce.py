@@ -200,13 +200,15 @@ class TestReasonClause:
         assert "safety limit" not in line
         assert "threshold" not in line.split("\n")[0]
 
-    def test_unknown_reason_no_clause_no_crash(self):
+    def test_unknown_reason_renders_raw_label_never_silence(self):
+        """Class guard (2026-08-20 audit): an unrecognized trigger_reason must
+        render its raw label, never an empty clause — an empty clause is the
+        'no reason stated' bug reappearing for the next new trigger."""
         line = _format_compaction_announce(
             **_base(trigger_reason="totally_made_up_reason", trigger_value=7)
         )
         assert line is not None
-        # unknown reason renders no clause (and does not crash)
-        assert "totally_made_up_reason" not in line
+        assert "(trigger: totally_made_up_reason)" in line
 
     def test_reason_does_not_defeat_gating(self):
         """A reason on a silent status is still silent (gating unchanged)."""
