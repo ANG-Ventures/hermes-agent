@@ -183,7 +183,7 @@ class TestReasonClause:
             ("overflow_413", "413"),
             ("overflow_context", "context length exceeded"),
             ("tier_reduction", "long-context tier"),
-            ("manual", "/compress"),
+            ("manual", "manual — you ran /compress"),
         ],
     )
     def test_other_reasons(self, reason, needle):

@@ -112,7 +112,10 @@ def _compaction_reason_clause(
     if trigger_reason == "tier_reduction":
         return " (long-context tier window reduction)"
     if trigger_reason == "manual":
-        return " (you ran /compress)"
+        # Keep in lockstep with manual_compression_feedback.MANUAL_TRIGGER_CLAUSE:
+        # the word "manual" must appear literally — "(you ran /compress)" alone
+        # was missed by the reader it was written for (2026-08-20).
+        return " (manual — you ran /compress)"
     return ""
 
 

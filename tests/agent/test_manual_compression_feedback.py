@@ -31,7 +31,7 @@ def test_classic_noop_headline_unchanged():
     msgs = _chat(4)
     s = summarize_manual_compression(msgs, list(msgs), 100, 100)
     assert s["noop"] is True
-    assert s["headline"] == "No changes from compression: 4 messages (you ran /compress)"
+    assert s["headline"] == "No changes from compression: 4 messages (manual — you ran /compress)"
     assert s["token_line"] == "Approx request size: ~100 tokens (unchanged)"
     assert s["note"] is None
     assert s["enhanced"] is False
@@ -44,7 +44,7 @@ def test_classic_compressed_headline_unchanged():
     after = [before[0], {"role": "assistant", "content": "summary"}, before[-1]]
     s = summarize_manual_compression(before, after, 100, 60)
     assert s["noop"] is False
-    assert s["headline"] == "Compressed: 4 → 3 messages (you ran /compress)"
+    assert s["headline"] == "Compressed: 4 → 3 messages (manual — you ran /compress)"
     assert s["token_line"] == "Approx request size: ~100 → ~60 tokens"
 
 
@@ -72,7 +72,7 @@ def test_zero_non_chat_rows_falls_back_to_classic():
         full_before_count=4,
     )
     assert s["enhanced"] is False
-    assert s["headline"] == "No changes from compression: 4 messages (you ran /compress)"
+    assert s["headline"] == "No changes from compression: 4 messages (manual — you ran /compress)"
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +97,7 @@ def test_case_a_rewrite_with_unchanged_chat_reports_compaction():
     )
     assert s["enhanced"] is True
     assert s["noop"] is False
-    assert s["headline"] == "Compacted stored transcript: 139 → 6 messages (you ran /compress)"
+    assert s["headline"] == "Compacted stored transcript: 139 → 6 messages (manual — you ran /compress)"
     assert "No changes" not in s["headline"]
     assert s["chat_line"] == (
         "Chat: 6 messages (~31,406 tokens) — already compact, kept verbatim"
@@ -122,7 +122,7 @@ def test_case_b_rewrite_with_compressed_chat_reports_both_axes():
     )
     assert s["enhanced"] is True
     assert s["noop"] is False
-    assert s["headline"] == "Compressed: 56 → 3 stored messages (you ran /compress)"
+    assert s["headline"] == "Compressed: 56 → 3 stored messages (manual — you ran /compress)"
     assert "Chat: 6 → 3 messages" in s["chat_line"]
     assert "~10,000 → ~3,000 tokens" in s["chat_line"]
     assert "Dropped: 50 stored tool/system messages" in s["dropped_line"]
@@ -146,7 +146,7 @@ def test_case_c_no_rewrite_reports_preserved_transcript():
     assert s["noop"] is True
     assert s["headline"] == (
         "No changes: transcript preserved (139 messages: 6 chat + 133 tool/system)"
-        " (you ran /compress)"
+        " (manual — you ran /compress)"
     )
     assert s["dropped_line"] is None
     assert "unchanged" in s["chat_line"]
@@ -268,7 +268,7 @@ def test_fallback_compression_reports_dropped_message_count():
 
     assert feedback["aborted"] is False
     assert feedback["fallback_used"] is True
-    assert feedback["headline"] == "Compressed with fallback: 12 → 4 messages (you ran /compress)"
+    assert feedback["headline"] == "Compressed with fallback: 12 → 4 messages (manual — you ran /compress)"
     assert "removed 8 message(s)" in feedback["note"]
     assert "invalid response" in feedback["note"]
 
