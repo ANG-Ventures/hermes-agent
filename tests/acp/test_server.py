@@ -531,7 +531,11 @@ class TestSlashCommands:
         original_session_db = object()
         state.agent._session_db = original_session_db
 
-        def _compress_context(messages, system_prompt, *, approx_tokens, task_id, force):
+        def _compress_context(
+            messages, system_prompt, *, approx_tokens, task_id, force,
+            trigger_reason=None,
+        ):
+            assert trigger_reason == "manual_compress_command"
             assert state.agent._session_db is None
             assert messages == state.history
             assert system_prompt == "system"
@@ -566,6 +570,7 @@ class TestSlashCommands:
             approx_tokens=40,
             task_id=state.session_id,
             force=True,
+            trigger_reason="manual_compress_command",
         )
         mock_save.assert_called_once_with(state.session_id)
 

@@ -2382,6 +2382,9 @@ class HermesACPAgent(acp.Agent):
                     approx_tokens=approx_tokens,
                     task_id=state.session_id,
                     force=True,
+                    # Attribution (2026-08-20 audit): the ACP /compress command
+                    # is a manual surface like the gateway slash command.
+                    trigger_reason="manual_compress_command",
                 )
             finally:
                 agent._session_db = original_session_db
@@ -2397,8 +2400,11 @@ class HermesACPAgent(acp.Agent):
                 system_prompt=_sys_prompt_after,
                 tools=_tools_after,
             )
+            from agent.manual_compression_feedback import MANUAL_TRIGGER_CLAUSE
+
             return (
-                f"Context compressed: {original_count} -> {new_count} messages\n"
+                f"Context compressed: {original_count} -> {new_count} messages"
+                f"{MANUAL_TRIGGER_CLAUSE}\n"
                 f"~{approx_tokens:,} -> ~{new_tokens:,} tokens"
             )
         except Exception as e:

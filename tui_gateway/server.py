@@ -5448,6 +5448,11 @@ def _compress_session_history_locked(
             head,
             None,
             approx_tokens=approx_tokens,
+            # Attribution (2026-08-20 audit): every manual surface passes the
+            # same trigger label the gateway /compress passes, so the core's
+            # "trigger=..." log line and any announce render the manual clause
+            # instead of UNATTRIBUTED.
+            trigger_reason="manual_compress_command",
             # Partial compress has no focus topic (the modes are exclusive;
             # parse_partial_compress_args returns focus_topic=None for the
             # boundary-aware forms).
