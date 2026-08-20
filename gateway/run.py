@@ -4108,11 +4108,22 @@ async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None
 # Max seconds between platform reconnect retries (primary watcher and
 # secondary-profile reconnects share this policy — tune in one place).
 _RECONNECT_BACKOFF_CAP = 300
+_DISCORD_RECONNECT_BACKOFF_CAP = 120
 
 
-def _reconnect_backoff(attempt: int) -> int:
-    """Exponential reconnect backoff: 30s, 60s, 120s, ... capped at 5 min."""
-    return min(30 * (2 ** (attempt - 1)), _RECONNECT_BACKOFF_CAP)
+def _reconnect_backoff(attempt: int, platform: Optional[Platform] = None) -> int:
+    """Return bounded exponential reconnect delay for a messaging platform.
+
+    Discord gets a two-minute cap.  During the 2026-08-20 DNS outage its
+    300-second cap left the adapter asleep for three minutes after DNS had
+    recovered.  Other platforms keep the existing five-minute policy.
+    """
+    cap = (
+        _DISCORD_RECONNECT_BACKOFF_CAP
+        if platform == Platform.DISCORD
+        else _RECONNECT_BACKOFF_CAP
+    )
+    return min(30 * (2 ** (attempt - 1)), cap)
 
 
 class TurnRunner:
@@ -15412,7 +15423,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _platform_reconnect_watcher(self) -> None:
         """Background task that periodically retries connecting failed platforms.
 
-        Uses exponential backoff: 30s → 60s → 120s → 240s → 300s (cap).
+        Uses exponential backoff: Discord caps at 120s; other platforms use
+        30s → 60s → 120s → 240s → 300s (cap).
         Retryable failures (network/DNS blips) keep retrying at the backoff
         cap indefinitely — they self-heal once connectivity returns, so a
         transient outage never requires manual intervention. Non-retryable
@@ -15566,7 +15578,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             error_code=adapter.fatal_error_code,
                             error_message=adapter.fatal_error_message or "failed to reconnect",
                         )
-                        backoff = _reconnect_backoff(attempt)
+                        backoff = _reconnect_backoff(attempt, platform)
                         info["attempts"] = attempt
                         info["next_retry"] = time.monotonic() + backoff
                         logger.info(
@@ -15604,7 +15616,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         error_code=None,
                         error_message=str(e),
                     )
-                    backoff = _reconnect_backoff(attempt)
+                    backoff = _reconnect_backoff(attempt, platform)
                     info["attempts"] = attempt
                     info["next_retry"] = time.monotonic() + backoff
                     logger.warning(
@@ -16662,7 +16674,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if not self._running:
                     return
                 attempts += 1
-                backoff = _reconnect_backoff(attempts)
+                backoff = _reconnect_backoff(attempts, platform)
                 logger.info(
                     "Secondary %s reconnect retry in %ds (profile: %s)",
                     platform.value,
