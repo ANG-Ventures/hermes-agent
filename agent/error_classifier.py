@@ -58,6 +58,10 @@ class FailoverReason(enum.Enum):
 
     # Transport
     timeout = "timeout"                  # Connection/read timeout — rebuild client + retry
+    # Local Tailscale client is explicitly stopped. This is not inferred from
+    # an API timeout: the host-local CLI must confirm the shared prerequisite
+    # is down before fallback routing may use this reason.
+    tailscale_down = "tailscale_down"
     # An HTTP response stream opened successfully but contained malformed
     # JSON/SSE data. Retry because another provider box may return valid bytes,
     # then fail over with an honest user-facing reason if the fault persists.

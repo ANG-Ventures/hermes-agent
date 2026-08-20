@@ -5,7 +5,10 @@ are properly resolved for model switching and that their full ``models:`` lists
 are exposed in the model picker.
 """
 
+from unittest.mock import MagicMock
+
 import pytest
+
 from hermes_cli.model_switch import list_authenticated_providers, switch_model
 from hermes_cli import runtime_provider as rp
 
@@ -387,6 +390,64 @@ def test_switch_model_resolves_user_provider_credentials(monkeypatch, tmp_path):
 
     assert result.success is True
     assert result.error_message == ""
+
+
+def test_switch_model_rejects_known_tailscale_route_while_client_is_stopped(
+    monkeypatch, tmp_path
+):
+    """A manual /model must not claim success for a route whose explicit local
+    prerequisite is down.  This is the 2026-08-19 ``/model fable`` warning:
+    model-list verification noise hid the actionable Tailscale condition."""
+    import yaml
+
+    config = {
+        "providers": {
+            "claude-apr": {
+                "name": "Claude APR",
+                "api": "http://127.0.0.1:18810/anthropic",
+                "default_model": "claude-fable-5",
+                "transport": "anthropic_messages",
+            }
+        }
+    }
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kw: {
+            "api_key": "test-key",
+            "base_url": "http://127.0.0.1:18810/anthropic",
+            "api_mode": "anthropic_messages",
+        },
+    )
+    monkeypatch.setattr(
+        "agent.shared_transport_guard.tailscale_status_down",
+        lambda: (True, "backend_state=Stopped"),
+    )
+    validation = MagicMock(
+        return_value={
+            "accepted": True,
+            "persist": True,
+            "recognized": True,
+            "message": None,
+        }
+    )
+    monkeypatch.setattr("hermes_cli.models.validate_requested_model", validation)
+
+    result = switch_model(
+        raw_input="claude-fable-5",
+        current_provider="claude-apr",
+        current_model="claude-opus-5",
+        current_base_url="http://127.0.0.1:18810/anthropic",
+        user_providers=config["providers"],
+    )
+
+    assert result.success is False
+    assert result.error_message == (
+        "Tailscale is down on the gateway host; `claude-apr/claude-fable-5` "
+        "is unavailable. Reconnect Tailscale or use a non-tailnet provider."
+    )
+    validation.assert_not_called()
 
 
 # =============================================================================

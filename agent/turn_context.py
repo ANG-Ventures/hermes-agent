@@ -430,6 +430,12 @@ def build_turn_context(
     # new episode by definition, so clear it unconditionally here — before the
     # restore path can early-return — so a genuinely new failover always announces.
     agent._last_fallback_announced = None
+    try:
+        from agent.shared_transport_guard import reset_turn_state
+
+        reset_turn_state(agent)
+    except Exception:
+        logger.debug("Could not reset shared-transport turn state", exc_info=True)
 
     # Restore the primary runtime if the previous turn activated fallback.
     agent._restore_primary_runtime()
