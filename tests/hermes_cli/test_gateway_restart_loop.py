@@ -1234,12 +1234,15 @@ class TestLifecycleGuardCdAwareResolution:
         bad.write_text("launchctl kickstart -k gui/501/ai.hermes.gateway\n")
         assert self._scan(f"cd - && bash {bad}", cwd=str(tmp_path)) is True
 
-    def test_directory_fail_closed_contract_unchanged(self, tmp_path):
-        # The existing non-regular-file contract stays: an explicit `bash
-        # <directory>` is still fail-closed (TestLifecycleGuardNeverRaises
-        # asserts this too; kept here to pin that cd-awareness did not
-        # loosen it).
-        assert self._scan(f"bash {tmp_path}") is True
+    def test_directory_reference_no_longer_fail_closed(self, tmp_path):
+        # CONTRACT CHANGE (pc-fb1bd018): a directory is definitively not
+        # executable script content — `bash <dir>` errors immediately
+        # ("is a directory"), so there is no lifecycle risk to fail closed
+        # on. The old fail-closed precaution hard-blocked any command
+        # invoking a script whose BODY merely names a directory path
+        # (pipecat acceptance.sh's REOLINK_DIR env default), training
+        # agents to route around the guard. cd-awareness is unaffected.
+        assert self._scan(f"bash {tmp_path}") is False
 
 
 
@@ -1278,10 +1281,13 @@ class TestLifecycleGuardNeverRaises:
         weird.write_bytes(b"\xff\xfe\x00\x01 not really a script")
         assert self._scan(f"bash {weird}") is False
 
-    def test_directory_and_dev_null_fail_closed_not_crash(self, tmp_path):
-        # Non-regular files are suspicious (fail closed = blocked), but the
-        # important contract is: verdict, not exception.
-        assert self._scan(f"bash {tmp_path}") is True
+    def test_directory_and_dev_null_verdicts_not_crash(self, tmp_path):
+        # The important contract is: verdict, not exception. A directory is
+        # NOT fail-closed (not executable content — see
+        # test_directory_reference_no_longer_fail_closed); other non-regular
+        # files (FIFOs/devices, here /dev/null) stay fail-closed because
+        # their content is unbounded/side-effectful.
+        assert self._scan(f"bash {tmp_path}") is False
         assert self._scan("bash /dev/null") is True
 
     def test_magic_prefix_binaries_skipped_without_full_read(self, tmp_path):
@@ -1310,8 +1316,15 @@ class TestLifecycleGuardNeverRaises:
         )
         binary = tmp_path / "prog"
         binary.write_bytes(b"\x7fELF" + bytes(128))
-        for value in ("nul\x00byte.sh", str(binary), "/nonexistent/x.sh"):
+        for value in (
+            "nul\x00byte.sh",
+            str(binary),
+            "/nonexistent/x.sh",
+            # A directory is not executable script content (contract change
+            # pc-fb1bd018) — must not raise, like the other junk values.
+            str(tmp_path),
+        ):
             check_gateway_lifecycle("clean prompt", value)  # must not raise
-        for value in ("/dev/null", str(tmp_path)):
+        for value in ("/dev/null",):
             with pytest.raises(GatewayLifecycleBlocked):
                 check_gateway_lifecycle("clean prompt", value)
