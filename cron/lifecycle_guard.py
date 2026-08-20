@@ -743,7 +743,17 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         return None, False
     try:
         metadata = os.fstat(descriptor)
+        if stat.S_ISDIR(metadata.st_mode):
+            # A directory is definitively not a shell script — bash cannot
+            # execute one, so there is nothing to scan and nothing to fear.
+            # Failing closed here blocked every command referencing a script
+            # that merely *names* a directory path (e.g. acceptance.sh's
+            # REOLINK_DIR="$HOME/.hermes/skills-shared/..." default), which
+            # trained agents to route around the guard (pc-fb1bd018).
+            return None, False
         if not stat.S_ISREG(metadata.st_mode):
+            # FIFOs / devices / sockets stay fail-closed: their content is
+            # unbounded/side-effectful and cannot be safely scanned.
             return None, True
         # Sniff a small prefix first: files that are clearly compiled
         # binaries (executable magic, or NUL bytes in the head) are never
