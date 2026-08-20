@@ -36,6 +36,15 @@ def _msgs(n):
 
 def test_clause_names_the_command():
     assert "/compress" in MANUAL_TRIGGER_CLAUSE
+    # The word "manual" must appear LITERALLY: "(you ran /compress)" alone was
+    # missed by the reader it was written for (2026-08-20) — the banner must be
+    # unambiguous that this was a manual, user-initiated compaction.
+    assert "manual" in MANUAL_TRIGGER_CLAUSE
+    # Lockstep with the automatic announce head's 'manual' arm — the two
+    # surfaces must describe the same event with the same words.
+    from agent.fork_ext.compaction_ext import _compaction_reason_clause
+
+    assert _compaction_reason_clause("manual", None) == MANUAL_TRIGGER_CLAUSE
     # Leading space: concatenates cleanly as a headline suffix. The desktop
     # e2e contract (session-compression-and-queue-stop.spec.ts) matches
     # /Compressed|No changes from compression/ — a suffix cannot break it.
@@ -95,7 +104,7 @@ def test_aborted_and_fallback_headlines_carry_the_trigger():
 def test_no_caller_double_appends():
     """The clause is appended at the chokepoint ONLY. A caller re-appending it
     (as the first iteration of this fix did in gateway/slash_commands.py)
-    would render '... (you ran /compress) (you ran /compress)'."""
+    would render '... (manual — you ran /compress) (manual — you ran /compress)'."""
     import gateway.slash_commands as sc
     import tui_gateway.methods_session as ms
     import tui_gateway.methods_tools as mt

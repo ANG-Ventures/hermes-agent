@@ -17,7 +17,7 @@ from agent.redact import redact_sensitive_text
 # mirror, CLI) routes through, so the clause is appended to the headline HERE
 # — callers must NOT append their own copy or the banner double-attributes.
 # Wording mirrors _compaction_reason_clause's 'manual' arm.
-MANUAL_TRIGGER_CLAUSE = " (you ran /compress)"
+MANUAL_TRIGGER_CLAUSE = " (manual — you ran /compress)"
 
 
 def describe_compression_lock_skip(lock_signal: Any) -> str:
