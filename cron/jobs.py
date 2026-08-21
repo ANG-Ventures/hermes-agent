@@ -420,6 +420,95 @@ def _coerce_job_text(value: Any, fallback: str = "") -> str:
     return str(value)
 
 
+def humanize_cron(expression: str) -> str:
+    """Describe the numeric five-field cron forms accepted by ``parse_schedule``."""
+    parts = expression.split()
+    if len(parts) != 5:
+        return expression
+    minute, hour, day, month, weekday = parts
+    months = (
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December",
+    )
+    weekdays = ("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")
+
+    def join(items: List[str]) -> str:
+        if len(items) < 3:
+            return " and ".join(items)
+        return f"{', '.join(items[:-1])}, and {items[-1]}"
+
+    def numbers(field: str) -> List[int]:
+        return [int(value) for value in field.split(",")]
+
+    def clock(hour_value: int, minute_value: int = 0) -> str:
+        suffix = "AM" if hour_value < 12 else "PM"
+        return f"{hour_value % 12 or 12}:{minute_value:02d} {suffix}"
+
+    def hour_scope(field: str) -> str:
+        scopes = []
+        for item in field.split(","):
+            if "-" in item:
+                start, end = (int(value) for value in item.split("-", 1))
+                scopes.append(f"from {clock(start)} through {clock(end, 59)}")
+            else:
+                scopes.append(f"during the {clock(int(item))} hour")
+        return join(scopes)
+
+    try:
+        if minute.startswith("*/"):
+            time_text = f"Every {int(minute[2:])} minutes"
+            if hour != "*":
+                time_text += f" during each hour {hour_scope(hour)}"
+        elif hour == "*":
+            minute_values = numbers(minute)
+            if minute_values == [0]:
+                time_text = "At the start of every hour"
+            else:
+                label = "minute" if len(minute_values) == 1 else "minutes"
+                time_text = f"At {label} {join([str(value) for value in minute_values])} past every hour"
+        elif hour.startswith("*/"):
+            interval = int(hour[2:])
+            minute_values = numbers(minute)
+            if minute_values == [0]:
+                time_text = f"Every {interval} hours starting at midnight"
+            else:
+                time_text = f"At {join([str(value) for value in minute_values])} minutes past every {interval} hours starting at midnight"
+        elif "-" in hour:
+            minute_values = numbers(minute)
+            if minute_values == [0]:
+                time_text = f"At the start of each hour {hour_scope(hour)}"
+            else:
+                time_text = f"At minutes {join([str(value) for value in minute_values])} past each hour {hour_scope(hour)}"
+        else:
+            times = [clock(h, m) for h in numbers(hour) for m in numbers(minute)]
+            time_text = f"At {join(times)}"
+
+        if day == "*" and month == "*" and weekday == "*":
+            date_text = "every day"
+        elif day == "*" and month == "*":
+            date_text = f"every {join([weekdays[value % 7] for value in numbers(weekday)])}"
+        elif weekday == "*" and day != "*":
+            day_values = numbers(day)
+            day_text = f"day {day_values[0]}" if len(day_values) == 1 else f"days {join([str(value) for value in day_values])}"
+            if month == "*":
+                date_text = f"on {day_text} of every month"
+            elif month.startswith("*/"):
+                date_text = f"on {day_text}, every {int(month[2:])} months starting in January"
+            else:
+                month_names = [months[value - 1] for value in numbers(month)]
+                if len(day_values) == len(month_names) == 1:
+                    date_text = f"on {month_names[0]} {day_values[0]} every year"
+                else:
+                    date_text = f"on {day_text} in {join(month_names)}"
+        else:
+            return expression
+    except (IndexError, ValueError):
+        return expression
+
+    separator = ", " if date_text.startswith("every day") else " "
+    return f"{time_text}{separator}{date_text}"
+
+
 def _schedule_display_for_job(job: Dict[str, Any]) -> str:
     display = _coerce_job_text(job.get("schedule_display")).strip()
     if display:
@@ -445,6 +534,13 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     ensure consumers never crash while formatting or running those records.
     """
     normalized = _apply_skill_fields(job)
+    schedule = normalized.get("schedule")
+    if isinstance(schedule, dict) and schedule.get("kind") == "cron":
+        expression = _coerce_job_text(schedule.get("expr")).strip()
+        if expression:
+            display = humanize_cron(expression)
+            normalized["schedule"] = {**schedule, "display": display}
+            normalized["schedule_display"] = display
     job_id = _coerce_job_text(normalized.get("id"), "unknown")
     prompt = _coerce_job_text(normalized.get("prompt"))
     normalized["id"] = job_id
@@ -609,7 +705,7 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
         return {
             "kind": "cron",
             "expr": schedule,
-            "display": schedule
+            "display": humanize_cron(schedule)
         }
     
     # ISO timestamp (contains T or looks like date)
