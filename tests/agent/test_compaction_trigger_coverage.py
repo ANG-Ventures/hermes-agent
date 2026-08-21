@@ -29,11 +29,16 @@ from agent.conversation_compression import (
 REPO = Path(__file__).resolve().parents[2]
 
 # Files that may legitimately pass trigger_reason literals into the core.
+# 🔴 RECURSIVE on purpose (review finding, PR #91158): `agent/*.py` alone lets a
+# call site in an existing subpackage (agent/monitoring/, gateway/…) escape
+# attribution coverage entirely while FEELING protected. A guard test below
+# asserts the scan actually reaches at least one subdirectory file so this
+# cannot silently regress back to flat globs.
 _PRODUCER_GLOBS = [
-    "agent/*.py",
-    "gateway/*.py",
-    "tui_gateway/*.py",
-    "acp_adapter/*.py",
+    "agent/**/*.py",
+    "gateway/**/*.py",
+    "tui_gateway/**/*.py",
+    "acp_adapter/**/*.py",
     "cli.py",
     "run_agent.py",
 ]
@@ -43,6 +48,9 @@ _PRODUCER_GLOBS = [
 # so the scan resolves both — matching only quoted literals would silently
 # miss every surface that uses the constant, and the coverage test would then
 # pass without ever having checked them.
+# NOTE (load-bearing convention): _LITERAL_RE matches lowercase snake_case only.
+# trigger_reason literals MUST be lowercase snake_case ("overflow_413", never
+# "Overflow413") — a differently-cased literal would slip this scan entirely.
 _LITERAL_RE = re.compile(r"""trigger_reason=["']([a-z_0-9]+)["']""")
 _CONSTANT_RE = re.compile(r"trigger_reason=([A-Z][A-Z_0-9]*)")
 
@@ -87,6 +95,26 @@ def test_scan_finds_the_known_producers():
     assert "threshold" in reasons
     assert "session_hygiene" in reasons
     assert MANUAL_TRIGGER_REASON in reasons
+
+
+def test_scan_reaches_subpackages():
+    """The globs must be RECURSIVE: a producer in agent/<subpkg>/x.py has to be
+    inside the scan, or a future call site there escapes attribution coverage
+    while feeling protected (review finding on PR #91158). Assert the file walk
+    actually visits at least one file below a subdirectory of a scanned root."""
+    seen_subdir_file = False
+    for pattern in _PRODUCER_GLOBS:
+        for path in REPO.glob(pattern):
+            rel = path.relative_to(REPO)
+            if len(rel.parts) > 2:  # e.g. agent/monitoring/foo.py
+                seen_subdir_file = True
+                break
+        if seen_subdir_file:
+            break
+    assert seen_subdir_file, (
+        "_PRODUCER_GLOBS never reached a subpackage file — globs are no longer "
+        "recursive, so subpackage call sites are invisible to this coverage test"
+    )
 
 
 def test_every_produced_reason_renders_a_clause():
