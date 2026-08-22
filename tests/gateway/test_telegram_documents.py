@@ -385,6 +385,29 @@ class TestDocumentDownloadBlock:
         assert event.media_urls == []
 
     @pytest.mark.asyncio
+    async def test_media_download_uses_dedicated_generous_timeouts(self, adapter):
+        """CDN payload fetches must not ride the bot's ~5s default read timeout.
+
+        Regression for the 2026-08-22 live failure: two consecutive voice notes
+        exhausted all 3 retries in seconds because every attempt reused the
+        short JSON-API default; the fix gives get_file/download_as_bytearray an
+        explicit per-request budget.
+        """
+        file_obj = _make_file_obj()
+        msg = _make_message()
+        msg.voice = MagicMock(file_size=100)
+        msg.voice.get_file = AsyncMock(return_value=file_obj)
+
+        await adapter._handle_media_message(_make_update(msg), MagicMock())
+
+        get_kwargs = msg.voice.get_file.await_args.kwargs
+        dl_kwargs = file_obj.download_as_bytearray.await_args.kwargs
+        for kwargs in (get_kwargs, dl_kwargs):
+            assert kwargs["read_timeout"] >= 30
+            assert kwargs["connect_timeout"] >= 10
+            assert kwargs["pool_timeout"] >= 10
+
+    @pytest.mark.asyncio
     async def test_oversized_voice_short_circuits_before_download_or_retry(self, adapter):
         adapter._max_doc_bytes = 100
         msg = _make_message()
