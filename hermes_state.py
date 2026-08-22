@@ -4107,27 +4107,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
                 raise
-            except SystemError as exc:
-                # CPython's sqlite3 layer raises a bare SystemError
-                # ("<Connection> returned NULL without setting an exception")
-                # when a statement on the shared writer connection races a
-                # statement another thread is running on the SAME connection
-                # object (check_same_thread=False makes this reachable; an
-                # unlocked reader on self._conn was the 2026-08-20 incident).
-                # It is transient — the identical write succeeds on retry —
-                # but it is NOT a sqlite3.Error, so without this handler it
-                # escaped the whole retry net and destroyed the user's turn
-                # as session_persistence_failed. Retry like locked/busy;
-                # patience exhaustion still propagates.
-                if "returned null without setting an exception" in str(exc).lower() \
-                        and self._sleep_before_write_retry(deadline, patience_s):
-                    logger.warning(
-                        "Transient sqlite3 SystemError on the shared writer "
-                        "connection (cross-thread statement race); retrying: %s",
-                        exc,
-                    )
-                    continue
-                raise
 
     def _sleep_before_write_retry(
         self, deadline: float, patience_s: float

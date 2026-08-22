@@ -17,10 +17,9 @@ Two independent layers are asserted here:
 1. The unlocked readers now route through ``_read_ctx()`` (per-thread
    read-only connections under WAL), so hammering them concurrently with
    turn-shaped batch writes must produce ZERO errors on either side.
-2. Defense in depth: even if some future code path reintroduces the race,
-   a message-scoped ``SystemError`` inside ``_execute_write`` retries
-   like locked/busy instead of killing the turn; any other SystemError
-   still propagates untouched.
+2. Exactly-once containment: a bare ``SystemError`` inside the transaction
+   callback is never replayed, while post-commit maintenance failures are
+   logged without invalidating the already-durable write.
 """
 
 import sqlite3
@@ -195,50 +194,50 @@ class TestConcurrentReadersDoNotRaceTheWriter:
         )
 
 
-class TestSystemErrorRetryNet:
-    """Layer 2: ``_execute_write`` treats the cross-thread-race SystemError
-    as transient instead of letting it escape the retry net."""
+class TestSystemErrorTransactionBoundary:
+    """A bare SystemError must never replay an ambiguous write."""
 
-    def test_transient_system_error_is_retried_to_success(self, db):
+    def test_matching_error_inside_callback_is_not_replayed(self, db):
         calls = {"n": 0}
 
-        def flaky(conn):
+        def broken(_conn):
             calls["n"] += 1
-            if calls["n"] <= 3:
+            raise SystemError(
+                "<TrackedConnection object at 0x0> returned NULL "
+                "without setting an exception"
+            )
+
+        with pytest.raises(SystemError, match="returned NULL"):
+            db._execute_write(broken)
+        assert calls["n"] == 1
+
+    def test_post_commit_maintenance_error_does_not_replay_message(
+        self, db, monkeypatch
+    ):
+        db.create_session("s1", "cli")
+        before = db._write_count
+        maintenance_calls = {"n": 0}
+
+        def fail_once(*, max_pages):
+            maintenance_calls["n"] += 1
+            if maintenance_calls["n"] == 1:
                 raise SystemError(
                     "<TrackedConnection object at 0x0> returned NULL "
                     "without setting an exception"
                 )
-            conn.execute(
-                "INSERT INTO state_meta (key, value) VALUES ('se', 'ok') "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
-            )
-            return "done"
+            return 0
 
-        assert db._execute_write(flaky) == "done"
-        assert calls["n"] == 4
-        assert db.get_meta("se") == "ok"
+        monkeypatch.setattr(db, "_FTS_MERGE_EVERY_N_WRITES", 1)
+        monkeypatch.setattr(db, "_merge_fts_incrementally", fail_once)
 
-    def test_unrelated_system_error_propagates_immediately(self, db):
-        calls = {"n": 0}
+        message_id = db.append_message("s1", "user", "exactly-once")
+        matching = [
+            row for row in db.get_messages("s1")
+            if row["content"] == "exactly-once"
+        ]
 
-        def broken(conn):
-            calls["n"] += 1
-            raise SystemError("something else entirely")
-
-        with pytest.raises(SystemError, match="something else"):
-            db._execute_write(broken)
-        assert calls["n"] == 1
-
-    def test_exhausted_patience_propagates_the_system_error(
-        self, db, monkeypatch
-    ):
-        monkeypatch.setattr(SessionDB, "_WRITE_PATIENCE_S", 0.05)
-
-        def always(conn):
-            raise SystemError(
-                "<Connection> returned NULL without setting an exception"
-            )
-
-        with pytest.raises(SystemError, match="returned NULL"):
-            db._execute_write(always)
+        assert isinstance(message_id, int)
+        assert len(matching) == 1
+        assert db.get_session("s1")["message_count"] == 1
+        assert db._write_count == before + 1
+        assert maintenance_calls["n"] == 1
