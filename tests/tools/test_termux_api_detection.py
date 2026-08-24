@@ -166,6 +166,11 @@ class TestDetectAudioEnvironmentTermuxFallback:
         monkeypatch.delenv("SSH_CLIENT", raising=False)
         monkeypatch.delenv("SSH_TTY", raising=False)
         monkeypatch.delenv("SSH_CONNECTION", raising=False)
+        # Pin the container probe: detect_audio_environment() does a
+        # function-local `from hermes_constants import is_container`; on a
+        # containerized CI runner the real probe returns True and injects a
+        # blocking no-audio-devices warning that flips available to False.
+        monkeypatch.setattr("hermes_constants.is_container", lambda: False)
 
         # No sounddevice — we go down the Termux:API branch.
         monkeypatch.setattr(
