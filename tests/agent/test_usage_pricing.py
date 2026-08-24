@@ -749,3 +749,41 @@ def test_every_shipped_dated_anthropic_id_is_priceable():
         if get_pricing_entry(model, provider="anthropic") is None
     )
     assert not unpriced, f"catalog models with no resolvable pricing: {unpriced}"
+
+
+def test_anthropic_dated_snapshot_ids_price_as_family_alias():
+    """Dated snapshot ids must price field-equal to their family alias.
+
+    Contributed by @Parker-Fawcett on #71441 (salvaged from closed #92749);
+    pins the table layer of the dated-suffix fallback.
+    """
+    for alias, dated in (
+        ("claude-haiku-4-5", "claude-haiku-4-5-20251001"),
+        ("claude-sonnet-4-5", "claude-sonnet-4-5-20250929"),
+    ):
+        ref = get_pricing_entry(alias, provider="anthropic")
+        assert ref is not None, alias
+        entry = get_pricing_entry(dated, provider="anthropic")
+        assert entry is not None, dated
+        assert entry.input_cost_per_million == ref.input_cost_per_million, dated
+        assert entry.output_cost_per_million == ref.output_cost_per_million, dated
+
+
+def test_anthropic_dated_snapshot_session_estimates_cost_not_unknown():
+    """Pinned snapshot ids must yield status='estimated', not unknown.
+
+    Contributed by @Parker-Fawcett on #71441; mirrors the Bedrock
+    estimate-level regression shape and pins the estimate layer that
+    empty_response_guard's cost-aware retry throttle depends on
+    (@vszgdcn8cj-ctrl's consumer report on the same PR).
+    """
+    usage = SimpleNamespace(
+        input_tokens=1000,
+        output_tokens=500,
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+    )
+    for model in ("claude-haiku-4-5-20251001", "claude-sonnet-4-5-20250929"):
+        result = estimate_usage_cost(model, usage, provider="anthropic")
+        assert result.status == "estimated", model
+        assert result.amount_usd is not None, model
