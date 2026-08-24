@@ -81,12 +81,6 @@ from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from hermes_cli.config import (
-    get_hermes_home,
-    get_config_path,
-    read_raw_config,
-    require_readable_config_before_write,
-)
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
@@ -562,6 +556,17 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         base_url_env_var="AZURE_FOUNDRY_BASE_URL",
     ),
 }
+
+# ``hermes_cli.config`` discovers model-provider plugins while importing.  A
+# provider plugin may in turn interact with this module's registry.  Keep this
+# import below ProviderConfig and PROVIDER_REGISTRY so that TUI startup never
+# exposes a partially initialized auth module to those plugins.
+from hermes_cli.config import (  # noqa: E402
+    get_hermes_home,
+    get_config_path,
+    read_raw_config,
+    require_readable_config_before_write,
+)
 
 # Auto-extend PROVIDER_REGISTRY with any api-key provider registered in
 # providers/ that is not already declared above.  New providers only need a
