@@ -637,6 +637,10 @@ class TestGatewayServiceDetection:
         monkeypatch.setattr(gateway_cli, "is_linux", lambda: True)
         monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
         monkeypatch.setattr(gateway_cli, "is_wsl", lambda: False)
+        # Pin the container probe: on a containerized CI runner the real
+        # is_container() is True, which routes into
+        # _container_systemd_operational() and fails this hermetic test.
+        monkeypatch.setattr(gateway_cli, "is_container", lambda: False)
         monkeypatch.setattr(gateway_cli.shutil, "which", lambda name: "/usr/bin/systemctl")
 
         assert gateway_cli.supports_systemd_services() is True
