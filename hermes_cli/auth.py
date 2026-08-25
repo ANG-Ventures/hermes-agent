@@ -561,6 +561,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
 # provider plugin may in turn interact with this module's registry.  Keep this
 # import below ProviderConfig and PROVIDER_REGISTRY so that TUI startup never
 # exposes a partially initialized auth module to those plugins.
+#
+# CONTRACT: during discovery a plugin may rely ONLY on ``ProviderConfig`` and
+# ``PROVIDER_REGISTRY`` from this module.  Names defined below this import are
+# NOT initialized yet at discovery time; a plugin that touches them reopens the
+# partial-init hazard this ordering closes.  (Longer term the cycle could be
+# removed entirely with a post-import hook — config calling back into a fully
+# built auth module — rather than sequenced around.)
+
 from hermes_cli.config import (  # noqa: E402
     get_hermes_home,
     get_config_path,
