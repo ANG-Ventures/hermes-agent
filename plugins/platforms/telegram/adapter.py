@@ -25,6 +25,34 @@ from typing import Dict, List, Optional, Set, Any
 logger = logging.getLogger(__name__)
 
 
+def _intake_update_kind(update: Any) -> str:
+    """Best-effort short label for an update's payload kind (logging only).
+
+    Used by the intake sentinel so a gap investigation can tell a text DM from
+    a callback query or an edit without dumping the whole update. Deliberately
+    tolerant: any attribute error yields ``"unknown"`` rather than disturbing
+    the observation path.
+    """
+    for attr in (
+        "message",
+        "edited_message",
+        "channel_post",
+        "edited_channel_post",
+        "callback_query",
+        "inline_query",
+        "my_chat_member",
+        "chat_member",
+        "poll",
+        "poll_answer",
+    ):
+        try:
+            if getattr(update, attr, None) is not None:
+                return attr
+        except Exception:
+            continue
+    return "unknown"
+
+
 def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
     text = "" if error is None else str(error)
@@ -244,6 +272,7 @@ try:
         CommandHandler,
         CallbackQueryHandler,
         MessageHandler as TelegramMessageHandler,
+        TypeHandler,
         ContextTypes,
         filters,
     )
@@ -262,6 +291,7 @@ except ImportError:
     CommandHandler = Any
     CallbackQueryHandler = Any
     TelegramMessageHandler = Any
+    TypeHandler = Any
     HTTPXRequest = Any
     filters = None
     ParseMode = None
@@ -414,6 +444,7 @@ def check_telegram_requirements() -> bool:
     global TELEGRAM_AVAILABLE, Update, Bot, Message, InlineKeyboardButton
     global InlineKeyboardMarkup, LinkPreviewOptions, Application
     global CommandHandler, CallbackQueryHandler, TelegramMessageHandler
+    global TypeHandler
     global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest
     if TELEGRAM_AVAILABLE:
         return True
@@ -433,6 +464,7 @@ def check_telegram_requirements() -> bool:
             Application as _App, CommandHandler as _CH,
             CallbackQueryHandler as _CQH,
             MessageHandler as _MH,
+            TypeHandler as _TH,
             ContextTypes as _CT, filters as _filters,
         )
         from telegram.constants import ParseMode as _PM, ChatType as _CtT
@@ -449,6 +481,7 @@ def check_telegram_requirements() -> bool:
     CommandHandler = _CH
     CallbackQueryHandler = _CQH
     TelegramMessageHandler = _MH
+    TypeHandler = _TH
     ContextTypes = _CT
     filters = _filters
     ParseMode = _PM
@@ -789,6 +822,16 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_progress_verifier_task: Optional[asyncio.Task] = None
         self._polling_teardown_started: bool = False
         self._polling_error_callback_ref = None
+        # Intake sentinel: last update_id observed at the ingest boundary.
+        # Telegram update_ids are sequential per bot, so a gap between
+        # consecutively observed updates proves the poller consumed (and
+        # offset-confirmed) an update that never reached any handler — a
+        # silent inbound drop that is otherwise unattributable (2026-08-26: a
+        # user DM vanished with pending_update_count=0 and zero log evidence).
+        # None until the first update of a polling session; reset on reconnect
+        # because drop_pending_updates/backlog replay make one legitimate
+        # discontinuity per session.
+        self._intake_last_update_id: Optional[int] = None
         # Network-error reconnect ladder tuning (config-overridable). A local
         # DNS/connectivity blip makes getUpdates fail repeatedly; we back off
         # and retry up to _network_retry_max times before escalating to a
@@ -2176,6 +2219,13 @@ class TelegramAdapter(BasePlatformAdapter):
             verifier.cancel()
         self._polling_progress_verifier_task = None
         self._polling_generation = getattr(self, "_polling_generation", 0) + 1
+        # A new polling session legitimately restarts the update_id stream at
+        # an arbitrary offset (cold boot drops the queue; a reconnect replays
+        # a backlog), so carrying the previous session's high-water mark would
+        # emit a false "intake gap". Clear it: the first update of the new
+        # session re-seeds the sentinel instead of being compared against a
+        # stale one.
+        self._intake_last_update_id = None
         self._polling_progress_event = asyncio.Event()
         self._polling_progress_accepting = True
         self._send_path_degraded = True
@@ -2220,6 +2270,117 @@ class TelegramAdapter(BasePlatformAdapter):
             and "result" in envelope
         ):
             self._record_polling_progress(generation)
+
+    def _register_handlers(self, app) -> None:
+        """Register every PTB handler on ``app``.
+
+        Single registration site on purpose. This used to be duplicated
+        verbatim between initial connect and the rebuild-on-retry path, so any
+        new handler had to be added in two places or it silently existed on
+        only one of them — a "you have to remember" defect. Both callers now
+        share this method, which makes that drift structurally impossible.
+
+        The intake sentinel is registered in group ``-1`` so it observes every
+        update strictly before the functional handlers in the default group
+        ``0``. It is *blocking* on purpose: PTB runs at most one handler per
+        group but runs every group, so a separate group cannot consume the
+        update — while ``block=False`` would defer the callback to
+        ``Application.create_task`` and let observations complete out of order,
+        which for a sequential-``update_id`` gap detector would manufacture
+        false "missing update" alarms. The callback only formats two log lines,
+        so blocking costs nothing on the dispatch path.
+        """
+        app.add_handler(
+            TypeHandler(Update, self._observe_intake_update),
+            group=-1,
+        )
+        app.add_handler(TelegramMessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            self._handle_text_message
+        ))
+        app.add_handler(TelegramMessageHandler(
+            filters.COMMAND,
+            self._handle_command
+        ))
+        app.add_handler(TelegramMessageHandler(
+            filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION),
+            self._handle_location_message
+        ))
+        app.add_handler(TelegramMessageHandler(
+            filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
+            self._handle_media_message
+        ))
+        # Handle inline keyboard button callbacks (update prompts)
+        app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+
+    async def _observe_intake_update(self, update, context=None) -> None:
+        """Log every raw update at the ingest boundary and detect silent drops.
+
+        Runs as a group ``-1`` ``TypeHandler`` so it observes EVERY update PTB
+        dispatches, before any filter, authorization prefilter, or text
+        batching can discard it. Purely observational — it never consumes the
+        update (``block=False`` handlers in a lower group cannot stop
+        propagation), so normal handling is unaffected.
+
+        Two signals, both previously missing:
+
+        1. **Attribution.** One line per update with its ``update_id`` and
+           chat. When a message "never arrives", this proves whether the
+           poller saw it at all — separating a Bot-API/transport loss (no line)
+           from an in-process drop after ingest (line present, no handler
+           work). Before this, an in-process drop left *zero* evidence.
+
+        2. **Gap detection.** Telegram ``update_id``s are sequential per bot.
+           PTB advances its offset to ``updates[-1].update_id + 1`` only after
+           queueing, so a jump greater than 1 between consecutively observed
+           updates means an update was fetched and offset-confirmed but never
+           dispatched — it is gone from the server queue and unrecoverable.
+           That is a silent inbound loss and is logged at WARNING with the
+           exact missing id range, turning an invisible failure into an
+           alertable one.
+
+        A gap is NOT reported for the first update after a (re)connect: a
+        polling session legitimately starts at an arbitrary offset (cold boot
+        uses ``drop_pending_updates=True``; a reconnect replays a backlog).
+        """
+        update_id = getattr(update, "update_id", None)
+        if update_id is None:
+            return
+        try:
+            update_id = int(update_id)
+        except (TypeError, ValueError):
+            return
+
+        previous = self._intake_last_update_id
+        # Telegram can redeliver an update (retry after a failed confirm) and
+        # PTB may dispatch out of order across queue drains; only a forward
+        # jump proves loss, so ignore duplicates/regressions.
+        if previous is not None and update_id > previous + 1:
+            missing_count = update_id - previous - 1
+            logger.warning(
+                "[%s] Telegram intake gap: %d update(s) consumed but never "
+                "dispatched (update_id %d..%d missing; last seen %d, now %d). "
+                "These were offset-confirmed to Telegram and are unrecoverable.",
+                self.name,
+                missing_count,
+                previous + 1,
+                update_id - 1,
+                previous,
+                update_id,
+            )
+        if previous is None or update_id > previous:
+            self._intake_last_update_id = update_id
+
+        chat = getattr(update, "effective_chat", None)
+        user = getattr(update, "effective_user", None)
+        logger.info(
+            "[%s] Telegram intake: update_id=%d chat=%s user=%s type=%s",
+            self.name,
+            update_id,
+            getattr(chat, "id", None),
+            getattr(user, "id", None),
+            _intake_update_kind(update),
+        )
 
     def _instrument_polling_request(self, request):
         """Instrument one dedicated PTB getUpdates request with progress tracking.
@@ -3902,25 +4063,8 @@ class TelegramAdapter(BasePlatformAdapter):
             self._app = builder.build()
             self._bot = self._app.bot
             
-            # Register handlers
-            self._app.add_handler(TelegramMessageHandler(
-                filters.TEXT & ~filters.COMMAND,
-                self._handle_text_message
-            ))
-            self._app.add_handler(TelegramMessageHandler(
-                filters.COMMAND,
-                self._handle_command
-            ))
-            self._app.add_handler(TelegramMessageHandler(
-                filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION),
-                self._handle_location_message
-            ))
-            self._app.add_handler(TelegramMessageHandler(
-                filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
-                self._handle_media_message
-            ))
-            # Handle inline keyboard button callbacks (update prompts)
-            self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+            # Register handlers (single site — see _register_handlers)
+            self._register_handlers(self._app)
             
             # Start polling — retry initialize() for transient TLS resets.
             # Each attempt is capped by _init_timeout so a single unreachable
@@ -4034,24 +4178,8 @@ class TelegramAdapter(BasePlatformAdapter):
                         old_app = self._app
                         self._app = builder.build()
                         self._bot = self._app.bot
-                        # Re-register handlers on the new app
-                        self._app.add_handler(TelegramMessageHandler(
-                            filters.TEXT & ~filters.COMMAND,
-                            self._handle_text_message
-                        ))
-                        self._app.add_handler(TelegramMessageHandler(
-                            filters.COMMAND,
-                            self._handle_command
-                        ))
-                        self._app.add_handler(TelegramMessageHandler(
-                            filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION),
-                            self._handle_location_message
-                        ))
-                        self._app.add_handler(TelegramMessageHandler(
-                            filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
-                            self._handle_media_message
-                        ))
-                        self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+                        # Re-register handlers on the new app (shared site)
+                        self._register_handlers(self._app)
                         # Best-effort discard the old app's resources
                         try:
                             await _shutdown_abandoned_app(old_app)
