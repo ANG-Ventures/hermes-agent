@@ -1,8 +1,46 @@
 """Integration coverage for polling progress against the installed PTB runtime."""
 
 import asyncio
+import importlib
+import sys
 
 import pytest
+
+
+def _evict_mocked_telegram() -> None:
+    """Remove MagicMock stand-ins other tests install as ``telegram``.
+
+    ~29 gateway unit-test files register a ``MagicMock`` under the ``telegram``
+    module names (via ``sys.modules.setdefault``) so they can exercise the
+    adapter without PTB installed. That is polite among *those* tests, but in a
+    combined run any of them executing first poisons this file: with a mock
+    resident, ``pytest.importorskip("telegram")`` finds a module object,
+    "succeeds", and every ``from telegram... import`` below silently yields
+    MagicMock attributes — this real-runtime suite then fails with
+    ``TypeError: object MagicMock can't be used in 'await' expression`` while
+    passing in isolation. The mocks are recognizable: a real package carries
+    ``__file__``; the MagicMock does not (its ``__file__`` is itself a mock,
+    not a str). Evict those entries so the imports below load the real PTB, and
+    reload the adapter module in case it was first imported with mock bindings.
+    """
+    poisoned = [
+        name for name in list(sys.modules)
+        if (name == "telegram" or name.startswith("telegram."))
+        and not isinstance(getattr(sys.modules[name], "__file__", None), str)
+    ]
+    if not poisoned:
+        return
+    for name in poisoned:
+        del sys.modules[name]
+    # The adapter module may have bound the mock's symbols at its own import
+    # time (module-level `from telegram.ext import ...` fallback machinery).
+    # Reload it so its globals rebind against the real package.
+    adapter_mod = sys.modules.get("plugins.platforms.telegram.adapter")
+    if adapter_mod is not None:
+        importlib.reload(adapter_mod)
+
+
+_evict_mocked_telegram()
 pytest.importorskip("telegram", reason="python-telegram-bot not installed")
 from telegram.error import Conflict, TelegramError
 from telegram.request import BaseRequest
