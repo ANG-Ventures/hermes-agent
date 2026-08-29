@@ -606,11 +606,109 @@ def _schedule_interval_seconds(schedule: Optional[Dict[str, Any]]) -> Optional[i
     return None
 
 
+# --- Vendor consistency of the (model, provider) pair --------------------
+# A job pinned to e.g. model="gpt-5.6-sol" + provider="claude-apr" fails EVERY
+# run with `HTTP 400: the model field names a different vendor model than this
+# endpoint serves; retrying will not help` -- a mis-pair, not a down model.
+# It is a recurring class: seen live 2026-08-19 and again 2026-08-29, each time
+# only caught AFTER the job had been persisted and had burned failed fires.
+#
+# This mirrors the post-hoc `cron-config-lint` Rule #20b, promoted to an
+# admission gate so the pair is refused before it is stored. Keep the two in
+# sync: the sibling implementation lives in the fleet lint script as
+# `model_provider_vendor_mismatch()`.
+#
+# The check is mechanical: infer each side's vendor from its name prefix and
+# refuse a cross-vendor pair. The prefix maps are deliberately conservative --
+# an unrecognized model or provider name yields vendor None and is NOT flagged
+# (fail-open on unknowns). This rule exists to catch the obvious mis-pairs, not
+# to maintain a model catalog.
+_MODEL_VENDOR_PREFIXES = (
+    ("claude", "anthropic"),
+    ("gpt-", "openai"),
+    ("o1", "openai"), ("o3", "openai"), ("o4", "openai"),
+    ("gemini", "google"),
+    ("grok", "xai"),
+    ("kimi", "moonshot"),
+    ("deepseek", "deepseek"),
+    ("llama", "meta"),
+    ("qwen", "alibaba"),
+)
+_PROVIDER_VENDOR_PREFIXES = (
+    ("claude", "anthropic"),
+    ("anthropic", "anthropic"),
+    ("openai", "openai"),
+    ("codex", "openai"),
+    ("gemini", "google"), ("google", "google"),
+    ("grok", "xai"), ("xai", "xai"),
+    ("moonshot", "moonshot"), ("kimi", "moonshot"),
+    ("deepseek", "deepseek"),
+)
+
+
+def _vendor_of(name: Any, prefixes: Tuple[Tuple[str, str], ...]) -> Optional[str]:
+    text = str(name or "").strip().lower()
+    for prefix, vendor in prefixes:
+        if text.startswith(prefix):
+            return vendor
+    return None
+
+
+def model_provider_vendor_mismatch(
+    model_name: Any, provider_name: Any
+) -> Optional[Tuple[str, str]]:
+    """Return ``(model_vendor, provider_vendor)`` when the pair is provably
+    cross-vendor, else None. Unknown names on either side -> None (fail-open)."""
+    model_vendor = _vendor_of(model_name, _MODEL_VENDOR_PREFIXES)
+    provider_vendor = _vendor_of(provider_name, _PROVIDER_VENDOR_PREFIXES)
+    if model_vendor and provider_vendor and model_vendor != provider_vendor:
+        return (model_vendor, provider_vendor)
+    return None
+
+
+def _model_provider_vendor_error(model: Any, provider: Any) -> Optional[str]:
+    """Hard-block message for a provably cross-vendor (model, provider) pair.
+
+    ``model`` may be a plain name or the ``{"model": ..., "provider": ...}``
+    object shape -- both occur in stored jobs. For the object shape the inner
+    model name is checked against BOTH the inner provider and the effective
+    top-level provider, since either can be the one that actually routes the
+    request. Returns None when neither side's vendor can be inferred.
+    """
+    if isinstance(model, dict):
+        model_name = model.get("model")
+        candidate_providers = (provider, model.get("provider"))
+    else:
+        model_name = model
+        candidate_providers = (provider,)
+
+    for candidate in candidate_providers:
+        mismatch = model_provider_vendor_mismatch(model_name, candidate)
+        if mismatch:
+            model_vendor, provider_vendor = mismatch
+            return (
+                f"model '{str(model_name).strip()}' ({model_vendor}) cannot run on "
+                f"provider '{str(candidate).strip()}' ({provider_vendor}) -- this pair "
+                "fails every run with HTTP 400 (the model field names a different "
+                "vendor model than this endpoint serves; retrying will not help). "
+                "Pick a provider that serves this model's vendor. "
+                "(cron Rule #20b)"
+            )
+    return None
+
+
 def _creation_admission_error(job: Dict[str, Any]) -> Optional[str]:
     """Return a hard-block error string for a cron shape that must be refused at
     create/update time, or None if the job is admissible.
 
-    Two rules, both about delivery going somewhere the author did not intend:
+    Three rules. One is about the job never being able to run at all:
+
+    * a provably cross-vendor (model, provider) pair (Rule #20b) -- every fire
+      returns HTTP 400, so the job is dead on arrival. Checked before the
+      schedule-shape rules because it holds for any cadence, including
+      one-shot jobs.
+
+    The other two are about delivery going somewhere the author did not intend:
 
     * deliver=origin on a sub-hourly recurring job (Rule #5 I1) --
       session-pollution every <1h is never a deliberate choice.
@@ -621,6 +719,12 @@ def _creation_admission_error(job: Dict[str, Any]) -> Optional[str]:
       and silently means "the home channel", so it is refused in favour of an
       explicit target.
     """
+    # Rule #20b runs first and unconditionally: a cross-vendor pair is broken
+    # for every cadence (including 'once') and stays broken while disabled, so
+    # it is refused regardless of schedule shape or enabled state.
+    vendor_error = _model_provider_vendor_error(job.get("model"), job.get("provider"))
+    if vendor_error:
+        return vendor_error
     if not job.get("enabled", True):
         return None
     schedule = job.get("schedule") or {}
@@ -1548,15 +1652,18 @@ def cronjob(
                             success=False,
                         )
 
-            # Reject a session-polluting shape BEFORE persisting it (Rule #5 I1):
-            # deliver=origin on a sub-hourly recurring job. Build a preview from
-            # the same inputs create_job() will use so the gate reads the real
-            # parsed schedule/deliver.
+            # Reject a shape that must never be persisted BEFORE persisting it:
+            # a cross-vendor model/provider pair (Rule #20b, dead on arrival with
+            # HTTP 400) and deliver=origin on a sub-hourly recurring job (Rule #5
+            # I1). Build a preview from the same inputs create_job() will use so
+            # the gate reads the real parsed schedule/deliver/pins.
             _preview_job = {
                 "deliver": _normalize_deliver_param(deliver),
                 "enabled": True,
                 "schedule": parse_schedule(schedule),
                 "origin": _origin_from_env(),
+                "model": _normalize_optional_job_value(model),
+                "provider": _normalize_optional_job_value(provider),
             }
             _admission_error = _creation_admission_error(_preview_job)
             if _admission_error:
@@ -1849,11 +1956,15 @@ def cronjob(
                     updates["enabled"] = True
             if not updates:
                 return tool_error("No updates provided.", success=False)
-            # Re-validate the session-pollution floor on the EFFECTIVE job (Rule
-            # #5 I1). An update that flips deliver→origin, tightens the cadence,
-            # or re-enables a paused job could introduce the sub-hourly-origin
-            # shape; merge this update over the stored job and refuse it here
-            # rather than letting the daily lint catch it after it fires.
+            # Re-validate the admission gates on the EFFECTIVE job (Rules #20b
+            # and #5 I1). An update may supply only `model` or only `provider`,
+            # so the cross-vendor check must run against the merged pair — e.g.
+            # repointing a working openai-pinned job at provider='claude-apr'
+            # is only detectable after the merge. Likewise an update that flips
+            # deliver→origin, tightens the cadence, or re-enables a paused job
+            # could introduce the sub-hourly-origin shape; merge this update
+            # over the stored job and refuse it here rather than letting the
+            # daily lint catch it after it has already failed a fire.
             _effective_job = {**job, **updates}
             _admission_error = _creation_admission_error(_effective_job)
             if _admission_error:

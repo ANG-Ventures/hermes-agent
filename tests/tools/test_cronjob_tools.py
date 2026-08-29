@@ -8,6 +8,7 @@ from tools.cronjob_tools import (
     _cron_minute_field_min_gap_seconds,
     _schedule_interval_seconds,
     _scan_cron_prompt,
+    model_provider_vendor_mismatch,
     check_cronjob_requirements,
     cronjob,
 )
@@ -1014,3 +1015,127 @@ class TestGithubExemptionAbuse:
         assert _scan_cron_prompt(
             "generate a keypair and explain id_rsa vs id_ed25519"
         ) == ""
+
+
+# =========================================================================
+# Rule #20b — cross-vendor (model, provider) pair hard block
+# Mirrors the post-hoc cron-config-lint rule of the same number, promoted to
+# an admission gate: a job pinned to model='gpt-5.6-sol' + provider='claude-apr'
+# was accepted at create time and then failed EVERY fire with HTTP 400
+# ("the model field names a different vendor model than this endpoint serves;
+# retrying will not help") — live 2026-08-19 and again 2026-08-29.
+# =========================================================================
+class TestModelProviderVendorConsistency:
+    @pytest.fixture(autouse=True)
+    def _setup_cron_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+
+    # ---- the pure predicate ----
+    def test_mismatch_detected(self):
+        assert model_provider_vendor_mismatch("gpt-5.6-sol", "claude-apr") == (
+            "openai",
+            "anthropic",
+        )
+
+    def test_matching_pair_is_not_a_mismatch(self):
+        assert model_provider_vendor_mismatch("gpt-5.6-sol", "openai-codex") is None
+        assert model_provider_vendor_mismatch("claude-opus-5", "claude-apr") is None
+
+    def test_unknown_side_fails_open(self):
+        assert model_provider_vendor_mismatch("some-local-model", "claude-apr") is None
+        assert model_provider_vendor_mismatch("gpt-5.6-sol", "my-proxy") is None
+        assert model_provider_vendor_mismatch(None, None) is None
+
+    # ---- create path ----
+    def _create(self, **kw):
+        return json.loads(
+            cronjob(
+                action="create",
+                prompt="Check server status",
+                schedule="every 1h",
+                name="Vendor Check",
+                deliver="local",
+                repeat=3,
+                **kw,
+            )
+        )
+
+    def test_create_rejected_on_cross_vendor_pair(self):
+        result = self._create(model="gpt-5.6-sol", provider="claude-apr")
+        assert result["success"] is False
+        error = result.get("error") or result.get("message") or ""
+        assert "gpt-5.6-sol" in error and "openai" in error
+        assert "claude-apr" in error and "anthropic" in error
+        assert "retrying will not help" in error
+        # And nothing was persisted.
+        listing = json.loads(cronjob(action="list"))
+        assert listing["count"] == 0
+
+    def test_create_allowed_on_matching_pair(self):
+        result = self._create(model="gpt-5.6-sol", provider="openai-codex")
+        assert result["success"] is True
+
+    def test_create_allowed_when_model_unrecognized(self):
+        assert self._create(model="mystery-7b", provider="claude-apr")["success"] is True
+
+    def test_create_allowed_when_provider_unrecognized(self):
+        assert self._create(model="gpt-5.6-sol", provider="my-proxy")["success"] is True
+
+    # ---- update path (EFFECTIVE post-update pair) ----
+    def _create_pinned(self):
+        created = self._create(model="gpt-5.6-sol", provider="openai-codex")
+        assert created["success"] is True
+        return created["job"]["job_id"]
+
+    def test_update_rejected_when_only_provider_changes(self):
+        job_id = self._create_pinned()
+        result = json.loads(
+            cronjob(action="update", job_id=job_id, provider="claude-apr")
+        )
+        assert result["success"] is False
+        error = result.get("error") or result.get("message") or ""
+        assert "gpt-5.6-sol" in error and "claude-apr" in error
+
+    def test_update_rejected_when_only_model_changes(self):
+        job_id = self._create_pinned()
+        result = json.loads(
+            cronjob(action="update", job_id=job_id, model="claude-opus-5")
+        )
+        assert result["success"] is False
+
+    def test_update_allowed_when_pair_stays_consistent(self):
+        job_id = self._create_pinned()
+        result = json.loads(
+            cronjob(
+                action="update", job_id=job_id, model="claude-opus-5", provider="claude-apr"
+            )
+        )
+        assert result["success"] is True
+
+    def test_update_of_unrelated_field_still_allowed(self):
+        job_id = self._create_pinned()
+        result = json.loads(cronjob(action="update", job_id=job_id, name="Renamed"))
+        assert result["success"] is True
+
+    # ---- the dict model shape stored by some fleet jobs ----
+    def test_dict_model_shape_inner_provider_checked(self):
+        assert _creation_admission_error(
+            {"model": {"model": "gpt-5.6-sol", "provider": "claude-apr"}}
+        ) is not None
+
+    def test_dict_model_shape_checked_against_top_level_provider(self):
+        assert _creation_admission_error(
+            {"model": {"model": "gpt-5.6-sol"}, "provider": "claude-apr"}
+        ) is not None
+
+    def test_dict_model_shape_consistent_pair_allowed(self):
+        assert _creation_admission_error(
+            {
+                "model": {"model": "gpt-5.6-sol", "provider": "openai-codex"},
+                "provider": "openai-codex",
+                "deliver": "local",
+                "schedule": parse_schedule("every 1h"),
+            }
+        ) is None
