@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from hermes_constants import display_hermes_home
 
@@ -628,6 +628,89 @@ def _resolve_cron_context_deliver(deliver: Optional[str]) -> Optional[str]:
     seen: set = set()
     unique = [p for p in resolved if not (p in seen or seen.add(p))]
     return ",".join(unique) if unique else None
+
+
+# --- Vendor consistency of the (model, provider) pair --------------------
+# A job pinned to e.g. model="gpt-5-codex" + provider="anthropic" is accepted
+# today, persisted, and then fails EVERY fire with an HTTP 400 along the lines
+# of "the model field names a different vendor model than this endpoint
+# serves" -- a mis-paired pin, not a transient outage, so every retry and
+# every future tick fails the same way.
+#
+# The check is mechanical: infer each side's vendor from its name prefix and
+# refuse a provably cross-vendor pair at create/update time. The prefix maps
+# are deliberately conservative -- an unrecognized model or provider name
+# yields vendor None and is NOT flagged (fail-open on unknowns). This exists to
+# catch obvious mis-pairs, not to maintain a model catalog: a brand new model
+# name simply falls through and is allowed.
+_MODEL_VENDOR_PREFIXES: Tuple[Tuple[str, str], ...] = (
+    ("claude", "anthropic"),
+    ("gpt-", "openai"),
+    ("o1", "openai"),
+    ("o3", "openai"),
+    ("o4", "openai"),
+    ("gemini", "google"),
+    ("grok", "xai"),
+    ("kimi", "moonshot"),
+    ("deepseek", "deepseek"),
+    ("llama", "meta"),
+    ("qwen", "alibaba"),
+)
+_PROVIDER_VENDOR_PREFIXES: Tuple[Tuple[str, str], ...] = (
+    ("claude", "anthropic"),
+    ("anthropic", "anthropic"),
+    ("openai", "openai"),
+    ("codex", "openai"),
+    ("gemini", "google"),
+    ("google", "google"),
+    ("grok", "xai"),
+    ("xai", "xai"),
+    ("moonshot", "moonshot"),
+    ("kimi", "moonshot"),
+    ("deepseek", "deepseek"),
+)
+
+
+def _vendor_of(name: Any, prefixes: Tuple[Tuple[str, str], ...]) -> Optional[str]:
+    text = str(name or "").strip().lower()
+    for prefix, vendor in prefixes:
+        if text.startswith(prefix):
+            return vendor
+    return None
+
+
+def model_provider_vendor_mismatch(
+    model_name: Any, provider_name: Any
+) -> Optional[Tuple[str, str]]:
+    """Return ``(model_vendor, provider_vendor)`` when the pair is provably
+    cross-vendor, else None. Unknown names on either side -> None (fail-open).
+    """
+    model_vendor = _vendor_of(model_name, _MODEL_VENDOR_PREFIXES)
+    provider_vendor = _vendor_of(provider_name, _PROVIDER_VENDOR_PREFIXES)
+    if model_vendor and provider_vendor and model_vendor != provider_vendor:
+        return (model_vendor, provider_vendor)
+    return None
+
+
+def _validate_model_provider_vendors(
+    model: Optional[Any], provider: Optional[Any]
+) -> Optional[str]:
+    """Hard-block message for a provably cross-vendor (model, provider) pin.
+
+    Returns an error string if the pair can never run, else None (including
+    whenever either side's vendor cannot be inferred).
+    """
+    mismatch = model_provider_vendor_mismatch(model, provider)
+    if not mismatch:
+        return None
+    model_vendor, provider_vendor = mismatch
+    return (
+        f"model {str(model).strip()!r} ({model_vendor}) cannot run on provider "
+        f"{str(provider).strip()!r} ({provider_vendor}) — this pair fails every "
+        "run with HTTP 400 (the model field names a different vendor model than "
+        "this endpoint serves; retrying will not help). Pick a provider that "
+        "serves this model's vendor, or clear one side of the pin."
+    )
 
 
 def _validate_cron_base_url(
@@ -1537,6 +1620,17 @@ def cronjob(
             if base_url_error:
                 return tool_error(base_url_error, success=False)
 
+            # A cross-vendor model/provider pin is dead on arrival: every fire
+            # returns HTTP 400. Refuse it before create_job() persists anything,
+            # so the caller gets one actionable error instead of a silent
+            # recurring failure. Fail-open on names we cannot classify.
+            vendor_error = _validate_model_provider_vendors(
+                _normalize_optional_job_value(model),
+                _normalize_optional_job_value(provider),
+            )
+            if vendor_error:
+                return tool_error(vendor_error, success=False)
+
             # bot-chat deliver targets are machine-local: named profiles must
             # exist here, and a bad name should fail the CREATE, not the run.
             bot_chat_error = _validate_bot_chat_deliver(_normalize_deliver_param(deliver))
@@ -1833,6 +1927,15 @@ def cronjob(
             base_url_error = _validate_cron_base_url(eff_provider, eff_base_url)
             if base_url_error:
                 return tool_error(base_url_error, success=False)
+            # Same for the model/provider vendor pair, and for the same reason
+            # it must run on the EFFECTIVE pair: an update may supply only
+            # `model` or only `provider`, so repointing an openai-pinned job at
+            # an anthropic provider is only detectable after merging this
+            # update over the stored job.
+            eff_model = updates["model"] if "model" in updates else job.get("model")
+            vendor_error = _validate_model_provider_vendors(eff_model, eff_provider)
+            if vendor_error:
+                return tool_error(vendor_error, success=False)
             if script is not None:
                 # Pass empty string to clear an existing script
                 if script:
