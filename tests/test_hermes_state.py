@@ -5451,3 +5451,53 @@ class TestRepairDetectsIncompleteFtsSchema:
         finally:
             conn.close()
         assert hermes_state._db_opens_cleanly(db_path) is None
+
+    def test_repair_drives_the_real_recovery_path_to_drop_fts_rebuild(self, tmp_path):
+        """Detection is only half of it — prove the pipeline actually repairs.
+
+        Coverage above stops at ``_db_opens_cleanly()``. This drives the whole
+        ``repair_state_db_schema()`` pipeline on a store with an orphaned FTS
+        trigger and pins WHICH strategy recovers it, because the obvious guess
+        is wrong in a way that matters for the description a reviewer reads:
+
+        Strategy 0 (``rebuild_fts``) issues ``INSERT INTO <t>(<t>)
+        VALUES('rebuild')`` per table and swallows the ``OperationalError``
+        raised by an ABSENT table via ``continue`` (``hermes_state.py:3628``),
+        so it cannot recreate a dropped virtual table and its post-pass probe
+        still fails. Recovery falls through to the FTS-schema drop, which
+        clears the orphaned ``messages_fts%`` entries and lets the indexes
+        rebuild from the canonical ``messages`` table on next open.
+        """
+        db_path = tmp_path / "state.db"
+        high_water = self._seed(db_path, n=10)
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Precondition: the store is genuinely write-broken and detected.
+        assert hermes_state._db_opens_cleanly(db_path) is not None
+
+        report = hermes_state.repair_state_db_schema(db_path, backup=False)
+
+        assert report["repaired"] is True
+        assert report["strategy"] == "drop_fts_rebuild"
+        # The probe must now agree the store is healthy...
+        assert hermes_state._db_opens_cleanly(db_path) is None
+
+        # ...and the canonical rows must have survived the surgery, which is
+        # the whole point of preferring this over a restore-from-backup.
+        reopened = SessionDB(db_path=db_path)
+        try:
+            surviving = reopened._conn.execute(
+                "SELECT COUNT(*) FROM messages"
+            ).fetchone()[0]
+            assert surviving == high_water
+            # And the store can record a new message again — the symptom the
+            # user actually reported.
+            reopened.append_message("s1", role="user", content="after repair zebra")
+        finally:
+            reopened.close()
