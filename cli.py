@@ -11890,6 +11890,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     ctx,
                     probe_custom_providers=force_refresh,
                     probe_current_custom_provider=not force_refresh,
+                    # The classic CLI picker honours the same model.picker
+                    # config as the desktop and TUI surfaces — otherwise a
+                    # user who hid a model still sees it here.
+                    apply_picker_prefs=True,
                 )["providers"]
             except Exception:
                 providers = []
