@@ -259,3 +259,56 @@ def test_no_mention_in_a_normal_channel_is_still_ignored(adapter):
     admitted, _ = adapter._discord_message_admission(message, claim=False)
 
     assert admitted is False
+
+
+def test_a_disconnected_client_does_not_classify_every_bot_as_another_bot(adapter):
+    """With no client, we cannot recognize ourselves — so admit nothing.
+
+    ``self_user`` used to be computed as
+    ``self._client.user if self._client is not None else None``. When the
+    client is absent that yields ``None``, and ``mentioned != self_user`` is
+    then true for EVERY bot in ``message.mentions`` — including Hermes itself.
+    A message that mentions only Hermes would be reclassified as an
+    "other bot" mention and silently suppressed, which inverts the admission
+    decision this module exists to get right.
+
+    The guard now short-circuits instead of guessing. Main reaches
+    ``self._client.user`` directly and would raise ``AttributeError`` here;
+    returning ``(False, False)`` states the invariant without depending on an
+    exception escaping the ingress path.
+    """
+    _free(adapter, 789)
+    adapter._client = None
+    channel = FakeTextChannel(channel_id=789)
+    # Mentions ONLY Hermes. With the old fallback this became an "other bot"
+    # mention because SELF_ID != None.
+    message = make_message(
+        channel=channel,
+        content=f"<@{SELF_ID}> what is the status?",
+        mentions=[SimpleNamespace(id=SELF_ID, bot=True, name="Hermes")],
+    )
+
+    admitted, role_authorized = adapter._discord_message_admission(message, claim=False)
+
+    assert admitted is False
+    assert role_authorized is False
+
+
+def test_a_connected_client_still_recognizes_its_own_mention(adapter):
+    """Companion to the guard above: the normal path must be unchanged.
+
+    Guards that short-circuit are easy to over-apply, so pin the positive
+    case — a live client seeing only its own mention admits the message and
+    must NOT treat itself as another bot.
+    """
+    _free(adapter, 789)
+    channel = FakeTextChannel(channel_id=789)
+    message = make_message(
+        channel=channel,
+        content=f"<@{SELF_ID}> what is the status?",
+        mentions=[SimpleNamespace(id=SELF_ID, bot=True, name="Hermes")],
+    )
+
+    admitted, _ = adapter._discord_message_admission(message, claim=False)
+
+    assert admitted is True

@@ -1569,6 +1569,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 return False, False
         elif self._dedup.contains(message_id):
             return False, False
+        # Every self-identity comparison below (the self-authored check here,
+        # and the other-bot classification further down) needs our own user.
+        # Without a client we cannot recognize ourselves, so a mention of
+        # Hermes would be classified as "another bot" and silently invert the
+        # admission decision. Admit nothing rather than guess, and state the
+        # invariant once instead of relying on an AttributeError escaping the
+        # ingress path.
+        if self._client is None:
+            return False, False
         if message.author == self._client.user:
             return False, False
         if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
@@ -1610,7 +1619,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if not isinstance(message.channel, discord.DMChannel) and (
             message.mentions or raw_self_mention
         ):
-            self_user = self._client.user if self._client is not None else None
+            self_user = self._client.user
             other_bot_mentions = [
                 mentioned for mentioned in message.mentions
                 if mentioned.bot and mentioned != self_user
