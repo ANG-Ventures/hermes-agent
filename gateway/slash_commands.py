@@ -2256,12 +2256,20 @@ class GatewaySlashCommandsMixin:
             # rest of the channel sees the model change with no explanation.
             # Compares the full provider/model route, so a same-slug switch
             # across providers still announces; silent on a true no-op.
-            await self._announce_switch(
-                source,
-                "model",
-                f"{current_provider}/{current_model}",
-                f"{result.target_provider}/{result.new_model}",
-            )
+            #
+            # One-turn switches are NOT announced: the override is reverted by
+            # ``_pending_one_turn_model_restores`` after a single turn, so a
+            # channel-visible "A -> B" line would leave the room believing B is
+            # still active with no second line to correct it. The invoker still
+            # gets the scoped confirmation, which already says the override
+            # applies to the next turn only.
+            if not one_turn:
+                await self._announce_switch(
+                    source,
+                    "model",
+                    f"{current_provider}/{current_model}",
+                    f"{result.target_provider}/{result.new_model}",
+                )
             if one_turn:
                 if not hasattr(self, "_pending_one_turn_model_restores"):
                     self._pending_one_turn_model_restores = {}

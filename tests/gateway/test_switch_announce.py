@@ -361,3 +361,81 @@ class TestAnnounceLocaleCatalog:
                 assert "{old}" in value and "{new}" in value, (
                     f"{path.name}: gateway.switch_announce.{kind} lost a placeholder"
                 )
+
+
+class TestOneTurnModelSwitchIsNotAnnounced:
+    """A ``/model --one-turn`` switch must not post a channel-visible line.
+
+    The override is reverted by ``_pending_one_turn_model_restores`` after a
+    single turn, so announcing "A → B" with no second line to correct it leaves
+    the channel believing B is still active. Reported in automated review on
+    #83463.
+
+    This is an AST contract test rather than a handler drive: the announce call
+    sits deep inside ``_handle_model_command`` behind provider resolution and a
+    live model-switch result, and the property that matters is structural —
+    the call must be dominated by a ``not one_turn`` guard.
+    """
+
+    def _model_announce_call(self):
+        import ast
+        import inspect
+
+        import gateway.slash_commands as slash_commands
+
+        source = inspect.getsource(slash_commands)
+        tree = ast.parse(source)
+        found = []
+
+        class Visitor(ast.NodeVisitor):
+            def __init__(self):
+                self.guards = []
+
+            def visit_If(self, node):
+                self.guards.append(node.test)
+                for child in node.body:
+                    self.visit(child)
+                self.guards.pop()
+                for child in node.orelse:
+                    self.visit(child)
+
+            def visit_Call(self, node):
+                func = node.func
+                name = getattr(func, "attr", None)
+                if name == "_announce_switch":
+                    kind = None
+                    if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+                        kind = node.args[1].value
+                    found.append((kind, list(self.guards)))
+                self.generic_visit(node)
+
+        Visitor().visit(tree)
+        return found
+
+    def test_model_announce_is_guarded_by_not_one_turn(self):
+        import ast
+
+        calls = self._model_announce_call()
+        model_calls = [(kind, guards) for kind, guards in calls if kind == "model"]
+        assert model_calls, "no _announce_switch(..., 'model', ...) call found"
+
+        # At least one model announce site must sit under a `not one_turn` guard.
+        def mentions_not_one_turn(test):
+            for node in ast.walk(test):
+                if (
+                    isinstance(node, ast.UnaryOp)
+                    and isinstance(node.op, ast.Not)
+                    and isinstance(node.operand, ast.Name)
+                    and node.operand.id == "one_turn"
+                ):
+                    return True
+            return False
+
+        guarded = [
+            guards for _, guards in model_calls
+            if any(mentions_not_one_turn(g) for g in guards)
+        ]
+        assert guarded, (
+            "the /model announce is not guarded by `not one_turn`; a one-turn "
+            "switch would announce a change that silently reverts"
+        )
