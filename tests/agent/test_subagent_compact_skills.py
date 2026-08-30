@@ -16,6 +16,7 @@ Contracts:
      (the cache key includes promoted_skills).
 """
 
+import os
 import shutil
 import tempfile
 import unittest
@@ -118,6 +119,86 @@ class SubagentCompactIndexTest(unittest.TestCase):
         self.assertIn("cat0 [names only]", out)
         # other categories keep descriptions
         self.assertIn("skill-1-0: A long, detailed description", out)
+
+
+class TestCompactSkillIndexDefaultResolves(unittest.TestCase):
+    """The gate must be DECLARED, not just read.
+
+    ``agent/system_prompt.py`` reads
+    ``(_delegation_config() or {}).get("compact_skill_index", True)``. A read
+    with an inline default still works, but the key never appears in
+    ``hermes config``, so the behaviour is undiscoverable and un-overridable
+    through the documented surface. This drives the REAL resolution chain
+    against a temp HERMES_HOME with NO config.yaml (AGENTS.md asks for
+    real-path validation over mocks here) and proves the default arrives from
+    DEFAULT_CONFIG rather than from the call-site fallback.
+    """
+
+    def test_default_is_declared_in_default_config(self):
+        """The key exists in the shipped delegation defaults."""
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        delegation = DEFAULT_CONFIG["delegation"]
+        self.assertIn("compact_skill_index", delegation)
+        self.assertIs(delegation["compact_skill_index"], True)
+
+    def test_default_resolves_through_load_config_on_a_bare_home(self):
+        """With no config.yaml, the loader still yields the declared default.
+
+        This is the assertion the inline ``.get(..., True)`` fallback cannot
+        make: it proves the value survives the real
+        DEFAULT_CONFIG -> load_config -> _load_config chain.
+        """
+        home = Path(tempfile.mkdtemp())
+        try:
+            self.assertFalse((home / "config.yaml").exists())
+            with mock.patch.dict(
+                os.environ, {"HERMES_HOME": str(home)}, clear=False
+            ):
+                os.environ.pop("HERMES_IGNORE_USER_CONFIG", None)
+                import importlib
+
+                import hermes_cli.config as _cfg
+                importlib.reload(_cfg)
+                from tools.delegate_tool import _load_config
+
+                delegation = _load_config() or {}
+                self.assertIn(
+                    "compact_skill_index",
+                    delegation,
+                    "delegation.compact_skill_index must resolve from "
+                    "DEFAULT_CONFIG on a home with no config.yaml",
+                )
+                self.assertIs(delegation["compact_skill_index"], True)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_a_user_can_turn_the_compact_index_off(self):
+        """The declared key is honoured when a real config.yaml sets it false.
+
+        Without the DEFAULT_CONFIG entry this still "worked", but only by
+        accident of the inline fallback; pinning it proves the documented
+        override path is live.
+        """
+        home = Path(tempfile.mkdtemp())
+        try:
+            (home / "config.yaml").write_text(
+                "delegation:\n  compact_skill_index: false\n"
+            )
+            with mock.patch.dict(
+                os.environ, {"HERMES_HOME": str(home)}, clear=False
+            ):
+                os.environ.pop("HERMES_IGNORE_USER_CONFIG", None)
+                import importlib
+
+                import hermes_cli.config as _cfg
+                importlib.reload(_cfg)
+                from tools.delegate_tool import _load_config
+
+                delegation = _load_config() or {}
+                self.assertIs(delegation.get("compact_skill_index"), False)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
 
 
 if __name__ == "__main__":
