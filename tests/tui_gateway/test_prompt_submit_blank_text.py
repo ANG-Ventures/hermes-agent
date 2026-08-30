@@ -11,7 +11,6 @@ content is the attachment — so that path must keep working.
 """
 
 import threading
-import time
 import types
 
 import pytest
@@ -47,7 +46,12 @@ def submit_probe(monkeypatch):
     }
     server._sessions[sid] = session
 
-    effects = {"agent_builds": 0, "db_rows": 0, "turns": []}
+    effects = {"slots": 0, "agent_builds": 0, "db_rows": 0, "turns": []}
+
+    def claim_slot(*_a, **_k):
+        effects["slots"] += 1
+
+    monkeypatch.setattr(server, "_ensure_active_session_slot", claim_slot)
     monkeypatch.setattr(
         server,
         "_start_agent_build",
@@ -75,9 +79,10 @@ def submit_probe(monkeypatch):
             }
         )
         # The accepted path runs the turn on a background thread.
-        deadline = time.time() + 2.0
-        while not effects["turns"] and time.time() < deadline:
-            time.sleep(0.01)
+        thread = session.get("_run_thread")
+        if thread is not None:
+            thread.join(timeout=2)
+            assert not thread.is_alive()
         return response
 
     try:
@@ -95,14 +100,15 @@ def test_a_blank_submit_is_rejected(submit_probe, text):
     response = submit_probe.submit(text)
 
     assert "result" not in response
-    assert response["error"]["code"] == 4029
+    assert response["error"]["code"] == 4033
+    assert submit_probe.effects == {"slots": 0, "agent_builds": 0, "db_rows": 0, "turns": []}
 
 
 def test_a_blank_submit_costs_no_agent_build_no_db_row_and_no_api_call(submit_probe):
     """The whole point: rejection happens before anything expensive."""
     submit_probe.submit("   \n  ")
 
-    assert submit_probe.effects == {"agent_builds": 0, "db_rows": 0, "turns": []}
+    assert submit_probe.effects == {"slots": 0, "agent_builds": 0, "db_rows": 0, "turns": []}
 
 
 def test_a_blank_submit_leaves_the_session_idle(submit_probe):
@@ -123,6 +129,8 @@ def test_an_image_only_submit_still_runs(submit_probe):
     assert response["result"] == {"status": "streaming"}
     assert submit_probe.effects["turns"] == [""]
     assert submit_probe.effects["agent_builds"] == 1
+    assert submit_probe.effects["slots"] == 1
+    assert submit_probe.effects["db_rows"] == 1
 
 
 def test_an_ordinary_submit_is_unaffected(submit_probe):
@@ -130,6 +138,9 @@ def test_an_ordinary_submit_is_unaffected(submit_probe):
 
     assert response["result"] == {"status": "streaming"}
     assert submit_probe.effects["turns"] == ["what is the weather"]
+    assert submit_probe.effects["slots"] == 1
+    assert submit_probe.effects["agent_builds"] == 1
+    assert submit_probe.effects["db_rows"] == 1
 
 
 def test_text_that_only_looks_blank_after_sanitizing_is_still_rejected(submit_probe):
@@ -147,15 +158,15 @@ def test_text_that_only_looks_blank_after_sanitizing_is_still_rejected(submit_pr
 
     response = submit_probe.submit(raw)
 
-    assert response["error"]["code"] == 4029
-    assert submit_probe.effects["turns"] == []
+    assert response["error"]["code"] == 4033
+    assert submit_probe.effects == {"slots": 0, "agent_builds": 0, "db_rows": 0, "turns": []}
 
 
 def test_the_rejection_code_is_not_reused_by_another_prompt_submit_error(submit_probe):
-    """4029 must be distinguishable from the other prompt.submit rejections.
+    """4033 must be distinguishable from the other prompt.submit rejections.
 
     A client needs to tell "you sent nothing" apart from "that truncation would
-    erase the transcript" (4028) and "target message is gone" (4018) to show
+    erase the transcript" (4028), "that truncation needs confirming" (4029) and "target message is gone" (4018) to show
     the right message.
     """
     blank = submit_probe.submit("")
@@ -171,5 +182,27 @@ def test_the_rejection_code_is_not_reused_by_another_prompt_submit_error(submit_
         }
     )
 
-    assert blank["error"]["code"] == 4029
-    assert bad_ordinal["error"]["code"] != 4029
+    assert blank["error"]["code"] == 4033
+    assert bad_ordinal["error"]["code"] != 4033
+
+
+@pytest.mark.parametrize("text", ["", " \n\t", "\x1b[200~\x1b[201~"])
+@pytest.mark.parametrize("fence,code", [("author", 4124), ("hosted", 4120), ("group", 4122)])
+def test_blank_submit_preserves_authorization_precedence(submit_probe, monkeypatch, text, fence, code):
+    params = {}
+    if fence == "author":
+        params["_turn_author"] = {"id": "forged"}
+        params["_hosted_task"] = {}
+    elif fence == "hosted":
+        params["_hosted_task"] = {}
+    else:
+        from gateway import hosted_rooms
+
+        submit_probe.session["title"] = "Group: hosted-room"
+        monkeypatch.setattr(hosted_rooms, "probe_hosted_room", lambda *_a, **_k: True)
+
+    response = submit_probe.submit(text, **params)
+
+    assert response["error"]["code"] == code
+    assert submit_probe.effects == {"slots": 0, "agent_builds": 0, "db_rows": 0, "turns": []}
+    assert submit_probe.session["running"] is False
