@@ -95,7 +95,7 @@ def test_a_blank_submit_is_rejected(submit_probe, text):
     response = submit_probe.submit(text)
 
     assert "result" not in response
-    assert response["error"]["code"] == 4029
+    assert response["error"]["code"] == 4033
 
 
 def test_a_blank_submit_costs_no_agent_build_no_db_row_and_no_api_call(submit_probe):
@@ -147,15 +147,15 @@ def test_text_that_only_looks_blank_after_sanitizing_is_still_rejected(submit_pr
 
     response = submit_probe.submit(raw)
 
-    assert response["error"]["code"] == 4029
+    assert response["error"]["code"] == 4033
     assert submit_probe.effects["turns"] == []
 
 
 def test_the_rejection_code_is_not_reused_by_another_prompt_submit_error(submit_probe):
-    """4029 must be distinguishable from the other prompt.submit rejections.
+    """4033 must be distinguishable from the other prompt.submit rejections.
 
     A client needs to tell "you sent nothing" apart from "that truncation would
-    erase the transcript" (4028) and "target message is gone" (4018) to show
+    erase the transcript" (4028), "that truncation needs confirming" (4029) and "target message is gone" (4018) to show
     the right message.
     """
     blank = submit_probe.submit("")
@@ -171,5 +171,5 @@ def test_the_rejection_code_is_not_reused_by_another_prompt_submit_error(submit_
         }
     )
 
-    assert blank["error"]["code"] == 4029
-    assert bad_ordinal["error"]["code"] != 4029
+    assert blank["error"]["code"] == 4033
+    assert bad_ordinal["error"]["code"] != 4033

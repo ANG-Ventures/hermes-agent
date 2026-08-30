@@ -335,6 +335,19 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    # A blank submit is never a real turn, and running it is expensive: the
+    # deferred path builds a full agent and sends the entire conversation to
+    # the provider to answer nothing, then writes an empty user row. A stale
+    # or reconnect-looping client that fires prompt.submit(text="") every
+    # cycle therefore burns one full-context API call per cycle. Reject before
+    # the session slot, any agent build, or any DB write.
+    #
+    # Image-only submits are legitimate and must still run: the turn's content
+    # is the attached image, so this only rejects when there is no text AND
+    # nothing attached. Placed after session resolution so attached_images is
+    # readable.
+    if isinstance(text, str) and not text.strip() and not session.get("attached_images"):
+        return _err(rid, 4033, "prompt text is empty")
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
     # Which desktop window this message was typed into. Rewritten on every
