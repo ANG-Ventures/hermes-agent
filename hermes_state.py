@@ -11379,13 +11379,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         included because deletion preserves them by orphaning their parent
         reference.
         """
-        with self._lock:
-            exists = self._conn.execute(
+        with self._read_ctx() as conn:
+            if conn is None:
+                raise RuntimeError("SessionDB connection is closed")
+            exists = conn.execute(
                 "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
             ).fetchone()
             if not exists:
                 return []
-            delegate_ids = _collect_delegate_child_ids(self._conn, [session_id])
+            delegate_ids = _collect_delegate_child_ids(conn, [session_id])
         return [session_id, *sorted(delegate_ids)]
 
     def delete_session(

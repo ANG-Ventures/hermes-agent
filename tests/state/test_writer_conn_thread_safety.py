@@ -119,9 +119,16 @@ class TestConcurrentReadersDoNotRaceTheWriter:
         )
         assert errors == []
 
+    def test_session_delete_target_reads_race_free(self, db):
+        errors = self._run_race(
+            db, lambda d, sid: d.get_session_delete_targets(sid)
+        )
+        assert errors == []
+
     def test_unlocked_writer_conn_use_is_enumerated(self):
-        """Sibling-sweep tripwire: no method may touch ``self._conn``
-        outside ``with self._lock`` (or the __init__/close lifecycle, which
+        """Sibling-sweep tripwire: no method may operationally use
+        ``self._conn`` outside ``with self._lock`` (or the __init__/close
+        lifecycle, which
         runs before/after any concurrent access is possible).
 
         This is the AST sweep that found the four incident sites, frozen as
@@ -160,6 +167,7 @@ class TestConcurrentReadersDoNotRaceTheWriter:
             def __init__(self):
                 self.lock_depth = 0
                 self.func_stack = []
+                self.parent_stack = []
 
             def generic_visit(self, node):
                 locked = is_lock_with(node)
@@ -175,10 +183,24 @@ class TestConcurrentReadersDoNotRaceTheWriter:
                         and node.value.id == "self"
                         and node.attr == "_conn"
                         and self.lock_depth == 0):
+                    parent = self.parent_stack[-1] if self.parent_stack else None
+                    # Merely checking whether the connection has been closed
+                    # does not execute a statement on the shared handle. The
+                    # invariant forbids operational use, not an identity
+                    # comparison against None.
+                    is_none_guard = (
+                        isinstance(parent, ast.Compare)
+                        and any(
+                            isinstance(part, ast.Constant) and part.value is None
+                            for part in [parent.left, *parent.comparators]
+                        )
+                    )
                     fn = self.func_stack[-1] if self.func_stack else "<module>"
-                    if fn not in ALLOWED_FUNCS:
+                    if fn not in ALLOWED_FUNCS and not is_none_guard:
                         violations.append((node.lineno, fn))
+                self.parent_stack.append(node)
                 super().generic_visit(node)
+                self.parent_stack.pop()
                 if locked:
                     self.lock_depth -= 1
                 if is_func:
