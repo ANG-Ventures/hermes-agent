@@ -138,6 +138,38 @@ class PricingEntry:
     output_cost_per_million_above: Optional[Decimal] = None
     cache_read_cost_per_million_above: Optional[Decimal] = None
 
+    def effective_cache_write_rate(
+        self, input_rate: Optional[Decimal]
+    ) -> Optional[Decimal]:
+        """The rate cache-write tokens are actually billed at.
+
+        Cache-write tokens are *prompt* tokens (see ``CanonicalUsage.prompt_tokens``,
+        which sums input + cache-read + cache-write) that the provider also wrote
+        into its prompt cache. Only some providers charge a premium for that write:
+        Anthropic bills it at 1.25x input, and every Anthropic entry in the pricing
+        snapshot sets ``cache_write_cost_per_million`` explicitly. Providers that do
+        *not* charge a write premium -- OpenAI, DeepSeek, Google, and every
+        OpenAI-compatible models API that omits a cache-write field -- publish no
+        such rate because the tokens are simply billed as ordinary input.
+
+        So a missing ``cache_write_cost_per_million`` means "no premium", not
+        "unpriceable": fall back to the input rate. Returns ``None`` only when the
+        input rate is unknown too, i.e. when the route is genuinely unpriceable.
+
+        ``input_rate`` is passed in rather than read from
+        ``self.input_cost_per_million`` so the fallback honours whole-request
+        context-tier selection: on an above-threshold request the caller has
+        already resolved ``input_cost_per_million_above``, and billing the cache
+        write at the base rate would under-charge it.
+
+        Deliberately asymmetric with cache-*read*, which must never fall back to
+        the input rate -- a cache read is discounted (often 10x), so substituting
+        the input rate would over-bill rather than fill a gap.
+        """
+        if self.cache_write_cost_per_million is not None:
+            return self.cache_write_cost_per_million
+        return input_rate
+
 
 @dataclass(frozen=True)
 class CostResult:
@@ -1540,14 +1572,23 @@ def estimate_usage_cost(
                 label="n/a",
                 notes=("cache-read pricing unavailable for route",),
             )
+    # Route through the shared effective rate so a missing cache-write premium
+    # is filled from the (tier-resolved) input rate. Only bail when that too is
+    # unknown, i.e. when the route is genuinely unpriceable.
+    cache_write_rate = entry.effective_cache_write_rate(input_rate)
     if usage.cache_write_tokens:
-        if entry.cache_write_cost_per_million is None:
+        if cache_write_rate is None:
             return CostResult(
                 amount_usd=None,
                 status="unknown",
                 source=entry.source,
                 label="n/a",
                 notes=("cache-write pricing unavailable for route",),
+            )
+        if entry.cache_write_cost_per_million is None:
+            notes.append(
+                "cache-write billed at the input rate "
+                "(provider publishes no separate cache-write rate)"
             )
 
     if input_rate is not None:
@@ -1556,8 +1597,8 @@ def estimate_usage_cost(
         amount += Decimal(usage.output_tokens) * output_rate / _ONE_MILLION
     if cache_read_rate is not None:
         amount += Decimal(usage.cache_read_tokens) * cache_read_rate / _ONE_MILLION
-    if entry.cache_write_cost_per_million is not None:
-        amount += Decimal(usage.cache_write_tokens) * entry.cache_write_cost_per_million / _ONE_MILLION
+    if cache_write_rate is not None:
+        amount += Decimal(usage.cache_write_tokens) * cache_write_rate / _ONE_MILLION
     if entry.request_cost is not None and usage.request_count:
         amount += Decimal(usage.request_count) * entry.request_cost
 

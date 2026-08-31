@@ -848,10 +848,16 @@ def _canonical_usage_and_cost(
                     * entry.cache_read_cost_per_million
                     / one_million
                 )
-            if entry.cache_write_cost_per_million is not None and canonical.cache_write_tokens:
+            # ``effective_cache_write_rate`` so a provider with no separate
+            # cache-write premium still gets a cache-write line (billed at the
+            # input rate) instead of silently vanishing from the breakdown.
+            cache_write_rate = entry.effective_cache_write_rate(
+                entry.input_cost_per_million
+            )
+            if cache_write_rate is not None and canonical.cache_write_tokens:
                 cost_details["cache_creation_input_tokens"] = float(
                     Decimal(canonical.cache_write_tokens)
-                    * entry.cache_write_cost_per_million
+                    * cache_write_rate
                     / one_million
                 )
     except Exception:  # pragma: no cover - canonical total remains usable
