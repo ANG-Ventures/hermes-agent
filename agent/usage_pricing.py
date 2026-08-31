@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone, UTC
 from decimal import Decimal
 from typing import Any, Dict, Literal, Optional
@@ -154,6 +154,18 @@ class PricingEntry:
         return input_rate
 
 
+#: Billable component classes a :class:`CostResult` can be decomposed into.
+#: ``request`` is the per-request flat fee some provider models APIs report
+#: (OpenRouter's ``pricing.request``); the rest are per-token classes.
+COST_COMPONENTS: tuple[str, ...] = (
+    "input",
+    "output",
+    "cache_read",
+    "cache_write",
+    "request",
+)
+
+
 @dataclass(frozen=True)
 class CostResult:
     amount_usd: Optional[Decimal]
@@ -163,6 +175,22 @@ class CostResult:
     fetched_at: Optional[datetime] = None
     pricing_version: Optional[str] = None
     notes: tuple[str, ...] = ()
+    #: Per-class dollar breakdown of ``amount_usd``, keyed by
+    #: :data:`COST_COMPONENTS`. Only classes that actually contributed are
+    #: present. Empty when ``amount_usd`` is ``None`` (no priced total to
+    #: decompose). When non-empty the values sum exactly to ``amount_usd`` --
+    #: both are built from the same ``Decimal`` terms, so the invariant holds
+    #: without rounding drift. Rates are the ones actually billed, i.e. the
+    #: context-tier rate on an above-threshold request.
+    components: Dict[str, Decimal] = field(default_factory=dict)
+
+    def component(self, name: str) -> Decimal:
+        """Return the dollar amount billed for ``name``, or zero.
+
+        Convenience for consumers that want a total-preserving read of one
+        class without having to special-case absent keys.
+        """
+        return self.components.get(name, _ZERO)
 
 
 _UTC_NOW = lambda: datetime.now(UTC)
@@ -783,7 +811,6 @@ def estimate_usage_cost(
     # Whole-request context tier (e.g. Gemini Pro >200k prompts): above the
     # threshold the *_above rates apply to the entire request; None falls back.
     above = entry.tier_threshold_tokens is not None and usage.prompt_tokens > entry.tier_threshold_tokens
-    amount = _ZERO
     notes: list[str] = []
     cache_write_rate, cache_write_rate_above = entry.cache_write_cost_per_million, entry.cache_write_cost_per_million_above
     if cache_write_rate is None and not (above and cache_write_rate_above is not None):
@@ -795,12 +822,16 @@ def estimate_usage_cost(
         cache_write_rate = entry.effective_cache_write_rate(input_rate)
         if cache_write_rate is not None and usage.cache_write_tokens:
             notes.append("cache-write billed at the input rate (provider publishes no separate cache-write rate)")
-    for tokens, rate, rate_above, note in (
-        (usage.input_tokens, entry.input_cost_per_million, entry.input_cost_per_million_above, ()),
-        (usage.output_tokens, entry.output_cost_per_million, entry.output_cost_per_million_above, ()),
-        (usage.cache_read_tokens, entry.cache_read_cost_per_million, entry.cache_read_cost_per_million_above,
-         ("cache-read pricing unavailable for route",)),
-        (usage.cache_write_tokens, cache_write_rate, cache_write_rate_above,
+    # Built from the RESOLVED rates, so the breakdown reports what was actually
+    # billed: the context-tier rate on an above-threshold request and the
+    # cache-write fallback rate when the provider publishes no premium.
+    components: Dict[str, Decimal] = {}
+    for component, tokens, rate, rate_above, note in (
+        ("input", usage.input_tokens, entry.input_cost_per_million, entry.input_cost_per_million_above, ()),
+        ("output", usage.output_tokens, entry.output_cost_per_million, entry.output_cost_per_million_above, ()),
+        ("cache_read", usage.cache_read_tokens, entry.cache_read_cost_per_million,
+         entry.cache_read_cost_per_million_above, ("cache-read pricing unavailable for route",)),
+        ("cache_write", usage.cache_write_tokens, cache_write_rate, cache_write_rate_above,
          ("cache-write pricing unavailable for route",)),
     ):
         if above and rate_above is not None:
@@ -809,9 +840,12 @@ def estimate_usage_cost(
             if tokens:
                 return _unknown_cost(entry.source, *note)
             continue
-        amount += Decimal(tokens) * rate / _ONE_MILLION
+        if tokens:
+            components[component] = Decimal(tokens) * rate / _ONE_MILLION
     if entry.request_cost is not None and usage.request_count:
-        amount += Decimal(usage.request_count) * entry.request_cost
+        components["request"] = Decimal(usage.request_count) * entry.request_cost
+
+    amount = sum(components.values(), _ZERO)
 
     status: CostStatus = "estimated"
     label = format_cost_label(amount)
@@ -826,6 +860,7 @@ def estimate_usage_cost(
     return CostResult(
         amount_usd=amount, status=status, source=entry.source, label=label,
         fetched_at=entry.fetched_at, pricing_version=entry.pricing_version, notes=tuple(notes),
+        components=components,
     )
 
 
