@@ -302,3 +302,35 @@ unrelated to this fix pass and was left exactly as found.
   rather than a hardcoded `sys.modules` key; RED-proven to still catch wiring drift.
 
 No production code changed. No fork feature removed. No test deleted or weakened.
+
+---
+
+# Addendum — wall-clock flake conversions (2026-08-30, commit `4e3c9c18bd`)
+
+Three tests failed with load-induced `TimeoutError`/timing asserts on **loaded GitHub
+slice runners across 2 consecutive CI runs** (jobs `99362422576` / `99362422593`,
+`99359951296` / `99359951372`, `99358137871` / `99358137883`) while passing per-file
+locally and inside heavy-ci run `33350387498`'s full 46,340-test pass. Converted per
+the fleet skill `wall-clock-flake-conversion`.
+
+| Test | Family | Conversion shape | RED proof line | Load proof | Upstream verdict |
+|---|---|---|---|---|---|
+| `tests/gateway/test_turn_lease.py::test_full_dispatch_rejects_lease_timeout_without_running_goal_hook` | **Convert** — outer `wait_for(…, 1)` is a stopwatch on incidental setup, not on the lease. Profiled: plugin `discover_and_load` 0.138s + bcrypt `hash_password` 0.042s + imports 0.150s of a 0.284s window vs a 0.02s lease budget. CI cancelled the task inside `asyncio.to_thread(_recover_telegram_topic_thread_id)` (run.py:23301), *before* the acquire at run.py:23680. | **Budget witness** — record the `timeout=` dispatch hands `SessionTurnLeaseRegistry.acquire`; assert it equals `HERMES_TURN_LEASE_TIMEOUT`. Outer `wait_for` kept as a hang guard only, 1s → 30s. | Mutated `run.py` acquire to read `HERMES_AGENT_TIMEOUT` → `AssertionError: dispatch did not wait on the lease's OWN budget (HERMES_TURN_LEASE_TIMEOUT=0.02): saw [5.0]`. (Old form could only have produced an unnamed `TimeoutError` — a hang-shaped red the skill rejects.) | 64 burners (2× ncpu) × 3 → 24/24 pass each run; 96 burners × 3 on `tests/gateway/test_turn_lease.py` → 12/12 each. | **Byte-identical to upstream** (`26350357d7` and `cd2bd160`). Draft ready: fork branch `tests-turn-lease-budget-witness`, RED-proved **on upstream main**, 12 passed there. |
+| `tests/agent/test_compression_review_76354.py::TestS3IdleChargedFromLastProgress::test_silence_cannot_approach_double_idle_timeout` | **Convert** — pure stopwatch (`assert elapsed < idle * 1.8`) on budget arithmetic. Membership measured, not argued: untouched tree = idle **4/4 PASS**, 64 burners **3/4 FAIL** (0.72 / 0.81 / 0.85s). CI red: 0.93s. | **Fake clock** (skill's "prefer a fake clock when the assertion is about budget ARITHMETIC") — `monkeypatch` `cc.time` with a `_FakeTimeModule` whose `monotonic` advances only by the host's own wait slices; `time`/`perf_counter`/`sleep` passed through. Asserts exact slices `[0.5, 0.25]` and give-up at `progress_at + idle`, instead of a fuzzy ceiling. | Mutated `wait_slice` to `min(max(idle, 0.005), …)` (charge from the check) → `AssertionError: second wait slice was not charged from the last progress event: slices=[0.5, 0.5], expected [0.5, 0.25]`. Second mutation (never extend on progress) → same assertion, `slices=[0.5]`. ⚠️ **First draft was vacuous** (advanced the clock inside the worker, so `since_progress` was 0 at slice time and the mutated run passed) — caught only by the RED proof, exactly the skill's 2-of-6 trap. | 64 burners × 3 → 24/24 pass; test dropped out of the slowest-durations list entirely (was 0.72–0.85s). | **Byte-identical at `26350357d7`**, but upstream `main` has since added `stall_fallback=False` to this test. Conversion **ported onto current upstream text**; fork branch `tests-compression-idle-budget-fake-clock`, RED-proved **on upstream main**, 10 passed there. |
+| `tests/test_tui_gateway_server.py::test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home` (+ sibling `…_installs_secret_scope`) | **Convert** — CI red was `assert ready.wait(timeout=5)` → "agent_ready never set after build" while the build was merely still running. The inner 5s bound was the racing deadline; measured build→ready tail 0.13–1.37s locally, 1.65–1.99s at 96 burners. | **Ordering witness** — join the thread `_start_agent_build` publishes at `session["_agent_build_thread"]`, then assert the facts directly: thread finished, `_make_agent` called, `agent_ready` set, no `agent_error`. 120s join is a hang guard, not a bound. Sibling converted too (skill: one converted test in a timing-sensitive file just re-rolls the dice). | Mutated `tui_gateway/server.py` to drop `ready.set()` from `_build`'s exit path → **both** tests fail with `AssertionError: agent_ready never set after the build thread exited`, **in 2.10s** (on the fact, not by waiting out a timeout). | 96 burners × 3 on the **full 632-test file** → 632 passed each run (109s / 110s / 119s). | **Fork-diverged file** → fixed on the branch only. **But the flaky assertion IS upstream-inherited verbatim** (upstream `main` lines 790/852) and upstream publishes `_agent_build_thread` (server.py:3377), so a **third draft** was prepared: fork branch `tests-tui-agent-build-thread-witness`, RED-proved **on upstream main**, both tests pass there. |
+
+**Ordering-sensitivity:** both file orders green, plus `-p randomly` enabled 3× green
+(proves the faked `time` module is `monkeypatch`-scoped and restores cleanly).
+
+**Scope:** test files only — `git status` verified no production file changed after
+every mutation/restore cycle. No test deleted or weakened; every conversion asserts a
+*stronger* fact than the duration it replaced.
+
+**Pre-existing red, shown not asserted:**
+`tests/test_tui_gateway_server.py::test_model_options_preserves_canonical_custom_row_after_agent_init`
+fails identically on a **pristine `upstream/main` checkout with zero diff applied**
+(`1 failed, 618 passed` both ways). Not caused by this pass.
+
+**Upstream package:** `/tmp/flake-fix-upstream/README.md` — 3 drafts (≤150 words each),
+worktrees `/tmp/flake-up-{1,2,3}` off `upstream/main@cd2bd160`. Branches pushed to
+**fork only**; PRs are **drafts, not opened** — Apollo reviews then submits.
