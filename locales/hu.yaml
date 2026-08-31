@@ -222,6 +222,14 @@ gateway:
     set_global_save_failed:    "🧠 ✓ Gondolkodási erőfeszítés beállítva: `{effort}` (csak ebben a munkamenetben — a konfiguráció mentése sikertelen)\n_(a következő üzenettől lép életbe)_"
     set_session:               "🧠 ✓ Gondolkodási erőfeszítés beállítva: `{effort}` (csak ebben a munkamenetben — add hozzá a `--global` opciót a megőrzéshez)\n_(a következő üzenettől lép életbe)_"
 
+  redo:
+    nothing: "Nincs mit újra végrehajtani."
+    restart_lost: "Nincs mit újra végrehajtani - az újra-előzmények nem élik túl az újraindítást."
+    restored: "↪️ {ops} visszavonás újra végrehajtva ({count} üzenet visszaállítva)."
+    invalid_count: "Érvénytelen darabszám: \"{arg}\" - használd a /redo vagy /redo N parancsot."
+    busy: "⏳ Az adatbázis foglalt volt - semmi sem változott. Próbáld újra a /redo parancsot egy pillanat múlva."
+    error: "⚠️ A /redo nem fejeződött be (belső hiba - semmi sem változott). Naplózva lett."
+
   reload_mcp:
     cancelled:             "🟡 /reload-mcp megszakítva. Az MCP-eszközök változatlanok."
     always_followup:       "ℹ️ A jövőbeli `/reload-mcp` hívások megerősítés nélkül futnak. Újra engedélyezhető az `approvals.mcp_reload_confirm: true` beállítással a config.yaml fájlban."

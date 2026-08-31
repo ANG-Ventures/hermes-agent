@@ -222,6 +222,14 @@ gateway:
     set_global_save_failed:    "🧠 ✓ 推理强度已设置为 `{effort}`（仅本会话 — 配置保存失败）\n_（下一条消息生效）_"
     set_session:               "🧠 ✓ 推理强度已设置为 `{effort}`（仅本会话 — 添加 `--global` 以持久化）\n_（下一条消息生效）_"
 
+  redo:
+    nothing: "没有可重做的操作。"
+    restart_lost: "没有可重做的操作 - 重做历史在重启后不会保留。"
+    restored: "↪️ 已重做 {ops} 次撤销操作（恢复 {count} 条消息）。"
+    invalid_count: "无效的数量 \"{arg}\" - 请使用 /redo 或 /redo N。"
+    busy: "⏳ 数据库繁忙 - 未做任何更改。请稍后重试 /redo。"
+    error: "⚠️ 无法完成 /redo（内部错误 - 未做任何更改）。已记录该问题。"
+
   reload_mcp:
     cancelled:             "🟡 已取消 /reload-mcp。MCP 工具未更改。"
     always_followup:       "ℹ️ 后续 `/reload-mcp` 调用将不再确认。可在 `config.yaml` 中将 `approvals.mcp_reload_confirm: true` 重新启用。"

@@ -222,6 +222,14 @@ gateway:
     set_global_save_failed:    "🧠 ✓ Esfuerzo de razonamiento ajustado a `{effort}` (solo en la sesión — error al guardar la configuración)\n_(se aplica en el próximo mensaje)_"
     set_session:               "🧠 ✓ Esfuerzo de razonamiento ajustado a `{effort}` (solo en la sesión — añade `--global` para persistir)\n_(se aplica en el próximo mensaje)_"
 
+  redo:
+    nothing: "No hay nada que rehacer."
+    restart_lost: "No hay nada que rehacer: el historial de rehacer no sobrevive a un reinicio."
+    restored: "↪️ Se rehicieron {ops} operación(es) de deshacer ({count} mensaje(s) restaurado(s))."
+    invalid_count: "Cantidad no válida \"{arg}\": usa /redo o /redo N."
+    busy: "⏳ La base de datos estaba ocupada: no se cambió nada. Vuelve a intentar /redo en un momento."
+    error: "⚠️ No se pudo completar /redo (error interno: no se cambió nada). Ha quedado registrado."
+
   reload_mcp:
     cancelled:             "🟡 /reload-mcp cancelado. Las herramientas MCP no han cambiado."
     always_followup:       "ℹ️ Las próximas llamadas a `/reload-mcp` se ejecutarán sin confirmación. Reactiva mediante `approvals.mcp_reload_confirm: true` en `config.yaml`."

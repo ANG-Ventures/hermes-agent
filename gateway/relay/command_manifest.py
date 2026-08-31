@@ -85,6 +85,7 @@ def build_relay_command_manifest() -> List[Dict[str, Any]]:
         },
         {"name": "retry", "description": "Retry your last message"},
         {"name": "undo", "description": "Remove the last exchange"},
+        {"name": "redo", "description": "Restore the last undone exchange"},
         {"name": "status", "description": "Show Hermes session status"},
         {"name": "sethome", "description": "Set this chat as the home channel"},
         {"name": "stop", "description": "Stop the running Hermes agent"},

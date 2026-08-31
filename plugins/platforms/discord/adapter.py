@@ -5898,6 +5898,10 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_undo(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/undo")
 
+        @tree.command(name="redo", description="Restore the last undone exchange")
+        async def slash_redo(interaction: discord.Interaction):
+            await self._run_simple_slash(interaction, "/redo")
+
         @tree.command(name="status", description="Show Hermes session status")
         async def slash_status(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/status", "Status sent~")

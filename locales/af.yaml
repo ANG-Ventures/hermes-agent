@@ -222,6 +222,14 @@ gateway:
     set_global_save_failed:    "🧠 ✓ Redenering-inspanning gestel op `{effort}` (slegs sessie — konfigurasie-stoor het misluk)\n_(neem effek by die volgende boodskap)_"
     set_session:               "🧠 ✓ Redenering-inspanning gestel op `{effort}` (slegs sessie — voeg `--global` by om permanent te stoor)\n_(neem effek by die volgende boodskap)_"
 
+  redo:
+    nothing: "Niks om te herdoen nie."
+    restart_lost: "Niks om te herdoen nie - herdoen-geskiedenis oorleef nie 'n herbegin nie."
+    restored: "↪️ {ops} ontdoen-bewerking(s) herdoen ({count} boodskap(pe) herstel)."
+    invalid_count: "Ongeldige telling \"{arg}\" - gebruik /redo of /redo N."
+    busy: "⏳ Die databasis was besig - niks is verander nie. Probeer /redo oor 'n oomblik weer."
+    error: "⚠️ Kon nie /redo voltooi nie (interne fout - niks is verander nie). Dit is aangeteken."
+
   reload_mcp:
     cancelled:             "🟡 /reload-mcp gekanselleer. MCP-gereedskap onveranderd."
     always_followup:       "ℹ️ Toekomstige `/reload-mcp`-oproepe sal sonder bevestiging loop. Heraktiveer via `approvals.mcp_reload_confirm: true` in config.yaml."

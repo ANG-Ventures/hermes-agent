@@ -4047,6 +4047,7 @@ def _rewind_active_session_history(
     user_ordinal: int,
     *,
     require_retryable: bool = False,
+    record_redo: bool = False,
 ) -> tuple[list[dict], dict, int]:
     """Rewind one canonical user turn while retaining carrier scaffolding.
 
@@ -4055,6 +4056,10 @@ def _rewind_active_session_history(
     transaction.  Memory is installed only after the durable commit and is
     built from the already-validated prefix plus the returned scaffold row id,
     so there is no fallible post-commit reload.
+
+    ``record_redo`` banks the archived row ids so ``session.redo`` can replay
+    them. It is opt-in because /retry and rollback also drive this helper, and
+    those replace the turn rather than leaving a branch to return to.
     """
     from agent.context_compressor import (
         history_before_user_originated_turn,
@@ -4167,7 +4172,19 @@ def _rewind_active_session_history(
                         warm["_row_id"] = row_id
             live_view = durable_live_view
             rewound_count = int(result.get("rewound_count", 0))
+            rewound_ids = [int(i) for i in (result.get("rewound_ids") or [])]
             persisted = True
+            # Bank the rewind so session.redo can replay exactly these rows.
+            # Only a plain undo leaves a branch worth returning to: /retry and
+            # rollback replace the turn, so they opt out via record_redo.
+            if record_redo and rewound_ids:
+                try:
+                    import hermes_undo
+
+                    hermes_undo._session_db = db
+                    hermes_undo.record_undo(session_key, 1, rewound_ids)
+                except Exception:  # pragma: no cover - defensive
+                    logger.debug("undo: redo bookkeeping skipped", exc_info=True)
     elif require_retryable:
         retryable_user_text(live_view.get("content"))
 
@@ -15422,6 +15439,7 @@ _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset(
         "proactive",
         "moa",
         "undo",
+        "redo",
         "learn",
         "init",
         "compress",

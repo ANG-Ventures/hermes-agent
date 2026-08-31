@@ -18853,6 +18853,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 execute=_do_undo,
             )
         
+        if canonical == "redo":
+            return await self._handle_redo_command(event)
+
         if canonical == "sethome":
             return await self._handle_set_home_command(event)
 

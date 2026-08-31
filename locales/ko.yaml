@@ -222,6 +222,14 @@ gateway:
     set_global_save_failed:    "🧠 ✓ 추론 노력이 `{effort}`(으)로 설정되었습니다 (세션 한정 — 설정 저장 실패)\n_(다음 메시지부터 적용됩니다)_"
     set_session:               "🧠 ✓ 추론 노력이 `{effort}`(으)로 설정되었습니다 (세션 한정 — 영구 저장하려면 `--global` 추가)\n_(다음 메시지부터 적용됩니다)_"
 
+  redo:
+    nothing: "다시 실행할 작업이 없습니다."
+    restart_lost: "다시 실행할 작업이 없습니다 - 다시 실행 기록은 재시작 후에는 남지 않습니다."
+    restored: "↪️ 실행 취소 {ops}건을 다시 실행했습니다({count}개 메시지 복원)."
+    invalid_count: "잘못된 개수 \"{arg}\" - /redo 또는 /redo N을 사용하세요."
+    busy: "⏳ 데이터베이스가 사용 중이었습니다 - 변경된 내용이 없습니다. 잠시 후 /redo를 다시 실행하세요."
+    error: "⚠️ /redo를 완료하지 못했습니다(내부 오류 - 변경된 내용 없음). 기록되었습니다."
+
   reload_mcp:
     cancelled:             "🟡 /reload-mcp가 취소되었습니다. MCP 도구는 변경되지 않았습니다."
     always_followup:       "ℹ️ 이후 `/reload-mcp` 호출은 확인 없이 실행됩니다. config.yaml의 `approvals.mcp_reload_confirm: true`로 다시 활성화할 수 있습니다."

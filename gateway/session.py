@@ -3692,6 +3692,16 @@ class SessionStore:
                 seen.add(session_id)
                 session_id = reroutes[session_id]
             self._append_to_transcript_serialized(session_id, message)
+            # A new user message ends the redo branch, exactly as typing after
+            # an undo does in a text editor: the undone turns are no longer
+            # reachable, so /redo must not resurrect them behind newer input.
+            if message.get("role") == "user":
+                try:
+                    from hermes_undo import on_user_message_appended
+
+                    on_user_message_appended(session_id)
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.debug("redo-branch invalidation skipped: %s", e)
 
     def _append_to_transcript_serialized(
         self, session_id: str, message: Dict[str, Any]
@@ -4190,6 +4200,19 @@ class SessionStore:
                 logger.debug("rewind_session: rewind_to_message failed: %s", e)
                 return None
             self._clear_dirty_transcript(session_id)
+            # Bank the rewind so /redo can replay it. Only the plain /undo path
+            # is redoable: a /retry rewind is immediately followed by a resend,
+            # so its rows are not a branch the user can return to.
+            if not require_retryable_composite:
+                try:
+                    import hermes_undo
+
+                    hermes_undo._session_db = self._db
+                    hermes_undo.record_undo(
+                        session_id, turns_undone, result.get("rewound_ids") or []
+                    )
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.debug("rewind_session: redo bookkeeping skipped: %s", e)
             # ``target_view`` is the canonical live projection of the physical DB
             # row. For a composite carrier, the raw target contains the historical
             # summary wrapper and must never be echoed back as the editable prompt.
@@ -4211,6 +4234,49 @@ class SessionStore:
                 "turns_undone": turns_undone,
                 "target_text": target_text,
             }
+
+    def restore_session(self, session_id: str, n: int = 1) -> Optional[Dict[str, Any]]:
+        """Replay ``n`` recorded ``/undo`` operations (the ``/redo`` path).
+
+        Reactivates exactly the rows those rewinds soft-deleted. Outcomes:
+
+        - a result dict (``reactivated_count`` present) — success, a healthy
+          empty (count 0 with a ``message``), or an honest partial;
+        - ``{"status": "busy"}`` — a retryable lock/busy DB error;
+        - ``{"status": "error"}`` — a genuine fault, logged at ERROR;
+        - ``None`` — no DB handle at all.
+
+        Reporting busy and error distinctly matters: collapsing either into
+        "nothing to redo" would tell the user their redo branch is gone when it
+        is merely momentarily unavailable.
+        """
+        import sqlite3
+
+        if not self._db:
+            return None
+        with self._get_transcript_drain_lock():
+            try:
+                import hermes_undo
+
+                hermes_undo._session_db = self._db
+                return hermes_undo.redo(session_id, n)
+            except sqlite3.OperationalError as e:
+                message = str(e).lower()
+                if "locked" in message or "busy" in message:
+                    logger.warning(
+                        "restore_session: transient DB busy for %s: %r", session_id, e
+                    )
+                    return {"status": "busy"}
+                logger.error(
+                    "restore_session: DB error for %s: %r", session_id, e, exc_info=True
+                )
+                return {"status": "error"}
+            except Exception as e:
+                logger.error(
+                    "restore_session: redo failed for %s: %r",
+                    session_id, e, exc_info=True,
+                )
+                return {"status": "error"}
 
 
 def build_session_context(

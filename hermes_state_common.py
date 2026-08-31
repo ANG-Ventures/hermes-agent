@@ -419,6 +419,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     compression_ineffective_count INTEGER NOT NULL DEFAULT 0,
     profile_name TEXT,
     rewind_count INTEGER NOT NULL DEFAULT 0,
+    -- Counter asymmetry with rewind_count is intentional: rewind_count bumps
+    -- per low-level rewind_to_message call, redo_count bumps once per /redo
+    -- command regardless of how many undo operations it replays.
+    redo_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
     pinned INTEGER NOT NULL DEFAULT 0,
     hidden INTEGER NOT NULL DEFAULT 0,

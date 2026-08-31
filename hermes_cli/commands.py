@@ -166,6 +166,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, args_hint="[initial text]", aliases=("compose",)),
     CommandDef("undo", "Back up N user turns and re-prompt (default 1)", "Session",
                args_hint="[N]"),
+    CommandDef("redo", "Redo N undo operations (default 1)", "Session",
+               args_hint="[N]"),
     CommandDef("title", "Set a title for the current session", "Session",
                args_hint="[name]"),
     CommandDef("handoff", "Hand off this session to a messaging platform (Telegram, Discord, etc.)", "Session",
@@ -466,6 +468,16 @@ def resolve_command(name: str) -> CommandDef | None:
     Accepts names with or without the leading slash.
     """
     return _COMMAND_LOOKUP.get(name.lower().lstrip("/"))
+
+
+# Commands that must NEVER be reached by prefix expansion — only by their
+# exact name. The CLI expands an unambiguous prefix to a full command and
+# breaks ties by "unique shortest match", which means a newly added SHORT
+# command silently steals an abbreviation users already rely on. /redo is the
+# shortest of the /re* family, so without this it would capture a bare /re
+# (previously reported as ambiguous) and quietly mutate the transcript.
+# Keep this list tight: every entry costs its own abbreviation.
+EXACT_MATCH_ONLY_COMMANDS: frozenset[str] = frozenset({"/redo"})
 
 
 def _build_description(cmd: CommandDef) -> str:
@@ -1478,7 +1490,12 @@ _SLACK_PRIORITY_ALIASES: tuple[str, ...] = ()
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights"})
+#   - "redo": /redo is reachable via `/hermes redo` on Slack. The registry is
+#     at the 50-cap, so adding /redo natively evicts the tail — measured as
+#     /usage, a far more frequently used command. Undo/redo is also a
+#     lower-frequency, deliberate action, so it is the better one to route
+#     through /hermes rather than displacing a daily-driver command.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights", "redo"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

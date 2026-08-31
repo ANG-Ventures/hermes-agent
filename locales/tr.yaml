@@ -222,6 +222,14 @@ gateway:
     set_global_save_failed:    "🧠 ✓ Akıl yürütme gücü `{effort}` olarak ayarlandı (yalnızca bu oturum — yapılandırma kaydedilemedi)\n_(sonraki mesajda etkili)_"
     set_session:               "🧠 ✓ Akıl yürütme gücü `{effort}` olarak ayarlandı (yalnızca bu oturum — kalıcı yapmak için `--global` ekleyin)\n_(sonraki mesajda etkili)_"
 
+  redo:
+    nothing: "Yinelenecek bir şey yok."
+    restart_lost: "Yinelenecek bir şey yok - yineleme geçmişi yeniden başlatmadan sonra kalmaz."
+    restored: "↪️ {ops} geri alma işlemi yinelendi ({count} ileti geri yüklendi)."
+    invalid_count: "Geçersiz sayı \"{arg}\" - /redo veya /redo N kullanın."
+    busy: "⏳ Veritabanı meşguldü - hiçbir şey değişmedi. Birazdan /redo komutunu yeniden deneyin."
+    error: "⚠️ /redo tamamlanamadı (dahili hata - hiçbir şey değişmedi). Kayda alındı."
+
   reload_mcp:
     cancelled:             "🟡 /reload-mcp iptal edildi. MCP araçları değiştirilmedi."
     always_followup:       "ℹ️ Bundan sonraki `/reload-mcp` çağrıları onaysız çalışacak. `config.yaml` içinde `approvals.mcp_reload_confirm: true` ile yeniden etkinleştirebilirsiniz."

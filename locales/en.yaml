@@ -237,6 +237,14 @@ gateway:
     set_global_save_failed:    "🧠 ✓ Reasoning effort set to `{effort}` (session only — config save failed)\n_(takes effect on next message)_"
     set_session:               "🧠 ✓ Reasoning effort set to `{effort}` (session only — add `--global` to persist)\n_(takes effect on next message)_"
 
+  redo:
+    nothing: "Nothing to redo."
+    restart_lost: "Nothing to redo - redo history does not survive a restart."
+    restored: "↪️ Redid {ops} undo operation(s) ({count} message(s) restored)."
+    invalid_count: "Invalid count \"{arg}\" - use /redo or /redo N."
+    busy: "⏳ The database was busy - nothing was changed. Try /redo again in a moment."
+    error: "⚠️ Couldn't complete /redo (internal error - nothing was changed). It's been logged."
+
   reload_mcp:
     cancelled:             "🟡 /reload-mcp cancelled. MCP tools unchanged."
     always_followup:       "ℹ️ Future `/reload-mcp` calls will run without confirmation. Re-enable via `approvals.mcp_reload_confirm: true` in config.yaml."

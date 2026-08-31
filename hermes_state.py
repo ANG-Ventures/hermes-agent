@@ -13052,9 +13052,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             {
                 "rewound_count": int,    # number of rows newly flipped to active=0
+                "rewound_ids":   [int],  # ids of exactly those rows, oldest first
                 "target_message": dict,  # full row dict of the target
                 "new_head_id":   int|None  # id of the last still-active row, or None
             }
+
+        ``rewound_ids`` names the rows this call actually deactivated (rows
+        already inactive are excluded), which is what :meth:`restore_ids` needs
+        to replay the rewind exactly — see the ``/redo`` path in
+        ``hermes_undo``.
 
         Raises ``ValueError`` if the target message does not exist in
         *session_id* or if its role is not ``"user"``.  With
@@ -13198,6 +13204,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         result = {
             "rewound_count": len(rewound),
+            "rewound_ids": [int(i) for i in rewound],
             "target_message": target_row,
             "new_head_id": new_head_id,
         }
@@ -13209,8 +13216,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Mark inactive messages with id >= *since_message_id* active again.
 
         Returns the number of rows flipped back to ``active=1``.
-        Intended for undo-of-rewind and test cleanup; not wired to a
-        slash command in v1.
+        Intended for undo-of-rewind and test cleanup. Prefer
+        :meth:`restore_ids` for ``/redo``: a suffix restore also revives rows
+        that were archived by something other than the rewind being replayed.
         """
         def _do(conn):
             cursor = conn.execute(
@@ -13228,6 +13236,56 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return len(ids)
 
         return self._execute_write(_do)
+
+    def restore_ids(self, session_id: str, ids: List[int]) -> int:
+        """Reactivate exactly the inactive rows in ``ids`` for *session_id*.
+
+        The id-set counterpart to :meth:`restore_rewound`, which restores a
+        contiguous suffix. ``/redo`` needs the set form: replaying one undo
+        operation must revive exactly the rows that operation deactivated and
+        nothing else, so a row archived in between by an unrelated write
+        (compaction, a sibling rewind) is not resurrected as a side effect.
+
+        Returns the number of rows flipped back to ``active=1``. Idempotent:
+        rows already active, belonging to another session, or no longer
+        present are skipped rather than raising — so a caller detects a
+        partial restore by comparing the count against ``len(ids)``.
+        ``redo_count`` is deliberately not bumped here; that counter is
+        per-command and one ``/redo`` may replay several operations.
+        """
+        bounded_ids = [int(i) for i in ids]
+        if not bounded_ids:
+            return 0
+
+        def _do(conn):
+            placeholders = ",".join("?" for _ in bounded_ids)
+            cursor = conn.execute(
+                f"UPDATE messages SET active = 1 "
+                f"WHERE session_id = ? AND id IN ({placeholders}) AND active = 0",
+                (session_id, *bounded_ids),
+            )
+            return cursor.rowcount
+
+        return self._execute_write(_do)
+
+    def bump_redo_count(self, session_id: str) -> None:
+        """Increment ``sessions.redo_count`` by one (once per ``/redo``).
+
+        Public helper so the shared undo/redo core does not reach into the
+        private ``_execute_write``. Counter asymmetry is intentional:
+        ``rewind_count`` bumps per low-level :meth:`rewind_to_message` call;
+        ``redo_count`` bumps once per ``/redo`` command regardless of how many
+        operations that command replayed.
+        """
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET redo_count = COALESCE(redo_count, 0) + 1 "
+                "WHERE id = ?",
+                (session_id,),
+            )
+
+        self._execute_write(_do)
 
     # =========================================================================
     # Search

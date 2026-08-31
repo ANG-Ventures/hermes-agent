@@ -222,6 +222,14 @@ gateway:
     set_global_save_failed:    "🧠 ✓ 推論強度を `{effort}` に設定しました (セッションのみ — 設定の保存に失敗)\n_(次のメッセージから有効)_"
     set_session:               "🧠 ✓ 推論強度を `{effort}` に設定しました (セッションのみ — 永続化するには `--global` を追加)\n_(次のメッセージから有効)_"
 
+  redo:
+    nothing: "やり直せる操作はありません。"
+    restart_lost: "やり直せる操作はありません - やり直し履歴は再起動後には残りません。"
+    restored: "↪️ {ops} 件の取り消し操作をやり直しました（{count} 件のメッセージを復元）。"
+    invalid_count: "無効な回数 \"{arg}\" - /redo または /redo N を使ってください。"
+    busy: "⏳ データベースが使用中でした - 変更はありません。少し待ってから /redo をもう一度実行してください。"
+    error: "⚠️ /redo を完了できませんでした（内部エラー - 変更はありません）。記録済みです。"
+
   reload_mcp:
     cancelled:             "🟡 /reload-mcp をキャンセルしました。MCP ツールは変更されていません。"
     always_followup:       "ℹ️ 今後の `/reload-mcp` は確認なしで実行されます。`config.yaml` で `approvals.mcp_reload_confirm: true` を設定すると再有効化できます。"

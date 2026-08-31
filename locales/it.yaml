@@ -222,6 +222,14 @@ gateway:
     set_global_save_failed:    "🧠 ✓ Sforzo di reasoning impostato su `{effort}` (solo per questa sessione — salvataggio della configurazione non riuscito)\n_(verrà applicato al prossimo messaggio)_"
     set_session:               "🧠 ✓ Sforzo di reasoning impostato su `{effort}` (solo per questa sessione — aggiungi `--global` per renderlo permanente)\n_(verrà applicato al prossimo messaggio)_"
 
+  redo:
+    nothing: "Niente da ripristinare."
+    restart_lost: "Niente da ripristinare - la cronologia di ripristino non sopravvive a un riavvio."
+    restored: "↪️ Ripristinate {ops} operazioni di annullamento ({count} messaggio/i recuperato/i)."
+    invalid_count: "Numero non valido \"{arg}\" - usa /redo o /redo N."
+    busy: "⏳ Il database era occupato - non è stato modificato nulla. Riprova /redo tra un momento."
+    error: "⚠️ Impossibile completare /redo (errore interno - non è stato modificato nulla). È stato registrato."
+
   reload_mcp:
     cancelled:             "🟡 /reload-mcp annullato. Strumenti MCP invariati."
     always_followup:       "ℹ️ Le future chiamate a `/reload-mcp` verranno eseguite senza conferma. Riattiva tramite `approvals.mcp_reload_confirm: true` in config.yaml."

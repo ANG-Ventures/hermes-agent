@@ -226,6 +226,14 @@ gateway:
     set_global_save_failed:    "🧠 ✓ Iarracht réasúnaíochta socraithe go `{effort}` (seisiún amháin — theip ar shábháil cumraíochta)\n_(éifeachtach ón gcéad teachtaireacht eile)_"
     set_session:               "🧠 ✓ Iarracht réasúnaíochta socraithe go `{effort}` (seisiún amháin — cuir `--global` leis chun é a choinneáil)\n_(éifeachtach ón gcéad teachtaireacht eile)_"
 
+  redo:
+    nothing: "Níl aon rud le hathdhéanamh."
+    restart_lost: "Níl aon rud le hathdhéanamh - ní mhaireann stair an athdhéanta thar atosú."
+    restored: "↪️ Athrinneadh {ops} oibríocht cealaithe ({count} teachtaireacht aisghafa)."
+    invalid_count: "Líon neamhbhailí \"{arg}\" - bain úsáid as /redo nó /redo N."
+    busy: "⏳ Bhí an bunachar sonraí gnóthach - níor athraíodh aon rud. Bain triail as /redo arís i gceann nóiméid."
+    error: "⚠️ Níorbh fhéidir /redo a chríochnú (earráid inmheánach - níor athraíodh aon rud). Taifeadadh é."
+
   reload_mcp:
     cancelled:             "🟡 /reload-mcp cealaithe. Tá uirlisí MCP gan athrú."
     always_followup:       "ℹ️ Rithfear glaonna `/reload-mcp` amach anseo gan dearbhú. Athchumasaigh trí `approvals.mcp_reload_confirm: true` a shocrú in config.yaml."

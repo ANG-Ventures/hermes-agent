@@ -985,7 +985,7 @@ def _(rid, params: dict) -> dict:
             target_position = len(user_indices) - turns_undone
             try:
                 active, live_view, rewound_count = _rewind_active_session_history(
-                    session, target_position
+                    session, target_position, record_redo=True
                 )
             except ValueError as exc:
                 return _err(rid, 4004, f"undo: {exc}")
@@ -1027,6 +1027,48 @@ def _(rid, params: dict) -> dict:
             rid,
             {"type": "prefill", "message": target_text, "notice": notice},
         )
+
+    if name == "redo":
+        # /redo [N]: replay the last N /undo operations, reactivating exactly
+        # the rows those undos archived. Restores rather than discards, so it
+        # needs no destructive confirmation.
+        if not session:
+            return _err(rid, 4001, "no active session to redo")
+        if session.get("running"):
+            return _err(
+                rid, 4009, "session busy — /interrupt the current turn before /redo"
+            )
+        n = 1
+        arg_str = (arg or "").strip()
+        if arg_str:
+            try:
+                n = int(arg_str.split()[0])
+            except (ValueError, IndexError):
+                return _err(
+                    rid,
+                    4004,
+                    f"redo: invalid count {arg_str!r} — use /redo or /redo N",
+                )
+        if n < 1:
+            n = 1
+        response = _methods["session.redo"](
+            rid,
+            {"session_id": params.get("session_id", ""), "n": n},
+        )
+        if isinstance(response, dict) and response.get("error"):
+            return response
+        payload = (response or {}).get("result") or {}
+        restored = int(payload.get("restored") or 0)
+        if restored <= 0:
+            output = payload.get("message") or "Nothing to redo."
+        else:
+            op_word = "operation" if n == 1 else "operations"
+            output = (
+                f"↷ Redid {n} undo {op_word} ({restored} message(s) restored)."
+            )
+            if payload.get("partial") and payload.get("message"):
+                output += f"\n{payload['message']}"
+        return _ok(rid, {"type": "exec", "output": output})
 
     if name in {"snapshot", "snap"}:
         subcommand = arg.split(maxsplit=1)[0].lower() if arg else ""

@@ -10832,6 +10832,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if durable_text:
                     removed_text = durable_text
                 rewound_rows = result.get("rewound_count", 0)
+                # Bank the rewind so /redo can replay exactly these rows.
+                try:
+                    import hermes_undo
+
+                    hermes_undo._session_db = self._session_db
+                    hermes_undo.record_undo(
+                        self.session_id,
+                        turns_undone,
+                        result.get("rewound_ids") or [],
+                    )
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.debug("undo: redo bookkeeping skipped: %s", e)
             except Exception as e:
                 logger.debug("undo: durable rewind failed: %s", e)
                 print(f"(x_x) Undo failed; history was not changed: {e}")
@@ -10884,6 +10896,90 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # edit and resubmit (Claude-Code-style). Editable, not auto-sent.
         if prefill and removed_text:
             self._prefill_input_buffer(removed_text)
+
+    def redo_last(self, n: int = 1) -> None:
+        """Replay the last N ``/undo`` operations (the inverse of /undo).
+
+        Because ``/undo`` soft-deletes (rows keep ``active=0`` in the session
+        DB), redo simply reactivates exactly the rows those undos archived,
+        then reloads the warm history from the restored durable transcript so
+        the in-memory view and the DB agree.
+
+        The redo branch lives in memory only: it does not survive a restart,
+        and appending a new user message clears it — the same contract a text
+        editor offers.
+        """
+        if self._session_db is None or not self.session_id:
+            print("(._.) No session database — nothing to redo.")
+            return
+
+        if n < 1:
+            n = 1
+
+        import hermes_undo
+
+        hermes_undo._session_db = self._session_db
+        try:
+            result = hermes_undo.redo(self.session_id, n)
+        except Exception as e:
+            logger.debug("redo: failed: %s", e)
+            print(f"(x_x) Redo failed; history was not changed: {e}")
+            return
+
+        reactivated = int(result.get("reactivated_count") or 0)
+        if reactivated <= 0:
+            print(f"(._.) {result.get('message') or 'Nothing to redo.'}")
+            return
+
+        # Republish the warm history from the restored durable transcript.
+        try:
+            self.conversation_history = (
+                self._session_db.get_messages_as_conversation(
+                    self.session_id,
+                    repair_alternation=True,
+                )
+            )
+        except Exception as e:
+            logger.debug("redo: history reload failed: %s", e)
+
+        # Mirror /undo's agent surgery so the next turn rebuilds from the
+        # restored transcript instead of a stale flush index.
+        if self.agent is not None:
+            if hasattr(self.agent, "_invalidate_system_prompt"):
+                try:
+                    self.agent._invalidate_system_prompt()
+                except Exception:
+                    pass
+            if hasattr(self.agent, "_last_flushed_db_idx"):
+                try:
+                    self.agent._last_flushed_db_idx = len(self.conversation_history)
+                except Exception:
+                    pass
+            if hasattr(self.agent, "_session_messages"):
+                self.agent._session_messages = self.conversation_history
+            if hasattr(self.agent, "_db_flush_scan_prefix"):
+                self.agent._db_flush_scan_prefix = self.conversation_history[:]
+            try:
+                _mm = getattr(self.agent, "_memory_manager", None)
+                if _mm is not None and self.session_id:
+                    _mm.on_session_switch(
+                        self.session_id,
+                        parent_session_id="",
+                        reset=False,
+                        rewound=True,
+                    )
+            except Exception:
+                pass
+
+        op_word = "operation" if n == 1 else "operations"
+        print(
+            f"(^_^)b Redid {min(n, reactivated)} undo {op_word} "
+            f"({reactivated} message(s) restored)."
+        )
+        # A partial replay must not read as a full one.
+        if result.get("partial") and result.get("message"):
+            print(f"  {result['message']}")
+        print(f"  {len(self.conversation_history)} message(s) in history.")
 
     @staticmethod
     def _undo_content_to_text(content) -> str:
@@ -12636,6 +12732,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             ) is None:
                 return True  # confirmation cancelled — command handled, keep REPL alive
             self.undo_last(_undo_n)
+        elif canonical == "redo":
+            # Parse optional operation count: "/redo" → 1, "/redo 3" → 3.
+            _redo_n = 1
+            _redo_parts = cmd_original.split()
+            if len(_redo_parts) > 1:
+                try:
+                    _redo_n = int(_redo_parts[1])
+                except ValueError:
+                    print(
+                        f"(._.) Invalid count {_redo_parts[1]!r} — "
+                        "use /redo or /redo N."
+                    )
+                    return True  # bad arg — command handled, keep the REPL alive
+                if _redo_n < 1:
+                    _redo_n = 1
+            # /redo restores content rather than discarding it, so unlike /undo
+            # it is not destructive and needs no confirmation.
+            self.redo_last(_redo_n)
         elif canonical == "branch":
             self._handle_branch_command(cmd_original)
         elif canonical == "worktree":
@@ -13059,10 +13173,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # Prefix matching: if input uniquely identifies one command, execute it.
                 # Matches against both built-in COMMANDS and installed skill commands so
                 # that execution-time resolution agrees with tab-completion.
-                from hermes_cli.commands import COMMANDS
+                from hermes_cli.commands import (
+                    COMMANDS,
+                    EXACT_MATCH_ONLY_COMMANDS,
+                )
                 typed_base = cmd_lower.split()[0]
                 all_known = set(COMMANDS) | set(skill_commands) | set(skill_bundles)
                 matches = [c for c in all_known if c.startswith(typed_base)]
+                # A command in EXACT_MATCH_ONLY_COMMANDS participates only on an
+                # exact match. Without this, adding a short command silently
+                # recaptures an established abbreviation: /redo is the shortest
+                # of the thirteen /re* commands, so the unique-shortest rule
+                # below would resolve a bare /re — previously "ambiguous", and
+                # a reasonable way to reach for /reset or /retry — to a
+                # destructive /redo with no warning.
+                matches = [
+                    c
+                    for c in matches
+                    if c not in EXACT_MATCH_ONLY_COMMANDS or c == typed_base
+                ]
                 if len(matches) > 1:
                     # Prefer an exact match (typed the full command name)
                     exact = [c for c in matches if c == typed_base]

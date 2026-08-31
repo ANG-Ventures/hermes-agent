@@ -2873,12 +2873,83 @@ def _(rid, params: dict) -> dict:
         if user_indices:
             try:
                 _installed, _live_view, rewound_count = (
-                    _rewind_active_session_history(session, len(user_indices) - 1)
+                    _rewind_active_session_history(
+                        session, len(user_indices) - 1, record_redo=True
+                    )
                 )
                 removed = rewound_count
             except Exception as exc:
                 return _err(rid, 5008, f"undo: {exc}")
     return _ok(rid, {"removed": removed})
+
+
+@method("session.redo")
+def _(rid, params: dict) -> dict:
+    """Replay the last N session.undo operations for this session."""
+    session, err = _sess(params, rid)
+    if err:
+        return err
+    # Same guard as session.undo: mutating history under a running turn races
+    # prompt.submit's post-run write.
+    if session.get("running"):
+        return _err(
+            rid, 4009, "session busy — /interrupt the current turn before /redo"
+        )
+    try:
+        n = int(params.get("n") or 1)
+    except (TypeError, ValueError):
+        return _err(rid, 4004, "redo: invalid count — use an integer")
+    if n < 1:
+        n = 1
+
+    session_key = session.get("session_key", "")
+    if not session_key:
+        return _err(rid, 4001, "no session key for redo")
+
+    restored = 0
+    with session["history_lock"]:
+        if session.get("running"):
+            return _err(
+                rid, 4009, "session busy — /interrupt the current turn before /redo"
+            )
+        try:
+            import hermes_undo
+
+            with _session_db(session) as db:
+                if db is None:
+                    return _err(rid, 4001, "no session database for redo")
+                hermes_undo._session_db = db
+                result = hermes_undo.redo(session_key, n)
+                restored = int(result.get("reactivated_count") or 0)
+                if restored:
+                    # Republish the warm history from the restored transcript
+                    # so the in-memory view and the DB agree.
+                    installed = db.get_messages_as_conversation(
+                        session_key,
+                        repair_alternation=True,
+                        include_row_ids=True,
+                    )
+                    session["history"] = installed
+                    session["history_version"] = (
+                        int(session.get("history_version", 0)) + 1
+                    )
+                    agent = session.get("agent")
+                    if agent is not None:
+                        agent._session_messages = installed
+                        if hasattr(agent, "_last_flushed_db_idx"):
+                            agent._last_flushed_db_idx = len(installed)
+                        if hasattr(agent, "_db_flush_scan_prefix"):
+                            agent._db_flush_scan_prefix = installed[:]
+        except Exception as exc:
+            return _err(rid, 5008, f"redo: {exc}")
+    return _ok(
+        rid,
+        {
+            "restored": restored,
+            "message": result.get("message") or "",
+            "partial": bool(result.get("partial")),
+        },
+    )
 
 
 @method("session.compress")
