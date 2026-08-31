@@ -2063,10 +2063,20 @@ _SENSITIVE_BARE_FILE_WORDS = frozenset({
 # ``token_counts.png`` is not a credential. Name-, prefix- and suffix-based
 # rules (``.env*``, ``id_rsa*``, ``*.pem``, ``*.key``, ``.hermes/``) are NOT
 # scoped this way and still apply to every extension.
+# Archive containers are NOT render artifacts. The exemption above is for
+# formats whose content is a picture/document of something (a chart named
+# ``token_counts.png``); an archive is an opaque container that can hold
+# anything, so ``secrets.zip`` / ``credentials.tar`` are exactly as dangerous
+# as ``secrets.json`` and must be word-scoped too. Without these, every
+# archive extension in BARE_LOCAL_FILE_EXTS bypassed the word heuristic.
+_SENSITIVE_ARCHIVE_EXTS = frozenset({
+    ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar",
+})
+
 _SENSITIVE_WORD_SCOPED_EXTS = frozenset({
     ".json", ".txt", ".yaml", ".yml", ".xml", ".toml", ".ini", ".conf",
     ".cfg", ".csv", ".tsv", ".log", ".md", ".env", ".properties", ".sh",
-})
+}) | _SENSITIVE_ARCHIVE_EXTS
 
 # Filename component separators: dots, dashes, underscores and spaces.
 _FILENAME_COMPONENT_RE = re.compile(r"[.\-_ ]+")

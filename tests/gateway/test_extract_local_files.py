@@ -274,6 +274,17 @@ class TestSensitiveGuardDirect:
         "/Users/alice/data/service-secret.json",
         "/Users/alice/data/passwords.txt",
         "/Users/alice/data/credentials.json",
+        # Archive containers are opaque and can hold anything, so the word
+        # heuristic must apply to them exactly as it does to .json/.txt.
+        # These previously bypassed it because archive extensions were not
+        # in the word-scoped set, and every one of them is in
+        # BARE_LOCAL_FILE_EXTS -- i.e. auto-attachable.
+        "/Users/alice/out/secrets.zip",
+        "/Users/alice/out/credentials.tar",
+        "/Users/alice/out/passwords.gz",
+        "/Users/alice/out/secrets.7z",
+        "/Users/alice/out/api-tokens.zip",
+        "/Users/alice/out/token.tgz",
     ])
     def test_guard_blocks_sensitive_paths(self, path):
         assert _is_sensitive_bare_local_file_path(path) is True
