@@ -839,6 +839,53 @@ def _extract_context(entry: Dict[str, Any]) -> Optional[int]:
     return None
 
 
+def _extract_cost(entry: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    """Extract flat per-million USD rates from a models.dev model entry."""
+    if not isinstance(entry, dict):
+        return None
+    cost = entry.get("cost")
+    if not isinstance(cost, dict):
+        return None
+
+    def _rate(key: str) -> Optional[float]:
+        value = cost.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value) if value >= 0 else None
+
+    input_cost = _rate("input")
+    output_cost = _rate("output")
+    if input_cost is None and output_cost is None:
+        return None
+
+    result: Dict[str, float] = {}
+    for key, value in (
+        ("input", input_cost),
+        ("output", output_cost),
+        ("cache_read", _rate("cache_read")),
+        ("cache_write", _rate("cache_write")),
+    ):
+        if value is not None:
+            result[key] = value
+    return result
+
+
+def lookup_models_dev_pricing(
+    provider: str, model: str, *, allow_network: bool = True
+) -> Optional[Dict[str, float]]:
+    """Look up provider-scoped per-million pricing from models.dev.
+
+    Providers absent from :data:`PROVIDER_TO_MODELS_DEV` return ``None``;
+    model ids are never scanned across vendors. ``allow_network=False`` uses
+    only the existing memory/disk cache for display-path predicates.
+    """
+    models = _get_provider_models(provider, allow_network=allow_network)
+    if models is None:
+        return None
+    entry = _find_model_entry(models, model)
+    return _extract_cost(entry) if entry is not None else None
+
+
 # ---------------------------------------------------------------------------
 # Model capability metadata
 # ---------------------------------------------------------------------------

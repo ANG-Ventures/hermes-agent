@@ -1207,13 +1207,91 @@ def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]
     return None
 
 
-def _openrouter_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
+def _openrouter_pricing_entry(
+    route: BillingRoute, *, cache_only: bool = False
+) -> Optional[PricingEntry]:
+    # OpenRouter's catalog is a flat model-id namespace. It is authoritative
+    # only when OpenRouter is the billing vendor; consulting it for another
+    # provider can misprice a self-hosted model that shares a hosted model id.
+    if route.provider != "openrouter":
+        return None
     return _pricing_entry_from_metadata(
-        fetch_model_metadata(),
+        fetch_model_metadata(allow_network=not cache_only),
         route.model,
         source_url="https://openrouter.ai/docs/api/api-reference/models/get-models",
         pricing_version="openrouter-models-api",
     )
+
+
+_VALID_PRICING_SOURCES = ("models_dev", "openrouter")
+_DEFAULT_PRICING_SOURCE = "models_dev"
+
+
+def _pricing_source_order() -> tuple[str, ...]:
+    """Return the configured external pricing source followed by fallbacks."""
+    primary = _DEFAULT_PRICING_SOURCE
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        pricing = (load_config_readonly() or {}).get("pricing")
+        if isinstance(pricing, dict):
+            candidate = pricing.get("external_source")
+            if isinstance(candidate, str):
+                candidate = candidate.strip().lower()
+                if candidate in _VALID_PRICING_SOURCES:
+                    primary = candidate
+    except Exception:
+        pass
+    return (primary, *(source for source in _VALID_PRICING_SOURCES if source != primary))
+
+
+def _models_dev_pricing_entry(
+    route: BillingRoute, *, cache_only: bool = False
+) -> Optional[PricingEntry]:
+    from agent.models_dev import lookup_models_dev_pricing
+
+    cost = lookup_models_dev_pricing(
+        route.provider,
+        route.model,
+        allow_network=not cache_only,
+    )
+    if not cost:
+        return None
+    input_cost = _to_decimal(cost.get("input"))
+    output_cost = _to_decimal(cost.get("output"))
+    if input_cost is None and output_cost is None:
+        return None
+    return PricingEntry(
+        input_cost_per_million=input_cost,
+        output_cost_per_million=output_cost,
+        cache_read_cost_per_million=_to_decimal(cost.get("cache_read")),
+        cache_write_cost_per_million=_to_decimal(cost.get("cache_write")),
+        source="provider_models_api",
+        source_url="https://models.dev/api.json",
+        pricing_version="models-dev-api",
+        fetched_at=_UTC_NOW(),
+    )
+
+
+_PRICING_SOURCE_BUILDERS = {
+    "models_dev": _models_dev_pricing_entry,
+    "openrouter": _openrouter_pricing_entry,
+}
+
+
+def _external_pricing_entry(
+    route: BillingRoute, *, cache_only: bool = False
+) -> Optional[PricingEntry]:
+    """Resolve dynamic pricing without crossing provider namespaces."""
+    for source in _pricing_source_order():
+        builder = _PRICING_SOURCE_BUILDERS[source]
+        try:
+            entry = builder(route, cache_only=cache_only)
+        except Exception:
+            entry = None
+        if entry is not None:
+            return entry
+    return None
 
 
 def _pricing_entry_from_metadata(
@@ -1265,6 +1343,8 @@ def get_pricing_entry(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    *,
+    cache_only: bool = False,
 ) -> Optional[PricingEntry]:
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
     if route.billing_mode == "subscription_included":
@@ -1277,8 +1357,10 @@ def get_pricing_entry(
             pricing_version="included-route",
         )
     if route.provider == "openrouter":
-        return _openrouter_pricing_entry(route)
-    if route.base_url:
+        return _openrouter_pricing_entry(
+            route, cache_only=cache_only
+        ) or _models_dev_pricing_entry(route, cache_only=cache_only)
+    if route.base_url and not cache_only:
         entry = _pricing_entry_from_metadata(
             fetch_endpoint_model_metadata(route.base_url, api_key=api_key or ""),
             route.model,
@@ -1287,7 +1369,9 @@ def get_pricing_entry(
         )
         if entry:
             return entry
-    return _lookup_official_docs_pricing(route)
+    return _lookup_official_docs_pricing(route) or _external_pricing_entry(
+        route, cache_only=cache_only
+    )
 
 
 def normalize_usage(
@@ -1558,7 +1642,13 @@ def has_known_pricing(
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
     if route.billing_mode == "subscription_included":
         return True
-    entry = get_pricing_entry(model_name, provider=provider, base_url=base_url, api_key=api_key)
+    entry = get_pricing_entry(
+        model_name,
+        provider=provider,
+        base_url=base_url,
+        api_key=api_key,
+        cache_only=True,
+    )
     return entry is not None
 
 

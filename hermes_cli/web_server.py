@@ -1399,6 +1399,9 @@ _CATEGORY_MERGE: Dict[str, str] = {
     # models_dev field — fold it in with the other network/agent plumbing
     # rather than spawning a one-field orphan tab.
     "models_dev": "agent",
+    # `pricing.external_source` is the only schema-surfaced pricing field —
+    # keep catalog selection with the other model/agent settings.
+    "pricing": "agent",
     "checkpoints": "agent",
     "approvals": "security",
     "human_delay": "display",
