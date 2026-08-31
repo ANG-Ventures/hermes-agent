@@ -97,7 +97,7 @@ async def _run_stop_with_drain(runner, *, running_at_start, timed_out):
     runner._running_agents = dict(running_at_start)
     snapshot = dict(running_at_start)
 
-    async def _fake_drain(timeout):
+    async def _fake_drain(timeout, cron_timeout=None):
         if not timed_out:
             # Clean drain: every active session finished during the window.
             runner._running_agents.clear()
@@ -254,7 +254,7 @@ async def _run_stop_partial_drain(runner, *, running_at_start, finish_keys):
     runner._running_agents = dict(running_at_start)
     snapshot = dict(running_at_start)
 
-    async def _fake_drain(timeout):
+    async def _fake_drain(timeout, cron_timeout=None):
         for _sk in finish_keys:
             runner._running_agents.pop(_sk, None)
         return snapshot, True  # deadline expired with stragglers resident

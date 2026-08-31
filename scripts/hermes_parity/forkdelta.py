@@ -94,7 +94,18 @@ def compute_fork_delta(
 
 
 def manifest_nodeids(path: Path) -> list[str]:
-    return [node for feature in load_manifest(path) for node in feature.tests]
+    # ORDER-PRESERVING DEDUPE: two features may legitimately share a test file/nodeid
+    # (e.g. one file guards both a route-identity feature and a session-scoping one).
+    # Feeding pytest the same path twice trips a spurious collection error
+    # ("Empty parameter set ...") that reads as manifest rot (bit 2026-08-30).
+    seen: set[str] = set()
+    out: list[str] = []
+    for feature in load_manifest(path):
+        for node in feature.tests:
+            if node not in seen:
+                seen.add(node)
+                out.append(node)
+    return out
 
 
 def covered_path(path: str, features: list[ForkFeature]) -> bool:

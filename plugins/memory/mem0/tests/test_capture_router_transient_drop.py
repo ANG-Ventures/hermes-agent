@@ -59,7 +59,7 @@ def test_transient_dropped_durable_kept(tmp_path, monkeypatch):
     # Greptile #407 P1: in staging mode the drop-log lands in the STAGING dir, NOT the brain inbox.
     log = tmp_path / "staged" / "_dropped-log.jsonl"
     assert log.exists()
-    rows = [json.loads(l) for l in log.read_text().splitlines()]
+    rows = [json.loads(l) for l in log.read_text(encoding="utf-8").splitlines()]
     assert len(rows) == 1
     assert rows[0]["reason"] == "transient_narration"
     assert rows[0]["text_prefix"].startswith("PR #15 landed")

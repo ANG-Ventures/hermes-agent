@@ -42,9 +42,9 @@ gateway:
       Görev kimliği: {task_id}
 
       Sohbete devam edebilirsin — sonuçlar tamamlandığında burada görünecek.'
-    usage: 'Kullanım: /background <prompt>
+    usage: 'Kullanım: /bg <prompt>
 
-      Örnek: /background Bugünün öne çıkan HN haberlerini özetle
+      Örnek: /bg Bugünün öne çıkan HN haberlerini özetle
 
 
       İstemi ayrı bir oturumda çalıştırır. Sohbete devam edebilirsin — sonuç tamamlandığında burada görünecek.'
@@ -77,6 +77,25 @@ gateway:
 
       This thread inherits the parent conversation ({count} messages) from {parent}. Explore freely here; the parent channel keeps its own session. Use `/merge` to fold a summary back into the parent.'
     thread_parent_fallback: the parent conversation
+  btw:
+    answer: '💬 /btw: "{preview}"
+
+
+      {answer}'
+    failed: '❌ /btw başarısız oldu: "{preview}"
+
+      {error}'
+    no_history: Henüz konuşma yok — sorunu normal bir mesaj olarak gönder.
+    no_provider: '❌ Yan soru yanıtlanamıyor: sağlayıcı kimlik bilgileri yapılandırılmamış.'
+    started: '💬 Yan soru: "{preview}"
+
+      Bu konuşmanın anlık görüntüsünden yanıtlanıyor — mevcut çalışma devam ediyor.'
+    usage: 'Kullanım: /btw <soru>
+
+      Örnek: /btw o hata hangi dosyadaydı?
+
+
+      Bu konuşma hakkında hızlı bir yan soruyu, konuşmayı kesmeden yanıtlar. Bağımsız bir arka plan görevi için /bg <prompt> kullan.'
   commands:
     default_desc: Skill komutu
     header: 📚 **Komutlar** (toplam {total}, sayfa {page}/{total_pages})
@@ -103,8 +122,9 @@ gateway:
     not_enough: Sıkıştırmak için yeterli konuşma yok (en az 4 mesaj gerekli).
     nothing_to_do: Henüz sıkıştırılacak bir şey yok (transkript hâlâ tamamen korunan bağlam).
     persist_failed: ⚠️ Sıkıştırma çalıştı, ancak sonuç kaydedilemedi — oturum veritabanı meşguldü (kilitli). Hiçbir şey kaybolmadı; dökümünüz değişmedi. Yeniden denemek için birazdan tekrar /compress çalıştırın.
-    timed_out: "⚠️ Sıkıştırma tamamlanamadı — özetleyici takıldı ve girişim hiçbir şey üretmeden zaman aşımına uğradı. Hiçbir şey kaybolmadı; dökümünüz değişmedi. Birazdan /compress komutunu yeniden çalıştırın."
     summary_failed: ⚠️ Özet oluşturma başarısız ({error}). {count} geçmiş mesaj kaldırılıp yer tutucuyla değiştirildi; önceki bağlam artık kurtarılamaz. auxiliary.compression model yapılandırmanızı kontrol edin.
+    timed_out: ⚠️ Sıkıştırma tamamlanamadı — özetleyici takıldı ve girişim hiçbir şey üretmeden zaman aşımına uğradı. Hiçbir şey kaybolmadı; dökümünüz değişmedi. Birazdan /compress komutunu yeniden çalıştırın.
+    turnhold_deferred: ℹ️ Bağlam sıkıştırma ertelendi — özet hâlâ akışta. Bu tur sıkıştırma olmadan devam ediliyor.
   config_read_failed: '⚠️ config.yaml okunamadı: {error}'
   config_save_failed: '⚠️ Yapılandırma kaydedilemedi: {error}'
   context:
@@ -206,7 +226,7 @@ gateway:
     paused: '⏸ Hedef duraklatıldı: {goal}'
     resumed: '▶ Hedef devam ettirildi: {goal}
 
-      Devam etmek için herhangi bir mesaj gönderin veya bekleyin — bir sonraki turda adımı atacağım.'
+      Hemen devam ediyorum — bir sonraki adımı derhal atacağım.'
     set: '⊙ Hedef ayarlandı ({budget} turluk bütçe): {goal}
 
       Hedef tamamlanana, siz duraklatana/temizleyene veya bütçe tükenene kadar çalışmaya devam edeceğim.
@@ -233,10 +253,14 @@ gateway:
     subscribed_suffix: (abone olundu — {task_id} tamamlandığında veya engellendiğinde bildirim alacaksınız)
     truncated_suffix: … (kısaltıldı; tam çıktı için terminalinizde `hermes kanban …` komutunu kullanın)
     wake:
+      block_loop_detected: routed to triage after repeated blocks; needs a decision
       blocked: blocked; needs attention
+      changes_requested: review requested changes (BLOCK); implementation is not approved
       completed: completed
       crashed: crashed (worker exited); dispatcher will retry
       gave_up: gave up (retries exhausted)
+      guidance: This is an automatic task-status notification, not a request to decompose the task again. Inspect the current board before creating follow-up tasks; do not recreate tasks or graphs that already exist.
+      handoff: 'Result: {summary}'
       message: '[kanban] Task {task_id} {status}.
 
         Title: {title}
@@ -247,6 +271,10 @@ gateway:
 
 
         Check the result or decide the next step.'
+      review_detail: 'Review feedback: {reason}
+
+        Inspect the existing card and its current review run; return work to the same implementation task. Do not treat this BLOCK as approval and do not create a duplicate task.'
+      review_requested: handed off for review; the implementation is done
       status_default: status changed
       status_joiner: ', '
       timed_out: timed out; dispatcher will retry
@@ -491,7 +519,12 @@ gateway:
   retry:
     no_previous: Yeniden denenecek önceki mesaj yok.
   rollback:
+    failed_deletes: '⚠️ Kaldırılamadı (yerinde bırakıldı): {files}'
     invalid_number: Geçersiz kontrol noktası numarası. 1-{max} aralığını kullanın.
+    kept_oversize: '↷ Korundu (denetim noktaları için çok büyük, geri dönülecek kayıtlı kopya yok): {files}'
+    kept_user_edits: '↷ Elle yaptığınız düzenlemeler korundu: {files}
+
+      Onları da geri yüklemek için /rollback <N> --all kullanın.'
     none_found: '{cwd} için kontrol noktası bulunamadı'
     not_enabled: "Kontrol noktaları etkin değil.\nconfig.yaml içinde etkinleştirin:\n```\ncheckpoints:\n  enabled: true\n```"
     restore_failed: ❌ {error}

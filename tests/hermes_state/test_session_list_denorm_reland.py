@@ -729,6 +729,12 @@ def test_every_sessiondb_message_insert_path_is_effective_last_active_adjacent()
         "_db_opens_cleanly": insert_functions.get("_db_opens_cleanly"),
         "SessionDB.append_message": insert_functions.get("SessionDB.append_message"),
         "SessionDB._insert_message_rows": insert_functions.get("SessionDB._insert_message_rows"),
+        # Pure-SQL tail clone for the compression rotation/archive paths —
+        # re-inserts existing rows column-exactly; recomputes the denorm
+        # (strictly stronger than the monotonic bump) before returning.
+        "SessionDB._clone_message_tail_rows": insert_functions.get(
+            "SessionDB._clone_message_tail_rows"
+        ),
     }
 
     methods = _sessiondb_method_sources()
@@ -742,6 +748,7 @@ def test_every_sessiondb_message_insert_path_is_effective_last_active_adjacent()
         name
         for name, src in inserting_methods.items()
         if "_bump_effective_last_active_for_message" not in src
+        and "_recompute_effective_last_active_for_session" not in src
     ]
     assert offenders == []
 

@@ -94,6 +94,38 @@ def _party(role: Any) -> str:
     return "other"
 
 
+def _is_user_originated(msg: Dict[str, Any]) -> bool:
+    """True when a user-role row is a real human turn, not a timeline marker.
+
+    Synthetic bookkeeping rows are persisted with ``role="user"`` and a
+    ``display_kind`` (``model_switch``, ``async_delegation_complete``,
+    compaction handoffs, …). Counting them as half-turn boundaries makes
+    ``/undo`` retire a marker instead of the last real exchange (#80622).
+
+    Parity 2026-08-29: upstream fixed this in its in-memory truncation path
+    via ``user_originated_turn_view``. The fork's undo is DB-backed and
+    shares this core, so the same rule has to live at this choke point —
+    both ``compute_half_turn_target`` callers inherit it here. Falls back to
+    a plain ``display_kind`` check if the compressor import is unavailable.
+    """
+    if msg.get("role") != "user":
+        return False
+    try:
+        from agent.context_compressor import user_originated_turn_view
+
+        return user_originated_turn_view(msg) is not None
+    except Exception:  # pragma: no cover - defensive import guard
+        return not msg.get("display_kind")
+
+
+def _boundary_party(msg: Dict[str, Any]) -> str:
+    """Half-turn party for boundary detection, marker rows excluded."""
+    party = _party(msg.get("role"))
+    if party == "user" and not _is_user_originated(msg):
+        return "other"
+    return party
+
+
 def compute_half_turn_target(
     active_messages: List[Dict[str, Any]], n: int
 ) -> Optional[int]:
@@ -110,7 +142,7 @@ def compute_half_turn_target(
     current_start: Optional[int] = None
 
     for msg in active_messages:
-        msg_party = _party(msg.get("role"))
+        msg_party = _boundary_party(msg)
         if current_party is None or msg_party != current_party:
             if current_party != "other" and current_start is not None:
                 group_starts.append(current_start)
@@ -263,9 +295,46 @@ def undo(session_id: str, n: int) -> Dict[str, Any]:
         and not isinstance(tail.get("content"), str)
     ):
         target_id = tail["id"]
+    elif tail is not None and tail.get("role") == "user":
+        # parity 2026-08-30 (upstream carrier-rewind contract): if the row that
+        # would SURVIVE as the new tail is a composite compaction carrier
+        # (hidden handoff summary + live ask in one user row), prefilling its
+        # raw content would dump the entire hidden preamble into the input
+        # buffer. Extend the rewind to include it — rewind_to_message with
+        # preserve_compaction_handoff archives the composite and re-inserts the
+        # canonical scaffold-only handoff in the same transaction, and the
+        # prefill below carries ONLY the live ask.
+        try:
+            from agent.context_compressor import is_compaction_summary_message
+
+            if is_compaction_summary_message(tail):
+                target_id = tail["id"]
+        except Exception:  # pragma: no cover - defensive import guard
+            pass
+
+    # Composite compaction carriers (hidden handoff summary + real live ask in
+    # one user row) must not lose their scaffold on rewind: rewind_to_message
+    # can archive the original row and insert the canonical hidden handoff as
+    # the new head inside the same transaction (upstream carrier-rewind
+    # contract; tests/tui_gateway/test_composite_carrier_rewind.py).
+    preserve_handoff = False
+    try:
+        from agent.context_compressor import is_compaction_summary_message
+
+        target_row = next((m for m in msgs if m.get("id") == target_id), None)
+        preserve_handoff = (
+            target_row is not None
+            and target_row.get("role") == "user"
+            and is_compaction_summary_message(target_row)
+        )
+    except Exception:  # pragma: no cover - defensive import guard
+        preserve_handoff = False
 
     result = db.rewind_to_message(
-        session_id, target_id, require_user_role=False
+        session_id,
+        target_id,
+        require_user_role=False,
+        preserve_compaction_handoff=preserve_handoff,
     )
     rewound_ids = list(result.get("rewound_ids", []))
     if not rewound_ids:
@@ -288,8 +357,23 @@ def undo(session_id: str, n: int) -> Dict[str, Any]:
     # read must fail SOFT — a raise here would unwind into rewind_session as
     # "error/nothing changed" for a rewind that DID happen (double-undo on retry).
     try:
-        active_after = db.get_messages(session_id, include_inactive=False)
-        prefill = _prefill_from_tail(_new_tail(active_after))
+        if preserve_handoff and target_row is not None:
+            # Composite carrier (upstream carrier-rewind contract, parity
+            # 2026-08-30): the scaffold stays at the history head; the prefill
+            # must be ONLY the live ask the user actually typed — never the
+            # hidden handoff text the new tail now carries.
+            from agent.context_compressor import user_originated_turn_view
+
+            _live = user_originated_turn_view(target_row)
+            _live_content = _live.get("content") if isinstance(_live, dict) else None
+            prefill = (
+                _content_to_text(_live_content).strip() or None
+                if _live_content is not None
+                else None
+            )
+        else:
+            active_after = db.get_messages(session_id, include_inactive=False)
+            prefill = _prefill_from_tail(_new_tail(active_after))
     except Exception as exc:
         logger.warning(
             "undo: post-commit prefill read failed for %s "

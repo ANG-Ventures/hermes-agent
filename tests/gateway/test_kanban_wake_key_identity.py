@@ -316,10 +316,13 @@ def test_legacy_rows_without_the_columns_behave_exactly_as_before(
         tid = kb.create_task(
             conn, title="legacy", assignee="w", session_id=human.session_key,
         )
-        # Exactly the columns a pre-migration writer supplied.
+        # Exactly the columns a pre-migration writer supplied, plus the
+        # delivery_mode the first-add migration stamps on every pre-existing
+        # gateway row ('notify+wake' WHERE platform != 'tui') — a fresh test
+        # DB never runs that backfill, so simulate its effect here.
         kb.add_notify_sub(
             conn, task_id=tid, platform="discord", chat_id=CHAT,
-            chat_type="group", user_id=OPEN_ID,
+            chat_type="group", user_id=OPEN_ID, delivery_mode="notify+wake",
         )
         kb.complete_task(conn, tid, summary="done")
         row = kb.list_notify_subs(conn, tid)[0]

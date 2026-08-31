@@ -66,20 +66,33 @@ def _init_git_repo(repo: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+
+
+
+
+
+@pytest.mark.windows_only
 def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypatch):
     """Windows must use a real (non-blocking) process lock, not a no-op open.
 
     The init lock acquires with LK_NBLCK in a bounded retry loop (#36644) so a
     wedged holder can never block connect() forever; a clean acquire takes the
     lock once and releases it once.
+
+    ``windows_only``: ``msvcrt`` does not exist off Windows, so faking
+    ``_IS_WINDOWS`` on Linux meant injecting a fake ``msvcrt`` module too —
+    the test then asserted against its own stub rather than the byte-range
+    locking API. Here the platform is real; only ``msvcrt.locking`` is
+    instrumented so the call sequence is observable.
     """
     calls: list[tuple[int, int, int]] = []
+    import msvcrt as _msvcrt
+
     fake_msvcrt = types.SimpleNamespace(
-        LK_NBLCK=3,
-        LK_UNLCK=2,
+        LK_NBLCK=_msvcrt.LK_NBLCK,
+        LK_UNLCK=_msvcrt.LK_UNLCK,
         locking=lambda fd, mode, nbytes: calls.append((fd, mode, nbytes)),
     )
-    monkeypatch.setattr(kb, "_IS_WINDOWS", True)
     monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
 
     db_path = tmp_path / "kanban.db"
@@ -1074,9 +1087,23 @@ def test_dispatch_idle_tick_preserves_pr_query_cycle(
             task_ids.append(task_id)
 
         kb.dispatch_once(conn, dry_run=True)
-        conn.execute("UPDATE tasks SET status = 'running'")
+        # An IDLE tick = nothing for the dispatcher to scan. A bare
+        # status='running' no longer produces that: upstream's reconciliation
+        # pass requeues a 'running' row that has no valid claim (dead/gone
+        # worker) straight back to 'ready', so the tick scanned the queue and
+        # burned rotation budget. Claim the rows the way a live worker does
+        # (unexpired claim + this process's pid) so the reconciler leaves them
+        # running and the tick is genuinely idle. (parity merge 2026-08-29)
+        conn.execute(
+            "UPDATE tasks SET status = 'running', claim_lock = ?, "
+            "claim_expires = ?, worker_pid = ?",
+            ("idle-tick-probe:1", int(time.time()) + 3600, os.getpid()),
+        )
         kb.dispatch_once(conn, dry_run=True)
-        conn.execute("UPDATE tasks SET status = 'ready'")
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL"
+        )
         kb.dispatch_once(conn, dry_run=True)
 
     assert calls == [("o/r", number) for number in range(1, 11)]
@@ -1729,6 +1756,39 @@ def test_connect_works_when_wal_is_silently_refused(tmp_path, monkeypatch, caplo
     )
 
 
+def test_sqlite_connect_closes_tracked_conn_on_setup_failure(tmp_path, monkeypatch):
+    """A PRAGMA failure after connect must not abandon a tracked kanban fd."""
+    from hermes_cli import sqlite_safe_read
+
+    db_path = tmp_path / "kanban.db"
+    real_connect = sqlite3.connect
+    opened = []
+
+    class _BusyTimeoutFailure(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):  # type: ignore[override]
+            if str(sql).startswith("PRAGMA busy_timeout="):
+                raise sqlite3.OperationalError("simulated setup failure")
+            return super().execute(sql, *args, **kwargs)
+
+    def failing_connect(*args, **kwargs):
+        kwargs.pop("factory", None)
+        conn = real_connect(*args, factory=_BusyTimeoutFailure, **kwargs)
+        opened.append(conn)
+        return conn
+
+    key = sqlite_safe_read._key(db_path)
+    with sqlite_safe_read._live_lock:
+        before = sqlite_safe_read._live_connections.get(key, 0)
+    monkeypatch.setattr(kb.sqlite3, "connect", failing_connect)
+
+    with pytest.raises(sqlite3.OperationalError, match="simulated setup failure"):
+        kb._sqlite_connect(db_path)
+
+    with sqlite_safe_read._live_lock:
+        after = sqlite_safe_read._live_connections.get(key, 0)
+    assert after == before
+
+
 def test_unlink_tasks_triggers_recompute_ready(kanban_home):
     """Regression test for issue #22459.
 
@@ -1954,6 +2014,29 @@ def _make_task(**overrides) -> "kb.Task":
 # dispatch_once — max_in_progress
 # ---------------------------------------------------------------------------
 
+
+def test_dispatch_max_in_progress_blocks_review_when_at_limit(
+    kanban_home, all_assignees_spawnable,
+):
+    """Review-only backlog must still respect max_in_progress."""
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        running = kb.create_task(conn, title="running", assignee="alice")
+        kb.claim_task(conn, running)
+        review = kb.create_task(conn, title="review", assignee="bob")
+        _set_task_status(conn, review, "review")
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=1)
+        review_task = kb.get_task(conn, review)
+
+    assert not res.spawned
+    assert not spawns
+    assert review_task is not None
+    assert review_task.status == "review"
 
 # Review column dispatch
 # ---------------------------------------------------------------------------

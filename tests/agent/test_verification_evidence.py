@@ -158,6 +158,144 @@ def test_classifier_does_not_treat_literal_env_as_a_prefix(
     assert classify_verification_command(command, cwd=tmp_path) is None
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pytest || true",
+        "pytest ; true",
+        "pytest | tee test.log",
+        "pytest &",
+    ],
+)
+def test_masking_shell_control_is_not_verification_evidence(
+    tmp_path, monkeypatch, command
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _python_project(tmp_path)
+
+    evidence = classify_verification_command(
+        command,
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+    )
+
+    assert evidence is None
+
+
+@pytest.mark.parametrize("command", ["prepare && pytest", "pytest && report"])
+def test_successful_and_chain_preserves_passing_evidence(
+    tmp_path, monkeypatch, command
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _python_project(tmp_path)
+
+    evidence = classify_verification_command(
+        command,
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+    )
+
+    assert evidence is not None
+    assert evidence.status == "passed"
+
+
+@pytest.mark.parametrize("exit_code, expected", [(0, "passed"), (1, "failed")])
+def test_final_verifier_after_sequence_owns_shell_exit_status(
+    tmp_path, monkeypatch, exit_code, expected
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _python_project(tmp_path)
+
+    evidence = classify_verification_command(
+        "prepare; pytest",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=exit_code,
+    )
+
+    assert evidence is not None
+    assert evidence.status == expected
+
+
+def test_quoted_shell_operator_remains_a_verifier_argument(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _python_project(tmp_path)
+
+    evidence = classify_verification_command(
+        "pytest -k 'passes || fails'",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+    )
+
+    assert evidence is not None
+    assert evidence.status == "passed"
+
+
+@pytest.mark.parametrize("redirect", ["2>&1", "&> test.log"])
+def test_shell_redirection_does_not_hide_simple_verifier(tmp_path, monkeypatch, redirect):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _python_project(tmp_path)
+
+    evidence = classify_verification_command(
+        f"pytest {redirect}",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+    )
+
+    assert evidence is not None
+    assert evidence.status == "passed"
+
+
+def test_masked_ad_hoc_script_is_not_verification_evidence(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    script = Path(tempfile.gettempdir()) / f"hermes-ad-hoc-{tmp_path.name}.py"
+    script.write_text("raise SystemExit(1)\n", encoding="utf-8")
+    try:
+        evidence = classify_verification_command(
+            f"python {script} || true",
+            cwd=tmp_path,
+            session_id="s1",
+            exit_code=0,
+        )
+    finally:
+        script.unlink(missing_ok=True)
+
+    assert evidence is None
+
+
+def test_masked_verifier_does_not_clear_edited_ledger_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _python_project(tmp_path)
+    record_terminal_result(
+        command="pytest",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+        output="passed",
+    )
+    mark_workspace_edited(
+        session_id="s1",
+        cwd=tmp_path,
+        paths=[str(tmp_path / "changed.py")],
+    )
+
+    result = record_terminal_result(
+        command="pytest || true",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+        output="1 failed",
+    )
+
+    assert result is None
+    assert verification_status(session_id="s1", cwd=tmp_path)["status"] == "stale"
+
+
 
 
 def test_temp_script_records_ad_hoc_evidence_without_canonical_suite(tmp_path, monkeypatch):

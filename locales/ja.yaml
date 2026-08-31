@@ -42,9 +42,9 @@ gateway:
       タスク ID: {task_id}
 
       チャットを続けられます — 完了したらここに結果が表示されます。'
-    usage: '使い方: /background <プロンプト>
+    usage: '使い方: /bg <プロンプト>
 
-      例: /background 今日の HN トップ記事を要約して
+      例: /bg 今日の HN トップ記事を要約して
 
 
       プロンプトを別のセッションで実行します。チャットを続けられます — 完了したらここに結果が表示されます。'
@@ -77,6 +77,25 @@ gateway:
 
       This thread inherits the parent conversation ({count} messages) from {parent}. Explore freely here; the parent channel keeps its own session. Use `/merge` to fold a summary back into the parent.'
     thread_parent_fallback: the parent conversation
+  btw:
+    answer: '💬 /btw: 「{preview}」
+
+
+      {answer}'
+    failed: '❌ /btw が失敗しました: 「{preview}」
+
+      {error}'
+    no_history: まだ会話がありません — 質問は通常のメッセージとして送ってください。
+    no_provider: '❌ 質問に回答できません: プロバイダーの認証情報が設定されていません。'
+    started: '💬 サイド質問: 「{preview}」
+
+      この会話のスナップショットから回答します — 現在の作業は継続します。'
+    usage: '使い方: /btw <質問>
+
+      例: /btw あのエラーはどのファイルだった？
+
+
+      この会話について、作業を中断せずにちょっとした質問に答えます。独立したバックグラウンドタスクには /bg <プロンプト> を使ってください。'
   commands:
     default_desc: スキルコマンド
     header: 📚 **コマンド** (合計 {total}、{page}/{total_pages} ページ)
@@ -103,8 +122,9 @@ gateway:
     not_enough: 圧縮するための会話が不十分です (少なくとも 4 件のメッセージが必要)。
     nothing_to_do: まだ圧縮するものがありません (トランスクリプトはすべて保護されたコンテキストのままです)。
     persist_failed: ⚠️ 圧縮は実行されましたが、結果を保存できませんでした — セッションデータベースがビジー（ロック）状態でした。失われたものはなく、トランスクリプトは変更されていません。少し待ってから /compress をもう一度実行して再試行してください。
-    timed_out: "⚠️ 圧縮を完了できませんでした — 要約モデルが停止し、何も生成されないままタイムアウトしました。失われたものはありません。トランスクリプトは変更されていません。少し待ってから /compress を再実行してください。"
     summary_failed: ⚠️ 要約の生成に失敗しました ({error})。{count} 件の履歴メッセージが削除され、プレースホルダーに置き換えられました。以前のコンテキストは復元できません。auxiliary.compression モデルの設定を確認してください。
+    timed_out: ⚠️ 圧縮を完了できませんでした — 要約モデルが停止し、何も生成されないままタイムアウトしました。失われたものはありません。トランスクリプトは変更されていません。少し待ってから /compress を再実行してください。
+    turnhold_deferred: ℹ️ コンテキスト圧縮を延期しました — 要約はまだストリーミング中です。このターンは圧縮せずに続行します。
   config_read_failed: '⚠️ config.yaml を読み込めませんでした: {error}'
   config_save_failed: '⚠️ 設定を保存できませんでした: {error}'
   context:
@@ -206,7 +226,7 @@ gateway:
     paused: '⏸ 目標を一時停止しました: {goal}'
     resumed: '▶ 目標を再開しました: {goal}
 
-      メッセージを送って続行するか、お待ちください — 次のターンで続きを進めます。'
+      すぐに続行します — 直ちに次のステップに進みます。'
     set: '⊙ 目標を設定しました ({budget} ターンの予算): {goal}
 
       目標が完了するか、一時停止/解除されるか、予算が尽きるまで作業を続けます。
@@ -233,10 +253,14 @@ gateway:
     subscribed_suffix: (購読しました — {task_id} が完了またはブロックされたときに通知されます)
     truncated_suffix: … (切り詰めました; 完全な出力にはターミナルで `hermes kanban …` を使用してください)
     wake:
+      block_loop_detected: routed to triage after repeated blocks; needs a decision
       blocked: blocked; needs attention
+      changes_requested: review requested changes (BLOCK); implementation is not approved
       completed: completed
       crashed: crashed (worker exited); dispatcher will retry
       gave_up: gave up (retries exhausted)
+      guidance: This is an automatic task-status notification, not a request to decompose the task again. Inspect the current board before creating follow-up tasks; do not recreate tasks or graphs that already exist.
+      handoff: 'Result: {summary}'
       message: '[kanban] Task {task_id} {status}.
 
         Title: {title}
@@ -247,6 +271,10 @@ gateway:
 
 
         Check the result or decide the next step.'
+      review_detail: 'Review feedback: {reason}
+
+        Inspect the existing card and its current review run; return work to the same implementation task. Do not treat this BLOCK as approval and do not create a duplicate task.'
+      review_requested: handed off for review; the implementation is done
       status_default: status changed
       status_joiner: ', '
       timed_out: timed out; dispatcher will retry
@@ -491,7 +519,12 @@ gateway:
   retry:
     no_previous: 再試行する前のメッセージがありません。
   rollback:
+    failed_deletes: '⚠️ 削除できませんでした（そのまま残っています）: {files}'
     invalid_number: 無効なチェックポイント番号です。1-{max} を使用してください。
+    kept_oversize: '↷ 保持しました（チェックポイントには大きすぎるため、戻せる保存コピーがありません）: {files}'
+    kept_user_edits: '↷ 手動編集は保持されました: {files}
+
+      それらも復元するには /rollback <N> --all を使用してください。'
     none_found: '{cwd} のチェックポイントが見つかりません'
     not_enabled: "チェックポイントは有効になっていません。\nconfig.yaml で有効にしてください:\n```\ncheckpoints:\n  enabled: true\n```"
     restore_failed: ❌ {error}

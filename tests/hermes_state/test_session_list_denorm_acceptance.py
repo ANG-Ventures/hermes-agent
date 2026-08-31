@@ -785,6 +785,9 @@ def test_all_six_session_parent_mutation_sites_are_maintenance_adjacent():
     # site (import_sessions' parent re-link) now lives in hermes_state_portability,
     # so scanning hermes_state.py alone finds only 5 and the contract reads as a
     # violation. Scan every module the SessionDB mixins are assembled from.
+    # The 2026-08 parity merge added a 7th site: adopt_orphaned_gateway_session
+    # stamps parent_session_id during gateway orphan repair (and recomputes the
+    # rollup for both rows).
     import hermes_state_portability
 
     source = "\n".join(
@@ -793,7 +796,7 @@ def test_all_six_session_parent_mutation_sites_are_maintenance_adjacent():
     )
     sites, maintained = _parent_mutation_contract(source)
 
-    assert len(sites) == 6, sites
+    assert len(sites) == 7, sites
     assert sites - maintained == set()
 
 

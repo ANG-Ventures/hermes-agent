@@ -209,9 +209,14 @@ def conflict_entries(repo: Path) -> list[tuple[str, str]]:
 
 
 def conflict_marker_lines(repo: Path) -> list[str]:
+    # Precise marker shapes only: git emits exactly-7-char markers — `<<<<<<< <label>`,
+    # `=======` alone on its line, `>>>>>>> <label>`, and `||||||| <label>` (diff3).
+    # A permissive `^=======` prefix match false-positives on RST/Sphinx docstring
+    # section underlines (`====…` x N), which upstream ships in ordinary modules
+    # (bit 2026-08-30: agent/terminal_env_provider.py et al., 5 false FAILs).
     result = run_git(
         repo,
-        ["grep", "-nE", r"^(<<<<<<<|=======|>>>>>>>)"],
+        ["grep", "-nE", r"^(<{7}( |$)|={7}$|>{7}( |$)|\|{7}( |$))"],
         check=False,
     )
     if result.returncode == 1:

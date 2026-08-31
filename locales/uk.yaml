@@ -42,9 +42,9 @@ gateway:
       ID завдання: {task_id}
 
       Можна продовжити спілкування — результати з''являться тут після завершення.'
-    usage: 'Використання: /background <запит>
+    usage: 'Використання: /bg <запит>
 
-      Приклад: /background Підсумуй найкращі історії з HN сьогодні
+      Приклад: /bg Підсумуй найкращі історії з HN сьогодні
 
 
       Запускає запит в окремому сеансі. Можна продовжити спілкування — результат з''явиться тут після завершення.'
@@ -77,6 +77,25 @@ gateway:
 
       This thread inherits the parent conversation ({count} messages) from {parent}. Explore freely here; the parent channel keeps its own session. Use `/merge` to fold a summary back into the parent.'
     thread_parent_fallback: the parent conversation
+  btw:
+    answer: '💬 /btw: «{preview}»
+
+
+      {answer}'
+    failed: '❌ /btw не вдалося: «{preview}»
+
+      {error}'
+    no_history: Розмови ще немає — надішліть питання звичайним повідомленням.
+    no_provider: '❌ Не вдалося відповісти: облікові дані провайдера не налаштовано.'
+    started: '💬 Побіжне питання: «{preview}»
+
+      Відповідаю за знімком цієї розмови — поточна робота триває.'
+    usage: 'Використання: /btw <питання>
+
+      Приклад: /btw у якому файлі була та помилка?
+
+
+      Відповідає на швидке побіжне питання про цю розмову, не перериваючи її. Для незалежного фонового завдання використовуйте /bg <запит>.'
   commands:
     default_desc: Команда навички
     header: 📚 **Команди** (всього {total}, сторінка {page}/{total_pages})
@@ -103,8 +122,9 @@ gateway:
     not_enough: Недостатньо розмови для стиснення (потрібно щонайменше 4 повідомлення).
     nothing_to_do: Поки що немає що стискати (стенограма все ще є повністю захищеним контекстом).
     persist_failed: ⚠️ Стиснення виконано, але результат не вдалося зберегти — база даних сесії була зайнята (заблокована). Нічого не втрачено; ваша транскрипція без змін. Запустіть /compress ще раз за мить, щоб повторити спробу.
-    timed_out: "⚠️ Стиснення не вдалося завершити — сумаризатор завис, і спроба вичерпала час, нічого не створивши. Нічого не втрачено; вашу стенограму не змінено. Запустіть /compress ще раз за мить."
     summary_failed: ⚠️ Не вдалося згенерувати зведення ({error}). {count} історичних повідомлень було видалено та замінено заповнювачем; попередній контекст більше не можна відновити. Перевірте конфігурацію моделі auxiliary.compression.
+    timed_out: ⚠️ Стиснення не вдалося завершити — сумаризатор завис, і спроба вичерпала час, нічого не створивши. Нічого не втрачено; вашу стенограму не змінено. Запустіть /compress ще раз за мить.
+    turnhold_deferred: ℹ️ Стиснення контексту відкладено — підсумок ще передається. Продовжуємо цей хід без стиснення.
   config_read_failed: '⚠️ Не вдалося прочитати config.yaml: {error}'
   config_save_failed: '⚠️ Не вдалося зберегти конфігурацію: {error}'
   context:
@@ -206,7 +226,7 @@ gateway:
     paused: '⏸ Ціль призупинено: {goal}'
     resumed: '▶ Ціль відновлено: {goal}
 
-      Надішліть будь-яке повідомлення, щоб продовжити, або зачекайте — я зроблю наступний крок у наступному ході.'
+      Продовжую зараз — негайно зроблю наступний крок.'
     set: '⊙ Ціль встановлено (бюджет {budget} ходів): {goal}
 
       Я продовжуватиму працювати, доки ціль не буде досягнута, ви її не призупините/очистите, або бюджет не вичерпається.
@@ -233,10 +253,14 @@ gateway:
     subscribed_suffix: (підписано — ви отримаєте сповіщення, коли {task_id} завершиться або буде заблоковано)
     truncated_suffix: … (скорочено; використовуйте `hermes kanban …` у терміналі для повного виводу)
     wake:
+      block_loop_detected: routed to triage after repeated blocks; needs a decision
       blocked: blocked; needs attention
+      changes_requested: review requested changes (BLOCK); implementation is not approved
       completed: completed
       crashed: crashed (worker exited); dispatcher will retry
       gave_up: gave up (retries exhausted)
+      guidance: This is an automatic task-status notification, not a request to decompose the task again. Inspect the current board before creating follow-up tasks; do not recreate tasks or graphs that already exist.
+      handoff: 'Result: {summary}'
       message: '[kanban] Task {task_id} {status}.
 
         Title: {title}
@@ -247,6 +271,10 @@ gateway:
 
 
         Check the result or decide the next step.'
+      review_detail: 'Review feedback: {reason}
+
+        Inspect the existing card and its current review run; return work to the same implementation task. Do not treat this BLOCK as approval and do not create a duplicate task.'
+      review_requested: handed off for review; the implementation is done
       status_default: status changed
       status_joiner: ', '
       timed_out: timed out; dispatcher will retry
@@ -491,7 +519,12 @@ gateway:
   retry:
     no_previous: Немає попереднього повідомлення для повторення.
   rollback:
+    failed_deletes: '⚠️ Не вдалося видалити (залишено на місці): {files}'
     invalid_number: Недійсний номер контрольної точки. Використовуйте 1-{max}.
+    kept_oversize: '↷ Збережено (завеликий для контрольних точок, немає збереженої копії для відкату): {files}'
+    kept_user_edits: '↷ Ваші ручні правки збережено: {files}
+
+      Використайте /rollback <N> --all, щоб відновити і їх.'
     none_found: Контрольних точок для {cwd} не знайдено
     not_enabled: "Контрольні точки не ввімкнено.\nУвімкніть у config.yaml:\n```\ncheckpoints:\n  enabled: true\n```"
     restore_failed: ❌ {error}

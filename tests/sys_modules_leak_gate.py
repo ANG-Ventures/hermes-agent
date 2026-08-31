@@ -63,8 +63,22 @@ _MISSING = object()
 # are not among the suite's cross-test failures.
 _WATCHED_PREFIXES = ("run_agent", "agent.", "tools.", "hermes_", "gateway.")
 
+# 🔴 `hermes_plugins.` is likewise EXCLUDED (parity 2026-08-29). Upstream's
+# conftest hermeticity step calls `_reset_plugin_managers_for_tests()`, which
+# BY DESIGN purges every directory-loaded plugin module
+# (`hermes_plugins.<slug>[.sub]`) at each test's setup so a manager built for
+# a previous test's HERMES_HOME can't leak forward. Those purged modules are
+# re-imported by the very next plugin discovery call — the same
+# re-import-on-demand property that exempts `plugins.` above. Without this
+# carve-out, any test file whose FIRST test triggers plugin discovery flags a
+# false 31-module "leak" on every LATER test in the file (the purge lands
+# inside the later test's gate window).
+_EXCLUDED_PREFIXES = ("hermes_plugins.",)
+
 
 def _watched(name: str) -> bool:
+    if name.startswith(_EXCLUDED_PREFIXES) or name == "hermes_plugins":
+        return False
     return name == "run_agent" or name.startswith(_WATCHED_PREFIXES)
 
 

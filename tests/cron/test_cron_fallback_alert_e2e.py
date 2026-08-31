@@ -108,8 +108,21 @@ def _patch_codex_runtime(monkeypatch):
     )
 
 
+def _connect_discord(monkeypatch):
+    # parity 2026-08-30: the merged scheduler pre-dispatch-validates delivery
+    # platforms against the live gateway config; make discord read as
+    # connected so these delivery-shape tests exercise the alert path.
+    from unittest.mock import MagicMock
+    from gateway.config import Platform
+
+    cfg = MagicMock()
+    cfg.get_connected_platforms.return_value = [Platform.DISCORD]
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: cfg)
+
+
 def _capture_alerts(monkeypatch):
     """Capture every _deliver_result call (digest delivery + fallback alert)."""
+    _connect_discord(monkeypatch)
     calls = []
 
     def fake(job, content, success=True, adapters=None, loop=None, wrap_override=None):

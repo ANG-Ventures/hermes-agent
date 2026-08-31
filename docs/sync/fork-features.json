@@ -1,211 +1,440 @@
 [
- {
-  "feature": "cron-subagent approval gate reads ContextVar not raw env",
-  "tests": [
-   "tests/tools/test_cron_subagent_session.py::TestCronSubagentApprovalGating"
-  ],
-  "paths": [
-   "tools/approval.py",
-   "gateway/session_context.py"
-  ],
-  "why": "Cron subagents must inherit approval gating from session ContextVars instead of ambient process environment.",
-  "lifecycle": "fork-permanent",
-  "upstream_ref": null,
-  "absorbed_date": null
- },
- {
-  "feature": "systemd restart exits 0, darwin/launchd exits 75",
-  "tests": [
-   "tests/gateway/test_gateway_shutdown.py::test_gateway_stop_systemd_service_restart_exits_cleanly",
-   "tests/gateway/test_gateway_shutdown.py::test_gateway_stop_launchd_service_restart_keeps_nonzero_exit"
-  ],
-  "paths": [
-   "gateway/run.py"
-  ],
-  "why": "Supervisor-specific restart exit contracts prevent restart loops and preserve launchd's intentional nonzero restart path. NOT converged: upstream (2026-07 40dbfa0e3) exits 75 unconditionally and relies on RestartForceExitStatus=75 in the unit file; the fork branches systemd\u21920 / launchd\u219275 instead. Checked 2026-07-16 retirement audit: keep the fork branch.",
-  "lifecycle": "fork-permanent",
-  "upstream_ref": null,
-  "absorbed_date": null
- },
- {
-  "feature": "hygiene compaction announces in-chat on success",
-  "tests": [
-   "tests/gateway/test_session_hygiene.py::test_hygiene_msgcount_announces_limit_not_count",
-   "tests/agent/test_compaction_announce.py::TestHygieneMessageLimitClause",
-   "tests/agent/test_compaction_announce.py::TestFormatterLCM",
-   "tests/agent/test_compaction_announce.py::TestFormatterBuiltin"
-  ],
-  "paths": [
-   "gateway/run.py",
-   "agent/fork_ext/compaction_ext.py",
-   "tests/golden/compaction_ext/"
-  ],
-  "why": "Successful hygiene compaction must be visible in the originating chat without exposing misleading raw message counts.",
-  "lifecycle": "upstream-intended",
-  "upstream_ref": null,
-  "absorbed_date": null
- },
- {
-  "feature": "messaging + moa toolsets present",
-  "tests": [
-   "tests/agent/test_fork_custom_toolsets.py::TestForkCustomToolsetsPresent::test_messaging_toolset_resolves_send_message",
-   "tests/agent/test_fork_custom_toolsets.py::TestForkCustomToolsetsPresent::test_moa_toolset_resolves_mixture_of_agents",
-   "tests/agent/test_fork_custom_toolsets.py::test_send_message_and_moa_not_silently_zero"
-  ],
-  "paths": [
-   "toolsets.py",
-   "tools/send_message_tool.py",
-   "tools/mixture_of_agents_tool.py"
-  ],
-  "why": "The fork intentionally exposes agent-callable messaging and MoA toolsets that upstream does not ship.",
-  "lifecycle": "fork-permanent",
-  "upstream_ref": null,
-  "absorbed_date": null
- },
- {
-  "feature": "telegram polling never drops pending updates on recovery",
-  "tests": [
-   "tests/gateway/test_telegram_restart_parity.py::test_reconnect_preserves_pending_updates",
-   "tests/gateway/test_telegram_restart_parity.py::test_all_start_polling_sites_preserve_queue_or_gate_on_reconnect",
-   "tests/gateway/test_telegram_restart_parity.py::test_recovery_ladders_preserve_queue_unconditionally"
-  ],
-  "paths": [
-   "plugins/platforms/telegram/*.py",
-   "tests/gateway/test_telegram_restart_parity.py"
-  ],
-  "why": "Recovery paths must keep Telegram pending updates; only cold bootstrap may drop stale backlog. CONVERGED in adapter code (2026-07-16 audit: zero fork delta on the drop_pending path) \u2014 the fork's contribution is now only the guard-test file, kept as a regression tripwire against upstream refactors reintroducing queue drops. 2026-07-25 sweep: upstream_ref PR #52844 is authored by teknium1 fixing third-party issue #46621 (reporter otopba) \u2014 NOT a fork submission, so this is upstream parallel invention (D3 converge), not D2 absorption of our work. Lifecycle kept 'absorbed' because upstream's implementation is canonical and ours is retired; the ref documents where the behavior now lives, not our authorship.",
-  "lifecycle": "absorbed",
-  "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/52844",
-  "absorbed_date": "2026-06-26"
- },
- {
-  "feature": "cron scheduler per-job reasoning and script timeout helpers",
-  "tests": [
-   "tests/cron/test_cron_script.py::TestRunJobScript::test_script_timeout",
-   "tests/cron/test_per_job_reasoning_effort.py::TestResolution",
-   "tests/cron/test_reasoning_config_per_model.py::TestCronPerModelReasoningConfig"
-  ],
-  "paths": [
-   "cron/fork_ext/scheduler_ext.py",
-   "tests/golden/scheduler_ext/"
-  ],
-  "why": "Cron jobs intentionally support per-job reasoning overrides and a bounded script-timeout resolution chain; the extracted fork helper must keep both behaviors byte-identical.",
-  "lifecycle": "upstream-intended",
-  "upstream_ref": null,
-  "absorbed_date": null
- },
- {
-  "feature": "relay-pool session affinity and lane headers",
-  "tests": [
-   "tests/agent/test_pool_affinity_header.py"
-  ],
-  "paths": [
-   "agent/fork_ext/relay_headers.py",
-   "tests/golden/relay_headers/"
-  ],
-  "why": "Claude API proxy pool requests must keep per-session affinity and classify interactive versus background relay lanes without stamping third-party providers.",
-  "lifecycle": "fork-permanent",
-  "upstream_ref": null,
-  "absorbed_date": null
- },
- {
-  "feature": "gateway restart failure count entry codec",
-  "tests": [
-   "tests/gateway/test_stuck_loop.py",
-   "tests/gateway/test_restart_resume_pending.py",
-   "tests/gateway/test_restart_cascade.py",
-   "tests/gateway/test_deferred_restart_taxonomy.py"
-  ],
-  "paths": [
-   "gateway/fork_ext/restart_codec.py",
-   "tests/golden/restart_codec/"
-  ],
-  "why": "Restart-loop failure counts must continue decoding legacy scalar entries and structured replay-breaker state byte-identically after extraction.",
-  "lifecycle": "upstream-intended",
-  "upstream_ref": null,
-  "absorbed_date": null
- },
- {
-  "feature": "gateway restart policy, config bridge, and initiator breadcrumb helpers",
-  "tests": [
-   "tests/gateway/test_fork_ext_restart_policy.py",
-   "tests/gateway/test_restart_cascade.py",
-   "tests/gateway/test_auto_continue_interrupted_turns.py",
-   "tests/gateway/test_reboot_resume_reason.py"
-  ],
-  "paths": [
-   "gateway/fork_ext/restart_policy.py",
-   "tests/golden/restart_policy/"
-  ],
-  "why": "Gateway restart thresholds, startup config-to-env bridging, safe-restart command detection, and per-session initiator breadcrumb naming must remain byte-identical after extraction from the upstream-churned gateway runner.",
-  "lifecycle": "upstream-intended",
-  "upstream_ref": null,
-  "absorbed_date": null
- },
- {
-  "feature": "gateway configured and persisted route identity helpers",
-  "tests": [
-   "tests/gateway/test_fast_command.py",
-   "tests/gateway/test_session_model_reset.py",
-   "tests/gateway/test_manual_reset_sticky_route.py"
-  ],
-  "paths": [
-   "gateway/fork_ext/route_identity.py",
-   "tests/golden/route_identity/"
-  ],
-  "why": "Gateway session routing must preserve credential-free configured identity parsing and fail-closed persisted route lookup semantics after extraction.",
-  "lifecycle": "upstream-intended",
-  "upstream_ref": null,
-  "absorbed_date": null
- },
- {
-  "feature": "tool-search unwrap scope gate and delegate code_execution inheritance exemption",
-  "tests": [
-   "tests/run_agent/test_tool_call_guardrail_runtime.py",
-   "tests/tools/test_tool_search.py::TestRegression_ToolsetScoping::test_tool_call_rejects_out_of_scope_tool",
-   "tests/tools/test_tool_search.py::TestRegression_ToolsetScoping::test_scoped_deferrable_names_helper",
-   "tests/tools/test_delegate_toolset_scope.py::TestToolsetIntersection::test_strip_blocked_removes_delegation"
-  ],
-  "paths": [
-   "agent/fork_ext/tool_gate.py",
-   "tests/golden/tool_gate/"
-  ],
-  "why": "Tool-search bridge calls must be scoped to the session's granted deferrable tools, and inherited subagent toolsets must keep the fork's code_execution exemption while stripping blocked delegation surfaces.",
-  "lifecycle": "upstream-intended",
-  "upstream_ref": null,
-  "absorbed_date": null
- },
- {
-  "feature": "state pure fork helpers preserve denorm gate and platform session search",
-  "tests": [
-   "tests/hermes_state/test_session_list_denorm_reland.py::test_session_list_denorm_flag_is_live_config_only",
-   "tests/test_hermes_state.py::TestSearchSessionsByTitle"
-  ],
-  "paths": [
-   "hermes_state_ext.py",
-   "tests/golden/state_ext/"
-  ],
-  "why": "Fork-owned pure state helpers must keep the config-only session-list denorm gate and cross-platform session title search aliases byte-identical while reducing inline fork logic in hermes_state.py.",
-  "lifecycle": "upstream-intended",
-  "upstream_ref": null,
-  "absorbed_date": null
- },
- {
-  "feature": "compute-host turn isolation (supervisor, delta/control protocol, synthetic heavy turn, AC-4 certify harness)",
-  "tests": [
-   "tests/tui_gateway/test_iso_certify_seam.py",
-   "tests/tui_gateway/test_compute_host.py",
-   "tests/tui_gateway/test_compute_host_phase1.py"
-  ],
-  "paths": [
-   "tui_gateway/compute_host.py",
-   "tui_gateway/host_supervisor.py",
-   "tui_gateway/synthetic_turn.py",
-   "scripts/iso-certify.py"
-  ],
-  "why": "Fork-authored dashboard turn-isolation feature (fork 2026-07-05/07-12). Upstream re-authored and merged it as PR #65895 (commit 7d27a31ce, 2026-07-16) carrying Co-authored-by: Kyzcreig; our PR #63096 was closed as superseded the same day. Upstream's copy is now CANONICAL per D2 — resolve future conflicts on upstream base and re-thread only verified deltas. NOTE: absorption is NOT visible via `gh pr list --state merged` (no Kyzcreig PR is merged upstream); the signal is a maintainer-authored PR carrying a Co-authored-by trailer.",
-  "lifecycle": "absorbed",
-  "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/65895",
-  "absorbed_date": "2026-07-16"
- }
+  {
+    "feature": "cron-subagent approval gate reads ContextVar not raw env",
+    "tests": [
+      "tests/tools/test_cron_subagent_session.py::TestCronSubagentApprovalGating"
+    ],
+    "paths": [
+      "tools/approval.py",
+      "gateway/session_context.py"
+    ],
+    "why": "Cron subagents must inherit approval gating from session ContextVars instead of ambient process environment.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cron",
+      "gateway"
+    ]
+  },
+  {
+    "feature": "systemd restart exits 0, darwin/launchd exits 75",
+    "tests": [
+      "tests/gateway/test_gateway_shutdown.py::test_gateway_stop_systemd_service_restart_exits_cleanly"
+    ],
+    "paths": [
+      "gateway/run.py"
+    ],
+    "why": "Supervisor-specific restart exit contracts prevent restart loops and preserve launchd's intentional nonzero restart path. NOT converged: upstream (2026-07 40dbfa0e3) exits 75 unconditionally and relies on RestartForceExitStatus=75 in the unit file; the fork branches systemd\u21920 / launchd\u219275 instead. Checked 2026-07-16 retirement audit: keep the fork branch.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
+    ],
+    "coverage_gap": "ROTTEN NODEID REMOVED (2026-08-30 audit): `::test_gateway_stop_launchd_service_restart_keeps_nonzero_exit` does not exist in the module (9 test functions, none is the launchd counterpart). The surviving systemd test is @pytest.mark.skipif(sys.platform=='darwin'), so ON MACOS THIS ENTRY COVERS ZERO EXECUTING TESTS. Highest residual risk in the registry: the `why` below documents this as a deliberate NON-CONVERGED fork/upstream divergence, and it is currently guarded by nothing on the platform we run. ACTION: write the darwin-side test asserting stop(restart=True, service_restart=True) leaves _exit_code == GATEWAY_SERVICE_RESTART_EXIT_CODE (75), then re-add the nodeid here."
+  },
+  {
+    "feature": "hygiene compaction announces in-chat on success",
+    "tests": [
+      "tests/gateway/test_session_hygiene.py::test_hygiene_msgcount_announces_limit_not_count",
+      "tests/agent/test_compaction_announce.py::TestHygieneMessageLimitClause",
+      "tests/agent/test_compaction_announce.py::TestFormatterLCM",
+      "tests/agent/test_compaction_announce.py::TestFormatterBuiltin"
+    ],
+    "paths": [
+      "gateway/run.py",
+      "agent/fork_ext/compaction_ext.py",
+      "tests/golden/compaction_ext/"
+    ],
+    "why": "Successful hygiene compaction must be visible in the originating chat without exposing misleading raw message counts.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "discord",
+      "telegram"
+    ]
+  },
+  {
+    "feature": "messaging + moa toolsets present",
+    "tests": [
+      "tests/agent/test_fork_custom_toolsets.py::TestForkCustomToolsetsPresent::test_messaging_toolset_resolves_send_message",
+      "tests/agent/test_fork_custom_toolsets.py::TestForkCustomToolsetsPresent::test_moa_toolset_resolves_mixture_of_agents",
+      "tests/agent/test_fork_custom_toolsets.py::test_send_message_and_moa_not_silently_zero"
+    ],
+    "paths": [
+      "toolsets.py",
+      "tools/send_message_tool.py",
+      "tools/mixture_of_agents_tool.py"
+    ],
+    "why": "The fork intentionally exposes agent-callable messaging and MoA toolsets that upstream does not ship.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "agent"
+    ]
+  },
+  {
+    "feature": "telegram polling never drops pending updates on recovery",
+    "tests": [
+      "tests/gateway/test_telegram_restart_parity.py::test_reconnect_preserves_pending_updates",
+      "tests/gateway/test_telegram_restart_parity.py::test_all_start_polling_sites_preserve_queue_or_gate_on_reconnect",
+      "tests/gateway/test_telegram_restart_parity.py::test_recovery_ladders_preserve_queue_unconditionally"
+    ],
+    "paths": [
+      "plugins/platforms/telegram/*.py",
+      "tests/gateway/test_telegram_restart_parity.py"
+    ],
+    "why": "Recovery paths must keep Telegram pending updates; only cold bootstrap may drop stale backlog. CONVERGED in adapter code (2026-07-16 audit: zero fork delta on the drop_pending path) \u2014 the fork's contribution is now only the guard-test file, kept as a regression tripwire against upstream refactors reintroducing queue drops. 2026-07-25 sweep: upstream_ref PR #52844 is authored by teknium1 fixing third-party issue #46621 (reporter otopba) \u2014 NOT a fork submission, so this is upstream parallel invention (D3 converge), not D2 absorption of our work. Lifecycle kept 'absorbed' because upstream's implementation is canonical and ours is retired; the ref documents where the behavior now lives, not our authorship.",
+    "lifecycle": "absorbed",
+    "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/52844",
+    "absorbed_date": "2026-06-26",
+    "surfaces": [
+      "telegram"
+    ]
+  },
+  {
+    "feature": "cron scheduler per-job reasoning and script timeout helpers",
+    "tests": [
+      "tests/cron/test_cron_script.py::TestRunJobScript",
+      "tests/cron/test_per_job_reasoning_effort.py::TestResolution",
+      "tests/cron/test_reasoning_config_per_model.py::TestCronPerModelReasoningConfig"
+    ],
+    "paths": [
+      "cron/fork_ext/scheduler_ext.py",
+      "tests/golden/scheduler_ext/"
+    ],
+    "why": "Cron jobs intentionally support per-job reasoning overrides and a bounded script-timeout resolution chain; the extracted fork helper must keep both behaviors byte-identical.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cron"
+    ],
+    "coverage_gap": "ROTTEN NODEID REPOINTED (2026-08-30 audit): `TestRunJobScript::test_script_timeout` does not exist; `grep -rn 'def test_script_timeout' tests/` is empty tree-wide. The class holds test_successful_script / test_script_relative_path / test_script_subprocess_env_sanitized. Repointed at the class so the entry collects, but the SCRIPT-TIMEOUT RESOLUTION CHAIN named in `why` is now UNCOVERED. The module docstring still advertises timeout coverage, suggesting a silent rename/drop. ACTION: restore a timeout test or amend `why` to stop claiming that behavior."
+  },
+  {
+    "feature": "relay-pool session affinity and lane headers",
+    "tests": [
+      "tests/agent/test_pool_affinity_header.py",
+      "tests/fork_canaries/test_fork_canary_relay_lane_headers.py"
+    ],
+    "paths": [
+      "agent/fork_ext/relay_headers.py",
+      "tests/golden/relay_headers/"
+    ],
+    "why": "Claude API proxy pool requests must keep per-session affinity and classify interactive versus background relay lanes without stamping third-party providers.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "agent"
+    ],
+    "proposed_canary": "/tmp/fork-e2e-lane/tests/test_fork_canary_relay_lane_headers.py (RED-proven: widen _POOL_AFFINITY_PROVIDERS -> 2 egress failures)",
+    "coverage_gap": "Pre-existing tests/agent/test_pool_affinity_header.py (20 tests) collects clean, but did NOT assert (a) that the pool gate is a frozenset rather than a bare literal \u2014 the exact mechanism that silently killed stamping on the claude-app->claude-apr rename (#241, 2026-07-08) \u2014 nor (b) the no-signal fail-safe (absent platform AND absent HERMES_SESSION_SOURCE must classify background, so a headless burst cannot claim interactive headroom). Complement canary added."
+  },
+  {
+    "feature": "gateway restart failure count entry codec",
+    "tests": [
+      "tests/gateway/test_stuck_loop.py",
+      "tests/gateway/test_restart_resume_pending.py",
+      "tests/gateway/test_restart_cascade.py",
+      "tests/gateway/test_deferred_restart_taxonomy.py"
+    ],
+    "paths": [
+      "gateway/fork_ext/restart_codec.py",
+      "tests/golden/restart_codec/"
+    ],
+    "why": "Restart-loop failure counts must continue decoding legacy scalar entries and structured replay-breaker state byte-identically after extraction.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
+    ]
+  },
+  {
+    "feature": "gateway restart policy, config bridge, and initiator breadcrumb helpers",
+    "tests": [
+      "tests/gateway/test_fork_ext_restart_policy.py",
+      "tests/gateway/test_restart_cascade.py",
+      "tests/gateway/test_auto_continue_interrupted_turns.py",
+      "tests/gateway/test_reboot_resume_reason.py"
+    ],
+    "paths": [
+      "gateway/fork_ext/restart_policy.py",
+      "tests/golden/restart_policy/"
+    ],
+    "why": "Gateway restart thresholds, startup config-to-env bridging, safe-restart command detection, and per-session initiator breadcrumb naming must remain byte-identical after extraction from the upstream-churned gateway runner.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
+    ]
+  },
+  {
+    "feature": "gateway configured and persisted route identity helpers",
+    "tests": [
+      "tests/gateway/test_fast_command.py",
+      "tests/gateway/test_session_model_reset.py",
+      "tests/gateway/test_manual_reset_sticky_route.py"
+    ],
+    "paths": [
+      "gateway/fork_ext/route_identity.py",
+      "tests/golden/route_identity/"
+    ],
+    "why": "Gateway session routing must preserve credential-free configured identity parsing and fail-closed persisted route lookup semantics after extraction.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
+    ]
+  },
+  {
+    "feature": "tool-search unwrap scope gate and delegate code_execution inheritance exemption",
+    "tests": [
+      "tests/run_agent/test_tool_call_guardrail_runtime.py",
+      "tests/tools/test_tool_search.py::TestRegression_ToolsetScoping::test_search_catalog_is_scoped_to_session_toolsets",
+      "tests/tools/test_tool_search.py::TestRegression_ToolsetScoping::test_scoped_deferrable_names_helper",
+      "tests/tools/test_delegate_toolset_scope.py::TestToolsetIntersection::test_strip_blocked_removes_delegation"
+    ],
+    "paths": [
+      "agent/fork_ext/tool_gate.py",
+      "tests/golden/tool_gate/"
+    ],
+    "why": "Tool-search bridge calls must be scoped to the session's granted deferrable tools, and inherited subagent toolsets must keep the fork's code_execution exemption while stripping blocked delegation surfaces.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "agent",
+      "delegation"
+    ],
+    "coverage_gap": "ROTTEN NODEID REPOINTED (2026-08-30 audit): `::test_tool_call_rejects_out_of_scope_tool` no longer exists; repointed at its likely successor `test_search_catalog_is_scoped_to_session_toolsets` (same scoping concern, same class). Verify the successor still asserts REJECTION of an out-of-scope tool_call, not merely catalog filtering \u2014 the reject path is the security-relevant half of the gate."
+  },
+  {
+    "feature": "state pure fork helpers preserve denorm gate and platform session search",
+    "tests": [
+      "tests/hermes_state/test_session_list_denorm_reland.py::test_session_list_denorm_flag_is_live_config_only",
+      "tests/test_hermes_state.py::TestSearchSessionsByTitle"
+    ],
+    "paths": [
+      "hermes_state_ext.py",
+      "tests/golden/state_ext/"
+    ],
+    "why": "Fork-owned pure state helpers must keep the config-only session-list denorm gate and cross-platform session title search aliases byte-identical while reducing inline fork logic in hermes_state.py.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "state"
+    ]
+  },
+  {
+    "feature": "compute-host turn isolation (supervisor, delta/control protocol, synthetic heavy turn, AC-4 certify harness)",
+    "tests": [
+      "tests/tui_gateway/test_iso_certify_seam.py",
+      "tests/tui_gateway/test_compute_host.py",
+      "tests/tui_gateway/test_compute_host_phase1.py"
+    ],
+    "paths": [
+      "tui_gateway/compute_host.py",
+      "tui_gateway/host_supervisor.py",
+      "tui_gateway/synthetic_turn.py",
+      "scripts/iso-certify.py"
+    ],
+    "why": "Fork-authored dashboard turn-isolation feature (fork 2026-07-05/07-12). Upstream re-authored and merged it as PR #65895 (commit 7d27a31ce, 2026-07-16) carrying Co-authored-by: Kyzcreig; our PR #63096 was closed as superseded the same day. Upstream's copy is now CANONICAL per D2 \u2014 resolve future conflicts on upstream base and re-thread only verified deltas. NOTE: absorption is NOT visible via `gh pr list --state merged` (no Kyzcreig PR is merged upstream); the signal is a maintainer-authored PR carrying a Co-authored-by trailer.",
+    "lifecycle": "absorbed",
+    "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/65895",
+    "absorbed_date": "2026-07-16",
+    "surfaces": [
+      "gateway"
+    ]
+  },
+  {
+    "feature": "slash commands /undo and /redo (half-turn rewind with redo branch)",
+    "tests": [
+      "tests/test_undo_redo_stack.py",
+      "tests/gateway/test_undo_redo_half_turn.py",
+      "tests/gateway/test_undo_error_honesty.py",
+      "tests/gateway/test_undo_drain_guard.py"
+    ],
+    "paths": [
+      "hermes_undo.py",
+      "hermes_cli/commands.py",
+      "cli.py",
+      "gateway/run.py"
+    ],
+    "why": "Fork-authored half-turn rewind. COMMAND_REGISTRY is the single source every consumer derives from (/help, CLI autocomplete, Telegram command menu, Slack mapping, gateway dispatch), so deleting the two CommandDef rows in a commands.py merge resolution removes /undo and /redo from EVERY surface at once with no import error and no test failure \u2014 the shipped undo tests exercise the engine, not the routing. The registry-level canary closes exactly that gap.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cli",
+      "gateway",
+      "discord",
+      "telegram"
+    ],
+    "proposed_canary": "/tmp/fork-e2e-lane/tests/test_fork_canary_slash_registry.py (RED-proven: delete the CommandDef row)"
+  },
+  {
+    "feature": "slash command /branch (alias /fork) incl. Discord context-inheriting thread spawn",
+    "tests": [
+      "tests/cli/test_branch_command.py",
+      "tests/gateway/test_discord_branch_thread_merge.py::TestBranchDiscordThread"
+    ],
+    "paths": [
+      "hermes_cli/commands.py",
+      "cli.py",
+      "gateway/run.py",
+      "plugins/platforms/discord/adapter.py"
+    ],
+    "why": "Session branching. On Discord /branch spawns a thread that inherits context while the parent channel keeps its own session; elsewhere it is a classic in-place switch. Two surfaces, one registry row, and the `fork` alias is documented in the slash-command reference \u2014 losing the alias is a silent UX regression that no existing test catches.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cli",
+      "gateway",
+      "discord"
+    ],
+    "proposed_canary": "/tmp/fork-e2e-lane/tests/test_fork_canary_slash_registry.py::test_branch_keeps_the_fork_alias"
+  },
+  {
+    "feature": "slash command /merge (fold a branch summary into its parent session)",
+    "tests": [
+      "tests/gateway/test_discord_branch_thread_merge.py::TestMergeCommand"
+    ],
+    "paths": [
+      "hermes_cli/commands.py",
+      "gateway/run.py",
+      "plugins/platforms/discord/adapter.py"
+    ],
+    "why": "Idempotent, owner-guarded fold-back of a branched session into its parent; writes ~/.hermes/merges/*.md. gateway_only=True is a load-bearing CONTRACT, not decoration: /merge has no branch/parent thread to fold into on the CLI surface. A merge that drops the flag makes it appear in the CLI where it cannot work. The canary asserts the flag AND the asymmetry against /branch (which must stay CLI-available).",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "discord"
+    ],
+    "proposed_canary": "/tmp/fork-e2e-lane/tests/test_fork_canary_slash_registry.py::test_merge_is_gateway_only_and_branch_is_not"
+  },
+  {
+    "feature": "slash command /fast (OpenAI Priority Processing / Anthropic Fast Mode toggle)",
+    "tests": [
+      "tests/gateway/test_fast_command.py"
+    ],
+    "paths": [
+      "hermes_cli/commands.py",
+      "gateway/fork_ext/route_identity.py",
+      "gateway/run.py"
+    ],
+    "why": "Per-session or --global priority-processing toggle. test_fast_command.py (41 tests) is cited by the 'route identity helpers' entry for a DIFFERENT reason (persisted route lookup), so the command's own registration and its normal|fast|status subcommand surface were unowned. The subcommands tuple is what makes the modes tab-completable \u2014 emptying it degrades the command silently.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cli",
+      "gateway"
+    ],
+    "proposed_canary": "/tmp/fork-e2e-lane/tests/test_fork_canary_slash_registry.py::test_fast_exposes_its_mode_subcommands"
+  },
+  {
+    "feature": "discord free-response channels: scalar coercion + quoted-bot-mention exemption",
+    "tests": [
+      "tests/fork_canaries/test_fork_canary_discord_free_response.py"
+    ],
+    "paths": [
+      "plugins/platforms/discord/adapter.py"
+    ],
+    "why": "Two behaviors that live as small conditions inside a very large gating block in on_message. (1) SCALAR COERCION: YAML parses a bare `free_response_channels: 1491973769726791812` as an int; an isinstance(raw, str) guard silently returns an empty set, the channel stops being free-response, and the bot goes MUTE for every unmentioned message with no error anywhere. (2) QUOTED-MENTION EXEMPTION: free-response channels routinely quote other bots (migration notes, pasted transcripts); the fork answers anyway and only stays silent when the message LITERALLY STARTS WITH another bot's mention. Neutering it makes the bot fall silent on any message that happens to quote another agent. Pre-existing coverage (test_discord_allowed_channels.py) tests a REPLICATED helper, not the real adapter method \u2014 so the real method was untested. This canary calls the real method.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "discord"
+    ],
+    "proposed_canary": "/tmp/fork-e2e-lane/tests/test_fork_canary_discord_free_response.py (RED-proven: revert to isinstance(str))"
+  },
+  {
+    "feature": "telegram intake sentinel makes silent inbound update drops visible",
+    "tests": [
+      "tests/gateway/test_telegram_intake_sentinel.py",
+      "tests/fork_canaries/test_fork_canary_telegram_intake_sentinel.py"
+    ],
+    "paths": [
+      "plugins/platforms/telegram/adapter.py"
+    ],
+    "why": "PR #639 (fork/main 6cc7ca42ee). A user DM was fetched by the poller, offset-confirmed to Telegram (pending_update_count back to 0), and never reached any handler \u2014 gateway healthy throughout, ZERO log evidence, unattributable after the fact. An observation-only TypeHandler in group -1 sees every update before any filter/auth-prefilter/batching can discard it, giving per-update attribution plus WARNING-level gap detection with the exact missing update_id range. THE GROUP -1 PRIORITY IS THE WHOLE FEATURE: at group>=0 a handler can discard an update before the sentinel observes it, reopening the exact blind spot. Census: OUTSTANDING upstream. The complement canary locks the registration priority and the no-false-alarm rules (contiguous / first-update / duplicate+reordered) that the shipped file does not.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "telegram"
+    ],
+    "proposed_canary": "/tmp/fork-e2e-lane/tests/test_fork_canary_telegram_intake_sentinel.py (RED-proven: group=-1 -> group=0)"
+  },
+  {
+    "feature": "cron refuses provably cross-vendor model/provider pairs at create/update time",
+    "tests": [
+      "tests/tools/test_cronjob_tools.py::TestModelProviderVendorConsistency",
+      "tests/fork_canaries/test_fork_canary_cron_cross_vendor.py"
+    ],
+    "paths": [
+      "tools/cronjob_tools.py"
+    ],
+    "why": "PR #641 (fork/main HEAD de200ebbf5). A job pinned to model='gpt-5.6-sol' + provider='claude-apr' was accepted, persisted, then failed EVERY fire with an unretryable HTTP 400. Burned real scheduled jobs on 2026-08-19 and again 2026-08-29. Rule #20b promotes the post-hoc cron-config-lint check into a create/update-time admission gate. THE FAIL-OPEN HALF IS THE FRAGILE HALF: the vendor maps are prefix-based and deliberately incomplete, so an unknown model or provider MUST yield vendor None and NOT be flagged. A merge that 'improves' this into a fail-closed catalog starts refusing every legitimate job on an uncatalogued model. Both halves are asserted. Census: OUTSTANDING upstream.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cron",
+      "cli",
+      "agent"
+    ],
+    "proposed_canary": "/tmp/fork-e2e-lane/tests/test_fork_canary_cron_cross_vendor.py (RED-proven: fail-open -> fail-closed, 5 failures)"
+  },
+  {
+    "feature": "test hygiene: evict MagicMock telegram modules before the real-PTB polling suite",
+    "tests": [
+      "tests/test_telegram_polling_progress_ptb.py"
+    ],
+    "paths": [
+      "tests/test_telegram_polling_progress_ptb.py"
+    ],
+    "why": "PR #640 (fork/main 640e57bd84). ~29 gateway unit-test files install a MagicMock under the telegram module names via sys.modules.setdefault so they can run without PTB. In a COMBINED run any of them executing first poisons this suite: importorskip finds the mock and 'succeeds', every telegram import binds MagicMock attributes, and all tests fail with \"object MagicMock can't be used in await expression\" \u2014 while passing in isolation. The fix evicts any telegram sys.modules entry whose __file__ is not a str, then reloads the adapter. NO CANARY BY DESIGN: asserting the helper exists would be a change-detector test (AGENTS.md: 'behavior contracts over snapshots'), and reproducing the pollution needs 29 mock-installing modules imported first. This entry exists so a merge reviewer knows the eviction block is LOAD-BEARING and must survive a tests/ resolution toward upstream \u2014 its absence produces an order-dependent flake invisible to CI slicing that happens to separate the files. Census: OUTSTANDING upstream.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "telegram",
+      "ci"
+    ],
+    "coverage_gap": "Deliberately no canary \u2014 self-guarding but only in a combined run. See `why`."
+  },
+  {
+    "feature": "gateway runtime footer fork fields: provider_model, context_full, reasoning",
+    "tests": [
+      "tests/fork_canaries/test_fork_canary_runtime_footer_fields.py"
+    ],
+    "paths": [
+      "gateway/runtime_footer.py"
+    ],
+    "why": "Census 2026-08-29: PR #80661 is still OUTSTANDING upstream (provider_model / context_full / reasoning are absent from upstream's gateway/runtime_footer.py) WHILE the sibling `latency` field from #71990 WAS ABSORBED via #77611. That makes this single file a live merge seam where upstream owns part and the fork owns the rest \u2014 the classic silent-drop shape: resolve toward upstream and the footer just renders shorter, no exception, no red test. Also locks the SKIP-SILENTLY doctrine (a field with missing data contributes nothing rather than '?%'), which is the byte-stability property upstream explicitly endorsed when absorbing the latency field on the same design \u2014 so keeping it is also what keeps #80661 landable.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/80661",
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "discord",
+      "telegram"
+    ],
+    "proposed_canary": "/tmp/fork-e2e-lane/tests/test_fork_canary_runtime_footer_fields.py (RED-proven: _DEFAULT_FIELDS -> upstream shape)"
+  }
 ]

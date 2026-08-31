@@ -1,6 +1,6 @@
 ---
 name: 1password
-description: Use 1Password CLI with the fleet service-account token for non-interactive secret reads, writes, injection, and validation. Also covers fallback interactive sign-in only for non-fleet machines without a service token.
+description: Fleet service-token op CLI secret reads, writes, injection.
 version: 1.0.0
 author: arceus77-7, enhanced by Hermes Agent
 license: MIT
@@ -147,7 +147,7 @@ OP_SERVICE_ACCOUNT_TOKEN="$(cat "$TOKEN_FILE")" \
 ### Run a command with secret env var
 
 ```bash
-export DB_PASSWORD="op://app-prod/db/password"
+export DB_PASSWORD="op://app-prod/db/password"  # example op:// reference, resolved by `op run`
 op run -- sh -c '[ -n "$DB_PASSWORD" ] && echo "DB_PASSWORD is set" || echo "DB_PASSWORD missing"'
 ```
 

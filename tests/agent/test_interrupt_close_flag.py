@@ -24,7 +24,8 @@ def test_interrupt_close_tail_is_structurally_flagged():
 
     assert close_interrupted_tool_sequence(messages) is True
 
-    assert messages[-1] == {
+    _tail = {k: v for k, v in messages[-1].items() if k != "timestamp"}
+    assert _tail == {
         "role": "assistant",
         "content": "Operation interrupted.",
         "_interrupt_close": True,
@@ -84,7 +85,8 @@ def test_dangling_assistant_tool_call_tail_is_removed_and_flagged():
 
     assert close_interrupted_tool_sequence(messages) is True
 
-    assert messages == [
+    _stripped = [{k: v for k, v in m.items() if k != "timestamp"} for m in messages]
+    assert _stripped == [
         {"role": "user", "content": "finish the migration"},
         {
             "role": "assistant",
@@ -104,7 +106,8 @@ def test_interrupted_assistant_text_tail_is_marked_and_api_valid():
 
     assert close_interrupted_tool_sequence(messages, interrupted_assistant_tail=True) is True
 
-    assert messages[-1] == {
+    _tail = {k: v for k, v in messages[-1].items() if k != "timestamp"}
+    assert _tail == {
         "role": "assistant",
         "content": "I checked the gateway and",
         "_interrupt_close": True,
