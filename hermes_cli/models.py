@@ -18,14 +18,21 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import time
+from dataclasses import dataclass
 from difflib import get_close_matches
 from pathlib import Path
-from typing import Any, NamedTuple, Optional, TYPE_CHECKING
+from typing import Any, Literal, NamedTuple, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from typing import TypeGuard
 
 from hermes_cli import __version__ as _HERMES_VERSION
+from hermes_cli.fast_mode_contracts import (
+    FAST_MODE_CAPABILITY_CATALOG,
+    anthropic_fast_contract_accepts,
+    codex_fast_contract_accepts,
+    normalize_fast_model_id,
+)
 from hermes_cli.urllib_security import open_credentialed_url, url_origin
 from utils import atomic_json_write, base_url_host_matches
 
@@ -3787,12 +3794,222 @@ def resolve_fast_mode_overrides(model_id: Optional[str]) -> dict[str, Any] | Non
     The overrides are injected into the API request kwargs by
     ``_build_api_kwargs`` in run_agent.py — each API path handles its own
     keys (service_tier for OpenAI/Codex, speed for Anthropic Messages).
+
+    .. note::
+       This is the model-only gate. It cannot see which wire the model is
+       reached over, so it answers for the model's *native* route. Callers
+       that know the resolved provider/api_mode should prefer
+       :func:`resolve_fast_mode_capability`, which additionally refuses to
+       emit an Anthropic ``speed`` key onto an OpenAI-compatible proxy route
+       (and vice versa). Kept as the compatibility surface for callers that
+       genuinely only have a model id.
     """
     if not model_supports_fast_mode(model_id):
         return None
     if _is_anthropic_fast_model(model_id):
         return {"speed": "fast"}
     return {"service_tier": "priority"}
+
+
+# ── Route-aware fast-mode capability ──────────────────────────────────
+#
+# ``resolve_fast_mode_overrides`` above answers "does this MODEL have a fast
+# offering", which is the right question for a model picker and an incomplete
+# one for a request builder, because the parameter that carries fast mode is
+# wire-specific:
+#
+#   service_tier=priority  OpenAI-compatible wires (chat completions/responses)
+#   service_tier=fast      Codex Responses subscription backend
+#   speed=fast             Anthropic Messages    (+ fast-mode beta header)
+#
+# The two ``service_tier`` cases are safe to be generous with: endpoints that
+# do not sell the tier ignore the field rather than rejecting it, so a false
+# positive costs nothing and a too-narrow gate would hide the toggle from a
+# newly released flagship. ``speed`` is the opposite — it is an Anthropic
+# Messages parameter, so on any other wire it is an unknown argument, and even
+# on Anthropic it is a hard 400 outside the dated contract.
+#
+# Resolving from the full ``(model, provider, api_mode)`` route lets each
+# family keep the gate that matches its failure mode, and gives the command
+# surface, the picker inventory and the request builder one shared answer.
+
+#: Config surfaces name a model before its transport is necessarily pinned:
+#: ``model.provider`` may be absent or still ``auto``. That is not the same as
+#: naming a *wrong* provider and must not fail closed, or ``/fast`` would
+#: vanish from a default config whose model genuinely supports it.
+_UNRESOLVED_PROVIDERS: frozenset[str] = frozenset({"", "auto"})
+
+#: Wires that carry an OpenAI-style ``service_tier`` field.
+_SERVICE_TIER_API_MODES: frozenset[str] = frozenset(
+    {"chat_completions", "codex_responses"}
+)
+
+
+@dataclass(frozen=True)
+class FastModeCapability:
+    """The single resolved answer for one route's fast-mode support.
+
+    ``request_overrides`` is the *only* thing that may reach the wire, and it
+    is empty whenever ``supported`` is False — so a caller cannot accidentally
+    ship a parameter whose gate said no. ``reason`` is a human sentence naming
+    the route, for the surface that has to explain the refusal.
+    """
+
+    supported: bool
+    family: Literal[
+        "openai_priority",
+        "codex_fast",
+        "anthropic_fast",
+        "unsupported",
+    ]
+    request_overrides: dict[str, Any]
+    reason: Optional[str] = None
+
+
+def _fast_route_label(provider: Optional[str], model: Optional[str]) -> str:
+    resolved_provider = normalize_provider(str(provider or "")) or "<unknown>"
+    return f"{resolved_provider}/{normalize_fast_model_id(model) or '<unset>'}"
+
+
+def resolve_fast_mode_capability(
+    *,
+    model: Optional[str],
+    provider: Optional[str],
+    api_mode: Optional[str],
+) -> FastModeCapability:
+    """Resolve fast-mode support from the complete transport contract.
+
+    One result shared by the command UX, the picker inventory and request
+    construction, so support, explanation and serialized overrides cannot
+    drift apart.
+
+    The per-family gates differ on purpose, matching how each vendor fails:
+
+    * **Anthropic Fast Mode** requires the *native Messages* route and an
+      exact model from the dated contract. ``speed`` does not exist on other
+      wires and is a 400 on other Claude models, so this fails closed.
+    * **Codex Fast** requires the Codex Responses backend and an exact model
+      from its (much shorter) contract, because it is a different tier value
+      from the OpenAI API's.
+    * **OpenAI Priority Processing** keeps the permissive pattern gate on any
+      OpenAI-style wire: the field is ignored rather than rejected by
+      endpoints that don't sell it, so breadth is free and a narrow list would
+      hide the toggle from new flagships.
+    """
+    normalized_provider = normalize_provider(str(provider or ""))
+    normalized_mode = str(api_mode or "").strip().lower()
+    route = _fast_route_label(provider, model)
+
+    # ── Anthropic Fast Mode: native Messages wire only, exact contract ─
+    if normalized_mode == "anthropic_messages":
+        supported = normalized_provider == "anthropic" and (
+            anthropic_fast_contract_accepts(model)
+        )
+        if supported:
+            reason = None
+        elif normalized_provider != "anthropic":
+            reason = (
+                f"Anthropic Fast Mode is only available on the native "
+                f"Anthropic endpoint; `{route}` is served by a third party "
+                "that would reject the fast-mode beta."
+            )
+        else:
+            reason = (
+                f"Anthropic Fast Mode (`speed=fast`) is not documented for "
+                f"`{route}`; other Claude models reject the parameter."
+            )
+        return FastModeCapability(
+            supported=supported,
+            family="anthropic_fast",
+            request_overrides={"speed": "fast"} if supported else {},
+            reason=reason,
+        )
+
+    # ── Codex Fast: the Codex Responses subscription backend ──────────
+    # A distinct tier VALUE ("fast", not "priority"), so it must be matched
+    # before the generic OpenAI branch below.
+    if normalized_provider == "openai-codex" and normalized_mode == "codex_responses":
+        supported = codex_fast_contract_accepts(model)
+        listed = ", ".join(FAST_MODE_CAPABILITY_CATALOG["codex_fast"]["models"])
+        return FastModeCapability(
+            supported=supported,
+            family="codex_fast",
+            request_overrides={"service_tier": "fast"} if supported else {},
+            reason=None
+            if supported
+            else f"Codex Fast is not available for `{route}` (currently {listed}).",
+        )
+
+    # ── OpenAI-style Priority Processing ──────────────────────────────
+    # Deliberately permissive: ``service_tier`` is ignored rather than
+    # rejected by endpoints that do not sell a priority tier, so this keeps
+    # the existing pattern gate and stays available through proxies.
+    if normalized_mode in _SERVICE_TIER_API_MODES or not normalized_mode:
+        from agent.model_metadata import is_grok_46_family
+
+        supported = _is_openai_fast_model(model) or is_grok_46_family(
+            str(model or "")
+        )
+        return FastModeCapability(
+            supported=supported,
+            family="openai_priority",
+            request_overrides={"service_tier": "priority"} if supported else {},
+            reason=None
+            if supported
+            else (
+                f"Priority Processing is not offered for `{route}`; requests "
+                "will use normal speed."
+            ),
+        )
+
+    return FastModeCapability(
+        supported=False,
+        family="unsupported",
+        request_overrides={},
+        reason=(
+            f"`{route}` with API mode `{normalized_mode or '<unset>'}` does not "
+            "declare a supported fast contract; requests will use normal speed."
+        ),
+    )
+
+
+def _native_fast_route(model_id: Optional[str]) -> Optional[tuple[str, str]]:
+    """Return the ``(provider, api_mode)`` whose contract documents fast for a model."""
+    if not normalize_fast_model_id(model_id):
+        return None
+    if anthropic_fast_contract_accepts(model_id):
+        return "anthropic", "anthropic_messages"
+    if model_supports_fast_mode(model_id):
+        return "openai-api", "chat_completions"
+    return None
+
+
+def resolve_fast_mode_capability_for_configured_route(
+    *,
+    model: Optional[str],
+    provider: Optional[str],
+    api_mode: Optional[str],
+) -> FastModeCapability:
+    """Resolve fast support for a configured route whose provider may be unpinned.
+
+    A concrete provider resolves through the full route contract unchanged. An
+    unresolved one (absent, or still ``auto``) resolves against the model's own
+    documented native route — which is exactly the answer a model-only gate
+    reports, and the one a config surface means when it names a model without
+    having pinned its transport yet.
+    """
+    if str(provider or "").strip().lower() not in _UNRESOLVED_PROVIDERS:
+        return resolve_fast_mode_capability(
+            model=model, provider=provider, api_mode=api_mode
+        )
+    native = _native_fast_route(model)
+    if native is None:
+        return resolve_fast_mode_capability(
+            model=model, provider=provider, api_mode=api_mode
+        )
+    return resolve_fast_mode_capability(
+        model=model, provider=native[0], api_mode=native[1]
+    )
 
 
 def _resolve_copilot_catalog_api_key() -> str:

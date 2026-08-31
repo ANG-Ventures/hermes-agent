@@ -292,11 +292,16 @@ class CLIAgentSetupMixin:
         """Build the effective model/runtime config for a single user turn.
 
         Always uses the session's primary model/provider.  If the user has
-        toggled `/fast` on and the current model supports Priority
-        Processing / Anthropic fast mode, attach `request_overrides` so the
-        API call is marked accordingly.
+        toggled `/fast` on and the *resolved route* (model + provider +
+        api_mode) has a documented fast contract, attach `request_overrides`
+        so the API call is marked accordingly.
+
+        Route-aware rather than model-only: the parameter that carries fast
+        mode is wire-specific (``speed`` on Anthropic Messages,
+        ``service_tier`` on OpenAI/xAI), so the same model reached over a
+        different transport may take a different key or none at all.
         """
-        from hermes_cli.models import resolve_fast_mode_overrides
+        from hermes_cli.models import resolve_fast_mode_capability
 
         runtime = {
             "api_key": self.api_key,
@@ -330,10 +335,14 @@ class CLIAgentSetupMixin:
             return route
 
         try:
-            overrides = resolve_fast_mode_overrides(route["model"])
+            overrides = resolve_fast_mode_capability(
+                model=route["model"],
+                provider=runtime["provider"],
+                api_mode=runtime["api_mode"],
+            ).request_overrides
         except Exception:
             overrides = None
-        route["request_overrides"] = overrides
+        route["request_overrides"] = overrides or None
         return route
 
     def _init_agent(self, *, model_override: str = None, runtime_override: dict = None, request_overrides: dict | None = None) -> bool:

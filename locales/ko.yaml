@@ -137,6 +137,17 @@ gateway:
     picker_title:          "⚡ **Priority Processing**\\n\\n현재 모드: `{mode}`\\n\\n옵션을 선택하세요:"
     choice_fast:           "fast — Priority Processing 켜기"
     choice_normal:         "normal — 표준 처리"
+    family_openai_priority: "OpenAI API Priority Processing"
+    family_codex_fast:     "Codex Fast"
+    family_anthropic_fast: "Anthropic Fast Mode"
+    family_unsupported:    "빠른 모드"
+    state_on:              "켜짐"
+    state_off:             "꺼짐"
+    route_status:          "⚡ Fast: {state} — `{route}`에서 {family}"
+    route_off:             "⚡ Fast: 꺼짐 — {reason}"
+    route_unavailable:     "⚡ Fast 사용 불가 — {reason}"
+    route_saved:           "⚡ ✓ {family}: **{label}** (설정에 저장됨)"
+    route_session_only:    "⚡ ✓ {family}: **{label}** (이 세션에만 적용)"
 
   footer:
     status:                "📎 런타임 푸터: **{state}**\n필드: `{fields}`\n플랫폼: `{platform}`"

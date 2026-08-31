@@ -137,6 +137,17 @@ gateway:
     picker_title:          "⚡ **Priority Processing**\\n\\n現在のモード: `{mode}`\\n\\nオプションを選択:"
     choice_fast:           "fast — Priority Processing オン"
     choice_normal:         "normal — 標準処理"
+    family_openai_priority: "OpenAI API Priority Processing"
+    family_codex_fast:     "Codex Fast"
+    family_anthropic_fast: "Anthropic Fast Mode"
+    family_unsupported:    "高速モード"
+    state_on:              "オン"
+    state_off:             "オフ"
+    route_status:          "⚡ Fast: {state} — `{route}` で {family}"
+    route_off:             "⚡ Fast: オフ — {reason}"
+    route_unavailable:     "⚡ Fast は利用できません — {reason}"
+    route_saved:           "⚡ ✓ {family}: **{label}** (設定に保存しました)"
+    route_session_only:    "⚡ ✓ {family}: **{label}** (このセッションのみ)"
 
   footer:
     status:                "📎 ランタイムフッター: **{state}**\nフィールド: `{fields}`\nプラットフォーム: `{platform}`"

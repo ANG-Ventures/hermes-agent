@@ -137,6 +137,17 @@ gateway:
     picker_title:          "⚡ **优先处理**\\n\\n当前模式：`{mode}`\\n\\n请选择："
     choice_fast:           "fast — 开启优先处理"
     choice_normal:         "normal — 标准处理"
+    family_openai_priority: "OpenAI API 优先处理"
+    family_codex_fast:     "Codex Fast"
+    family_anthropic_fast: "Anthropic 快速模式"
+    family_unsupported:    "快速模式"
+    state_on:              "开启"
+    state_off:             "关闭"
+    route_status:          "⚡ Fast：{state} — {family}，路由 `{route}`"
+    route_off:             "⚡ Fast：关闭 — {reason}"
+    route_unavailable:     "⚡ Fast 不可用 — {reason}"
+    route_saved:           "⚡ ✓ {family}：**{label}**（已保存到配置）"
+    route_session_only:    "⚡ ✓ {family}：**{label}**（仅本次会话）"
 
   footer:
     status:                "📎 运行时页脚：**{state}**\n字段：`{fields}`\n平台：`{platform}`"

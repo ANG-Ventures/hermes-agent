@@ -152,6 +152,17 @@ gateway:
     picker_title:          "⚡ **Priority Processing**\n\nCurrent mode: `{mode}`\n\nPick an option:"
     choice_fast:           "fast — Priority Processing on"
     choice_normal:         "normal — standard processing"
+    family_openai_priority: "OpenAI API Priority Processing"
+    family_codex_fast:     "Codex Fast"
+    family_anthropic_fast: "Anthropic Fast Mode"
+    family_unsupported:    "Fast mode"
+    state_on:              "on"
+    state_off:             "off"
+    route_status:          "⚡ Fast: {state} — {family} on `{route}`"
+    route_off:             "⚡ Fast: off — {reason}"
+    route_unavailable:     "⚡ Fast unavailable — {reason}"
+    route_saved:           "⚡ ✓ {family}: **{label}** (saved to config)"
+    route_session_only:    "⚡ ✓ {family}: **{label}** (this session only)"
 
   footer:
     status:                "📎 Runtime footer: **{state}**\nFields: `{fields}`\nPlatform: `{platform}`"

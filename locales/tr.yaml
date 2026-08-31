@@ -137,6 +137,17 @@ gateway:
     picker_title:          "⚡ **Priority Processing**\\n\\nMevcut mod: `{mode}`\\n\\nBir seçenek seçin:"
     choice_fast:           "fast — Priority Processing açık"
     choice_normal:         "normal — standart işleme"
+    family_openai_priority: "OpenAI API Priority Processing"
+    family_codex_fast:     "Codex Fast"
+    family_anthropic_fast: "Anthropic Fast Mode"
+    family_unsupported:    "Hızlı mod"
+    state_on:              "açık"
+    state_off:             "kapalı"
+    route_status:          "⚡ Fast: {state} — `{route}` üzerinde {family}"
+    route_off:             "⚡ Fast: kapalı — {reason}"
+    route_unavailable:     "⚡ Fast kullanılamıyor — {reason}"
+    route_saved:           "⚡ ✓ {family}: **{label}** (yapılandırmaya kaydedildi)"
+    route_session_only:    "⚡ ✓ {family}: **{label}** (yalnızca bu oturum)"
 
   footer:
     status:                "📎 Çalışma zamanı altbilgisi: **{state}**\nAlanlar: `{fields}`\nPlatform: `{platform}`"

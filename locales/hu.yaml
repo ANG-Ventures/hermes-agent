@@ -137,6 +137,17 @@ gateway:
     picker_title:          "⚡ **Priority Processing**\\n\\nJelenlegi mód: `{mode}`\\n\\nVálassz egy opciót:"
     choice_fast:           "fast — Priority Processing bekapcsolva"
     choice_normal:         "normal — normál feldolgozás"
+    family_openai_priority: "OpenAI API Priority Processing"
+    family_codex_fast:     "Codex Fast"
+    family_anthropic_fast: "Anthropic Fast Mode"
+    family_unsupported:    "Gyors mód"
+    state_on:              "be"
+    state_off:             "ki"
+    route_status:          "⚡ Fast: {state} — {family} ezen az útvonalon: `{route}`"
+    route_off:             "⚡ Fast: ki — {reason}"
+    route_unavailable:     "⚡ A Fast nem érhető el — {reason}"
+    route_saved:           "⚡ ✓ {family}: **{label}** (mentve a konfigurációba)"
+    route_session_only:    "⚡ ✓ {family}: **{label}** (csak ebben a munkamenetben)"
 
   footer:
     status:                "📎 Futási idejű lábléc: **{state}**\nMezők: `{fields}`\nPlatform: `{platform}`"

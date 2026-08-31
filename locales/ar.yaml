@@ -160,6 +160,17 @@ gateway:
     picker_title:          "⚡ **المعالجة ذات الأولوية**\n\nالوضع الحالي: `{mode}`\n\nاختر خيارًا:"
     choice_fast:           "fast — المعالجة ذات الأولوية مُفعّلة"
     choice_normal:         "normal — المعالجة القياسية"
+    family_openai_priority: "OpenAI API Priority Processing"
+    family_codex_fast:     "Codex Fast"
+    family_anthropic_fast: "Anthropic Fast Mode"
+    family_unsupported:    "الوضع السريع"
+    state_on:              "مُفعّل"
+    state_off:             "مُعطّل"
+    route_status:          "⚡ Fast: {state} — {family} على `{route}`"
+    route_off:             "⚡ Fast: مُعطّل — {reason}"
+    route_unavailable:     "⚡ Fast غير متاح — {reason}"
+    route_saved:           "⚡ ✓ {family}: **{label}** (حُفظت في الإعدادات)"
+    route_session_only:    "⚡ ✓ {family}: **{label}** (هذه الجلسة فقط)"
 
   footer:
     status:                "📎 تذييل التشغيل: **{state}**\nالحقول: `{fields}`\nالمنصّة: `{platform}`"

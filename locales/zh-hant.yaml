@@ -137,6 +137,17 @@ gateway:
     picker_title:          "⚡ **Priority Processing**\\n\\n目前模式：`{mode}`\\n\\n請選擇："
     choice_fast:           "fast — 開啟 Priority Processing"
     choice_normal:         "normal — 標準處理"
+    family_openai_priority: "OpenAI API Priority Processing"
+    family_codex_fast:     "Codex Fast"
+    family_anthropic_fast: "Anthropic Fast Mode"
+    family_unsupported:    "快速模式"
+    state_on:              "開啟"
+    state_off:             "關閉"
+    route_status:          "⚡ Fast：{state} — {family}，路由 `{route}`"
+    route_off:             "⚡ Fast：關閉 — {reason}"
+    route_unavailable:     "⚡ Fast 無法使用 — {reason}"
+    route_saved:           "⚡ ✓ {family}：**{label}**（已儲存到設定）"
+    route_session_only:    "⚡ ✓ {family}：**{label}**（僅本次工作階段）"
 
   footer:
     status:                "📎 執行階段頁尾：**{state}**\n欄位：`{fields}`\n平台：`{platform}`"

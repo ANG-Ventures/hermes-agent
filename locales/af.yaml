@@ -137,6 +137,17 @@ gateway:
     picker_title:          "⚡ **Priority Processing**\\n\\nHuidige modus: `{mode}`\\n\\nKies \\'n opsie:"
     choice_fast:           "fast — Priority Processing aan"
     choice_normal:         "normal — standaardverwerking"
+    family_openai_priority: "OpenAI API Priority Processing"
+    family_codex_fast:     "Codex Fast"
+    family_anthropic_fast: "Anthropic Fast Mode"
+    family_unsupported:    "Vinnige modus"
+    state_on:              "aan"
+    state_off:             "af"
+    route_status:          "⚡ Fast: {state} — {family} op `{route}`"
+    route_off:             "⚡ Fast: af — {reason}"
+    route_unavailable:     "⚡ Fast nie beskikbaar nie — {reason}"
+    route_saved:           "⚡ ✓ {family}: **{label}** (gestoor in konfigurasie)"
+    route_session_only:    "⚡ ✓ {family}: **{label}** (slegs hierdie sessie)"
 
   footer:
     status:                "📎 Looptyd-voetstuk: **{state}**\nVelde: `{fields}`\nPlatform: `{platform}`"

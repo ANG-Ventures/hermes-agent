@@ -8679,9 +8679,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Build the effective model/runtime config for a single turn.
 
         Always uses the session's primary model/provider.  If `/fast` is
-        enabled and the model supports Priority Processing / Anthropic fast
-        mode, attach `request_overrides` so the API call is marked
-        accordingly.
+        enabled and the *resolved route* (model + provider + api_mode) has a
+        documented fast contract, attach `request_overrides` so the API call
+        is marked accordingly.
+
+        Route-aware rather than model-only: the parameter that carries fast
+        mode is wire-specific (``speed`` on Anthropic Messages,
+        ``service_tier`` on OpenAI/xAI), so the same model id reached over a
+        different transport may take a different key or none at all. A route
+        with no contract contributes no overrides and the turn runs at normal
+        speed.
 
         Per-provider ``request_overrides`` resolved by
         ``resolve_runtime_provider`` (e.g. a ``custom_providers`` ``extra_body``
@@ -8689,7 +8696,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         the fast-mode overrides, so a provider's configured request body still
         reaches the model on the gateway turn path.
         """
-        from hermes_cli.models import resolve_fast_mode_overrides
+        from hermes_cli.models import resolve_fast_mode_capability
 
         runtime = {
             "api_key": runtime_kwargs.get("api_key"),
@@ -8729,7 +8736,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return route
 
         try:
-            overrides = resolve_fast_mode_overrides(route["model"])
+            overrides = resolve_fast_mode_capability(
+                model=route["model"],
+                provider=runtime["provider"],
+                api_mode=runtime["api_mode"],
+            ).request_overrides
         except Exception:
             overrides = None
         # Fast-mode overrides (service_tier / speed) are top-level keys and do
@@ -10062,6 +10073,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ):
                 return _t_state.conversation.service_tier_override
         return self._load_service_tier()
+
+    def _resolve_session_fast_route(
+        self,
+        *,
+        session_key: Optional[str] = None,
+        user_config: Optional[dict] = None,
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """Resolve the ``(model, provider, api_mode)`` a session's turns will use.
+
+        A session-scoped ``/model`` override wins over the configured gateway
+        route, exactly as the turn path resolves it — so ``/fast`` answers for
+        the route the *next message* will take rather than the one config
+        names. Falls back to the configured route when there is no override.
+
+        Returns the triple with ``api_mode`` re-derived from the
+        provider/endpoint when the override did not record one (persisted
+        overrides deliberately drop ``api_mode``, which is re-resolved at
+        rehydration).
+        """
+        from hermes_cli.providers import determine_api_mode
+
+        cfg = user_config if user_config is not None else _load_gateway_config()
+        model = _resolve_gateway_model(cfg)
+        model_cfg = cfg.get("model", {})
+        provider = (
+            model_cfg.get("provider") if isinstance(model_cfg, dict) else None
+        )
+        base_url = model_cfg.get("base_url") if isinstance(model_cfg, dict) else None
+        api_mode = model_cfg.get("api_mode") if isinstance(model_cfg, dict) else None
+
+        if session_key:
+            override = (
+                getattr(self, "_session_model_overrides", {}) or {}
+            ).get(session_key) or {}
+            if isinstance(override, dict) and override:
+                model = override.get("model") or model
+                provider = override.get("provider") or provider
+                base_url = override.get("base_url") or base_url
+                # api_mode is intentionally NOT persisted with the override;
+                # prefer a live one when present, else re-derive below.
+                api_mode = override.get("api_mode") or None
+
+        if not api_mode:
+            try:
+                api_mode = determine_api_mode(
+                    str(provider or ""), str(base_url or ""), str(model or "")
+                )
+            except Exception:
+                api_mode = None
+        return model, provider, api_mode
 
     def _set_session_service_tier_override(
         self,

@@ -9798,12 +9798,41 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     
     def _fast_command_available(self) -> bool:
         try:
-            from hermes_cli.models import model_supports_fast_mode
+            from hermes_cli.models import (
+                resolve_fast_mode_capability_for_configured_route,
+            )
+            from hermes_cli.providers import determine_api_mode
         except Exception:
             return False
         agent = getattr(self, "agent", None)
         model = getattr(agent, "model", None) or getattr(self, "model", None)
-        return model_supports_fast_mode(model)
+        provider = getattr(agent, "provider", None) or getattr(self, "provider", None)
+        api_mode = getattr(agent, "api_mode", None) or getattr(self, "api_mode", None)
+        if not api_mode:
+            # A live agent always carries a resolved api_mode; a pre-build CLI
+            # may not. Re-derive it from the provider/endpoint rather than
+            # guessing, so the toggle is offered on exactly the routes the
+            # request builder would honour.
+            try:
+                api_mode = determine_api_mode(
+                    str(provider or ""),
+                    str(
+                        getattr(agent, "base_url", None)
+                        or getattr(self, "base_url", None)
+                        or ""
+                    ),
+                    str(model or ""),
+                )
+            except Exception:
+                api_mode = None
+        # ``_for_configured_route`` so an unpinned provider ("auto", or absent
+        # before the first turn resolves one) still reports the model's own
+        # native support instead of failing closed and hiding /fast.
+        return resolve_fast_mode_capability_for_configured_route(
+            model=model,
+            provider=provider,
+            api_mode=api_mode,
+        ).supported
 
     def _command_available(self, slash_command: str) -> bool:
         if slash_command == "/fast":

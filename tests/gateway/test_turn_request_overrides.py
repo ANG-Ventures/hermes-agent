@@ -49,17 +49,34 @@ def test_provider_request_overrides_preserved_without_service_tier():
     assert route["request_overrides"] is not rk["request_overrides"]
 
 
-def test_provider_request_overrides_merged_under_fast_mode(monkeypatch):
-    """/fast active: provider extra_body AND the service-tier marker both survive."""
-    monkeypatch.setattr(
-        "hermes_cli.models.resolve_fast_mode_overrides",
-        lambda model_id: {"service_tier": "priority"},
+def test_provider_request_overrides_merged_under_fast_mode():
+    """/fast active: provider extra_body AND the service-tier marker both survive.
+
+    Uses a genuinely fast-capable route (rather than stubbing the resolver) so
+    the merge is exercised against the same capability lookup the runtime uses.
+    """
+    runner = _runner(service_tier="priority")
+    rk = _runtime_kwargs(
+        request_overrides=PROVIDER_OVERRIDES,
+        provider="openai-api",
+        api_mode="chat_completions",
     )
+    route = runner._resolve_turn_agent_config("hi", "gpt-5.4", rk)
+    assert route["request_overrides"]["extra_body"] == PROVIDER_OVERRIDES["extra_body"]
+    assert route["request_overrides"]["service_tier"] == "priority"
+
+
+def test_provider_overrides_survive_when_route_has_no_fast_contract():
+    """A route without a fast contract must still forward the provider's body.
+
+    The fast lookup returning nothing must not swallow the provider's own
+    configured ``extra_body``.
+    """
     runner = _runner(service_tier="priority")
     rk = _runtime_kwargs(request_overrides=PROVIDER_OVERRIDES)
     route = runner._resolve_turn_agent_config("hi", "main", rk)
     assert route["request_overrides"]["extra_body"] == PROVIDER_OVERRIDES["extra_body"]
-    assert route["request_overrides"]["service_tier"] == "priority"
+    assert "service_tier" not in route["request_overrides"]
 
 
 def test_no_provider_overrides_yields_empty():

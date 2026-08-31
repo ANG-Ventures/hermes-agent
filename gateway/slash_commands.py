@@ -4094,9 +4094,18 @@ class GatewaySlashCommandsMixin:
 
         Session-scoped by default; ``--global`` persists agent.service_tier
         to config.yaml (parity with /model and /reasoning).
+
+        Route-aware: support is resolved from the full ``(model, provider,
+        api_mode)`` the session's next turn will use, not the model id alone,
+        because the parameter that carries fast mode differs per wire. An
+        unsupported route refuses to enable and says why, rather than
+        accepting the toggle and silently sending nothing.
         """
         from gateway.run import _load_gateway_config, _resolve_gateway_model
-        from hermes_cli.models import model_supports_fast_mode
+        from hermes_cli.models import (
+            resolve_fast_mode_capability,
+            resolve_fast_mode_capability_for_configured_route,
+        )
 
         raw_args = event.get_command_args().strip().lower()
         # Reuse the /reasoning arg parser: strips --global (any position),
@@ -4108,13 +4117,64 @@ class GatewaySlashCommandsMixin:
         )
 
         user_config = _load_gateway_config()
-        model = _resolve_gateway_model(user_config)
-        if not model_supports_fast_mode(model):
-            return t("gateway.fast.not_supported")
+        model, provider, api_mode = self._resolve_session_fast_route(
+            session_key=session_key, user_config=user_config
+        )
+        capability = resolve_fast_mode_capability(
+            model=model, provider=provider, api_mode=api_mode
+        )
+        route = f"{provider or '<unknown>'}/{model or '<unset>'}"
+        family_label = t(f"gateway.fast.family_{capability.family}")
+        # The ``--global`` lane persists a default that applies to the
+        # CONFIGURED gateway route, so it must be gated on that route rather
+        # than on whatever this one session overrode itself to.
+        _configured_model_cfg = user_config.get("model", {})
+        _configured_provider = (
+            _configured_model_cfg.get("provider")
+            if isinstance(_configured_model_cfg, dict)
+            else None
+        )
+        _configured_api_mode = (
+            _configured_model_cfg.get("api_mode")
+            if isinstance(_configured_model_cfg, dict)
+            else None
+        )
+        logger.debug(
+            "Fast capability route=%s api_mode=%s family=%s supported=%s",
+            route,
+            api_mode or "",
+            capability.family,
+            capability.supported,
+        )
 
         def _apply_fast_selection(value: str, persist: bool = False) -> str:
-            """Apply a /fast argument (typed or picked) and return the reply."""
+            """Apply a /fast argument (typed or picked) and return the reply.
+
+            Enabling is gated on the route that will actually carry the
+            request: the session route for a session-scoped toggle, the
+            configured route for ``--global`` (whose persisted default applies
+            to the gateway route, not to whatever this one session overrode
+            itself to). Disabling is always allowed — turning the toggle off
+            must never be blocked by an unsupported route.
+            """
             if value in {"fast", "on"}:
+                if persist:
+                    global_capability = (
+                        resolve_fast_mode_capability_for_configured_route(
+                            model=_resolve_gateway_model(user_config),
+                            provider=_configured_provider,
+                            api_mode=_configured_api_mode,
+                        )
+                    )
+                    if not global_capability.supported:
+                        return t(
+                            "gateway.fast.route_unavailable",
+                            reason=global_capability.reason,
+                        )
+                elif not capability.supported:
+                    return t(
+                        "gateway.fast.route_unavailable", reason=capability.reason
+                    )
                 tier = "priority"
                 saved_value = "fast"
                 label = t("gateway.fast.label_fast")
@@ -4132,45 +4192,71 @@ class GatewaySlashCommandsMixin:
                         session_key, None, clear=True
                     )
                     self._evict_cached_agent(session_key)
-                    return t("gateway.fast.saved", label=label)
+                    return t(
+                        "gateway.fast.route_saved", family=family_label, label=label
+                    )
                 # Config write failed — fall back to a session override so the
                 # user's choice still applies (mirrors /reasoning --global).
                 self._set_session_service_tier_override(session_key, tier)
                 self._evict_cached_agent(session_key)
-                return t("gateway.fast.session_only", label=label)
+                return t(
+                    "gateway.fast.route_session_only",
+                    family=family_label,
+                    label=label,
+                )
             self._set_session_service_tier_override(session_key, tier)
             self._evict_cached_agent(session_key)
-            return t("gateway.fast.session_only", label=label)
+            return t(
+                "gateway.fast.route_session_only", family=family_label, label=label
+            )
 
         if not args or args == "status":
             is_fast = self._service_tier == "priority"
-            status = t("gateway.fast.status_fast") if is_fast else t("gateway.fast.status_normal")
-
-            async def _on_fast_choice(_chat_id: str, value: str) -> str:
-                return _apply_fast_selection(value, persist=persist_global)
-
-            picker_sent = await self._try_send_choice_picker(
-                event,
-                session_key,
-                title=t("gateway.fast.picker_title", mode=status),
-                choices=[
-                    {
-                        "value": "fast",
-                        "label": t("gateway.fast.choice_fast"),
-                        "is_current": is_fast,
-                    },
-                    {
-                        "value": "normal",
-                        "label": t("gateway.fast.choice_normal"),
-                        "is_current": not is_fast,
-                    },
-                ],
-                on_choice_selected=_on_fast_choice,
+            state = t(
+                "gateway.fast.state_on" if is_fast else "gateway.fast.state_off"
             )
-            if picker_sent:
-                return None  # Picker sent — adapter handles the response
 
-            return t("gateway.fast.status", mode=status)
+            # Only offer the picker on a route that can actually take the
+            # toggle; otherwise the tap would be refused after the fact.
+            if capability.supported:
+                status = (
+                    t("gateway.fast.status_fast")
+                    if is_fast
+                    else t("gateway.fast.status_normal")
+                )
+
+                async def _on_fast_choice(_chat_id: str, value: str) -> str:
+                    return _apply_fast_selection(value, persist=persist_global)
+
+                picker_sent = await self._try_send_choice_picker(
+                    event,
+                    session_key,
+                    title=t("gateway.fast.picker_title", mode=status),
+                    choices=[
+                        {
+                            "value": "fast",
+                            "label": t("gateway.fast.choice_fast"),
+                            "is_current": is_fast,
+                        },
+                        {
+                            "value": "normal",
+                            "label": t("gateway.fast.choice_normal"),
+                            "is_current": not is_fast,
+                        },
+                    ],
+                    on_choice_selected=_on_fast_choice,
+                )
+                if picker_sent:
+                    return None  # Picker sent — adapter handles the response
+
+                return t(
+                    "gateway.fast.route_status",
+                    state=state,
+                    family=family_label,
+                    route=route,
+                )
+
+            return t("gateway.fast.route_off", reason=capability.reason)
 
         return _apply_fast_selection(args, persist=persist_global)
 

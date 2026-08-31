@@ -437,8 +437,15 @@ def _reasoning_catalog_reader(slug: str):
 def _apply_capabilities(rows: list[dict]) -> None:
     """Attach a ``{model: {fast, reasoning, ...}}`` map to each provider row.
 
-    `fast` mirrors ``model_supports_fast_mode`` (the same gate the runtime
-    enforces). `reasoning` comes from the models.dev catalog when known and
+    `fast` mirrors the runtime's own route-aware gate: the picker row is keyed
+    by the provider serving the model, so it can ask the same
+    ``(model, provider, api_mode)`` question the request builder asks and never
+    advertise a toggle that the turn path would then decline to send. This is
+    why a Claude model listed under a routing proxy shows `fast: false` while
+    the same id under `anthropic` shows true — the proxy route has no `speed`
+    parameter to carry it.
+
+    `reasoning` comes from the models.dev catalog when known and
     defaults to True otherwise — the effort dial is broadly accepted and a
     no-op on models that ignore it, whereas hiding it from a capable-but-
     uncatalogued model is the worse failure.
@@ -457,7 +464,8 @@ def _apply_capabilities(rows: list[dict]) -> None:
     ``minimal`` at its lowest thinking), so filtering the picker by that list
     would hide levels that demonstrably work.
     """
-    from hermes_cli.models import model_supports_fast_mode
+    from hermes_cli.models import resolve_fast_mode_capability
+    from hermes_cli.providers import determine_api_mode
 
     try:
         from agent.models_dev import get_model_capabilities
@@ -468,6 +476,13 @@ def _apply_capabilities(rows: list[dict]) -> None:
         slug = row.get("slug") or ""
         caps: dict[str, dict[str, Any]] = {}
         read_reasoning_catalog = _reasoning_catalog_reader(slug.lower())
+        # Provider-only derivation: the inventory has no endpoint context, and
+        # a row's slug is exactly the provider that would serve every model in
+        # it, so this is the same route the runtime resolves for these models.
+        try:
+            row_api_mode = determine_api_mode(slug)
+        except Exception:
+            row_api_mode = ""
 
         for model in row.get("models") or []:
             reasoning = True
@@ -480,7 +495,11 @@ def _apply_capabilities(rows: list[dict]) -> None:
                     reasoning = True
 
             entry: dict[str, Any] = {
-                "fast": bool(model_supports_fast_mode(model)),
+                "fast": resolve_fast_mode_capability(
+                    model=model,
+                    provider=slug,
+                    api_mode=row_api_mode,
+                ).supported,
                 "reasoning": reasoning,
             }
 

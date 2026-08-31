@@ -137,6 +137,17 @@ gateway:
     picker_title:          "⚡ **Priority Processing**\\n\\nТекущий режим: `{mode}`\\n\\nВыберите вариант:"
     choice_fast:           "fast — Priority Processing включён"
     choice_normal:         "normal — стандартная обработка"
+    family_openai_priority: "OpenAI API Priority Processing"
+    family_codex_fast:     "Codex Fast"
+    family_anthropic_fast: "Anthropic Fast Mode"
+    family_unsupported:    "Быстрый режим"
+    state_on:              "включено"
+    state_off:             "выключено"
+    route_status:          "⚡ Fast: {state} — {family} на `{route}`"
+    route_off:             "⚡ Fast: выключено — {reason}"
+    route_unavailable:     "⚡ Fast недоступен — {reason}"
+    route_saved:           "⚡ ✓ {family}: **{label}** (сохранено в конфигурации)"
+    route_session_only:    "⚡ ✓ {family}: **{label}** (только этот сеанс)"
 
   footer:
     status:                "📎 Нижний колонтитул среды выполнения: **{state}**\nПоля: `{fields}`\nПлатформа: `{platform}`"

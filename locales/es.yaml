@@ -137,6 +137,17 @@ gateway:
     picker_title:          "⚡ **Priority Processing**\\n\\nModo actual: `{mode}`\\n\\nElige una opción:"
     choice_fast:           "fast — Priority Processing activado"
     choice_normal:         "normal — procesamiento estándar"
+    family_openai_priority: "OpenAI API Priority Processing"
+    family_codex_fast:     "Codex Fast"
+    family_anthropic_fast: "Anthropic Fast Mode"
+    family_unsupported:    "Modo rápido"
+    state_on:              "activado"
+    state_off:             "desactivado"
+    route_status:          "⚡ Fast: {state} — {family} en `{route}`"
+    route_off:             "⚡ Fast: desactivado — {reason}"
+    route_unavailable:     "⚡ Fast no disponible — {reason}"
+    route_saved:           "⚡ ✓ {family}: **{label}** (guardado en la configuración)"
+    route_session_only:    "⚡ ✓ {family}: **{label}** (solo esta sesión)"
 
   footer:
     status:                "📎 Pie de ejecución: **{state}**\nCampos: `{fields}`\nPlataforma: `{platform}`"

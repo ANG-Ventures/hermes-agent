@@ -141,6 +141,17 @@ gateway:
     picker_title:          "⚡ **Priority Processing**\\n\\nMód reatha: `{mode}`\\n\\nRoghnaigh rogha:"
     choice_fast:           "fast — Priority Processing ar siúl"
     choice_normal:         "normal — gnáthphróiseáil"
+    family_openai_priority: "OpenAI API Priority Processing"
+    family_codex_fast:     "Codex Fast"
+    family_anthropic_fast: "Anthropic Fast Mode"
+    family_unsupported:    "Mód tapa"
+    state_on:              "ann"
+    state_off:             "as"
+    route_status:          "⚡ Fast: {state} — {family} ar `{route}`"
+    route_off:             "⚡ Fast: as — {reason}"
+    route_unavailable:     "⚡ Níl Fast ar fáil — {reason}"
+    route_saved:           "⚡ ✓ {family}: **{label}** (sábháilte sa chumraíocht)"
+    route_session_only:    "⚡ ✓ {family}: **{label}** (an seisiún seo amháin)"
 
   footer:
     status:                "📎 Buntásc rite: **{state}**\nRéimsí: `{fields}`\nArdán: `{platform}`"
