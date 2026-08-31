@@ -2387,3 +2387,44 @@ class TestCanonicalCostExport:
         # explicit zeros are treated as authoritative by Langfuse and block
         # its own model-based estimation (#43129).
         assert response_cost == {}
+
+    def test_breakdown_uses_context_tier_rates_not_base(self, monkeypatch):
+        """The per-type breakdown must agree with the exported total.
+
+        On an above-threshold request ``estimate_usage_cost`` bills the WHOLE
+        request at the entry's ``*_above`` context-tier rates.  The breakdown
+        used to be re-derived from the entry's BASE rates, so every tier-
+        resolved line understated its true cost and a dashboard summing the
+        per-type keys disagreed with the ``total`` key sent alongside them.
+        """
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+        import agent.usage_pricing as pricing
+
+        entry = pricing.PricingEntry(
+            input_cost_per_million=Decimal("1"),
+            output_cost_per_million=Decimal("2"),
+            cache_read_cost_per_million=Decimal("0.5"),
+            tier_threshold_tokens=100,
+            input_cost_per_million_above=Decimal("2"),
+            output_cost_per_million_above=Decimal("4"),
+            cache_read_cost_per_million_above=Decimal("1"),
+            source="custom_contract",
+        )
+        monkeypatch.setattr(pricing, "get_pricing_entry", lambda *_, **__: entry)
+        # prompt = 200 + 40 + 60 = 300 > 100, so the above-tier rates apply.
+        usage = self._summary(200, 10, cache_read=40, cache_write=60)
+
+        response_cost, summary_cost = self._run_both_paths(mod, monkeypatch, usage)
+
+        for cost in (response_cost, summary_cost):
+            # Above-tier: input 200*2/1e6, output 10*4/1e6, cache_read 40*1/1e6,
+            # cache_write falls back to the TIER-resolved input rate (2), not 1.
+            assert cost["input"] == pytest.approx(0.0004)
+            assert cost["output"] == pytest.approx(0.00004)
+            assert cost["cache_read_input_tokens"] == pytest.approx(0.00004)
+            assert cost["cache_creation_input_tokens"] == pytest.approx(0.00012)
+            # The invariant that actually matters to a dashboard: the per-type
+            # keys sum to the authoritative total.
+            components = {k: v for k, v in cost.items() if k != "total"}
+            assert sum(components.values()) == pytest.approx(cost["total"])

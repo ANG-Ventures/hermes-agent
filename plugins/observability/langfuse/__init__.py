@@ -822,46 +822,27 @@ def _canonical_usage_and_cost(
 
     # Langfuse cost_details keys match usage_details keys.  Keep the per-type
     # breakdown for dashboards in addition to the authoritative request total.
-    try:
-        from decimal import Decimal
-
-        from agent.usage_pricing import get_pricing_entry
-
-        one_million = Decimal("1000000")
-        entry = get_pricing_entry(model, provider=provider, base_url=base_url)
-        if entry:
-            if entry.input_cost_per_million is not None and canonical.input_tokens:
-                cost_details["input"] = float(
-                    Decimal(canonical.input_tokens)
-                    * entry.input_cost_per_million
-                    / one_million
-                )
-            if entry.output_cost_per_million is not None and canonical.output_tokens:
-                cost_details["output"] = float(
-                    Decimal(canonical.output_tokens)
-                    * entry.output_cost_per_million
-                    / one_million
-                )
-            if entry.cache_read_cost_per_million is not None and canonical.cache_read_tokens:
-                cost_details["cache_read_input_tokens"] = float(
-                    Decimal(canonical.cache_read_tokens)
-                    * entry.cache_read_cost_per_million
-                    / one_million
-                )
-            # ``effective_cache_write_rate`` so a provider with no separate
-            # cache-write premium still gets a cache-write line (billed at the
-            # input rate) instead of silently vanishing from the breakdown.
-            cache_write_rate = entry.effective_cache_write_rate(
-                entry.input_cost_per_million
-            )
-            if cache_write_rate is not None and canonical.cache_write_tokens:
-                cost_details["cache_creation_input_tokens"] = float(
-                    Decimal(canonical.cache_write_tokens)
-                    * cache_write_rate
-                    / one_million
-                )
-    except Exception:  # pragma: no cover - canonical total remains usable
-        pass
+    #
+    # Read the breakdown straight off ``CostResult.components`` rather than
+    # re-deriving it from the raw ``PricingEntry`` rates.  The entry exposes
+    # BASE rates only, but ``estimate_usage_cost`` may have billed the whole
+    # request at the context-tier ``*_above`` rates (e.g. gemini-2.5-pro over
+    # 200k prompt tokens).  Re-deriving from the base rates therefore produced
+    # a breakdown that disagreed with the ``total`` sent one block above --
+    # understating every tier-resolved line -- so a dashboard summing the
+    # per-type keys got a different number than the request total.  The
+    # components are built from the same Decimal terms as ``amount_usd``, so
+    # they sum to it exactly.
+    _COMPONENT_KEYS = {
+        "input": "input",
+        "output": "output",
+        "cache_read": "cache_read_input_tokens",
+        "cache_write": "cache_creation_input_tokens",
+    }
+    for _component, _key in _COMPONENT_KEYS.items():
+        _amount = cost.components.get(_component)
+        if _amount:
+            cost_details[_key] = float(_amount)
 
     return usage_details, cost_details
 
