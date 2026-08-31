@@ -2648,6 +2648,25 @@ def _cmd_attach_rm(args: argparse.Namespace) -> int:
 
 
 def _worker_run_id_for(task_id: str) -> Optional[int]:
+    """Return this process's dispatcher run id, but only if it OWNS the run.
+
+    ``HERMES_KANBAN_*`` is ordinary process environment, inherited verbatim by
+    every descendant. Stamping the inherited ``HERMES_KANBAN_RUN_ID`` onto a
+    write from a process that is not the dispatcher's worker attributes that
+    write to a run it never made — and, worse, satisfies the ``expected_run_id``
+    optimistic-concurrency guard that ``complete``/``heartbeat``/``request-review``
+    rely on to keep a stale writer from closing a live card. The authority
+    anchor is ``agent.delegation_context.owns_kanban_worker_authority``
+    (``HERMES_KANBAN_OWNER_PID``); read it here so the CLI path is gated on the
+    same predicate as the tool path (``tools.kanban_tools._owned_worker_task_id``).
+    """
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        if not is_dispatcher_owned_worker_context():
+            return None
+    except Exception:
+        pass
     if os.environ.get("HERMES_KANBAN_TASK") != task_id:
         return None
     raw = os.environ.get("HERMES_KANBAN_RUN_ID")

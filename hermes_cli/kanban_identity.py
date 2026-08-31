@@ -52,6 +52,26 @@ def _resolve_current_session_id() -> Optional[str]:
         return os.environ.get("HERMES_SESSION_ID") or None
 
 
+def _owns_dispatcher_run(env: Mapping[str, str] | None) -> bool:
+    """True when this process may attest to ``HERMES_KANBAN_RUN_ID``.
+
+    Ambient ``HERMES_KANBAN_*`` is inherited by every descendant process, so a
+    nested Hermes subprocess would otherwise stamp its parent worker's run id
+    onto its own comments — attributing a write to a run that never made it.
+    Only meaningful for the live process env; an explicit ``env`` mapping is a
+    caller-supplied snapshot (the dashboard passes one) and keeps its old
+    semantics.
+    """
+    if env is not None:
+        return True
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        return is_dispatcher_owned_worker_context()
+    except Exception:
+        return True
+
+
 def resolve_comment_provenance(
     task_id: str,
     *,
@@ -77,7 +97,7 @@ def resolve_comment_provenance(
 
     source = os.environ if env is None else env
     run_id: Optional[int] = None
-    if source.get("HERMES_KANBAN_TASK") == task_id:
+    if source.get("HERMES_KANBAN_TASK") == task_id and _owns_dispatcher_run(env):
         raw = source.get("HERMES_KANBAN_RUN_ID")
         if raw:
             try:

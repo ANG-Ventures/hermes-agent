@@ -7610,6 +7610,50 @@ def reopen_task(
                 "voided_result": (row["result"] or "")[:500] or None,
             },
         )
+
+        # This task is no longer ``done``, so any child promoted on that
+        # premise now violates the invariant the dispatcher trusts: a ``ready``
+        # task has all blocking parents done/archived (see ``promote_task``'s
+        # own check). ``recompute_ready`` ONLY ever promotes, so nothing else
+        # walks this back — the child stays dispatchable and a worker gets
+        # spawned on a premise that was explicitly withdrawn. Demote the
+        # unclaimed ones; a child already claimed or past ``ready`` is reported
+        # rather than yanked out from under its running worker.
+        demoted: list[str] = []
+        still_live: list[str] = []
+        children = conn.execute(
+            "SELECT t.id, t.status, t.current_run_id, t.claim_lock FROM tasks t "
+            "JOIN task_links l ON l.child_id = t.id "
+            "WHERE l.parent_id = ? AND COALESCE(l.kind, ?) = ?",
+            (task_id, DEFAULT_LINK_KIND, LINK_KIND_BLOCKS),
+        ).fetchall()
+        for child in children:
+            if (
+                child["status"] == "ready"
+                and not child["current_run_id"]
+                and not child["claim_lock"]
+            ):
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo' "
+                    "WHERE id = ? AND status = 'ready'",
+                    (child["id"],),
+                )
+                _append_event(
+                    conn,
+                    child["id"],
+                    "demoted",
+                    {"reason": f"parent {task_id} reopened", "actor": actor},
+                )
+                demoted.append(child["id"])
+            elif child["status"] in ("running", "review", "done"):
+                still_live.append(child["id"])
+        if demoted or still_live:
+            _append_event(
+                conn,
+                task_id,
+                "reopen_child_fanout",
+                {"demoted": demoted, "not_demoted": still_live},
+            )
     return True, None
 
 

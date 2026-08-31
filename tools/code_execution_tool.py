@@ -397,12 +397,23 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     # a delegated child the parent's board mutation capability.
     try:
         from agent.delegation_context import (
+            KANBAN_OWNER_PID_ENV,
             is_delegated_child_process_context,
             scrub_kanban_env,
         )
 
         if is_delegated_child_process_context():
             scrubbed = scrub_kanban_env(scrubbed)
+        elif scrubbed.get("HERMES_KANBAN_TASK") and not scrubbed.get(
+            KANBAN_OWNER_PID_ENV
+        ):
+            # An env_passthrough opt-in can readmit HERMES_KANBAN_TASK into the
+            # sandbox env while the owner-pid marker (no passthrough entry of
+            # its own) stays stripped. That combination fails OPEN in
+            # ``owns_kanban_worker_authority``, so the sandboxed child would
+            # resolve itself as the dispatcher-spawned worker. Name an owner
+            # that is definitively not the child.
+            scrubbed[KANBAN_OWNER_PID_ENV] = str(os.getpid())
     except Exception:
         pass
 
