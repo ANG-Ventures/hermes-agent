@@ -91,7 +91,7 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
 | `/voice [on\|off\|tts\|status]` | Toggle CLI voice mode and spoken playback. Recording uses `voice.record_key` (default: `Ctrl+B`). |
 | `/yolo` | Toggle YOLO mode — skip all dangerous command approval prompts. |
 | `/approvals [manual\|smart\|off]` | Show or set the persistent dangerous-command approval mode. |
-| `/footer [on\|off\|status]` | Toggle the gateway runtime-metadata footer on final replies (shows model, context %, and cwd). |
+| `/footer [on\|off\|status]` | Toggle the gateway runtime-metadata footer on final replies (default fields: model, context %, and cwd; `display.runtime_footer.fields` can also select `provider_model`, `context_full`, `reasoning`, and `latency`). |
 | `/busy [queue\|steer\|interrupt\|status]` | Control what happens when you message while Hermes is working — queue the new message, steer mid-turn, or interrupt immediately. Works in the CLI and messaging gateway. |
 | `/indicator [kaomoji\|emoji\|unicode\|ascii]` | CLI-only: pick the TUI busy-indicator style. |
 | `/timestamps [on\|off\|status]` | CLI-only: toggle `[HH:MM]` timestamps on messages and in `/history`. |
@@ -272,7 +272,7 @@ The messaging gateway supports the following built-in commands inside Telegram, 
 | `/plan [task]` | Write a markdown implementation plan to `.hermes/plans/`; no execution. |
 | `/bundles` | List configured skill bundles (`/<name>` aliases that preload several skills). |
 | `/reload-skills` (alias: `/reload_skills`) | Re-scan `~/.hermes/skills/` for newly installed or removed skills. |
-| `/footer [on\|off\|status]` | Toggle the runtime-metadata footer on final replies (shows model, context %, and cwd). |
+| `/footer [on\|off\|status]` | Toggle the runtime-metadata footer on final replies (default fields: model, context %, and cwd; `display.runtime_footer.fields` can also select `provider_model`, `context_full`, `reasoning`, and `latency`). |
 | `/curator [status\|run\|pin\|archive]` | Background skill maintenance controls. |
 | `/suggestions [accept\|dismiss N\|catalog\|clear]` | Review suggested automations right in chat. `/suggestions` lists pending suggestions, `catalog` adds curated starter automations, and `clear` prunes resolved suggestion records. Accepted suggestions keep this chat/thread as the job delivery origin. |
 | `/blueprint [name] [slot=value ...]` | Browse cron blueprints, start a guided slot-filling conversation, or create a blueprint job directly. Directly created jobs deliver back to the current chat/thread. |
