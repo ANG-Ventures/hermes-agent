@@ -172,6 +172,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="<platform>", cli_only=True, argument_mode="options"),
     CommandDef("branch", "Branch the current session (explore a different path)", "Session",
                aliases=("fork",), args_hint="[name]"),
+    CommandDef("merge", "Merge a summary of this session into another session (branched thread, or a named session)", "Session",
+               gateway_only=True, args_hint="[name]"),
     CommandDef("worktree", "Show, list, create, or prune isolated git worktrees", "Session",
                cli_only=True, args_hint="[new [name]|list|prune [--dry-run]]",
                subcommands=("new", "list", "prune")),
@@ -1478,7 +1480,13 @@ _SLACK_PRIORITY_ALIASES: tuple[str, ...] = ()
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights"})
+#   - rollback: filesystem-checkpoint recovery; reached via /hermes rollback
+#     on Slack. Demoted when /merge claimed a native slot (merge is the
+#     interactive counterpart to /branch and is used mid-conversation;
+#     rollback is a rare recovery action) — without this entry /merge tips
+#     the registry past the 50-cap and silently clamps /usage, breaking
+#     Telegram parity.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights", "rollback"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
