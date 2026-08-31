@@ -174,6 +174,26 @@ def _tail_before_target(
 
 def _prefill_from_tail(tail: Optional[Dict[str, Any]]) -> Optional[str]:
     if tail and tail.get("role") == "user" and isinstance(tail.get("content"), str):
+        # parity 2026-08-30: a surviving composite compaction carrier (hidden
+        # handoff summary + live ask in one user row) must prefill ONLY the
+        # live ask — never the raw carrier with its hidden preamble. Rewind
+        # semantics are untouched (half-turn; the carrier row stays active,
+        # RESOLUTION-LEDGER rows 96-98); this only sanitizes the prefill text.
+        try:
+            from agent.context_compressor import (
+                is_compaction_summary_message,
+                user_originated_turn_view,
+            )
+
+            if is_compaction_summary_message(tail):
+                live = user_originated_turn_view(tail)
+                if isinstance(live, dict):
+                    live_content = live.get("content")
+                    if isinstance(live_content, str) and live_content.strip():
+                        return live_content
+                return None
+        except Exception:  # pragma: no cover - defensive import guard
+            pass
         return tail["content"]
     return None
 
@@ -295,22 +315,6 @@ def undo(session_id: str, n: int) -> Dict[str, Any]:
         and not isinstance(tail.get("content"), str)
     ):
         target_id = tail["id"]
-    elif tail is not None and tail.get("role") == "user":
-        # parity 2026-08-30 (upstream carrier-rewind contract): if the row that
-        # would SURVIVE as the new tail is a composite compaction carrier
-        # (hidden handoff summary + live ask in one user row), prefilling its
-        # raw content would dump the entire hidden preamble into the input
-        # buffer. Extend the rewind to include it — rewind_to_message with
-        # preserve_compaction_handoff archives the composite and re-inserts the
-        # canonical scaffold-only handoff in the same transaction, and the
-        # prefill below carries ONLY the live ask.
-        try:
-            from agent.context_compressor import is_compaction_summary_message
-
-            if is_compaction_summary_message(tail):
-                target_id = tail["id"]
-        except Exception:  # pragma: no cover - defensive import guard
-            pass
 
     # Composite compaction carriers (hidden handoff summary + real live ask in
     # one user row) must not lose their scaffold on rewind: rewind_to_message

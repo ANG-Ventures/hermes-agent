@@ -1,0 +1,8 @@
+Merge upstream parity into sync/upstream-2026-08-29
+
+Target SHA: 26350357d76e4508c8df9304a3374bdc5a6f6220
+Merge-base: 1e5b50744094959db5536eca9df3881d13fd28d8
+Bucket stats: {"arch_split": 6, "files": 184, "hunks": 1725, "mechanical": 7, "semantic": 171}
+
+## Behavior changes
+

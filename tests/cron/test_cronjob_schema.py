@@ -19,12 +19,8 @@ def test_cronjob_schema_action_description_flags_create_requirements():
     assert "REQUIRED" in action_desc
 
 
-def test_cronjob_schema_reasoning_effort_matches_generic_contract():
-    from hermes_constants import VALID_REASONING_EFFORTS
-    from tools.cronjob_tools import CRONJOB_SCHEMA
-
-    enum = CRONJOB_SCHEMA["parameters"]["properties"]["reasoning_effort"]["enum"]
-    assert enum == [*VALID_REASONING_EFFORTS, "none"]
-    assert "max" in enum
-    # 2026-07-15 parity merge: upstream #62650 made ultra a valid effort.
-    assert "ultra" in enum
+# parity 2026-08-30: test_cronjob_schema_reasoning_effort_matches_generic_contract
+# removed — upstream 991af03f4c (2026-08-20) deliberately took reasoning_effort OFF
+# the model-facing cronjob schema (policy: models never choose model config; the
+# per-job pin lives in `hermes cron create/edit --reasoning-effort`). The absence is
+# pinned by tests/cron/test_cron_reasoning_effort.py::test_schema_does_not_expose_reasoning_effort.

@@ -1929,35 +1929,35 @@
   ],
   "gates": {
     "imports": {
-      "at": "2026-08-31T00:25:23.593918+00:00",
+      "at": "2026-08-31T00:29:19.100368+00:00",
       "detail": "0 compile failure(s)",
       "ok": true,
       "repro": "python3.11 -m py_compile $(git ls-files '*.py')",
       "tree_sha": "8319c6b53796c0107f85b8ba9405a3ce35e204d9"
     },
     "manifest+forkdelta": {
-      "at": "2026-08-31T00:27:01.136602+00:00",
+      "at": "2026-08-31T00:30:53.873210+00:00",
       "detail": "12 covered, 0 uncovered, 383 acknowledged path(s), 0 lint error(s)",
       "ok": true,
       "repro": "python3.11 -m hermes_parity gates --stage manifest+forkdelta",
       "tree_sha": "8319c6b53796c0107f85b8ba9405a3ce35e204d9"
     },
     "markers": {
-      "at": "2026-08-31T00:25:17.426929+00:00",
+      "at": "2026-08-31T00:29:13.168242+00:00",
       "detail": "0 marker line(s)",
       "ok": true,
       "repro": "git grep -nE '^(<<<<<<<|=======|>>>>>>>)' && git diff --diff-filter=U",
       "tree_sha": "8319c6b53796c0107f85b8ba9405a3ce35e204d9"
     },
     "tests": {
-      "at": "2026-08-31T00:27:01.183249+00:00",
+      "at": "2026-08-31T00:30:53.909538+00:00",
       "detail": "SKIPPED (no corpus; run scripts/run_tests.sh for the full suite)",
       "ok": false,
       "repro": "scripts/run_tests.sh",
       "tree_sha": "8319c6b53796c0107f85b8ba9405a3ce35e204d9"
     },
     "traps": {
-      "at": "2026-08-31T00:26:14.811522+00:00",
+      "at": "2026-08-31T00:30:09.065949+00:00",
       "detail": "5942 unbound + 16 merge-trap issue(s)",
       "ok": true,
       "repro": "python3.11 -m hermes_parity gates --stage traps --strict",
