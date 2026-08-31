@@ -91,6 +91,11 @@ paths = [
   '''tests/gateway/test_buzz_adapter\.py''',         # same Nostr PUBLIC key constant
   '''tests/test_iron_proxy\.py''',                   # literal "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END..."
   '''tests/run_agent/test_run_agent_init_memory\.py''',  # api_key="test-key-123456789"
+  # Mapped 2026-08-30 parity sync (upstream-identical files; upstream doesn't run
+  # this gate so their new fixtures arrive unmapped — same class as every sync):
+  '''tests/cli/test_show_config_credential\.py''',   # literal MASKED display fixtures "sk-pro...1234"/"sk-pro...5678" (the masking-under-test itself)
+  '''tests/tools/test_stage2_hook_api_server_keygen\.py''',  # obviously-fake operator/env key fixtures (operator-env-key-0123456789, env-key-9876543210fedcba)
+  '''website/docusaurus\.config\.ts''',             # Algolia DocSearch SEARCH-ONLY apiKey — public by design in every Docusaurus site
 ]
 # Regex allowlist — SOURCE files keep full scanning EXCEPT public OAuth *client
 # IDs* (client IDs are sent in browser auth flows — public by design, not
