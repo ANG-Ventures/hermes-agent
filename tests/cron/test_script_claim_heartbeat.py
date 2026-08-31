@@ -510,7 +510,22 @@ def test_heartbeat_thread_start_failure_does_not_start_execution(monkeypatch):
 
 
 def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
-    """Store uncertainty cannot let a run outlive its last confirmed lease forever."""
+    """Store uncertainty cannot let a run outlive its last confirmed lease forever.
+
+    Deterministic by construction: the heartbeat loop's clock is a fixed
+    sequence rather than wall time, so the test asserts the GRACE PREDICATE
+    (cancel once ``now - last_confirmed >= grace``) instead of inferring
+    retry counts from thread scheduling. The wall-clock form of this test
+    was flaky under load -- it observed ``calls == 2`` whenever the third
+    10ms tick had not been scheduled yet, which says nothing about the
+    behavior under test.
+
+    Clock sequence (grace = 2):
+      t=0  loop start, ``last_confirmed = 0``
+      t=1  call 2 raises; 1 - 0 = 1 < 2  -> must NOT cancel (proves the
+           grace window is honored rather than cancelling on first error)
+      t=3  call 3 raises; 3 - 0 = 3 >= 2 -> must cancel
+    """
     import cron.scheduler as scheduler
 
     calls = 0
@@ -522,8 +537,19 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
             return True
         raise OSError("store unavailable")
 
+    # Consumed in order by the heartbeat loop: loop entry, then one reading
+    # per failed renewal. Trailing values keep any extra read pinned past the
+    # grace boundary instead of raising StopIteration inside the thread.
+    monotonic_values = iter([0.0, 1.0, 3.0] + [3.0] * 32)
+
+    def fake_monotonic():
+        try:
+            return next(monotonic_values)
+        except StopIteration:
+            return 3.0
+
     def run_body(_job, **kwargs):
-        assert kwargs["fire_claim_lost"].wait(timeout=0.5)
+        assert kwargs["fire_claim_lost"].wait(timeout=5.0)
         return True
 
     job = {
@@ -532,11 +558,15 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
     }
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", heartbeat)
     monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
-    monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
-    monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", 0.03)
+    monkeypatch.setattr(scheduler.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.0)
+    monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", 2.0)
 
     assert scheduler.run_one_job(job) is True
-    assert calls >= 3
+    # Exactly three: the confirming call, the below-grace failure that must
+    # NOT cancel, and the at-grace failure that must. A looser ``>=`` would
+    # pass even if the below-grace failure cancelled immediately.
+    assert calls == 3
 
 
 def test_terminal_owner_cas_failure_marks_ledger_ownership_lost(monkeypatch):
