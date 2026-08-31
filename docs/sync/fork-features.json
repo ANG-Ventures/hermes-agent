@@ -8,14 +8,15 @@
       "tools/approval.py",
       "gateway/session_context.py"
     ],
-    "why": "Cron subagents must inherit approval gating from session ContextVars instead of ambient process environment.",
-    "lifecycle": "fork-permanent",
-    "upstream_ref": null,
-    "absorbed_date": null,
+    "why": "ABSORBED 2026-08-31 (was fork-permanent). Upstream's _is_cron_approval_context() is already ContextVar-first (get_session_env('HERMES_CRON_SESSION')) with a raw-env fallback; the fork's ONLY remaining delta is a logger.error in the except branch (commentary, not mechanism). RENAMED-MECHANISM TRAP: greps for the fork's helpers (_bind_child_cron_session / _is_cron_child / set_cron_session) return 0 hits upstream, which reads as 'not absorbed' — WRONG. Upstream closes the same cross-executor hole generically via contextvars.copy_context()+ctx.run at BOTH delegate spawn sites, and via propagate_context_to_thread() in tools/async_delegation.py. MEASURED on origin/main: parent-in-cron=True; child via copy_context().run=True (marker SURVIVES); child via BARE submit=False (RED control, proves the boundary is real); end-to-end cron_mode=deny child decision approved=False/BLOCKED. Residual (audited, NOT a gap): agent/subagent_lifecycle.py:259 submits bare and does lose the marker, but falls through to interactive approval with no callback => FAILS CLOSED (approved=False under BOTH cron_mode=deny AND approve). No excessive-agency hole; optional consistency ticket only. DO NOT re-open as an upstream PR. Adjudicated 2026-08-31 against origin/main @ a0a63a1bc2 in a hermetic worktree (uv sync --extra all --extra dev). Evidence: /tmp/up-discord/REPORT-discord-platform-fixes.md + rerunnable probes.",
+    "lifecycle": "absorbed",
+    "upstream_ref": "tools/approval.py::_is_cron_approval_context + contextvars.copy_context() at tools/delegate_tool.py:2960,:4153",
+    "absorbed_date": "2026-08-31",
     "surfaces": [
       "cron",
       "gateway"
-    ]
+    ],
+    "coverage_gap": "The fork test tests/tools/test_cron_subagent_session.py models a BARE executor submit, which is not upstream's call shape — porting it upstream would either test stdlib copy_context semantics or become a source-contract change-detector (on upstream's explicit reject list). Intentionally not ported."
   },
   {
     "feature": "systemd restart exits 0, darwin/launchd exits 75",
@@ -25,14 +26,14 @@
     "paths": [
       "gateway/run.py"
     ],
-    "why": "Supervisor-specific restart exit contracts prevent restart loops and preserve launchd's intentional nonzero restart path. NOT converged: upstream (2026-07 40dbfa0e3) exits 75 unconditionally and relies on RestartForceExitStatus=75 in the unit file; the fork branches systemd\u21920 / launchd\u219275 instead. Checked 2026-07-16 retirement audit: keep the fork branch.",
+    "why": "FORK-PERMANENT BY DESIGN (deployment-model divergence). Re-adjudicated 2026-08-31: DO NOT UPSTREAM — porting this branch would REGRESS upstream. The fork's two stated premises are both FALSE against upstream's GENERATED service definitions (measured, not read): (L) 'launchd needs nonzero because KeepAlive.SuccessfulExit=false' — FALSE: upstream's plist emits an UNCONDITIONAL KeepAlive <true/> and never emits SuccessfulExit, so exit 0 and 75 relaunch identically. (S) 'exit 75 under systemd trips stepped restart backoff' — FALSE: upstream's unit emits RestartForceExitStatus=75 (75 IS the designed planned-restart signal) with StartLimitIntervalSec=0 (rate limiting disabled), and NEVER emits RestartSteps/RestartMaxDelaySec (those appear only in _SYSTEMD_OPTIONAL_DIRECTIVES, a stale-unit comparison normalization list). Exit 75 is a load-bearing upstream contract across 5 modules: gateway/restart.py:10, hermes_cli/gateway.py:3956,3994 (both unit templates), :1802 (ExecMainStatus=='75' -> reset-failed+start recovery), :4740 (diagnostics), gateway/shutdown_watchdog.py:122. Upstream PINS it unguarded in tests/gateway/test_gateway_shutdown.py::test_planned_service_exit_issues_no_restart_of_its_own (asserts _exit_code==75 on BOTH platforms, no skipif) — so the fork's change turns that test RED on Linux. The fork branch also depends on _launch_systemd_restart_shortcut(), a fork-only method (0 hits upstream) that works around backoff upstream does not generate. Re-open ONLY if upstream starts emitting RestartSteps or KeepAlive.SuccessfulExit=false. Adjudicated 2026-08-31 against origin/main @ a0a63a1bc2 in a hermetic worktree (uv sync --extra all --extra dev). Evidence: /tmp/up-discord/REPORT-discord-platform-fixes.md + rerunnable probes.",
     "lifecycle": "fork-permanent",
     "upstream_ref": null,
     "absorbed_date": null,
     "surfaces": [
       "gateway"
     ],
-    "coverage_gap": "ROTTEN NODEID REMOVED (2026-08-30 audit): `::test_gateway_stop_launchd_service_restart_keeps_nonzero_exit` does not exist in the module (9 test functions, none is the launchd counterpart). The surviving systemd test is @pytest.mark.skipif(sys.platform=='darwin'), so ON MACOS THIS ENTRY COVERS ZERO EXECUTING TESTS. Highest residual risk in the registry: the `why` below documents this as a deliberate NON-CONVERGED fork/upstream divergence, and it is currently guarded by nothing on the platform we run. ACTION: write the darwin-side test asserting stop(restart=True, service_restart=True) leaves _exit_code == GATEWAY_SERVICE_RESTART_EXIT_CODE (75), then re-add the nodeid here."
+    "coverage_gap": "The macOS coverage hole is a SYMPTOM of this deliberate divergence, not an upstream test defect: upstream's own test asserts 75 unguarded on both platforms, so the fork must skipif(darwin) its systemd-0 variant. ACTION (fork-side only): add a darwin test asserting stop(restart=True, service_restart=True) leaves _exit_code == 75, then re-add the nodeid. Do NOT 'fix' this by porting the branch upstream."
   },
   {
     "feature": "hygiene compaction announces in-chat on success",
@@ -88,7 +89,7 @@
       "plugins/platforms/telegram/*.py",
       "tests/gateway/test_telegram_restart_parity.py"
     ],
-    "why": "Recovery paths must keep Telegram pending updates; only cold bootstrap may drop stale backlog. CONVERGED in adapter code (2026-07-16 audit: zero fork delta on the drop_pending path) \u2014 the fork's contribution is now only the guard-test file, kept as a regression tripwire against upstream refactors reintroducing queue drops. 2026-07-25 sweep: upstream_ref PR #52844 is authored by teknium1 fixing third-party issue #46621 (reporter otopba) \u2014 NOT a fork submission, so this is upstream parallel invention (D3 converge), not D2 absorption of our work. Lifecycle kept 'absorbed' because upstream's implementation is canonical and ours is retired; the ref documents where the behavior now lives, not our authorship.",
+    "why": "Recovery paths must keep Telegram pending updates; only cold bootstrap may drop stale backlog. CONVERGED in adapter code (2026-07-16 audit: zero fork delta on the drop_pending path) — the fork's contribution is now only the guard-test file, kept as a regression tripwire against upstream refactors reintroducing queue drops. 2026-07-25 sweep: upstream_ref PR #52844 is authored by teknium1 fixing third-party issue #46621 (reporter otopba) — NOT a fork submission, so this is upstream parallel invention (D3 converge), not D2 absorption of our work. Lifecycle kept 'absorbed' because upstream's implementation is canonical and ours is retired; the ref documents where the behavior now lives, not our authorship.",
     "lifecycle": "absorbed",
     "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/52844",
     "absorbed_date": "2026-06-26",
@@ -134,7 +135,7 @@
       "agent"
     ],
     "proposed_canary": "/tmp/fork-e2e-lane/tests/test_fork_canary_relay_lane_headers.py (RED-proven: widen _POOL_AFFINITY_PROVIDERS -> 2 egress failures)",
-    "coverage_gap": "Pre-existing tests/agent/test_pool_affinity_header.py (20 tests) collects clean, but did NOT assert (a) that the pool gate is a frozenset rather than a bare literal \u2014 the exact mechanism that silently killed stamping on the claude-app->claude-apr rename (#241, 2026-07-08) \u2014 nor (b) the no-signal fail-safe (absent platform AND absent HERMES_SESSION_SOURCE must classify background, so a headless burst cannot claim interactive headroom). Complement canary added."
+    "coverage_gap": "Pre-existing tests/agent/test_pool_affinity_header.py (20 tests) collects clean, but did NOT assert (a) that the pool gate is a frozenset rather than a bare literal — the exact mechanism that silently killed stamping on the claude-app->claude-apr rename (#241, 2026-07-08) — nor (b) the no-signal fail-safe (absent platform AND absent HERMES_SESSION_SOURCE must classify background, so a headless burst cannot claim interactive headroom). Complement canary added."
   },
   {
     "feature": "gateway restart failure count entry codec",
@@ -215,7 +216,7 @@
       "agent",
       "delegation"
     ],
-    "coverage_gap": "ROTTEN NODEID REPOINTED (2026-08-30 audit): `::test_tool_call_rejects_out_of_scope_tool` no longer exists; repointed at its likely successor `test_search_catalog_is_scoped_to_session_toolsets` (same scoping concern, same class). Verify the successor still asserts REJECTION of an out-of-scope tool_call, not merely catalog filtering \u2014 the reject path is the security-relevant half of the gate."
+    "coverage_gap": "ROTTEN NODEID REPOINTED (2026-08-30 audit): `::test_tool_call_rejects_out_of_scope_tool` no longer exists; repointed at its likely successor `test_search_catalog_is_scoped_to_session_toolsets` (same scoping concern, same class). Verify the successor still asserts REJECTION of an out-of-scope tool_call, not merely catalog filtering — the reject path is the security-relevant half of the gate."
   },
   {
     "feature": "state pure fork helpers preserve denorm gate and platform session search",
@@ -248,7 +249,7 @@
       "tui_gateway/synthetic_turn.py",
       "scripts/iso-certify.py"
     ],
-    "why": "Fork-authored dashboard turn-isolation feature (fork 2026-07-05/07-12). Upstream re-authored and merged it as PR #65895 (commit 7d27a31ce, 2026-07-16) carrying Co-authored-by: Kyzcreig; our PR #63096 was closed as superseded the same day. Upstream's copy is now CANONICAL per D2 \u2014 resolve future conflicts on upstream base and re-thread only verified deltas. NOTE: absorption is NOT visible via `gh pr list --state merged` (no Kyzcreig PR is merged upstream); the signal is a maintainer-authored PR carrying a Co-authored-by trailer.",
+    "why": "Fork-authored dashboard turn-isolation feature (fork 2026-07-05/07-12). Upstream re-authored and merged it as PR #65895 (commit 7d27a31ce, 2026-07-16) carrying Co-authored-by: Kyzcreig; our PR #63096 was closed as superseded the same day. Upstream's copy is now CANONICAL per D2 — resolve future conflicts on upstream base and re-thread only verified deltas. NOTE: absorption is NOT visible via `gh pr list --state merged` (no Kyzcreig PR is merged upstream); the signal is a maintainer-authored PR carrying a Co-authored-by trailer.",
     "lifecycle": "absorbed",
     "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/65895",
     "absorbed_date": "2026-07-16",
@@ -270,7 +271,7 @@
       "cli.py",
       "gateway/run.py"
     ],
-    "why": "Fork-authored half-turn rewind. COMMAND_REGISTRY is the single source every consumer derives from (/help, CLI autocomplete, Telegram command menu, Slack mapping, gateway dispatch), so deleting the two CommandDef rows in a commands.py merge resolution removes /undo and /redo from EVERY surface at once with no import error and no test failure \u2014 the shipped undo tests exercise the engine, not the routing. The registry-level canary closes exactly that gap.",
+    "why": "Fork-authored half-turn rewind. COMMAND_REGISTRY is the single source every consumer derives from (/help, CLI autocomplete, Telegram command menu, Slack mapping, gateway dispatch), so deleting the two CommandDef rows in a commands.py merge resolution removes /undo and /redo from EVERY surface at once with no import error and no test failure — the shipped undo tests exercise the engine, not the routing. The registry-level canary closes exactly that gap.",
     "lifecycle": "fork-permanent",
     "upstream_ref": null,
     "absorbed_date": null,
@@ -294,7 +295,7 @@
       "gateway/run.py",
       "plugins/platforms/discord/adapter.py"
     ],
-    "why": "Session branching. On Discord /branch spawns a thread that inherits context while the parent channel keeps its own session; elsewhere it is a classic in-place switch. Two surfaces, one registry row, and the `fork` alias is documented in the slash-command reference \u2014 losing the alias is a silent UX regression that no existing test catches.",
+    "why": "Session branching. On Discord /branch spawns a thread that inherits context while the parent channel keeps its own session; elsewhere it is a classic in-place switch. Two surfaces, one registry row, and the `fork` alias is documented in the slash-command reference — losing the alias is a silent UX regression that no existing test catches.",
     "lifecycle": "fork-permanent",
     "upstream_ref": null,
     "absorbed_date": null,
@@ -335,7 +336,7 @@
       "gateway/fork_ext/route_identity.py",
       "gateway/run.py"
     ],
-    "why": "Per-session or --global priority-processing toggle. test_fast_command.py (41 tests) is cited by the 'route identity helpers' entry for a DIFFERENT reason (persisted route lookup), so the command's own registration and its normal|fast|status subcommand surface were unowned. The subcommands tuple is what makes the modes tab-completable \u2014 emptying it degrades the command silently.",
+    "why": "Per-session or --global priority-processing toggle. test_fast_command.py (41 tests) is cited by the 'route identity helpers' entry for a DIFFERENT reason (persisted route lookup), so the command's own registration and its normal|fast|status subcommand surface were unowned. The subcommands tuple is what makes the modes tab-completable — emptying it degrades the command silently.",
     "lifecycle": "fork-permanent",
     "upstream_ref": null,
     "absorbed_date": null,
@@ -353,14 +354,15 @@
     "paths": [
       "plugins/platforms/discord/adapter.py"
     ],
-    "why": "Two behaviors that live as small conditions inside a very large gating block in on_message. (1) SCALAR COERCION: YAML parses a bare `free_response_channels: 1491973769726791812` as an int; an isinstance(raw, str) guard silently returns an empty set, the channel stops being free-response, and the bot goes MUTE for every unmentioned message with no error anywhere. (2) QUOTED-MENTION EXEMPTION: free-response channels routinely quote other bots (migration notes, pasted transcripts); the fork answers anyway and only stays silent when the message LITERALLY STARTS WITH another bot's mention. Neutering it makes the bot fall silent on any message that happens to quote another agent. Pre-existing coverage (test_discord_allowed_channels.py) tests a REPLICATED helper, not the real adapter method \u2014 so the real method was untested. This canary calls the real method.",
-    "lifecycle": "fork-permanent",
-    "upstream_ref": null,
-    "absorbed_date": null,
+    "why": "ABSORBED 2026-08-31 (was fork-permanent). (1) SCALAR COERCION: upstream's _discord_free_response_channels() is BYTE-IDENTICAL to the fork's (AST full-body compare), including the fork's own explanatory comment; it landed upstream via cc8e5ec2af. MEASURED on origin/main: bare int 1491973769726791812 -> {'1491973769726791812'}; CSV, list, '*', None, '' all correct. Also byte-identical upstream: _discord_channel_keys, _discord_channel_keys_from_channel, _discord_message_admission, _dispatch_recovered_message, _missed_message_backfill_channels, and the _apply_yaml_config seeding block. (2) QUOTED-MENTION EXEMPTION: the fork's copy lives in _dispatch_incoming_message (a fork-only pre-extraction ingress helper); upstream refactored the same policy into _discord_message_admission, and OUR OWN OPEN PR #72014 already ports exactly this mechanism there (same is_free_response_channel precompute, same other_bot_mentions list, same leading <@ID>/<@!ID> direct-address carve-out). A second PR would DUPLICATE our own open PR, not stack on it. Fork-vs-upstream diff of _handle_message = 23 lines with ZERO free-response hunks — no free-response behavior exists fork-side that is not already on main or in #72014. Adjudicated 2026-08-31 against origin/main @ a0a63a1bc2 in a hermetic worktree (uv sync --extra all --extra dev). Evidence: /tmp/up-discord/REPORT-discord-platform-fixes.md + rerunnable probes.",
+    "lifecycle": "absorbed",
+    "upstream_ref": "cc8e5ec2af (scalar coercion, byte-identical upstream); remainder = our open upstream PR #72014",
+    "absorbed_date": "2026-08-31",
     "surfaces": [
       "discord"
     ],
-    "proposed_canary": "/tmp/fork-e2e-lane/tests/test_fork_canary_discord_free_response.py (RED-proven: revert to isinstance(str))"
+    "proposed_canary": "/tmp/fork-e2e-lane/tests/test_fork_canary_discord_free_response.py (RED-proven: revert to isinstance(str))",
+    "coverage_gap": "Track via upstream PR #72014 (OPEN/MERGEABLE/CLEAN as of 2026-08-31, CI green). Keep the fork canary until #72014 lands. Do NOT open a sibling PR for the mention half, and do NOT re-PR the scalar coercion."
   },
   {
     "feature": "telegram intake sentinel makes silent inbound update drops visible",
@@ -371,7 +373,7 @@
     "paths": [
       "plugins/platforms/telegram/adapter.py"
     ],
-    "why": "PR #639 (fork/main 6cc7ca42ee). A user DM was fetched by the poller, offset-confirmed to Telegram (pending_update_count back to 0), and never reached any handler \u2014 gateway healthy throughout, ZERO log evidence, unattributable after the fact. An observation-only TypeHandler in group -1 sees every update before any filter/auth-prefilter/batching can discard it, giving per-update attribution plus WARNING-level gap detection with the exact missing update_id range. THE GROUP -1 PRIORITY IS THE WHOLE FEATURE: at group>=0 a handler can discard an update before the sentinel observes it, reopening the exact blind spot. Census: OUTSTANDING upstream. The complement canary locks the registration priority and the no-false-alarm rules (contiguous / first-update / duplicate+reordered) that the shipped file does not.",
+    "why": "PR #639 (fork/main 6cc7ca42ee). A user DM was fetched by the poller, offset-confirmed to Telegram (pending_update_count back to 0), and never reached any handler — gateway healthy throughout, ZERO log evidence, unattributable after the fact. An observation-only TypeHandler in group -1 sees every update before any filter/auth-prefilter/batching can discard it, giving per-update attribution plus WARNING-level gap detection with the exact missing update_id range. THE GROUP -1 PRIORITY IS THE WHOLE FEATURE: at group>=0 a handler can discard an update before the sentinel observes it, reopening the exact blind spot. Census: OUTSTANDING upstream. The complement canary locks the registration priority and the no-false-alarm rules (contiguous / first-update / duplicate+reordered) that the shipped file does not.",
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
@@ -408,7 +410,7 @@
     "paths": [
       "tests/test_telegram_polling_progress_ptb.py"
     ],
-    "why": "PR #640 (fork/main 640e57bd84). ~29 gateway unit-test files install a MagicMock under the telegram module names via sys.modules.setdefault so they can run without PTB. In a COMBINED run any of them executing first poisons this suite: importorskip finds the mock and 'succeeds', every telegram import binds MagicMock attributes, and all tests fail with \"object MagicMock can't be used in await expression\" \u2014 while passing in isolation. The fix evicts any telegram sys.modules entry whose __file__ is not a str, then reloads the adapter. NO CANARY BY DESIGN: asserting the helper exists would be a change-detector test (AGENTS.md: 'behavior contracts over snapshots'), and reproducing the pollution needs 29 mock-installing modules imported first. This entry exists so a merge reviewer knows the eviction block is LOAD-BEARING and must survive a tests/ resolution toward upstream \u2014 its absence produces an order-dependent flake invisible to CI slicing that happens to separate the files. Census: OUTSTANDING upstream.",
+    "why": "PR #640 (fork/main 640e57bd84). ~29 gateway unit-test files install a MagicMock under the telegram module names via sys.modules.setdefault so they can run without PTB. In a COMBINED run any of them executing first poisons this suite: importorskip finds the mock and 'succeeds', every telegram import binds MagicMock attributes, and all tests fail with \"object MagicMock can't be used in await expression\" — while passing in isolation. The fix evicts any telegram sys.modules entry whose __file__ is not a str, then reloads the adapter. NO CANARY BY DESIGN: asserting the helper exists would be a change-detector test (AGENTS.md: 'behavior contracts over snapshots'), and reproducing the pollution needs 29 mock-installing modules imported first. This entry exists so a merge reviewer knows the eviction block is LOAD-BEARING and must survive a tests/ resolution toward upstream — its absence produces an order-dependent flake invisible to CI slicing that happens to separate the files. Census: OUTSTANDING upstream.",
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
@@ -416,7 +418,7 @@
       "telegram",
       "ci"
     ],
-    "coverage_gap": "Deliberately no canary \u2014 self-guarding but only in a combined run. See `why`."
+    "coverage_gap": "Deliberately no canary — self-guarding but only in a combined run. See `why`."
   },
   {
     "feature": "gateway runtime footer fork fields: provider_model, context_full, reasoning",
@@ -426,7 +428,7 @@
     "paths": [
       "gateway/runtime_footer.py"
     ],
-    "why": "Census 2026-08-29: PR #80661 is still OUTSTANDING upstream (provider_model / context_full / reasoning are absent from upstream's gateway/runtime_footer.py) WHILE the sibling `latency` field from #71990 WAS ABSORBED via #77611. That makes this single file a live merge seam where upstream owns part and the fork owns the rest \u2014 the classic silent-drop shape: resolve toward upstream and the footer just renders shorter, no exception, no red test. Also locks the SKIP-SILENTLY doctrine (a field with missing data contributes nothing rather than '?%'), which is the byte-stability property upstream explicitly endorsed when absorbing the latency field on the same design \u2014 so keeping it is also what keeps #80661 landable.",
+    "why": "Census 2026-08-29: PR #80661 is still OUTSTANDING upstream (provider_model / context_full / reasoning are absent from upstream's gateway/runtime_footer.py) WHILE the sibling `latency` field from #71990 WAS ABSORBED via #77611. That makes this single file a live merge seam where upstream owns part and the fork owns the rest — the classic silent-drop shape: resolve toward upstream and the footer just renders shorter, no exception, no red test. Also locks the SKIP-SILENTLY doctrine (a field with missing data contributes nothing rather than '?%'), which is the byte-stability property upstream explicitly endorsed when absorbing the latency field on the same design — so keeping it is also what keeps #80661 landable.",
     "lifecycle": "upstream-intended",
     "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/80661",
     "absorbed_date": null,
