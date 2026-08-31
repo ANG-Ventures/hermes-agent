@@ -30,7 +30,10 @@ jobs:
     # cargo builds codegen units and test binaries in parallel across the
     # cores. This lane also builds the crate from the start when Cargo.toml
     # changes.
-    runs-on: ubuntu-latest-32-core
+    # fork 2026-08-30: upstream pins a paid 32-core runner pool that does not
+    # exist in this org — the job queues forever and blocks the required
+    # aggregator. Standard hosted runner is fine here (30-min timeout holds).
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     defaults:
       run:

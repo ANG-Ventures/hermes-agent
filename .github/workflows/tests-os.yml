@@ -48,7 +48,8 @@ jobs:
             runner: macos-latest
             marker: macos_only
           - name: Windows-only tests
-            runner: windows-latest-32-core
+            # fork 2026-08-30: 32-core Windows pool absent in this org (queues forever)
+            runner: windows-latest
             marker: windows_only
     steps:
       - name: Checkout code
