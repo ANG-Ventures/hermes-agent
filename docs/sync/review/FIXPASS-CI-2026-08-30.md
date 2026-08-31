@@ -23,9 +23,23 @@ SB=$(mktemp -d); HERMES_HOME=$SB timeout 600 \
 | 2 | `tests/agent/test_anthropic_credential_persist_failure.py` | 3 | same cause as #1 | **FIXED** (same one-line seam) |
 | 3 | `tests/agent/test_anthropic_spent_rotation_verdict.py` | 6 | same cause as #1 | **FIXED** (same one-line seam) |
 | 4 | `tests/plugins/blackbox/test_loader_e2e.py::test_full_turn_lifecycle_through_loader` | 1 | upstream profile-scoped plugin namespacing vs. fork test's hardcoded module name | **FIXED** (test retargeted to the real seam) |
-| 5 | `tests/tools/test_browser_real_profile.py` (3 tests) | 3 | not reproducible | **NO DEFECT** — 77/77 green on this worktree |
+| 5 | `tests/tools/test_browser_real_profile.py` (3 tests) | 3 | container-vs-VM env gap in upstream-verbatim code | **NOT MERGE DAMAGE** — root-caused, OPERATOR-DECISION below |
 
-All 15 anthropic tests + the blackbox e2e are green. Two edits, both narrow.
+All 15 anthropic tests + the blackbox e2e are green, **confirmed on heavy-ci Linux**.
+Two edits, both narrow.
+
+### Verified on heavy-ci
+
+Run [`33348781737`](https://github.com/Kyzcreig/hermes-heavy-ci/actions/runs/33348781737)
+against `sync/upstream-2026-08-29` @ `54afd0c5e5`:
+
+```
+=== Summary: 3745 files, 46340 tests passed, 3 failed, 299 skipped (100% complete) ===
+```
+
+**22 reds → 3.** Every red in the assigned set is closed on Linux CI; the 3 survivors are
+the pre-existing browser trio (§5), which were red for the same reasons in the baseline
+run `33344885412` and are not attributable to this merge.
 
 ---
 
@@ -179,23 +193,84 @@ tests/plugins/ (whole)    2065 passed, 8 skipped, 1 failed
 
 ---
 
-## 5. `tests/tools/test_browser_real_profile.py` — NO DEFECT FOUND
+## 5. `tests/tools/test_browser_real_profile.py` (3 tests) — NOT MERGE DAMAGE
 
-The 3 named tests (`TestReviewRound3::test_relaunch_path_does_snapshot`,
-`TestSnapshotRealProfile::test_existing_lax_snapshot_heals_on_refresh`,
-`TestSnapshotRealProfile::test_snapshot_files_are_owner_only`) do **not** reproduce on
-this worktree under the mandated recipe:
+### OPERATOR-DECISION — env-conditional reds in upstream-verbatim code; no fix applied
+
+These 3 do **not** reproduce on macOS under the mandated recipe
+(`77 passed`), and they reproduce on heavy-ci for reasons that are **structural to the
+runner, not to this merge**. Root-caused rather than guessed, after the post-fix
+heavy-ci run kept exactly these 3 red.
+
+**Provenance first.** The test file is **byte-identical to upstream target
+`26350357d7`** (`git diff 26350357d7 HEAD -- tests/tools/test_browser_real_profile.py`
+→ empty), and so are the three impl functions they depend on:
+`hermes_cli/config.py::{_is_container,_secure_file,_secure_dir}` (md5-compared
+per-function against upstream: IDENTICAL). The fork's diffs to `config.py`
+(reasoning_effort validation, terminal.* env bridges) and `browser_connect.py`
+(`--remote-allow-origins`, mock-keychain flags) do not touch either seam. The error
+string in the third test is upstream's too (present in
+`git show 26350357d7:tools/browser_tool.py`). **Nothing the merge did causes these.**
+
+**Cause A — the two permission tests
+(`test_snapshot_files_are_owner_only`, `test_existing_lax_snapshot_heals_on_refresh`).**
+`_secure_file` / `_secure_dir` deliberately **no-op inside a container**:
+
+```python
+if is_managed() or _is_container():
+    return          # Docker/Podman volume mounts often need broader permissions
+```
+
+`_is_container()` returns True on `/.dockerenv`, which exists on the heavy-ci
+self-hosted runner. So `snapshot_real_profile()` never tightens the copies, they keep
+`copy2`'s inherited 0644, and the tests' `mode & 0o077` walk reports every file.
+Proven locally by simulating only the marker file (nothing else changed):
 
 ```
-tests/tools/test_browser_real_profile.py   77 passed in 3.39s
+IS_CONTAINER (simulated /.dockerenv) = True
+MODE after _secure_file = 0o644          # ← the carve-out fires; chmod skipped
 ```
 
-Verified before touching anything, per the brief. These are almost certainly
-linux-only/umask- or ordering-sensitive on the CI runner (two of the three are about
-file **mode** bits, which are umask-dependent). **No change made** — a speculative edit
-to a green test would only risk disarming an owner-only-permissions guard. If the
-triggered heavy-ci run reds them again, they want a linux-side reproduction, not a
-macOS-side guess.
+The CI failure list matches exactly (`Cookies`, `Login Data`, `Local State`,
+`Preferences`, `Network/Cookies`, the done-marker — all `0o644`).
+
+**Cause B — `TestReviewRound3::test_relaunch_path_does_snapshot`.** Different cause, not
+a permissions issue at all. The container has no Chrome/Chromium installed, so
+`chromium_executable(browser)` returns `None` and `_real_profile_cdp()` returns
+upstream's guard string instead of `None`:
+
+```
+assert "browser.use_real_profile is on, but the real browser binary for 'chrome'
+        could not be found. Reinstall it or turn the toggle off." is None
+```
+
+The test patches `detect_default_chromium` and `snapshot_real_profile` but not
+`chromium_executable`, so the real lookup runs against a binary-less image.
+
+**Why no fix was applied here** (deliberate, per the brief's "preserve fork-critical
+behavior / write it up rather than force it green" rule):
+
+- Making Cause A pass would mean weakening or bypassing `_is_container()` — a
+  **security/deployment carve-out that upstream owns**, whose whole purpose is to not
+  fight Docker volume mounts. Doing that to satisfy a test would be exactly the
+  "fix that destroys the feature it secures" the rubric rejects. The alternative
+  (teaching the test to pin the non-container branch, à la the platform-branch class)
+  is a legitimate change — but it is an edit to an **upstream-verbatim test of an
+  upstream feature**, which belongs upstream, not smuggled into a parity merge.
+- Cause B is a **missing-binary environment gap** in the runner image, not a code
+  defect. The correct fixes are either installing Chromium in the heavy-ci image or
+  patching `chromium_executable` in the test — again an upstream test change.
+- These 3 are also **pre-existing**: they were red in the *baseline* run
+  `33344885412` for the same reasons, i.e. they are not a regression this branch
+  introduced.
+
+**Recommended disposition (operator's call):** this is precisely what
+`known-env-failures.txt` in `Kyzcreig/hermes-heavy-ci` exists for — its header says
+"add entries ONLY with a documented container-vs-VM root cause." The file is currently
+empty (`allowlisted-env: 0`), which is why the run gates red. Either
+(a) add these 3 with the root causes above, or (b) fix the image (install Chromium) and
+send the `_is_container` interaction upstream. Both are decisions outside this fix
+pass's mandate.
 
 ---
 
