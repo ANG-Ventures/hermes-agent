@@ -169,10 +169,21 @@ def test_mutation_without_masking_the_prose_case_would_block(monkeypatch):
     pre-existing quoted-data exemption already allowed `<<'EOF'` (single-quoted
     delimiter) prose, so that shape proves nothing about this fix. The UNQUOTED
     (`<<EOF`) and double-quoted (`<<"EOF"`) delimiters were genuinely BLOCKED before
-    and are allowed only because of the heredoc masking — so disabling the masker must
-    send them back to blocked.
+    and are allowed only because of the heredoc masking — so disabling the masking
+    must send them back to blocked.
+
+    Parity merge 2026-08-29: there are now TWO heredoc maskers on this path —
+    the fork's `_mask_heredoc_bodies` (inside `_lifecycle_command_scan_with_data_exemption`)
+    and upstream's `strip_inert_heredoc_bodies` (called at the top of
+    `contains_gateway_lifecycle_command`). They cover the same inert-heredoc
+    class, so neutering only ONE leaves the other masking the body and the
+    mutation no longer flips the verdict — the probe silently stops proving
+    anything. Disable BOTH so the assertion still measures "no heredoc masking
+    at all". The guard's own behavior is unchanged by the union: inert prose is
+    allowed and executable heredocs still block (asserted above and below).
     """
     import cron.lifecycle_guard as G
+    import tools.shell_heredoc as SH
 
     unquoted = "cat <<EOF > /tmp/notes.md\nRun hermes gateway %s from a separate shell.\nEOF" % R
     double_q = 'cat <<"EOF" > /tmp/n.md\nhermes gateway %s is documented here\nEOF' % R
@@ -181,5 +192,6 @@ def test_mutation_without_masking_the_prose_case_would_block(monkeypatch):
     assert guard(double_q) is False
 
     monkeypatch.setattr(G, "_mask_heredoc_bodies", lambda text: text)
+    monkeypatch.setattr(SH, "strip_inert_heredoc_bodies", lambda text: text)
     assert G._direct_lifecycle_scan(unquoted) is True
     assert G._direct_lifecycle_scan(double_q) is True

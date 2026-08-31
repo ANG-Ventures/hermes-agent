@@ -92,7 +92,12 @@ def test_session_redo_round_trip_restores_active_rows_and_history(server, db):
         "prefill_text": None,
     }
     assert [row["id"] for row in db.get_messages(session["session_key"])] == before
-    assert session["history"] == db.get_messages_as_conversation(session["session_key"])
+    # The undo/redo reload stamps durable row ids (include_row_ids=True —
+    # upstream 79b7d969d3 addresses rewind targets by _row_id), so compare
+    # against a load with the same shape.
+    assert session["history"] == db.get_messages_as_conversation(
+        session["session_key"], include_row_ids=True
+    )
 
 
 def test_session_redo_busy_guard_code_4009(server, db):

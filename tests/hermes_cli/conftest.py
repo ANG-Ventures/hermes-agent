@@ -54,3 +54,64 @@ def _suppress_concurrent_hermes_gate(request, monkeypatch):
         lambda *_a, **_k: [],
         raising=False,
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_real_launchd_fleet_restart(request, monkeypatch):
+    """Keep ``cmd_update`` tests away from the host's real launchd fleet.
+
+    ``_cmd_update_impl``'s gateway-restart phase branches on the REAL host
+    platform: on macOS it walks every installed ``ai.hermes.gateway*``
+    LaunchAgent via ``launchctl`` — draining/kickstarting live gateways on a
+    developer Mac and then failing the update (SystemExit 1,
+    ``gateway_fleet_restart_incomplete``) when supervision verification
+    can't line up with the test's sandboxed HERMES_HOME. Upstream's update
+    tests are authored against Linux CI, where ``is_macos()`` is False and
+    the phase is a no-op, so they never stub it.
+
+    Neutralize the launchd phase by default; the files that test it
+    directly (test_update_launchd_*.py) are opted out by filename so they
+    keep exercising the real functions.
+    """
+    if "launchd" in request.node.fspath.basename:
+        return
+    try:
+        from hermes_cli import update_cmd as _update_cmd
+    except Exception:
+        return
+    monkeypatch.setattr(
+        _update_cmd,
+        "_restart_macos_launchd_gateways",
+        lambda *_a, **_k: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _update_cmd,
+        "_restart_launchd_gateway_after_update",
+        lambda *_a, **_k: ([], []),
+        raising=False,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_stale_module_purge(request, monkeypatch):
+    """Default ``_purge_stale_hermes_modules`` to a no-op in cmd_update tests.
+
+    The real purge deletes ~70 live hermes modules from ``sys.modules`` so a
+    post-update process resolves fresh code. Inside pytest that orphans every
+    module object other tests hold references to (the PR #538 bug class); the
+    fork's sys_modules leak gate rightly fails any test that lets the purge
+    run un-restored. Files that test the purge itself opt out by name.
+    """
+    if "purge" in request.node.fspath.basename:
+        return
+    try:
+        from hermes_cli import main as _cli_main
+    except Exception:
+        return
+    monkeypatch.setattr(
+        _cli_main,
+        "_purge_stale_hermes_modules",
+        lambda *_a, **_k: None,
+        raising=False,
+    )

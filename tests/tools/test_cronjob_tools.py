@@ -341,6 +341,44 @@ class TestUnifiedCronjobTool:
         assert len(updated["warnings"]) == 2
         assert all(warning in updated["message"] for warning in updated["warnings"])
 
+    def test_create_with_natural_weekday_schedule(self):
+        # The documented "every monday 9am" form must create a real cron job
+        # through the tool path, not error out (issue: parser rejected it).
+        pytest.importorskip("croniter")
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Weekly report",
+                schedule="every monday 9am",
+                name="Weekly Report",
+            )
+        )
+        assert created["success"] is True
+        # Display keeps the user's natural phrasing.
+        assert created["schedule"] == "every monday 9am"
+        # A recurring job must have a computed next run.
+        assert created["next_run_at"]
+
+        # The stored schedule is a cron expression.
+        from cron.jobs import get_job
+        stored = get_job(created["job_id"])
+        assert stored["schedule"]["kind"] == "cron"
+        assert stored["schedule"]["expr"] == "0 9 * * 1"
+
+    def test_update_to_natural_weekday_schedule(self):
+        pytest.importorskip("croniter")
+        created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
+        job_id = created["job_id"]
+
+        updated = json.loads(
+            cronjob(action="update", job_id=job_id, schedule="every day at 9am")
+        )
+        assert updated["success"] is True
+        assert updated["job"]["schedule"] == "every day at 9am"
+
+        from cron.jobs import get_job
+        assert get_job(job_id)["schedule"]["expr"] == "0 9 * * *"
+
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs
 
@@ -603,6 +641,123 @@ class TestAgentCannotSetModelPin:
         assert stored2["name"] == "renamed-again"
 
 
+class TestRegisteredHandlerForwardsAttachToSession:
+    """#84802 — schema + cronjob() already accept attach_to_session, but the
+    registry adapter must forward it or create silently drops the field and
+    update returns "No updates provided." """
+
+    @pytest.fixture(autouse=True)
+    def _setup_cron_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+
+    def test_create_persists_attach_to_session(self):
+        from cron.jobs import get_job
+        from tools.registry import registry
+
+        created = json.loads(
+            registry.dispatch(
+                "cronjob",
+                {
+                    "action": "create",
+                    "name": "Continuable cron canary",
+                    "schedule": "1h",
+                    "repeat": 1,
+                    "deliver": "origin",
+                    "attach_to_session": True,
+                    "prompt": "Reply exactly: canary",
+                },
+            )
+        )
+        assert created["success"] is True
+        assert created.get("job", {}).get("attach_to_session") is True
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert stored.get("attach_to_session") is True
+        listing = json.loads(registry.dispatch("cronjob", {"action": "list"}))
+        listed = next(j for j in listing["jobs"] if j["job_id"] == created["job_id"])
+        assert listed.get("attach_to_session") is True
+
+    def test_update_persists_attach_to_session(self):
+        from cron.jobs import get_job
+        from tools.registry import registry
+
+        created = json.loads(
+            registry.dispatch(
+                "cronjob",
+                {
+                    "action": "create",
+                    "name": "plain",
+                    "schedule": "1h",
+                    "prompt": "Reply exactly: canary",
+                },
+            )
+        )
+        assert created["success"] is True
+        assert "attach_to_session" not in (get_job(created["job_id"]) or {})
+
+        updated = json.loads(
+            registry.dispatch(
+                "cronjob",
+                {
+                    "action": "update",
+                    "job_id": created["job_id"],
+                    "attach_to_session": True,
+                },
+            )
+        )
+        assert updated["success"] is True, updated
+        assert updated.get("job", {}).get("attach_to_session") is True
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert stored.get("attach_to_session") is True
+
+        disabled = json.loads(
+            registry.dispatch(
+                "cronjob",
+                {
+                    "action": "update",
+                    "job_id": created["job_id"],
+                    "attach_to_session": False,
+                },
+            )
+        )
+        assert disabled["success"] is True, disabled
+        assert disabled.get("job", {}).get("attach_to_session") is False
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert stored.get("attach_to_session") is False
+        listing = json.loads(registry.dispatch("cronjob", {"action": "list"}))
+        listed = next(j for j in listing["jobs"] if j["job_id"] == created["job_id"])
+        assert listed.get("attach_to_session") is False
+
+    def test_omitted_create_leaves_field_absent(self):
+        from cron.jobs import get_job
+        from tools.registry import registry
+
+        created = json.loads(
+            registry.dispatch(
+                "cronjob",
+                {
+                    "action": "create",
+                    "schedule": "1h",
+                    "prompt": "fire and forget",
+                },
+            )
+        )
+        assert created["success"] is True
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert "attach_to_session" not in stored
+        # And the formatted list output must not invent the field either.
+        listed = json.loads(registry.dispatch("cronjob", {"action": "list"}))
+        formatted = next(
+            j for j in listed["jobs"] if j["job_id"] == created["job_id"]
+        )
+        assert "attach_to_session" not in formatted
+
+
 class TestLocalDeliveryNotice:
     """#51568 — TUI/CLI cron jobs are local-only; surface that at create time
     so the agent doesn't promise a delivery that never happens."""
@@ -762,7 +917,11 @@ class TestOriginSubHourlyAdmission:
         assert _schedule_interval_seconds(parse_schedule("5/20 * * * *")) == 1200
 
     def test_once_has_no_interval(self):
-        assert _schedule_interval_seconds(parse_schedule("30m")) is None
+        # One-shot spelling is 'in 30m'. Bare '30m' became a RECURRING 30m
+        # interval upstream (e8bab87ba7, deliberate contract fix: the tool
+        # schema always documented '30m' as "every 30 minutes"), so the
+        # one-shot case this test pins now uses the 'in X' form.
+        assert _schedule_interval_seconds(parse_schedule("in 30m")) is None
 
     def test_min_gap_matches_croniter_ground_truth(self):
         # Ground-truth the whole minute-field parser against croniter (the real
@@ -830,7 +989,18 @@ class TestOriginSubHourlyAdmission:
         assert self._err("origin", "0 9 * * *") is None
 
     def test_origin_once_allowed(self):
-        assert self._err("origin", "30m") is None  # parses to a one-shot
+        # A true one-shot can't pollute (it fires once), so the gate must let
+        # it through. Spelled 'in 30m' since upstream's e8bab87ba7 made bare
+        # '30m' a recurring interval; the sub-hourly RECURRING form of the
+        # same duration is covered by test_origin_bare_duration_blocked below.
+        assert self._err("origin", "in 30m") is None
+
+    def test_origin_bare_duration_blocked(self):
+        # Guards the regression e8bab87ba7 introduces for this gate: bare
+        # '30m' is now a recurring 30-minute interval, i.e. exactly the
+        # sub-hourly origin shape Rule #5 I1 exists to refuse. Before the
+        # contract flip this parsed to a one-shot and was correctly allowed.
+        assert self._err("origin", "30m") is not None
 
     def test_non_origin_subhourly_allowed(self):
         # Same fast cadence but delivering to a channel is fine.

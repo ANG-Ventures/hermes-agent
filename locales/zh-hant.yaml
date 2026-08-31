@@ -42,9 +42,9 @@ gateway:
       任務 ID：{task_id}
 
       你可以繼續聊天 — 完成後結果將顯示於此。'
-    usage: '用法：/background <提示>
+    usage: '用法：/bg <提示>
 
-      範例：/background 摘要今天 HN 上的熱門故事
+      範例：/bg 摘要今天 HN 上的熱門故事
 
 
       在獨立工作階段中執行該提示。你可以繼續聊天 — 完成後結果將顯示於此。'
@@ -77,6 +77,25 @@ gateway:
 
       This thread inherits the parent conversation ({count} messages) from {parent}. Explore freely here; the parent channel keeps its own session. Use `/merge` to fold a summary back into the parent.'
     thread_parent_fallback: the parent conversation
+  btw:
+    answer: '💬 /btw:「{preview}」
+
+
+      {answer}'
+    failed: '❌ /btw 失敗：「{preview}」
+
+      {error}'
+    no_history: 尚無對話 — 請將問題作為一般訊息傳送。
+    no_provider: ❌ 無法回答問題：未設定供應商憑證。
+    started: '💬 順帶一問：「{preview}」
+
+      正根據此對話的快照回答 — 目前的工作繼續進行。'
+    usage: '用法：/btw <問題>
+
+      範例：/btw 那個錯誤在哪個檔案？
+
+
+      在不打斷目前工作的情況下，回答關於此對話的快速問題。若要執行獨立的背景任務，請使用 /bg <提示>。'
   commands:
     default_desc: 技能指令
     header: 📚 **指令**（共 {total} 個，第 {page}/{total_pages} 頁）
@@ -103,8 +122,9 @@ gateway:
     not_enough: 對話內容不足，無法壓縮（至少需要 4 則訊息）。
     nothing_to_do: 目前沒有可壓縮的內容（對話記錄仍全部為受保護的上下文）。
     persist_failed: ⚠️ 壓縮已執行，但結果無法儲存——工作階段資料庫正忙（已鎖定）。沒有遺失任何內容；你的記錄未變更。請稍後再次執行 /compress 重試。
-    timed_out: "⚠️ 壓縮未能完成 —— 摘要模型停滯，尚未產生任何內容便已逾時。沒有遺失任何內容；您的記錄未變更。請稍後重新執行 /compress 重試。"
     summary_failed: ⚠️ 摘要產生失敗（{error}）。{count} 則歷史訊息已被移除並以佔位符取代；先前的上下文已無法復原。建議檢查 auxiliary.compression 模型設定。
+    timed_out: ⚠️ 壓縮未能完成 —— 摘要模型停滯，尚未產生任何內容便已逾時。沒有遺失任何內容；您的記錄未變更。請稍後重新執行 /compress 重試。
+    turnhold_deferred: ℹ️ 上下文壓縮已延後 — 摘要仍在產生中。本回合將不壓縮繼續。
   config_read_failed: ⚠️ 無法讀取 config.yaml：{error}
   config_save_failed: ⚠️ 無法儲存設定：{error}
   context:
@@ -206,7 +226,7 @@ gateway:
     paused: ⏸ 目標已暫停：{goal}
     resumed: '▶ 目標已恢復：{goal}
 
-      傳送任意訊息繼續，或等待 — 我會在下一輪繼續推進。'
+      立即繼續 — 我馬上進行下一步。'
     set: '⊙ 目標已設定（{budget} 輪預算）：{goal}
 
       我會持續工作直到目標完成、你暫停／清除目標，或預算耗盡。
@@ -233,10 +253,14 @@ gateway:
     subscribed_suffix: （已訂閱 — 當 {task_id} 完成或被封鎖時將通知您）
     truncated_suffix: …（已截斷；如需完整輸出請在終端機執行 `hermes kanban …`）
     wake:
+      block_loop_detected: routed to triage after repeated blocks; needs a decision
       blocked: blocked; needs attention
+      changes_requested: review requested changes (BLOCK); implementation is not approved
       completed: completed
       crashed: crashed (worker exited); dispatcher will retry
       gave_up: gave up (retries exhausted)
+      guidance: 這是自動任務狀態通知，不是再次分解任務的請求。建立後續任務前請先檢查目前看板；不要重複建立已存在的任務或任務圖。
+      handoff: 結果：{summary}
       message: '[kanban] Task {task_id} {status}.
 
         Title: {title}
@@ -247,6 +271,10 @@ gateway:
 
 
         Check the result or decide the next step.'
+      review_detail: 'Review feedback: {reason}
+
+        Inspect the existing card and its current review run; return work to the same implementation task. Do not treat this BLOCK as approval and do not create a duplicate task.'
+      review_requested: handed off for review; the implementation is done
       status_default: status changed
       status_joiner: ', '
       timed_out: timed out; dispatcher will retry
@@ -491,7 +519,12 @@ gateway:
   retry:
     no_previous: 沒有可重試的上一則訊息。
   rollback:
+    failed_deletes: ⚠️ 無法移除（保留原檔）：{files}
     invalid_number: 無效的檢查點編號。請使用 1-{max}。
+    kept_oversize: ↷ 已保留（檔案過大無法納入檢查點，沒有可還原的儲存副本）：{files}
+    kept_user_edits: '↷ 已保留您的手動編輯：{files}
+
+      若也要還原這些檔案，請使用 /rollback <N> --all。'
     none_found: 找不到 {cwd} 的檢查點
     not_enabled: "檢查點未啟用。\n請在 config.yaml 中啟用：\n```\ncheckpoints:\n  enabled: true\n```"
     restore_failed: ❌ {error}

@@ -219,9 +219,26 @@ def test_cli_goal_loop_stops_when_task_ownership_moves(monkeypatch):
     turn_prompts = []
     block_calls = []
 
+    class _Cursor:
+        """No matching row -- this run has no recorded outcome yet."""
+
+        def fetchone(self):
+            return None
+
     class _Conn:
         def close(self):
             return None
+
+        def execute(self, *_args, **_kw):
+            # Parity merge 2026-08-29: cli.py's _task_status now delegates to
+            # kanban_db.goal_run_status (upstream absorbed + generalized the
+            # fork's inline ownership guard), and that helper reads task_runs
+            # to bind terminal handoffs to THIS run. A close()-only stub made
+            # the status check raise, so the loop stopped on the exception path
+            # before running its single turn -- masking the behavior this test
+            # exists to pin. Returning "no outcome row" lets goal_run_status
+            # reach its ownership comparison, which is the branch under test.
+            return _Cursor()
 
     class _Agent:
         session_id = "session-1"

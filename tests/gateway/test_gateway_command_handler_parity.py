@@ -45,6 +45,19 @@ def _handled_canonicals(source: str) -> set[str]:
     for group in re.findall(r"canonical\s+in\s*[\(\{]([^)\}]*)[\)\}]", source):
         for tok in re.findall(r"""["']([a-z0-9_-]+)["']""", group):
             names.add(tok)
+    # 2026-08 parity merge: the fork routes ordinary slash commands through a
+    # shared handler TABLE (_gateway_plain_command_handlers, used by both the
+    # idle and busy dispatch paths) instead of per-command `canonical == "x"`
+    # ladders. Harvest its `"name": self._handle_..._command,` keys too.
+    table = re.search(
+        r"def _gateway_plain_command_handlers\(self\).*?return \{(.*?)\n\s*\}",
+        source,
+        re.DOTALL,
+    )
+    if table:
+        names.update(
+            re.findall(r"""["']([a-z0-9_-]+)["']\s*:\s*self\.""", table.group(1))
+        )
     return names
 
 

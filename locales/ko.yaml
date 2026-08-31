@@ -42,9 +42,9 @@ gateway:
       작업 ID: {task_id}
 
       계속 대화하실 수 있습니다 — 완료되면 결과가 여기에 표시됩니다.'
-    usage: '사용법: /background <prompt>
+    usage: '사용법: /bg <prompt>
 
-      예시: /background 오늘 HN 인기 글을 요약해줘
+      예시: /bg 오늘 HN 인기 글을 요약해줘
 
 
       프롬프트를 별도 세션에서 실행합니다. 계속 대화할 수 있으며, 완료되면 결과가 여기에 표시됩니다.'
@@ -77,6 +77,25 @@ gateway:
 
       This thread inherits the parent conversation ({count} messages) from {parent}. Explore freely here; the parent channel keeps its own session. Use `/merge` to fold a summary back into the parent.'
     thread_parent_fallback: the parent conversation
+  btw:
+    answer: '💬 /btw: "{preview}"
+
+
+      {answer}'
+    failed: '❌ /btw 실패: "{preview}"
+
+      {error}'
+    no_history: 아직 대화가 없습니다 — 질문을 일반 메시지로 보내주세요.
+    no_provider: '❌ 질문에 답할 수 없습니다: 공급자 자격 증명이 설정되지 않았습니다.'
+    started: '💬 사이드 질문: "{preview}"
+
+      이 대화의 스냅샷을 바탕으로 답변합니다 — 현재 작업은 계속됩니다.'
+    usage: '사용법: /btw <질문>
+
+      예시: /btw 그 오류가 어느 파일에 있었지?
+
+
+      현재 작업을 중단하지 않고 이 대화에 대한 간단한 질문에 답합니다. 독립적인 백그라운드 작업은 /bg <prompt>를 사용하세요.'
   commands:
     default_desc: 스킬 명령
     header: 📚 **명령 목록** (총 {total}개, {page}/{total_pages} 페이지)
@@ -103,8 +122,9 @@ gateway:
     not_enough: 압축할 대화가 충분하지 않습니다 (최소 4개의 메시지가 필요합니다).
     nothing_to_do: 아직 압축할 내용이 없습니다 (대화 내용이 모두 보호된 컨텍스트입니다).
     persist_failed: ⚠️ 압축은 실행되었지만 결과를 저장할 수 없었습니다 — 세션 데이터베이스가 사용 중(잠김)이었습니다. 손실된 것은 없으며 대화 기록은 변경되지 않았습니다. 잠시 후 /compress를 다시 실행하여 재시도하세요.
-    timed_out: "⚠️ 압축을 완료하지 못했습니다 — 요약 모델이 멈췄고 아무것도 생성하지 못한 채 시간이 초과되었습니다. 손실된 내용은 없으며 대화 기록은 그대로입니다. 잠시 후 /compress를 다시 실행하세요."
     summary_failed: ⚠️ 요약 생성에 실패했습니다 ({error}). 과거 메시지 {count}개가 제거되어 자리표시자로 대체되었으며, 이전 컨텍스트는 더 이상 복구할 수 없습니다. auxiliary.compression 모델 설정을 확인해 보세요.
+    timed_out: ⚠️ 압축을 완료하지 못했습니다 — 요약 모델이 멈췄고 아무것도 생성하지 못한 채 시간이 초과되었습니다. 손실된 내용은 없으며 대화 기록은 그대로입니다. 잠시 후 /compress를 다시 실행하세요.
+    turnhold_deferred: ℹ️ 컨텍스트 압축이 연기되었습니다 — 요약이 아직 스트리밍 중입니다. 이번 턴은 압축 없이 계속합니다.
   config_read_failed: '⚠️ config.yaml을 읽을 수 없습니다: {error}'
   config_save_failed: '⚠️ 설정을 저장할 수 없습니다: {error}'
   context:
@@ -206,7 +226,7 @@ gateway:
     paused: '⏸ 목표 일시정지: {goal}'
     resumed: '▶ 목표 재개: {goal}
 
-      메시지를 보내 계속하거나 기다려 주세요 — 다음 차례에 다음 단계를 진행하겠습니다.'
+      바로 계속합니다 — 즉시 다음 단계를 진행하겠습니다.'
     set: '⊙ 목표 설정됨 ({budget}회 예산): {goal}
 
       목표가 완료되거나, 일시정지/삭제하거나, 예산이 소진될 때까지 계속 작업하겠습니다.
@@ -233,10 +253,14 @@ gateway:
     subscribed_suffix: (구독 중 — {task_id}이(가) 완료되거나 차단되면 알림을 받습니다)
     truncated_suffix: … (잘림; 전체 출력을 보려면 터미널에서 `hermes kanban …`을 사용하세요)
     wake:
+      block_loop_detected: routed to triage after repeated blocks; needs a decision
       blocked: blocked; needs attention
+      changes_requested: review requested changes (BLOCK); implementation is not approved
       completed: completed
       crashed: crashed (worker exited); dispatcher will retry
       gave_up: gave up (retries exhausted)
+      guidance: This is an automatic task-status notification, not a request to decompose the task again. Inspect the current board before creating follow-up tasks; do not recreate tasks or graphs that already exist.
+      handoff: 'Result: {summary}'
       message: '[kanban] Task {task_id} {status}.
 
         Title: {title}
@@ -247,6 +271,10 @@ gateway:
 
 
         Check the result or decide the next step.'
+      review_detail: 'Review feedback: {reason}
+
+        Inspect the existing card and its current review run; return work to the same implementation task. Do not treat this BLOCK as approval and do not create a duplicate task.'
+      review_requested: handed off for review; the implementation is done
       status_default: status changed
       status_joiner: ', '
       timed_out: timed out; dispatcher will retry
@@ -491,7 +519,12 @@ gateway:
   retry:
     no_previous: 재시도할 이전 메시지가 없습니다.
   rollback:
+    failed_deletes: '⚠️ 제거할 수 없었습니다 (그대로 남아 있음): {files}'
     invalid_number: 잘못된 체크포인트 번호입니다. 1-{max}을 사용하세요.
+    kept_oversize: '↷ 유지됨 (체크포인트에 저장하기엔 너무 커서 되돌릴 저장본이 없습니다): {files}'
+    kept_user_edits: '↷ 직접 수정한 내용은 유지되었습니다: {files}
+
+      해당 파일도 복원하려면 /rollback <N> --all 을 사용하세요.'
     none_found: '{cwd}에 체크포인트를 찾을 수 없습니다'
     not_enabled: "체크포인트가 활성화되어 있지 않습니다.\nconfig.yaml에서 활성화하세요:\n```\ncheckpoints:\n  enabled: true\n```"
     restore_failed: ❌ {error}

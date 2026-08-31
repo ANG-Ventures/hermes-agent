@@ -303,7 +303,9 @@ def test_e2e_desktop_exemption_matches_the_ci_yml_guard():
     import re
     from pathlib import Path
 
-    ci_yml = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml"
+    # parity 2026-08-30: merged tree adopted upstream rename ci.yml -> ci.yaml
+    # (RESOLUTION-LEDGER H1-H3); same guard, new filename.
+    ci_yml = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yaml"
     text = ci_yml.read_text(encoding="utf-8")
 
     block = re.search(r"^  e2e-desktop:\n(?:.*\n)*?^    uses:", text, re.MULTILINE)

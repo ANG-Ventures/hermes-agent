@@ -47,7 +47,9 @@ from agent.context_engine import (
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.memory_provider import is_trivial_prompt
+from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.model_metadata import (
+    anchored_context_tokens,
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
 )
@@ -80,6 +82,56 @@ def maybe_stamp_empty_resume_row(agent, user_msg: dict) -> bool:
     except Exception:
         pass
     return False
+
+
+def _preflight_request_tokens(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    system_prompt: str,
+) -> int:
+    """Token estimate for automatic preflight compression.
+
+    When the upcoming request is eligible for native Responses compaction,
+    count the checkpoint-pruned wire payload rather than the full durable
+    transcript. Auxiliary compression still uses the generic estimator
+    (``native_compaction_eligible=False``).
+
+    Usage-anchored fast path: when a provider-reported usage anchor is
+    valid for ``messages`` (see ``anchored_context_tokens``), it already
+    covers system prompt + tool schemas + full history EXACTLY as the
+    provider counted them, with estimation confined to the messages
+    appended since that response. Prefer it over every heuristic.
+    """
+    anchored = anchored_context_tokens(
+        messages, getattr(agent, "_usage_anchor", None)
+    )
+    if anchored is not None:
+        return anchored
+    tools = getattr(agent, "tools", None) or None
+    try:
+        from agent.codex_responses_adapter import (
+            estimate_native_responses_preflight_tokens,
+        )
+
+        native = estimate_native_responses_preflight_tokens(
+            agent,
+            messages,
+            system_prompt=system_prompt or "",
+            tools=tools,
+        )
+        if isinstance(native, int) and not isinstance(native, bool) and native >= 0:
+            return native
+    except Exception:
+        logger.debug(
+            "native Responses preflight estimate unavailable; "
+            "using generic transcript estimate",
+            exc_info=True,
+        )
+    return estimate_request_tokens_rough(
+        messages,
+        system_prompt=system_prompt or "",
+        tools=tools,
+    )
 
 
 def compose_user_api_content(
@@ -202,6 +254,93 @@ def append_notes_to_multimodal_content(content: Any, notes: str) -> bool:
         return False
 
 
+# Surfaces whose sessions must not be auto-titled. The prologue is shared by
+# EVERY agent, not only the ones a human is watching, so membership here is what
+# keeps the titler off machine-driven runs:
+#
+# - cron  — the scheduler names its own session after the job in its `finally`
+#   block, and the opener is the cron delivery hint, not a user's request.
+#   Titling it writes that scaffolding as the visible name for the whole run and
+#   bills a side-LLM call per fire, against the same job that sets
+#   `skip_memory` / `skip_background_review` to avoid exactly that.
+# - subagent — a delegated child's session is hidden from every picker, so its
+#   title is never read. A batch at `max_concurrent_children` would pay N title
+#   calls for N names nobody sees.
+_UNTITLED_PLATFORMS = frozenset({"cron", "subagent"})
+
+
+def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
+    """Kick off auto-titling for this session's first user message.
+
+    Called from the turn prologue, so every surface a human reads (CLI, gateway,
+    TUI/desktop, ACP) gets identical behavior without each one re-implementing
+    the call. Fully defensive: titling is cosmetic and must never break a turn.
+    """
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if not session_db or not session_id:
+        return
+
+    if str(getattr(agent, "platform", "") or "").lower() in _UNTITLED_PLATFORMS:
+        return
+
+    try:
+        from agent.message_content import flatten_message_text
+        from agent.title_generator import maybe_auto_title
+
+        # The turn's own user message, as text. Multimodal turns flatten to
+        # their text parts; an image-only turn yields "" and is skipped, since
+        # there is nothing to title from.
+        user_text = ""
+        for msg in reversed(messages or []):
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                user_text = flatten_message_text(msg.get("content")).strip()
+                break
+        if not user_text:
+            return
+
+        # The session row is created lazily on the first persist, which happens
+        # later in the turn. Force it now, or the title write matches zero rows
+        # and the session stays untitled for the whole turn anyway.
+        if not getattr(agent, "_session_db_created", False):
+            ensure = getattr(agent, "_ensure_db_session", None)
+            if callable(ensure):
+                ensure()
+            if not getattr(agent, "_session_db_created", False):
+                return
+
+        # Snapshot the runtime identity; the validator lets the background
+        # titler skip its LLM call if the user switches models before it fires
+        # (a stale request would reload an unloaded Ollama model, #19027).
+        _model = getattr(agent, "model", None)
+        _provider = getattr(agent, "provider", None)
+
+        maybe_auto_title(
+            session_db,
+            session_id,
+            user_text,
+            conversation_history=messages,
+            failure_callback=(
+                getattr(agent, "_title_failure_callback", None)
+                or getattr(agent, "_emit_auxiliary_failure", None)
+            ),
+            main_runtime={
+                "model": _model,
+                "provider": _provider,
+                "base_url": getattr(agent, "base_url", None),
+                "api_key": getattr(agent, "api_key", None),
+                "api_mode": getattr(agent, "api_mode", None),
+            },
+            title_callback=getattr(agent, "_on_session_title", None),
+            runtime_validator=lambda: (
+                getattr(agent, "model", None) == _model
+                and getattr(agent, "provider", None) == _provider
+            ),
+        )
+    except Exception:
+        logger.debug("Turn-start auto-title dispatch failed", exc_info=True)
+
+
 def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> int:
     """Locate this turn's user message after compaction rebuilt ``messages``.
 
@@ -211,20 +350,34 @@ def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> in
     meaningless. Prefer the LAST user message whose content exactly matches
     this turn's text — the surviving copy in the common case — so the
     injection stamp and the #48677 persist override can't land on a
-    todo-snapshot or historical row. Fall back to the last user message when
-    no exact match survives (merge-summary-into-tail rewrites the content but
-    the trackers still need a live anchor). Returns -1 when the list has no
-    user message at all.
+    todo-snapshot or historical row. Fall back to the last *user-originated*
+    turn when no exact match survives (merge-summary-into-tail rewrites the
+    content but the trackers still need a live anchor). Compaction handoffs
+    must never become the fallback anchor (#80622) — they are reference-only
+    scaffolding, not the active ask. Returns -1 when the list has no
+    user-originated message at all.
     """
+    from agent.context_compressor import user_originated_turn_view
+
     fallback = -1
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
         if not (isinstance(msg, dict) and msg.get("role") == "user"):
             continue
-        if fallback < 0:
-            fallback = i
+        # Typed synthetic current events still need their physical persistence
+        # anchor when their raw content is unchanged.  They are not eligible
+        # for the human-only fallback below.
         if msg.get("content") == user_message:
             return i
+        live_view = user_originated_turn_view(msg)
+        if live_view is None:
+            continue
+        if live_view.get("content") == user_message:
+            return i
+        # Prefer a real human turn over a synthetic handoff / continuation
+        # marker when the exact content was rewritten by merge-into-tail.
+        if fallback < 0:
+            fallback = i
     return fallback
 
 
@@ -256,6 +409,24 @@ def compression_made_progress(
 # old name bound means existing callers and any test that patches
 # ``_compression_made_progress`` continue to work unchanged.
 _compression_made_progress = compression_made_progress
+
+
+def _review_fork_first_request_pending(agent: Any) -> bool:
+    """Whether a detached review fork has yet to send its first provider request.
+
+    The background-review fork (issue #93057) replays the parent's FULL
+    snapshot on its first provider request as a warm prompt-cache read
+    (same-model cache parity). Compaction must not rewrite the snapshot
+    before that first request goes out — a compacted transcript would miss
+    the parent's cached prefix and turn a cheap cached replay into a cold
+    over-threshold write. Once the first provider response has arrived the
+    fork's tool loop is its own context, and both compression gates resume.
+    Dormant for every agent without the attribute.
+    """
+    return bool(
+        getattr(agent, "_review_defer_compaction_before_first_response", False)
+        and not getattr(agent, "_turn_received_provider_response", False)
+    )
 
 
 def _compression_warrants_another_preflight_pass(
@@ -444,6 +615,17 @@ def build_turn_context(
     # after primary restoration has settled the runtime.
     try:
         from agent.auxiliary_client import set_runtime_main
+        from agent.prompt_cache_scope import resolve_prompt_cache_scope_safe
+        # Rotation-stable prompt-cache scope. Memoized per segment on the
+        # agent, so this is a DB walk at most once per segment — except a
+        # brand-new session whose row lands later in turn setup
+        # (_ensure_db_session); that first turn falls back to the physical
+        # id here and the first build_api_kwargs re-resolves. Stays valid
+        # through a mid-turn compression rotation because the lineage root
+        # is by definition rotation-invariant (#79017). Resolved with the
+        # never-raising variant OUTSIDE the argument list, so a resolution
+        # failure can only lose the scope — never the whole runtime binding.
+        _cache_scope = resolve_prompt_cache_scope_safe(agent) or ""
         set_runtime_main(
             getattr(agent, "provider", "") or "",
             getattr(agent, "model", "") or "",
@@ -453,6 +635,7 @@ def build_turn_context(
             api_mode=getattr(agent, "api_mode", "") or "",
             auth_mode=getattr(agent, "auth_mode", "") or "",
             session_id=getattr(agent, "session_id", "") or "",
+            cache_scope=_cache_scope,
         )
     except Exception:
         pass
@@ -564,6 +747,15 @@ def build_turn_context(
     # NOTE: _turns_since_memory and _iters_since_skill are NOT reset here.
     agent.iteration_budget = IterationBudget(agent.max_iterations)
 
+    # Wall-clock run budget: per-run_conversation clock. Only stamped when a
+    # budget is configured so the default path stays clock-free; the wrap-up
+    # latch resets each turn (one notice per run, not per session).
+    if getattr(agent, "run_budget_seconds", None):
+        agent._run_budget_started_at = time.time()
+    else:
+        agent._run_budget_started_at = None
+    agent._run_budget_wrapup_injected = False
+
     # Log conversation turn start for debugging/observability.
     _preview_text = summarize_user_message_for_log(user_message)
     _msg_preview = (_preview_text[:80] + "...") if len(_preview_text) > 80 else _preview_text
@@ -607,9 +799,15 @@ def build_turn_context(
         # the same dict and any close-path durable marker.
         user_msg["content"] = user_message
     else:
-        user_msg = {"role": "user", "content": user_message}
+        user_msg = stamp_message_timestamp(
+            {"role": "user", "content": user_message},
+            timestamp=persist_user_timestamp,
+        )
         if isinstance(pending_cli_message, dict):
             agent._pending_cli_user_message = None
+    # CLI input is stamped when staged. Gateway input may carry the platform
+    # event time. Preserve either value and cover any legacy unstamped handoff.
+    stamp_message_timestamp(user_msg, timestamp=persist_user_timestamp)
 
     # Preserve the original user message (no nudge injection).
     original_user_message = persist_user_message if persist_user_message is not None else user_message
@@ -637,7 +835,13 @@ def build_turn_context(
         user_msg["display_kind"] = persist_user_display_kind
         if persist_user_display_metadata:
             user_msg["display_metadata"] = persist_user_display_metadata
-    messages.append(user_msg)
+    # Parity note (2026-08-29): the fork RELOCATED this block earlier in the
+    # function (it lives here now); upstream kept it at the old site but
+    # changed `messages.append(user_msg)` -> `append_message(...)`. Both
+    # deletions of the old site are honored below; upstream's call change is
+    # ported onto the fork's relocated copy so the metadata-stamping wrapper
+    # is not silently reverted.
+    append_message(messages, user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
 
@@ -706,6 +910,19 @@ def build_turn_context(
         restore_or_build_system_prompt(agent, system_message, conversation_history)
 
     active_system_prompt = agent._cached_system_prompt
+
+    # Bot Mode DM tool — injected ONLY into a bot's canonical "Bot Chat"
+    # session on Bot-Mode-managed installs (same gate as the protocol
+    # section above). The gate is stable for a session's lifetime, so the
+    # tool list is byte-identical every turn: prompt-cache safe. Every
+    # other session (CLI, gateway chats, group-room member sessions, cron,
+    # subagents) fails the gate and never sees the schema.
+    try:
+        from tools.bot_mode_dm import ensure_message_agent_tool
+
+        ensure_message_agent_tool(agent)
+    except Exception:
+        logger.debug("message_agent injection skipped", exc_info=True)
 
     # Create the DB session row now that _cached_system_prompt is populated, so
     # the persisted snapshot is written non-NULL on the first turn (Issue
@@ -828,16 +1045,20 @@ def build_turn_context(
     _preflight_compression_blocked = False
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
-    if agent.compression_enabled and _should_run_preflight_estimate(
-        messages,
-        agent.context_compressor.protect_first_n,
-        agent.context_compressor.protect_last_n,
-        agent.context_compressor.threshold_tokens,
-    ):
-        _preflight_tokens = estimate_request_tokens_rough(
+    if (
+        agent.compression_enabled
+        and not _review_fork_first_request_pending(agent)
+        and _should_run_preflight_estimate(
             messages,
-            system_prompt=active_system_prompt or "",
-            tools=agent.tools or None,
+            agent.context_compressor.protect_first_n,
+            agent.context_compressor.protect_last_n,
+            agent.context_compressor.threshold_tokens,
+        )
+    ):
+        _preflight_tokens = _preflight_request_tokens(
+            agent,
+            messages,
+            active_system_prompt or "",
         )
         _compressor = agent.context_compressor
         # ── P2 "compact on the truth" — calibrate the rough estimate by the
@@ -977,9 +1198,25 @@ def build_turn_context(
         else:
             # Fork P2: trigger on the skew-CALIBRATED estimate (raw rough scaled
             # by the provider's measured rough/real ratio) instead of raw rough.
-            _should_compress_now = _call_with_messages(
+            #
+            # Parity 2026-08-29: `should_compress_calibrated` is a FORK-ONLY
+            # compressor method, so upstream's newer compression tests build
+            # MagicMock compressors that never configure it — the auto-created
+            # child mock is truthy and forced a compaction on every preflight
+            # even with the raw estimate far below threshold (upstream's own
+            # `should_compress` side_effect was scripted, the fork's calibrated
+            # twin was not). Pin the type the same way the display-snapshot
+            # guard below already does, and fall back to the configured
+            # `should_compress` when the calibrated answer is not a real bool.
+            _calibrated_verdict = _call_with_messages(
                 _compressor.should_compress_calibrated, _preflight_tokens, messages
             )
+            if isinstance(_calibrated_verdict, bool):
+                _should_compress_now = _calibrated_verdict
+            else:
+                _should_compress_now = bool(
+                    _compressor.should_compress(_preflight_tokens)
+                )
             if not _should_compress_now:
                 # Context is over threshold but compression is blocked
                 # (summary-LLM cooldown or anti-thrashing). Ask should_compress_info
@@ -1003,16 +1240,35 @@ def build_turn_context(
             _clear_warn = getattr(agent, "_clear_context_overflow_warn", None)
             if callable(_clear_warn):
                 _clear_warn()
-            logger.info(
-                "Preflight compression: calibrated ~%s (raw ~%s × skew %.3f) >= %s "
-                "threshold (model %s, ctx %s)",
-                f"{_calibrated:,}",
-                f"{_preflight_tokens:,}",
-                _compressor._current_skew(),
-                f"{_compressor.threshold_tokens:,}",
-                agent.model,
-                f"{_compressor.context_length:,}",
-            )
+            # Parity 2026-08-29: this is the fork's calibrated-preflight log
+            # (absent upstream) and it now runs under upstream's new
+            # compression tests, whose agent/compressor doubles return
+            # MagicMocks for these counters — `f"{mock:,}"` raises TypeError
+            # and killed the compression path itself. Diagnostics must never
+            # perturb control flow, so format defensively and drop the line if
+            # a value is not a real number.
+            def _fmt_count(value: Any) -> str:
+                try:
+                    return f"{value:,}"
+                except (TypeError, ValueError):
+                    return str(value)
+
+            try:
+                _skew_for_log = _compressor._current_skew()
+                if not isinstance(_skew_for_log, (int, float)):
+                    _skew_for_log = float("nan")
+                logger.info(
+                    "Preflight compression: calibrated ~%s (raw ~%s × skew %.3f) >= %s "
+                    "threshold (model %s, ctx %s)",
+                    _fmt_count(_calibrated),
+                    _fmt_count(_preflight_tokens),
+                    _skew_for_log,
+                    _fmt_count(_compressor.threshold_tokens),
+                    agent.model,
+                    _fmt_count(_compressor.context_length),
+                )
+            except Exception:
+                logger.debug("preflight compression log failed", exc_info=True)
             _preflight_status = automatic_compaction_status_message(
                 _compressor,
                 phase="preflight",
@@ -1063,10 +1319,10 @@ def build_turn_context(
                 # lower token count — e.g. summarising tool outputs) is
                 # recognised as progress instead of being misread as
                 # "Cannot compress further". Fixes #39548.
-                _preflight_tokens = estimate_request_tokens_rough(
+                _preflight_tokens = _preflight_request_tokens(
+                    agent,
                     messages,
-                    system_prompt=active_system_prompt or "",
-                    tools=agent.tools or None,
+                    active_system_prompt or "",
                 )
                 # Upstream anti-infinite-loop guard (#39548 sibling): stop if a pass moved
                 # neither rows nor tokens. Then rebuild history + reset retry state.
@@ -1267,6 +1523,57 @@ def build_turn_context(
                     agent._last_content_with_tools = None
                     agent._last_content_tools_all_housekeeping = False
                     agent._mute_post_response = False
+    elif not agent.compression_enabled:
+        # Uncompressed session guard (#89297): when compression is explicitly
+        # disabled, sessions can grow past the model's context window across
+        # hundreds of messages with nothing to shrink them. The warning itself
+        # fires from the conversation loop's pre-API site, which reuses the
+        # unconditionally computed request estimate at zero marginal cost and
+        # covers both turn-start and mid-turn growth (every provider request
+        # passes through it). Here we only RE-ARM the dedup once the session
+        # is back under the window, so the guard can warn again after the
+        # user compacts (/compress with force=True works with compression
+        # disabled) and the context later regrows past the limit.
+        _ctx_len = getattr(
+            getattr(agent, "context_compressor", None), "context_length", None
+        )
+        if isinstance(_ctx_len, int) and _ctx_len > 0:
+            _raw_chars = 0
+            for _m in messages:
+                if not isinstance(_m, dict):
+                    continue
+                _c = _m.get("content")
+                if isinstance(_c, str):
+                    _raw_chars += len(_c)
+                elif _c:
+                    # Non-string, non-empty content (multimodal part lists,
+                    # dict payloads) defeats a char count — force the real
+                    # estimate by treating it as over-gate. None/"" (routine
+                    # assistant tool-call rows) contribute nothing.
+                    _raw_chars = _ctx_len + 1
+                    break
+            # Cheap gate: a session whose raw text is under ~1/4 of the
+            # window (4 chars/token upper bound) cannot be over it — skip
+            # the estimator. Non-string (multimodal) content defeats a char
+            # count, so any such message forces the real estimate.
+            if _raw_chars <= _ctx_len:
+                _clear_warn = getattr(
+                    agent, "_clear_context_overflow_warn", None
+                )
+                if callable(_clear_warn):
+                    _clear_warn()
+            else:
+                _uncompressed_tokens = estimate_request_tokens_rough(
+                    messages,
+                    system_prompt=active_system_prompt or "",
+                    tools=agent.tools or None,
+                )
+                if _uncompressed_tokens <= _ctx_len:
+                    _clear_warn = getattr(
+                        agent, "_clear_context_overflow_warn", None
+                    )
+                    if callable(_clear_warn):
+                        _clear_warn()
 
     if _preflight_compressed:
         # Compression rebuilt the list (tail messages are fresh compaction
@@ -1371,10 +1678,15 @@ def build_turn_context(
     # Clear stale per-thread interrupt state, preserving a pending interrupt.
     ra()._set_interrupt(False, agent._execution_thread_id)
     if agent._interrupt_requested:
-        ra()._set_interrupt(True, agent._execution_thread_id)
+        ra()._set_interrupt(
+            True,
+            agent._execution_thread_id,
+            reason=getattr(agent, "_tool_interrupt_reason", None),
+        )
         agent._interrupt_thread_signal_pending = False
     else:
         agent._interrupt_message = None
+        agent._tool_interrupt_reason = None
         agent._interrupt_thread_signal_pending = False
 
     # Notify memory providers of the new turn (BEFORE prefetch_all).
@@ -1397,6 +1709,17 @@ def build_turn_context(
                 ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
         except Exception:
             pass
+        # Deterministic, model-independent recall indicator: when memory was
+        # actually injected this turn, tell the user — don't rely on the model
+        # to surface it. Rendered by Hermes (via _emit_status), so it always
+        # shows and can't be silently dropped by the model.
+        if ext_prefetch_cache:
+            try:
+                _recall_indicator = agent._memory_manager.describe_recall()
+                if _recall_indicator:
+                    agent._emit_status(_recall_indicator)
+            except Exception:
+                pass
 
     # ── api_content sidecar: persist what you send ──
     # The prefetch/plugin context above is injected into the API copy of this
@@ -1483,6 +1806,16 @@ def build_turn_context(
         # close path must no longer treat it as a pre-worker UI input.
         if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
             agent._pending_cli_user_message = None
+
+    # Title the session from this user message, now — the row exists and the
+    # turn has not called the model yet. Titling is derived from the user's
+    # ask alone, so it runs concurrently with the turn instead of waiting for
+    # a final response; on a long tool-heavy first turn that is the difference
+    # between a title in ~1s and a title minutes later (or never, when the
+    # turn failed before producing one). Fire-and-forget on a daemon thread,
+    # a no-op once the session has a title, and shared by every surface
+    # because every surface enters the turn through this prologue.
+    _maybe_title_session_at_turn_start(agent, messages)
 
     return TurnContext(
         user_message=user_message,

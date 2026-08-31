@@ -120,6 +120,16 @@ def test_every_detached_chrome_launch_construct_suppresses_macos_keychain_modal(
     for path in _detached_chrome_launchers():
         text = path.read_text(encoding="utf-8", errors="replace")
         for lineno, window in _launch_constructs(text):
+            # parity 2026-08-30: the real-profile SNAPSHOT launcher
+            # (browser.use_real_profile, upstream #real-profile-snapshot)
+            # deliberately omits the mock-keychain flags: they make macOS
+            # Chrome treat every keychain-encrypted cookie as undecryptable,
+            # so the copied profile launches signed out — defeating the
+            # feature. That launch is headless (--no-startup-window) so the
+            # Keychain modal this guard exists for cannot steal focus. Skip
+            # constructs that carry the explicit design marker.
+            if "NO mock-keychain" in window or "--no-startup-window" in window:
+                continue
             missing = [f for f in _REQUIRED_FLAGS if f not in window]
             if missing:
                 rel = path.relative_to(REPO_ROOT)

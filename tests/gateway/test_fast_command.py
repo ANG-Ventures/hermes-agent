@@ -72,7 +72,7 @@ def _make_runner():
     runner.hooks = SimpleNamespace(loaded_hooks=False)
     runner.config = SimpleNamespace(streaming=None)
     runner.session_store = SimpleNamespace(
-        get_or_create_session=lambda source: SimpleNamespace(session_id="session-1"),
+        get_or_create_session=lambda source, **_kw: SimpleNamespace(session_id="session-1"),
         load_transcript=lambda session_id: [],
     )
     runner._get_or_create_gateway_honcho = lambda session_key: (None, None)
@@ -930,7 +930,7 @@ async def test_persisted_route_lookup_failures_abort_before_enrichment_or_provid
         ensure_loaded=ensure_loaded,
         entry_for=entry_for,
     )
-    store.get_or_create_session = lambda _source: entry
+    store.get_or_create_session = lambda _source, **_kw: entry
     runner.session_store = store
     runner._async_session_store = AsyncSessionStore(store)
     runner._recover_telegram_topic_thread_id = MagicMock(return_value=None)

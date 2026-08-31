@@ -117,8 +117,13 @@ _PATTERNS: List[Tuple[str, str, str]] = [
     (r'\bcommand\s+and\s+control\b', "c2_explicit_long", "context"),
 
     # ── Exfiltration via curl/wget/cat with secrets (applies everywhere) ──
-    (r'curl\s+[^\n]{0,2048}\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)', "exfil_curl", "all"),
-    (r'wget\s+[^\n]{0,2048}\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)', "exfil_wget", "all"),
+    # Anchor env var name end with \b to avoid false positives on legitimate
+    # env vars like $TRILLIUM_ETAPI_URL that contain KEY/TOKEN/API as
+    # substrings. API is dropped from the alternation outright: mid-name API
+    # is ubiquitous in benign var names, and every real secret shape it
+    # caught ($OPENAI_API_KEY) already ends in KEY/TOKEN.
+    (r'curl\s+[^\n]{0,2048}\$\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)S?\b', "exfil_curl", "all"),
+    (r'wget\s+[^\n]{0,2048}\$\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)S?\b', "exfil_wget", "all"),
     # `cat` needs a WORD BOUNDARY and a same-line gap. Without `\b`, any word
     # ENDING in "cat" matches — "pipecat", "concat", "tomcat", "bobcat". A repo
     # whose name ends in cat (pipecat-house-voice) had its AGENTS.md blocked

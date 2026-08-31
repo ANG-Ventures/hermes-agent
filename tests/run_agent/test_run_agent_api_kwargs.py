@@ -57,6 +57,7 @@ class TestBuildSystemPrompt:
     def test_memory_guidance_when_memory_tool_loaded(self, agent_with_memory_tool):
         from agent.prompt_builder import MEMORY_GUIDANCE
 
+        agent_with_memory_tool._memory_enabled = True
         prompt = agent_with_memory_tool._build_system_prompt()
         assert MEMORY_GUIDANCE in prompt
 
@@ -75,7 +76,13 @@ class TestBuildSystemPrompt:
         """Timestamp must be date-only (no HH:MM) so the system prompt
         stays byte-stable for the full day. Minute precision invalidates
         prefix-cache KV on every rebuild path (compression, fresh-agent
-        gateway turns, session resume without a stored prompt)."""
+        gateway turns, session resume without a stored prompt).
+
+        The trailing zone parenthetical -- e.g. ``(America/New_York, EDT,
+        UTC-04:00)`` -- is exempt from the HH:MM check: a UTC offset is not
+        time-of-day and is constant for the whole day (it shifts only at a DST
+        transition), so it does not affect cache stability.
+        """
         prompt = agent._build_system_prompt()
         # Find the line and strip it for inspection
         for line in prompt.splitlines():
@@ -86,17 +93,20 @@ class TestBuildSystemPrompt:
                 )
                 # Must NOT contain a colon followed by two digits (HH:MM pattern)
                 import re as _re
-                assert not _re.search(r":\d{2}", line), (
+                date_part = line.split(" (")[0]
+                assert not _re.search(r":\d{2}", date_part), (
                     f"Timestamp line has HH:MM, breaks daily cache stability: {line!r}"
                 )
                 break
         else:
             assert False, "Expected a 'Conversation started:' line in the system prompt"
 
-    def test_includes_nous_subscription_prompt(self, agent, monkeypatch):
-        monkeypatch.setattr(run_agent, "build_nous_subscription_prompt", lambda tool_names: "NOUS SUBSCRIPTION BLOCK")
-        prompt = agent._build_system_prompt()
-        assert "NOUS SUBSCRIPTION BLOCK" in prompt
+    # Parity 2026-08-29: test_includes_nous_subscription_prompt removed here to
+    # match upstream 4032a15ad0 (#95005), which deleted the ~1.2K-token Nous
+    # Subscription block from the system prompt along with
+    # build_nous_subscription_prompt itself. Upstream deleted the identical test
+    # from its monolith; the fork's split copy survived the split and would
+    # otherwise fail on a symbol that no longer exists.
 
     def test_skills_prompt_derives_available_toolsets_from_loaded_tools(self):
         tools = _make_tool_defs("web_search", "skills_list", "skill_view", "skill_manage")

@@ -87,8 +87,12 @@ class TestTickerClosesItsLedgerRows:
         This is the invariant that was violated — a second entry point grew
         without the ledger calls its sibling had.
         """
-        ticker = _body("_process_one_job")
-        provider = _body("run_one_job")
+        # parity 2026-08-30: upstream restructured run_one_job into a thin
+        # fire-claim wrapper; the ledger bookkeeping lives in the SHARED
+        # _run_one_job_body both entry points call (OPERATOR-DECISION 1,
+        # godfile-scheduler EVIDENCE). The contract holds at that shared body.
+        ticker = _body("_process_one_job") + _body("_run_one_job_body")
+        provider = _body("run_one_job") + _body("_run_one_job_body")
         for call in ("mark_execution_running(", "finish_execution("):
             assert (call in ticker) == (call in provider), (
                 f"{call} present in only one firing body — the ledger contract "

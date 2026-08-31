@@ -51,7 +51,7 @@ def _worker_card(session_id) -> str:
         )
         kb.add_notify_sub(
             conn, task_id=tid, platform="discord", chat_id=CHAT,
-            chat_type="group",
+            chat_type="group", delivery_mode="notify+wake",
         )
         kb.complete_task(conn, tid, summary="done")
         return tid
@@ -83,10 +83,18 @@ def test_worker_created_card_with_raw_session_id_lands_in_humans_session(
 
 
 def test_unstamped_card_sends_text_but_never_wakes(env, monkeypatch):
-    """A card with NO session id at all cannot wake anything (the notifier's
-    wake path requires ``task.session_id``), so no phantom is possible — the
-    ping degrades to a plain text send. Pins the contract this suite's other
-    tests rely on."""
+    """An unstamped card (no session id) with a notify+wake sub must deliver
+    BOTH the text ping and the wake — and the wake must land in the human's
+    OWN session, never mint a phantom.
+
+    parity 2026-08-30: the pinned contract changed. Pre-merge, the fork's
+    push-wake gate required ``task.session_id`` (``and _session_key``), so an
+    unstamped card could never wake — that WAS the phantom guard. The merged
+    tree adopts upstream's delivery_mode semantics (#73030): the sub's
+    explicit ``notify+wake`` opens the gate even unstamped, and phantom
+    safety now comes from live-routing identity resolution inside
+    ``_push_wake`` (#562/#568 machinery) rather than from refusing the wake.
+    What this test pins is the SAFETY property, not the refusal."""
     import asyncio as _asyncio
 
     from tests.gateway.test_kanban_wake_phantom_prevention import (
@@ -94,15 +102,26 @@ def test_unstamped_card_sends_text_but_never_wakes(env, monkeypatch):
     )
 
     store = env
-    _human_turn(store)
+    human = _human_turn(store)
     _worker_card(None)
 
     adapter = RecordingAdapter()
     runner = _make_runner(store, adapter)
     _asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert not adapter.handled, "an unstamped card produced a wake event"
     assert adapter.sent, "the terminal notification text was dropped"
+    assert adapter.handled, (
+        "a notify+wake sub on an unstamped card delivered no wake "
+        "(merged delivery_mode contract)"
+    )
+    source = adapter.handled[-1].source
+    assert source.user_id == HUMAN, (
+        "the wake was built with no participant — it would mint the phantom"
+    )
+    woken = _resolve(store, source)
+    assert woken.session_key == human.session_key, (
+        f"wake minted a second key: {woken.session_key!r} != {human.session_key!r}"
+    )
 
 
 def test_worker_card_in_two_human_channel_still_refuses(env, monkeypatch):

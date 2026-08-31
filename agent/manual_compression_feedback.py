@@ -89,6 +89,11 @@ def summarize_manual_compression(
         compression_state is not None
         and getattr(compression_state, "_last_compress_aborted", False) is True
     )
+    refused_would_grow = (
+        compression_state is not None
+        and getattr(compression_state, "_last_compress_refused_would_grow", False)
+        is True
+    )
     fallback_used = (
         compression_state is not None
         and getattr(compression_state, "_last_summary_fallback_used", False) is True
@@ -112,7 +117,16 @@ def summarize_manual_compression(
     chat_line: Optional[str] = None
     dropped_line: Optional[str] = None
 
-    if aborted:
+    if refused_would_grow:
+        # Refusal outcome (upstream): the generated summary would have grown
+        # the conversation; nothing was removed. Store is untouched, so this
+        # wins over enhanced/classic mode the same way `aborted` does.
+        noop = True
+        headline = (
+            f"Compression refused (summary would grow the conversation): "
+            f"{before_count} messages preserved"
+        )
+    elif aborted:
         # Failure outcome (upstream): nothing was removed; say so regardless
         # of enhanced/classic mode.
         noop = True
@@ -179,8 +193,11 @@ def summarize_manual_compression(
     # next request resends the ORIGINAL context regardless of what the
     # compressor produced in memory. Force the unchanged token wording rather
     # than trusting every caller to pass after_tokens == before_tokens.
-    # An aborted compression preserves the store the same way.
-    _preserved = (enhanced and not transcript_rewritten) or aborted
+    # An aborted or refused (would-grow) compression preserves the store the
+    # same way.
+    _preserved = (
+        (enhanced and not transcript_rewritten) or aborted or refused_would_grow
+    )
 
     if noop_chat or _preserved:
         if after_tokens == before_tokens or _preserved:
@@ -199,7 +216,12 @@ def summarize_manual_compression(
         )
 
     note = None
-    if aborted:
+    if refused_would_grow:
+        note = (
+            "The generated summary was larger than what it would replace; "
+            "no messages were removed."
+        )
+    elif aborted:
         note = "Summary generation failed; no messages were removed."
     elif fallback_used:
         dropped_count = getattr(
@@ -232,6 +254,7 @@ def summarize_manual_compression(
     return {
         "noop": noop,
         "aborted": aborted,
+        "refused_would_grow": refused_would_grow,
         "fallback_used": fallback_used,
         # Chokepoint attribution: every manual banner names its initiator.
         "headline": f"{headline}{MANUAL_TRIGGER_CLAUSE}",

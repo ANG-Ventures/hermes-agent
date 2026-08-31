@@ -234,5 +234,6 @@ def test_execute_code_non_approved_still_interrupts_on_stale_bit(monkeypatch):
     # and printed before the parent's first poll under heavy parallel load.
     assert result["status"] == "interrupted", result
     assert "execution interrupted" in result["output"], result
+    assert "user sent a new message" not in result["output"]
 
 

@@ -127,27 +127,34 @@ def test_restore_other_error_returns_error(store, monkeypatch):
     assert store.restore_session("any-sid", 1) == {"status": "error"}
 
 
-# ── B1 (pass-1 blocker): post-commit read failure must NOT double-undo ───────
+# ── B1 (pass-1 blocker): head-read failure must NOT double-undo ──────────────
 
-def test_post_commit_head_read_failure_still_returns_committed_rewind(store, monkeypatch):
-    """AC5/I2/B1: if the POST-commit head-id read raises, the rewind already
-    committed — rewind_to_message must return the committed result (rewound rows
-    durable) with new_head_id=None, NOT raise. A raise would reach
-    rewind_session → error sentinel → user retries → DOUBLE undo."""
+def test_in_txn_head_read_failure_rolls_back_whole_rewind(store, monkeypatch):
+    """AC5/I2/B1 — updated for the in-transaction head read (parity 2026-08-29,
+    RESOLUTION-LEDGER-2026-08-29.md L9 / hermes_state.py hunk 20).
+
+    The head read now runs INSIDE the write transaction, which retires the
+    fork's post-commit fail-soft guard BY CONSTRUCTION: if the MAX(id) read
+    raises, _execute_write rolls the WHOLE rewind back before re-raising, so
+    the caller's error is truthful ("nothing changed" really means nothing
+    changed) and a user retry cannot double-undo. This is strictly stronger
+    than the old fail-soft contract (committed result + new_head_id=None).
+    Do NOT restore the post-commit read: it re-opens the durable-rewind-
+    reported-as-nothing-changed split this structure eliminates.
+    """
     db = store._db
     entry = store.get_or_create_session(_source("b1"))
     sid = entry.session_id
     _seed(db, sid)
 
-    active_before = len(db.get_messages(sid, include_inactive=False))
+    active_before = db.get_messages(sid, include_inactive=False)
+    target = hermes_undo.compute_half_turn_target(active_before, 1)
 
-    target = hermes_undo.compute_half_turn_target(
-        db.get_messages(sid, include_inactive=False), 1
-    )
-
-    # Wrap the connection so ONLY the post-write MAX(id) read raises; the write
-    # and validation reads pass through. (Can't monkeypatch the C-level
-    # Connection.execute, so proxy the object.)
+    # Wrap the connection so ONLY the in-transaction MAX(id) head read raises;
+    # the write and validation reads pass through. A HARD (non-lock) error is
+    # used deliberately: a "database is locked" from inside the txn is retried
+    # by _execute_write's patience loop, while a hard error must surface
+    # immediately — and either way the transaction rolls back.
     real_conn = db._conn
     state = {"armed": False}
 
@@ -157,7 +164,7 @@ def test_post_commit_head_read_failure_still_returns_committed_rewind(store, mon
 
         def execute(self, sql, *a, **kw):
             if state["armed"] and "MAX(id)" in sql:
-                raise sqlite3.OperationalError("database is locked")
+                raise sqlite3.OperationalError("disk I/O error")
             return self._inner.execute(sql, *a, **kw)
 
         def __getattr__(self, name):
@@ -166,17 +173,19 @@ def test_post_commit_head_read_failure_still_returns_committed_rewind(store, mon
     db._conn = _FlakyConn(real_conn)
     state["armed"] = True
     try:
-        result = db.rewind_to_message(sid, target, require_user_role=False)
+        with pytest.raises(sqlite3.OperationalError):
+            db.rewind_to_message(sid, target, require_user_role=False)
     finally:
         state["armed"] = False
         db._conn = real_conn
 
-    # The rewind committed: rows were deactivated, result returned (no raise),
-    # head id is None (fail-soft).
-    assert result["rewound_ids"], "rewind must have committed"
-    assert result["new_head_id"] is None
-    active_after = len(db.get_messages(sid, include_inactive=False))
-    assert active_after < active_before, "rows really deactivated (durable)"
+    # The rewind rolled back: the active transcript is IDENTICAL — no row was
+    # deactivated, no counter moved. "Error" and "nothing changed" agree, so a
+    # retry performs exactly one undo (no double-undo).
+    active_after = db.get_messages(sid, include_inactive=False)
+    assert [m["id"] for m in active_after] == [m["id"] for m in active_before]
+    session = db.get_session(sid) or {}
+    assert (session.get("rewind_count") or 0) == 0
 
 
 def test_redo_second_op_failure_returns_partial_not_nothing_changed(store):

@@ -42,9 +42,9 @@ gateway:
       Feladatazonosító: {task_id}
 
       Folytathatod a beszélgetést — az eredmények itt jelennek meg, amint elkészülnek.'
-    usage: 'Használat: /background <prompt>
+    usage: 'Használat: /bg <prompt>
 
-      Példa: /background Foglald össze a mai legjobb HN sztorikat
+      Példa: /bg Foglald össze a mai legjobb HN sztorikat
 
 
       Külön munkamenetben futtatja a promptot. Folytathatod a beszélgetést — az eredmény itt jelenik meg, amint elkészül.'
@@ -77,6 +77,25 @@ gateway:
 
       This thread inherits the parent conversation ({count} messages) from {parent}. Explore freely here; the parent channel keeps its own session. Use `/merge` to fold a summary back into the parent.'
     thread_parent_fallback: the parent conversation
+  btw:
+    answer: '💬 /btw: "{preview}"
+
+
+      {answer}'
+    failed: '❌ A /btw sikertelen: "{preview}"
+
+      {error}'
+    no_history: Még nincs beszélgetés — küldd el a kérdésed normál üzenetként.
+    no_provider: '❌ A mellékkérdés nem válaszolható meg: nincs szolgáltatói hitelesítő adat beállítva.'
+    started: '💬 Mellékkérdés: "{preview}"
+
+      A beszélgetés pillanatképéből válaszolunk — a jelenlegi munka folytatódik.'
+    usage: 'Használat: /btw <kérdés>
+
+      Példa: /btw melyik fájlban volt az a hiba?
+
+
+      Gyors mellékkérdésre válaszol erről a beszélgetésről anélkül, hogy megszakítaná. Független háttérfeladathoz használd a /bg <prompt> parancsot.'
   commands:
     default_desc: Készségparancs
     header: 📚 **Parancsok** (összesen {total}, {page}/{total_pages}. oldal)
@@ -103,8 +122,9 @@ gateway:
     not_enough: Nincs elég beszélgetés a tömörítéshez (legalább 4 üzenet kell).
     nothing_to_do: Még nincs mit tömöríteni (a teljes átirat még védett kontextus).
     persist_failed: ⚠️ A tömörítés lefutott, de az eredményt nem sikerült menteni — a munkamenet-adatbázis foglalt volt (zárolva). Semmi sem veszett el; az átirat változatlan. Futtasd újra a /compress parancsot egy pillanat múlva az újrapróbálkozáshoz.
-    timed_out: "⚠️ A tömörítés nem tudott befejeződni — az összefoglaló elakadt, és a próbálkozás időtúllépéssel zárult, mielőtt bármit előállított volna. Semmi nem veszett el; az átirat változatlan. Futtasd újra a /compress parancsot egy pillanat múlva."
     summary_failed: ⚠️ Az összefoglaló generálása sikertelen ({error}). {count} korábbi üzenet eltávolítva és helykitöltővel helyettesítve; a korábbi kontextus már nem helyreállítható. Érdemes ellenőrizni az auxiliary.compression modell konfigurációját.
+    timed_out: ⚠️ A tömörítés nem tudott befejeződni — az összefoglaló elakadt, és a próbálkozás időtúllépéssel zárult, mielőtt bármit előállított volna. Semmi nem veszett el; az átirat változatlan. Futtasd újra a /compress parancsot egy pillanat múlva.
+    turnhold_deferred: ℹ️ A kontextustömörítés elhalasztva — az összefoglaló még streamel. Ebben a körben tömörítés nélkül folytatjuk.
   config_read_failed: '⚠️ Nem sikerült olvasni a config.yaml fájlt: {error}'
   config_save_failed: '⚠️ Nem sikerült menteni a konfigurációt: {error}'
   context:
@@ -206,7 +226,7 @@ gateway:
     paused: '⏸ Cél szüneteltetve: {goal}'
     resumed: '▶ Cél folytatva: {goal}
 
-      Küldj bármilyen üzenetet a folytatáshoz, vagy várj — a következő körben megteszem a következő lépést.'
+      Máris folytatom — azonnal megteszem a következő lépést.'
     set: '⊙ Cél beállítva ({budget} körös keret): {goal}
 
       Dolgozni fogok rajta, amíg a cél el nem készül, te nem szünetelteted/törlöd, vagy a keret ki nem merül.
@@ -233,10 +253,14 @@ gateway:
     subscribed_suffix: (feliratkozva — értesítést kapsz, ha a {task_id} befejeződik vagy elakad)
     truncated_suffix: … (csonkítva; használd a `hermes kanban …` parancsot a terminálban a teljes kimenethez)
     wake:
+      block_loop_detected: routed to triage after repeated blocks; needs a decision
       blocked: blocked; needs attention
+      changes_requested: review requested changes (BLOCK); implementation is not approved
       completed: completed
       crashed: crashed (worker exited); dispatcher will retry
       gave_up: gave up (retries exhausted)
+      guidance: This is an automatic task-status notification, not a request to decompose the task again. Inspect the current board before creating follow-up tasks; do not recreate tasks or graphs that already exist.
+      handoff: 'Result: {summary}'
       message: '[kanban] Task {task_id} {status}.
 
         Title: {title}
@@ -247,6 +271,10 @@ gateway:
 
 
         Check the result or decide the next step.'
+      review_detail: 'Review feedback: {reason}
+
+        Inspect the existing card and its current review run; return work to the same implementation task. Do not treat this BLOCK as approval and do not create a duplicate task.'
+      review_requested: handed off for review; the implementation is done
       status_default: status changed
       status_joiner: ', '
       timed_out: timed out; dispatcher will retry
@@ -491,7 +519,12 @@ gateway:
   retry:
     no_previous: Nincs előző üzenet az újrapróbáláshoz.
   rollback:
+    failed_deletes: '⚠️ Nem sikerült eltávolítani (a helyén maradt): {files}'
     invalid_number: Érvénytelen ellenőrzőpont-szám. Használj 1-{max} közötti értéket.
+    kept_oversize: '↷ Megtartva (túl nagy az ellenőrzőpontokhoz, nincs tárolt másolat, amire vissza lehetne állni): {files}'
+    kept_user_edits: '↷ A kézi szerkesztéseid megmaradtak: {files}
+
+      Használd a /rollback <N> --all parancsot, hogy azokat is visszaállítsd.'
     none_found: 'Nem található ellenőrzőpont ehhez: {cwd}'
     not_enabled: "Az ellenőrzőpontok nincsenek bekapcsolva.\nKapcsold be a config.yaml fájlban:\n```\ncheckpoints:\n  enabled: true\n```"
     restore_failed: ❌ {error}

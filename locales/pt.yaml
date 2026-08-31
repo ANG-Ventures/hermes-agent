@@ -42,9 +42,9 @@ gateway:
       ID da tarefa: {task_id}
 
       Podes continuar a conversar — os resultados aparecerão aqui quando estiverem prontos.'
-    usage: 'Uso: /background <prompt>
+    usage: 'Uso: /bg <prompt>
 
-      Exemplo: /background Resume as principais histórias do HN de hoje
+      Exemplo: /bg Resume as principais histórias do HN de hoje
 
 
       Executa o prompt numa sessão separada. Podes continuar a conversar — o resultado aparecerá aqui quando estiver concluído.'
@@ -77,6 +77,25 @@ gateway:
 
       This thread inherits the parent conversation ({count} messages) from {parent}. Explore freely here; the parent channel keeps its own session. Use `/merge` to fold a summary back into the parent.'
     thread_parent_fallback: the parent conversation
+  btw:
+    answer: '💬 /btw: "{preview}"
+
+
+      {answer}'
+    failed: '❌ /btw falhou: "{preview}"
+
+      {error}'
+    no_history: Ainda não há conversa — envia a tua pergunta como mensagem normal.
+    no_provider: '❌ Não é possível responder: nenhuma credencial de fornecedor configurada.'
+    started: '💬 Pergunta à parte: "{preview}"
+
+      A responder a partir de um instantâneo desta conversa — o trabalho atual continua.'
+    usage: 'Uso: /btw <pergunta>
+
+      Exemplo: /btw em que ficheiro estava aquele erro?
+
+
+      Responde a uma pergunta rápida sobre esta conversa sem a interromper. Para uma tarefa independente em segundo plano, usa /bg <prompt>.'
   commands:
     default_desc: Comando de skill
     header: 📚 **Comandos** ({total} no total, página {page}/{total_pages})
@@ -103,8 +122,9 @@ gateway:
     not_enough: Não há conversa suficiente para comprimir (são necessárias pelo menos 4 mensagens).
     nothing_to_do: Ainda não há nada para comprimir (a transcrição continua a ser todo o contexto protegido).
     persist_failed: ⚠️ A compressão foi executada, mas o resultado não pôde ser salvo — o banco de dados da sessão estava ocupado (bloqueado). Nada foi perdido; sua transcrição está inalterada. Execute /compress novamente em um instante para tentar de novo.
-    timed_out: "⚠️ A compressão não pôde ser concluída — o sumarizador travou e a tentativa expirou antes de produzir qualquer coisa. Nada foi perdido; sua transcrição está inalterada. Execute /compress novamente em instantes."
     summary_failed: ⚠️ Falha ao gerar o resumo ({error}). {count} mensagem(ns) histórica(s) foram removidas e substituídas por um marcador; o contexto anterior já não pode ser recuperado. Considera verificar a configuração do modelo auxiliary.compression.
+    timed_out: ⚠️ A compressão não pôde ser concluída — o sumarizador travou e a tentativa expirou antes de produzir qualquer coisa. Nada foi perdido; sua transcrição está inalterada. Execute /compress novamente em instantes.
+    turnhold_deferred: ℹ️ Compressão de contexto adiada — o resumo ainda está em transmissão. Continuando sem compressão neste turno.
   config_read_failed: '⚠️ Não foi possível ler config.yaml: {error}'
   config_save_failed: '⚠️ Não foi possível guardar a configuração: {error}'
   context:
@@ -206,7 +226,7 @@ gateway:
     paused: '⏸ Objetivo pausado: {goal}'
     resumed: '▶ Objetivo retomado: {goal}
 
-      Envia qualquer mensagem para continuar, ou aguarda — darei o próximo passo no próximo turno.'
+      Continuando agora — darei o próximo passo imediatamente.'
     set: '⊙ Objetivo definido (orçamento de {budget} turnos): {goal}
 
       Vou continuar a trabalhar até o objetivo estar concluído, pausares/limpares ou o orçamento esgotar.
@@ -233,10 +253,14 @@ gateway:
     subscribed_suffix: (subscrito — receberás uma notificação quando {task_id} terminar ou bloquear)
     truncated_suffix: … (truncado; usa `hermes kanban …` no teu terminal para a saída completa)
     wake:
+      block_loop_detected: routed to triage after repeated blocks; needs a decision
       blocked: blocked; needs attention
+      changes_requested: review requested changes (BLOCK); implementation is not approved
       completed: completed
       crashed: crashed (worker exited); dispatcher will retry
       gave_up: gave up (retries exhausted)
+      guidance: This is an automatic task-status notification, not a request to decompose the task again. Inspect the current board before creating follow-up tasks; do not recreate tasks or graphs that already exist.
+      handoff: 'Result: {summary}'
       message: '[kanban] Task {task_id} {status}.
 
         Title: {title}
@@ -247,6 +271,10 @@ gateway:
 
 
         Check the result or decide the next step.'
+      review_detail: 'Review feedback: {reason}
+
+        Inspect the existing card and its current review run; return work to the same implementation task. Do not treat this BLOCK as approval and do not create a duplicate task.'
+      review_requested: handed off for review; the implementation is done
       status_default: status changed
       status_joiner: ', '
       timed_out: timed out; dispatcher will retry
@@ -491,7 +519,12 @@ gateway:
   retry:
     no_previous: Não há mensagem anterior para tentar novamente.
   rollback:
+    failed_deletes: '⚠️ Não foi possível remover (mantido no lugar): {files}'
     invalid_number: Número de checkpoint inválido. Usa 1-{max}.
+    kept_oversize: '↷ Mantido (grande demais para os checkpoints, sem cópia guardada para reverter): {files}'
+    kept_user_edits: '↷ As suas edições manuais foram mantidas: {files}
+
+      Use /rollback <N> --all para restaurar essas também.'
     none_found: Não foram encontrados checkpoints para {cwd}
     not_enabled: "Os checkpoints não estão ativados.\nAtiva-os em config.yaml:\n```\ncheckpoints:\n  enabled: true\n```"
     restore_failed: ❌ {error}

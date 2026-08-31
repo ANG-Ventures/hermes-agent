@@ -89,7 +89,12 @@ def test_str_prefill_edit_resend_merges_two_user_rows_before_provider(db):
     repairs = repair_message_sequence(object(), messages)
 
     assert repairs == 1
-    assert messages == [{"role": "user", "content": "original draft\n\nedited draft"}]
+    # parity 2026-08-30: rows re-materialized from the DB carry the
+    # _db_persisted provenance marker; the contract is role+content.
+    assert [
+        {k: v for k, v in m.items() if not k.startswith("_")}
+        for m in messages
+    ] == [{"role": "user", "content": "original draft\n\nedited draft"}]
 
 
 def test_clear_redo_on_send_leaves_undo_stack_available(db):

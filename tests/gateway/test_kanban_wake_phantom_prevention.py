@@ -101,7 +101,12 @@ def _subscribed_completed_task(
         tid = kb.create_task(
             conn, title="worker card", assignee="worker", session_id=session_key,
         )
-        kw: dict = {"chat_type": "group"}
+        # delivery_mode: the merged schema gates wakes on delivery_mode
+        # (upstream #73030); real gateway rows carry 'notify+wake' (stamped by
+        # the migration for legacy rows and by subscribe_calling_session for
+        # new gateway sessions). The wake-identity contracts under test are
+        # about WHERE the wake lands, not whether the mode gate opens.
+        kw: dict = {"chat_type": "group", "delivery_mode": "notify+wake"}
         kw.update(sub_kw)
         kb.add_notify_sub(
             conn, task_id=tid, platform=platform, chat_id=chat_id, **kw,

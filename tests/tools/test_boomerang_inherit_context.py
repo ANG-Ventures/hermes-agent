@@ -290,7 +290,7 @@ class TestInheritContextIntegration:
         history = [{"role": "user", "content": "BATCH_MARKER established fact"}]
         parent = self._make_parent(history)
         kids = self._capture_all_child_kwargs(
-            tasks=[{"goal": "task A"}, {"goal": "task B"}],
+            tasks=[{"goal": "summarize task A fully"}, {"goal": "summarize task B fully"}],
             inherit_context=True,
             parent_agent=parent,
         )
@@ -306,7 +306,7 @@ class TestInheritContextIntegration:
         history = [{"role": "user", "content": "OVERRIDE_MARKER fact"}]
         parent = self._make_parent(history)
         kids = self._capture_all_child_kwargs(
-            tasks=[{"goal": "inherits"}, {"goal": "opts out", "inherit_context": False}],
+            tasks=[{"goal": "inherits parent context"}, {"goal": "opts out of context", "inherit_context": False}],
             inherit_context=True,
             parent_agent=parent,
         )

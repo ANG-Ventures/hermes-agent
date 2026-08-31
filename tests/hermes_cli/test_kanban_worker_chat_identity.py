@@ -76,6 +76,7 @@ def _fake_cli() -> _FakeCLI:
         agent=None,
         _install_tool_callbacks=noop,
         _ensure_tirith_security=noop,
+        finalize_preloaded_skills=noop,
         _ensure_runtime_credentials=lambda: True,
         _current_reasoning_callback=lambda: None,
         _session_db=object(),

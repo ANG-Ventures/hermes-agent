@@ -42,9 +42,9 @@ gateway:
       Taak-ID: {task_id}
 
       Jy kan aanhou gesels — resultate verskyn hier wanneer dit klaar is.'
-    usage: 'Gebruik: /background <prompt>
+    usage: 'Gebruik: /bg <prompt>
 
-      Voorbeeld: /background Som vandag se top HN-stories op
+      Voorbeeld: /bg Som vandag se top HN-stories op
 
 
       Voer die prompt in ''n aparte sessie uit. Jy kan aanhou gesels — die resultaat verskyn hier wanneer dit klaar is.'
@@ -77,6 +77,25 @@ gateway:
 
       This thread inherits the parent conversation ({count} messages) from {parent}. Explore freely here; the parent channel keeps its own session. Use `/merge` to fold a summary back into the parent.'
     thread_parent_fallback: the parent conversation
+  btw:
+    answer: '💬 /btw: "{preview}"
+
+
+      {answer}'
+    failed: '❌ /btw het misluk: "{preview}"
+
+      {error}'
+    no_history: Nog geen gesprek nie — stuur jou vraag eerder as 'n gewone boodskap.
+    no_provider: '❌ Kan nie newevraag beantwoord nie: geen verskaffer-geloofsbriewe opgestel nie.'
+    started: '💬 Newevraag: "{preview}"
+
+      Beantwoord vanaf ''n momentopname van hierdie gesprek — die huidige werk gaan voort.'
+    usage: 'Gebruik: /btw <vraag>
+
+      Voorbeeld: /btw in watter lêer was daardie fout?
+
+
+      Beantwoord ''n vinnige newevraag oor hierdie gesprek sonder om dit te onderbreek. Vir ''n onafhanklike agtergrondtaak, gebruik /bg <prompt>.'
   commands:
     default_desc: Vaardigheidsopdrag
     header: 📚 **Opdragte** ({total} altesaam, bladsy {page}/{total_pages})
@@ -103,8 +122,9 @@ gateway:
     not_enough: Nie genoeg gesprek om saam te pers nie (ten minste 4 boodskappe nodig).
     nothing_to_do: Niks om saam te pers nie (die transkripsie is steeds heeltemal beskermde konteks).
     persist_failed: ⚠️ Kompressie het gewerk, maar die resultaat kon nie gestoor word nie — die sessie-databasis was besig (gesluit). Niks is verloor nie; jou transkripsie is onveranderd. Hardloop /compress weer oor 'n oomblik om te herprobeer.
-    timed_out: "⚠️ Kompressie kon nie voltooi nie — die opsommer het gaan staan en die poging het uitgetel voordat enigiets geproduseer is. Niks is verloor nie; jou transkripsie is onveranderd. Voer /compress oor 'n oomblik weer uit om te herprobeer."
     summary_failed: ⚠️ Opsomming kon nie gegenereer word nie ({error}). {count} historiese boodskap(pe) is verwyder en met 'n plekhouer vervang; vroeëre konteks kan nie meer herstel word nie. Oorweeg om jou auxiliary.compression-modelopstelling na te gaan.
+    timed_out: ⚠️ Kompressie kon nie voltooi nie — die opsommer het gaan staan en die poging het uitgetel voordat enigiets geproduseer is. Niks is verloor nie; jou transkripsie is onveranderd. Voer /compress oor 'n oomblik weer uit om te herprobeer.
+    turnhold_deferred: ℹ️ Kontekskompressie uitgestel — opsomming stroom nog. Gaan hierdie beurt sonder kompressie voort.
   config_read_failed: '⚠️ Kon nie config.yaml lees nie: {error}'
   config_save_failed: '⚠️ Kon nie konfigurasie stoor nie: {error}'
   context:
@@ -206,7 +226,7 @@ gateway:
     paused: '⏸ Doelwit gepouse: {goal}'
     resumed: '▶ Doelwit hervat: {goal}
 
-      Stuur enige boodskap om voort te gaan, of wag — ek sal die volgende stap met die volgende beurt neem.'
+      Gaan nou voort — ek neem dadelik die volgende stap.'
     set: '⊙ Doelwit gestel ({budget}-beurt-begroting): {goal}
 
       Ek sal aanhou werk totdat die doelwit klaar is, jy dit pouseer/verwyder, of die begroting opgebruik is.
@@ -233,10 +253,14 @@ gateway:
     subscribed_suffix: (ingeteken — jy sal in kennis gestel word wanneer {task_id} voltooi of vasval)
     truncated_suffix: … (afgekap; gebruik `hermes kanban …` in jou terminale vir volle uitvoer)
     wake:
+      block_loop_detected: routed to triage after repeated blocks; needs a decision
       blocked: blocked; needs attention
+      changes_requested: review requested changes (BLOCK); implementation is not approved
       completed: completed
       crashed: crashed (worker exited); dispatcher will retry
       gave_up: gave up (retries exhausted)
+      guidance: This is an automatic task-status notification, not a request to decompose the task again. Inspect the current board before creating follow-up tasks; do not recreate tasks or graphs that already exist.
+      handoff: 'Result: {summary}'
       message: '[kanban] Task {task_id} {status}.
 
         Title: {title}
@@ -247,6 +271,10 @@ gateway:
 
 
         Check the result or decide the next step.'
+      review_detail: 'Review feedback: {reason}
+
+        Inspect the existing card and its current review run; return work to the same implementation task. Do not treat this BLOCK as approval and do not create a duplicate task.'
+      review_requested: handed off for review; the implementation is done
       status_default: status changed
       status_joiner: ', '
       timed_out: timed out; dispatcher will retry
@@ -491,7 +519,12 @@ gateway:
   retry:
     no_previous: Geen vorige boodskap om te herhaal nie.
   rollback:
+    failed_deletes: '⚠️ Kon nie verwyder nie (in plek gelaat): {files}'
     invalid_number: Ongeldige kontrolepunt-nommer. Gebruik 1-{max}.
+    kept_oversize: '↷ Behou (te groot vir kontrolepunte, geen gestoorde kopie om na terug te keer nie): {files}'
+    kept_user_edits: '↷ Jou handwysigings is behou: {files}
+
+      Gebruik /rollback <N> --all om dié ook te herstel.'
     none_found: Geen kontrolepunte vir {cwd} gevind nie
     not_enabled: "Kontrolepunte is nie geaktiveer nie.\nAktiveer in config.yaml:\n```\ncheckpoints:\n  enabled: true\n```"
     restore_failed: ❌ {error}

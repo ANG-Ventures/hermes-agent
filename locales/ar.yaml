@@ -42,9 +42,9 @@ gateway:
       معرّف المهمة: {task_id}
 
       يمكنك متابعة المحادثة — ستظهر النتائج عند الانتهاء.'
-    usage: 'الاستخدام: /background <prompt>
+    usage: 'الاستخدام: /bg <prompt>
 
-      مثال: /background لخّص أهم قصص HN اليوم
+      مثال: /bg لخّص أهم قصص HN اليوم
 
 
       يشغّل الموجِّه في جلسة منفصلة. يمكنك متابعة المحادثة — ستظهر النتيجة هنا عند الانتهاء.'
@@ -77,6 +77,25 @@ gateway:
 
       This thread inherits the parent conversation ({count} messages) from {parent}. Explore freely here; the parent channel keeps its own session. Use `/merge` to fold a summary back into the parent.'
     thread_parent_fallback: the parent conversation
+  btw:
+    answer: '💬 /btw: "{preview}"
+
+
+      {answer}'
+    failed: '❌ فشل /btw: "{preview}"
+
+      {error}'
+    no_history: لا توجد محادثة بعد — أرسل سؤالك كرسالة عادية بدلاً من ذلك.
+    no_provider: '❌ تعذّرت الإجابة عن السؤال الجانبي: لم يتم إعداد بيانات اعتماد مزوّد.'
+    started: '💬 سؤال جانبي: "{preview}"
+
+      تتم الإجابة من لقطة لهذه المحادثة — يستمر العمل الحالي.'
+    usage: 'الاستخدام: /btw <سؤال>
+
+      مثال: /btw في أي ملف كان ذلك الخطأ؟
+
+
+      يجيب عن سؤال جانبي سريع حول هذه المحادثة دون مقاطعتها. لمهمة خلفية مستقلة استخدم /bg <prompt>.'
   commands:
     default_desc: أمر مهارة
     header: 📚 **الأوامر** ({total} إجمالًا، صفحة {page}/{total_pages})
@@ -103,8 +122,9 @@ gateway:
     not_enough: لا توجد محادثة كافية للضغط (يلزم 4 رسائل على الأقل).
     nothing_to_do: لا شيء للضغط بعد (النص كله لا يزال سياقًا محميًا).
     persist_failed: ⚠️ Compression ran, but the result could not be saved — the session database was busy (locked). Nothing was lost; your transcript is unchanged. Run /compress again in a moment to retry.
-    timed_out: "⚠️ Compression could not finish — the summarizer stalled and the attempt timed out before producing anything. Nothing was lost; your transcript is unchanged. Run /compress again in a moment to retry."
     summary_failed: ⚠️ فشل توليد الملخّص ({error}). أُزيلت {count} رسالة تاريخية واستُبدلت بعنصر نائب؛ لم يعد السياق الأقدم قابلًا للاسترجاع. فكّر في مراجعة إعداد نموذج auxiliary.compression.
+    timed_out: ⚠️ Compression could not finish — the summarizer stalled and the attempt timed out before producing anything. Nothing was lost; your transcript is unchanged. Run /compress again in a moment to retry.
+    turnhold_deferred: ℹ️ تم تأجيل ضغط السياق — الملخص لا يزال قيد البث. نواصل هذا الدور دون ضغط.
   config_read_failed: '⚠️ تعذّر قراءة config.yaml: {error}'
   config_save_failed: '⚠️ تعذّر حفظ الإعدادات: {error}'
   context:
@@ -212,7 +232,7 @@ gateway:
     paused: '⏸ أُوقف الهدف مؤقتًا: {goal}'
     resumed: '▶ استُؤنف الهدف: {goal}
 
-      أرسل أي رسالة للمتابعة، أو انتظر — سأتخذ الخطوة التالية في الدور القادم.'
+      سأتابع الآن — سأتخذ الخطوة التالية فورًا.'
     set: '⊙ حُدِّد الهدف (ميزانية {budget} دور): {goal}
 
       سأواصل العمل حتى يكتمل الهدف، أو توقفه/تمسحه، أو تنفد الميزانية.
@@ -239,10 +259,14 @@ gateway:
     subscribed_suffix: (مُشترك — ستُخطَر عند اكتمال {task_id} أو حجبها)
     truncated_suffix: … (مقتطع؛ استخدم `hermes kanban …` في الطرفية للخرج الكامل)
     wake:
+      block_loop_detected: أُحيلت إلى الفرز بعد تكرار الحجب؛ تحتاج إلى قرار
       blocked: محجوبة؛ تحتاج إلى انتباه
+      changes_requested: طلبت المراجعة تغييرات (BLOCK)؛ التنفيذ غير معتمد
       completed: اكتملت
       crashed: تعطّل (خرج العامل)؛ سيعيد المُوزّع المحاولة
       gave_up: استسلم (نفدت المحاولات)
+      guidance: This is an automatic task-status notification, not a request to decompose the task again. Inspect the current board before creating follow-up tasks; do not recreate tasks or graphs that already exist.
+      handoff: 'Result: {summary}'
       message: '[kanban] المهمة {task_id} {status}.
 
         العنوان: {title}
@@ -253,6 +277,10 @@ gateway:
 
 
         راجع النتيجة أو قرّر الخطوة التالية.'
+      review_detail: 'ملاحظات المراجعة: {reason}
+
+        افحص البطاقة الحالية وتشغيل المراجعة الجاري؛ أعد العمل إلى مهمة التنفيذ نفسها. لا تعتبر هذا الحجب موافقة ولا تنشئ مهمة مكررة.'
+      review_requested: أُحيلت للمراجعة؛ اكتمل التنفيذ
       status_default: تغيّرت الحالة
       status_joiner: '، '
       timed_out: انتهت المهلة؛ سيعيد المُوزّع المحاولة
@@ -513,7 +541,12 @@ gateway:
   retry:
     no_previous: لا توجد رسالة سابقة لإعادة المحاولة.
   rollback:
+    failed_deletes: '⚠️ تعذّرت الإزالة (تُرك الملف في مكانه): {files}'
     invalid_number: رقم نقطة تحقّق غير صالح. استخدم 1-{max}.
+    kept_oversize: '↷ احتُفظ به (أكبر من أن يُحفظ في نقاط التفتيش، لا توجد نسخة مخزنة للرجوع إليها): {files}'
+    kept_user_edits: '↷ احتُفظ بتعديلاتك اليدوية: {files}
+
+      استخدم ‎/rollback <N> --all لاستعادتها أيضًا.'
     none_found: لم يُعثر على نقاط تحقّق لـ {cwd}
     not_enabled: "نقاط التحقّق غير مُفعّلة.\nفعّلها في config.yaml:\n```\ncheckpoints:\n  enabled: true\n```"
     restore_failed: ❌ {error}
