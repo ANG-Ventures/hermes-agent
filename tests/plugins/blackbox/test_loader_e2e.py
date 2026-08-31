@@ -120,10 +120,22 @@ def test_full_turn_lifecycle_through_loader(home, monkeypatch):
     mgr = _fresh_manager()
     mgr.discover_and_load()
 
-    # The loader imports the plugin as ``hermes_plugins.blackbox`` — a DIFFERENT
-    # module object than ``plugins.blackbox``. Patch the instance the loader
-    # actually wired the hooks from, or the patches no-op.
-    bb = sys.modules["hermes_plugins.blackbox"]
+    # The loader imports the plugin under the ``hermes_plugins.*`` namespace — a
+    # DIFFERENT module object than ``plugins.blackbox``. Patch the instance the
+    # loader actually wired the hooks from, or the patches no-op.
+    #
+    # parity 2026-08-30: resolve it from the manager rather than hardcoding
+    # ``sys.modules["hermes_plugins.blackbox"]``. Upstream's profile-scoped
+    # plugin namespacing (``_BARE_MODULE_SCOPE`` / ``_directory_module_name``)
+    # only hands the bare name to the FIRST manager scope that claims a slug;
+    # every later scope gets ``hermes_plugins.blackbox__home_<digest>``. Each
+    # test in this file uses its own tmp HERMES_HOME, so from the second loader
+    # test onward the bare name still pointed at the PREVIOUS test's module and
+    # the patches silently no-op'd (turn never persisted). Reading the loaded
+    # module off the manager is the seam-accurate lookup and is immune to both
+    # ordering and the scope-suffix scheme.
+    bb = mgr._plugins["blackbox"].module
+    assert bb is not None, "loader did not attach a module to the blackbox plugin"
     monkeypatch.setattr(bb, "compute_turn_cost", lambda *a, **k: (1.26, "estimated", {"uncached":0.5,"cache_read":0.5,"cache_write":0.13,"output":0.13}))
     monkeypatch.setattr(bb, "_turn_id", lambda: "turn_e2e")
 

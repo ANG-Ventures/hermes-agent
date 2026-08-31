@@ -863,16 +863,32 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
         (_real_home_dir / ".claude" / ".credentials.json") if _real_home_dir else None
     )
 
-    def _make_hermetic_read_from_file(_orig_read_file):
+    def _make_hermetic_read_from_file(_orig_read_file, _mod_ref):
         def _hermetic_read_from_file(*_args, **_kwargs):
             if _real_claude_creds is None:
                 return None
             try:
-                # Resolve the home the ADAPTER will use. Tests that legitimately
-                # exercise this path redirect it (``monkeypatch.setattr(Path,
-                # "home", ...)`` or HOME), so read it the same way the adapter
-                # does rather than trusting the process env.
-                target = Path.home() / ".claude" / ".credentials.json"
+                # Resolve the target the READER will actually use, by calling
+                # the same seam it calls -- ``claude_code_credentials_path()``
+                # -- rather than re-deriving ``Path.home()/.claude/...`` here.
+                #
+                # parity 2026-08-30: re-deriving the path was too narrow. It
+                # only detected redirects performed via ``Path.home``/``HOME``,
+                # so a fixture that redirects the SUPPORTED way -- patching
+                # ``agent.anthropic_credentials.claude_code_credentials_path``
+                # (upstream's own borrowed-row / rotation-verdict suites do
+                # exactly this) -- still looked like the real developer home and
+                # had its OWN fake credentials file suppressed. That left
+                # ``load_pool("anthropic")`` with an empty pool and reds shaped
+                # like ``StopIteration`` on the expected ``claude_code`` row.
+                # Resolving through the seam keeps the fork's leak guard intact
+                # (an unredirected read still resolves to the real home and is
+                # suppressed) while honouring every redirect style.
+                _path_fn = getattr(_mod_ref, "claude_code_credentials_path", None)
+                if callable(_path_fn):
+                    target = Path(_path_fn())
+                else:
+                    target = Path.home() / ".claude" / ".credentials.json"
                 if target.resolve() != _real_claude_creds.resolve():
                     # Redirected to a sandbox: this is a deliberate fixture, let
                     # the real reader run against the fake file.
@@ -900,7 +916,8 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
             _mod,
             "_read_claude_code_credentials_from_file",
             _make_hermetic_read_from_file(
-                getattr(_mod, "_read_claude_code_credentials_from_file", None)
+                getattr(_mod, "_read_claude_code_credentials_from_file", None),
+                _mod,
             ),
             raising=False,
         )
