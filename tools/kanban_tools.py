@@ -102,6 +102,25 @@ def _is_dispatcher_owned_worker() -> bool:
         return True
 
 
+def _owned_worker_task_id() -> Optional[str]:
+    """Return ``HERMES_KANBAN_TASK`` only when this process actually owns it.
+
+    Every trust decision keyed on the dispatcher's task id must read it through
+    here. ``HERMES_KANBAN_*`` is ordinary process env, so a nested ``hermes``
+    subprocess inherits it verbatim; reading ``os.environ`` directly treats that
+    inheritance as proof of ownership, which is how a nested default-profile
+    agent completed its parent's card while the owning worker was still running
+    (2026-08-12, card ``t_09b90233``).
+
+    The authority anchor itself is ``agent.delegation_context``'s
+    ``HERMES_KANBAN_OWNER_PID``; this is the task-id-shaped accessor that keeps
+    the read-side sites from re-deriving it (and from forgetting to).
+    """
+    if not _is_dispatcher_owned_worker():
+        return None
+    return os.environ.get("HERMES_KANBAN_TASK") or None
+
+
 def _reject_delegated_child_mutation(tool_name: str) -> Optional[str]:
     """Deny Kanban mutations from delegate_task children.
 
@@ -175,7 +194,7 @@ def _default_task_id(arg: Optional[str]) -> Optional[str]:
 
 def _worker_run_id(task_id: str) -> Optional[int]:
     """Return this worker's dispatcher run id when it is scoped to task_id."""
-    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+    if _owned_worker_task_id() != task_id:
         return None
     raw = os.environ.get("HERMES_KANBAN_RUN_ID")
     if not raw:
@@ -190,7 +209,7 @@ def _stamp_worker_session_metadata(
     task_id: str, metadata: Optional[dict]
 ) -> Optional[dict]:
     """Add trusted worker session id metadata for this worker's own task."""
-    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+    if _owned_worker_task_id() != task_id:
         return metadata
     session_id = _current_session_id()
     if not session_id:
@@ -518,7 +537,7 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     structured tool_error so the model gets a clear refusal instead of
     silently mutating board state from a worker context.
     """
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    if _owned_worker_task_id():
         return tool_error(
             f"{tool_name} is orchestrator-only; dispatcher-spawned workers "
             "must use kanban_complete, kanban_block, kanban_heartbeat, or "

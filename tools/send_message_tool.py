@@ -2418,6 +2418,21 @@ async def _send_bluebubbles(extra, chat_id, message):
 # (and the feishu media branch above). #41112.
 
 
+def _is_dispatcher_owned_worker_process() -> bool:
+    """True only when THIS process is the dispatcher-spawned worker.
+
+    ``HERMES_KANBAN_TASK`` is inherited by every descendant process, so it
+    alone does not distinguish the worker from a nested subprocess it spawned.
+    See ``agent.delegation_context.owns_kanban_worker_authority``.
+    """
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        return is_dispatcher_owned_worker_context()
+    except Exception:
+        return True
+
+
 def _check_send_message():
     """Gate send_message on gateway running (always available on messaging platforms).
 
@@ -2431,7 +2446,7 @@ def _check_send_message():
     reply with more than the ~200-char first-line truncation the kanban
     notifier applies.
     """
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker_process():
         return True
     from gateway.session_context import get_session_env
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")

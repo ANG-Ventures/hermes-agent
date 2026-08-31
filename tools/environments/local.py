@@ -660,15 +660,40 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
 
 
 def _scrub_delegated_child_kanban_env(env: dict[str, str]) -> dict[str, str]:
-    """Strip dispatcher-owned Kanban env from delegate_task child subprocesses."""
+    """Strip dispatcher-owned Kanban env from delegate_task child subprocesses.
+
+    Also SEALS worker authority for ordinary (non-delegated) children. The
+    authority anchor ``HERMES_KANBAN_OWNER_PID`` deliberately fails OPEN when
+    absent, so back-compat surfaces (hand-driven ``HERMES_KANBAN_TASK=... hermes
+    chat``, dispatchers older than the stamp) keep working. That fail-open is
+    safe only while the stamp travels with ``HERMES_KANBAN_TASK``: any child env
+    that carries the task id WITHOUT the owner pid re-opens the full 2026-08-12
+    hole, because the child then resolves itself as the worker. An
+    ``env_passthrough`` opt-in on ``HERMES_KANBAN_TASK`` (or a caller-built env
+    that copies only the task pins) produces exactly that shape.
+
+    Sealing here rather than at each spawn site is deliberate: every subprocess
+    env builder in this module (``_make_run_env``, ``_sanitize_subprocess_env``,
+    ``hermes_subprocess_env``) already funnels through this one call, so the
+    invariant holds at the fork boundary by construction and cannot be
+    forgotten by a new spawn path.
+    """
     try:
         from agent.delegation_context import (
+            KANBAN_OWNER_PID_ENV,
             is_delegated_child_process_context,
             scrub_kanban_env,
         )
 
         if is_delegated_child_process_context():
             return scrub_kanban_env(env)
+        if env.get("HERMES_KANBAN_TASK") and not env.get(KANBAN_OWNER_PID_ENV):
+            # The grant is already spent (this process, or an ancestor, owns
+            # it). A child inheriting the task id with no owner marker would
+            # fail OPEN, so name an owner that is definitively not the child.
+            import os
+
+            env[KANBAN_OWNER_PID_ENV] = str(os.getpid())
     except Exception:
         pass
     return env
