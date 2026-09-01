@@ -42,13 +42,32 @@ class TestExecuteToolCalls:
         tc2 = _mock_tool_call(name="web_search", arguments="{}", call_id="c2")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
         messages = []
+        # ``agent.tool_executor`` does a plain ``import time``, so patching
+        # ``agent.tool_executor.time.sleep`` rebinds the attribute on the shared
+        # ``time`` MODULE -- every thread in the process sees the mock, not only
+        # the dispatch loop under test. ``AIAgent.__init__`` starts a daemon
+        # ``env-probe`` thread (``tools.env_probe.warm_environment_probe_async``)
+        # that shells out to python3/pip, and ``subprocess.Popen.wait()``'s poll
+        # loop charges thousands of ``time.sleep(0.002..0.05)`` calls to that
+        # mock. A bare ``assert_not_called()`` therefore fails on unrelated
+        # background traffic whenever the probe is still running -- which is
+        # whenever no earlier test in the process happened to quiesce it.
+        # Attribute the sleeps to their calling thread so the assertion gates
+        # the between-call delay it actually names.
+        dispatch_thread = threading.get_ident()
+        dispatch_sleeps: list[float] = []
+
+        def _record_sleep(seconds=0.0, *args, **kwargs):
+            if threading.get_ident() == dispatch_thread:
+                dispatch_sleeps.append(seconds)
+
         with (
             patch("run_agent.handle_function_call", return_value="ok") as mock_hfc,
-            patch("agent.tool_executor.time.sleep") as mock_sleep,
+            patch("agent.tool_executor.time.sleep", side_effect=_record_sleep),
         ):
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
         assert mock_hfc.call_count == 2
-        mock_sleep.assert_not_called()
+        assert dispatch_sleeps == []
         tool_results = [m for m in messages if m["role"] == "tool"]
         assert [m["tool_call_id"] for m in tool_results] == ["c1", "c2"]
 
