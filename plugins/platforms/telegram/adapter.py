@@ -285,7 +285,8 @@ def _separate_chunk_indicator_from_fence(text: str) -> str:
 
 # MarkdownV2 has no table syntax, so pipe tables become bullet groups via convert_table_to_bullets().
 from gateway.platforms.helpers import (
-    TABLE_SEPARATOR_RE as _TABLE_SEPARATOR_RE, compile_mention_patterns, convert_table_to_bullets as _wrap_markdown_tables)
+    TABLE_SEPARATOR_RE as _TABLE_SEPARATOR_RE, compile_mention_patterns, convert_table_to_bullets as _wrap_markdown_tables,
+    is_transient_network_error)
 from gateway.platforms.helpers import cancel_task
 
 # Rich-message regions whose internal newlines must stay bare (Telegram renders them natively):
@@ -5976,16 +5977,25 @@ class TelegramAdapter(BasePlatformAdapter):
         return f"{existing}\n\n{note}" if existing else note
 
     async def _download_media_with_retry(self, source: Any, kind: str):
-        """Fetch Telegram media with bounded retries for transient network errors."""
-        from gateway.run import _is_transient_network_error
+        """Fetch Telegram media with bounded retries for transient network errors.
 
+        The transient/permanent verdict comes from the shared classifier in
+        ``gateway.platforms.helpers``, imported at module scope (#84210). It
+        used to be a call-time ``from gateway.run import
+        _is_transient_network_error`` — a private symbol in a module this
+        adapter has no business reaching into, and a rename there would have
+        raised ``ImportError`` from inside this method, where the *callers'*
+        broad ``except Exception`` handlers swallow it into a generic "media
+        could not be downloaded" reply. Retries would have silently stopped
+        with no traceback naming the real cause.
+        """
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
             try:
                 file_obj = await source.get_file()
                 payload = await file_obj.download_as_bytearray()
             except Exception as exc:
-                if attempt == max_attempts or not _is_transient_network_error(exc):
+                if attempt == max_attempts or not is_transient_network_error(exc):
                     raise
                 await asyncio.sleep(0.5 * (2 ** (attempt - 1)))
                 continue
