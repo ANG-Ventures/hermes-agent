@@ -199,6 +199,9 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+    # Codex app-server turns bypass conversation_loop's sibling assignment.
+    # Preserve the same canonical usage for turn_finalizer's context-engine hook.
+    agent._last_turn_usage = dict(usage_dict)
 
     cost_result = estimate_usage_cost(
         agent.model,
