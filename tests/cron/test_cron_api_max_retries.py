@@ -87,6 +87,31 @@ class TestJobStoreApiMaxRetries:
             _create(api_max_retries=garbage)
         assert load_jobs() == []
 
+    @pytest.mark.parametrize("value", [3.5, 2.999, 1.0])
+    def test_floats_rejected_not_truncated(self, tmp_cron_dir, value):
+        """A float must raise, not silently truncate.
+
+        ``int(3.5)`` is ``3``, so without an explicit guard a float pin
+        persists a DIFFERENT budget than the caller asked for — the exact
+        silent-degradation failure this normalizer exists to prevent, and
+        which the string form ``"3.5"`` is already rejected for. Reported by
+        @Enough1122: the garbage parametrization above covers only the string.
+
+        ``1.0`` is included deliberately: it round-trips through ``int()``
+        without changing value, so a truncation-only check would let it pass
+        and leave the type contract half-enforced.
+        """
+        with pytest.raises(ValueError):
+            _create(api_max_retries=value)
+        assert load_jobs() == []
+
+    def test_floats_rejected_at_update(self, tmp_cron_dir):
+        """Same guard on the update path — the stored pin stays untouched."""
+        job = _create(api_max_retries=6)
+        with pytest.raises(ValueError):
+            update_job(job["id"], {"api_max_retries": 3.5})
+        assert load_jobs()[0]["api_max_retries"] == 6
+
     @pytest.mark.parametrize("flag", [True, False])
     def test_booleans_rejected_not_coerced(self, tmp_cron_dir, flag):
         """int(True) == 1 would silently turn a YAML `true` into a retry
@@ -177,6 +202,21 @@ class TestSchedulerAppliesJobApiMaxRetries:
         with caplog.at_level(logging.WARNING, logger="cron.scheduler"):
             _apply_job_api_max_retries(agent, {"id": "b", "api_max_retries": True})
         assert agent._api_max_retries == 3
+
+    def test_hand_edited_float_warns_and_keeps_default(self, caplog):
+        """JSON has no integer type distinction, so a hand-edited jobs.json
+        can legally carry ``3.5``. The store choke point rejects floats, but
+        this consumer reads the file directly and must not silently truncate
+        to a budget the operator never wrote — degrade to the agent default
+        and say so, matching the boolean/garbage paths.
+        """
+        from cron.scheduler import _apply_job_api_max_retries
+
+        agent = self._agent(default=3)
+        with caplog.at_level(logging.WARNING, logger="cron.scheduler"):
+            _apply_job_api_max_retries(agent, {"id": "f", "api_max_retries": 3.5})
+        assert agent._api_max_retries == 3
+        assert any("3.5" in (r.getMessage()) for r in caplog.records)
 
     def test_hand_edited_below_floor_clamps(self):
         """The store clamps, but a hand-edited 0 must not disable the loop."""
