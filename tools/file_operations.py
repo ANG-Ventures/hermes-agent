@@ -411,13 +411,18 @@ def _search_stdout_and_limit(result: ExecuteResult) -> tuple[str, Optional[str]]
     return result.stdout, None
 
 
-def _split_tool_diagnostics(output: str) -> tuple[str, str]:
+def _split_tool_diagnostics(output: str, exit_code: int) -> tuple[str, str]:
     """Separate rg/grep diagnostic lines from real match output.
 
     ``_exec`` runs commands with ``stderr=subprocess.STDOUT``, so error and
     warning text from ``rg``/``grep`` is interleaved with match lines in a
     single stream. Diagnostics must not be parsed as matches, and on a hard
     failure they are the error message to surface.
+
+    ``exit_code`` is the search process' status. It scopes the unprefixed
+    old-ripgrep heuristic below to runs that can actually carry a per-file
+    I/O diagnostic: a clean exit (0) means every file was read successfully,
+    so any ``(os error N)`` text in that output is content, not a diagnostic.
 
     Returns ``(diagnostics, payload)`` where ``payload`` contains only lines
     that look like real search output — a match line (``file:line:content``),
@@ -451,12 +456,19 @@ def _split_tool_diagnostics(output: str) -> tuple[str, str]:
         # shape regex below already rejects most of those, but it mis-reads the
         # ones whose path contains "-<digit>" (e.g. "/tmp/pytest-686/x: ...
         # (os error 13)"), classifying the diagnostic as a match. Catch that
-        # narrow gap here -- but ONLY for lines that are not a real,
-        # line-numbered search hit, so a legitimate match whose *content* ends
-        # in "(os error N)" (e.g. "a.py:1:needle (os error 13)") is kept.
+        # narrow gap here, guarded so it can only ever fire on a genuine
+        # diagnostic:
+        #   * only on an error exit -- a successful search never emitted one;
+        #   * only on the "<path>: <message>" shape, since real output always
+        #     separates the path from a line number with ":<n>:" or "-<n>-",
+        #     never with a colon-SPACE;
+        #   * and never on a line-numbered match or a numbered context line,
+        #     whose *content* may legitimately end in "(os error N)".
         if (
-            _OS_ERROR_DIAGNOSTIC_RE.search(line)
+            exit_code != 0
+            and _OS_ERROR_DIAGNOSTIC_RE.search(line)
             and not _SEARCH_LINE_NUMBERED_RE.match(line)
+            and not _SEARCH_CONTEXT_NUMBERED_RE.match(line)
         ):
             diagnostics.append(line)
             continue
@@ -476,13 +488,27 @@ def _split_tool_diagnostics(output: str) -> tuple[str, str]:
 
 # Matches an rg/grep per-file I/O diagnostic that some rg versions emit
 # WITHOUT a "rg: " prefix, e.g. "<path>: Permission denied (os error 13)".
-_OS_ERROR_DIAGNOSTIC_RE = re.compile(r"\(os error \d+\)\s*$")
+# The ": " separator is part of the shape on purpose: real search output
+# separates a path from a line number with ":<n>:" (match) or "-<n>-"
+# (context) and emits a files-only path bare, so a colon-SPACE is the
+# structural tell of the unprefixed diagnostic form. Without it a successful
+# files-only result whose path ends in "(os error N)" would be discarded.
+_OS_ERROR_DIAGNOSTIC_RE = re.compile(r"^.*?: .*\(os error \d+\)\s*$")
 
 # Matches a REAL, line-numbered search hit: "<path>:<line>:<content>" (rg is
 # always invoked with --line-number/--with-filename for content mode). Used to
 # exempt genuine matches from the unprefixed-diagnostic heuristic above, so a
 # match whose content happens to end in "(os error N)" is never discarded.
 _SEARCH_LINE_NUMBERED_RE = re.compile(r'^([A-Za-z]:)?[^\s:][^\n]*?:\d+:')
+
+# Matches a REAL, numbered CONTEXT line: "<path>-<line>-<content>". Same
+# exemption as above for -A/-B/-C output, whose content may also legitimately
+# end in "(os error N)". A path that itself contains "-<digits>-" makes a
+# single line inherently ambiguous (the same ambiguity
+# ``_parse_search_context_line`` documents); this resolves it toward keeping
+# user-visible results, since a leaked diagnostic is noise while a dropped
+# context line is silent data loss.
+_SEARCH_CONTEXT_NUMBERED_RE = re.compile(r'^([A-Za-z]:)?[^\s:][^\n]*?-\d+-')
 
 
 # A real rg/grep output line starts with a path token and is followed by a
@@ -3308,7 +3334,7 @@ class ShellFileOperations(FileOperations):
         # diagnostic lines ("rg: <file>: <error>", "rg: regex parse error:")
         # are interleaved with match output. Split them out: diagnostics must
         # not be parsed as matches, and on a hard error they ARE the message.
-        diagnostics, payload = _split_tool_diagnostics(stdout)
+        diagnostics, payload = _split_tool_diagnostics(stdout, result.exit_code)
 
         # rg exit codes: 0=matches found, 1=no matches, 2=error. rg returns 2
         # even on partial errors (e.g. one unreadable file in a tree that
@@ -3523,7 +3549,7 @@ class ShellFileOperations(FileOperations):
         # ("grep: <file>: <error>") are interleaved with matches. Split them
         # out so they're never parsed as matches and so a hard error has a
         # clean message.
-        diagnostics, payload = _split_tool_diagnostics(stdout)
+        diagnostics, payload = _split_tool_diagnostics(stdout, result.exit_code)
 
         # grep exit codes: 0=matches found, 1=no matches, 2=error. grep
         # returns 2 on partial errors (e.g. an unreadable file) even when
