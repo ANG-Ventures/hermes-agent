@@ -2,7 +2,7 @@
 
 Extracts common patterns that were duplicated across 5-7 adapters:
 message deduplication, text batch aggregation, markdown stripping,
-and thread participation tracking.
+thread participation tracking, and transient-network-error classification.
 """
 
 import asyncio
@@ -11,7 +11,7 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING, Dict, Optional, Set
 
 from utils import atomic_json_write
 
@@ -19,6 +19,81 @@ if TYPE_CHECKING:
     from gateway.platforms.base import MessageEvent
 
 logger = logging.getLogger(__name__)
+
+
+# ─── Transient network-error classification ───────────────────────────────────
+
+# Exception class names that mean "the wire hiccuped, try again" rather than
+# "this request is wrong". Matched by NAME, not by type, so the classifier
+# stays importable in environments where python-telegram-bot / httpx / aiohttp
+# are not installed (they are lazy-install extras — see ``tools/lazy_deps.py``).
+#
+# NOTE ON PTB'S HIERARCHY: in python-telegram-bot 22.x, ``BadRequest``
+# inherits from ``NetworkError``. A subclass check would therefore classify a
+# permanent "file is unavailable" BadRequest as transient and retry it three
+# times for nothing. Name matching is the deliberate, correct discriminator
+# here, not a shortcut.
+TRANSIENT_NETWORK_ERROR_CLASS_NAMES = frozenset(
+    {
+        "TimedOut",  # telegram.error.TimedOut
+        "NetworkError",  # telegram.error.NetworkError
+        "ReadError",  # httpx
+        "WriteError",  # httpx
+        "ConnectError",  # httpx
+        "ConnectTimeout",  # httpx
+        "ReadTimeout",  # httpx
+        "WriteTimeout",  # httpx
+        "PoolTimeout",  # httpx
+        "RemoteProtocolError",  # httpx
+        "ServerDisconnectedError",  # aiohttp
+        "ClientConnectorError",  # aiohttp
+        "ClientOSError",  # aiohttp
+    }
+)
+
+# Bound on the ``__cause__``/``__context__`` walk, so a pathological or cyclic
+# chain can never spin.
+_TRANSIENT_CAUSE_CHAIN_MAX_DEPTH = 12
+
+
+def is_transient_network_error(exc: BaseException) -> bool:
+    """Return True for transient network errors safe to retry or log+swallow.
+
+    The crash class targeted by #31066 / #31110: an unhandled Telegram
+    ``TimedOut`` (or peer ``NetworkError`` / ``httpx`` connection error)
+    propagating to the event loop and killing the entire gateway process.
+    These are by definition transient — the next poll cycle or user action
+    recovers — so they must never crash the process, and a bounded retry of
+    the failed operation is the right response.
+
+    Two consumers share this single definition:
+
+    * :func:`gateway.run._gateway_loop_exception_handler` — the loop-level
+      safety net that logs and swallows instead of dying.
+    * ``TelegramAdapter._download_media_with_retry`` — bounded media-download
+      retries (#84210).
+
+    They MUST agree: an error the loop handler treats as survivable is exactly
+    an error the adapter should retry. Two copies of the class-name set would
+    silently drift apart.
+
+    Walks the exception cause chain so wrapped errors (e.g. PTB's
+    ``NetworkError`` wrapping ``httpx.ConnectError``) are still classified.
+    The chain is bounded and cycle-guarded.
+    """
+    seen: Set[int] = set()
+    cur: Optional[BaseException] = exc
+    depth = 0
+    while cur is not None and depth < _TRANSIENT_CAUSE_CHAIN_MAX_DEPTH:
+        ident = id(cur)
+        if ident in seen:
+            break
+        seen.add(ident)
+        depth += 1
+        if type(cur).__name__ in TRANSIENT_NETWORK_ERROR_CLASS_NAMES:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 # ─── Message Deduplication ────────────────────────────────────────────────────

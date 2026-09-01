@@ -54,13 +54,18 @@ _ensure_telegram_mock()
 # Now we can safely import
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
-
-class TimedOut(Exception):
-    """Stand-in for telegram.error.TimedOut (classifier matches class names)."""
-
-
-class BadRequest(Exception):
-    """Stand-in for telegram.error.BadRequest, which must not be retried."""
+# Raise the REAL telegram exception types, not local ``class X(Exception)``
+# stand-ins. ``python-telegram-bot`` is a lazy-install extra (pyproject
+# ``[messaging]``, resolved by tools/lazy_deps.py at first use), so it is not
+# guaranteed in every test env — but ``tests/gateway/conftest.py`` installs a
+# PTB-22.x-faithful ``telegram.error`` hierarchy when the real library is
+# absent, including the load-bearing detail that ``BadRequest`` INHERITS FROM
+# ``NetworkError``. Importing through ``telegram.error`` therefore exercises
+# the real inheritance graph either way: local stand-ins subclassing bare
+# ``Exception`` would have hidden the fact that the classifier must match on
+# class NAME, since a subclass check would wrongly retry a permanent
+# ``BadRequest``.
+from telegram.error import BadRequest, TimedOut  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

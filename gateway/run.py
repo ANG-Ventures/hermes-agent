@@ -63,6 +63,7 @@ from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import (
     compression_made_progress,
 )
+from gateway.platforms.helpers import is_transient_network_error
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -507,47 +508,15 @@ def _seed_hygiene_system_prompt(
 
 
 def _is_transient_network_error(exc: BaseException) -> bool:
-    """Return True for transient network errors safe to log + swallow.
+    """Backwards-compatible alias for the shared classifier.
 
-    The crash class targeted by #31066 / #31110: an unhandled Telegram
-    ``TimedOut`` (or peer ``NetworkError`` / ``httpx`` connection error)
-    propagating to the event loop and killing the entire gateway
-    process. These are by definition transient — the next poll cycle or
-    user action recovers — so they must never crash the process.
-
-    Walk the exception cause chain so wrapped errors (e.g. PTB's
-    ``NetworkError`` wrapping ``httpx.ConnectError``) are still
-    classified. The chain is bounded to avoid pathological cycles.
+    Canonical home is :func:`gateway.platforms.helpers.is_transient_network_error`
+    (#84210) — promoted there so the Telegram adapter can consume it as a
+    supported helper instead of reaching into this module's privates at call
+    time. Kept as a thin module-level re-export because existing callers and
+    tests import ``gateway.run._is_transient_network_error`` directly.
     """
-    seen: set[int] = set()
-    cur: Optional[BaseException] = exc
-    depth = 0
-    transient_class_names = {
-        "TimedOut",
-        "NetworkError",
-        "ReadError",
-        "WriteError",
-        "ConnectError",
-        "ConnectTimeout",
-        "ReadTimeout",
-        "WriteTimeout",
-        "PoolTimeout",
-        "RemoteProtocolError",
-        "ServerDisconnectedError",
-        "ClientConnectorError",
-        "ClientOSError",
-    }
-    while cur is not None and depth < 12:
-        ident = id(cur)
-        if ident in seen:
-            break
-        seen.add(ident)
-        depth += 1
-        name = type(cur).__name__
-        if name in transient_class_names:
-            return True
-        cur = cur.__cause__ or cur.__context__
-    return False
+    return is_transient_network_error(exc)
 
 
 def _gateway_loop_exception_handler(
