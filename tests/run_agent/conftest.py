@@ -22,6 +22,11 @@ from __future__ import annotations
 
 import pytest
 
+from unittest.mock import MagicMock, patch
+
+from run_agent import AIAgent
+from tests.run_agent._run_agent_helpers import _make_tool_defs
+
 
 @pytest.fixture(autouse=True)
 def _fast_retry_backoff(monkeypatch):
@@ -44,3 +49,46 @@ def _fast_retry_backoff(monkeypatch):
         monkeypatch.setattr(_conv_loop, "jittered_backoff", lambda *a, **k: 0.0)
     except ImportError:
         pass
+
+
+@pytest.fixture()
+def agent():
+    """Minimal AIAgent with mocked OpenAI client and tool loading."""
+    with (
+        patch(
+            "run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")
+        ),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        a = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        a.client = MagicMock()
+        return a
+
+
+@pytest.fixture()
+def agent_with_memory_tool():
+    """Agent whose valid_tool_names includes 'memory'."""
+    with (
+        patch(
+            "run_agent.get_tool_definitions",
+            return_value=_make_tool_defs("web_search", "memory"),
+        ),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        a = AIAgent(
+            api_key="test-k...7890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        a.client = MagicMock()
+        return a
