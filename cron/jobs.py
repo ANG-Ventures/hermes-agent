@@ -2138,7 +2138,8 @@ def _normalize_api_max_retries(value: Any) -> Optional[int]:
     at 3am would look like the pin never worked. So a non-integer raises here
     and nothing invalid ever persists. Booleans are rejected rather than
     coerced (``int(True) == 1``) so a YAML ``true`` cannot become a retry
-    budget.
+    budget, and floats likewise (``int(3.5) == 3``) so a pin can never persist
+    a quietly different budget than the caller asked for.
 
     Returns None for unset (None / empty string), which clears the pin and
     keeps the job following ``agent.api_max_retries``.
@@ -2146,6 +2147,18 @@ def _normalize_api_max_retries(value: Any) -> Optional[int]:
     if value is None:
         return None
     if isinstance(value, bool):
+        raise ValueError(
+            f"Invalid api_max_retries {value!r}. Expected an integer >= 1 "
+            "(empty string clears the override)."
+        )
+    # Floats are rejected rather than truncated (``int(3.5) == 3``): a pin
+    # that silently persists a DIFFERENT budget than the caller asked for is
+    # the same silent degradation this normalizer exists to prevent, and the
+    # string form ("3.5") already raises. Rejecting the whole type — not just
+    # non-integral values — keeps 1.0 from passing and leaving the contract
+    # half-enforced. Only reachable via direct Python calls; the CLI hands
+    # over strings.
+    if isinstance(value, float):
         raise ValueError(
             f"Invalid api_max_retries {value!r}. Expected an integer >= 1 "
             "(empty string clears the override)."

@@ -685,14 +685,16 @@ def _apply_job_api_max_retries(agent: Any, job: dict) -> None:
 
     A value that no longer parses (hand-edited jobs.json) logs a warning and
     leaves the agent default in place — a bad pin must degrade the run's retry
-    budget, never kill the tick. Absent pin is a no-op, so an unpinned job is
-    byte-identical to pre-feature behavior.
+    budget, never kill the tick. Floats are rejected here as well as at the
+    store: JSON draws no int/float distinction, so a hand-edited ``3.5`` would
+    otherwise truncate to a budget the operator never wrote. Absent pin is a
+    no-op, so an unpinned job is byte-identical to pre-feature behavior.
     """
     pinned = job.get("api_max_retries")
     if pinned is None:
         return
     try:
-        if isinstance(pinned, bool):
+        if isinstance(pinned, (bool, float)):
             raise ValueError(pinned)
         retries = max(int(pinned), 1)
     except (TypeError, ValueError):
