@@ -2122,6 +2122,49 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     return text
 
 
+def _normalize_api_max_retries(value: Any) -> Optional[int]:
+    """Validate a per-job API retry budget at the storage choke point.
+
+    Semantics deliberately match the ``agent.api_max_retries`` config sibling
+    (``agent/agent_init.py``): an integer count of attempts per model API call,
+    clamped to ``>= 1`` (1 = a single attempt, no retry). The clamp is applied
+    here rather than at fire time so the stored record reads exactly as it
+    behaves.
+
+    Where this is STRICTER than config is the failure mode, and for the same
+    reason the reasoning-effort pin is: config falls back to the default 3 on
+    a garbage value because a human is watching the session start, while a
+    cron job is fire-and-forget — a typo that silently degraded to the default
+    at 3am would look like the pin never worked. So a non-integer raises here
+    and nothing invalid ever persists. Booleans are rejected rather than
+    coerced (``int(True) == 1``) so a YAML ``true`` cannot become a retry
+    budget.
+
+    Returns None for unset (None / empty string), which clears the pin and
+    keeps the job following ``agent.api_max_retries``.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(
+            f"Invalid api_max_retries {value!r}. Expected an integer >= 1 "
+            "(empty string clears the override)."
+        )
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        value = text
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Invalid api_max_retries {value!r}. Expected an integer >= 1 "
+            "(empty string clears the override)."
+        ) from None
+    return max(parsed, 1)
+
+
 def _compute_provider_model_snapshots(
     *,
     provider: Any,
@@ -2225,6 +2268,7 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    api_max_retries: Optional[Union[int, str]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2292,6 +2336,17 @@ def create_job(
                 exactly like config-set effort. Inert with ``no_agent=True``
                 (no LLM call to configure). None/empty = unset (job follows
                 config resolution, pre-existing behavior).
+        api_max_retries: Optional per-job API retry budget. Overrides the
+                global ``agent.api_max_retries`` (config.yaml, default 3) for
+                this job's runs only — the number of attempts each model API
+                call gets on transient errors before the fallback-provider
+                chain engages. Clamped to ``>= 1`` (1 = single attempt, no
+                retry). Useful for a job pinned to a flaky endpoint: more
+                attempts keep it on its requested model through a transient
+                stretch instead of swapping models, without slowing failure
+                handling for every other agent and job. Inert with
+                ``no_agent=True`` (no API call to retry). None/empty = unset
+                (job follows config, pre-existing behavior).
 
     Returns:
         The created job dict
@@ -2327,6 +2382,7 @@ def create_job(
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
+    normalized_api_max_retries = _normalize_api_max_retries(api_max_retries)
     normalized_monitor_script = str(monitor_script).strip() if isinstance(monitor_script, str) else None
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
@@ -2443,6 +2499,10 @@ def create_job(
     # absent key = job follows config resolution (pre-feature behavior).
     if normalized_reasoning_effort is not None:
         job["reasoning_effort"] = normalized_reasoning_effort
+    # Same conditional-persist rule for the per-job API retry budget: absent
+    # key = job follows agent.api_max_retries (pre-feature behavior).
+    if normalized_api_max_retries is not None:
+        job["api_max_retries"] = normalized_api_max_retries
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2556,6 +2616,14 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             if "reasoning_effort" in updates:
                 updates["reasoning_effort"] = _normalize_reasoning_effort(
                     updates["reasoning_effort"]
+                )
+
+            # Same choke point for the per-job API retry budget: integer >= 1,
+            # empty string (or None) clears. Invalid values raise BEFORE the
+            # merge so the stored value stays untouched.
+            if "api_max_retries" in updates:
+                updates["api_max_retries"] = _normalize_api_max_retries(
+                    updates["api_max_retries"]
                 )
 
             # Normalize repeat the same way create_job does. Callers pass

@@ -781,6 +781,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["script"] = job["script"]
     if job.get("reasoning_effort"):
         result["reasoning_effort"] = job["reasoning_effort"]
+    if job.get("api_max_retries") is not None:
+        result["api_max_retries"] = job["api_max_retries"]
     if job.get("monitor_script"):
         result["monitor_script"] = job["monitor_script"]
     if job.get("monitor_url"):
@@ -1482,6 +1484,7 @@ def cronjob(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    api_max_retries: Optional[Union[int, str]] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1592,12 +1595,14 @@ def cronjob(
                     attach_to_session=attach_to_session,
                     monitor_script=_normalize_optional_job_value(monitor_script),
                     monitor_url=_normalize_optional_job_value(monitor_url),
-                    # reasoning_effort reaches here from the CLI
-                    # (hermes cron create --reasoning-effort) ONLY — it is
-                    # deliberately absent from CRONJOB_SCHEMA and the model
-                    # dispatch below: models do not make model-config
-                    # decisions (standing policy).
+                    # reasoning_effort / api_max_retries reach here from the
+                    # CLI (hermes cron create --reasoning-effort /
+                    # --api-max-retries) ONLY — both are deliberately absent
+                    # from CRONJOB_SCHEMA and the model dispatch below: models
+                    # do not make model-config or unattended-spend decisions
+                    # (standing policy).
                     reasoning_effort=reasoning_effort,
+                    api_max_retries=api_max_retries,
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
@@ -1814,6 +1819,10 @@ def cronjob(
                 # CLI-only lane (see create above): update_job validates
                 # against the canonical grammar; empty string clears the pin.
                 updates["reasoning_effort"] = reasoning_effort
+            if api_max_retries is not None:
+                # CLI-only lane (see create above): update_job validates the
+                # integer and clamps to >= 1; empty string clears the pin.
+                updates["api_max_retries"] = api_max_retries
             # Re-validate the EFFECTIVE provider/base_url on EVERY update, not
             # only when this update supplies provider/base_url. A job persisted
             # before this guard (or written directly to the jobs store) may
