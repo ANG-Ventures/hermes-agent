@@ -36,6 +36,13 @@ def isolated_kanban_home_with_profiles(monkeypatch):
     for mod in _saved_modules:
         del sys.modules[mod]
     from hermes_cli import kanban_db
+    # The purge above also discards the module object that tests/conftest.py's
+    # autouse memory-guard fixture patched, so this fresh import carries the
+    # REAL ``_system_memory_sample``. On a loaded CI runner (<15% MemAvailable
+    # => "elevated") the dispatcher then caps to ONE spawn per tick and
+    # ``count("alpha") == 2`` fails — heavy-ci nightly 2026-09-02 (assert 1 == 2).
+    # Re-apply the seam on the module we actually yield.
+    monkeypatch.setattr(kanban_db, "_system_memory_sample", lambda: {}, raising=False)
     try:
         yield kanban_db
     finally:
