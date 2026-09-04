@@ -2015,6 +2015,24 @@ def get_pricing_entry(
         # model absent from the curated snapshot price from the configured
         # external catalog — models.dev by default, OpenRouter as fallback
         # (config.yaml `pricing.external_source`). See _external_pricing_entry.
+        #
+        # Curated snapshot FIRST for the OpenAI family: a freshly-launched
+        # model (gpt-6-astra, 2026-09-04) reached the fleet's codex lane the
+        # same day and was priced in _OFFICIAL_DOCS_PRICING in the same PR —
+        # but models.dev/OpenRouter lagged, so every astra turn resolved to
+        # source="none"/$0 while a correct entry sat unused. The docstring
+        # above (external is consulted only AFTER the snapshot misses) is the
+        # contract; this makes the notional route honor it.
+        snapshot = _lookup_official_docs_pricing(
+            BillingRoute(
+                provider="openai",
+                model=route.model,
+                base_url=route.base_url,
+                billing_mode="official_docs_snapshot",
+            )
+        )
+        if snapshot is not None:
+            return snapshot
         return _external_pricing_entry(route)
     if route.base_url:
         entry = _pricing_entry_from_metadata(
