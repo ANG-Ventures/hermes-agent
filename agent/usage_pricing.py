@@ -476,6 +476,23 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://openai.com/index/previewing-gpt-5-6-sol/",
         pricing_version="openai-gpt-5.6-2026-07",
     ),
+    # ── OpenAI GPT-6 Astra ───────────────────────────────────────────────
+    # GA 2026-09-04. OpenAI's flagship; replaces gpt-5.6-sol as the codex
+    # workhorse. Cache read is the standard 0.1x input discount; cache write
+    # 1.25x input, same ratio as the 5.6 tiers.
+    # Source: https://developers.openai.com/api/docs/models/gpt-6-astra
+    (
+        "openai",
+        "gpt-6-astra",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("10.00"),
+        output_cost_per_million=Decimal("50.00"),
+        cache_read_cost_per_million=Decimal("1.00"),
+        cache_write_cost_per_million=Decimal("12.50"),
+        source="official_docs_snapshot",
+        source_url="https://developers.openai.com/api/docs/models/gpt-6-astra",
+        pricing_version="openai-gpt-6-2026-09",
+    ),
     # ── Anthropic Claude Opus 5 ──────────────────────────────────────────
     # Released 2026-07-24, same $5/$25 base pricing as Opus 4.8 (announcement:
     # "priced at $5 per million input tokens and $25 per million output tokens
@@ -1400,7 +1417,7 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
 # onto the base entries so the snapshot stays single-source. The Hermes-side
 # "-900k" large-context Codex picker variants are the same underlying model
 # (the suffix is stripped on the wire), so they alias identically.
-for _base_56 in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+for _base_56 in ("gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
     _OFFICIAL_DOCS_PRICING[("openai", f"{_base_56}-pro")] = _OFFICIAL_DOCS_PRICING[
         ("openai", _base_56)
     ]

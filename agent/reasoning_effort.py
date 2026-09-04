@@ -72,10 +72,16 @@ CODEX_LEGACY_EFFORTS: tuple[str, ...] = (
     "none", "low", "medium", "high", "xhigh",
 )
 
+#: Slugs whose Codex wire vocabulary is the wider gpt-5.6-era set (i.e. they
+#: accept ``max``). gpt-6-astra was verified to expose the same
+#: low/medium/high/xhigh/max/ultra ladder as gpt-5.6-sol (2026-09-04).
+_CODEX_MAX_EFFORT_SLUGS: tuple[str, ...] = ("gpt-5.6", "gpt-6-astra")
+
 
 def codex_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
     """Supported effort set for an OpenAI/Codex Responses model."""
-    if "gpt-5.6" in (model or "").lower():
+    name = (model or "").lower()
+    if any(slug in name for slug in _CODEX_MAX_EFFORT_SLUGS):
         return CODEX_GPT56_EFFORTS
     return CODEX_LEGACY_EFFORTS
 
