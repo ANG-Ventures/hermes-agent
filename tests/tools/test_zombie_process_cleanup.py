@@ -472,7 +472,20 @@ class TestDelegationCleanup:
         parent._active_children.append(child)
         relay_host = MagicMock()
         monkeypatch.setattr(relay_runtime, "get_runtime", lambda **_kwargs: relay_host)
-        monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 0.1)
+        # CHILD_TIMEOUT is read by _run_single_child BEFORE the worker thread is
+        # submitted, so it is the budget for "schedule the child AND let it run
+        # to its blocking wait". At 0.1s a loaded CI runner can time out before
+        # the executor thread ever reaches child_started.set() (merge-queue
+        # flake, 2026-09-04: `assert child_started.is_set()` -> False). The
+        # property under test is ORDERING (child started, then the parent
+        # stopped waiting), not speed: the child blocks on release_child for
+        # CHILD_BLOCK seconds, so any timeout well below CHILD_BLOCK still
+        # proves the parent gave up on a live child. Keep a large ratio.
+        CHILD_TIMEOUT = 2.0
+        CHILD_BLOCK = 20.0
+        monkeypatch.setattr(
+            "tools.delegate_tool._get_child_timeout", lambda: CHILD_TIMEOUT
+        )
 
         def run_conversation(**kwargs):
             lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
@@ -487,7 +500,7 @@ class TestDelegationCleanup:
             )
             child_started.set()
             try:
-                release_child.wait(timeout=5)
+                release_child.wait(timeout=CHILD_BLOCK)
                 return {
                     "final_response": "late result",
                     "completed": True,
@@ -512,7 +525,7 @@ class TestDelegationCleanup:
                 parent_agent=parent,
             )
 
-            assert child_started.is_set()
+            assert child_started.wait(timeout=CHILD_BLOCK), "child never started"
             assert result["status"] == "timeout"
             assert relay_runtime.SESSION_COORDINATOR.has_active_turn(
                 profile_key=str(profile_home),
