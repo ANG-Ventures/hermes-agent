@@ -295,9 +295,18 @@ describe('status-chrome timers under an occluding overlay', () => {
     nowSpy.mockReturnValue(T0 + 300_000)
     rule.clear()
     resetOverlayState()
-    await flush()
 
-    const resumed = rule.output()
+    // A single 20ms flush() is a race against React's scheduler, not a proof:
+    // on a loaded CI runner (merge-queue run 33925200338) no frame had been
+    // rendered yet and the assertion read '' (`expected '' to contain '6m 0s'`).
+    // Wait for the reveal re-render itself — bounded by ITERATIONS, not wall
+    // clock, because nowSpy has replaced Date.now in this file. A genuine
+    // regression still fails below, just on the real frame text.
+    let resumed = ''
+    for (let i = 0; i < 250 && resumed === ''; i++) {
+      await flush()
+      resumed = rule.output()
+    }
 
     // Caught up to real elapsed time, not stuck on the pre-overlay values.
     expect(resumed).toContain('6m 0s')
