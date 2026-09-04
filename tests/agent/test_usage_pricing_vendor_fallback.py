@@ -61,3 +61,25 @@ def test_vendor_fallback_never_fabricates_when_snapshot_missing():
         assert got is None
     else:
         assert got is not None and got.input_cost_per_million == direct.input_cost_per_million
+
+
+def test_codex_notional_route_prefers_curated_snapshot_over_external_catalog(monkeypatch):
+    """A day-one OpenAI model (gpt-6-astra, 2026-09-04) is priced in the curated
+    snapshot before models.dev/OpenRouter list it. The openai-codex notional
+    route must consult the snapshot FIRST, or every turn on the new flagship
+    resolves to source="none"/$0 while a correct entry sits unused.
+    """
+    from agent import usage_pricing as up
+
+    # Simulate the external catalogs not knowing the model yet.
+    monkeypatch.setattr(up, "_external_pricing_entry", lambda route: None)
+    usage = up.CanonicalUsage(input_tokens=1_000_000, output_tokens=0)
+    result = up.estimate_usage_cost("gpt-6-astra", usage, provider="openai-codex")
+    assert result.source == "official_docs_snapshot"
+    assert result.amount_usd == up._OFFICIAL_DOCS_PRICING[("openai", "gpt-6-astra")].input_cost_per_million
+
+    # Models absent from the snapshot still fall through to the external catalog.
+    sentinel = up._OFFICIAL_DOCS_PRICING[("openai", "gpt-6-astra")]
+    monkeypatch.setattr(up, "_external_pricing_entry", lambda route: sentinel)
+    result = up.estimate_usage_cost("gpt-9-not-in-snapshot", usage, provider="openai-codex")
+    assert result.source == "official_docs_snapshot"  # came via the external stub
