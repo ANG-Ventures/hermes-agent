@@ -16,6 +16,7 @@ from typing import Any, Mapping, Optional
 # openai_priority contract below is its exact intersection with the current
 # ``openai-api`` provider catalog.
 OPENAI_PRIORITY_SOURCE_MODELS: tuple[str, ...] = (
+    "gpt-6-astra",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
@@ -56,6 +57,7 @@ FAST_MODE_CAPABILITY_CATALOG: Mapping[str, Mapping[str, Any]] = MappingProxyType
         "openai_priority": _contract(
             source_url="https://openai.com/api-priority-processing/",
             models=(
+                "gpt-6-astra",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",

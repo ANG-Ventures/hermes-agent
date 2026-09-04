@@ -556,6 +556,12 @@ DEFAULT_CONTEXT_LENGTHS = {
     # GPT-5.6 series (Sol/Terra/Luna, GA 2026-07-09) — 1.05M on the direct
     # OpenAI API (same as gpt-5.5). Codex OAuth caps these at 272K.
     # (Lookups length-sort keys at match time, so dict order is cosmetic.)
+    # GPT-6 Astra (GA 2026-09-04) — 1.05M on the direct OpenAI API, same as
+    # the 5.6 series. Codex OAuth caps it at 272K (see
+    # _CODEX_OAUTH_CONTEXT_FALLBACK). Listed explicitly rather than relying on
+    # a "gpt-6" family prefix so the longest-key-first substring lookup can
+    # never fall through to a coarser entry.
+    "gpt-6-astra": 1050000,
     "gpt-5.6-luna": 1050000,
     "gpt-5.6-terra": 1050000,
     "gpt-5.6-sol": 1050000,
@@ -2705,6 +2711,7 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
     "gpt-5.3-codex-spark": 128_000,
     "gpt-5.2-codex": 272_000,
     "gpt-5.4-mini": 272_000,
+    "gpt-6-astra": 272_000,
     "gpt-5.6-sol": 272_000,
     "gpt-5.6-terra": 272_000,
     "gpt-5.6-luna": 272_000,
@@ -2752,6 +2759,10 @@ _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_PREFIXES: Dict[str, int] = {
 _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_EXACT: Dict[str, int] = {
     "gpt-5.4": 900_000,   # verified live at 900K; gpt-5.4-mini rejected 500K — excluded
     "gpt-daybreak-blue-latest": 900_000,  # exact Daybreak/Sol alias verified at 911,276
+    # GPT-6 Astra advertises 272K on the codex-sub catalog but reports
+    # max_context_window=872,000 (measured 2026-09-04). EXACT, not a
+    # "gpt-6" family prefix: no other gpt-6 slug has been probed.
+    "gpt-6-astra": 872_000,
 }
 
 # The advertised value the verified-above table is allowed to override.
@@ -2768,6 +2779,7 @@ CODEX_CONTEXT_VARIANT_SUFFIX = "-900k"
 # were never probed. Dated snapshots of the routable 5.6 bases are allowed
 # via _CODEX_900K_SNAPSHOT_RE.
 _CODEX_900K_ELIGIBLE_BASES = frozenset({
+    "gpt-6-astra",                # measured max_context_window 872,000
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
