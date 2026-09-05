@@ -93,6 +93,40 @@ def test_live_catalog_route_left_null_route_purity(store, real_pricing_fn):
     assert store.get_turn("or1")["cost_usd"] is None
 
 
+def test_notional_codex_route_with_snapshot_entry_is_repriced(store, real_pricing_fn):
+    # #650 made the openai-codex notional route consult the curated snapshot
+    # before any live catalog. When the entry it resolves is the snapshot's,
+    # the price is a pure function of (model, tokens) — same as an
+    # official_docs_snapshot route — so an unpriced row is healable. Before
+    # this, a day-one codex model paged "unpriced" once and stayed NULL forever
+    # (gpt-6-astra, 2026-09-04) because only the live path ever priced it.
+    from agent.usage_pricing import get_pricing_entry, resolve_billing_route
+
+    route = resolve_billing_route("gpt-6-astra", provider="openai-codex")
+    assert route.billing_mode == "official_models_api"  # the notional relay mode
+    entry = get_pricing_entry("gpt-6-astra", provider="openai-codex")
+    assert entry is not None and entry.source == "official_docs_snapshot"
+
+    _seed(store, "cx1", "openai-codex", "gpt-6-astra", i=46111, o=17)
+    res = store.reprice_unpriced(real_pricing_fn, apply=True)
+    assert res["repriced"] == 1 and res["still_unknown"] == 0
+    row = store.get_turn("cx1")
+    assert row["cost_usd"] is not None and row["cost_usd"] > 0
+    assert row["cost_status"] == "estimated"
+
+
+def test_notional_codex_route_without_snapshot_entry_stays_null(store, real_pricing_fn, monkeypatch):
+    # The purity gate still holds when the codex route falls through to a live
+    # catalog (no snapshot entry): leave NULL rather than price from today's rates.
+    import plugins.blackbox.store as st
+
+    monkeypatch.setattr(st, "get_pricing_entry", lambda *a, **k: None)
+    _seed(store, "cx2", "openai-codex", "gpt-99-nonexistent", i=1000, o=10)
+    res = store.reprice_unpriced(real_pricing_fn, apply=True)
+    assert res["still_unknown"] == 1 and res["repriced"] == 0
+    assert store.get_turn("cx2")["cost_usd"] is None
+
+
 def test_nonlinear_request_cost_route_left_null(store, real_pricing_fn, monkeypatch):
     # INV-9/RC-B: a resolved entry carrying request_cost != None can't be
     # reconstructed from summed tokens → leave NULL.
