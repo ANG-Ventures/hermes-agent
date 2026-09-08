@@ -11054,15 +11054,33 @@ def check_respawn_guard(
     # 4. Recent GitHub PR comments. Guard while ANY referenced PR is open,
     #    unparseable, unqueryable, or beyond this tick's query budget. The
     #    duplicate-PR risk is gone only when ALL referenced PRs are closed.
+    #    Exception: an explicit requeue at/after the newest PR comment means
+    #    the open PR is the fix-round target, not duplicate work. Honor it
+    #    before querying PR states (2026-09-07, clanker-voice-backlog
+    #    t_800b8189: both unblock and changes_requested stranded PR #315).
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     pr_urls: list[str] = []
+    newest_pr_at = 0
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         body = c["body"] or ""
-        pr_urls.extend(match.group(0) for match in _RESPAWN_GUARD_PR_URL_RE.finditer(body))
+        urls = [match.group(0) for match in _RESPAWN_GUARD_PR_URL_RE.finditer(body)]
+        if urls:
+            pr_urls.extend(urls)
+            newest_pr_at = max(newest_pr_at, int(c["created_at"]))
     if pr_urls:
+        requeued_after = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND created_at >= ? "
+            "AND kind IN ('changes_requested', 'unblocked', 'promoted', "
+            "'reclaimed', 'status', 'review_reopened') LIMIT 1",
+            (task_id, newest_pr_at),
+        ).fetchone()
+        if requeued_after:
+            return None
         resolver = pr_state_resolver or _PrStateResolver()
         for url in dict.fromkeys(pr_urls):
             parsed = _parse_github_pr_url(url)
