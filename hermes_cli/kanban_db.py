@@ -11058,6 +11058,9 @@ def check_respawn_guard(
     #    the open PR is the fix-round target, not duplicate work. Honor it
     #    before querying PR states (2026-09-07, clanker-voice-backlog
     #    t_800b8189: both unblock and changes_requested stranded PR #315).
+    #    Unlike rule 3, this is not gated behind a completed run: automatic
+    #    reclaim after a worker dies with an open PR is the guard's founding
+    #    case. Only manual reclaim counts; generic status events do not.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     pr_urls: list[str] = []
     newest_pr_at = 0
@@ -11075,8 +11078,9 @@ def check_respawn_guard(
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('changes_requested', 'unblocked', 'promoted', "
-            "'reclaimed', 'status', 'review_reopened') LIMIT 1",
+            "AND (kind IN ('changes_requested', 'unblocked', 'promoted', "
+            "'review_reopened') OR (kind = 'reclaimed' "
+            "AND json_extract(payload, '$.manual') = 1)) LIMIT 1",
             (task_id, newest_pr_at),
         ).fetchone()
         if requeued_after:
