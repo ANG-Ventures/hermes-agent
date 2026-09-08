@@ -58,7 +58,7 @@ def fake_cli(result):
     ("tool_error", "tool execution failed", 1),
     (None, "", 0),
 ])
-def test_cli_publishes_terminal_result(cli_worker, monkeypatch, reason, error, code):
+def test_cli_publishes_terminal_result(cli_worker, monkeypatch, capsys, reason, error, code):
     result = {"failed": reason is not None, "failure_reason": reason,
               "error": error, "final_response": ""}
     monkeypatch.setattr(cli, "HermesCLI", fake_cli(result))
@@ -69,6 +69,7 @@ def test_cli_publishes_terminal_result(cli_worker, monkeypatch, reason, error, c
     with pytest.raises(SystemExit) as exc:
         cli.main(query="work", quiet=True, toolsets="terminal")
     assert exc.value.code == code
+    assert "session_id: test-session" in capsys.readouterr().err
     payload = json.loads(cli_worker.read_text())
     assert payload["exit_code"] == code
     assert payload["failure_reason"] == reason

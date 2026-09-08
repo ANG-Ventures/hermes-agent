@@ -21708,15 +21708,16 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             user_message=prompt,
             conversation_history=cli.conversation_history,
         )
-        if isinstance(result, dict) and result.get("failed"):
-            from hermes_cli.kanban_worker_exit import WorkerExit
-            raise WorkerExit(result)
         # Keep session_id in sync if mid-run compression rotated it.
         if (
             getattr(cli.agent, "session_id", None)
             and cli.agent.session_id != cli.session_id
         ):
             cli.session_id = cli.agent.session_id
+        if isinstance(result, dict) and result.get("failed"):
+            from hermes_cli.kanban_worker_exit import WorkerExit
+            print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
+            raise WorkerExit(result)
         resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
         if resp:
             print(resp)
@@ -22336,10 +22337,10 @@ def main(
                         # out (→ sticky block). Gated on the env vars the
                         # dispatcher sets in `_default_spawn`; a no-op for every
                         # normal worker and every non-kanban `-q` run.
-                        if os.environ.get("HERMES_KANBAN_TASK") and isinstance(result, dict) and result.get("failed"):
-                            from hermes_cli.kanban_worker_exit import WorkerExit
-                            raise WorkerExit(result)
-                        if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
+                        if (
+                            os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1"
+                            and not (isinstance(result, dict) and result.get("failed"))
+                        ):
                             try:
                                 _run_kanban_goal_loop_q(cli, response)
                             except Exception as _goal_exc:
