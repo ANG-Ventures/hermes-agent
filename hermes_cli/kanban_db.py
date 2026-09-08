@@ -9195,6 +9195,25 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
+# Event kinds that mean "an OPERATOR deliberately asked for this task to run
+# again". Any of these at/after the newest PR comment overrides the
+# ``active_pr`` guard: the open PR is the fix-round target, not duplicate work.
+# This is the TOTAL set of operator requeue verbs -- every CLI verb that moves a
+# task back toward ``ready`` by human intent must appear here, and
+# ``tests/hermes_cli/test_kanban_db.py::test_operator_requeue_verbs_all_override_active_pr``
+# drives each verb for real and fails if one is missing. Automatic
+# transitions (dependency promotion, generic status writes, crash reclaim)
+# deliberately stay OUT: they carry no intent. 2026-09-08: ``triage_resolved``
+# (block-loop -> triage -> ``triage-resolve --to todo``) and ``reopened``
+# (``reopen``) were missing after #653 and stranded t_e0c917fc for 6 minutes
+# behind its own checkpoint draft PR (respawn_guarded:active_pr every tick).
+_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS: tuple[str, ...] = (
+    "changes_requested",
+    "unblocked",
+    "review_reopened",
+    "triage_resolved",
+    "reopened",
+)
 _RESPAWN_GUARD_PR_QUERY_LIMIT = 5
 _RESPAWN_GUARD_PR_QUERY_TIMEOUT_SECONDS = 5
 _RESPAWN_GUARD_PR_TERMINAL_CACHE_LIMIT = 1024
@@ -11076,13 +11095,13 @@ def check_respawn_guard(
             pr_urls.extend(urls)
             newest_pr_at = max(newest_pr_at, int(c["created_at"]))
     if pr_urls:
+        _kinds_sql = ",".join("?" * len(_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS))
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND (kind IN ('changes_requested', 'unblocked', "
-            "'review_reopened') OR (kind = 'reclaimed' "
+            f"AND (kind IN ({_kinds_sql}) OR (kind = 'reclaimed' "
             "AND json_extract(payload, '$.manual') = 1)) LIMIT 1",
-            (task_id, newest_pr_at),
+            (task_id, newest_pr_at, *_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS),
         ).fetchone()
         if requeued_after:
             return None
