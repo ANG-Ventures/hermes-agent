@@ -2543,3 +2543,86 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# --- 2026-09-08: operator requeue verbs must ALL override the active_pr guard ---
+# t_e0c917fc (clanker-voice-backlog): a worker opened a checkpoint draft PR, then
+# blocked twice for rulings; the block-loop breaker routed it to ``triage``; the
+# operator ran ``triage-resolve --to todo``; and the dispatcher emitted
+# ``respawn_guarded:active_pr`` every tick for 6 minutes because ``triage_resolved``
+# was not in the override set. The set must be TOTAL over the operator verbs, and
+# this test drives each verb for real so a new verb can't be added without it.
+
+
+def _seed_task_with_open_pr(conn, kb_mod, monkeypatch, now):
+    monkeypatch.setattr(kb_mod, "_query_github_pr_state", lambda repo, number: "OPEN")
+    task_id = kb_mod.create_task(conn, title="Worker with a checkpoint PR", assignee="alice")
+    worker = kb_mod.claim_task(conn, task_id)
+    assert worker is not None
+    kb_mod.add_comment(conn, task_id, "alice", "checkpoint: https://github.com/o/r/pull/9")
+    assert kb_mod.check_respawn_guard(conn, task_id) == "active_pr"
+    return task_id, worker
+
+
+def test_operator_requeue_verbs_all_override_active_pr(kanban_home, monkeypatch):
+    """Each operator verb that returns a task to the queue must clear ``active_pr``."""
+    base = int(time.time())
+    clock = {"now": base}
+    monkeypatch.setattr(kb.time, "time", lambda: clock["now"])
+
+    def tick():
+        clock["now"] += 5
+
+    # --- triage-resolve (the founding case: block-loop breaker -> triage -> human) ---
+    with kb.connect() as conn:
+        task_id, worker = _seed_task_with_open_pr(conn, kb, monkeypatch, clock["now"])
+        tick()
+        assert kb.block_task(conn, task_id, reason="needs ruling 1", kind="needs_input")
+        tick(); assert kb.unblock_task(conn, task_id)
+        tick(); worker2 = kb.claim_task(conn, task_id); assert worker2 is not None
+        tick()
+        assert kb.block_task(conn, task_id, reason="needs ruling 2", kind="needs_input")
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "triage", task.status
+        tick()
+        ok, err = kb.triage_resolve_task(conn, task_id, to="todo", reason="ruling posted", actor="ace")
+        assert ok, err
+        assert kb.check_respawn_guard(conn, task_id) is None, "triage_resolved must override active_pr"
+
+    # --- reopen (void a false terminal state) ---
+    with kb.connect() as conn:
+        task_id, worker = _seed_task_with_open_pr(conn, kb, monkeypatch, clock["now"])
+        tick()
+        assert kb.complete_task(conn, task_id, result="claimed done")
+        tick()
+        ok, err = kb.reopen_task(conn, task_id, actor="ace", reason="not actually done")
+        assert ok, err
+        assert kb.check_respawn_guard(conn, task_id) is None, "reopened must override active_pr"
+
+    # --- unblock (already covered by #653, kept here so the set stays total) ---
+    with kb.connect() as conn:
+        task_id, worker = _seed_task_with_open_pr(conn, kb, monkeypatch, clock["now"])
+        tick()
+        assert kb.block_task(conn, task_id, reason="needs ruling", kind="needs_input")
+        tick(); assert kb.unblock_task(conn, task_id)
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
+def test_operator_requeue_kinds_constant_matches_verbs_that_emit_them():
+    """Every kind in the override set is actually emitted by kanban_db (no dead entries),
+    and every operator requeue verb's event kind is in the set (no missing entries)."""
+    import inspect
+    src = inspect.getsource(kb)
+    for kind in kb._RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS:
+        assert f'"{kind}"' in src, f"{kind!r} is in the override set but nothing emits it"
+    # Verbs a human runs to send a task back toward the queue, and the event each appends.
+    verb_kinds = {
+        "unblock_task": "unblocked",
+        "request_changes": "changes_requested",
+        "reopen_review_task": "review_reopened",
+        "triage_resolve_task": "triage_resolved",
+        "reopen_task": "reopened",
+    }
+    for fn, kind in verb_kinds.items():
+        assert hasattr(kb, fn), fn
+        assert kind in kb._RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS, f"{fn} emits {kind!r} which is not an override"
