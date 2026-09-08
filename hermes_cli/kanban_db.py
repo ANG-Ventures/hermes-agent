@@ -506,15 +506,19 @@ def _resolve_crash_grace_seconds() -> int:
 def _resolve_rate_limit_cooldown_seconds() -> int:
     """Return the rate-limit requeue cooldown in seconds.
 
-    Reads ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS`` from the environment;
-    falls back to ``DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS`` when absent, empty,
-    non-integer, or negative. A value of 0 disables the cooldown (re-spawn on
-    the next tick) — useful for tests that want to assert the task becomes
-    spawnable again immediately.
+    ``kanban.rate_limit_cooldown_seconds`` is authoritative. The legacy
+    environment bridge is only a fallback when no config value is available.
+    Invalid/negative values use ``DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS``;
+    zero permits a retry on the next tick.
     """
-    raw = os.environ.get(
-        "HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", ""
-    ).strip()
+    raw = os.environ.get("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "").strip()
+    try:
+        from hermes_cli.config import load_config
+        configured = load_config().get("kanban", {}).get("rate_limit_cooldown_seconds")
+        if configured is not None:
+            raw = str(configured)
+    except Exception:
+        pass
     if raw:
         try:
             parsed = int(raw)
@@ -1313,6 +1317,7 @@ class Task:
     # worker runs at that depth regardless of the profile's
     # ``agent.reasoning_effort``. NULL = the worker profile's own setting.
     reasoning_effort: Optional[str] = None
+    next_eligible_at: Optional[int] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
     # ``max_retries=1`` blocks on the first failure (zero retries),
@@ -1424,6 +1429,7 @@ class Task:
             max_retries=(
                 row["max_retries"] if "max_retries" in keys else None
             ),
+            next_eligible_at=row["next_eligible_at"] if "next_eligible_at" in keys else None,
             goal_mode=(
                 bool(row["goal_mode"]) if "goal_mode" in keys and row["goal_mode"] else False
             ),
@@ -1597,6 +1603,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- worker resolves the model against the right backend instead of the
     -- profile's configured provider. NULL = profile provider.
     provider_override    TEXT,
+    next_eligible_at     INTEGER,
     -- Per-task reasoning effort for the worker (minimal|low|medium|high|
     -- xhigh|max|ultra, or 'none' for thinking off). When set, the dispatcher
     -- passes --reasoning <level> so the worker runs at that depth regardless
@@ -3022,6 +3029,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     if "model_override" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
+
+    if "next_eligible_at" not in cols:
+        _add_column_if_missing(conn, "tasks", "next_eligible_at", "next_eligible_at INTEGER")
 
     if "provider_override" not in cols:
         # Provider the model_override belongs to. NULL = worker profile's
@@ -9618,18 +9628,25 @@ class DispatchResult:
 _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
+_worker_processes: dict = {}
+_worker_processes_lock = threading.Lock()
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
-    """Record a reaped child's exit status for later classification.
+    """Legacy POSIX wait-status entry point; retained for older callers."""
+    try:
+        code = os.waitstatus_to_exitcode(raw_status)
+    except (ValueError, AttributeError):
+        return
+    _record_worker_returncode(pid, code)
 
-    Called from the reap loop in ``dispatch_once``. Safe to call many
-    times; duplicate pids overwrite (pids can cycle, latest wins).
-    """
+
+def _record_worker_returncode(pid: int, code: int) -> None:
+    """Remember Popen's native return code, including on Windows."""
     if not pid or pid <= 0:
         return
     now = time.time()
-    _recent_worker_exits[int(pid)] = (int(raw_status), now)
+    _recent_worker_exits[int(pid)] = (int(code), now)
     # Age-based trim: drop entries older than the TTL.
     if len(_recent_worker_exits) > _RECENT_WORKER_EXITS_MAX // 2:
         cutoff = now - _RECENT_WORKER_EXIT_TTL_SECONDS
@@ -9670,43 +9687,47 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
         return ("unknown", None)
-    raw, _ = entry
-    try:
-        if os.WIFEXITED(raw):
-            code = os.WEXITSTATUS(raw)
-            if code == 0:
-                return ("clean_exit", 0)
-            if code == KANBAN_RATE_LIMIT_EXIT_CODE:
-                return ("rate_limited", code)
-            return ("nonzero_exit", code)
-        if os.WIFSIGNALED(raw):
-            return ("signaled", os.WTERMSIG(raw))
-    except Exception:
-        pass
-    return ("unknown", None)
+    code, _ = entry
+    if code < 0:
+        return ("signaled", -code)
+    if code == 0:
+        return ("clean_exit", 0)
+    if code == KANBAN_RATE_LIMIT_EXIT_CODE:
+        return ("rate_limited", code)
+    return ("nonzero_exit", code)
 
 
 def reap_worker_zombies() -> "list[int]":
-    """Reap all zombie children of this process without blocking.
+    """Poll only our retained children, not other subsystems' subprocesses.
 
-    Returns the list of reaped PIDs. Safe to call when there are no
-    children (returns []). No-op on Windows.
+    Popen can report zero if an external reaper wins; the run-scoped receipt
+    takes precedence over this best-effort fallback.
     """
-    reaped: "list[int]" = []
-    if os.name != "nt":
-        try:
-            while True:
-                try:
-                    pid, status = os.waitpid(-1, os.WNOHANG)
-                except ChildProcessError:
-                    break
-                if pid == 0:
-                    break
-                _record_worker_exit(pid, status)
+    reaped: list[int] = []
+    with _worker_processes_lock:
+        for pid, proc in list(_worker_processes.items()):
+            code = proc.poll()
+            if code is not None:
+                _record_worker_returncode(pid, code)
+                _worker_processes.pop(pid, None)
                 reaped.append(pid)
-        except Exception:
-            pass
     return reaped
+
+
+def _classify_run_exit(conn, task_id, run_id, pid):
+    """Use the connected board and exact run, never ambient env or PID alone."""
+    from hermes_cli.kanban_worker_exit import exit_file, read_exit_status
+
+    db_path = next(r[2] for r in conn.execute("PRAGMA database_list") if r[1] == "main")
+    if db_path and run_id is not None:
+        code = read_exit_status(exit_file(Path(db_path), task_id, run_id))
+        if code is not None:
+            if code == 0:
+                return "clean_exit", code
+            if code == KANBAN_RATE_LIMIT_EXIT_CODE:
+                return "rate_limited", code
+            return "nonzero_exit", code
+    return _classify_worker_exit(pid)
 
 
 def _pid_alive(pid: Optional[int]) -> bool:
@@ -10419,7 +10440,7 @@ def detect_crashed_workers(
     exited_hook_payloads: list[dict] = []
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, claim_lock, started_at, assignee, current_run_id "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -10441,7 +10462,7 @@ def detect_crashed_workers(
                 continue
 
             pid = int(row["worker_pid"])
-            kind, code = _classify_worker_exit(pid)
+            kind, code = _classify_run_exit(conn, row["id"], row["current_run_id"], pid)
             rate_limited_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
@@ -10489,6 +10510,7 @@ def detect_crashed_workers(
                     "pid": pid,
                     "claimer": row["claim_lock"],
                     "exit_code": code,
+                    "next_eligible_at": int(time.time()) + _resolve_rate_limit_cooldown_seconds(),
                 }
             else:
                 protocol_violation = False
@@ -10549,8 +10571,8 @@ def detect_crashed_workers(
                     # ``consecutive_failures`` (that's the whole point: no
                     # breaker trip on a throttle).
                     conn.execute(
-                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
-                        (error_text[:500], row["id"]),
+                        "UPDATE tasks SET last_failure_error = ?, next_eligible_at = ? WHERE id = ?",
+                        (error_text[:500], event_payload["next_eligible_at"], row["id"]),
                     )
                     rate_limited.append(row["id"])
                 else:
@@ -10990,7 +11012,7 @@ def check_respawn_guard(
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, next_eligible_at FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -11019,6 +11041,9 @@ def check_respawn_guard(
         latest_run is not None
         and latest_run["outcome"] == "rate_limited"
     ):
+        next_eligible_at = row["next_eligible_at"]
+        if next_eligible_at is not None:
+            return "rate_limit_cooldown" if now < next_eligible_at else None
         if rl_cooldown <= 0:
             # Cooldown disabled — respawn immediately, and skip the
             # blocker_auth regex so the stamped rate-limit text doesn't
@@ -11871,16 +11896,18 @@ def _dispatch_once_locked(
         nonterminal_cache_limit=_RESPAWN_GUARD_PR_NONTERMINAL_CACHE_LIMIT,
         cycle_skip=pr_cycle_skip,
     )
-    result.reclaimed = release_stale_claims(conn)
+
+    result.crashed = detect_crashed_workers(conn, board=board)
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
         # bookkeeping is broken (no valid claim, dead/gone worker) that the
         # TTL/crash/stale paths can never see. See reconcile_orphaned_running.
         result.reconciled_orphans = reconcile_orphaned_running(conn)
+    # Classify dead workers before TTL/staleness can erase their terminal status.
+    result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
-    result.crashed = detect_crashed_workers(conn, board=board)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
@@ -12013,6 +12040,26 @@ def _dispatch_once_locked(
     reported_collision_scopes: Optional[dict[str, set[str]]] = None
     collision_scope_load_failed = False
     spawned = 0
+    from hermes_cli.kanban_provider_health import capped_provider, configured_probes
+    health_probes = configured_probes()
+    health_cache: dict = {}
+
+    def provider_deferred(task_id, assignee):
+        if not health_probes:
+            return False
+        task = get_task(conn, task_id)
+        if task is None:
+            return False
+        task.assignee = assignee
+        payload = capped_provider(task, health_probes, health_cache)
+        if payload is None:
+            return False
+        result.respawn_guarded.append((task_id, "provider_capped"))
+        if not dry_run:
+            with write_txn(conn):
+                _append_event(conn, task_id, "deferred", payload)
+        return True
+
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
     # when this would push that assignee past the cap. Prevents
@@ -12156,6 +12203,8 @@ def _dispatch_once_locked(
                         conn, row["id"], "respawn_guarded",
                         {"reason": guard_reason},
                     )
+            continue
+        if provider_deferred(row["id"], row_assignee):
             continue
         if reported_collision_scopes is None and not collision_scope_load_failed:
             try:
@@ -12323,6 +12372,8 @@ def _dispatch_once_locked(
                         conn, row["id"], "respawn_guarded",
                         {"reason": guard_reason},
                     )
+            continue
+        if provider_deferred(row["id"], row["assignee"]):
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
@@ -12837,6 +12888,12 @@ def _default_spawn(
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+        from hermes_cli.kanban_worker_exit import exit_file
+        status_path = exit_file(kanban_db_path(board=board), task.id, task.current_run_id)
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        env["HERMES_KANBAN_EXIT_FILE"] = str(status_path)
+    else:
+        env.pop("HERMES_KANBAN_EXIT_FILE", None)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
     # Goal-loop mode: the worker reads these and wraps its run in the
@@ -12923,18 +12980,11 @@ def _default_spawn(
         # value). argparse is order-insensitive, so this is presentation only;
         # both flags still travel as an adjacent pair, keeping ``ps`` output
         # readable and the pairing greppable.
-        if task.provider_override:
-            cmd.extend(["-m", task.model_override, "--provider", task.provider_override])
-        else:
-            provider, separator, model = task.model_override.partition("/")
-            if (
-                separator
-                and model
-                and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", provider)
-            ):
-                cmd.extend(["-m", model, "--provider", provider])
-            else:
-                cmd.extend(["-m", task.model_override])
+        from hermes_cli.kanban_provider_health import model_override
+        model, provider = model_override(task)
+        cmd.extend(["-m", model])
+        if provider:
+            cmd.extend(["--provider", provider])
         # Structured spawn line so per-task model overrides are auditable
         # post-hoc ("why did this task cost Opus money"). Only emitted when
         # an override is actually set — a cleared/no-override task logs
@@ -12957,13 +13007,8 @@ def _default_spawn(
         "chat",
         "-q", prompt,
     ])
-    if task.goal_mode:
-        # Goal-mode workers must take the fully-quiet single-query path:
-        # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
-        # cli.py's quiet branch. Without -Q the worker gets exactly one
-        # turn, prints text, exits rc=0, and the dispatcher records a
-        # protocol violation (incident 2026-06-09 t_d9cbe312).
-        cmd.append("-Q")
+    # Every worker needs the result-aware exit path, not only goal-mode runs.
+    cmd.append("-Q")
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
@@ -12993,11 +13038,11 @@ def _default_spawn(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
-    # NOTE: we intentionally do NOT close log_f here — we want Popen's
-    # child process to keep writing after this function returns.  The
-    # handle is kept alive by the child's inheritance.  The parent's
-    # reference goes out of scope and is GC'd, but the OS-level FD stays
-    # open in the child until the child exits.
+    finally:
+        log_f.close()  # the child owns its inherited descriptor
+    with _worker_processes_lock:
+        _recent_worker_exits.pop(proc.pid, None)
+        _worker_processes[proc.pid] = proc
     return proc.pid
 
 

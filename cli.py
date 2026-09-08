@@ -21708,6 +21708,9 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             user_message=prompt,
             conversation_history=cli.conversation_history,
         )
+        if isinstance(result, dict) and result.get("failed"):
+            from hermes_cli.kanban_worker_exit import WorkerExit
+            raise WorkerExit(result)
         # Keep session_id in sync if mid-run compression rotated it.
         if (
             getattr(cli.agent, "session_id", None)
@@ -22333,6 +22336,9 @@ def main(
                         # out (→ sticky block). Gated on the env vars the
                         # dispatcher sets in `_default_spawn`; a no-op for every
                         # normal worker and every non-kanban `-q` run.
+                        if os.environ.get("HERMES_KANBAN_TASK") and isinstance(result, dict) and result.get("failed"):
+                            from hermes_cli.kanban_worker_exit import WorkerExit
+                            raise WorkerExit(result)
                         if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
                             try:
                                 _run_kanban_goal_loop_q(cli, response)
@@ -22354,20 +22360,8 @@ def main(
                         # 5-hour quota window can't trip the circuit breaker and
                         # permanently block the card. Non-kanban runs keep the
                         # plain 0/1 contract automation wrappers expect.
-                        _exit_code = 0
-                        if isinstance(result, dict) and result.get("failed"):
-                            _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
-                                "failure_reason"
-                            ) in ("rate_limit", "billing"):
-                                try:
-                                    from hermes_cli.kanban_db import (
-                                        KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
-                                    )
-                                    _exit_code = _RL_CODE
-                                except Exception:
-                                    _exit_code = 1
-                        sys.exit(_exit_code)
+                        from hermes_cli.kanban_worker_exit import WorkerExit
+                        raise WorkerExit(result)
 
                 # Exit with error code if credentials or agent init fails
                 sys.exit(1)
@@ -22394,7 +22388,12 @@ def main(
                 cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary(clear_screen=False)
         finally:
-            _finalize_single_query(cli)
+            try:
+                _finalize_single_query(cli)
+            finally:
+                if os.environ.get("HERMES_KANBAN_EXIT_FILE"):
+                    from hermes_cli.kanban_worker_exit import report_exit
+                    report_exit(sys.exc_info()[1])
         return
     
     # Run interactive mode
