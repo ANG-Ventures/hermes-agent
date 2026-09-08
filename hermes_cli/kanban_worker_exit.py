@@ -25,8 +25,10 @@ class WorkerExit(SystemExit):
                 self.failure_reason == "overloaded"
                 and any(p in str(result.get("error", "")).lower() for p in _POOL_EXHAUSTED_PATTERNS)
             )
-            if owns_kanban_worker_authority() and (
-                self.failure_reason in ("rate_limit", "billing") or pool_exhausted
+            if (
+                os.environ.get("HERMES_KANBAN_TASK")
+                and owns_kanban_worker_authority()
+                and (self.failure_reason in ("rate_limit", "billing") or pool_exhausted)
             ):
                 code = KANBAN_RATE_LIMIT_EXIT_CODE
         super().__init__(code)

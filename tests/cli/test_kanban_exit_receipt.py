@@ -95,11 +95,36 @@ def test_goal_continuation_quota_escapes_before_judge_block(cli_worker, monkeypa
     assert blocked == []
 
 
-def test_inherited_child_cannot_overwrite_worker_receipt(cli_worker, monkeypatch):
+@pytest.mark.parametrize("reason", ["rate_limit", "billing", "pool_exhausted", "overloaded"])
+@pytest.mark.parametrize("task_grant", [None, ""])
+@pytest.mark.parametrize("owner_marker", [False, True])
+def test_quiet_cli_without_task_keeps_failure_exit_one(
+    cli_worker, monkeypatch, reason, task_grant, owner_marker,
+):
+    # No Kanban environment is the ordinary CLI path. Empty task grants and
+    # an otherwise valid owner marker must not opt it into worker exit codes.
+    for name in list(os.environ):
+        if name.startswith("HERMES_KANBAN_"):
+            monkeypatch.delenv(name)
+    if task_grant is not None:
+        monkeypatch.setenv("HERMES_KANBAN_TASK", task_grant)
+    if owner_marker:
+        monkeypatch.setenv("HERMES_KANBAN_OWNER_PID", str(os.getpid()))
+    result = {"failed": True, "failure_reason": reason,
+              "error": 'HTTP 503 {"error":"no eligible sub"}', "final_response": ""}
+    monkeypatch.setattr(cli, "HermesCLI", fake_cli(result))
+    with pytest.raises(SystemExit) as exc:
+        cli.main(query="ordinary quiet CLI", quiet=True, toolsets="terminal")
+    assert exc.value.code == 1
+    assert not cli_worker.exists()
+
+
+@pytest.mark.parametrize("reason", ["rate_limit", "billing", "pool_exhausted", "overloaded"])
+def test_inherited_child_cannot_overwrite_worker_receipt(cli_worker, monkeypatch, reason):
     from hermes_cli.kanban_worker_exit import WorkerExit, report_exit
     cli_worker.write_text('{"exit_code":75}', encoding="utf-8")
     monkeypatch.setenv("HERMES_KANBAN_OWNER_PID", str(os.getpid() + 1))
-    exc = WorkerExit({"failed": True, "failure_reason": "rate_limit"})
+    exc = WorkerExit({"failed": True, "failure_reason": reason, "error": "no eligible sub"})
     assert exc.code == 1
     report_exit(exc)
     assert json.loads(cli_worker.read_text(encoding="utf-8")) == {"exit_code": 75}
