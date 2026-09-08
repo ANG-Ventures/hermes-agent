@@ -1093,6 +1093,43 @@ def test_respawn_guard_ignores_status_after_pr_comment(kanban_home, monkeypatch)
         assert kb.check_respawn_guard(conn, task_id) == "active_pr"
 
 
+@pytest.mark.parametrize("promotion_delay", [0, 1], ids=["same-second", "later"])
+def test_respawn_guard_still_defers_open_pr_after_dependency_promotion(
+    kanban_home, monkeypatch, promotion_delay
+):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="Dependency", assignee="alice")
+        assert kb.complete_task(conn, parent_id)
+        task_id = kb.create_task(
+            conn, title="PR awaiting dependency", assignee="alice", parents=[parent_id],
+        )
+        worker = kb.claim_task(conn, task_id)
+        assert worker is not None and worker.worker_pid is None
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/1")
+        pr_at = now
+
+        now += promotion_delay
+        assert kb.reopen_task(
+            conn, parent_id, actor="operator", reason="Retract dependency",
+        ) == (True, None)
+        kb.invalidate_descendants_for_parent_reopen(conn, parent_id, author="operator")
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "todo"
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+        # Parent completion calls recompute_ready, just like a dispatch tick.
+        # This automatic promotion is not a request to amend the child's PR.
+        assert kb.complete_task(conn, parent_id)
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready"
+        promoted = next(e for e in kb.list_events(conn, task_id) if e.kind == "promoted")
+        assert promoted.created_at >= pr_at
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
 def test_respawn_guard_ignores_requeue_older_than_pr_comment(kanban_home, monkeypatch):
     now = int(time.time())
     monkeypatch.setattr(kb.time, "time", lambda: now)
