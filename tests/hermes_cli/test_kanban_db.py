@@ -961,6 +961,193 @@ def test_respawn_guard_requires_all_recent_prs_closed(
         assert kb.check_respawn_guard(conn, task_id) == "active_pr"
 
 
+@pytest.mark.parametrize("requeue_delay", [0, 1], ids=["same-second", "later"])
+def test_respawn_guard_allows_open_pr_after_changes_requested(
+    kanban_home, monkeypatch, requeue_delay
+):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="PR needs rework", assignee="alice")
+        worker = kb.claim_task(conn, task_id)
+        assert worker is not None
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/1")
+        assert kb.request_review(
+            conn, task_id, reviewer="reviewer", expected_run_id=worker.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id)
+        assert review is not None
+
+        now += requeue_delay
+        assert kb.request_changes(
+            conn, task_id, reason="Fix the edge case",
+            expected_run_id=review.current_run_id,
+        ) == (True, "alice")
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready"
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
+@pytest.mark.parametrize("requeue_delay", [0, 1], ids=["same-second", "later"])
+def test_respawn_guard_allows_open_pr_after_unblock(
+    kanban_home, monkeypatch, requeue_delay
+):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="PR awaits decision", assignee="alice")
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/1")
+        assert kb.block_task(conn, task_id, kind="needs_input", reason="Choose fix")
+
+        now += requeue_delay
+        assert kb.unblock_task(conn, task_id)
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready"
+        # A newer non-PR comment must not move the requeue cutoff forward.
+        now += 1
+        kb.add_comment(conn, task_id, "operator", "Proceed with the agreed fix")
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
+def test_respawn_guard_still_defers_open_pr_without_requeue(kanban_home, monkeypatch):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="PR already open", assignee="alice")
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/1")
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready"
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_respawn_guard_still_defers_open_pr_after_automatic_reclaim(
+    kanban_home, monkeypatch
+):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="Worker died after PR", assignee="alice")
+        worker = kb.claim_task(conn, task_id)
+        assert worker is not None and worker.worker_pid is None
+        assert worker.claim_expires is not None
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/1")
+
+        now = worker.claim_expires + 1
+        assert kb.release_stale_claims(conn) == 1
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready"
+        reclaimed = next(e for e in kb.list_events(conn, task_id) if e.kind == "reclaimed")
+        assert reclaimed.payload is not None
+        assert not reclaimed.payload.get("manual")
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_respawn_guard_allows_open_pr_after_manual_reclaim(kanban_home, monkeypatch):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="Operator requests retry", assignee="alice")
+        worker = kb.claim_task(conn, task_id)
+        assert worker is not None and worker.worker_pid is None
+        assert worker.claim_expires is not None
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/1")
+
+        now = worker.claim_expires + 1
+        assert kb.reclaim_task(conn, task_id, reason="Amend the existing PR")
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready"
+        reclaimed = next(e for e in kb.list_events(conn, task_id) if e.kind == "reclaimed")
+        assert reclaimed.payload is not None
+        assert reclaimed.payload["manual"] is True
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
+def test_respawn_guard_ignores_status_after_pr_comment(kanban_home, monkeypatch):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="Dependency", assignee="alice")
+        assert kb.complete_task(conn, parent_id)
+        task_id = kb.create_task(
+            conn, title="PR on invalidated premise", assignee="alice", parents=[parent_id],
+        )
+        assert kb.claim_task(conn, task_id) is not None
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/1")
+
+        now += 1
+        assert kb.reopen_task(
+            conn, parent_id, actor="operator", reason="Retract dependency",
+        ) == (True, None)
+        # Creation emits 'created', not 'status'. Use the production status
+        # emitter: automatic descendant invalidation is not a fix-round request.
+        kb.invalidate_descendants_for_parent_reopen(conn, parent_id, author="operator")
+        status = next(e for e in kb.list_events(conn, task_id) if e.kind == "status")
+        assert status.payload is not None
+        assert status.payload["reason"] == "ancestor_reopened"
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+@pytest.mark.parametrize("promotion_delay", [0, 1], ids=["same-second", "later"])
+def test_respawn_guard_still_defers_open_pr_after_dependency_promotion(
+    kanban_home, monkeypatch, promotion_delay
+):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="Dependency", assignee="alice")
+        assert kb.complete_task(conn, parent_id)
+        task_id = kb.create_task(
+            conn, title="PR awaiting dependency", assignee="alice", parents=[parent_id],
+        )
+        worker = kb.claim_task(conn, task_id)
+        assert worker is not None and worker.worker_pid is None
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/1")
+        pr_at = now
+
+        now += promotion_delay
+        assert kb.reopen_task(
+            conn, parent_id, actor="operator", reason="Retract dependency",
+        ) == (True, None)
+        kb.invalidate_descendants_for_parent_reopen(conn, parent_id, author="operator")
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "todo"
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+        # Parent completion calls recompute_ready, just like a dispatch tick.
+        # This automatic promotion is not a request to amend the child's PR.
+        assert kb.complete_task(conn, parent_id)
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready"
+        promoted = next(e for e in kb.list_events(conn, task_id) if e.kind == "promoted")
+        assert promoted.created_at >= pr_at
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_respawn_guard_ignores_requeue_older_than_pr_comment(kanban_home, monkeypatch):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="New PR after unblock", assignee="alice")
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/1")
+        assert kb.block_task(conn, task_id, kind="needs_input", reason="Choose fix")
+        now += 1
+        assert kb.unblock_task(conn, task_id)
+        now += 1
+        # The requeue is newer than the first PR, but older than the newest PR.
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/2")
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready"
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
 def test_respawn_guard_clears_when_all_recent_prs_closed(kanban_home, monkeypatch):
     monkeypatch.setattr(
         kb,
@@ -2356,3 +2543,86 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# --- 2026-09-08: operator requeue verbs must ALL override the active_pr guard ---
+# t_e0c917fc (clanker-voice-backlog): a worker opened a checkpoint draft PR, then
+# blocked twice for rulings; the block-loop breaker routed it to ``triage``; the
+# operator ran ``triage-resolve --to todo``; and the dispatcher emitted
+# ``respawn_guarded:active_pr`` every tick for 6 minutes because ``triage_resolved``
+# was not in the override set. The set must be TOTAL over the operator verbs, and
+# this test drives each verb for real so a new verb can't be added without it.
+
+
+def _seed_task_with_open_pr(conn, kb_mod, monkeypatch, now):
+    monkeypatch.setattr(kb_mod, "_query_github_pr_state", lambda repo, number: "OPEN")
+    task_id = kb_mod.create_task(conn, title="Worker with a checkpoint PR", assignee="alice")
+    worker = kb_mod.claim_task(conn, task_id)
+    assert worker is not None
+    kb_mod.add_comment(conn, task_id, "alice", "checkpoint: https://github.com/o/r/pull/9")
+    assert kb_mod.check_respawn_guard(conn, task_id) == "active_pr"
+    return task_id, worker
+
+
+def test_operator_requeue_verbs_all_override_active_pr(kanban_home, monkeypatch):
+    """Each operator verb that returns a task to the queue must clear ``active_pr``."""
+    base = int(time.time())
+    clock = {"now": base}
+    monkeypatch.setattr(kb.time, "time", lambda: clock["now"])
+
+    def tick():
+        clock["now"] += 5
+
+    # --- triage-resolve (the founding case: block-loop breaker -> triage -> human) ---
+    with kb.connect() as conn:
+        task_id, worker = _seed_task_with_open_pr(conn, kb, monkeypatch, clock["now"])
+        tick()
+        assert kb.block_task(conn, task_id, reason="needs ruling 1", kind="needs_input")
+        tick(); assert kb.unblock_task(conn, task_id)
+        tick(); worker2 = kb.claim_task(conn, task_id); assert worker2 is not None
+        tick()
+        assert kb.block_task(conn, task_id, reason="needs ruling 2", kind="needs_input")
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "triage", task.status
+        tick()
+        ok, err = kb.triage_resolve_task(conn, task_id, to="todo", reason="ruling posted", actor="ace")
+        assert ok, err
+        assert kb.check_respawn_guard(conn, task_id) is None, "triage_resolved must override active_pr"
+
+    # --- reopen (void a false terminal state) ---
+    with kb.connect() as conn:
+        task_id, worker = _seed_task_with_open_pr(conn, kb, monkeypatch, clock["now"])
+        tick()
+        assert kb.complete_task(conn, task_id, result="claimed done")
+        tick()
+        ok, err = kb.reopen_task(conn, task_id, actor="ace", reason="not actually done")
+        assert ok, err
+        assert kb.check_respawn_guard(conn, task_id) is None, "reopened must override active_pr"
+
+    # --- unblock (already covered by #653, kept here so the set stays total) ---
+    with kb.connect() as conn:
+        task_id, worker = _seed_task_with_open_pr(conn, kb, monkeypatch, clock["now"])
+        tick()
+        assert kb.block_task(conn, task_id, reason="needs ruling", kind="needs_input")
+        tick(); assert kb.unblock_task(conn, task_id)
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
+def test_operator_requeue_kinds_constant_matches_verbs_that_emit_them():
+    """Every kind in the override set is actually emitted by kanban_db (no dead entries),
+    and every operator requeue verb's event kind is in the set (no missing entries)."""
+    import inspect
+    src = inspect.getsource(kb)
+    for kind in kb._RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS:
+        assert f'"{kind}"' in src, f"{kind!r} is in the override set but nothing emits it"
+    # Verbs a human runs to send a task back toward the queue, and the event each appends.
+    verb_kinds = {
+        "unblock_task": "unblocked",
+        "request_changes": "changes_requested",
+        "reopen_review_task": "review_reopened",
+        "triage_resolve_task": "triage_resolved",
+        "reopen_task": "reopened",
+    }
+    for fn, kind in verb_kinds.items():
+        assert hasattr(kb, fn), fn
+        assert kind in kb._RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS, f"{fn} emits {kind!r} which is not an override"

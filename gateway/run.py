@@ -1010,9 +1010,9 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
 
 
 def _is_model_route_change_status(message: str) -> bool:
-    """Return whether ``message`` is a durable failover/recovery announcement."""
+    """Return whether ``message`` is a durable route/effort announcement."""
     text = str(message or "").lstrip()
-    return text.startswith("🔄 Model fallback") or text.startswith("🔄 Model recovery")
+    return text.startswith(("🔄 Model fallback", "🔄 Model recovery", "🔀 Model switched"))
 
 
 def render_notice_line(notice) -> str:
@@ -6553,7 +6553,42 @@ class TurnRunner:
         agent.notice_callback = _notice_callback_sync
         agent.notice_clear_callback = None
         agent.event_callback = ctx._event_callback_sync
-        agent.reasoning_config = reasoning_config
+        # Resolution above describes the primary/session target, not an active
+        # fallback. Refresh the restore target without overwriting the actual
+        # fallback effort: restore_primary_runtime owns the transition and its
+        # single before/after announcement (or keeps the fallback while blocked).
+        _primary_runtime = getattr(agent, "_primary_runtime", None)
+        if isinstance(_primary_runtime, dict):
+            _primary_runtime["reasoning_config"] = (
+                dict(reasoning_config) if reasoning_config is not None else None
+            )
+        _on_fallback = getattr(agent, "_fallback_activated", False) is True
+        _previous_reasoning_config = getattr(agent, "reasoning_config", None)
+        if not _on_fallback:
+            agent.reasoning_config = reasoning_config
+        if (reused_cached_agent and not _on_fallback
+                and self._runner._switch_announce_enabled(ctx.user_config)):
+            # Per-turn config resolution can change effort without rebuilding
+            # the agent or changing its provider/model. Announce that real change
+            # through this turn's freshly-bound callback, not the previous turn.
+            try:
+                from agent.chat_completion_helpers import _emit_switch_announce
+                agent._last_switch_announced = None
+                _emit_switch_announce(
+                    agent, agent.model, agent.model, agent.provider,
+                    old_provider=agent.provider,
+                    old_effort=_previous_reasoning_config,
+                    new_effort=reasoning_config,
+                )
+            except Exception:
+                logger.warning("turn reasoning-change announce failed", exc_info=True)
+        if not reused_cached_agent:
+            self._runner._announce_reinit_recovery(
+                agent=agent,
+                session_key=ctx.session_key,
+                applied_provider=getattr(agent, "provider", None),
+                applied_model=getattr(agent, "model", None),
+            )
         agent.service_tier = self._runner._service_tier
         # Merge, never overwrite: init-time request overrides (e.g. a custom
         # provider's extra_body merged at agent construction) must survive
@@ -10999,7 +11034,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 meta = self._thread_metadata_for_source(source, None)
             except Exception:
                 meta = None
-            await adapter.send(source.chat_id, f"\U0001f500 {kind}: {old} \u2192 {new}", metadata=meta)
+            result = await adapter.send(source.chat_id, f"\U0001f500 {kind}: {old} \u2192 {new}", metadata=meta)
+            if kind == "Reasoning" and getattr(result, "success", False) is True:
+                key = self._session_key_for_source(source)
+                self._session_state(key).conversation.announced_reasoning_effort = new
         except Exception:
             logger.debug("switch announce skipped (non-fatal)", exc_info=True)
 
@@ -13230,11 +13268,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         served_model,
         was_reinit: bool,
     ) -> None:
-        """Announce a model RECOVERY (return-to-primary) and persist the served
-        route, at the ONE unified recovery-announce site.
+        """Persist the actual served route/effort; this site never announces.
 
         PERSIST the route this turn actually served on (identity-only
-        ``{provider, model}``) — the single writer of ``last_served_identity``.
+        ``{provider, model, effort}``) — the single writer of ``last_served_identity``.
 
         This site is deliberately PERSIST-ONLY (restructured from #238, which
         also emitted recovery announces here keyed on the final served route).
@@ -13265,7 +13302,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not (agent and session_key and served_model and served_provider):
             return
         try:
+            from agent.chat_completion_helpers import _effort_label
             served_identity = {"provider": served_provider, "model": served_model}
+            effort = _effort_label(getattr(agent, "reasoning_config", None))
+            if effort:
+                served_identity["effort"] = effort
             # Persist THIS turn's served route for the next turn's pre-run
             # comparison — UNDER the store lock, via update_session (never a
             # bare _entries/_save here).
@@ -13283,6 +13324,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # this makes correctness independent of that cross-file coupling.)
         try:
             getattr(self, "_override_target_just_changed", {}).pop(session_key, None)
+            state = self._peek_session_state(session_key)
+            if state is not None:
+                state.conversation.announced_reasoning_effort = None
         except Exception:
             pass
 
@@ -13318,7 +13362,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         Invariants (mirror the inline restore emit):
           • INV-1 cache-sacred: read + status-emit + sink append only.
-          • INV-2 identity-only: ``{provider, model}`` — never a secret.
+          • INV-2 identity-only: ``{provider, model, effort}`` — never a secret.
           • INV-3 best-effort: never raises into the turn.
           • INV-4 symmetry: same formatter (``_emit_fallback_announce``,
             kind="recovery").
@@ -13336,6 +13380,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not (agent and session_key and applied_model and applied_provider):
             return
         try:
+            state = self._peek_session_state(session_key)
+            announced_effort = None
+            if state is not None:
+                announced_effort = state.conversation.announced_reasoning_effort
+                state.conversation.announced_reasoning_effort = None
             # Read prior state under the store lock (mirrors every other reader).
             lock = getattr(self.session_store, "_lock", None)
             if lock is not None:
@@ -13352,6 +13401,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             prev_route = (prev_identity.get("provider"), prev_identity.get("model"))
             applied_route = (applied_provider, applied_model)
+            from agent.chat_completion_helpers import _effort_label
+            new_effort = _effort_label(getattr(agent, "reasoning_config", None))
+            # Legacy rows carry no effort: do not invent a historical change.
+            old_effort = prev_identity.get("effort", new_effort)
+            if prev_route == applied_route and announced_effort == new_effort:
+                return  # /reasoning already delivered this exact effort change.
             override_target = None
             if isinstance(override_identity, dict):
                 override_target = (override_identity.get("provider"), override_identity.get("model"))
@@ -13361,6 +13416,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 prev_route, applied_route,
                 override_target=override_target,
                 override_target_changed=_target_changed,
+                old_effort=old_effort,
+                new_effort=new_effort,
             ):
                 return
             try:
@@ -13373,6 +13430,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "recovery",
                     prev_route[0], prev_route[1],
                     applied_provider, applied_model,
+                    old_effort=old_effort,
+                    new_effort=new_effort,
                 )
                 announce = False
                 try:
@@ -13385,6 +13444,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _emit_fallback_announce(
                     agent, prev_route[1], applied_model, applied_provider,
                     old_provider=prev_route[0],
+                    old_effort=old_effort,
+                    new_effort=new_effort,
                     announce_enabled=announce,
                     record_event=False,
                     kind="recovery",

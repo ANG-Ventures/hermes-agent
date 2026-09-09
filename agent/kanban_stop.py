@@ -1,25 +1,30 @@
 """Turn-end guard for kanban workers.
 
-Kanban workers must end with ``kanban_complete`` or ``kanban_block``. Models
+Kanban workers must close their run with a terminal lifecycle handoff. Models
 (especially GLM / Qwen families) sometimes narrate the next step
 ("Let me write the report now") and stop with ``finish_reason=stop`` and no
 tool calls. Hermes treats that as a clean exit → ``rc=0`` → dispatcher
 ``protocol_violation``.
 
-This module is policy-only: when a kanban worker tries to finish without a
-terminal board tool, return a bounded synthetic nudge so the conversation
-loop continues instead of exiting.
+When a kanban worker tries to finish without closing its originating run,
+return a bounded synthetic nudge so the conversation loop continues instead
+of exiting. A successor's task status must not invalidate an earlier handoff.
 """
 
 from __future__ import annotations
 
+import logging
 import os
+from contextlib import closing
 from typing import Any, Iterable, Optional
 
 
-_TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+_TERMINAL_KANBAN_TOOLS = frozenset({
+    "kanban_complete", "kanban_block", "kanban_request_review", "kanban_request_changes",
+})
 
 _DEFAULT_MAX_ATTEMPTS = 2
+_log = logging.getLogger(__name__)
 
 
 def kanban_stop_nudge_enabled() -> bool:
@@ -66,6 +71,24 @@ def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
     return False
 
 
+def _worker_run_ended(task_id: str, run_id: str) -> bool:
+    """Check the pinned run, never the task's mutable current_run_id/status."""
+    try:
+        from hermes_cli import kanban_db
+
+        with closing(kanban_db.connect_readonly()) as conn:
+            row = conn.execute(
+                "SELECT outcome, ended_at FROM task_runs WHERE id = ? AND task_id = ?",
+                (int(run_id), task_id),
+            ).fetchone()
+        return bool(row and row[0] and row[1] is not None)
+    except Exception:
+        # An unreadable/missing run is not proof of a handoff. Keep the bounded
+        # reminder rather than letting a failed tool invocation suppress it.
+        _log.warning("Could not verify kanban worker run closure", exc_info=True)
+        return False
+
+
 def build_kanban_stop_nudge(
     *,
     messages: Iterable[dict] | None = None,
@@ -73,29 +96,35 @@ def build_kanban_stop_nudge(
     max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
     task_id: Optional[str] = None,
 ) -> Optional[str]:
-    """Return a synthetic follow-up when a kanban worker exits without a terminal tool.
+    """Return a synthetic follow-up when a kanban worker exits without a handoff.
 
     Returns ``None`` when the guard should not fire (not a kanban worker,
-    already completed/blocked, or nudge budget exhausted).
+    originating run already closed, or nudge budget exhausted). Only legacy
+    workers without a run pin fall back to tool-call history.
     """
     if not kanban_stop_nudge_enabled():
         return None
     if attempts >= max_attempts:
         return None
-    if session_called_kanban_terminal(messages):
+    tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
+    run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+    if run_id is not None:
+        if _worker_run_ended(tid, run_id):
+            return None
+    elif session_called_kanban_terminal(messages):
         return None
 
-    tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
     return (
         "[System: You are a Hermes kanban worker. A plain-text reply is NOT a "
         "terminal state for the board.\n\n"
-        f"Task `{tid}` is still `running`. Ending now without a board tool "
-        "causes a protocol violation (clean exit with no "
-        "`kanban_complete` / `kanban_block`).\n\n"
+        f"No terminal handoff was confirmed for your run of task `{tid}`. "
+        "Ending without closing your run causes a protocol violation.\n\n"
         "Do this immediately in your next response — do not narrate intent:\n"
         "1. Finish any remaining deliverable (write the required file(s) now).\n"
         "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work "
-        "is done, OR `kanban_block(reason=...)` if you are blocked.\n\n"
+        "is done, `kanban_request_review(summary=...)` for a review handoff, "
+        "`kanban_request_changes(reason=...)` to return a review for rework, "
+        "OR `kanban_block(reason=...)` if you are blocked.\n\n"
         "Never end a turn with only a promise of future action. Repeated "
         "protocol violations will block this task and require manual intervention.]"
     )

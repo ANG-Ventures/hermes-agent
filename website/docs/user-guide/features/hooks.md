@@ -1655,10 +1655,13 @@ Each time the event fires, Hermes spawns a subprocess for every matching hook (m
 {"action": "continue", "message": "Run the formatter, then finish."}
 {"decision": "block",  "reason":  "Run the formatter, then finish."}
 
-// Silent no-op — any empty / non-matching output is fine:
+// Allow a pre_tool_call (exit 0); {} is also a legacy explicit no-op:
+{"action": "allow"}
+
+// Silent no-op for default fail-open hooks only — empty / non-matching output:
 ```
 
-Malformed JSON, non-zero exit codes, and timeouts log a warning but never abort the agent loop.
+Malformed JSON, non-zero exit codes, and timeouts fail open by default (except `pre_tool_call` exit code 2 below). A `fail_closed` hook instead blocks the tool call on failure, without aborting the agent loop.
 
 ### Exit code 2 = block (Claude Code / Cursor compatible)
 
@@ -1699,8 +1702,14 @@ With `fail_closed: true`, each of these now **blocks** the tool call with `hook 
 |---------|--------------------|--------------------|
 | Command not found / not executable | warn, proceed | **block** |
 | Timeout | warn, proceed | **block** |
+| Non-zero exit / signal, even with allow or modify JSON | warn, parse stdout | **block** |
 | Non-JSON stdout (e.g. a stack trace) | warn, proceed | **block** |
+| Empty stdout / unknown directive / invalid modify args | proceed | **block** |
+| Callback serialization / evaluation exception | warn, proceed | **block** |
 | Clean exit, valid no-op JSON (`{}`) | proceed | proceed |
+| Clean exit, explicit `allow` / valid `modify` | proceed / modify | proceed / modify |
+
+For fail-closed hooks, exit 0 alone is not authorization: emit `{"action":"allow"}` (or `{"decision":"allow"}`), a valid modify directive, or the legacy `{}` no-op after a successful policy check. Empty output now blocks. Exit 2 keeps its explicit block-message precedence. This policy is not an OS sandbox; registration, tool access, and the policy script itself must also be trusted.
 
 `fail_closed` only applies to blocking-capable events (`pre_tool_call` today); setting it on any other event logs a warning at config-parse time and is ignored. `hermes hooks test` reflects these semantics — the `parsed` line shows exactly the block shape the dispatcher would receive.
 

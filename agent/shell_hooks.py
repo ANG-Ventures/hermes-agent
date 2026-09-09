@@ -53,7 +53,10 @@ Wire protocol
     # Modify tool input for pre_tool_call (Claude-Code-style):
     {"decision": "modify", "tool_input": {"new_string": "fixed content"}}
 
-    # Silent no-op:
+    # Allow (exit 0; {} is also accepted as a legacy explicit no-op):
+    {"action": "allow"}
+
+    # Silent no-op for default fail-open hooks only:
     <empty or any non-matching JSON object>
 
 **exit codes**
@@ -63,8 +66,8 @@ stdout carries no block JSON (Claude-Code / Cursor compatible).  The block
 message is taken from the stdout block JSON when present, then the first
 400 characters of stderr, then a generic default.  For events whose block
 directive is not honored, exit 2 is logged at warning like any other
-non-zero exit.  All other non-zero exits log a warning and stdout is still
-parsed normally.
+non-zero exit.  All other non-zero exits log a warning. Fail-closed hooks
+block regardless of stdout; default fail-open hooks still parse it normally.
 
 **failure semantics**
 
@@ -72,11 +75,13 @@ Hooks fail *open* by default: a spawn error, timeout, or unparseable
 stdout logs a warning and contributes nothing.  A ``pre_tool_call`` entry
 can opt into fail-*closed* semantics with ``fail_closed: true``
 (``failClosed`` also accepted for Cursor/Claude-Code config compat) —
-spawn errors, timeouts, and malformed stdout then BLOCK the tool call
+spawn errors, timeouts, abnormal exits, empty/malformed stdout, and callback
+errors then BLOCK the tool call
 with ``hook <command> failed closed: <reason>``.  Use this for
 security-gating hooks (secret scanners, policy checks) where a crashed
 hook must not silently allow the action.  On non-blocking events
-``fail_closed`` is ignored with a warning.
+``fail_closed`` is ignored with a warning. A successful fail-closed hook must
+emit a valid block, allow, or modify directive (or the legacy no-op ``{}``).
 
 Per-event ``extra`` keys
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -625,13 +630,24 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
     """Build the closure that ``invoke_hook()`` will call per firing."""
 
     def _callback(**kwargs: Any) -> Optional[Dict[str, Any]]:
-        # Matcher gate — only meaningful for tool-scoped events.
-        if spec.event in {"pre_tool_call", "post_tool_call"}:
-            if not spec.matches_tool(kwargs.get("tool_name")):
-                return None
+        try:
+            # Matcher gate — only meaningful for tool-scoped events.
+            if spec.event in {"pre_tool_call", "post_tool_call"}:
+                if not spec.matches_tool(kwargs.get("tool_name")):
+                    return None
 
-        r = _spawn(spec, _serialize_payload(spec.event, kwargs))
-        return _evaluate_result(spec, r)
+            r = _spawn(spec, _serialize_payload(spec.event, kwargs))
+            return _evaluate_result(spec, r)
+        except Exception as exc:
+            # Generic plugin/dispatcher catches fail open. Keep the policy
+            # decision here, where the individual hook's opt-in is known.
+            logger.warning(
+                "shell hook callback failed (event=%s command=%s): %s",
+                spec.event, spec.command, exc,
+            )
+            if spec.fail_closed and spec.event in _BLOCKING_EVENTS:
+                return _fail_closed_block(spec, f"callback error ({type(exc).__name__})")
+            return None
 
     _callback.__name__ = f"shell_hook[{spec.event}:{spec.command}]"
     _callback.__qualname__ = _callback.__name__
@@ -659,9 +675,11 @@ def _evaluate_result(
     * exit code 2 on a blocking-capable event — block, with the message
       taken from stdout block JSON, then stderr, then a default
       (Claude-Code / Cursor compatible);
-    * other non-zero exits — warn, then parse stdout normally;
-    * non-JSON / unparseable stdout on a ``fail_closed`` blocking hook —
-      block instead of silently contributing nothing.
+    * other non-zero exits — block if ``fail_closed``, otherwise warn and
+      parse stdout normally;
+    * empty / invalid stdout on a ``fail_closed`` blocking hook — block
+      instead of silently contributing nothing. Successful allow/modify
+      directives and the legacy explicit no-op ``{}`` remain accepted.
 
     Shared by the live callback path (:func:`_make_callback`) and the CLI
     test helper (:func:`run_once`) so ``hermes hooks test`` reflects
@@ -710,8 +728,8 @@ def _evaluate_result(
         )
         return {"action": "block", "message": message}
 
-    # Other non-zero exits: log but still parse stdout so scripts that
-    # signal failure via exit code can also return a block directive.
+    # Never trust an allow/modify payload from an unsuccessful policy check.
+    # Default fail-open hooks retain their legacy stdout handling.
     if r["returncode"] != 0:
         logger.warning(
             "shell hook exited %d (event=%s command=%s); stderr=%s",
@@ -719,22 +737,26 @@ def _evaluate_result(
             stderr[:_STDERR_MESSAGE_LIMIT],
         )
 
+        if fail_closed:
+            return _fail_closed_block(spec, f"hook exited {r['returncode']}")
+
     stdout = (r["stdout"] or "").strip()
     parsed = _parse_response(spec.event, stdout)
 
-    if parsed is None and fail_closed and stdout:
-        # The hook produced output we could not turn into a directive.
-        # A fail-closed gate must not silently allow the action on
-        # garbage output (e.g. a stack trace on stdout).
+    if parsed is None and fail_closed:
+        # None is ambiguous: allow and legacy {} are intentional no-ops,
+        # whereas missing output, typos and malformed modify args are not.
         try:
             data = json.loads(stdout)
-            valid_json = isinstance(data, dict)
-        except json.JSONDecodeError:
-            valid_json = False
-        if not valid_json:
+        except (ValueError, RecursionError):
             return _fail_closed_block(
                 spec, "unparseable stdout (expected a JSON object)",
             )
+        if isinstance(data, dict):
+            actions = [data[key] for key in ("action", "decision") if key in data]
+            if not data or (actions and all(action == "allow" for action in actions)):
+                return None
+        return _fail_closed_block(spec, "invalid stdout (expected allow, block, or modify)")
 
     return parsed
 
@@ -797,7 +819,7 @@ def _parse_response(event: str, stdout: str) -> Optional[Dict[str, Any]]:
 
     try:
         data = json.loads(stdout)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         logger.warning(
             "shell hook stdout was not valid JSON (event=%s): %s",
             event, stdout[:200],

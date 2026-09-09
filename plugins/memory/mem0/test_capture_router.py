@@ -319,6 +319,20 @@ def test_build_router_constructs_when_enabled(tmp_path):
     assert r._staging_mode is True
 
 
+def test_build_router_fallback_model_never_inherits_primary_id(tmp_path):
+    """The fallback bridge (gemini) does not share the primary's (codex) model namespace.
+    2026-09-07: passing the primary id through made every fallback 400 ("unknown model
+    'gpt-…'"), so the fallback leg was structurally dead. The default must be a gemini-bridge
+    id; an explicit config pin still wins."""
+    cfg = {"mem0_capture_router": {"enabled": True, "staging_dir": str(tmp_path / "s"),
+                                   "staging_mode": True}}
+    ex = build_router_from_config(cfg)._extractor
+    assert ex._model != ex._fallback_model
+    assert ex._fallback_model.startswith("gemini")
+    cfg["mem0_capture_router"]["fallback_model"] = "gemini-3.8-flash-low"
+    assert build_router_from_config(cfg)._extractor._fallback_model == "gemini-3.8-flash-low"
+
+
 def test_build_router_threads_correction_marker_config(tmp_path):
     cfg = {"mem0_capture_router": {
         "enabled": True,

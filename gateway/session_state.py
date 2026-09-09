@@ -97,6 +97,8 @@ class ConversationState:
     one_turn_restore: Optional[Dict[str, Any]] = None
     # /reasoning per-session override.
     reasoning_override: Optional[Dict[str, Any]] = None
+    # One-shot: /reasoning already announced this effort before agent re-init.
+    announced_reasoning_effort: Optional[str] = None
     # /fast per-session override: "priority" or None; _UNSET_TIER = absent.
     service_tier_override: Any = _UNSET_TIER
     # Last successfully-resolved non-empty model (#35314 recovery).
@@ -120,6 +122,7 @@ class ConversationState:
         self.model_override = None
         self.one_turn_restore = None
         self.reasoning_override = None
+        self.announced_reasoning_effort = None
         self.service_tier_override = _UNSET_TIER
         self.last_resolved_model = ""
         self.queued_events = []

@@ -276,7 +276,7 @@ class BridgeExtractor:
         *,
         primary_url: str = "http://127.0.0.1:18812/v1/chat/completions",
         fallback_url: str = "http://192.168.1.216:18813/v1/chat/completions",
-        model: str = "gpt-5.4-mini",
+        model: str = "gpt-6-astra",
         fallback_model: Optional[str] = None,
         primary_secret_ref: str = "op://Engineering/codex-bridge/secret",
         fallback_secret_ref: str = "op://Engineering/gemini-bridge/secret",
@@ -289,7 +289,11 @@ class BridgeExtractor:
         self._model = model
         # gemini-bridge advertises different model ids; a caller can pin one. Default: let the bridge
         # pick its default model by omitting an id it doesn't know when the passthrough model is unknown.
-        self._fallback_model = fallback_model or model
+        # The fallback bridge (gemini) does NOT share the primary's (codex) model namespace, so
+        # passing the primary id through 400s every fallback ("unknown model 'gpt-…'") — the
+        # fallback leg was structurally dead until 2026-09-07. Default to the bridge's own
+        # family alias, which gemini-bridge re-resolves to the newest live Flash tier.
+        self._fallback_model = fallback_model or "gemini-flash"
         self._primary_ref = primary_secret_ref
         self._fallback_ref = fallback_secret_ref
         self._timeout_s = timeout_s
@@ -717,7 +721,7 @@ def build_router_from_config(cfg: Dict[str, Any],
                 "primary_secret_ref", "op://Engineering/codex-bridge/secret")),
             fallback_secret_ref=str(router_cfg.get(
                 "fallback_secret_ref", "op://Engineering/gemini-bridge/secret")),
-            model=str(router_cfg.get("model", "gpt-5.4-mini")),
+            model=str(router_cfg.get("model", "gpt-6-astra")),
             fallback_model=router_cfg.get("fallback_model") or None,
             timeout_s=float(router_cfg.get("timeout_s", 180.0)),
         )
