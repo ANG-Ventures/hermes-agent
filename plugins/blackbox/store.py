@@ -501,11 +501,18 @@ def reprice_unpriced(pricing_fn, *, apply: bool = False, limit: int | None = Non
                 continue
             # Real-token: route-purity gate (INV-9 / RC-A).
             route = resolve_billing_route(r["model"], provider=r["provider"])
+            entry = get_pricing_entry(r["model"], provider=r["provider"])
             if route.billing_mode not in _PURE_BILLING_MODES:
-                continue  # live-catalog / unknown-mode route → still_unknown
+                # A notional relay (openai-codex → official_models_api) consults the
+                # curated snapshot BEFORE any live catalog (#650). When the resolved
+                # entry came from the snapshot, the price is the same pure function
+                # of (model, tokens) as an official_docs_snapshot route — repricing a
+                # historical row from it is correct. Only a LIVE-catalog entry (or no
+                # entry) keeps the row NULL (INV-9 / RC-A).
+                if entry is None or getattr(entry, "source", None) != "official_docs_snapshot":
+                    continue  # live-catalog / unknown-mode route → still_unknown
             # Non-linear per-request term can't be reconstructed from summed
             # tokens (RC-B): refuse rather than misprice.
-            entry = get_pricing_entry(r["model"], provider=r["provider"])
             if entry is not None and getattr(entry, "request_cost", None) is not None:
                 continue
             tokens = {
