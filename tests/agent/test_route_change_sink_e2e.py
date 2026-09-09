@@ -156,6 +156,7 @@ def _recovery_agent(*, primary_reasoning=("dict", "high"), on_fallback=True):
     a.api_key = "codex-token"
     a.reasoning_config = {"enabled": True, "effort": "xhigh"}
     a._fallback_activated = on_fallback
+    a._provider_fallback_active = on_fallback
     a._fallback_index = 1
     a._rate_limited_until = 0.0
     a._transport_cache = {}

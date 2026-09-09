@@ -438,5 +438,45 @@
       "telegram"
     ],
     "proposed_canary": "/tmp/fork-e2e-lane/tests/test_fork_canary_runtime_footer_fields.py (RED-proven: _DEFAULT_FIELDS -> upstream shape)"
+  },
+  {
+    "feature": "model/provider transitions announce once on the originating chat surface",
+    "tests": [
+      "tests/gateway/test_route_change_turn_contract.py::test_every_cause_announces_route_change_in_same_turn",
+      "tests/gateway/test_route_change_turn_contract.py::test_pool_exhaustion_then_429_delivers_each_hop_before_final",
+      "tests/gateway/test_route_change_turn_contract.py::test_manual_model_switch_delivers_once_without_old_turn_callback",
+      "tests/gateway/test_model_route_status_delivery.py"
+    ],
+    "paths": [
+      "agent/chat_completion_helpers.py",
+      "agent/agent_runtime_helpers.py",
+      "gateway/run.py",
+      "gateway/slash_commands.py"
+    ],
+    "why": "The September 2026 visibility audit found the re-init recovery helper orphaned from TurnRunner, and overlapping upstream/fork recovery notices emitting twice. The 503 no-eligible-sub x3 then 429 fallback branch itself already announced; do not replace the common emitter with per-error-branch notices. Manual switches must use their current command source, not the cached agent's previous-turn callback, and show the actual pre-switch route. Upstream has a buffered fallback notice and a single generic recovery notice; port the richer transition contract, not deletion of upstream's only notice.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": ["gateway", "discord", "telegram", "cli"]
+  },
+  {
+    "feature": "reasoning-effort-only changes announce with symmetric before/after identity",
+    "tests": [
+      "tests/gateway/test_route_change_turn_contract.py::test_effort_only_fallback_and_restore_are_each_delivered",
+      "tests/gateway/test_route_change_turn_contract.py::test_reinit_route_or_effort_change_is_delivered_by_real_turn_runner",
+      "tests/gateway/test_reinit_recovery_announce.py::TestPersistOnlyEndOfTurn::test_effort_survives_session_entry_roundtrip",
+      "tests/gateway/test_reinit_recovery_announce.py::TestPersistOnlyEndOfTurn::test_reasoning_command_not_reannounced_on_reinit"
+    ],
+    "paths": [
+      "agent/chat_completion_helpers.py",
+      "agent/agent_runtime_helpers.py",
+      "gateway/run.py",
+      "gateway/session_state.py"
+    ],
+    "why": "Effort is part of the visible (provider, model, effort) identity, not merely a decorative rider. Equal provider/model must not suppress a changed effort; fallback and restore show both sides. Persist actual served effort for rebuilds, retain legacy rows without inventing unknown history, announce cached-agent config changes, and avoid replaying an already-delivered /reasoning announcement on re-init. Tests drive real fallback/restore and TurnRunner, not just an isolated formatter.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": ["gateway", "discord", "telegram", "cli"]
   }
 ]

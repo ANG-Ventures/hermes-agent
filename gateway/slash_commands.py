@@ -2013,26 +2013,25 @@ class GatewaySlashCommandsMixin:
             getattr(getattr(event, "source", None), "platform", None),
         )
 
-    def _announce_model_switch(
+    async def _announce_model_switch(
         self,
         agent,
         *,
+        source: SessionSource,
         old_model: str,
         new_model: str,
         old_provider: str,
         new_provider: str,
-        old_effort: "str | None" = None,
-        new_effort: "str | None" = None,
+        old_effort: Any = None,
+        new_effort: Any = None,
         old_window: "int | None" = None,
         new_window: "int | None" = None,
     ) -> None:
         """Announce a deliberate ``/model`` switch in-chat, like failover does.
 
-        Config-gated (``model.announce_switch``, default ON). Routes through the
-        agent's ``_emit_switch_announce`` → ``_emit_status`` seam so the ``🔀``
-        line reaches the CHANNEL (Discord/Telegram ``status_callback``), not just
-        the ephemeral slash-command reply the runner sees. Symmetric to/from with
-        model + effort + context-window deltas.
+        Config-gated (``model.announce_switch``, default ON). Delivers directly
+        to the command's source, never through an old cached turn's callback.
+        Symmetric to/from with model, effort and context-window deltas.
 
         A bug here must NEVER break the switch: everything is wrapped so the
         already-applied ``switch_model`` result stands regardless. This is a
@@ -2056,10 +2055,9 @@ class GatewaySlashCommandsMixin:
                 announce = True
             if not announce:
                 return
-            from agent.chat_completion_helpers import _emit_switch_announce
+            from agent.chat_completion_helpers import _format_switch_announce
 
-            _emit_switch_announce(
-                agent,
+            message = _format_switch_announce(
                 old_model=old_model or "",
                 new_model=new_model or "",
                 new_provider=new_provider or "",
@@ -2069,6 +2067,16 @@ class GatewaySlashCommandsMixin:
                 old_effort=old_effort,
                 new_effort=new_effort,
             )
+            if message is None:
+                return
+            # A cached agent's status callback belongs to a PREVIOUS turn.
+            # Commands own their source, so deliver directly to that source.
+            adapter = self._adapter_for_source(source)
+            if adapter is not None:
+                await adapter.send(
+                    source.chat_id, message,
+                    metadata=self._thread_metadata_for_source(source, None),
+                )
         except Exception as exc:  # noqa: BLE001 — announce must never break the switch
             logger.debug("model-switch announce failed: %s", exc)
 
@@ -2393,6 +2401,9 @@ class GatewaySlashCommandsMixin:
                             with _cache_lock:
                                 cached_entry = _cache.get(_session_key)
                         if cached_entry and cached_entry[0] is not None:
+                            _sw_old_model = getattr(cached_entry[0], "model", _cur_model)
+                            _sw_old_provider = getattr(cached_entry[0], "provider", _cur_provider)
+                            _sw_effort = getattr(cached_entry[0], "reasoning_config", None)
                             _sw_old_window = None
                             try:
                                 _sw_old_window = getattr(
@@ -2445,8 +2456,7 @@ class GatewaySlashCommandsMixin:
                             # Announce the deliberate switch in-chat (like
                             # failover does) so spectators who didn't run
                             # /model see the change, not just the ephemeral
-                            # reply. Fires on the cached agent (whose
-                            # _emit_status reaches the channel status_callback).
+                            # reply. Delivery belongs to this command's source.
                             _sw_new_window = None
                             try:
                                 _sw_new_window = getattr(
@@ -2456,13 +2466,7 @@ class GatewaySlashCommandsMixin:
                                 )
                             except Exception:
                                 _sw_new_window = None
-                            _sw_effort = None
-                            try:
-                                _sw_effort = _self._reasoning_effort_label(
-                                    _self._resolve_session_reasoning_config(source=event.source)
-                                )
-                            except Exception:
-                                _sw_effort = None
+
                             # #467 rule 3: the NEW side reads the agent's ACTUAL
                             # post-switch reasoning_config, never the value that
                             # requested the change — a per-model override for the
@@ -2479,11 +2483,12 @@ class GatewaySlashCommandsMixin:
                                 )
                             except Exception:
                                 _sw_new_effort = _sw_effort
-                            _self._announce_model_switch(
+                            await _self._announce_model_switch(
                                 cached_entry[0],
-                                old_model=_cur_model,
+                                source=event.source,
+                                old_model=_sw_old_model,
                                 new_model=result.new_model,
-                                old_provider=_cur_provider,
+                                old_provider=_sw_old_provider,
                                 new_provider=result.target_provider,
                                 old_effort=_sw_effort,
                                 new_effort=_sw_new_effort,
@@ -2532,12 +2537,13 @@ class GatewaySlashCommandsMixin:
                         })
 
                         # Announce the deliberate switch to the conversation (P2).
-                        await _self._announce_switch(
-                            event.source,
-                            "Model",
-                            f"{_cur_provider}/{_cur_model}",
-                            f"{result.target_provider}/{result.new_model}",
-                        )
+                        if not cached_entry or cached_entry[0] is None:
+                            await _self._announce_switch(
+                                event.source,
+                                "Model",
+                                f"{_cur_provider}/{_cur_model}",
+                                f"{result.target_provider}/{result.new_model}",
+                            )
 
                         # Write-through the non-secret parts to the session
                         # store so the picked model survives a gateway restart
@@ -2804,6 +2810,9 @@ class GatewaySlashCommandsMixin:
                     cached_entry = _cache.get(session_key)
 
             if cached_entry and cached_entry[0] is not None:
+                _sw_old_model = getattr(cached_entry[0], "model", current_model)
+                _sw_old_provider = getattr(cached_entry[0], "provider", current_provider)
+                _sw_effort = getattr(cached_entry[0], "reasoning_config", None)
                 _sw_old_window = None
                 try:
                     _sw_old_window = getattr(
@@ -2856,13 +2865,7 @@ class GatewaySlashCommandsMixin:
                     )
                 except Exception:
                     _sw_new_window = None
-                _sw_effort = None
-                try:
-                    _sw_effort = self._reasoning_effort_label(
-                        self._resolve_session_reasoning_config(source=source)
-                    )
-                except Exception:
-                    _sw_effort = None
+
                 # #467 rule 3: the NEW side reads the agent's ACTUAL post-switch
                 # reasoning_config, not the value that requested the change.
                 _sw_new_effort = _sw_effort
@@ -2877,11 +2880,12 @@ class GatewaySlashCommandsMixin:
                     )
                 except Exception:
                     _sw_new_effort = _sw_effort
-                self._announce_model_switch(
+                await self._announce_model_switch(
                     cached_entry[0],
-                    old_model=current_model,
+                    source=event.source,
+                    old_model=_sw_old_model,
                     new_model=result.new_model,
-                    old_provider=current_provider,
+                    old_provider=_sw_old_provider,
                     new_provider=result.target_provider,
                     old_effort=_sw_effort,
                     new_effort=_sw_new_effort,
@@ -2945,12 +2949,13 @@ class GatewaySlashCommandsMixin:
             # Announce the deliberate switch to the conversation (P2). Compares the
             # (provider, model, api_mode) route so a same-slug/different-endpoint
             # switch still announces; silent on a true no-op. Best-effort.
-            await self._announce_switch(
-                event.source,
-                "Model",
-                f"{current_provider}/{current_model}",
-                f"{result.target_provider}/{result.new_model}",
-            )
+            if not cached_entry or cached_entry[0] is None:
+                await self._announce_switch(
+                    event.source,
+                    "Model",
+                    f"{current_provider}/{current_model}",
+                    f"{result.target_provider}/{result.new_model}",
+                )
 
             # Write-through the non-secret parts (model/provider/base_url) to
             # the session store so the override survives a gateway restart.

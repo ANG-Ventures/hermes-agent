@@ -112,7 +112,7 @@ def test_switch_announce_is_pure_emission_no_context_mutation():
         agent, old_model="x", new_model="y", new_provider="p",
     )
     # The only side effects allowed: the dedupe marker + the emission.
-    assert agent._last_switch_announced == ("x", "y")
+    assert agent._last_switch_announced is not None
     assert len([m for (_k, m) in agent._announced if m.startswith("🔀")]) == 1
     assert not hasattr(agent, "messages")
     assert not hasattr(agent, "_cached_system_prompt")

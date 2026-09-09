@@ -169,7 +169,10 @@ class TestRestorePrimaryRuntime:
         assert agent.model == original_model
         assert agent.provider == original_provider
 
-    def test_emits_user_visible_primary_restore_notice(self):
+    def test_emits_user_visible_primary_restore_notice(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {
+            "model": {"announce_recovery": True},
+        })
         agent = _make_agent(
             fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
         )
@@ -190,12 +193,15 @@ class TestRestorePrimaryRuntime:
             assert agent._restore_primary_runtime() is True
 
         assert emitted == [
-            f"✅ Primary model restored: {original_model} via {original_provider}; "
-            "fallback anthropic/claude-sonnet-4 via openrouter is no longer active."
+            "🔄 Model recovery (restore): openrouter/anthropic/claude-sonnet-4 "
+            f"→ {original_provider}/{original_model}"
         ]
 
-    def test_does_not_label_temporary_model_restore_as_fallback_recovery(self):
+    def test_does_not_label_temporary_model_restore_as_fallback_recovery(self, monkeypatch):
         """`/model --once` reuses restore with no provider fallback lifecycle."""
+        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {
+            "model": {"announce_recovery": True},
+        })
         agent = _make_agent()
         agent.model = "temporary-model"
         agent.provider = "openrouter"
@@ -208,7 +214,10 @@ class TestRestorePrimaryRuntime:
 
         assert emitted == []
 
-    def test_restore_retry_preserves_fallback_identity_after_partial_failure(self):
+    def test_restore_retry_preserves_fallback_identity_after_partial_failure(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {
+            "model": {"announce_recovery": True},
+        })
         agent = _make_agent(
             fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
         )
@@ -235,8 +244,8 @@ class TestRestorePrimaryRuntime:
             assert agent._restore_primary_runtime() is True
 
         assert emitted == [
-            "✅ Primary model restored: primary-model via custom; "
-            "fallback anthropic/claude-sonnet-4 via openrouter is no longer active."
+            "🔄 Model recovery (restore): openrouter/anthropic/claude-sonnet-4 "
+            "→ custom/primary-model"
         ]
 
     def test_resets_fallback_index(self):
