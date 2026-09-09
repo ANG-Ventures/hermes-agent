@@ -6753,6 +6753,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return
 
         def _do(conn):
+            self._assert_unique_gateway_routes(conn, {session_key: entry_json}, scope)
             conn.execute(
                 """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
                    VALUES (?, ?, ?, ?)
@@ -6765,7 +6766,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._execute_write(_do)
 
     def replace_gateway_routing_entries(
-        self, entries: Dict[str, str], *, scope: str = ""
+        self, entries: Dict[str, str], *, scope: str = "", retired_keys=()
     ) -> None:
         """Atomically replace the routing index for *scope* with *entries*.
 
@@ -6777,6 +6778,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         now = time.time()
 
         def _do(conn):
+            self._assert_unique_gateway_routes(conn, entries, scope, retired_keys=retired_keys)
             conn.execute("DELETE FROM gateway_routing WHERE scope = ?", (scope,))
             if entries:
                 conn.executemany(
@@ -6786,6 +6788,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
 
         self._execute_write(_do)
+
+    @staticmethod
+    def _assert_unique_gateway_routes(conn, entries, scope, *, retired_keys=()):
+        from gateway.routing_identity import assert_unique_routing_entries
+
+        durable = dict(conn.execute(
+            "SELECT session_key, entry_json FROM gateway_routing WHERE scope = ?", (scope,)
+        ).fetchall())
+
+        def decode(rows):
+            decoded = {}
+            for key, value in rows.items():
+                try:
+                    decoded[key] = json.loads(value)
+                except (ValueError, TypeError):
+                    decoded[key] = {}  # Key-only ownership still guards legacy rows.
+            return decoded
+
+        assert_unique_routing_entries(decode(entries), decode(durable), retired_keys=retired_keys)
 
     def load_gateway_routing_entries(self, *, scope: str = "") -> Dict[str, str]:
         """Load routing entries for *scope* as {session_key: entry_json}."""

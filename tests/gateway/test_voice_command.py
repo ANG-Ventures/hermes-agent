@@ -621,6 +621,7 @@ class TestVoiceChannelCommands:
         mock_channel = AsyncMock()
         mock_adapter._client = MagicMock()
         mock_adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        mock_adapter.get_chat_info = AsyncMock(return_value={"type": "group"})
         mock_adapter.handle_message = AsyncMock()
         runner.adapters[Platform.DISCORD] = mock_adapter
         await runner._handle_voice_channel_input(111, 42, "Hello from VC")
@@ -629,7 +630,10 @@ class TestVoiceChannelCommands:
         assert event.text == "Hello from VC"
         assert event.message_type == MessageType.VOICE
         assert event.source.chat_id == "123"
-        assert event.source.chat_type == "channel"
+        # Voice input must join the text channel's session, so the type comes
+        # from the resolved Discord channel, never a hard-coded producer label.
+        mock_adapter.get_chat_info.assert_awaited_once_with("123")
+        assert event.source.chat_type == "group"
 
     @pytest.mark.asyncio
     async def test_input_resolves_channel_prompt(self, runner):
@@ -640,6 +644,7 @@ class TestVoiceChannelCommands:
         mock_adapter._voice_sources = {}
         mock_adapter._client = MagicMock()
         mock_adapter._client.get_channel = MagicMock(return_value=AsyncMock())
+        mock_adapter.get_chat_info = AsyncMock(return_value={"type": "group"})
         mock_adapter.handle_message = AsyncMock()
         mock_adapter._resolve_channel_prompt = MagicMock(return_value="Be terse in #dev.")
         runner.adapters[Platform.DISCORD] = mock_adapter

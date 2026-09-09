@@ -6067,26 +6067,46 @@ class DiscordAdapter(BasePlatformAdapter):
             except (asyncio.CancelledError, Exception):
                 pass
 
-    @staticmethod
-    def _session_chat_type(channel) -> str:
+    def _session_chat_type(self, channel) -> str:
         """Discord objects, not producer labels, define session identity."""
         if isinstance(channel, discord.DMChannel):
-            return "dm"
-        if isinstance(channel, discord.Thread):
-            return "thread"
-        return "group"
+            kind = "dm"
+        elif isinstance(channel, discord.Thread):
+            kind = "thread"
+        else:
+            kind = "group"
+        if not hasattr(self, "_session_chat_types"):
+            self._session_chat_types = {}
+        self._session_chat_types[str(channel.id)] = kind
+        return kind
+
+    def canonicalize_session_source(self, source) -> None:
+        """Synchronous store/key path, using only previously resolved Discord objects.
+
+        Cold synthetic ingress fetches via get_chat_info first. Unknown channels
+        fail closed here rather than treating a caller's label as evidence.
+        """
+        chat_id = str(source.thread_id or source.chat_id)
+        channel = self._client.get_channel(int(chat_id)) if self._client else None
+        kind = (self._session_chat_type(channel) if channel is not None
+                else getattr(self, "_session_chat_types", {}).get(chat_id))
+        if kind is None:
+            raise ValueError("Cannot resolve Discord session channel")
+        source.chat_type = kind
+        if kind == "thread":
+            source.chat_id = source.thread_id = chat_id
+        else:
+            source.thread_id = None
 
     async def handle_message(self, event: MessageEvent) -> None:
         # All synthetic producers (notify/wake, cron, delegation, restart)
         # pass this boundary too. A lookup failure must not invent a DM route.
         # Native messages/slashes already resolved their actual channel object.
         if event.internal:
-            info = await self.get_chat_info(event.source.chat_id)
+            info = await self.get_chat_info(event.source.thread_id or event.source.chat_id)
             if info.get("error"):
                 raise RuntimeError("Cannot resolve Discord session channel")
-            event.source.chat_type = info["type"]
-            if info["type"] == "thread":
-                event.source.thread_id = event.source.chat_id
+        self.canonicalize_session_source(event.source)
         await super().handle_message(event)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
@@ -7976,6 +7996,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 auto_archive_duration=auto_archive_duration,
                 reason=reason,
             )
+            self._session_chat_type(thread)
             if starter_message:
                 await thread.send(starter_message)
             return {
@@ -7992,6 +8013,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     auto_archive_duration=auto_archive_duration,
                     reason=reason,
                 )
+                self._session_chat_type(thread)
                 return {
                     "success": True,
                     "thread_id": str(thread.id),

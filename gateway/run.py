@@ -7869,6 +7869,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Sync helpers keep using ``session_store`` directly; async gateway
         # handlers call this facade and await every operation.
         self._async_session_store = AsyncSessionStore(self.session_store)
+        self.session_store.on_session_key_conflict = self._notify_session_key_conflict
+        self.session_store.source_resolver = self._canonicalize_session_source
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -8840,6 +8842,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def exit_code(self) -> Optional[int]:
         return self._exit_code
 
+    def _notify_session_key_conflict(self, conflict) -> None:
+        """Post the once-per-collision warning without opening another session."""
+        from gateway.delivery import DeliveryTarget
+
+        loop = getattr(self, "_gateway_loop", None)
+        if loop is None or loop.is_closed():
+            return  # The store already logged WARNING; no live transport yet.
+
+        async def deliver():
+            results = await self.delivery_router.deliver(
+                str(conflict),
+                [DeliveryTarget(platform=Platform(conflict.platform), chat_id=conflict.chat_id,
+                                thread_id=conflict.thread_id, is_explicit=True)],
+            )
+            if any(not result.get("success") for result in results.values()):
+                logger.warning("Session collision notice delivery failed")
+
+        safe_schedule_threadsafe(
+            deliver(), loop, logger=logger,
+            log_message="Session collision notice scheduling failed",
+            log_level=logging.WARNING,
+        )
+
     async def _migrate_discord_session_keys(self) -> None:
         """Resolve legacy routes before restart/delegation wakes can use them."""
         adapter = self.adapters.get(Platform.DISCORD)
@@ -8849,20 +8874,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         chat_types = {}
         for entry in entries:
             source = entry.origin
-            if source is None or source.platform != Platform.DISCORD:
+            parts = entry.session_key.split(":")
+            if len(parts) < 5 or parts[2] != "discord":
                 continue
-            if source.chat_id in chat_types:
+            chat_id = source.chat_id if source is not None else parts[4]
+            if chat_id in chat_types:
                 continue
             try:
-                info = await asyncio.wait_for(adapter.get_chat_info(source.chat_id), 10)
+                info = await asyncio.wait_for(adapter.get_chat_info(chat_id), 10)
                 if not info.get("error"):
-                    chat_types[source.chat_id] = info.get("type")
+                    chat_types[chat_id] = info.get("type")
             except Exception:
                 logger.warning("Discord session migration lookup failed", exc_info=True)
         await asyncio.to_thread(self.session_store.migrate_discord_session_keys, chat_types)
 
+    def _canonicalize_session_source(self, source: SessionSource) -> None:
+        """Use the platform's object-derived identity even for direct store writers."""
+        adapter = self._adapter_for_source(source)
+        resolver = getattr(type(adapter), "canonicalize_session_source", None)
+        if callable(resolver):
+            resolver(adapter, source)
+
     def _session_key_for_source(self, source: SessionSource) -> str:
         """Resolve the current session key for a source, honoring gateway config when available."""
+        self._canonicalize_session_source(source)
         if hasattr(self, "session_store") and self.session_store is not None:
             try:
                 session_key = self.session_store._generate_session_key(source)
@@ -27164,12 +27199,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source.user_id = str(user_id)
             source.user_name = str(user_id)
         else:
+            info = await adapter.get_chat_info(str(text_ch_id))
+            if info.get("error"):
+                logger.warning("Cannot resolve voice input's Discord channel")
+                return
             source = SessionSource(
                 platform=Platform.DISCORD,
                 chat_id=str(text_ch_id),
                 user_id=str(user_id),
                 user_name=str(user_id),
-                chat_type="channel",
+                chat_type=info["type"],
             )
 
         # Check authorization before processing voice input

@@ -26,7 +26,7 @@ def test_duplicate_route_write_fails_closed_and_reports_once(tmp_path, writer, c
     before = (tmp_path / "sessions.json").read_bytes()
     for _ in range(2):
         store._entries[alias] = replace(entry, session_key=alias, session_id="illegal-second-session", origin=entry.origin if keep_origin else None)
-        with pytest.raises(ValueError, match="Duplicate session route"):
+        with pytest.raises(ValueError, match="session-key collision"):
             if writer == "snapshot":
                 store.persist()
             else:
@@ -34,7 +34,7 @@ def test_duplicate_route_write_fails_closed_and_reports_once(tmp_path, writer, c
     assert (tmp_path / "sessions.json").read_bytes() == before
     assert len(alerts) == 1
     assert alias not in store._entries
-    assert sum("Duplicate session route" in rec.message for rec in caplog.records) == 1
+    assert sum("session-key collision" in rec.message for rec in caplog.records) == 1
 
 
 def test_distinct_participants_and_chats_remain_independent(tmp_path):
