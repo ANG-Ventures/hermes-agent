@@ -391,12 +391,22 @@ async def test_manual_model_switch_delivers_once_without_old_turn_callback(
     agent.switch_model = switch
     owner._agent_cache = {key: (agent, ("signature",))}
     owner._agent_cache_lock = threading.RLock()
+    state_at_send = []
+    original_send = adapter.send
+
+    async def send_after_commit(*args, **kwargs):
+        override = owner._session_model_overrides.get(key) or {}
+        state_at_send.append(override.get("model"))
+        return await original_send(*args, **kwargs)
+
+    adapter.send = send_after_commit
     result = await owner._handle_model_command(event)
     if picker:
         assert result is None
         result = await adapter.picker_callback("c1", "gpt-5.5", "openrouter")
     assert result is not None
     assert prior_turn == []
+    assert state_at_send == ["gpt-5.5"]
     assert len(adapter.messages) == 1
     assert "fallback-provider/fallback/model" in adapter.messages[0][1]
     assert "openrouter/gpt-5.5" in adapter.messages[0][1]

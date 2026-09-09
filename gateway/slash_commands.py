@@ -2394,6 +2394,7 @@ class GatewaySlashCommandsMixin:
                             logger.debug("preflight-compression switch warning failed: %s", exc)
 
                         # Update cached agent in-place
+                        _switch_announce_kwargs = {}
                         cached_entry = None
                         _cache_lock = getattr(_self, "_agent_cache_lock", None)
                         _cache = getattr(_self, "_agent_cache", None)
@@ -2483,18 +2484,17 @@ class GatewaySlashCommandsMixin:
                                 )
                             except Exception:
                                 _sw_new_effort = _sw_effort
-                            await _self._announce_model_switch(
-                                cached_entry[0],
-                                source=event.source,
-                                old_model=_sw_old_model,
-                                new_model=result.new_model,
-                                old_provider=_sw_old_provider,
-                                new_provider=result.target_provider,
-                                old_effort=_sw_effort,
-                                new_effort=_sw_new_effort,
-                                old_window=_sw_old_window,
-                                new_window=_sw_new_window,
-                            )
+                            _switch_announce_kwargs = {
+                                "source": event.source,
+                                "old_model": _sw_old_model,
+                                "new_model": result.new_model,
+                                "old_provider": _sw_old_provider,
+                                "new_provider": result.target_provider,
+                                "old_effort": _sw_effort,
+                                "new_effort": _sw_new_effort,
+                                "old_window": _sw_old_window,
+                                "new_window": _sw_new_window,
+                            }
 
                         # Persist the new model to the session DB so the
                         # dashboard shows the updated model (#34850).
@@ -2543,6 +2543,11 @@ class GatewaySlashCommandsMixin:
                                 "Model",
                                 f"{_cur_provider}/{_cur_model}",
                                 f"{result.target_provider}/{result.new_model}",
+                            )
+                        else:
+                            await _self._announce_model_switch(
+                                cached_entry[0],
+                                **_switch_announce_kwargs,
                             )
 
                         # Write-through the non-secret parts to the session
@@ -2802,6 +2807,7 @@ class GatewaySlashCommandsMixin:
         async def _finish_switch() -> str:
             """Apply the resolved switch (agent, session, config) and build the reply."""
             # If there's a cached agent, update it in-place
+            _switch_announce_kwargs = {}
             cached_entry = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
             _cache = getattr(self, "_agent_cache", None)
@@ -2880,18 +2886,17 @@ class GatewaySlashCommandsMixin:
                     )
                 except Exception:
                     _sw_new_effort = _sw_effort
-                await self._announce_model_switch(
-                    cached_entry[0],
-                    source=event.source,
-                    old_model=_sw_old_model,
-                    new_model=result.new_model,
-                    old_provider=_sw_old_provider,
-                    new_provider=result.target_provider,
-                    old_effort=_sw_effort,
-                    new_effort=_sw_new_effort,
-                    old_window=_sw_old_window,
-                    new_window=_sw_new_window,
-                )
+                _switch_announce_kwargs = {
+                    "source": event.source,
+                    "old_model": _sw_old_model,
+                    "new_model": result.new_model,
+                    "old_provider": _sw_old_provider,
+                    "new_provider": result.target_provider,
+                    "old_effort": _sw_effort,
+                    "new_effort": _sw_new_effort,
+                    "old_window": _sw_old_window,
+                    "new_window": _sw_new_window,
+                }
 
             # Persist the new model to the session DB so the dashboard
             # shows the updated model (#34850).
@@ -2955,6 +2960,11 @@ class GatewaySlashCommandsMixin:
                     "Model",
                     f"{current_provider}/{current_model}",
                     f"{result.target_provider}/{result.new_model}",
+                )
+            else:
+                await self._announce_model_switch(
+                    cached_entry[0],
+                    **_switch_announce_kwargs,
                 )
 
             # Write-through the non-secret parts (model/provider/base_url) to
