@@ -6080,18 +6080,66 @@ class DiscordAdapter(BasePlatformAdapter):
         self._session_chat_types[str(channel.id)] = kind
         return kind
 
-    def canonicalize_session_source(self, source) -> None:
-        """Synchronous store/key path, using only previously resolved Discord objects.
+    @staticmethod
+    def _discord_snowflake(value) -> Optional[int]:
+        """Coerce a chat/thread id to an int snowflake; None when it isn't one.
 
-        Cold synthetic ingress fetches via get_chat_info first. Unknown channels
-        fail closed here rather than treating a caller's label as evidence.
+        Test harnesses and some synthetic producers carry non-numeric ids
+        (mock objects, ``e2e-chat-1``). Those must degrade to inference, not
+        crash the resolver.
+        """
+        text = str(value if value is not None else "").strip()
+        return int(text) if text.isdigit() else None
+
+    def _infer_session_chat_type(self, source, chat_id: str) -> str:
+        """Best-effort chat type when no Discord channel object is at hand.
+
+        Evidence order (never raises):
+          1. the source's own structural fields — a thread/parent id means a
+             thread, a guild/scope id means a guild channel;
+          2. the ``_session_chat_types`` cache populated by earlier object
+             resolutions for this chat;
+          3. the caller's label, canonicalized (``channel`` → ``group``) so a
+             legacy producer converges on the inbound key instead of forking it;
+          4. ``dm``.
+        The collision guard on the session store remains the fail-closed
+        backstop; the resolver's job is to always produce the best key.
+        """
+        if source.thread_id or getattr(source, "parent_chat_id", None):
+            return "thread"
+        if getattr(source, "scope_id", None) or getattr(source, "guild_id", None):
+            return "group"
+        cached = getattr(self, "_session_chat_types", {}).get(chat_id)
+        if cached:
+            return cached
+        label = str(source.chat_type or "").strip().lower()
+        if label == "channel":
+            return "group"
+        if label in ("dm", "group", "thread"):
+            return label
+        return "dm"
+
+    def canonicalize_session_source(self, source) -> None:
+        """Synchronous store/key path: Discord objects define session identity.
+
+        Cold synthetic ingress fetches via get_chat_info first so the channel
+        object is cached. When no object can be resolved (client down, mock
+        harness, non-snowflake id) fall back to ``_infer_session_chat_type``;
+        this resolver never refuses to produce a key — only the store's
+        collision guard fails closed.
         """
         chat_id = str(source.thread_id or source.chat_id)
-        channel = self._client.get_channel(int(chat_id)) if self._client else None
-        kind = (self._session_chat_type(channel) if channel is not None
-                else getattr(self, "_session_chat_types", {}).get(chat_id))
-        if kind is None:
-            raise ValueError("Cannot resolve Discord session channel")
+        channel = None
+        snowflake = self._discord_snowflake(chat_id)
+        if self._client is not None and snowflake is not None:
+            try:
+                channel = self._client.get_channel(snowflake)
+            except Exception:
+                channel = None
+        if channel is not None:
+            kind = self._session_chat_type(channel)
+        else:
+            kind = self._infer_session_chat_type(source, chat_id)
         source.chat_type = kind
         if kind == "thread":
             source.chat_id = source.thread_id = chat_id
@@ -6100,12 +6148,18 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def handle_message(self, event: MessageEvent) -> None:
         # All synthetic producers (notify/wake, cron, delegation, restart)
-        # pass this boundary too. A lookup failure must not invent a DM route.
+        # pass this boundary too: fetch the channel object so canonicalization
+        # uses Discord's own type. A lookup failure degrades to inference from
+        # the source's fields (logged), never to a refusal.
         # Native messages/slashes already resolved their actual channel object.
         if event.internal:
             info = await self.get_chat_info(event.source.thread_id or event.source.chat_id)
             if info.get("error"):
-                raise RuntimeError("Cannot resolve Discord session channel")
+                logger.warning(
+                    "[%s] Could not resolve channel %s for internal event (%s); "
+                    "inferring session type from source fields",
+                    self.name, event.source.thread_id or event.source.chat_id, info.get("error"),
+                )
         self.canonicalize_session_source(event.source)
         await super().handle_message(event)
 
