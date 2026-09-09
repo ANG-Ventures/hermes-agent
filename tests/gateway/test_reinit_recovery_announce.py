@@ -21,6 +21,7 @@ both sites in lockstep) + persist-only invariants of the end-of-turn site.
 
 import threading
 import types
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
@@ -256,6 +257,7 @@ class TestRestoreInlineAnnounce:
         a._emit_status = lambda m: a._announced.append(m)
         a._last_fallback_announced = None
         a._fallback_activated = True
+        a._provider_fallback_active = True
         a._fallback_index = 2
         a._rate_limited_until = 0
         # Currently ON the fallback (opus); primary snapshot is the pin (fable).
@@ -360,6 +362,46 @@ class TestPersistOnlyEndOfTurn:
         assert store._entries[key].last_served_identity == {
             "provider": "yunwu", "model": "claude-fable-5",
         }
+
+    def test_effort_survives_session_entry_roundtrip(self, env):
+        _, store, runner = env
+        key = "agent:main:discord:c1:c1"
+        store._entries[key] = _entry(key)
+        agent = _agent()
+        agent.reasoning_config = {"effort": "high"}
+        _persist(runner, agent, key, *FABLE)
+        restored = SessionEntry.from_dict(store._entries[key].to_dict())
+        assert restored.last_served_identity == {
+            "provider": FABLE[0], "model": FABLE[1], "effort": "high",
+        }
+
+    def test_reasoning_command_not_reannounced_on_reinit(self, env, monkeypatch):
+        from gateway.config import Platform
+        _, store, runner = env
+        key = "agent:main:discord:c1:c1"
+        store._entries[key] = _entry(key, last_served={
+            "provider": FABLE[0], "model": FABLE[1], "effort": "high",
+        })
+        sent = []
+
+        async def send(chat_id, text, metadata=None):
+            sent.append(text)
+            return types.SimpleNamespace(success=True)
+
+        runner.adapters = {Platform.DISCORD: types.SimpleNamespace(send=send)}
+        runner._thread_metadata_for_source = lambda *args: None
+        runner._session_key_for_source = lambda source: key
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+        source = types.SimpleNamespace(platform=Platform.DISCORD, chat_id="c1")
+        asyncio.run(runner._announce_switch(source, "Reasoning", "high", "medium"))
+        assert len(sent) == 1
+        agent = _agent()
+        agent.reasoning_config = {"effort": "medium"}
+        _reinit(runner, agent, key, *FABLE)
+        assert agent._announced == []
+        # The one-turn suppression must not swallow a later genuine restore.
+        _reinit(runner, agent, key, *FABLE)
+        assert len(agent._announced) == 1
 
     def test_never_announces_even_on_route_change(self, env):
         # Mutation-guard for the restructure: end-of-turn route change (e.g. a

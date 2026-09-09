@@ -25,6 +25,7 @@ from agent.chat_completion_helpers import (
     _append_route_change,
     _effort_label,
     _emit_fallback_announce,
+    _emit_switch_announce,
 )
 
 
@@ -108,6 +109,29 @@ def test_two_distinct_transitions_both_announce():
     _emit_fallback_announce(a, "opus", "gpt-5.5", "openai-codex", old_provider="claude-app")
     _emit_fallback_announce(a, "gpt-5.5", "sonnet", "anthropic", old_provider="openai-codex")
     assert len(a._announced) == 2
+
+
+@pytest.mark.parametrize("emit", [_emit_fallback_announce, _emit_switch_announce])
+def test_effort_changes_are_part_of_dedupe_identity(emit):
+    a = _agent()
+    for effort in ("medium", "medium", "low"):
+        emit(
+            a, "model", "model", "provider", old_provider="provider",
+            old_effort={"effort": "high"}, new_effort=effort,
+        )
+    assert len(a._announced) == 2
+    assert "medium" in a._announced[0]
+    assert "low" in a._announced[1]
+
+
+@pytest.mark.parametrize("emit", [_emit_fallback_announce, _emit_switch_announce])
+def test_same_triple_is_silent_after_effort_normalization(emit):
+    a = _agent()
+    emit(
+        a, "model", "model", "provider", old_provider="provider",
+        old_effort={"effort": "high"}, new_effort="high",
+    )
+    assert a._announced == []
 
 
 def test_announce_route_change_gate_off_suppresses_but_records_event():

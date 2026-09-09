@@ -2841,17 +2841,16 @@ def _emit_fallback_announce(
     the provider is the thing that explains a window/behavior change. When the
     old provider is unknown the source side degrades to the bare model slug.
 
-    Route identity is the ``(provider, model)`` tuple. A same-model, cross-PROVIDER
+    Route identity is the ``(provider, model, effort)`` tuple. A same-model, cross-PROVIDER
     failover (``opus@claude-app → opus@f3``) is a REAL route change and announces;
-    only a true no-op (same provider AND model) is silent. De-duplicated on the
-    ``((old_provider, old_model), (new_provider, new_model))`` transition so a
+    only a true no-op (same provider, model AND effort) is silent. De-duplicated on the
+    before/after identity transition so a
     re-entrant chain bouncing to the same destination within a turn announces once
     (Invariant I5).
 
-    Reasoning-effort is a display RIDER, never part of the route identity: a side
-    renders ``(effort)`` only when the two sides' resolved effort LABELS differ, so
-    the common inherited-effort failover reads as a pure route change. ``old_effort``
-    / ``new_effort`` are already normalized to bare labels by the caller.
+    Identity includes normalized reasoning effort. An effort-only change on the
+    same provider/model is visible too; inherited effort still renders without
+    redundant suffixes. Callers supply the actual before/after runtime values.
 
     ``announce_enabled`` (caller-resolved from ``model.announce_route_change`` for a
     failover or ``model.announce_recovery`` for a recovery) gates ONLY the chat
@@ -2859,8 +2858,10 @@ def _emit_fallback_announce(
     reads. ``record_event`` is True only for a genuine failover (a recovery must NOT
     stamp the "after model fallback" causality record).
     """
-    old_route = (old_provider, old_model)
-    new_route = (new_provider, new_model)
+    _oe = _effort_label(old_effort)
+    _ne = _effort_label(new_effort)
+    old_route = (old_provider, old_model, _oe)
+    new_route = (new_provider, new_model, _ne)
     if not new_model or old_route == new_route:
         return
     # Edge (§5B): when the old provider is UNKNOWN and the model is unchanged,
@@ -2868,7 +2869,7 @@ def _emit_fallback_announce(
     # spurious "opus → provider/opus" announce for a possibly-identical route.
     # (In the real failover path old_provider is always captured from
     # agent.provider, so this only guards the degenerate/defensive call.)
-    if old_provider is None and old_model == new_model:
+    if old_provider is None and old_model == new_model and _oe == _ne:
         return
     transition = (old_route, new_route)
     if getattr(agent, "_last_fallback_announced", None) == transition:
@@ -2913,8 +2914,6 @@ def _emit_fallback_announce(
     # Reasoning-effort rider: render the (effort) suffix on each side only when
     # the two resolved labels differ, so an inherited-effort failover reads as a
     # pure route change. Both labels come pre-normalized from the caller.
-    _oe = _effort_label(old_effort)
-    _ne = _effort_label(new_effort)
     _show_effort = bool(_oe or _ne) and _oe != _ne
 
     def _side_label(prov, mdl, eff):
@@ -2982,62 +2981,66 @@ def _emit_switch_announce(
     old_provider: "str | None" = None,
     old_window: "int | None" = None,
     new_window: "int | None" = None,
-    old_effort: "str | None" = None,
-    new_effort: "str | None" = None,
+    old_effort: "Any | None" = None,
+    new_effort: "Any | None" = None,
 ) -> None:
-    """Emit a single, always-visible chat status line when a DELIBERATE
-    ``/model`` switch lands mid-session.
+    """Emit a deliberate provider/model/effort transition once per episode."""
+    msg = _format_switch_announce(
+        old_model, new_model, new_provider, old_provider=old_provider,
+        old_window=old_window, new_window=new_window,
+        old_effort=old_effort, new_effort=new_effort,
+    )
+    if msg is None:
+        return
+    transition = (
+        (old_provider, old_model, _effort_label(old_effort)),
+        (new_provider, new_model, _effort_label(new_effort)),
+    )
+    if getattr(agent, "_last_switch_announced", None) == transition:
+        return
+    agent._last_switch_announced = transition
+    emit = getattr(agent, "_emit_status", None)
+    if callable(emit):
+        emit(msg)
 
-    This is the sibling of :func:`_emit_fallback_announce`: the automatic
-    failover half already announces to the conversation, but a deliberate
-    ``/model`` switch was only stored as a ``[Note:…]`` model-context prepend
-    plus an ephemeral slash reply — so a spectator who did not personally run
-    ``/model`` saw the footer change silently. This closes that gap by routing
-    the switch through the SAME ``_emit_status`` seam the failover announce uses,
-    reaching the gateway ``status_callback`` (Discord/Telegram) and the CLI.
 
-    Both sides are rendered ``provider/model`` so the route is unambiguous. When
-    the reasoning effort or the context window differ across the switch, they are
-    appended as ``· effort A→B`` / ``· context window A→B`` deltas — symmetric
-    to/from, per Ace's explicit ask that the change be loud in both directions.
+def _format_switch_announce(
+    old_model: str,
+    new_model: str,
+    new_provider: str,
+    *,
+    old_provider: "str | None" = None,
+    old_window: "int | None" = None,
+    new_window: "int | None" = None,
+    old_effort: "Any | None" = None,
+    new_effort: "Any | None" = None,
+) -> "str | None":
+    """Format a switch without choosing a delivery surface or mutating context.
 
-    De-duplicated on the ``(old_model, new_model)`` pair (sibling of
-    ``agent._last_fallback_announced``) so a re-entrant / double-dispatch handler
-    announces once. A no-op transition (``old_model == new_model`` with no
-    effort/window delta) is silent — the switch itself already surfaced its
-    ephemeral confirmation.
-
-    **Cache invariant:** this is an out-of-band status EMISSION. It does not
-    touch conversation history, the system prompt, or the toolset, so it cannot
-    invalidate the per-conversation prompt cache. (Contrast the ``[Note:…]``
-    injection, which is deliberately a model-context prepend and is left intact.)
+    Commands deliver to their own source; in-turn config changes use the live
+    status callback. Both share provider/model labels and effort/window deltas.
+    Unknown old provider alone is not evidence of a transition.
     """
     old_lbl_ctx = _format_context_window(old_window)
     new_lbl_ctx = _format_context_window(new_window)
     _window_differs = bool(old_lbl_ctx and new_lbl_ctx and old_lbl_ctx != new_lbl_ctx)
-    _old_eff = (old_effort or "").strip()
-    _new_eff = (new_effort or "").strip()
-    _effort_differs = bool(_old_eff and _new_eff and _old_eff != _new_eff)
+    _old_eff = _effort_label(old_effort)
+    _new_eff = _effort_label(new_effort)
+    _effort_differs = _old_eff != _new_eff
     # Silent-on-no-op: nothing meaningful changed.
     if not new_model or (
-        old_model == new_model and not _window_differs and not _effort_differs
+        old_model == new_model and (old_provider is None or old_provider == new_provider)
+        and not _window_differs and not _effort_differs
     ):
         return
-    transition = (old_model, new_model)
-    if getattr(agent, "_last_switch_announced", None) == transition:
-        return
-    agent._last_switch_announced = transition
-
     old_label = f"{old_provider}/{old_model}" if old_provider else old_model
     new_label = f"{new_provider}/{new_model}" if new_provider else new_model
     msg = f"🔀 Model switched: {old_label} → {new_label}"
     if _effort_differs:
-        msg += f" · effort {_old_eff}→{_new_eff}"
+        msg += f" · effort {_old_eff or 'default'}→{_new_eff or 'default'}"
     if _window_differs:
         msg += f" · context window {old_lbl_ctx}→{new_lbl_ctx}"
-    emit = getattr(agent, "_emit_status", None)
-    if callable(emit):
-        emit(msg)
+    return msg
 
 
 def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:

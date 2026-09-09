@@ -1,16 +1,9 @@
-"""A4 axis A (gateway) — the deliberate /model switch announce.
+"""Config and failure semantics of command-scoped model announcements.
 
-Proves the shared ``_announce_model_switch`` helper is config-gated
-(model.announce_switch, default ON) and routes through the agent's
-``_emit_switch_announce`` -> ``_emit_status`` seam, and that BOTH /model
-handlers (the picker path ``_on_model_selected`` and the text-arg path
-``_finish_switch``) actually call it — the "fix the whole bug class, not one
-site" requirement — asserted at the source level (AST) so a future edit that
-drops the announce from one handler fails the gate.
+Both real command paths are exercised in test_route_change_turn_contract.py.
 """
 
-import ast
-import os
+import asyncio
 import types
 
 
@@ -19,6 +12,13 @@ def _mixin_instance():
     from gateway.slash_commands import GatewaySlashCommandsMixin
 
     obj = GatewaySlashCommandsMixin.__new__(GatewaySlashCommandsMixin)
+    obj._sent = []
+
+    async def send(chat_id, text, metadata=None):
+        obj._sent.append(text)
+
+    obj._adapter_for_source = lambda source: types.SimpleNamespace(send=send)
+    obj._thread_metadata_for_source = lambda *args: None
     return obj
 
 
@@ -37,13 +37,15 @@ def test_announce_helper_emits_when_gate_default_on(monkeypatch):
     monkeypatch.setattr(run, "_load_gateway_config", lambda: {"model": {}}, raising=True)
     obj = _mixin_instance()
     agent = _capture_agent()
-    obj._announce_model_switch(
+    asyncio.run(obj._announce_model_switch(
         agent,
+        source=types.SimpleNamespace(chat_id="c1"),
         old_model="claude-opus-4-8", new_model="gpt-5.5",
         old_provider="claude-app", new_provider="openai-codex",
-    )
-    msgs = [m for m in agent._announced if m.startswith("🔀")]
+    ))
+    msgs = [m for m in obj._sent if m.startswith("🔀")]
     assert len(msgs) == 1, agent._announced
+    assert agent._announced == []
     assert "claude-app/claude-opus-4-8" in msgs[0]
     assert "openai-codex/gpt-5.5" in msgs[0]
 
@@ -57,11 +59,12 @@ def test_announce_helper_silent_when_gate_off(monkeypatch):
     )
     obj = _mixin_instance()
     agent = _capture_agent()
-    obj._announce_model_switch(
+    asyncio.run(obj._announce_model_switch(
         agent,
+        source=types.SimpleNamespace(chat_id="c1"),
         old_model="a", new_model="b", old_provider="p1", new_provider="p2",
-    )
-    assert agent._announced == [], f"gate off must be silent, got {agent._announced!r}"
+    ))
+    assert obj._sent == [], f"gate off must be silent, got {obj._sent!r}"
 
 
 def test_announce_helper_never_raises_on_bad_agent(monkeypatch):
@@ -69,45 +72,15 @@ def test_announce_helper_never_raises_on_bad_agent(monkeypatch):
 
     monkeypatch.setattr(run, "_load_gateway_config", lambda: {"model": {}}, raising=True)
     obj = _mixin_instance()
-    # agent with an _emit_status that raises must not propagate (switch stands).
+    # A failed direct delivery must not propagate (the switch stands).
     bad = types.SimpleNamespace()
     bad._last_switch_announced = None
 
-    def _boom(_m):
+    async def _boom(*args, **kwargs):
         raise RuntimeError("emit broke")
 
-    bad._emit_status = _boom
-    obj._announce_model_switch(
+    obj._adapter_for_source = lambda source: types.SimpleNamespace(send=_boom)
+    asyncio.run(obj._announce_model_switch(
         bad, old_model="a", new_model="b", old_provider="p", new_provider="q",
-    )  # must not raise
-
-
-def test_both_model_handlers_call_announce():
-    """Source contract: BOTH the picker (_on_model_selected) and the text-arg
-    (_finish_switch) handlers must invoke self._announce_model_switch — a fix
-    wired into only one site leaves the other silent."""
-    import gateway.slash_commands as sc
-
-    src = open(sc.__file__, encoding="utf-8").read()
-    tree = ast.parse(src)
-
-    def _calls_announce(node):
-        for n in ast.walk(node):
-            if isinstance(n, ast.Call):
-                fn = n.func
-                if isinstance(fn, ast.Attribute) and fn.attr == "_announce_model_switch":
-                    return True
-        return False
-
-    found = {}
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name in ("_on_model_selected", "_finish_switch"):
-                found[node.name] = _calls_announce(node)
-
-    assert found.get("_on_model_selected") is True, (
-        "picker handler _on_model_selected must call _announce_model_switch"
-    )
-    assert found.get("_finish_switch") is True, (
-        "text-arg handler _finish_switch must call _announce_model_switch"
-    )
+        source=types.SimpleNamespace(chat_id="c1"),
+    ))  # must not raise

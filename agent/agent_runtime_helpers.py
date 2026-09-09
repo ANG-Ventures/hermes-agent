@@ -1707,6 +1707,8 @@ def recovery_should_announce(
     *,
     override_target=None,
     override_target_changed: bool = False,
+    old_effort=None,
+    new_effort=None,
 ) -> bool:
     """Single source of truth for "does this model route-change announce as a
     recovery?" — the ONE predicate every recovery-announce site calls (Momus
@@ -1716,7 +1718,7 @@ def recovery_should_announce(
 
     A genuine recovery announces when:
       • we know the previous route (``prev_route[1]`` truthy), AND
-      • it differs from the candidate route (a real model return), AND
+      • its route or normalized effort differs from the candidate, AND
       • it is NOT the user's own ``/model`` action this turn. Suppression covers
         two manual shapes, for exactly the one turn ``override_target_changed``
         is True: (a) re-target — the candidate lands on the freshly-set override
@@ -1734,8 +1736,10 @@ def recovery_should_announce(
         return False
     if not prev_route[1]:
         return False  # nothing to recover from
-    if tuple(prev_route) == tuple(candidate_route):
-        return False  # no genuine model return
+    from agent.chat_completion_helpers import _effort_label
+    if (tuple(prev_route) == tuple(candidate_route)
+            and _effort_label(old_effort) == _effort_label(new_effort)):
+        return False  # no genuine route/effort return
     if override_target_changed and (
         override_target is None or tuple(candidate_route) == tuple(override_target)
     ):
@@ -1868,17 +1872,17 @@ def restore_primary_runtime(agent) -> bool:
     rt = agent._primary_runtime
     # Capture the route we are LEAVING (the fallback served last turn) before any
     # assignment — the inline restore emit below needs the real from-route.
-    _from_route = (getattr(agent, "provider", None), getattr(agent, "model", None))
+    _old_reasoning_config = getattr(agent, "reasoning_config", None)
     fallback_route = getattr(agent, "_provider_fallback_route", None)
     if (
         isinstance(fallback_route, (list, tuple))
         and len(fallback_route) == 2
     ):
-        previous_model = str(fallback_route[0] or "unknown")
-        previous_provider = str(fallback_route[1] or "unknown")
+        # A previous restore attempt may already have reassigned agent.model
+        # before failing. Keep the original fallback identity on that retry.
+        _from_route = (fallback_route[1], fallback_route[0])
     else:
-        previous_model = str(getattr(agent, "model", "") or "unknown")
-        previous_provider = str(getattr(agent, "provider", "") or "unknown")
+        _from_route = (getattr(agent, "provider", None), getattr(agent, "model", None))
     provider_fallback_active = bool(
         getattr(agent, "_provider_fallback_active", False)
     )
@@ -2100,16 +2104,8 @@ def restore_primary_runtime(agent) -> bool:
         )
         agent._provider_fallback_active = False
         agent._provider_fallback_route = None
-        if provider_fallback_active:
-            try:
-                agent._emit_status(
-                    f"✅ Primary model restored: {agent.model} via {agent.provider}; "
-                    f"fallback {previous_model} via {previous_provider} is no longer active."
-                )
-            except Exception:
-                # Notification surfaces are best-effort and must never undo a
-                # successful runtime restoration.
-                pass
+        # The shared route announcement below owns recovery visibility. A
+        # separate generic notice duplicates it and bypasses announce_recovery.
 
         # NOTE (#238, superseded 2026-07-08): the recovery-announce for the
         # restore leg is back HERE — inline, at the only moment the restored
@@ -2128,7 +2124,10 @@ def restore_primary_runtime(agent) -> bool:
         # degenerate same-route case.
         try:
             _to_route = (rt["provider"], rt["model"])
-            if recovery_should_announce(_from_route, _to_route):
+            if provider_fallback_active and recovery_should_announce(
+                _from_route, _to_route, old_effort=_old_reasoning_config,
+                new_effort=getattr(agent, "reasoning_config", None),
+            ):
                 # predicate guarantees a truthy from-model; narrow for typing
                 _from_provider, _from_model = _from_route[0], str(_from_route[1])
                 from agent.chat_completion_helpers import (
@@ -2139,6 +2138,8 @@ def restore_primary_runtime(agent) -> bool:
                 _append_route_change(
                     "recovery", _from_provider, _from_model,
                     _to_route[0], _to_route[1],
+                    old_effort=_old_reasoning_config,
+                    new_effort=getattr(agent, "reasoning_config", None),
                 )
                 _rec_announce = False
                 try:
@@ -2151,6 +2152,8 @@ def restore_primary_runtime(agent) -> bool:
                 _emit_fallback_announce(
                     agent, _from_model, _to_route[1], _to_route[0],
                     old_provider=_from_provider,
+                    old_effort=_old_reasoning_config,
+                    new_effort=getattr(agent, "reasoning_config", None),
                     announce_enabled=_rec_announce,
                     record_event=False,
                     kind="recovery",
