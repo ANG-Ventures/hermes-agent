@@ -208,12 +208,13 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides", "strict_args",
+        "extra_accepted_args",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
                  max_result_size_chars=None, dynamic_schema_overrides=None,
-                 strict_args=False):
+                 strict_args=False, extra_accepted_args=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -238,6 +239,10 @@ class ToolEntry:
         # (delegate_task's imaginary `model=`); wrong for tools that inspect stray
         # keys to give a better error (execute_code's `command` redirect).
         self.strict_args = strict_args
+        # Keys the HANDLER accepts beyond the model-facing schema (legacy shapes kept
+        # off the schema on purpose, e.g. delegate_task's single-goal form). Counted as
+        # known by the unknown-arg check so strict mode never rejects a valid call.
+        self.extra_accepted_args = frozenset(extra_accepted_args or ())
 
 
 class _PluginOverridePolicy:
@@ -783,6 +788,7 @@ class ToolRegistry:
         override: bool = False,
         scope: Optional[str] = None,
         strict_args: bool = False,
+        extra_accepted_args: Optional[list] = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -879,6 +885,7 @@ class ToolRegistry:
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
                 strict_args=strict_args,
+                extra_accepted_args=extra_accepted_args,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -1168,19 +1175,20 @@ class ToolRegistry:
             params = (entry.schema or {}).get("parameters") or {}
             props = params.get("properties")
             if isinstance(args, dict) and isinstance(props, dict) and props and params.get("additionalProperties") is not True:
-                unknown_args = sorted(k for k in args if k not in props)
+                accepted = set(props) | set(entry.extra_accepted_args)
+                unknown_args = sorted(k for k in args if k not in accepted)
                 if unknown_args:
                     logger.warning(
                         "Tool %s called with argument(s) %s not in its schema (accepted: %s) — "
                         "the handler will ignore them unless it checks explicitly",
-                        name, unknown_args, sorted(props),
+                        name, unknown_args, sorted(accepted),
                     )
         except Exception:  # noqa: BLE001 — schema introspection must never block dispatch
             unknown_args = []
         if unknown_args and entry.strict_args:
             return tool_error(
                 f"{name}: unknown argument(s) {unknown_args} — not in the tool schema, "
-                f"so they would be silently ignored. Accepted: {sorted(props)}"
+                f"so they would be silently ignored. Accepted: {sorted(accepted)}"
             )
         try:
             if entry.is_async:

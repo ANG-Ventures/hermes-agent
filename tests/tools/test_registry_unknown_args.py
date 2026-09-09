@@ -56,3 +56,15 @@ def test_delegate_task_is_registered_strict():
     import tools.delegate_tool  # noqa: F401 — registers the tool
     from tools.registry import registry
     assert registry.get_entry("delegate_task").strict_args is True
+
+
+def test_delegate_task_legacy_single_goal_shape_is_not_rejected():
+    """The schema omits goal/context/role on purpose (legacy shape); strict mode must
+    still accept them — only a genuinely unknown key (model=) is rejected."""
+    import tools.delegate_tool  # noqa: F401
+    from tools.registry import registry
+    entry = registry.get_entry("delegate_task")
+    props = set(entry.schema["parameters"]["properties"]) | set(entry.extra_accepted_args)
+    for k in ("goal", "context", "role", "tasks", "background", "skills"):
+        assert k in props, k
+    assert "model" not in props
