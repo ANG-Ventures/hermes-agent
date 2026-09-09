@@ -40,7 +40,9 @@ class RecordingAdapter:
         return SimpleNamespace(success=True)
 
     async def send_or_update_status(self, *args, **kwargs):
-        raise AssertionError("Route changes must not use an overwriteable status bubble")
+        raise AssertionError(
+            "Route changes must not use an overwriteable status bubble"
+        )
 
 
 def make_agent(monkeypatch):
@@ -146,7 +148,7 @@ def test_every_cause_announces_route_change_in_same_turn(monkeypatch, reason):
 
 @pytest.mark.parametrize("announce_recovery", [True, False])
 def test_pool_exhaustion_then_429_delivers_each_hop_before_final(
-    monkeypatch, announce_recovery
+    monkeypatch, announce_recovery, capsys
 ):
     agent = make_agent(monkeypatch)
     adapter = RecordingAdapter()
@@ -203,10 +205,16 @@ def test_pool_exhaustion_then_429_delivers_each_hop_before_final(
 
     asyncio.run(scenario())
     assert attempts == ["primary/model"] * 3 + ["fallback/one", "fallback/two"]
+    console = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("🔄 Model")
+    ]
+    assert console == [text for _, text, _ in adapter.messages]
 
 
-def test_effort_only_fallback_and_restore_are_each_delivered(monkeypatch):
-    """Same provider/model on another endpoint still changes reasoning effort."""
+def test_effort_only_fallback_and_restore_are_each_delivered(monkeypatch, capsys):
+    """Mutation: drop effort from the fallback identity tuples -> silent/RED."""
     agent = make_agent(monkeypatch)
     agent.reasoning_config = {"effort": "high"}
     agent._primary_runtime["reasoning_config"] = dict(agent.reasoning_config)
@@ -239,6 +247,12 @@ def test_effort_only_fallback_and_restore_are_each_delivered(monkeypatch):
         assert "(high)" in adapter.messages[-1][1]
 
     asyncio.run(scenario())
+    console = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("🔄 Model")
+    ]
+    assert console == [text for _, text, _ in adapter.messages]
 
 
 @pytest.mark.parametrize(
