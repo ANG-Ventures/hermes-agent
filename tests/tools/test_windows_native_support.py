@@ -538,36 +538,40 @@ class TestTuiGatewayEntrySignalGuards:
 
 
 # ---------------------------------------------------------------------------
-# hermes_cli/kanban_db.py waitpid guard
+# hermes_cli/kanban_db.py portable worker polling
 # ---------------------------------------------------------------------------
 
 
-class TestKanbanWaitpidWindowsGuard:
-    """os.WNOHANG doesn't exist on Windows — the dispatcher tick reap loop
-    must be gated behind ``os.name != "nt"``."""
+class TestKanbanWorkerPolling:
+    """Popen owns host-specific reaping; the dispatcher consumes native codes."""
 
-    def test_source_gates_waitpid_loop(self):
-        root = Path(__file__).resolve().parents[2]
-        source = (root / "hermes_cli" / "kanban_db.py").read_text(encoding="utf-8")
-        # Find the waitpid call and confirm it's inside a POSIX gate.
-        idx = source.find("os.waitpid(-1, os.WNOHANG)")
-        assert idx > 0, "waitpid call must exist"
-        # Look backwards up to 400 chars for the gate. Accept either form:
-        #   `if os.name != "nt":` (run iff POSIX), or
-        #   `if os.name == "nt": return []` (early-return guard).
-        # Both correctly keep the waitpid loop off Windows; the early-return
-        # form is stronger because the rest of the function never runs.
-        preamble = source[max(0, idx - 400):idx]
-        guard_patterns = (
-            'os.name != "nt"',
-            "os.name != 'nt'",
-            'os.name == "nt"',  # early-return guard
-            "os.name == 'nt'",
-        )
-        assert any(p in preamble for p in guard_patterns), (
-            "os.waitpid(-1, os.WNOHANG) must sit behind an os.name guard "
-            f"(checked patterns: {guard_patterns})"
-        )
+    @pytest.mark.parametrize("code,kind", [(0, "clean_exit"), (75, "rate_limited"),
+                                         (1, "nonzero_exit"), (3221225477, "nonzero_exit")])
+    def test_poll_classifies_native_returncodes(self, monkeypatch, code, kind):
+        from hermes_cli import kanban_db as kb
+        finished = MagicMock()
+        finished.poll.return_value = code
+        running = MagicMock()
+        running.poll.return_value = None
+        monkeypatch.setattr(kb, "_worker_processes", {101: finished, 102: running})
+        monkeypatch.setattr(kb, "_recent_worker_exits", {})
+        assert kb.reap_worker_zombies() == [101]
+        assert kb._classify_worker_exit(101) == (kind, code)
+        assert kb._worker_processes == {102: running}
+        finished.poll.assert_called_once_with()
+        running.poll.assert_called_once_with()
+
+    @pytest.mark.windows_only
+    def test_real_worker_poll_windows(self, monkeypatch):
+        from hermes_cli import kanban_db as kb
+        monkeypatch.setattr(kb, "_worker_processes", {})
+        monkeypatch.setattr(kb, "_recent_worker_exits", {})
+        with subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(75)"],
+                              stdin=subprocess.DEVNULL) as proc:
+            proc.wait(timeout=10)
+            kb._worker_processes[proc.pid] = proc
+            assert kb.reap_worker_zombies() == [proc.pid]
+            assert kb._classify_worker_exit(proc.pid) == ("rate_limited", 75)
 
 
 # ---------------------------------------------------------------------------

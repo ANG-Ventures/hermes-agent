@@ -891,6 +891,49 @@ kanban:
   default_workdir: ~/work/active-project
 ```
 
+### Provider quota recovery
+
+Workers publish atomic, per-run exit receipts under
+`<board-db-directory>/runs/<task_id>.<run_id>.exit.json`. The dispatcher reads
+the exact run's receipt before consulting process status, so another gateway
+subprocess reaper cannot turn a quota exit into a crash. Ordinary and goal-mode
+workers use the same result-aware exit path. Rate-limit, billing, and exhausted
+subscription-pool failures exit with code 75; generic overloads and tool failures
+remain errors. A quota exit returns to the run's source lane (`ready` or `review`)
+without increasing `consecutive_failures`.
+
+```yaml
+kanban:
+  rate_limit_cooldown_seconds: 300  # nonnegative integer; 0 retries next tick
+  provider_health_probes: {}       # opt-in provider name -> HTTP(S) health URL
+```
+
+Configure probes on the dispatcher's profile, for example
+`provider_health_probes: {my-pool: "http://localhost:8080/health"}`. The effective
+provider follows the worker's explicit task override, inline `provider/model`
+override, then the assigned profile's model provider. Before claiming a task in
+either lane, the dispatcher probes its configured URL with a one-second timeout
+(at most once per URL per tick). `eligible_count: 0` or `status: all_capped`
+leaves the card in its lane and emits `deferred` with `reason: provider_capped`
+and the probe's `reset_at`, if supplied. The next tick checks again. Missing,
+malformed, or unreachable probes do not prevent dispatch.
+
+To repair older quota failures that were counted as crashes:
+
+```bash
+hermes kanban repair --reclassify-quota-crashes --board my-board --dry-run --json
+hermes kanban repair --reclassify-quota-crashes --board my-board --json
+```
+
+Dry-run opens the board read-only without schema migrations. Review its proposed
+run IDs before applying: historical classification uses the crash event's saved
+stderr quota patterns. Apply changes only still-crashed run outcomes, preserves
+the original events, and appends audit events. It discounts matching failures
+only in the current automatic crash-breaker streak, releasing cards below their
+recorded limit while preserving dependency and review-lane gating. Explicit human
+blocks, live claims, successful cards, and unrelated crashes are not reopened.
+Repeating the repair does not discount the same run twice.
+
 ### Scheduled task starts (`scheduled_at`)
 
 Set `scheduled_at` on a task to delay dispatch until a specific time. The dispatcher skips ready tasks whose `scheduled_at` is in the future and picks them up on the first tick after that timestamp.

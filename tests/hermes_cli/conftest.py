@@ -5,6 +5,14 @@ from __future__ import annotations
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_kanban_process_registry(monkeypatch):
+    """Retained fake Popen handles must not leak into the next test's tick."""
+    from hermes_cli import kanban_db
+    monkeypatch.setattr(kanban_db, "_worker_processes", {})
+    monkeypatch.setattr(kanban_db, "_recent_worker_exits", {})
+
+
 @pytest.fixture
 def all_assignees_spawnable(monkeypatch):
     """Pretend every assignee maps to a real Hermes profile.

@@ -1217,6 +1217,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_repair.add_argument("--json", action="store_true",
                           help="Emit the repair report as JSON")
+    p_repair.add_argument("--reclassify-quota-crashes", action="store_true",
+                          help="Reclassify recorded quota crashes without counting task failures")
+    p_repair.add_argument("--dry-run", action="store_true",
+                          help="Report quota repairs without writes or schema migration")
+    p_repair.add_argument("--board", default=argparse.SUPPRESS,
+                          help="Board to repair (also accepted before the repair verb)")
 
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
@@ -4258,6 +4264,32 @@ def _cmd_repair(args: argparse.Namespace) -> int:
     1 = still corrupt (non-index corruption, or REINDEX did not produce a
     clean re-check).
     """
+    if getattr(args, "reclassify_quota_crashes", False):
+        import sqlite3
+        from hermes_cli.kanban_quota_repair import reclassify_quota_crashes
+
+        conn = None
+        try:
+            dry_run = bool(getattr(args, "dry_run", False))
+            conn = kb.connect_readonly() if dry_run else kb.connect()
+            conn.row_factory = sqlite3.Row
+            quota_report = reclassify_quota_crashes(conn, dry_run=dry_run)
+        except Exception as exc:
+            print(f"kanban repair: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            if conn is not None:
+                conn.close()
+        if getattr(args, "json", False):
+            print(json.dumps(quota_report, indent=2))
+        else:
+            prefix = "Would repair" if dry_run else "Repaired"
+            print(f"{prefix} {quota_report['reclassified']} quota-crashed runs; "
+                  f"{len(quota_report['unblocked'])} cards unblocked.")
+        return 0
+    if getattr(args, "dry_run", False):
+        print("kanban repair: --dry-run requires --reclassify-quota-crashes", file=sys.stderr)
+        return 2
     try:
         report = kb.repair_db()
     except Exception as exc:  # locked/busy probe, unexpected I/O

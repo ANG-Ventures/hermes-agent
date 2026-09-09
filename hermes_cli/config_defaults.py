@@ -2989,6 +2989,10 @@ DEFAULT_CONFIG = {
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
         "failure_limit": 2,
+        # Quota releases are not task failures. Defer the next attempt this long.
+        "rate_limit_cooldown_seconds": 300,
+        # Optional provider -> health URL admission probes; disabled by default.
+        "provider_health_probes": {},
         # Worker stdout/stderr logs rotate at spawn time. Defaults preserve
         # the historical 2 MiB + one-backup behavior; long-running workers can
         # raise these to keep more early failure evidence.
