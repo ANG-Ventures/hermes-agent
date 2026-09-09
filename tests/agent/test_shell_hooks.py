@@ -658,11 +658,13 @@ class TestEvaluateResult:
         )
         assert r is None
 
-    def test_empty_stdout_passes_fail_closed(self):
+    def test_empty_stdout_blocks_fail_closed(self):
         r = shell_hooks._evaluate_result(
             self._spec(fail_closed=True), _spawn_result(stdout=""),
         )
-        assert r is None
+        assert r is not None
+        assert r["action"] == "block"
+        assert "unparseable stdout" in r["message"]
 
     def test_fail_closed_on_non_blocking_event_still_fails_open(self):
         """Defense in depth: even if a spec sneaks past parsing with
