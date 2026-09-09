@@ -50,6 +50,30 @@ def _fmt_ts(ts: Optional[int]) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
+def _fmt_respawn_guard_detail(detail: Optional[dict]) -> str:
+    """`` — "<error>" recorded <ts> (Ns ago), eligible <ts>`` for a deferral
+    the respawn guard derived from a stamped failure; empty otherwise."""
+    if not detail:
+        return ""
+    now = int(time.time())
+    parts = []
+    err = detail.get("error")
+    if err:
+        err = " ".join(str(err).split())
+        if len(err) > 120:
+            err = err[:117] + "..."
+        parts.append(f'"{err}"')
+    recorded_at = detail.get("recorded_at")
+    if recorded_at:
+        parts.append(
+            f"recorded {_fmt_ts(recorded_at)} ({max(0, now - int(recorded_at))}s ago)"
+        )
+    eligible_at = detail.get("eligible_at")
+    if eligible_at:
+        parts.append(f"eligible {_fmt_ts(eligible_at)}")
+    return " — " + ", ".join(parts) if parts else ""
+
+
 def _fmt_task_line(t: kb.Task) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
@@ -3301,7 +3325,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "respawn_guarded": [
-                {"task_id": tid, "reason": reason}
+                {"task_id": tid, "reason": reason,
+                 **res.respawn_guard_details.get(tid, {})}
                 for (tid, reason) in res.respawn_guarded
             ],
             "auto_assigned_default": res.auto_assigned_default,
@@ -3394,7 +3419,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             )
     if res.respawn_guarded:
         for tid, reason in res.respawn_guarded:
-            print(f"Deferred (respawn guard {reason}): {tid}")
+            print(
+                f"Deferred (respawn guard {reason}): {tid}"
+                + _fmt_respawn_guard_detail(res.respawn_guard_details.get(tid))
+            )
     if res.skipped_nonspawnable:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
