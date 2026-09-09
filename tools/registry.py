@@ -207,12 +207,14 @@ class ToolEntry:
     __slots__ = (
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
-        "max_result_size_chars", "dynamic_schema_overrides",
+        "max_result_size_chars", "dynamic_schema_overrides", "strict_args",
+        "extra_accepted_args",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 strict_args=False, extra_accepted_args=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -231,6 +233,16 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        # When True, dispatch() rejects model-supplied arguments the schema does not
+        # declare (instead of only logging). Opt-in per tool: right for tools whose
+        # handler reads args by name and would otherwise silently drop an intent
+        # (delegate_task's imaginary `model=`); wrong for tools that inspect stray
+        # keys to give a better error (execute_code's `command` redirect).
+        self.strict_args = strict_args
+        # Keys the HANDLER accepts beyond the model-facing schema (legacy shapes kept
+        # off the schema on purpose, e.g. delegate_task's single-goal form). Counted as
+        # known by the unknown-arg check so strict mode never rejects a valid call.
+        self.extra_accepted_args = frozenset(extra_accepted_args or ())
 
 
 class _PluginOverridePolicy:
@@ -775,6 +787,8 @@ class ToolRegistry:
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
         scope: Optional[str] = None,
+        strict_args: bool = False,
+        extra_accepted_args: Optional[list] = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -870,6 +884,8 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                strict_args=strict_args,
+                extra_accepted_args=extra_accepted_args,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -1144,6 +1160,36 @@ class ToolRegistry:
         entry = self.get_entry(name, scope=scope)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
+        # A model-supplied argument the schema does not declare is silently dropped by
+        # handlers that read args.get(...) by name — the call "succeeds" while doing
+        # something other than what the model asked. 2026-09-09: delegate_task was
+        # called with model={provider, model}; no such parameter exists, the override
+        # vanished, and both children ran on the (capped) config default and 429'd.
+        # The registry does NOT reject here — handlers legitimately inspect undeclared
+        # keys to give a BETTER error (execute_code redirects a stray `command`), and
+        # hook tests inject probe keys. Instead: log at WARNING with the accepted set,
+        # and hand the handler the list under a reserved kwarg so a tool that wants to
+        # be strict (delegate_task) can fail loudly with the same message.
+        unknown_args: list = []
+        try:
+            params = (entry.schema or {}).get("parameters") or {}
+            props = params.get("properties")
+            if isinstance(args, dict) and isinstance(props, dict) and props and params.get("additionalProperties") is not True:
+                accepted = set(props) | set(entry.extra_accepted_args)
+                unknown_args = sorted(k for k in args if k not in accepted)
+                if unknown_args:
+                    logger.warning(
+                        "Tool %s called with argument(s) %s not in its schema (accepted: %s) — "
+                        "the handler will ignore them unless it checks explicitly",
+                        name, unknown_args, sorted(accepted),
+                    )
+        except Exception:  # noqa: BLE001 — schema introspection must never block dispatch
+            unknown_args = []
+        if unknown_args and entry.strict_args:
+            return tool_error(
+                f"{name}: unknown argument(s) {unknown_args} — not in the tool schema, "
+                f"so they would be silently ignored. Accepted: {sorted(accepted)}"
+            )
         try:
             if entry.is_async:
                 from model_tools import _run_async

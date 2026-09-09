@@ -5743,6 +5743,14 @@ registry.register(
     name="delegate_task",
     toolset="delegation",
     schema=DELEGATE_TASK_SCHEMA,
+    # Reject undeclared args (e.g. an imaginary per-call `model=`): the handler below
+    # reads args by name, so anything not in the schema would be silently dropped
+    # and the children would run on the config default (2026-09-09).
+    strict_args=True,
+    # The legacy single-goal shape is accepted by the handler but deliberately kept off
+    # the model-facing schema (see the NOTE on DELEGATE_TASK_SCHEMA); list it here so
+    # strict mode never rejects a valid goal= call.
+    extra_accepted_args=["goal", "context", "role", "max_iterations", "background", "output_schema"],
     handler=lambda args, **kw: delegate_task(
         goal=args.get("goal"),
         context=args.get("context"),
