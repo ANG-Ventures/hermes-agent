@@ -9224,6 +9224,29 @@ _RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS: tuple[str, ...] = (
     "triage_resolved",
     "reopened",
 )
+# Event kinds that make a stamped failure STALE for the ``blocker_auth`` and
+# ``rate_limit_cooldown`` rules when they land at/after the failing run ended:
+# the operator-intent verbs above, the requeue events ``recent_success``
+# already honors (status / promoted / unblocked / reclaimed), and the two
+# LANE-CHANGE verbs (reassign, set-model) — a quota wall belongs to the
+# provider lane that hit it, not to the task. 2026-09-09, hermes-fork
+# t_53316ee6: a 429 stamped that morning kept deferring the card as
+# ``blocker_auth`` after a review reopen until the column was NULLed by hand;
+# a set-model to a pool with free seats still sat out the full cooldown.
+_RESPAWN_GUARD_FAILURE_RESET_KINDS: tuple[str, ...] = (
+    *_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS,
+    "status",
+    "promoted",
+    "reclaimed",
+    "assigned",
+    "model_override_set",
+)
+# Run outcomes that stamp ``tasks.last_failure_error``. A newer run with any
+# other outcome (completed / review_requested / changes_requested / blocked /
+# reclaimed / stale ...) supersedes the stamped text: it belongs to history.
+_RESPAWN_GUARD_FAILURE_OUTCOMES: frozenset[str] = frozenset(
+    {"crashed", "timed_out", "spawn_failed", "gave_up", "rate_limited"}
+)
 _RESPAWN_GUARD_PR_QUERY_LIMIT = 5
 _RESPAWN_GUARD_PR_QUERY_TIMEOUT_SECONDS = 5
 _RESPAWN_GUARD_PR_TERMINAL_CACHE_LIMIT = 1024
@@ -9567,6 +9590,11 @@ class DispatchResult:
     Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    respawn_guard_details: dict[str, dict] = field(default_factory=dict)
+    """For failure-derived guard reasons (``blocker_auth`` /
+    ``rate_limit_cooldown``): ``task_id`` → ``{"error", "recorded_at",
+    "eligible_at"}`` so the deferral names WHICH error text is holding the
+    task and WHEN it was recorded (staleness is visible, not inferred)."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
@@ -10949,18 +10977,62 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def _respawn_guard_eligible_at(
+    next_eligible_at: Optional[int],
+    failed_at: Optional[int],
+    cooldown: int,
+) -> Optional[int]:
+    """When the failure stamped on a task stops deferring its respawn.
+
+    ``tasks.next_eligible_at`` wins when it was stamped for THIS failure
+    (at/after the failing run ended); a leftover from an earlier rate-limit
+    requeue is ignored and the bound is derived as ``failed_at + cooldown``.
+    """
+    if next_eligible_at is not None and (
+        failed_at is None or int(next_eligible_at) >= failed_at
+    ):
+        return int(next_eligible_at)
+    if failed_at is not None:
+        return failed_at + cooldown
+    return None
+
+
+def _respawn_guard_failure_reset_after(
+    conn: sqlite3.Connection, task_id: str, failed_at: int,
+) -> bool:
+    """True when a requeue / lane-change event landed at/after ``failed_at``.
+
+    Such an event makes the failure stamped on the task stale for the
+    ``rate_limit_cooldown`` and ``blocker_auth`` respawn-guard rules.
+    """
+    kinds_sql = ",".join("?" * len(_RESPAWN_GUARD_FAILURE_RESET_KINDS))
+    return conn.execute(
+        "SELECT 1 FROM task_events "
+        "WHERE task_id = ? AND created_at >= ? "
+        f"AND kind IN ({kinds_sql}) LIMIT 1",
+        (task_id, failed_at, *_RESPAWN_GUARD_FAILURE_RESET_KINDS),
+    ).fetchone() is not None
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     lane: str = "ready",
     pr_state_resolver: Optional[_PrStateResolver] = None,
+    detail: Optional[dict] = None,
 ) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
     Called per ready/review task in ``dispatch_once`` before any claim attempt.
     Returning a reason defers the spawn this tick; the task stays in its
     source phase and gets another chance on the next dispatcher tick.
+
+    ``detail`` (optional dict) is filled in-place for the failure-derived
+    reasons (``rate_limit_cooldown`` / ``blocker_auth``) with ``error`` (the
+    stamped text), ``recorded_at`` (when the failing run ended) and
+    ``eligible_at`` (when the guard stops deferring), so the dispatcher can
+    name WHICH error is holding the task and HOW OLD it is.
 
     ``lane`` names the dispatch column the task is being spawned from
     (``"ready"`` or ``"review"``). In the review lane the
@@ -11030,38 +11102,78 @@ def check_respawn_guard(
     #    We look at the LATEST run only (ORDER BY ended_at DESC LIMIT 1): if a
     #    newer crash/completion superseded the rate-limit run, this guard
     #    no longer applies and the normal paths take over.
+    #
+    #    A requeue / lane-change event (``_RESPAWN_GUARD_FAILURE_RESET_KINDS``)
+    #    at/after the rate-limited run resets the cooldown: the wall belonged
+    #    to the provider lane the task was on when it hit it.
     rl_cooldown = _resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
-        "SELECT outcome, ended_at FROM task_runs "
+        "SELECT outcome, ended_at, error FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    if (
-        latest_run is not None
-        and latest_run["outcome"] == "rate_limited"
-    ):
-        next_eligible_at = row["next_eligible_at"]
-        if next_eligible_at is not None:
-            return "rate_limit_cooldown" if now < next_eligible_at else None
-        if rl_cooldown <= 0:
-            # Cooldown disabled — respawn immediately, and skip the
-            # blocker_auth regex so the stamped rate-limit text doesn't
-            # re-trap the task.
+    latest_outcome = latest_run["outcome"] if latest_run is not None else None
+    failed_at: Optional[int] = (
+        int(latest_run["ended_at"])
+        if latest_run is not None and latest_run["ended_at"] is not None
+        else None
+    )
+    if latest_outcome == "rate_limited":
+        if failed_at is not None and _respawn_guard_failure_reset_after(
+            conn, task_id, failed_at,
+        ):
             return None
-        ended_at = latest_run["ended_at"]
-        if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
+        eligible_at = _respawn_guard_eligible_at(
+            row["next_eligible_at"], failed_at, rl_cooldown,
+        )
+        if eligible_at is not None and now < int(eligible_at):
+            if detail is not None:
+                detail.update(
+                    error=row["last_failure_error"] or latest_run["error"],
+                    recorded_at=failed_at,
+                    eligible_at=int(eligible_at),
+                )
             return "rate_limit_cooldown"
-        # Cooldown elapsed — allow the respawn. Return early so the
-        # blocker_auth check below doesn't catch the rate-limit text we
-        # stamped on the task; this path intentionally retries forever
+        # Cooldown elapsed (or disabled) — allow the respawn. Return early
+        # so the blocker_auth check below doesn't catch the rate-limit text
+        # we stamped on the task; this path intentionally retries forever
         # (cheaply, spaced by the cooldown) until quota returns or a real
         # crash/completion supersedes it.
         return None
 
-    # 2. Quota / auth blocker: retrying immediately will not help.
+    # 2. Quota / auth blocker: retrying immediately will not help. The
+    #    stamped text is only evidence while it is CURRENT:
+    #      * a newer run with a non-failure outcome (review_requested,
+    #        completed, ...) supersedes it — the column is just history;
+    #      * a requeue / lane-change event at/after the failing run means
+    #        an operator (or the lifecycle) deliberately put the task back;
+    #      * older than the provider cooldown (``next_eligible_at``, else
+    #        ended_at + cooldown) it is no longer a blocker — allow a probe
+    #        so the breaker can accumulate real failures instead of the
+    #        task parking on one stale 429 forever.
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
+        if (
+            latest_outcome is not None
+            and latest_outcome not in _RESPAWN_GUARD_FAILURE_OUTCOMES
+        ):
+            return None
+        if failed_at is not None and _respawn_guard_failure_reset_after(
+            conn, task_id, failed_at,
+        ):
+            return None
+        eligible_at = _respawn_guard_eligible_at(
+            row["next_eligible_at"], failed_at, rl_cooldown,
+        )
+        if eligible_at is not None and now >= int(eligible_at):
+            return None
+        if detail is not None:
+            detail.update(
+                error=err,
+                recorded_at=failed_at,
+                eligible_at=int(eligible_at) if eligible_at is not None else None,
+            )
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR
@@ -12189,11 +12301,15 @@ def _dispatch_once_locked(
         # still trips the auto-block circuit breaker after failure_limit
         # consecutive failures, so a persistent auth error eventually
         # blocks via the normal path rather than on first occurrence.
+        guard_detail: dict = {}
         guard_reason = check_respawn_guard(
             conn, row["id"], pr_state_resolver=pr_state_resolver,
+            detail=guard_detail,
         )
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
+            if guard_detail:
+                result.respawn_guard_details[row["id"]] = guard_detail
             # Emit an event so operators can see why the task was
             # skipped when reading `hermes kanban tail` — without
             # this the task appears stuck in ready with no diagnosis.
@@ -12201,7 +12317,7 @@ def _dispatch_once_locked(
                 with write_txn(conn):
                     _append_event(
                         conn, row["id"], "respawn_guarded",
-                        {"reason": guard_reason},
+                        {"reason": guard_reason, **guard_detail},
                     )
             continue
         if provider_deferred(row["id"], row_assignee):
@@ -12363,14 +12479,19 @@ def _dispatch_once_locked(
                     (row["id"], row["assignee"], current)
                 )
                 continue
-        guard_reason = check_respawn_guard(conn, row["id"], lane="review")
+        guard_detail = {}
+        guard_reason = check_respawn_guard(
+            conn, row["id"], lane="review", detail=guard_detail,
+        )
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
+            if guard_detail:
+                result.respawn_guard_details[row["id"]] = guard_detail
             if not dry_run:
                 with write_txn(conn):
                     _append_event(
                         conn, row["id"], "respawn_guarded",
-                        {"reason": guard_reason},
+                        {"reason": guard_reason, **guard_detail},
                     )
             continue
         if provider_deferred(row["id"], row["assignee"]):

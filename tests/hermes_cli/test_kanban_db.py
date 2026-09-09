@@ -2626,3 +2626,209 @@ def test_operator_requeue_kinds_constant_matches_verbs_that_emit_them():
     for fn, kind in verb_kinds.items():
         assert hasattr(kb, fn), fn
         assert kind in kb._RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS, f"{fn} emits {kind!r} which is not an override"
+
+
+# ---------------------------------------------------------------------------
+# Stale ``last_failure_error`` must not poison the respawn guard (2026-09-09,
+# hermes-fork t_53316ee6: a 429 stamped by a rate-limited run stayed on the
+# column after a LATER run ended ``review_requested`` and the card was
+# review-reopened; ``dispatch`` deferred it as ``blocker_auth`` every tick until
+# an operator NULLed the column by hand).
+# ---------------------------------------------------------------------------
+
+
+def _seed_quota_failure(conn, *, now, error="HTTP 429: usage limit reached"):
+    """A task whose latest run crashed with a quota error stamped on the task."""
+    tid = kb.create_task(conn, title="quota-stale", assignee="a")
+    kb.claim_task(conn, tid)
+    run_id = kb.get_task(conn, tid).current_run_id
+    conn.execute(
+        "UPDATE task_runs SET outcome='crashed', status='crashed', "
+        "ended_at=?, error=? WHERE id=?",
+        (now, error, run_id),
+    )
+    conn.execute(
+        "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+        "claim_expires=NULL, worker_pid=NULL, last_failure_error=? WHERE id=?",
+        (error, tid),
+    )
+    conn.commit()
+    return tid
+
+
+def test_respawn_guard_blocker_auth_defers_fresh_error(kanban_home, monkeypatch):
+    """Control: a quota error from the latest run, inside the cooldown, with no
+    requeue event after it, still defers as ``blocker_auth``."""
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = 5_000_000
+    with kb.connect() as conn:
+        tid = _seed_quota_failure(conn, now=now)
+        monkeypatch.setattr(kb.time, "time", lambda: now + 30)
+        assert kb.check_respawn_guard(conn, tid) == "blocker_auth"
+        assert kb.check_respawn_guard(conn, tid, lane="review") == "blocker_auth"
+
+
+def test_respawn_guard_ignores_error_superseded_by_later_run(kanban_home, monkeypatch):
+    """The founding case: a later run ended ``review_requested`` (not a failure),
+    so the stamped 429 belongs to history and must not defer the spawn."""
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = 5_000_000
+    with kb.connect() as conn:
+        tid = _seed_quota_failure(conn, now=now)
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, "
+                "started_at, ended_at) VALUES (?, 'a', 'review_requested', "
+                "'review_requested', ?, ?)",
+                (tid, now + 5, now + 10),
+            )
+        monkeypatch.setattr(kb.time, "time", lambda: now + 30)
+        assert kb.get_task(conn, tid).last_failure_error  # still stamped
+        assert kb.check_respawn_guard(conn, tid) is None
+        assert kb.check_respawn_guard(conn, tid, lane="review") is None
+
+
+@pytest.mark.parametrize(
+    "kind", ["status", "promoted", "review_reopened", "changes_requested",
+             "triage_resolved", "reopened", "assigned", "model_override_set"],
+)
+def test_respawn_guard_ignores_error_after_requeue_event(kanban_home, monkeypatch, kind):
+    """An explicit requeue / lane-change event AFTER the failure means the error
+    is stale — the task was deliberately put back, spawn it."""
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = 5_000_000
+    with kb.connect() as conn:
+        tid = _seed_quota_failure(conn, now=now)
+        monkeypatch.setattr(kb.time, "time", lambda: now + 20)
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, kind, None)
+        monkeypatch.setattr(kb.time, "time", lambda: now + 30)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_respawn_guard_ignores_requeue_event_before_failure(kanban_home, monkeypatch):
+    """Mutation control for the event rule: a requeue event OLDER than the
+    failure does not unstick it."""
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = 5_000_000
+    with kb.connect() as conn:
+        tid = _seed_quota_failure(conn, now=now)
+        monkeypatch.setattr(kb.time, "time", lambda: now - 20)
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "review_reopened", None)
+        monkeypatch.setattr(kb.time, "time", lambda: now + 30)
+        assert kb.check_respawn_guard(conn, tid) == "blocker_auth"
+
+
+def test_respawn_guard_blocker_auth_is_age_bound(kanban_home, monkeypatch):
+    """A quota/auth error older than the provider cooldown is not a blocker:
+    the guard allows a probe, so the breaker can actually accumulate failures
+    instead of the task parking forever."""
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = 5_000_000
+    with kb.connect() as conn:
+        tid = _seed_quota_failure(conn, now=now)
+        monkeypatch.setattr(kb.time, "time", lambda: now + 299)
+        assert kb.check_respawn_guard(conn, tid) == "blocker_auth"
+        monkeypatch.setattr(kb.time, "time", lambda: now + 300)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+        # An explicit next_eligible_at wins over the derived age bound.
+        conn.execute(
+            "UPDATE tasks SET next_eligible_at=? WHERE id=?", (now + 900, tid),
+        )
+        conn.commit()
+        monkeypatch.setattr(kb.time, "time", lambda: now + 600)
+        assert kb.check_respawn_guard(conn, tid) == "blocker_auth"
+        monkeypatch.setattr(kb.time, "time", lambda: now + 900)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+@pytest.mark.parametrize("kind", ["model_override_set", "assigned"])
+def test_rate_limit_cooldown_resets_on_lane_change(kanban_home, monkeypatch, kind):
+    """SCOPE ADD: set-model / reassign after a rate-limited run resets the
+    cooldown — the quota wall belonged to the OLD provider lane."""
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = 5_000_000
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rl-lane", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='rate_limited', status='rate_limited', "
+            "ended_at=? WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, last_failure_error=?, "
+            "next_eligible_at=? WHERE id=?",
+            ("pid 1 exited rate-limited (quota wall) — requeued", now + 300, tid),
+        )
+        conn.commit()
+        monkeypatch.setattr(kb.time, "time", lambda: now + 100)
+        assert kb.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+
+        # Lane change via the real verbs (they emit the events).
+        if kind == "model_override_set":
+            assert kb.set_model_override(conn, tid, "other-model", "other-provider")
+        else:
+            assert kb.reassign_task(conn, tid, "b")
+        monkeypatch.setattr(kb.time, "time", lambda: now + 101)
+        assert kb.check_respawn_guard(conn, tid) is None
+        # ...and the stale rate-limit text must not fall through to blocker_auth.
+        assert kb.check_respawn_guard(conn, tid, lane="review") is None
+
+
+def test_rate_limit_cooldown_ignores_lane_change_before_run(kanban_home, monkeypatch):
+    """Mutation control: a model change BEFORE the rate-limited run is not a reset."""
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = 5_000_000
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rl-lane-old", assignee="a")
+        monkeypatch.setattr(kb.time, "time", lambda: now - 50)
+        assert kb.set_model_override(conn, tid, "other-model", "other-provider")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='rate_limited', status='rate_limited', "
+            "ended_at=? WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, next_eligible_at=? WHERE id=?",
+            (now + 300, tid),
+        )
+        conn.commit()
+        monkeypatch.setattr(kb.time, "time", lambda: now + 100)
+        assert kb.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+
+
+def test_dispatch_respawn_guard_detail_names_error_and_age(kanban_home, monkeypatch):
+    """``dispatch`` surfaces WHICH error text deferred the task and WHEN it was
+    recorded / becomes eligible, on the result and on the ``respawn_guarded``
+    event, so staleness is visible without opening the DB."""
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = 5_000_000
+    with kb.connect() as conn:
+        tid = _seed_quota_failure(conn, now=now, error="HTTP 429: usage limit reached")
+        monkeypatch.setattr(kb.time, "time", lambda: now + 30)
+        res = kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        assert res.respawn_guarded == [(tid, "blocker_auth")]
+        detail = res.respawn_guard_details[tid]
+        assert detail["error"] == "HTTP 429: usage limit reached"
+        assert detail["recorded_at"] == now
+        assert detail["eligible_at"] == now + 300
+        ev = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='respawn_guarded' "
+            "ORDER BY id DESC LIMIT 1", (tid,),
+        ).fetchone()
+        payload = json.loads(ev["payload"])
+        assert payload["reason"] == "blocker_auth"
+        assert payload["error"] == "HTTP 429: usage limit reached"
+        assert payload["recorded_at"] == now
+        assert payload["eligible_at"] == now + 300
