@@ -82,7 +82,12 @@ jobs:
     if: needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/tests.yml
     with:
-      slice_count: 12
+      # 2026-09-09: 12 -> 16. On the fork's hosted 4-vCPU runners every exit-143
+      # "runner received a shutdown signal" death this week (9 jobs, 09-08..09-09)
+      # hit a slice that had already run 412-784 s; the passing distribution is
+      # 4-6 min. Shorter slices keep each job out of that window. Three PRs
+      # (#651 x2, #660) were blocked by it with no test actually failing.
+      slice_count: 16
       test_scope: ${{ needs.detect.outputs.test_scope }}
 
   # macOS + Windows lanes. The main `tests` lane above is Linux-only, and
