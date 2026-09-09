@@ -1144,6 +1144,25 @@ class ToolRegistry:
         entry = self.get_entry(name, scope=scope)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
+        # A model-supplied argument the schema does not declare is silently dropped by
+        # handlers that read args.get(...) by name — the call "succeeds" while doing
+        # something other than what the model asked. 2026-09-09: delegate_task was
+        # called with model={provider, model}; no such parameter exists, the override
+        # vanished, and both children ran on the (capped) config default and 429'd.
+        # Surface it loudly instead: fail the call and name the unknown keys, unless
+        # the schema opts into additionalProperties.
+        try:
+            props = ((entry.schema or {}).get("parameters") or {}).get("properties")
+            extra = (entry.schema or {}).get("parameters", {}).get("additionalProperties", None)
+            if isinstance(args, dict) and isinstance(props, dict) and props and extra is not True:
+                unknown = sorted(k for k in args if k not in props)
+                if unknown:
+                    return tool_error(
+                        f"{name}: unknown argument(s) {unknown} — not in the tool schema, "
+                        f"so they would be silently ignored. Accepted: {sorted(props)}"
+                    )
+        except Exception:  # noqa: BLE001 — schema introspection must never block dispatch
+            pass
         try:
             if entry.is_async:
                 from model_tools import _run_async
