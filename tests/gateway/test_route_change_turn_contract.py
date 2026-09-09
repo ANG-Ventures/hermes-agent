@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -274,6 +275,21 @@ def test_reinit_route_or_effort_change_is_delivered_by_real_turn_runner(
         agent, "_interruptible_streaming_api_call", lambda *a, **kw: response()
     )
     adapter = RecordingAdapter()
+    owner = make_turn_owner(agent, prior, cached=cached)
+
+    async def scenario():
+        await run_turn(owner, agent, adapter)
+        assert len(adapter.messages) == 1
+        text = adapter.messages[0][1]
+        if not cached:
+            assert f"{prior['provider']}/{prior['model']}" in text
+        assert "openrouter/primary/model" in text
+        assert "high" in text and "medium" in text
+
+    asyncio.run(scenario())
+
+
+def make_turn_owner(agent, prior, *, cached=True, effort="medium"):
     owner = MagicMock()
     owner.config = SimpleNamespace(streaming=None)
     owner._provider_routing = {}
@@ -294,7 +310,7 @@ def test_reinit_route_or_effort_change_is_delivered_by_real_turn_runner(
     owner.session_store._entries = {"test-session-key": entry}
     owner._get_system_prompt_for_channel.return_value = None
     owner._resolve_session_agent_runtime.return_value = (agent.model, {})
-    owner._resolve_session_reasoning_config.return_value = {"effort": "medium"}
+    owner._resolve_session_reasoning_config.return_value = {"effort": effort}
     owner._resolve_session_service_tier.return_value = None
     owner._resolve_turn_agent_config.return_value = {
         "model": agent.model,
@@ -315,36 +331,171 @@ def test_reinit_route_or_effort_change_is_delivered_by_real_turn_runner(
         GatewayRunner._announce_and_persist_served_route.__get__(owner)
     )
     owner._switch_announce_enabled = GatewayRunner._switch_announce_enabled
+    return owner
+
+
+async def run_turn(owner, agent, adapter, user_config=None):
+    ctx = TurnContext(
+        source=SessionSource(
+            platform=Platform.DISCORD, chat_id="test-chat", user_id="test-user"
+        ),
+        message="hello",
+        history=[],
+        session_id=agent.session_id,
+        session_key="test-session-key",
+        user_config=user_config or {},
+        AIAgent=lambda **kw: agent,
+        resolve_display_setting=lambda *a: False,
+        _run_still_current=lambda: True,
+        _hooks_ref=SimpleNamespace(loaded_hooks=False),
+        _current_status_adapter=lambda: adapter,
+        _status_chat_id="test-chat",
+        _loop_for_step=asyncio.get_running_loop(),
+    )
+    runner = TurnRunner(owner, ctx)
+    ctx._status_callback_sync = runner._status_callback_sync
+    result = await asyncio.to_thread(runner.run_sync)
+    await asyncio.sleep(0)
+    assert result["final_response"] == "Recovered"
+    return result
+
+
+def prepare_warm_fallback(monkeypatch, same_route):
+    agent = make_agent(monkeypatch)
+    agent.reasoning_config = {"effort": "medium"}
+    agent._primary_runtime["reasoning_config"] = dict(agent.reasoning_config)
+    agent._fallback_chain = [{
+        "provider": agent.provider,
+        "model": agent.model if same_route else "fallback/one",
+        "base_url": "https://fallback.example/v1",
+        "reasoning_effort": "high",
+    }]
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda *a, **kw: response())
+    monkeypatch.setattr(
+        agent, "_interruptible_streaming_api_call", lambda *a, **kw: response()
+    )
+    return agent
+
+
+@pytest.mark.parametrize("same_route", [False, True])
+@pytest.mark.parametrize("effort", ["medium", "low"])
+@pytest.mark.parametrize("announce_switch", [False, True])
+@pytest.mark.parametrize("announce_recovery", [False, True])
+def test_warm_cache_recovery_preserves_from_effort_and_announces_once(
+    monkeypatch, capsys, same_route, effort, announce_switch, announce_recovery
+):
+    """Mutation: unconditionally overwrite live effort in run_sync -> RED."""
+    agent = prepare_warm_fallback(monkeypatch, same_route)
+    adapter = RecordingAdapter()
+    owner = make_turn_owner(agent, None, effort=effort)
+    config = {"model": {
+        "announce_switch": announce_switch, "announce_recovery": announce_recovery,
+    }}
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: config)
 
     async def scenario():
-        ctx = TurnContext(
-            source=SessionSource(
-                platform=Platform.DISCORD, chat_id="test-chat", user_id="test-user"
-            ),
-            message="hello",
-            history=[],
-            session_id=agent.session_id,
-            session_key="test-session-key",
-            user_config={},
-            AIAgent=lambda **kw: agent,
-            resolve_display_setting=lambda *a: False,
-            _run_still_current=lambda: True,
-            _hooks_ref=SimpleNamespace(loaded_hooks=False),
-            _current_status_adapter=lambda: adapter,
-            _status_chat_id="test-chat",
-            _loop_for_step=asyncio.get_running_loop(),
+        await bind_delivery(agent, adapter)
+        assert await asyncio.to_thread(
+            agent._try_activate_fallback, reason=FailoverReason.overloaded
         )
-        runner = TurnRunner(owner, ctx)
-        ctx._status_callback_sync = runner._status_callback_sync
-        result = await asyncio.to_thread(runner.run_sync)
         await asyncio.sleep(0)
-        assert result["final_response"] == "Recovered"
         assert len(adapter.messages) == 1
-        text = adapter.messages[0][1]
-        if not cached:
-            assert f"{prior['provider']}/{prior['model']}" in text
-        assert "openrouter/primary/model" in text
-        assert "high" in text and "medium" in text
+        fallback = adapter.messages[0][1].split(": ", 1)[1]
+        assert fallback.endswith("(high)")
+        capsys.readouterr()
+        adapter.messages.clear()
+
+        result = await run_turn(owner, agent, adapter, config)
+        assert agent.model == "primary/model"
+        assert result["reasoning_config"] == {"effort": effort}
+        assert not agent._fallback_activated
+        assert len(adapter.messages) == int(announce_recovery)
+        if announce_recovery:
+            chat, text, _ = adapter.messages[0]
+            assert chat == "test-chat"
+            assert "Model recovery (restore)" in text
+            before, after = fallback.split(" → ")
+            assert text.split(": ", 1)[1] == (
+                f"{after} → {before.replace('(medium)', f'({effort})')}"
+            )
+        console = [line for line in capsys.readouterr().out.splitlines()
+                   if line.startswith(("🔄 Model", "🔀 Model"))]
+        assert console == [text for _, text, _ in adapter.messages]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("same_route", [False, True])
+@pytest.mark.parametrize("blocked_by", ["cooldown", "auto_recovery"])
+def test_warm_cache_blocked_recovery_keeps_fallback_effort(
+    monkeypatch, same_route, blocked_by
+):
+    agent = prepare_warm_fallback(monkeypatch, same_route)
+    adapter = RecordingAdapter()
+    owner = make_turn_owner(agent, None, effort="low")
+    config = {"model": {"announce_switch": True, "announce_recovery": True}}
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: config)
+
+    async def scenario():
+        await bind_delivery(agent, adapter)
+        assert await asyncio.to_thread(
+            agent._try_activate_fallback, reason=FailoverReason.overloaded
+        )
+        await asyncio.sleep(0)
+        old_model = agent.model
+        adapter.messages.clear()
+        if blocked_by == "cooldown":
+            agent._rate_limited_until = time.monotonic() + 3600
+        else:
+            config["model"]["auto_recovery"] = False
+        for _ in range(2):
+            result = await run_turn(owner, agent, adapter, config)
+            assert agent.model == old_model
+            assert agent._fallback_activated
+            assert result["reasoning_config"]["effort"] == "high"
+            assert adapter.messages == []
+        agent._rate_limited_until = 0
+        config["model"]["auto_recovery"] = True
+        result = await run_turn(owner, agent, adapter, config)
+        assert result["reasoning_config"] == {"effort": "low"}
+        assert len(adapter.messages) == 1
+        assert "Model recovery (restore)" in adapter.messages[0][1]
+        assert f"openrouter/{old_model} (high) → openrouter/primary/model (low)" in adapter.messages[0][1]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("announce_switch", [False, True])
+def test_cached_config_effort_change_survives_later_fallback(
+    monkeypatch, announce_switch
+):
+    """Mutation: omit primary reasoning snapshot refresh in run_sync -> RED."""
+    agent = prepare_warm_fallback(monkeypatch, same_route=False)
+    adapter = RecordingAdapter()
+    owner = make_turn_owner(agent, None, effort="low")
+    config = {"model": {"announce_switch": announce_switch, "announce_recovery": False}}
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: config)
+
+    async def scenario():
+        result = await run_turn(owner, agent, adapter, config)
+        assert result["reasoning_config"] == {"effort": "low"}
+        assert len(adapter.messages) == int(announce_switch)
+        if announce_switch:
+            assert "Model switched" in adapter.messages[0][1]
+            assert "effort medium→low" in adapter.messages[0][1]
+        await run_turn(owner, agent, adapter, config)
+        assert len(adapter.messages) == int(announce_switch)  # no-op is silent
+        assert await asyncio.to_thread(
+            agent._try_activate_fallback, reason=FailoverReason.overloaded
+        )
+        await asyncio.sleep(0)
+        adapter.messages.clear()
+        # Exercise core restoration too: gateway config refresh must update the
+        # snapshot, not leave the next non-gateway restore pointing at old effort.
+        assert await asyncio.to_thread(agent._restore_primary_runtime)
+        await asyncio.sleep(0)
+        assert agent.reasoning_config == {"effort": "low"}
+        assert adapter.messages == []
 
     asyncio.run(scenario())
 

@@ -445,6 +445,7 @@
       "tests/gateway/test_route_change_turn_contract.py::test_every_cause_announces_route_change_in_same_turn",
       "tests/gateway/test_route_change_turn_contract.py::test_pool_exhaustion_then_429_delivers_each_hop_before_final",
       "tests/gateway/test_route_change_turn_contract.py::test_manual_model_switch_delivers_once_without_old_turn_callback",
+      "tests/gateway/test_route_change_turn_contract.py::test_warm_cache_recovery_preserves_from_effort_and_announces_once",
       "tests/gateway/test_model_route_status_delivery.py"
     ],
     "paths": [
@@ -463,6 +464,9 @@
     "feature": "reasoning-effort-only changes announce with symmetric before/after identity",
     "tests": [
       "tests/gateway/test_route_change_turn_contract.py::test_effort_only_fallback_and_restore_are_each_delivered",
+      "tests/gateway/test_route_change_turn_contract.py::test_warm_cache_recovery_preserves_from_effort_and_announces_once",
+      "tests/gateway/test_route_change_turn_contract.py::test_warm_cache_blocked_recovery_keeps_fallback_effort",
+      "tests/gateway/test_route_change_turn_contract.py::test_cached_config_effort_change_survives_later_fallback",
       "tests/gateway/test_route_change_turn_contract.py::test_reinit_route_or_effort_change_is_delivered_by_real_turn_runner",
       "tests/gateway/test_reinit_recovery_announce.py::TestPersistOnlyEndOfTurn::test_effort_survives_session_entry_roundtrip",
       "tests/gateway/test_reinit_recovery_announce.py::TestPersistOnlyEndOfTurn::test_reasoning_command_not_reannounced_on_reinit"

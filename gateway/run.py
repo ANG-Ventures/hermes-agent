@@ -6553,9 +6553,21 @@ class TurnRunner:
         agent.notice_callback = _notice_callback_sync
         agent.notice_clear_callback = None
         agent.event_callback = ctx._event_callback_sync
+        # Resolution above describes the primary/session target, not an active
+        # fallback. Refresh the restore target without overwriting the actual
+        # fallback effort: restore_primary_runtime owns the transition and its
+        # single before/after announcement (or keeps the fallback while blocked).
+        _primary_runtime = getattr(agent, "_primary_runtime", None)
+        if isinstance(_primary_runtime, dict):
+            _primary_runtime["reasoning_config"] = (
+                dict(reasoning_config) if reasoning_config is not None else None
+            )
+        _on_fallback = getattr(agent, "_fallback_activated", False) is True
         _previous_reasoning_config = getattr(agent, "reasoning_config", None)
-        agent.reasoning_config = reasoning_config
-        if reused_cached_agent and self._runner._switch_announce_enabled(ctx.user_config):
+        if not _on_fallback:
+            agent.reasoning_config = reasoning_config
+        if (reused_cached_agent and not _on_fallback
+                and self._runner._switch_announce_enabled(ctx.user_config)):
             # Per-turn config resolution can change effort without rebuilding
             # the agent or changing its provider/model. Announce that real change
             # through this turn's freshly-bound callback, not the previous turn.
