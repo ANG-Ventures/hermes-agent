@@ -28,6 +28,30 @@ def creator_stamp_is_session_key(stamp: Any) -> bool:
     return ":" in str(stamp or "")
 
 
+def canonical_chat_type(platform: str, chat_type: str) -> str:
+    """Compatibility for pre-resolver Discord guild-channel envelopes."""
+    return "group" if platform == "discord" and chat_type == "channel" else chat_type
+
+
+def routing_owner_identity(session_key: str, source: Any):
+    """Type-free destination ownership, retaining profile/workspace/thread isolation."""
+    parts = session_key.split(":")
+    if len(parts) < 5 or parts[0] != "agent":
+        return None
+    if source is None:
+        return ("key", *parts[:3], *parts[4:])
+    platform = str(getattr(source.platform, "value", source.platform))
+    chat = str(source.chat_id or "")
+    if not chat:
+        return None
+    thread = str(source.thread_id or source.prospective_thread_id or "")
+    if platform == "discord" and thread:
+        chat, thread = thread, ""
+    scope = str(source.scope_id or "") if platform == "slack" else ""
+    user = str(source.user_id_alt or source.user_id or "")
+    return ("source", parts[1], platform, scope, chat, thread, user)
+
+
 def effective_routing_lane(
     *,
     platform: Any,
@@ -43,7 +67,7 @@ def effective_routing_lane(
 
     platform_value = clean(getattr(platform, "value", platform)).lower()
     chat = clean(chat_id)
-    kind = clean(chat_type).lower()
+    kind = canonical_chat_type(platform_value, clean(chat_type).lower())
     thread = clean(thread_id)
     prospective = clean(prospective_thread_id)
     if kind != "dm" and prospective and not thread:

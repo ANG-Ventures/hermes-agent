@@ -6067,10 +6067,32 @@ class DiscordAdapter(BasePlatformAdapter):
             except (asyncio.CancelledError, Exception):
                 pass
 
+    @staticmethod
+    def _session_chat_type(channel) -> str:
+        """Discord objects, not producer labels, define session identity."""
+        if isinstance(channel, discord.DMChannel):
+            return "dm"
+        if isinstance(channel, discord.Thread):
+            return "thread"
+        return "group"
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        # All synthetic producers (notify/wake, cron, delegation, restart)
+        # pass this boundary too. A lookup failure must not invent a DM route.
+        # Native messages/slashes already resolved their actual channel object.
+        if event.internal:
+            info = await self.get_chat_info(event.source.chat_id)
+            if info.get("error"):
+                raise RuntimeError("Cannot resolve Discord session channel")
+            event.source.chat_type = info["type"]
+            if info["type"] == "thread":
+                event.source.thread_id = event.source.chat_id
+        await super().handle_message(event)
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a Discord channel."""
         if not self._client:
-            return {"name": "Unknown", "type": "dm"}
+            return {"name": "Unknown", "error": "Discord client unavailable"}
 
         try:
             channel = self._client.get_channel(int(chat_id))
@@ -6078,22 +6100,18 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel = await self._client.fetch_channel(int(chat_id))
 
             if not channel:
-                return {"name": str(chat_id), "type": "dm"}
+                return {"name": str(chat_id), "error": "Discord channel unavailable"}
 
-            # Determine channel type
+            chat_type = self._session_chat_type(channel)
             if isinstance(channel, discord.DMChannel):
-                chat_type = "dm"
                 name = channel.recipient.name if channel.recipient else str(chat_id)
             elif isinstance(channel, discord.Thread):
-                chat_type = "thread"
                 name = channel.name
             elif isinstance(channel, discord.TextChannel):
-                chat_type = "channel"
                 name = f"#{channel.name}"
                 if channel.guild:
                     name = f"{channel.guild.name} / {name}"
             else:
-                chat_type = "channel"
                 name = getattr(channel, "name", str(chat_id))
 
             return {
@@ -6104,7 +6122,7 @@ class DiscordAdapter(BasePlatformAdapter):
             }
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to get chat info for %s: %s", self.name, chat_id, e, exc_info=True)
-            return {"name": str(chat_id), "type": "dm", "error": str(e)}
+            return {"name": str(chat_id), "error": str(e)}
 
     async def _resolve_allowed_usernames(self) -> None:
         """
@@ -6822,13 +6840,9 @@ class DiscordAdapter(BasePlatformAdapter):
         is_thread = isinstance(interaction.channel, discord.Thread)
         thread_id = None
 
-        if is_dm:
-            chat_type = "dm"
-        elif is_thread:
-            chat_type = "thread"
+        chat_type = self._session_chat_type(interaction.channel)
+        if is_thread:
             thread_id = str(interaction.channel_id)
-        else:
-            chat_type = "group"
 
         chat_name = ""
         if not is_dm and hasattr(interaction.channel, "name"):
@@ -9241,15 +9255,12 @@ class DiscordAdapter(BasePlatformAdapter):
         # When auto-threading kicked in, route responses to the new thread
         effective_channel = auto_threaded_channel or message.channel
 
-        # Determine chat type
+        chat_type = self._session_chat_type(effective_channel)
         if isinstance(message.channel, discord.DMChannel):
-            chat_type = "dm"
             chat_name = message.author.name
         elif is_thread:
-            chat_type = "thread"
             chat_name = self._format_thread_chat_name(effective_channel)
         else:
-            chat_type = "group"
             chat_name = getattr(message.channel, "name", str(message.channel.id))
             if hasattr(message.channel, "guild") and message.channel.guild:
                 chat_name = f"{message.channel.guild.name} / #{chat_name}"

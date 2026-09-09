@@ -1012,7 +1012,7 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
 def _is_model_route_change_status(message: str) -> bool:
     """Return whether ``message`` is a durable route/effort announcement."""
     text = str(message or "").lstrip()
-    return text.startswith(("🔄 Model fallback", "🔄 Model recovery", "🔀 Model switched"))
+    return text.startswith(("🔄 Model fallback", "🔄 Model recovery", "🔀 Model switched", "⚠ replying on "))
 
 
 def render_notice_line(notice) -> str:
@@ -4880,6 +4880,24 @@ class TurnRunner:
         self._runner = runner
         self._ctx = ctx
 
+    def _announce_chat_pin_mismatch(self, model, provider, result, final_response):
+        """One durable notice per emitted reply, including cross-session wakes."""
+        from agent.chat_completion_helpers import format_chat_pin_notice
+        from gateway.response_filters import is_intentional_silence_agent_result
+
+        if not final_response or is_intentional_silence_agent_result(result, final_response):
+            return
+        store = getattr(self._runner, "session_store", None)
+        if getattr(type(store), "lookup_chat_model_pin", None) is None:
+            return
+        try:
+            _, pin = store.lookup_chat_model_pin(self._ctx.source)
+            notice = format_chat_pin_notice(model, provider, pin, reason=result.get("failure_reason"))
+            if notice:
+                self._status_callback_sync("info", notice)
+        except Exception:
+            logger.warning("Chat model-pin announcement failed", exc_info=True)
+
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
@@ -7521,6 +7539,8 @@ class TurnRunner:
             0 if (_session_was_split or _compacted_in_place) else len(agent_history)
         )
 
+        self._announce_chat_pin_mismatch(_resolved_model, _resolved_provider, result, final_response)
+
         if not final_response:
             final_response = _normalize_empty_agent_response(
                 result, final_response or "", history_len=len(agent_history),
@@ -8820,6 +8840,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def exit_code(self) -> Optional[int]:
         return self._exit_code
 
+    async def _migrate_discord_session_keys(self) -> None:
+        """Resolve legacy routes before restart/delegation wakes can use them."""
+        adapter = self.adapters.get(Platform.DISCORD)
+        if adapter is None:
+            return
+        entries = await asyncio.to_thread(self.session_store.snapshot_entries)
+        chat_types = {}
+        for entry in entries:
+            source = entry.origin
+            if source is None or source.platform != Platform.DISCORD:
+                continue
+            if source.chat_id in chat_types:
+                continue
+            try:
+                info = await asyncio.wait_for(adapter.get_chat_info(source.chat_id), 10)
+                if not info.get("error"):
+                    chat_types[source.chat_id] = info.get("type")
+            except Exception:
+                logger.warning("Discord session migration lookup failed", exc_info=True)
+        await asyncio.to_thread(self.session_store.migrate_discord_session_keys, chat_types)
+
     def _session_key_for_source(self, source: SessionSource) -> str:
         """Resolve the current session key for a source, honoring gateway config when available."""
         if hasattr(self, "session_store") and self.session_store is not None:
@@ -9319,11 +9360,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         absence: callers must fail closed before enrichment, global-provider
         resolution, or agent construction.
         """
-        return persisted_session_route_identity(
+        # /model --once is a deliberate one-turn exception, never a chat pin.
+        if session_key in getattr(self, "_pending_one_turn_model_restores", {}):
+            cached = self._session_model_overrides.get(session_key)
+            if cached:
+                from gateway.session import sanitize_model_override_identity
+                return PersistedSessionRouteLookup("valid", sanitize_model_override_identity(cached))
+        lookup = persisted_session_route_identity(
             getattr(self, "session_store", None),
             session_key,
             PersistedSessionRouteLookup,
         )
+        # A chat clear performed by another process/session invalidates a warm
+        # credential cache too. Absence of a pin is NOT an instruction to clear.
+        store = getattr(self, "session_store", None)
+        if lookup.state == "absent" and getattr(type(store), "get_chat_model_pin", None):
+            present, pin = store.get_chat_model_pin(session_key)
+            if present and pin is None:
+                # NOTE(P3b/RC-2): cache reconciliation only; the durable user
+                # action already happened in the chat preference store.
+                self._session_model_overrides.pop(session_key, None)
+        return lookup
 
     def _resolve_configured_session_route_identity(
         self,
@@ -16900,6 +16957,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # previous gateway restart/shutdown.  The resume_pending flag is cleared
         # by the normal successful-turn path, so a failed auto-resume remains
         # visible for manual recovery on the next user message.
+        await self._migrate_discord_session_keys()
         await self._restore_resume_pending_sessions_at_startup()
 
         # Adapters and parent-session startup restore are complete. Claim once,

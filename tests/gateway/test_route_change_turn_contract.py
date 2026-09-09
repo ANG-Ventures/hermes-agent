@@ -360,6 +360,35 @@ async def run_turn(owner, agent, adapter, user_config=None):
     return result
 
 
+def test_cross_session_pin_mismatch_announces_on_emitted_turn(monkeypatch, tmp_path):
+    """Mutation: remove run_sync's chat-pin check -> no durable notice -> RED."""
+    from gateway.chat_model_pins import ChatModelPins
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+
+    agent = make_agent(monkeypatch)
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda *a, **kw: response())
+    monkeypatch.setattr(agent, "_interruptible_streaming_api_call", lambda *a, **kw: response())
+    owner = make_turn_owner(agent, None)
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    store._db = None
+    owner.session_store = store
+    ChatModelPins(tmp_path).set("main", "discord", "test-chat", {
+        "model": "user-pinned/model", "provider": "openrouter",
+    })
+    adapter = RecordingAdapter()
+
+    async def scenario():
+        result = await run_turn(owner, agent, adapter)
+        assert result["final_response"] == "Recovered"
+        notices = [text for _, text, _ in adapter.messages if "this chat is pinned to" in text]
+        assert len(notices) == 1
+        assert notices[0].startswith("⚠ replying on openrouter/primary/model")
+        assert "openrouter/user-pinned/model" in notices[0]
+
+    asyncio.run(scenario())
+
+
 def prepare_warm_fallback(monkeypatch, same_route):
     agent = make_agent(monkeypatch)
     agent.reasoning_config = {"effort": "medium"}
