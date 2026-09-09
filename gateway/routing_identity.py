@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, Optional
+from types import SimpleNamespace
 
 
 def creator_stamp_is_session_key(stamp: Any) -> bool:
@@ -28,6 +29,81 @@ def creator_stamp_is_session_key(stamp: Any) -> bool:
     return ":" in str(stamp or "")
 
 
+def canonical_chat_type(platform: str, chat_type: str) -> str:
+    """Compatibility for pre-resolver Discord guild-channel envelopes."""
+    return "group" if platform == "discord" and chat_type == "channel" else chat_type
+
+
+def routing_owner_identity(session_key: str, source: Any):
+    """Type-free destination ownership, retaining profile/workspace/thread isolation."""
+    parts = session_key.split(":")
+    if len(parts) < 5 or parts[0] != "agent":
+        return None
+    if source is None:
+        return ("key", *parts[:3], *parts[4:])
+    if isinstance(source, dict):
+        source = SimpleNamespace(**{
+            name: source.get(name) for name in (
+                "platform", "chat_id", "thread_id", "prospective_thread_id",
+                "scope_id", "user_id_alt", "user_id",
+            )
+        })
+    platform = str(getattr(source.platform, "value", source.platform))
+    chat = str(source.chat_id or "")
+    if not chat:
+        return None
+    thread = str(source.thread_id or source.prospective_thread_id or "")
+    if platform == "discord" and thread:
+        chat, thread = thread, ""
+    scope = str(source.scope_id or "") if platform == "slack" else ""
+    user = str(source.user_id_alt or source.user_id or "")
+    return ("source", parts[1], platform, scope, chat, thread, user)
+
+
+class SessionKeyConflict(ValueError):
+    """A rejected alias; carries only routing metadata for the chat notice."""
+
+    def __init__(self, existing_key: str, candidate_key: str, source=None):
+        self.existing_key = existing_key
+        self.candidate_key = candidate_key
+        self.keys = tuple(sorted((existing_key, candidate_key)))
+        parts, other = existing_key.split(":"), candidate_key.split(":")
+        self.platform, self.chat_id = parts[2], parts[4]
+        self.thread_id = None
+        if source is not None:
+            get = source.get if isinstance(source, dict) else lambda name: getattr(source, name, None)
+            self.chat_id = str(get("chat_id") or self.chat_id)
+            self.thread_id = get("thread_id")
+        super().__init__(
+            f"session-key collision refused: {self.platform} {self.chat_id} "
+            f"({parts[3]} vs {other[3]})"
+        )
+
+
+def assert_unique_routing_entries(entries, existing=None, *, retired_keys=()):
+    """Check both the proposed index and durable ownership BEFORE replacement.
+
+    Call under the storage transaction/lock. A whole-index rewrite must not
+    hide an alias by deleting the old row first. Only explicit migration may
+    retire an old spelling; the resulting index must still be unique.
+    """
+    owners = {}
+    for batch in (existing or {}, entries):
+        for key, data in batch.items():
+            if batch is not entries and key in retired_keys:
+                continue
+            if not isinstance(data, dict):
+                data = {}
+            for owner in (routing_owner_identity(key, None),
+                          routing_owner_identity(key, data.get("origin"))):
+                if owner is None:
+                    continue
+                previous = owners.get(owner)
+                if previous and previous != key and previous.split(":")[3] != key.split(":")[3]:
+                    raise SessionKeyConflict(previous, key, data.get("origin"))
+                owners[owner] = key
+
+
 def effective_routing_lane(
     *,
     platform: Any,
@@ -43,7 +119,7 @@ def effective_routing_lane(
 
     platform_value = clean(getattr(platform, "value", platform)).lower()
     chat = clean(chat_id)
-    kind = clean(chat_type).lower()
+    kind = canonical_chat_type(platform_value, clean(chat_type).lower())
     thread = clean(thread_id)
     prospective = clean(prospective_thread_id)
     if kind != "dm" and prospective and not thread:

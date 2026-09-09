@@ -6067,10 +6067,106 @@ class DiscordAdapter(BasePlatformAdapter):
             except (asyncio.CancelledError, Exception):
                 pass
 
+    def _session_chat_type(self, channel) -> str:
+        """Discord objects, not producer labels, define session identity."""
+        if isinstance(channel, discord.DMChannel):
+            kind = "dm"
+        elif isinstance(channel, discord.Thread):
+            kind = "thread"
+        else:
+            kind = "group"
+        if not hasattr(self, "_session_chat_types"):
+            self._session_chat_types = {}
+        self._session_chat_types[str(channel.id)] = kind
+        return kind
+
+    @staticmethod
+    def _discord_snowflake(value) -> Optional[int]:
+        """Coerce a chat/thread id to an int snowflake; None when it isn't one.
+
+        Test harnesses and some synthetic producers carry non-numeric ids
+        (mock objects, ``e2e-chat-1``). Those must degrade to inference, not
+        crash the resolver.
+        """
+        text = str(value if value is not None else "").strip()
+        return int(text) if text.isdigit() else None
+
+    def _infer_session_chat_type(self, source, chat_id: str) -> str:
+        """Best-effort chat type when no Discord channel object is at hand.
+
+        Evidence order (never raises):
+          1. the source's own structural fields — a thread/parent id means a
+             thread, a guild/scope id means a guild channel;
+          2. the ``_session_chat_types`` cache populated by earlier object
+             resolutions for this chat;
+          3. the caller's label, canonicalized (``channel`` → ``group``) so a
+             legacy producer converges on the inbound key instead of forking it;
+          4. ``dm``.
+        The collision guard on the session store remains the fail-closed
+        backstop; the resolver's job is to always produce the best key.
+        """
+        if source.thread_id or getattr(source, "parent_chat_id", None):
+            return "thread"
+        if getattr(source, "scope_id", None) or getattr(source, "guild_id", None):
+            return "group"
+        cached = getattr(self, "_session_chat_types", {}).get(chat_id)
+        if cached:
+            return cached
+        label = str(source.chat_type or "").strip().lower()
+        if label == "channel":
+            return "group"
+        if label in ("dm", "group", "thread"):
+            return label
+        return "dm"
+
+    def canonicalize_session_source(self, source) -> None:
+        """Synchronous store/key path: Discord objects define session identity.
+
+        Cold synthetic ingress fetches via get_chat_info first so the channel
+        object is cached. When no object can be resolved (client down, mock
+        harness, non-snowflake id) fall back to ``_infer_session_chat_type``;
+        this resolver never refuses to produce a key — only the store's
+        collision guard fails closed.
+        """
+        chat_id = str(source.thread_id or source.chat_id)
+        channel = None
+        snowflake = self._discord_snowflake(chat_id)
+        if self._client is not None and snowflake is not None:
+            try:
+                channel = self._client.get_channel(snowflake)
+            except Exception:
+                channel = None
+        if channel is not None:
+            kind = self._session_chat_type(channel)
+        else:
+            kind = self._infer_session_chat_type(source, chat_id)
+        source.chat_type = kind
+        if kind == "thread":
+            source.chat_id = source.thread_id = chat_id
+        else:
+            source.thread_id = None
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        # All synthetic producers (notify/wake, cron, delegation, restart)
+        # pass this boundary too: fetch the channel object so canonicalization
+        # uses Discord's own type. A lookup failure degrades to inference from
+        # the source's fields (logged), never to a refusal.
+        # Native messages/slashes already resolved their actual channel object.
+        if event.internal:
+            info = await self.get_chat_info(event.source.thread_id or event.source.chat_id)
+            if info.get("error"):
+                logger.warning(
+                    "[%s] Could not resolve channel %s for internal event (%s); "
+                    "inferring session type from source fields",
+                    self.name, event.source.thread_id or event.source.chat_id, info.get("error"),
+                )
+        self.canonicalize_session_source(event.source)
+        await super().handle_message(event)
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a Discord channel."""
         if not self._client:
-            return {"name": "Unknown", "type": "dm"}
+            return {"name": "Unknown", "error": "Discord client unavailable"}
 
         try:
             channel = self._client.get_channel(int(chat_id))
@@ -6078,22 +6174,18 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel = await self._client.fetch_channel(int(chat_id))
 
             if not channel:
-                return {"name": str(chat_id), "type": "dm"}
+                return {"name": str(chat_id), "error": "Discord channel unavailable"}
 
-            # Determine channel type
+            chat_type = self._session_chat_type(channel)
             if isinstance(channel, discord.DMChannel):
-                chat_type = "dm"
                 name = channel.recipient.name if channel.recipient else str(chat_id)
             elif isinstance(channel, discord.Thread):
-                chat_type = "thread"
                 name = channel.name
             elif isinstance(channel, discord.TextChannel):
-                chat_type = "channel"
                 name = f"#{channel.name}"
                 if channel.guild:
                     name = f"{channel.guild.name} / {name}"
             else:
-                chat_type = "channel"
                 name = getattr(channel, "name", str(chat_id))
 
             return {
@@ -6104,7 +6196,7 @@ class DiscordAdapter(BasePlatformAdapter):
             }
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to get chat info for %s: %s", self.name, chat_id, e, exc_info=True)
-            return {"name": str(chat_id), "type": "dm", "error": str(e)}
+            return {"name": str(chat_id), "error": str(e)}
 
     async def _resolve_allowed_usernames(self) -> None:
         """
@@ -6822,13 +6914,9 @@ class DiscordAdapter(BasePlatformAdapter):
         is_thread = isinstance(interaction.channel, discord.Thread)
         thread_id = None
 
-        if is_dm:
-            chat_type = "dm"
-        elif is_thread:
-            chat_type = "thread"
+        chat_type = self._session_chat_type(interaction.channel)
+        if is_thread:
             thread_id = str(interaction.channel_id)
-        else:
-            chat_type = "group"
 
         chat_name = ""
         if not is_dm and hasattr(interaction.channel, "name"):
@@ -7962,6 +8050,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 auto_archive_duration=auto_archive_duration,
                 reason=reason,
             )
+            self._session_chat_type(thread)
             if starter_message:
                 await thread.send(starter_message)
             return {
@@ -7978,6 +8067,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     auto_archive_duration=auto_archive_duration,
                     reason=reason,
                 )
+                self._session_chat_type(thread)
                 return {
                     "success": True,
                     "thread_id": str(thread.id),
@@ -9241,15 +9331,12 @@ class DiscordAdapter(BasePlatformAdapter):
         # When auto-threading kicked in, route responses to the new thread
         effective_channel = auto_threaded_channel or message.channel
 
-        # Determine chat type
+        chat_type = self._session_chat_type(effective_channel)
         if isinstance(message.channel, discord.DMChannel):
-            chat_type = "dm"
             chat_name = message.author.name
         elif is_thread:
-            chat_type = "thread"
             chat_name = self._format_thread_chat_name(effective_channel)
         else:
-            chat_type = "group"
             chat_name = getattr(message.channel, "name", str(message.channel.id))
             if hasattr(message.channel, "guild") and message.channel.guild:
                 chat_name = f"{message.channel.guild.name} / #{chat_name}"

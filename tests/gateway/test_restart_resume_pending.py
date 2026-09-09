@@ -1153,7 +1153,10 @@ async def test_startup_restore_cross_session_failures_yield_and_back_off():
     try:
         await asyncio.wait_for(unrelated_ran.wait(), timeout=0.1)
         await asyncio.sleep(0.25)
-        assert 1 <= adapter_lookup.call_count <= 3
+        # Each blocked iteration resolves the adapter three times: once to
+        # dispatch, then once per queued source while canonicalizing session
+        # keys for promotion. Backoff (0.1s, 0.2s) bounds this to 3 iterations.
+        assert 1 <= adapter_lookup.call_count <= 9
         assert len(runner._startup_restore_queue) == 2
     finally:
         replay_task.cancel()

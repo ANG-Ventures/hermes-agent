@@ -1203,7 +1203,12 @@ class QQAdapter(BasePlatformAdapter):
 
         update_answer = parse_update_prompt_button_data(button_data)
         if update_answer is not None:
-            update_session_key = f"agent:main:qqbot:{event.scene}:{event.group_openid or event.guild_id or event.user_openid}"
+            from gateway.session import SessionSource, build_session_key
+
+            update_session_key = build_session_key(SessionSource(
+                platform=Platform.QQBOT, chat_type=event.scene,
+                chat_id=event.group_openid or event.guild_id or event.user_openid,
+            ), group_sessions_per_user=False)
             if not self._is_authorized_interaction_for_session(event, update_session_key):
                 logger.warning(
                     "[%s] Rejected unauthorized update prompt click (operator=%s)",

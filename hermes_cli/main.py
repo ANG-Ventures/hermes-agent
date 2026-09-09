@@ -3761,6 +3761,11 @@ def cmd_setup(args):
 
 def cmd_model(args):
     """Select default model — starts with provider selection, then model picker."""
+    if getattr(args, "chat", None):
+        from hermes_cli.subcommands.model import set_chat_model
+        return set_chat_model(args)
+    if getattr(args, "chat_model", None) or getattr(args, "clear", False) or getattr(args, "provider", None):
+        raise SystemExit("--set, --clear and --provider require --chat")
     _require_tty("model")
     if getattr(args, "refresh", False):
         try:

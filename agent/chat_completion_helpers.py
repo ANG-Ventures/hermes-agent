@@ -2916,12 +2916,8 @@ def _emit_fallback_announce(
     # pure route change. Both labels come pre-normalized from the caller.
     _show_effort = bool(_oe or _ne) and _oe != _ne
 
-    def _side_label(prov, mdl, eff):
-        base = f"{prov}/{mdl}" if prov else mdl
-        return f"{base} ({eff})" if (_show_effort and eff) else base
-
-    old_label = _side_label(old_provider, old_model, _oe)
-    new_label = _side_label(new_provider, new_model, _ne)
+    old_label = _format_model_route_label(old_provider, old_model, _oe if _show_effort else None)
+    new_label = _format_model_route_label(new_provider, new_model, _ne if _show_effort else None)
     verb = "Model recovery" if kind == "recovery" else "Model fallback"
     icon = "🔄"
     # Rider (why/how the route changed). For a FAILOVER: the fault reason —
@@ -3004,6 +3000,23 @@ def _emit_switch_announce(
         emit(msg)
 
 
+def _format_model_route_label(provider, model, effort=None):
+    base = f"{provider}/{model}" if provider else model
+    return f"{base} ({effort})" if effort else base
+
+
+def format_chat_pin_notice(model, provider, pin, *, reason=None):
+    """The cross-session sibling of route-change announcements."""
+    if not model or not pin or (
+        model == pin.get("model") and provider == pin.get("provider")
+    ):
+        return None
+    live = _format_model_route_label(provider, model)
+    pinned = _format_model_route_label(pin.get("provider"), pin.get("model"))
+    why = _fallback_reason_label(reason) if reason else None
+    return f"⚠ replying on {live} — this chat is pinned to {pinned}; {why or 'emitting session uses a different route'}"
+
+
 def _format_switch_announce(
     old_model: str,
     new_model: str,
@@ -3033,8 +3046,8 @@ def _format_switch_announce(
         and not _window_differs and not _effort_differs
     ):
         return
-    old_label = f"{old_provider}/{old_model}" if old_provider else old_model
-    new_label = f"{new_provider}/{new_model}" if new_provider else new_model
+    old_label = _format_model_route_label(old_provider, old_model)
+    new_label = _format_model_route_label(new_provider, new_model)
     msg = f"🔀 Model switched: {old_label} → {new_label}"
     if _effort_differs:
         msg += f" · effort {_old_eff or 'default'}→{_new_eff or 'default'}"

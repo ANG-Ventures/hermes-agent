@@ -19,7 +19,7 @@ import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Optional, Any, Literal, NamedTuple
+from typing import Callable, Dict, List, Optional, Any, Literal, NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -1330,7 +1330,11 @@ def build_session_key(
     # already carry chat_type="thread", so this only rewrites the initiating
     # channel message's slot.)
     effective_thread_id = source.thread_id or source.prospective_thread_id
-    chat_type_slot = source.chat_type
+    # Legacy synthetic Discord producers used "channel" for guild groups.
+    # Live adapters resolve from the Discord object; old persisted envelopes
+    # must not recreate the split before they reach that boundary.
+    from gateway.routing_identity import canonical_chat_type
+    chat_type_slot = canonical_chat_type(platform, source.chat_type)
     if source.prospective_thread_id and not source.thread_id:
         chat_type_slot = "thread"
     key_parts = [ns, platform, chat_type_slot]
@@ -1399,6 +1403,10 @@ class SessionStore:
         self.sessions_dir = sessions_dir
         self.config = config
         self._entries: Dict[str, SessionEntry] = {}
+        self._valid_routing_keys: set[str] = set()
+        self._reported_session_key_conflicts: set[tuple[str, str]] = set()
+        self.on_session_key_conflict: Optional[Callable[[Any], None]] = None
+        self.source_resolver: Optional[Callable[[SessionSource], None]] = None
         self._loaded = False
         # A fallback-only initial load must be reconciled with state.db after
         # the handle recovers, before a whole-index save can replace DB rows.
@@ -1685,6 +1693,8 @@ class SessionStore:
                 print(f"[gateway] Warning: Failed to load sessions: {e}")
 
         self._loaded = True
+        self._valid_routing_keys = set(self._entries)
+        self._seed_chat_model_pins_locked()
         self._routing_db_loaded = db_load_succeeded
         self._routing_fallback_baseline = (
             None
@@ -1701,7 +1711,115 @@ class SessionStore:
         # live-gateway case; this startup prune still self-heals crash-left
         # entries before the first message arrives. Pruning here (lock already
         # held) is cheap: one lookup per routing key, once at startup.
-        self._prune_stale_sessions_locked()
+        if self._find_session_key_conflict() is None:
+            self._prune_stale_sessions_locked()
+        else:
+            logger.warning("Legacy duplicate session routes await canonical migration")
+
+    def _find_session_key_conflict(self, candidate=None):
+        from gateway.routing_identity import SessionKeyConflict, assert_unique_routing_entries
+
+        data = {key: {"origin": entry.origin} for key, entry in self._entries.items()}
+        if candidate is not None:
+            data[candidate.session_key] = {"origin": candidate.origin}
+        try:
+            assert_unique_routing_entries(data)
+        except SessionKeyConflict as conflict:
+            return conflict
+        return None
+
+    def _assert_unique_session_routes(self, candidate=None) -> None:
+        conflict = self._find_session_key_conflict(candidate)
+        if conflict is None:
+            return
+        self._reject_session_key_conflict(conflict)
+
+    def _reject_session_key_conflict(self, conflict) -> None:
+        # Reject a newly introduced alias in memory too, not only on disk.
+        # Existing legacy rows are never deleted by the guard; only the
+        # explicit startup migration can choose their surviving transcript.
+        for key in conflict.keys:
+            if key not in self._valid_routing_keys:
+                self._entries.pop(key, None)
+        if conflict.keys not in self._reported_session_key_conflicts:
+            self._reported_session_key_conflicts.add(conflict.keys)
+            logger.warning("%s", conflict)
+            if self.on_session_key_conflict is not None:
+                try:
+                    self.on_session_key_conflict(conflict)
+                except Exception:
+                    logger.exception("Session route conflict notification failed")
+        raise conflict
+
+    def migrate_discord_session_keys(self, chat_types: Dict[str, str]) -> int:
+        """Merge type-only aliases using channel types resolved by the adapter.
+
+        Namespace, chat, thread and participant suffixes remain isolated.
+        Transcript files are untouched: newest routing entry remains primary.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            groups = {}
+            retired_keys = set()
+            for key, entry in self._entries.items():
+                parts = key.split(":")
+                if len(parts) < 5 or parts[2] != "discord":
+                    continue
+                kind = chat_types.get(parts[4])
+                if kind not in {"dm", "group", "thread"}:
+                    continue
+                if entry.origin is not None:
+                    origin = replace(entry.origin, chat_type=kind)
+                else:
+                    origin = SessionSource(
+                        platform=Platform.DISCORD, chat_id=parts[4], chat_type=kind,
+                        user_id=parts[-1] if len(parts) > 5 and parts[3] != "dm" else None,
+                    )
+                if kind == "thread":
+                    origin.thread_id = origin.chat_id
+                elif kind == "dm":
+                    origin.thread_id = origin.prospective_thread_id = None
+                canonical = build_session_key(
+                    origin,
+                    group_sessions_per_user=self.config.group_sessions_per_user,
+                    thread_sessions_per_user=self.config.thread_sessions_per_user,
+                    profile=parts[1],
+                )
+                groups.setdefault(canonical, []).append((key, entry))
+            merged = 0
+            for canonical, aliases in groups.items():
+                if len(aliases) == 1 and aliases[0][0] == canonical:
+                    continue
+                aliases.sort(key=lambda item: item[1].updated_at.timestamp(), reverse=True)
+                primary = replace(aliases[0][1], session_key=canonical)
+                # Preserve the most recently updated pinned entry when the
+                # newer, accidentally-created session has no preference.
+                for _, entry in aliases:
+                    if entry.model_override_identity or entry.model_override or entry._model_override_identity_invalid:
+                        primary.model_override = entry.model_override
+                        primary.model_override_identity = entry.model_override_identity
+                        primary._model_override_identity_invalid = entry._model_override_identity_invalid
+                        break
+                for key, _ in aliases:
+                    self._entries.pop(key)
+                    retired_keys.add(key)
+                primary.session_key = canonical
+                if primary.origin:
+                    primary.origin = replace(primary.origin, chat_type=canonical.split(":")[3])
+                    if primary.origin.chat_type == "thread" and not primary.origin.prospective_thread_id:
+                        primary.origin.thread_id = primary.origin.chat_id
+                    elif primary.origin.chat_type == "dm":
+                        primary.origin.thread_id = primary.origin.prospective_thread_id = None
+                self._entries[canonical] = primary
+                merged += 1
+            if merged:
+                self._save(retired_keys=retired_keys)
+                # Even if ongoing JSON mirroring is disabled, retire aliases
+                # from an existing legacy import so they cannot resurrect.
+                if not self._write_sessions_json and (self.sessions_dir / "sessions.json").exists():
+                    self._save_sessions_json({key: entry.to_dict() for key, entry in self._entries.items()}, retired_keys=retired_keys)
+                logger.info("Merged Discord session type aliases: %d canonical routes", merged)
+            return merged
 
     def _prune_stale_sessions_locked(self) -> None:
         """Remove ended routes and old inert routes that never reached state.db.
@@ -1827,6 +1945,46 @@ class SessionStore:
         """Public read accessor for a single entry by session key."""
         return self._entries.get(session_key)
 
+    def _chat_pin_key(self, session_key: str):
+        entry = self._entries.get(session_key)
+        parts = session_key.split(":")
+        if len(parts) < 5 or parts[0] != "agent":
+            return None
+        source = entry.origin if entry else None
+        if source and source.chat_id:
+            return parts[1], source.platform.value, str(source.chat_id)
+        # Discord snowflakes are unambiguous even before a wake has an entry.
+        if parts[2] == "discord":
+            return parts[1], "discord", parts[4]
+        return None
+
+    def _seed_chat_model_pins_locked(self) -> None:
+        from gateway.chat_model_pins import ChatModelPins
+
+        pins = ChatModelPins(self.sessions_dir)
+        for entry in sorted(self._entries.values(), key=lambda e: e.updated_at, reverse=True):
+            key = self._chat_pin_key(entry.session_key)
+            identity = entry.model_override_identity or entry.model_override
+            if key and sanitize_model_override_identity(identity) and not entry._model_override_identity_invalid:
+                pins.set(*key, identity, seed=True)
+
+    def lookup_chat_model_pin(self, source: SessionSource):
+        """Read the destination's pin independently of the emitting session."""
+        self._ensure_loaded()
+        from gateway.chat_model_pins import ChatModelPins
+
+        namespace = _session_key_namespace(self._resolve_profile_for_key(source)).split(":")[1]
+        return ChatModelPins(self.sessions_dir).get(namespace, source.platform.value, str(source.chat_id))
+
+    def get_chat_model_pin(self, session_key: str):
+        """Return (present, identity); a present NULL explicitly clears a pin."""
+        from gateway.chat_model_pins import ChatModelPins
+
+        if not hasattr(self, "sessions_dir"):
+            return False, None
+        key = self._chat_pin_key(session_key)
+        return ChatModelPins(self.sessions_dir).get(*key) if key else (False, None)
+
     def lookup_persisted_route_identity(
         self, session_key: str
     ) -> PersistedSessionRouteLookup:
@@ -1842,6 +2000,11 @@ class SessionStore:
         try:
             self._ensure_loaded()
             entry = self.entry_for(session_key)
+            has_chat_pin, chat_pin = self.get_chat_model_pin(session_key)
+            if has_chat_pin:
+                return PersistedSessionRouteLookup(
+                    "valid" if chat_pin else "absent", chat_pin
+                )
             if entry is None:
                 return PersistedSessionRouteLookup("absent")
             if entry._model_override_identity_invalid:
@@ -1875,13 +2038,14 @@ class SessionStore:
         """Public trigger for a durable save of the session index."""
         self._save()
 
-    def _save(self, *, require_primary: bool = False) -> None:
+    def _save(self, *, require_primary: bool = False, retired_keys=()) -> None:
         """Persist the routing index while the caller holds ``_lock``."""
         data, generation = self._snapshot_routing_locked()
         self._persist_routing_data(
             data,
             generation,
             require_primary=require_primary,
+            retired_keys=retired_keys,
         )
 
     def _next_routing_generation_locked(self) -> int:
@@ -1942,6 +2106,7 @@ class SessionStore:
     def _snapshot_routing_locked(self) -> tuple[Dict[str, Any], int]:
         """Capture immutable routing data and a monotonic generation."""
         self._reconcile_recovered_routing_locked()
+        self._assert_unique_session_routes()
         return (
             {key: entry.to_dict() for key, entry in self._entries.items()},
             self._next_routing_generation_locked(),
@@ -1953,8 +2118,10 @@ class SessionStore:
         generation: int,
         *,
         require_primary: bool = False,
+        retired_keys=(),
     ) -> None:
         """Serialize all whole-index writers through one durable write lock."""
+        from gateway.routing_identity import SessionKeyConflict
         save_lock = getattr(self, "_save_lock", None)
         if save_lock is None:
             save_lock = threading.Lock()
@@ -1981,8 +2148,11 @@ class SessionStore:
                         replacer(
                             {k: json.dumps(v) for k, v in data.items()},
                             scope=self._routing_scope(),
+                            **({"retired_keys": retired_keys} if retired_keys else {}),
                         )
                         db_saved = True
+                    except SessionKeyConflict as exc:
+                        self._reject_session_key_conflict(exc)
                     except Exception as exc:
                         logger.warning(
                             "gateway.session: state.db routing save failed: %s", exc
@@ -1995,7 +2165,9 @@ class SessionStore:
                             raise
             if getattr(self, "_write_sessions_json", True) or not db_saved:
                 try:
-                    self._save_sessions_json(data)
+                    self._save_sessions_json(data, **({"retired_keys": retired_keys} if retired_keys else {}))
+                except SessionKeyConflict as exc:
+                    self._reject_session_key_conflict(exc)
                 except Exception as exc:
                     if not db_saved:
                         raise
@@ -2007,6 +2179,7 @@ class SessionStore:
                         exc,
                     )
             self._persisted_routing_generation = generation
+            self._valid_routing_keys = set(data)
             # This rewrite supersedes fast records at or below its
             # generation; newer ones stay for the next delayed full writer.
             if fast_persisted:
@@ -2016,7 +2189,24 @@ class SessionStore:
                 ]:
                     del fast_persisted[key]
 
-    def _save_sessions_json(self, data: Dict[str, Any]) -> None:
+    def _save_sessions_json(self, data: Dict[str, Any], *, retired_keys=()) -> None:
+        """Guard the fallback/mirror under a cross-process lock, before replace."""
+        from gateway.status import _try_acquire_file_lock, _release_file_lock
+        from gateway.routing_identity import assert_unique_routing_entries
+
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        with (self.sessions_dir / ".sessions.lock").open("a+b") as lock:
+            if not _try_acquire_file_lock(lock):
+                raise OSError("Session routing file is locked by another writer")
+            try:
+                path = self.sessions_dir / "sessions.json"
+                existing = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+                assert_unique_routing_entries(data, existing, retired_keys=retired_keys)
+                self._write_sessions_json_unlocked(data)
+            finally:
+                _release_file_lock(lock)
+
+    def _write_sessions_json_unlocked(self, data: Dict[str, Any]) -> None:
         """Write the legacy sessions.json mirror of the routing index."""
         import tempfile
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -2116,6 +2306,8 @@ class SessionStore:
         unchanged live value.
         """
         def _capture() -> Optional[tuple[str, int, Optional[Dict[str, Any]]]]:
+            candidate = SessionEntry.from_dict(entry_data) if entry_data is not None else None
+            self._assert_unique_session_routes(candidate)
             entry = self._entries.get(session_key)
             if entry is None:
                 return None
@@ -2140,6 +2332,7 @@ class SessionStore:
         _db = getattr(self, "_db", None)
         saver = getattr(_db, "save_gateway_routing_entry", None) if _db else None
         if callable(saver):
+            from gateway.routing_identity import SessionKeyConflict
             save_lock = getattr(self, "_save_lock", None)
             if save_lock is None:
                 save_lock = threading.Lock()
@@ -2157,7 +2350,10 @@ class SessionStore:
                         return
                     saver(session_key, entry_json, scope=self._routing_scope())
                     fast_persisted[session_key] = (revision, entry_json)
+                    self._valid_routing_keys.add(session_key)
                 return
+            except SessionKeyConflict as exc:
+                self._reject_session_key_conflict(exc)
             except Exception as exc:
                 logger.warning(
                     "gateway.session: single-entry routing save failed for %r "
@@ -2245,6 +2441,9 @@ class SessionStore:
 
     def _generate_session_key(self, source: SessionSource) -> str:
         """Generate a session key from a source."""
+        resolver = getattr(self, "source_resolver", None)
+        if resolver is not None:
+            resolver(source)
         return build_session_key(
             source,
             group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
@@ -3435,6 +3634,10 @@ class SessionStore:
             if entry is None:
                 return
             cleaned = sanitize_model_override(override)
+            from gateway.chat_model_pins import ChatModelPins
+            pin_key = self._chat_pin_key(session_key)
+            if pin_key and (override is None or sanitize_model_override_identity(override)):
+                ChatModelPins(self.sessions_dir).set(*pin_key, override)
             if entry.model_override == cleaned:
                 return
             entry.model_override = cleaned
@@ -3457,8 +3660,6 @@ class SessionStore:
             old_identity = entry.model_override_identity
             old_legacy = entry.model_override
             old_invalid = entry._model_override_identity_invalid
-            if old_identity is None and old_legacy is None and not old_invalid:
-                return True
             entry.model_override_identity = None
             entry._model_override_identity_invalid = False
             entry.model_override = None
@@ -3469,12 +3670,19 @@ class SessionStore:
                 entry._model_override_identity_invalid = old_invalid
                 entry.model_override = old_legacy
                 raise
+            from gateway.chat_model_pins import ChatModelPins
+            pin_key = self._chat_pin_key(session_key)
+            if pin_key:
+                ChatModelPins(self.sessions_dir).set(*pin_key, None)
             return True
 
     def get_model_override(self, session_key: str) -> Optional[Dict[str, str]]:
         """Return the persisted /model override for *session_key*, if any."""
         with self._lock:
             self._ensure_loaded_locked()
+            present, pin = self.get_chat_model_pin(session_key)
+            if present and pin is None:
+                return None
             entry = self._entries.get(session_key)
             if entry is None:
                 return None
