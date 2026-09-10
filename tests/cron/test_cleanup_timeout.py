@@ -2,12 +2,17 @@
 
 A cron worker must release its in-memory dispatch guard even when SQLite or an
 agent resource finalizer stops returning after the model turn has ended.
+
+The bound is proven by ordering, not by a stopwatch: the caller must return
+while the deliberately hung finalizer is still parked on its release Event
+(``returned`` unset). ``run_job`` also assembles the prompt (notepad SQLite,
+config load), so a whole-run ``elapsed < 0.5`` ceiling measured disk I/O
+unrelated to cleanup and flaked on loaded CI runners.
 """
 
 from __future__ import annotations
 
 import threading
-import time
 from unittest.mock import MagicMock, patch
 
 from cron.scheduler import run_job, _teardown_cron_agent
@@ -20,16 +25,25 @@ _RUNTIME = {
     "api_mode": "chat_completions",
 }
 
+# Generous guards: orders of magnitude above the 0.02s cleanup timeout so load
+# cannot trip them, but finite so a regression fails by name instead of hanging.
+HANG_GUARD_SECONDS = 5.0
+SCHEDULING_GUARD_SECONDS = 10.0
+
 
 class HangingSessionDB:
     def __init__(self, release: threading.Event):
         self.release = release
         self.entered = threading.Event()
+        self.returned = threading.Event()
 
     def get_compression_tip(self, _session_id):
-        self.entered.set()
-        self.release.wait()
-        return None
+        try:
+            self.entered.set()
+            self.release.wait(timeout=HANG_GUARD_SECONDS)
+            return None
+        finally:
+            self.returned.set()
 
     def end_session(self, *_args, **_kwargs):
         return None
@@ -42,10 +56,14 @@ class HangingAgent:
     def __init__(self, release: threading.Event):
         self.release = release
         self.entered = threading.Event()
+        self.returned = threading.Event()
 
     def close(self):
-        self.entered.set()
-        self.release.wait()
+        try:
+            self.entered.set()
+            self.release.wait(timeout=HANG_GUARD_SECONDS)
+        finally:
+            self.returned.set()
 
 
 def test_run_job_bounds_sessiondb_finalization(tmp_path):
@@ -66,17 +84,19 @@ def test_run_job_bounds_sessiondb_finalization(tmp_path):
             mock_agent.run_conversation.return_value = {"final_response": "ok"}
             mock_agent_cls.return_value = mock_agent
 
-            started = time.monotonic()
             success, _output, final_response, error = run_job(job)
-            elapsed = time.monotonic() - started
 
-        assert fake_db.entered.wait(timeout=0.5)
-        assert elapsed < 0.5
+        assert fake_db.entered.wait(timeout=SCHEDULING_GUARD_SECONDS)
+        assert not release.is_set()
+        assert not fake_db.returned.is_set(), (
+            "run_job waited for the hung SessionDB finalizer instead of abandoning it"
+        )
         assert success is True
         assert final_response == "ok"
         assert error is None
     finally:
         release.set()
+        fake_db.returned.wait(timeout=SCHEDULING_GUARD_SECONDS)
 
 
 def test_agent_teardown_is_bounded():
@@ -84,14 +104,16 @@ def test_agent_teardown_is_bounded():
     agent = HangingAgent(release)
 
     try:
-        started = time.monotonic()
         _teardown_cron_agent(agent, "cleanup-agent-hang", timeout_seconds=0.02)
-        elapsed = time.monotonic() - started
 
-        assert agent.entered.wait(timeout=0.5)
-        assert elapsed < 0.5
+        assert agent.entered.wait(timeout=SCHEDULING_GUARD_SECONDS)
+        assert not release.is_set()
+        assert not agent.returned.is_set(), (
+            "_teardown_cron_agent waited for the hung agent.close() instead of abandoning it"
+        )
     finally:
         release.set()
+        agent.returned.wait(timeout=SCHEDULING_GUARD_SECONDS)
 
 
 def test_dispatch_guard_releases_after_sessiondb_finalization_hang(tmp_path):
