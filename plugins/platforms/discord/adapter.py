@@ -10518,7 +10518,7 @@ def _define_discord_view_classes() -> None:
                 self._build_expensive_confirm(model_id)
                 await interaction.response.edit_message(
                     embed=discord.Embed(
-                        title=f"⚠ {warning.title}",
+                        title=f"⚠️ {warning.title}",
                         description=warning.message,
                         color=discord.Color.red(),
                     ),

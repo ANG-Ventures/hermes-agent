@@ -33,7 +33,7 @@ NOISY_STATUS_MESSAGES = [
     "🗜️ Compacting context — summarizing earlier conversation so I can continue...",
     "💤 Resumed after 3600s idle — compacting ~120,000 tokens before continuing.",
     "⚠️  Session compressed 12 times — accuracy may degrade. Consider /new to start fresh.",
-    "⚠ Compression summary failed: upstream error. Inserted a fallback context marker.",
+    "⚠️ Compression summary failed: upstream error. Inserted a fallback context marker.",
     "⏱️ Rate limited. Waiting 30.0s (attempt 2/3)...",
     "⏳ Retrying in 4.2s (attempt 1/3)...",
     # Buffered overflow/attempt-cap retry chatter (replayed on retry exhaustion).
@@ -43,18 +43,18 @@ NOISY_STATUS_MESSAGES = [
     "🗜️ Context reduced to 120,000 tokens (was 250,000), retrying...",
     # Post-#69332 auto-lower wording + aux-provider/lock chatter.
     (
-        "⚠ Compression model small (openrouter) context is 32,000 tokens, but "
+        "⚠️ Compression model small (openrouter) context is 32,000 tokens, but "
         "the main model big (anthropic)'s compression threshold was 100,000 "
         "tokens. Auto-lowered this session's threshold to 30,000 tokens so "
         "compression can run."
     ),
     (
-        "⚠ Configured auxiliary compression provider 'openai' is unavailable — "
+        "⚠️ Configured auxiliary compression provider 'openai' is unavailable — "
         "context compression will drop middle turns without a summary. Check "
         "auxiliary.compression in config.yaml and reauthenticate that provider."
     ),
     (
-        "⚠ Skipping concurrent compression — another path is already "
+        "⚠️ Skipping concurrent compression — another path is already "
         "compressing this session. Will retry after it finishes."
     ),
 ]
@@ -69,12 +69,12 @@ VISIBLE_COMPRESSION_MESSAGES = [
     "Compressed with fallback: 30 → 12 messages",
     "No changes from compression: 30 messages",
     (
-        "⚠ Compression aborted: auth failure. No messages were dropped — "
+        "⚠️ Compression aborted: auth failure. No messages were dropped — "
         "conversation continues unchanged. Run /compress to retry, or /new "
         "to start a fresh session."
     ),
     (
-        "⚠ Compression returned an empty transcript. No session split was "
+        "⚠️ Compression returned an empty transcript. No session split was "
         "performed; conversation continues unchanged."
     ),
     # Manual /compress lock-skip feedback (issue #57631): both the
@@ -108,7 +108,7 @@ def test_telegram_status_suppresses_auxiliary_and_retry_noise():
     """Auxiliary failures and retry backoff chatter should not hit Telegram."""
     noisy_messages = [
         "⚠ Auxiliary title generation failed: HTTP 400: Operation contains cybersecurity risk",
-        "⚠ Compression summary failed: upstream error. Inserted a fallback context marker.",
+        "⚠️ Compression summary failed: upstream error. Inserted a fallback context marker.",
         "🗜️ Compacting context — summarizing earlier conversation so I can continue...",
         "ℹ Configured compression model 'small-model' failed (timeout). Recovered using main model — check auxiliary.compression.model in config.yaml.",
         "⏳ Retrying in 4.2s (attempt 1/3)...",

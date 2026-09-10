@@ -172,7 +172,7 @@ def test_codex_app_server_compression_failure_preserves_bookkeeping():
     assert agent.touch_calls[-1] == "context compression failed"
     assert agent.status_events == [
         ("lifecycle", COMPACTION_STATUS),
-        ("warn", "⚠ Codex app-server compaction failed: compact failed"),
+        ("warn", "⚠️ Codex app-server compaction failed: compact failed"),
     ]
 
 

@@ -33,14 +33,14 @@ NON_COMPRESSION_NOISE = [
     "⏳ Retrying in 4.2s (attempt 1/3)...",
     "⏱️ Rate limited. Waiting 30.0s (attempt 2/3)...",
     "⚠️ Max retries (3) exhausted — trying fallback...",
-    "⚠ Compression summary failed: upstream error. Inserted a fallback context marker.",
+    "⚠️ Compression summary failed: upstream error. Inserted a fallback context marker.",
     (
-        "⚠ Configured auxiliary compression provider 'openai' is unavailable — "
+        "⚠️ Configured auxiliary compression provider 'openai' is unavailable — "
         "context compression will drop middle turns without a summary. Check "
         "auxiliary.compression in config.yaml and reauthenticate that provider."
     ),
     (
-        "⚠ Skipping concurrent compression — another path is already "
+        "⚠️ Skipping concurrent compression — another path is already "
         "compressing this session. Will retry after it finishes."
     ),
 ]
