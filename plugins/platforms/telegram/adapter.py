@@ -7222,7 +7222,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 ])
                 await query.edit_message_text(
                     text=self.format_message(
-                        f"⚠ *{warning.title}*\n\n{warning.message}"
+                        f"⚠️ *{warning.title}*\n\n{warning.message}"
                     ),
                     parse_mode=ParseMode.MARKDOWN_V2,
                     reply_markup=keyboard,

@@ -2505,7 +2505,7 @@ def init_agent(
                     _config_max_tokens,
                 )
                 print(
-                    f"\n⚠ Invalid model.max_tokens in config.yaml: {_config_max_tokens!r}\n"
+                    f"\n⚠️ Invalid model.max_tokens in config.yaml: {_config_max_tokens!r}\n"
                     f"  Must be a positive integer (e.g. 4096).\n"
                     f"  Falling back to provider default.\n",
                     file=sys.stderr,
@@ -2528,7 +2528,7 @@ def init_agent(
                 _config_context_length,
             )
             print(
-                f"\n⚠ Invalid model.context_length in config.yaml: {_config_context_length!r}\n"
+                f"\n⚠️ Invalid model.context_length in config.yaml: {_config_context_length!r}\n"
                 f"  Must be a plain integer (e.g. 256000, not '256K').\n"
                 f"  Falling back to auto-detected context window.\n",
                 file=sys.stderr,
@@ -2754,7 +2754,7 @@ def init_agent(
                                         agent.model, _cp_ctx,
                                     )
                                     print(
-                                        f"\n⚠ Invalid context_length for model {agent.model!r} in custom_providers: {_cp_ctx!r}\n"
+                                        f"\n⚠️ Invalid context_length for model {agent.model!r} in custom_providers: {_cp_ctx!r}\n"
                                         f"  Must be a positive integer (e.g. 256000, not '256K').\n"
                                         f"  Falling back to auto-detected context window.\n",
                                         file=sys.stderr,
@@ -2992,7 +2992,7 @@ def init_agent(
             _hermes_warn = _check_hermes_model_warning(agent.model or "")
             if _hermes_warn:
                 _user_msg = (
-                    "⚠ Nous Research Hermes 3 & 4 models are NOT agentic — they "
+                    "⚠️ Nous Research Hermes 3 & 4 models are NOT agentic — they "
                     "lack reliable tool-calling for agent workflows (delegation, "
                     "cron, proactive tools). Consider an agentic model instead "
                     "(Claude, GPT, Gemini, Qwen-Coder, etc.)."

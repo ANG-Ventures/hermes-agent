@@ -1010,9 +1010,17 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
 
 
 def _is_model_route_change_status(message: str) -> bool:
-    """Return whether ``message`` is a durable route/effort announcement."""
+    """Return whether ``message`` is a durable route/effort announcement.
+
+    The warning prefix is matched with an optional U+FE0F variation selector:
+    the emitter uses emoji presentation (``⚠️``) so the notice renders as the
+    warning emoji on chat surfaces, but a bare ``⚠`` must keep matching so an
+    older/plain-text producer is never silently dropped by this gate.
+    """
     text = str(message or "").lstrip()
-    return text.startswith(("🔄 Model fallback", "🔄 Model recovery", "🔀 Model switched", "⚠ replying on "))
+    if text.startswith(("🔄 Model fallback", "🔄 Model recovery", "🔀 Model switched")):
+        return True
+    return text.startswith("⚠️ replying on ") or text.startswith("⚠ replying on ")
 
 
 def render_notice_line(notice) -> str:

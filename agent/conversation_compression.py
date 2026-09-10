@@ -401,7 +401,7 @@ def _emit_compaction_done(agent: Any) -> None:
 # suppressed on human-facing chat platforms by _TELEGRAM_NOISY_STATUS_RE
 # (gateway/run.py) — when rewording ANY of them, update that regex and the
 # pinned data in tests/gateway/test_telegram_noise_filter.py in the same PR.
-# Failure notices (⚠ Compression aborted / empty transcript / codex compaction
+# Failure notices (⚠️ Compression aborted / empty transcript / codex compaction
 # failed) and manual /compress feedback (manual_compression_feedback.py) are
 # deliberate carve-outs from silence and must NOT be added here.
 PRE_API_COMPRESSION_STATUS_TEMPLATE = (
@@ -451,7 +451,7 @@ COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE = (
 # (_TELEGRAM_NOISY_STATUS_RE); it is pinned un-swallowed in
 # tests/gateway/test_telegram_noise_filter.py::VISIBLE_COMPRESSION_MESSAGES.
 CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE = (
-    "⚠ Context is over the compression threshold "
+    "⚠️ Context is over the compression threshold "
     "(~{tokens:,} tokens >= {threshold:,}) "
     "but compression is currently blocked ({reason}). "
     "The model may stop responding. Run /new to start a fresh "
@@ -2528,7 +2528,7 @@ def check_compression_model_feasibility(agent: Any) -> None:
         if client is None or not aux_model:
             if _aux_cfg_provider and _aux_cfg_provider != "auto":
                 msg = (
-                    "⚠ Configured auxiliary compression provider "
+                    "⚠️ Configured auxiliary compression provider "
                     f"'{_aux_cfg_provider}' is unavailable — context "
                     "compression will drop middle turns without a summary. "
                     "Check auxiliary.compression in config.yaml and "
@@ -2536,7 +2536,7 @@ def check_compression_model_feasibility(agent: Any) -> None:
                 )
             else:
                 msg = (
-                    "⚠ No auxiliary LLM provider configured — context "
+                    "⚠️ No auxiliary LLM provider configured — context "
                     "compression will drop middle turns without a summary. "
                     "Run `hermes setup` or set OPENROUTER_API_KEY."
                 )
@@ -2675,7 +2675,7 @@ def check_compression_model_feasibility(agent: Any) -> None:
             )
             _aux_label = f"{aux_model} ({_aux_provider_label})"
             msg = (
-                f"⚠ Compression model {_aux_label} context is "
+                f"⚠️ Compression model {_aux_label} context is "
                 f"{aux_context:,} tokens, but the main model "
                 f"{_main_label}'s compression threshold was "
                 f"{old_threshold:,} tokens. "
@@ -3621,7 +3621,7 @@ def compress_context(
                 agent._last_compression_lock_warning_sid = _lock_sid
                 try:
                     agent._emit_warning(
-                        "⚠ Skipping concurrent compression — another path "
+                        "⚠️ Skipping concurrent compression — another path "
                         "is already compressing this session. Will retry "
                         "after it finishes."
                     )
@@ -4213,7 +4213,7 @@ def compress_context(
                 if getattr(agent, "_last_compression_summary_warning", None) != _err:
                     agent._last_compression_summary_warning = _err
                     agent._emit_warning(
-                        f"⚠ Compression aborted: {_err}. "
+                        f"⚠️ Compression aborted: {_err}. "
                         "No messages were dropped — conversation continues unchanged. "
                         "Run /compress to retry, or /new to start a fresh session."
                     )
@@ -4273,7 +4273,7 @@ def compress_context(
             )
             try:
                 agent._emit_warning(
-                    "⚠ Compression returned an empty transcript. "
+                    "⚠️ Compression returned an empty transcript. "
                     "No session split was performed; conversation continues unchanged."
                 )
             except Exception:
@@ -4323,7 +4323,7 @@ def compress_context(
             if getattr(agent, "_last_compression_summary_warning", None) != summary_error:
                 agent._last_compression_summary_warning = summary_error
                 agent._emit_warning(
-                    f"⚠ Compression summary failed: {summary_error}. "
+                    f"⚠️ Compression summary failed: {summary_error}. "
                     "Inserted a fallback context marker."
                 )
         else:
@@ -5778,7 +5778,7 @@ def _compress_context_via_codex_app_server(
     if getattr(result, "interrupted", False) or getattr(result, "error", None):
         try:
             agent._emit_warning(
-                f"⚠ Codex app-server compaction failed: {result.error}"
+                f"⚠️ Codex app-server compaction failed: {result.error}"
             )
         except Exception:
             pass
