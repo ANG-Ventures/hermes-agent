@@ -121,7 +121,9 @@ def test_dispatch_guard_releases_after_sessiondb_finalization_hang(tmp_path):
     import cron.scheduler as sched
 
     release = threading.Event()
-    fake_db = HangingSessionDB(release)
+    # Each fire needs its own witness: reusing the first entered Event could
+    # hide a second tick that skips run_job entirely.
+    fake_dbs = [HangingSessionDB(release), HangingSessionDB(release)]
     job = {
         "id": "cleanup-guard-hang",
         "name": "cleanup-guard-hang",
@@ -135,16 +137,19 @@ def test_dispatch_guard_releases_after_sessiondb_finalization_hang(tmp_path):
     sched._parallel_pool_max_workers = None
     sched._running_job_ids.clear()
 
+    # The due-job fixture is not persisted. Pair it with a successful fire
+    # claim or tick returns 1 for a lost claim without ever constructing an agent.
     try:
         with patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_state.SessionDB", side_effect=fake_dbs), \
              patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=_RUNTIME), \
              patch("run_agent.AIAgent") as mock_agent_cls, \
              patch("cron.scheduler._cron_cleanup_timeout_seconds", return_value=0.02), \
              patch.object(sched, "get_due_jobs", return_value=[job]), \
+             patch.object(sched, "claim_job_for_fire", return_value=job), \
              patch.object(sched, "advance_next_runs"), \
              patch.object(sched, "save_job_output", return_value="/tmp/out"), \
              patch.object(sched, "mark_job_run"), \
@@ -153,10 +158,19 @@ def test_dispatch_guard_releases_after_sessiondb_finalization_hang(tmp_path):
             mock_agent.run_conversation.return_value = {"final_response": "ok"}
             mock_agent_cls.return_value = mock_agent
 
-            assert sched.tick(verbose=False) == 1
-            assert "cleanup-guard-hang" not in sched.get_running_job_ids()
-            assert sched.tick(verbose=False) == 1
+            for fire, fake_db in enumerate(fake_dbs, start=1):
+                assert sched.tick(verbose=False) == 1
+                assert mock_agent_cls.call_count == fire
+                assert fake_db.entered.wait(timeout=SCHEDULING_GUARD_SECONDS)
+                assert not release.is_set()
+                assert not fake_db.returned.is_set(), (
+                    "tick waited for the hung SessionDB finalizer instead of abandoning it"
+                )
+                assert job["id"] not in sched.get_running_job_ids()
     finally:
         release.set()
+        for fake_db in fake_dbs:
+            if fake_db.entered.is_set():
+                fake_db.returned.wait(timeout=SCHEDULING_GUARD_SECONDS)
         sched._running_job_ids.discard("cleanup-guard-hang")
         sched._shutdown_parallel_pool()
