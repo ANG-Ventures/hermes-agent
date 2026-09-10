@@ -189,6 +189,101 @@ _EXTRA_KEYS = frozenset({
 })
 
 
+# Which payload keys carry token material for a singleton-seeded provider, and
+# which timestamp decides whether that material is fresh.
+#
+# ``_seed_from_singletons`` re-reads the auth.json singleton on every
+# ``load_pool()`` and hands it to ``_upsert_entry``.  A *different* pair is not
+# automatically a *newer* pair: another process can leave an older,
+# already-consumed pair behind, or a write-back can lose a race.  Adopting it
+# would replay a consumed single-use refresh token (``refresh_token_reused``
+# 4xx / portal revocation) and persist the regression to disk — the same defect
+# the ``_sync_*_entry_from_auth_store`` readers guard against, arriving through
+# the seeding door.
+#
+# Declared per group, not per provider, because one singleton can carry more
+# than one clock: Nous stamps its OAuth pair with ``obtained_at`` and its
+# inference agent key independently with ``agent_key_obtained_at``, so an older
+# pair must not block a legitimately newer key.  Routing/label/metadata keys are
+# deliberately absent — they are not token material and keep updating.
+#
+# A provider added here inherits the gate at the choke point; no new call-site
+# comparison is needed.
+_SINGLETON_FRESHNESS_GROUPS: Dict[str, Tuple[Tuple[str, frozenset], ...]] = {
+    "openai-codex": (
+        ("last_refresh", frozenset({"access_token", "refresh_token", "last_refresh"})),
+    ),
+    "xai-oauth": (
+        ("last_refresh", frozenset({"access_token", "refresh_token", "last_refresh"})),
+    ),
+    "nous": (
+        ("obtained_at", frozenset({
+            "access_token", "refresh_token", "expires_at",
+            "obtained_at", "expires_in",
+        })),
+        ("agent_key_obtained_at", frozenset({
+            "agent_key", "agent_key_expires_at", "agent_key_id",
+            "agent_key_expires_in", "agent_key_reused", "agent_key_obtained_at",
+        })),
+    ),
+}
+
+# Sources seeded *from* a singleton.  ``manual:*`` rows are independent
+# credentials with their own refresh-token lifecycle and are never gated.
+_SINGLETON_SEED_SOURCE = "device_code"
+
+
+def _drop_stale_singleton_token_material(
+    existing: "PooledCredential",
+    provider: str,
+    source: str,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Strip token material that is older than what the entry already holds.
+
+    Freshness is compared as instants via ``_parse_absolute_timestamp`` (not ISO
+    string order), per group.  Missing or unparseable timestamps on either side
+    keep the pre-existing adopt behavior for that group, so rotation recovery
+    from an untimestamped store still works.
+
+    Returns ``payload`` unchanged (same object) when nothing is stale, so the
+    common path costs one dict lookup.
+    """
+    groups = _SINGLETON_FRESHNESS_GROUPS.get(provider)
+    if not groups or source != _SINGLETON_SEED_SOURCE:
+        return payload
+
+    stale_keys: Set[str] = set()
+    pair_stale = False
+    for stamp_key, gated_keys in groups:
+        entry_at = _parse_absolute_timestamp(getattr(existing, stamp_key, None))
+        store_at = _parse_absolute_timestamp(payload.get(stamp_key))
+        if entry_at is None or store_at is None or store_at >= entry_at:
+            continue
+        stale_keys |= gated_keys
+        if "access_token" in gated_keys:
+            pair_stale = True
+
+    # ``_set_nous_agent_key_from_invoke_jwt`` mirrors the access token onto
+    # ``agent_key``, which is what ``runtime_api_key`` actually serves.  If the
+    # incoming key IS the refused access token, refuse it with the pair —
+    # otherwise the stale pair launders itself in through ``agent_key``.
+    incoming_key = payload.get("agent_key")
+    if pair_stale and incoming_key and incoming_key == payload.get("access_token"):
+        for stamp_key, gated_keys in groups:
+            if "agent_key" in gated_keys:
+                stale_keys |= gated_keys
+
+    if not stale_keys:
+        return payload
+    logger.debug(
+        "Pool entry %s: refusing stale singleton token material from auth.json (%s)",
+        existing.id,
+        ", ".join(sorted(stale_keys)),
+    )
+    return {k: v for k, v in payload.items() if k not in stale_keys}
+
+
 def _normalize_pool_auth_type(provider: str, token: Any, auth_type: Any) -> str:
     """Infer pool auth metadata for token formats with one unambiguous meaning."""
     if (
@@ -2869,6 +2964,11 @@ def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, p
         return True
 
     existing = entries[existing_idx]
+    # Choke point for singleton freshness: an older auth.json pair must not
+    # displace (or persist over) the fresher one this entry already holds.
+    # Done before ``token_changed`` so a refused pair can't look like a
+    # rotation and clear the entry's exhaustion state.
+    payload = _drop_stale_singleton_token_material(existing, provider, source, payload)
     field_updates = {}
     extra_updates = {}
     _field_names = {f.name for f in fields(existing)}
