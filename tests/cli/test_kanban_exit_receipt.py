@@ -54,7 +54,10 @@ def fake_cli(result):
     ("billing", "insufficient credits", 75),
     ("pool_exhausted", 'HTTP 503 {"error":"no eligible sub"}', 75),
     ("overloaded", 'HTTP 503 {"error":"no eligible sub"}', 75),
-    ("overloaded", "HTTP 503 service unavailable", 1),
+    ("overloaded", "HTTP 503 service unavailable", 75),
+    ("overloaded", "API call failed after 3 retries: Our servers are currently "
+                   "overloaded. Please try again later.", 75),
+    ("server_error", "HTTP 500 internal server error", 1),
     ("tool_error", "tool execution failed", 1),
     (None, "", 0),
 ])

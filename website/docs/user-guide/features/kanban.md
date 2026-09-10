@@ -897,10 +897,14 @@ Workers publish atomic, per-run exit receipts under
 `<board-db-directory>/runs/<task_id>.<run_id>.exit.json`. The dispatcher reads
 the exact run's receipt before consulting process status, so another gateway
 subprocess reaper cannot turn a quota exit into a crash. Ordinary and goal-mode
-workers use the same result-aware exit path. Rate-limit, billing, and exhausted
-subscription-pool failures exit with code 75; generic overloads and tool failures
-remain errors. A quota exit returns to the run's source lane (`ready` or `review`)
-without increasing `consecutive_failures`.
+workers use the same result-aware exit path. Rate-limit, billing, exhausted
+subscription-pool, and upstream provider capacity failures (529 / 503 /
+"servers are currently overloaded") exit with code 75; app-level 500s,
+assertions, OOMs, and tool failures remain errors. The receipt carries an
+`exit_class` (`quota`, `pool_exhausted`, `upstream_capacity`) so telemetry can
+tell a quota wall from a capped relay pool from a full vendor, while all three
+share the same retry-preserving handling. A quota exit returns to the run's
+source lane (`ready` or `review`) without increasing `consecutive_failures`.
 
 ```yaml
 kanban:
