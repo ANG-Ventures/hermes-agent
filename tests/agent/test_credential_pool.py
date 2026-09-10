@@ -1710,6 +1710,177 @@ class TestLeastUsedStrategy:
 # ── OpenAI Codex OAuth cross-process sync tests ────────────────────────────
 
 
+@pytest.fixture
+def codex_sync_pool(tmp_path, monkeypatch):
+    """Real pool/persistence/refresh code; only HTTP is replaced, never OAuth."""
+    from types import SimpleNamespace
+    from urllib.parse import parse_qs
+
+    import httpx
+    import hermes_cli.auth as auth
+    from agent.credential_pool import load_pool
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    assert auth._auth_file_path() == tmp_path / "hermes" / "auth.json"
+    assert auth._global_auth_file_path() is None
+    calls = []
+    owners = {}
+
+    def token(account, generation, ttl):
+        return _jwt_with_claims({
+            "https://api.openai.com/auth": {"chatgpt_account_id": account},
+            "exp": int(time.time()) + ttl,
+            "jti": generation,
+        })
+
+    def transport(request):
+        if request.method == "GET" and request.url.path.endswith("/usage"):
+            return httpx.Response(200, json={
+                "rate_limit": {"primary_window": {"used_percent": 100}},
+            })
+        assert request.method == "POST"
+        assert str(request.url) == "https://auth.openai.com/oauth/token"
+        form = parse_qs(request.content.decode())
+        assert form["grant_type"] == ["refresh_token"]
+        refresh = form["refresh_token"][0]
+        calls.append(refresh)
+        # Bind the response to the PRESENTED token's owner, not the desired
+        # account: otherwise a fake upstream masks cross-account adoption.
+        return httpx.Response(200, json={
+            "access_token": token(owners[refresh], "rotated", 3600),
+            "refresh_token": "synthetic-rotated-refresh",
+        })
+
+    client = httpx.Client
+    monkeypatch.setattr(auth, "httpx", SimpleNamespace(
+        Client=lambda **kw: client(transport=httpx.MockTransport(transport), **kw),
+        Timeout=httpx.Timeout,
+    ))
+
+    def build(*, store_account="account-A", entry_account="account-A",
+              store_time="2026-09-10T04:30:00Z",
+              entry_time="2026-09-10T04:00:00Z", store_ttl=3600,
+              source="manual:device_code", identical=False):
+        entry_access = token(entry_account, "pool", 30)
+        store_access = token(store_account, "store", store_ttl)
+        entry_refresh, store_refresh = "synthetic-pool-refresh", "synthetic-store-refresh"
+        owners.update({entry_refresh: entry_account, store_refresh: store_account})
+        if identical:
+            store_access, store_refresh = entry_access, entry_refresh
+        entry = {
+            "id": "target", "label": "independent-account", "priority": 1,
+            "auth_type": "oauth", "source": source,
+            "access_token": entry_access, "refresh_token": entry_refresh,
+            "last_refresh": entry_time,
+        }
+        decoy = {
+            **entry, "id": "capped", "label": "capped-account", "priority": 0,
+            "access_token": token("account-B", "capped", 3600),
+            "source": "manual:device_code", "last_status": "exhausted",
+            "last_status_at": time.time(), "last_error_code": 429,
+            "last_error_reset_at": time.time() + 86400,
+        }
+        _write_auth_store(tmp_path, {
+            "version": 1,
+            "providers": {"openai-codex": {
+                "tokens": {"access_token": store_access, "refresh_token": store_refresh},
+                "last_refresh": store_time,
+            }},
+            "credential_pool": {"openai-codex": [decoy, entry]},
+            "suppressed_sources": {"openai-codex": ["device_code"]},
+        })
+        pool = load_pool("openai-codex")
+        target = next(e for e in pool.entries() if e.id == "target")
+        return pool, target, (store_access, store_refresh), auth._auth_file_path(), calls
+
+    return build
+
+
+@pytest.mark.parametrize("source", ["device_code", "manual:device_code"])
+def test_codex_sync_refuses_cross_account(codex_sync_pool, source):
+    pool, entry, _, path, calls = codex_sync_pool(store_account="account-B", source=source)
+    before = path.read_bytes()
+    assert pool._sync_codex_entry_from_auth_store(entry) is entry
+    assert path.read_bytes() == before
+    assert calls == []
+
+
+@pytest.mark.parametrize("force", [False, True], ids=["select", "forced-refresh"])
+def test_codex_sync_never_spends_other_accounts_refresh(codex_sync_pool, force):
+    pool, entry, _, path, calls = codex_sync_pool(store_account="account-B")
+    selected = (pool.try_refresh_matching(credential_id=entry.id)
+                if force else pool.select())
+    assert selected is not None
+    assert calls == [entry.refresh_token]
+    disk = json.loads(path.read_text())
+    persisted = next(e for e in disk["credential_pool"]["openai-codex"] if e["id"] == entry.id)
+    assert selected.access_token == persisted["access_token"]
+    claims = json.loads(base64.urlsafe_b64decode(selected.access_token.split(".")[1] + "=="))
+    assert claims["https://api.openai.com/auth"]["chatgpt_account_id"] == "account-A"
+    assert (selected.label, selected.priority) == (entry.label, entry.priority)
+
+
+@pytest.mark.parametrize("store_time,entry_time", [
+    ("2026-07-22T15:28:55Z", "2026-09-10T04:30:04Z"),
+    ("2026-09-10T05:00:00+02:00", "2026-09-10T04:00:00Z"),
+])
+def test_codex_sync_refuses_stale_pair(codex_sync_pool, store_time, entry_time):
+    pool, entry, _, path, calls = codex_sync_pool(
+        store_time=store_time, entry_time=entry_time, store_ttl=-60,
+    )
+    before = path.read_bytes()
+    assert pool._sync_codex_entry_from_auth_store(entry) is entry
+    assert path.read_bytes() == before
+    assert pool.try_refresh_matching(credential_id=entry.id) is not None
+    assert calls == [entry.refresh_token]
+
+
+@pytest.mark.parametrize("store_time,entry_time", [
+    ("2026-09-10T04:30:00Z", "2026-09-10T04:00:00Z"),
+    ("2026-09-10T04:00:00Z", "2026-09-10T04:00:00Z"),
+    (None, "2026-09-10T04:00:00Z"),
+    ("invalid", "2026-09-10T04:00:00Z"),
+    ("2026-09-10T04:30:00Z", None),
+])
+def test_codex_sync_same_account_adopts(codex_sync_pool, store_time, entry_time):
+    pool, entry, pair, path, calls = codex_sync_pool(store_time=store_time, entry_time=entry_time)
+    selected = pool.select()
+    assert selected is not None
+    assert (selected.access_token, selected.refresh_token) == pair
+    assert calls == []
+    persisted = next(e for e in json.loads(path.read_text())["credential_pool"]["openai-codex"]
+                     if e["id"] == entry.id)
+    assert (persisted["access_token"], persisted["refresh_token"]) == pair
+
+
+def test_codex_sync_identical_pair_noop(codex_sync_pool):
+    pool, entry, _, path, calls = codex_sync_pool(identical=True)
+    before = path.read_bytes()
+    assert pool._sync_codex_entry_from_auth_store(entry) is entry
+    assert path.read_bytes() == before
+    assert calls == []
+
+
+@pytest.mark.parametrize("unknown_side", ["entry", "store"])
+@pytest.mark.parametrize("unknown", [None, "opaque-token", "bad.jwt.token"])
+def test_codex_sync_unknown_account_preserves_adoption(codex_sync_pool, unknown_side, unknown):
+    from dataclasses import replace
+
+    pool, entry, pair, path, calls = codex_sync_pool()
+    if unknown_side == "entry":
+        changed = replace(entry, access_token=unknown)
+        pool._replace_entry(entry, changed)
+        entry = changed
+    else:
+        store = json.loads(path.read_text())
+        store["providers"]["openai-codex"]["tokens"]["access_token"] = unknown
+        path.write_text(json.dumps(store))
+    synced = pool._sync_codex_entry_from_auth_store(entry)
+    assert synced.refresh_token == pair[1]
+    assert calls == []
+
+
 
 
 

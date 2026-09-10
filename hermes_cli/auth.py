@@ -2620,6 +2620,21 @@ def _decode_jwt_claims(token: Any) -> Dict[str, Any]:
     return claims if isinstance(claims, dict) else {}
 
 
+def get_codex_account_id(access_token: Any) -> Optional[str]:
+    """Best-effort account identity for Codex sync and account-scoped HTTP.
+
+    This decodes an unverified JWT claim, not proof of authentication. Opaque
+    tokens, malformed claims, and missing identities return None so callers
+    can preserve compatibility with tokens whose identity cannot be compared.
+    """
+    auth_claim = _decode_jwt_claims(access_token).get("https://api.openai.com/auth")
+    if isinstance(auth_claim, dict):
+        account_id = auth_claim.get("chatgpt_account_id")
+        if isinstance(account_id, str):
+            return account_id.strip() or None
+    return None
+
+
 def _scope_values(raw_scope: Any) -> set[str]:
     # OAuth token responses normally return a space-separated string. Keep
     # collection support for JWT ``scp`` claims and older stored test fixtures.
@@ -4478,14 +4493,9 @@ def _probe_codex_quota_restored(
         }
         # Best-effort ChatGPT-Account-Id from the JWT (the backend requires it
         # for some account shapes; harmless to omit for others).
-        claims = _decode_jwt_claims(token)
-        account_id = (
-            claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id")
-            if isinstance(claims.get("https://api.openai.com/auth"), dict)
-            else None
-        )
-        if isinstance(account_id, str) and account_id.strip():
-            headers["ChatGPT-Account-Id"] = account_id.strip()
+        account_id = get_codex_account_id(token)
+        if account_id:
+            headers["ChatGPT-Account-Id"] = account_id
         with httpx.Client(timeout=10.0) as client:
             response = client.get(_codex_usage_probe_url(base_url), headers=headers)
         if response.status_code == 200:
