@@ -102,7 +102,7 @@ class _FakeAgent:
         if self._last_ctx_overflow_warn != _warn_key:
             self._last_ctx_overflow_warn = _warn_key
             self._emit_warning(
-                f"⚠ Context is over the compression threshold "
+                f"⚠️ Context is over the compression threshold "
                 f"(~{preflight_tokens:,} tokens >= {threshold_tokens:,}) "
                 f"but compression is currently blocked ({reason})."
             )
