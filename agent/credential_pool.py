@@ -39,6 +39,7 @@ from hermes_cli.auth import (
     _save_auth_store,
     _save_provider_state,
     _store_provider_state,
+    get_codex_account_id,
     read_credential_pool,
     write_credential_pool,
 )
@@ -1061,7 +1062,8 @@ class CredentialPool:
 
         Mirrors the Nous/Anthropic resync paths above.  Only applies to
         device_code-sourced entries; env/API-key-sourced entries have no
-        auth.json shadow to sync from.
+        auth.json shadow to sync from. Refuse known account mismatches and
+        older token pairs; manual device-code rows may be independent accounts.
         """
         if self.provider != "openai-codex" or entry.source not in ("device_code", "manual:device_code"):
             return entry
@@ -1076,8 +1078,9 @@ class CredentialPool:
                 return entry
             store_access = tokens.get("access_token", "")
             store_refresh = tokens.get("refresh_token", "")
-            # Adopt auth.json tokens when either side differs.  Codex refresh
-            # tokens are single-use too, so a fresh refresh_token from
+            # Subject to the account/freshness checks below, adopt auth.json
+            # tokens when either side differs. Codex refresh tokens are
+            # single-use too, so a fresh refresh_token from
             # another process means our entry's pair is consumed/stale.
             #
             # Also adopt when the store has a refresh_token but no
@@ -1086,6 +1089,26 @@ class CredentialPool:
             # the important signal is the refresh_token difference.
             entry_access = entry.access_token or ""
             entry_refresh = entry.refresh_token or ""
+            # Manual device-code entries can represent independent accounts.
+            # Different token bytes imply rotation only within one account;
+            # unknown identities must still allow opaque-token recovery.
+            entry_account = get_codex_account_id(entry_access)
+            store_account = get_codex_account_id(store_access)
+            if entry_account and store_account and entry_account != store_account:
+                return entry
+
+            # A different pair can also be an older, already-consumed pair.
+            # Compare instants (not ISO strings); missing/unparseable refresh
+            # timestamps retain the existing rotation-recovery behavior.
+            entry_refreshed_at = _parse_absolute_timestamp(entry.last_refresh)
+            store_refreshed_at = _parse_absolute_timestamp(state.get("last_refresh"))
+            if (
+                entry_refreshed_at is not None
+                and store_refreshed_at is not None
+                and store_refreshed_at < entry_refreshed_at
+            ):
+                return entry
+
             should_adopt = False
             if store_access and (
                 store_access != entry_access

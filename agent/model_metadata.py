@@ -4,7 +4,6 @@ Pure utility functions with no AIAgent dependency. Used by ContextCompressor
 and run_agent.py for pre-flight context checks.
 """
 
-import base64
 import hashlib
 import ipaddress
 import json
@@ -2895,31 +2894,10 @@ def _codex_oauth_token_fingerprint(access_token: str) -> str:
 
 
 def _extract_chatgpt_account_id(access_token: str) -> Optional[str]:
-    """Extract ``chatgpt_account_id`` from the Codex OAuth JWT.
+    """Account header required by the per-account Codex model catalog."""
+    from hermes_cli.auth import get_codex_account_id
 
-    The Codex ``/backend-api/codex/models`` endpoint returns the per-account
-    catalog only when the ``ChatGPT-Account-Id`` header is present; without
-    it, the endpoint returns ``{"models":[]}`` (HTTP 200) and the context
-    probe falls back to the hardcoded defaults — which can be stale or
-    wrong for the active account's plan. Mirrors the same extraction done
-    in ``auxiliary_client.py`` for the request path.
-
-    Returns ``None`` on any parse error rather than raising, so a bad
-    token still surfaces as a normal probe failure instead of crashing
-    the metadata resolver.
-    """
-    try:
-        parts = access_token.split(".")
-        if len(parts) < 2:
-            return None
-        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
-        claims = json.loads(base64.urlsafe_b64decode(payload_b64))
-        if not isinstance(claims, dict):
-            return None
-        acct_id = claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id")
-        return acct_id if isinstance(acct_id, str) and acct_id else None
-    except Exception:
-        return None
+    return get_codex_account_id(access_token)
 
 
 def _fetch_codex_oauth_context_lengths_with_source(

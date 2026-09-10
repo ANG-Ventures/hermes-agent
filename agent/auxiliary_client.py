@@ -1480,20 +1480,11 @@ def _codex_cloudflare_headers(
             "User-Agent": f"HermesAgent/{__version__}",
             "originator": "hermes-agent",
         })
-    if not isinstance(access_token, str) or not access_token.strip():
-        return headers
-    try:
-        import base64
-        parts = access_token.split(".")
-        if len(parts) < 2:
-            return headers
-        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
-        claims = json.loads(base64.urlsafe_b64decode(payload_b64))
-        acct_id = claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id")
-        if isinstance(acct_id, str) and acct_id:
-            headers["ChatGPT-Account-ID"] = acct_id
-    except Exception:
-        pass
+    from hermes_cli.auth import get_codex_account_id
+
+    acct_id = get_codex_account_id(access_token)
+    if acct_id:
+        headers["ChatGPT-Account-ID"] = acct_id
     return headers
 
 
