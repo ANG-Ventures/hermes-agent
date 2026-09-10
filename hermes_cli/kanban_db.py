@@ -9758,6 +9758,21 @@ def _classify_run_exit(conn, task_id, run_id, pid):
     return _classify_worker_exit(pid)
 
 
+def _run_exit_class(conn, task_id, run_id) -> Optional[str]:
+    """Telemetry-only: which retry-preserving class the run's receipt named.
+
+    ``quota`` / ``pool_exhausted`` / ``upstream_capacity`` (see
+    ``hermes_cli.kanban_worker_exit``), or ``None`` for a legacy receipt or a
+    status-only fallback. Never changes the exit KIND — that is the code.
+    """
+    from hermes_cli.kanban_worker_exit import exit_file, read_exit_class
+
+    db_path = next(r[2] for r in conn.execute("PRAGMA database_list") if r[1] == "main")
+    if db_path and run_id is not None:
+        return read_exit_class(exit_file(Path(db_path), task_id, run_id))
+    return None
+
+
 def _pid_alive(pid: Optional[int]) -> bool:
     """Return True if ``pid`` is still running on this host.
 
@@ -10529,8 +10544,13 @@ def detect_crashed_workers(
                 # trip the circuit breaker and permanently block the card.
                 protocol_violation = False
                 rate_limited_exit = True
+                exit_class = _run_exit_class(conn, row["id"], row["current_run_id"])
+                _wall = {
+                    "upstream_capacity": "provider capacity overload",
+                    "pool_exhausted": "sub pool capped",
+                }.get(exit_class or "", "quota wall")
                 error_text = (
-                    f"pid {pid} exited rate-limited (quota wall) — "
+                    f"pid {pid} exited rate-limited ({_wall}) — "
                     f"requeued without counting a failure"
                 )
                 event_kind = "rate_limited"
@@ -10540,6 +10560,8 @@ def detect_crashed_workers(
                     "exit_code": code,
                     "next_eligible_at": int(time.time()) + _resolve_rate_limit_cooldown_seconds(),
                 }
+                if exit_class:
+                    event_payload["exit_class"] = exit_class
             else:
                 protocol_violation = False
                 if kind == "nonzero_exit":
