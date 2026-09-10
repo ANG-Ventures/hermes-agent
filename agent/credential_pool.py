@@ -1172,7 +1172,14 @@ class CredentialPool:
         if self.provider != "openai-codex" or self._auth_owner is None:
             return entry
         from agent.codex_owner import sync
-        return sync(self, entry)
+        synced = sync(self, entry)
+        # Least-used selection increments this process-local counter without
+        # persisting on every request. Owner reconciliation must not erase it.
+        if synced.request_count < entry.request_count:
+            updated = replace(synced, request_count=entry.request_count)
+            self._replace_entry(synced, updated)
+            return updated
+        return synced
 
     def _sync_xai_oauth_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
         """Sync an xAI OAuth pool entry from auth.json if tokens differ.
@@ -2256,6 +2263,14 @@ class CredentialPool:
         entry, pending_refresh = self._select_under_lock()
         if pending_refresh:
             self._refresh_pending_entries(pending_refresh)
+            if self._auth_owner is not None:
+                # Deferred I/O can outlive a peer reservation/removal of the
+                # candidate chosen above. Reconcile again before returning it.
+                with self._lock:
+                    available, _ = self._available_entries(clear_expired=True, refresh=True)
+                    entry = next((e for e in available if entry is not None and e.id == entry.id), None)
+                    if entry is None:
+                        entry, _ = self._select_unlocked()
         if entry is not None:
             self._unmatched_rotation_streak = 0
             return entry
@@ -2286,7 +2301,14 @@ class CredentialPool:
             # _refresh_entry_impl take self._lock explicitly around their
             # read-modify-write of self._entries — required because this
             # call site runs OUTSIDE the pool lock.
-            self._refresh_entry(entry, force=False)
+            try:
+                self._refresh_entry(entry, force=False)
+            except auth_mod.AuthError:
+                # The owner transaction has already persisted cooldown or
+                # fenced an uncertain generation. One unusable grant must not
+                # abort selection of unrelated healthy credentials. Keep the
+                # private transaction raising, and do not hide coding errors.
+                logger.debug("credential pool: deferred refresh unavailable", exc_info=True)
 
     def _available_entries(
         self, *, clear_expired: bool = False, refresh: bool = False,
@@ -2343,18 +2365,18 @@ class CredentialPool:
                 if synced is not entry:
                     entry = synced
                     cleared_any = True
-            # For openai-codex entries, same pattern: the user may have
-            # re-authed via `hermes model` / `hermes auth` after a 429/401,
-            # leaving fresh tokens on disk while the pool entry is still
-            # frozen behind last_error_reset_at (can be hours in the
-            # future for ChatGPT weekly windows).
-            if (self.provider == "openai-codex"
-                    and entry.source == "device_code"
-                    and entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD}):
-                synced = self._sync_codex_entry_from_auth_store(entry)
-                if synced is not entry:
-                    entry = synced
-                    cleared_any = True
+            # All owned Codex rows (including healthy manual grants) must be
+            # reconciled before cached access tokens can be handed out. A peer
+            # may have removed, rotated, or reserved this generation since load.
+            # Run before DEAD checks so a fresh owner grant can recover, but
+            # isolate expected owner refusals to this entry rather than poison
+            # the rest of the pool. sync() updates the owner baseline itself.
+            if self.provider == "openai-codex":
+                try:
+                    entry = self._sync_codex_entry_from_auth_store(entry)
+                except auth_mod.AuthError:
+                    logger.debug("credential pool: Codex owner row unavailable", exc_info=True)
+                    continue
             # For xai-oauth singleton-seeded entries, identical pattern:
             # an entry frozen as exhausted may simply be holding stale
             # tokens that another process (or a fresh `hermes model` ->
@@ -2709,6 +2731,12 @@ class CredentialPool:
             # a refresh returns None even though the refresh succeeded — the
             # caller sees "no credentials available" and fails a request that
             # should have gone through.
+            if chosen_id is not None and self._auth_owner is not None:
+                with self._lock:
+                    available, _ = self._available_entries(clear_expired=True, refresh=True)
+                    if not any(entry.id == chosen_id for entry in available):
+                        self.release_lease(chosen_id)
+                        chosen_id = None
             if chosen_id is None:
                 chosen_id, _ = self._acquire_lease_under_lock(credential_id)
         return chosen_id
@@ -2719,6 +2747,11 @@ class CredentialPool:
         """Run lease acquisition under the lock, returning id + pending refreshes."""
         with self._lock:
             if credential_id:
+                if self._auth_owner is not None:
+                    available, pending = self._available_entries(clear_expired=True, refresh=True)
+                    if not any(entry.id == credential_id for entry in available):
+                        return None, [(entry, sync) for entry, sync in pending
+                                      if entry.id == credential_id]
                 self._active_leases[credential_id] = self._active_leases.get(credential_id, 0) + 1
                 self._current_id = credential_id
                 return credential_id, []

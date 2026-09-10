@@ -1009,11 +1009,13 @@ class AuthError(RuntimeError):
         provider: str = "",
         code: Optional[str] = None,
         relogin_required: bool = False,
+        http_status: Optional[int] = None,
     ) -> None:
         super().__init__(message)
         self.provider = provider
         self.code = code
         self.relogin_required = relogin_required
+        self.http_status = http_status
 
 
 def is_rate_limited_auth_error(error: Exception) -> bool:
@@ -4023,6 +4025,7 @@ def refresh_codex_oauth_pure(
             provider="openai-codex",
             code=CODEX_RATE_LIMITED_CODE,
             relogin_required=False,
+            http_status=response.status_code,
         )
 
     if response.status_code != 200:
@@ -4069,6 +4072,7 @@ def refresh_codex_oauth_pure(
             provider="openai-codex",
             code=code,
             relogin_required=relogin_required,
+            http_status=response.status_code,
         )
 
     try:

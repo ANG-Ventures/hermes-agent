@@ -161,7 +161,7 @@ def test_uncertain_response_is_durable_and_new_login_recovers(stores, monkeypatc
     receipts = list(root.with_name("auth.json.codex-refresh").glob("*.json"))
     assert receipts
     for receipt in receipts:
-        assert json.loads(receipt.read_text()) == {"version": 1, "outcome": "uncertain"}
+        assert json.loads(receipt.read_text()) == {"version": 2, "outcome": "uncertain"}
         assert "fresh-login" not in receipt.name
 
 
@@ -283,6 +283,9 @@ def test_definite_quota_rejection_allows_later_retry(stores, monkeypatch):
     with pytest.raises(auth.AuthError) as exc:
         pool._refresh_entry(pool._entries[0], force=True)
     assert exc.value.code == auth.CODEX_RATE_LIMITED_CODE
+    until = cp._exhausted_until(pool._entries[0])
+    assert until is not None
+    monkeypatch.setattr("time.time", lambda: until + 1)
     pool = cp.load_pool(P)
     assert pool._refresh_entry(pool._entries[0], force=True).refresh_token == "fresh"
     assert len(calls) == 2

@@ -89,7 +89,7 @@ def resolve_runtime(*, force_refresh, refresh_if_expiring, refresh_skew_seconds)
     singletons = (
         [e for e in pool._entries if e.source == "device_code"] if has_singleton else []
     )
-    candidates = singletons or pool._entries
+    candidates = singletons + [e for e in pool._entries if e not in singletons]
     from agent.credential_pool import STATUS_DEAD, STATUS_EXHAUSTED, _exhausted_until
     import time
 
@@ -123,22 +123,26 @@ def resolve_runtime(*, force_refresh, refresh_if_expiring, refresh_skew_seconds)
                 pool._replace_entry(entry, cleared)
                 pool._persist()
                 entry = cleared
-        if force_refresh or (
-            refresh_if_expiring
-            and auth._codex_access_token_is_expiring(
-                entry.access_token, refresh_skew_seconds
-            )
-        ):
-            entry = refresh(pool, entry, force_refresh)
-        else:
-            entry = sync(pool, entry)
-        _require_usable(entry)
+        try:
+            if force_refresh or (
+                refresh_if_expiring
+                and auth._codex_access_token_is_expiring(
+                    entry.access_token, refresh_skew_seconds
+                )
+            ):
+                entry = refresh(pool, entry, force_refresh)
+            else:
+                entry = sync(pool, entry)
+            _require_usable(entry)
+        except auth.AuthError as exc:
+            blocked = exc
+            continue
         return {
             "provider": PROVIDER,
             "base_url": os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
             or auth.DEFAULT_CODEX_BASE_URL,
             "api_key": entry.access_token,
-            "source": "hermes-auth-store" if singletons else "credential_pool",
+            "source": "hermes-auth-store" if any(e.id == entry.id for e in singletons) else "credential_pool",
             "last_refresh": entry.last_refresh,
             "auth_mode": "chatgpt",
         }
@@ -148,11 +152,9 @@ def resolve_runtime(*, force_refresh, refresh_if_expiring, refresh_skew_seconds)
 
 
 def _receipt(owner, entry):
-    # A receipt is scoped to the declared owner and row. Fingerprints detect
-    # replay of a generation; they do NOT infer ownership across stores.
-    key = hashlib.sha256(
-        (entry.id + "\0" + (entry.refresh_token or "")).encode()
-    ).hexdigest()
+    # The directory scopes the owner; row labels cannot change a generation.
+    # This does not infer or coalesce ownership across different stores.
+    key = hashlib.sha256((entry.refresh_token or "").encode()).hexdigest()
     return owner.with_name(owner.name + ".codex-refresh") / (key + ".json")
 
 
@@ -171,7 +173,7 @@ def _reserve(owner, entry):
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as handle:
         # No tokens, account identifiers, or exception text in receipts.
-        json.dump({"version": 1, "outcome": "uncertain"}, handle)
+        json.dump({"version": 2, "outcome": "uncertain"}, handle)
         handle.flush()
         os.fsync(handle.fileno())
     _sync_dir(path.parent)
@@ -350,8 +352,7 @@ def refresh(pool, entry, force):
             pool._replace_entry(entry, current)
             pool._owner_baseline[current.id] = current.to_dict()
             return current  # peer committed; even forced waiters must not POST again
-        if current.last_status == "dead":
-            raise _error("Codex credential is quarantined; authenticate a new grant.")
+        _require_usable(current)
         receipt = _reserve(pool._auth_owner, current)  # durable BEFORE any POST
         try:
             refreshed = auth.refresh_codex_oauth_pure(
@@ -361,10 +362,17 @@ def refresh(pool, entry, force):
             # A definite quota rejection did not consume the grant. All other
             # errors stay fenced: transport/5xx/malformed success are uncertain,
             # invalid-grant/reused are terminal. Never claim refresh succeeded.
-            if exc.code == auth.CODEX_RATE_LIMITED_CODE:
+            if exc.http_status == 429:
+                # Commit cooldown before releasing the reservation, so peers
+                # cannot retry immediately if this writer dies after release.
+                pool._replace_entry(entry, current)
+                pool._owner_baseline[current.id] = current.to_dict()
+                pool._mark_exhausted(current, 429)
                 receipt.unlink()
                 _sync_dir(receipt.parent)
             raise
+        except auth.httpx.TransportError as exc:
+            raise _error("Codex refresh transport outcome is uncertain; authenticate at its owner.") from exc
         updated = replace(
             current,
             **{k: refreshed.get(k) for k in TOKEN_FIELDS},

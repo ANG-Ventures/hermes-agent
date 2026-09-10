@@ -1,8 +1,9 @@
 # Codex owner-aware refresh — PR preparation
 
 Base: `a034e62a702beae21f7fa8fd09f98ce5c5249da2` (`fork/main`).
-Target: **ANG-Ventures/hermes-agent**, fork-only. No push, PR, merge, deployment,
-restart, real credential inspection, or OAuth operation is part of this change.
+Target: **ANG-Ventures/hermes-agent**, fork-only. Branch push and review PR are
+authorized; no merge, deployment, restart, real credential inspection, or real
+OAuth operation is part of this change.
 
 ## PR title
 
@@ -32,12 +33,18 @@ fix(auth): preserve Codex pool ownership across refresh and persistence
   cannot fall through to the old singleton refresh path. Re-auth writes only
   `device_code` rows, never inferred manual aliases.
 * A tokenless receipt is durably created **before POST** in the owner's
-  `auth.json.codex-refresh/` directory. Its filename fingerprints row ID plus
-  refresh generation; its content is only version/outcome. It survives process
+  `auth.json.codex-refresh/` directory. Its filename is SHA-256 of the refresh
+  generation alone; the directory scopes the owner. Renaming/removing row IDs
+  cannot bypass it. Its content is only version/outcome (format version 2). It survives process
   death and failed replacement writes. The uncertain generation is blocked on
-  fresh load and before refresh. A new authenticated generation recovers without
+  fresh load, selection/lease, and before refresh. A new authenticated generation recovers without
   deleting receipts. A definite 429 releases the reservation; transport errors,
   malformed success, 5xx, and terminal auth errors stay fenced and raise.
+  HTTP-status provenance, not a body-controlled error code, permits release.
+  Genuine 429 cooldown is persisted before release and honored on repeat calls.
+  Public selection isolates expected auth refusals and tries healthy siblings;
+  private transactions still raise. Runtime prefers the singleton but falls back
+  to healthy manual rows when that singleton is unusable.
 * Existing Anthropic post-failure receipt infrastructure is source-specific and
   records after rotation; it cannot supply this pre-POST transaction reservation
   unchanged. This patch does not alter that provider's semantics.
@@ -70,6 +77,10 @@ not evidence that existing mirrored stores have a single owner.
 * All writers must run the new implementation before migration. Old resident
   processes and external token consumers do not honor receipts. Quiescence and
   a new grant at the canonical owner remain necessary operational gates.
+* The earlier row-ID-based receipt format was unreleased and never deployed.
+  This revision does not migrate those prototype receipts. Any experimental
+  installation must quiesce old writers and obtain new grants before switching;
+  do not treat row-scoped receipts as format-2 backup replay protection.
 * Receipts deliberately are not garbage-collected: restoring an old auth backup
   must not make a consumed generation refreshable. Keep receipt directories with
   auth-store backups. Directory-fsync failures fail closed; tests certify macOS
@@ -104,6 +115,31 @@ access-token-equality alias rewriting were changed to assert the explicitly
 requested independence contract. No diagnostic expectations were weakened.
 The old direct-constructor lock test now loads its row from the actual store;
 unowned in-memory Codex refresh is refused.
+
+## Review-blocker follow-up evidence
+
+* Eight receipt/runtime regressions were RED before their fixes: changed/missing
+  row-ID replay, absent genuine-429 cooldown, 500 with a quota-looking body,
+  runtime singleton failure isolation (429/500), and transport-timeout isolation
+  for select and lease. Transport errors retain the receipt and become structured
+  auth refusals; programming errors still propagate.
+* Added public consumer coverage for select, implicit/explicit lease, rotation,
+  resident receipt/dead/removed/source-replaced rows, peer generation adoption,
+  deferred-refresh race, and programming-error propagation.
+* Selection regression suite on pre-fix implementation: **44 failed, 3 passed**;
+  controls preserved private error propagation and programming-error visibility.
+* Exact sibling suite below: **489 passed, 2 skipped in 48.49s**. This is the
+  complete documented credential/auth slice, not the repository-wide test suite.
+* Unchanged nine-scenario diagnostic: **10/10 predicates true**, exit 0; mirrored
+  profile-local same-grant stores still POST twice and are NOT migration-safe.
+* Original reviewer selection probe: two healthy selections, one POST, persisted
+  exhausted status. Original multi-case probe (only source path changed) now
+  stops at the changed-ID replay with `codex_refresh_uncertain`, as intended.
+  Before stopping: healthy selected after 429; 500 quota-body receipt retained,
+  one POST; resident reserved generation returns no credential. Missing-ID and
+  new-grant recovery are independently covered by the passing regressions.
+* Real network denied, synthetic tokens only, disposable HOME/HERMES_HOME, and
+  imports positively pinned with editable finders removed in every test runner.
 
 ## Reproduction
 
