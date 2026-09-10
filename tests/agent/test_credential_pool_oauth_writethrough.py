@@ -225,7 +225,9 @@ def test_codex_pool_refresh_holds_auth_store_lock_across_post(monkeypatch, tmp_p
         access_token="stale-access",
         refresh_token="stale-refresh",
     )
-    pool = CredentialPool(provider, [entry])
+    _write_store(profile_path, {"version": 1, "credential_pool": {provider: [entry.to_dict()]}})
+    pool = CP.load_pool(provider)
+    entry = pool._entries[0]
 
     refreshed = pool._refresh_entry(entry, force=True)
 
