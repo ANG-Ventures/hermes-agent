@@ -1843,15 +1843,17 @@ def test_codex_sync_refuses_stale_pair(codex_sync_pool, store_time, entry_time):
     ("invalid", "2026-09-10T04:00:00Z"),
     ("2026-09-10T04:30:00Z", None),
 ])
-def test_codex_sync_same_account_adopts(codex_sync_pool, store_time, entry_time):
+def test_codex_manual_same_account_keeps_own_grant(codex_sync_pool, store_time, entry_time):
     pool, entry, pair, path, calls = codex_sync_pool(store_time=store_time, entry_time=entry_time)
     selected = pool.select()
     assert selected is not None
-    assert (selected.access_token, selected.refresh_token) == pair
-    assert calls == []
+    # Same-account singleton is not evidence that this manual grant is owned
+    # by that singleton. Refresh the row's own grant instead of adopting it.
+    assert calls == [entry.refresh_token]
+    assert selected.refresh_token != pair[1]
     persisted = next(e for e in json.loads(path.read_text())["credential_pool"]["openai-codex"]
                      if e["id"] == entry.id)
-    assert (persisted["access_token"], persisted["refresh_token"]) == pair
+    assert (persisted["access_token"], persisted["refresh_token"]) == (selected.access_token, selected.refresh_token)
 
 
 def test_codex_sync_identical_pair_noop(codex_sync_pool):
@@ -1864,7 +1866,7 @@ def test_codex_sync_identical_pair_noop(codex_sync_pool):
 
 @pytest.mark.parametrize("unknown_side", ["entry", "store"])
 @pytest.mark.parametrize("unknown", [None, "opaque-token", "bad.jwt.token"])
-def test_codex_sync_unknown_account_preserves_adoption(codex_sync_pool, unknown_side, unknown):
+def test_codex_unknown_account_does_not_join_manual_grant(codex_sync_pool, unknown_side, unknown):
     from dataclasses import replace
 
     pool, entry, pair, path, calls = codex_sync_pool()
@@ -1877,7 +1879,8 @@ def test_codex_sync_unknown_account_preserves_adoption(codex_sync_pool, unknown_
         store["providers"]["openai-codex"]["tokens"]["access_token"] = unknown
         path.write_text(json.dumps(store))
     synced = pool._sync_codex_entry_from_auth_store(entry)
-    assert synced.refresh_token == pair[1]
+    assert synced.refresh_token == "synthetic-pool-refresh"
+    assert synced.refresh_token != pair[1]
     assert calls == []
 
 

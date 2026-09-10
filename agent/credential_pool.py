@@ -837,6 +837,8 @@ def _write_through_provider_state_to_global_root(
 class CredentialPool:
     def __init__(self, provider: str, entries: List[PooledCredential]):
         self.provider = provider
+        self._auth_owner: Optional[Path] = None
+        self._owner_baseline: Dict[str, Dict[str, Any]] = {}
         self._entries = sorted(entries, key=lambda entry: entry.priority)
         self._current_id: Optional[str] = None
         self._strategy = get_pool_strategy(provider)
@@ -965,6 +967,10 @@ class CredentialPool:
         # Self-locking (RLock): snapshotting self._entries must not race a
         # concurrent rotation when called from the deferred refresh path.
         with self._lock:
+            if self._auth_owner is not None:
+                from agent.codex_owner import persist
+                persist(self, removed_ids)
+                return
             write_credential_pool(
                 self.provider,
                 [entry.to_dict() for entry in self._entries],
@@ -1162,114 +1168,11 @@ class CredentialPool:
         return entry
 
     def _sync_codex_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
-        """Sync a Codex device_code pool entry from auth.json if tokens differ.
-
-        When a Codex OAuth access token expires (or the ChatGPT account hits
-        its 5h/weekly quota), the pool entry gets marked ``STATUS_EXHAUSTED``
-        with a ``last_error_reset_at`` that can be many hours in the future.
-        Meanwhile the user may run ``hermes model`` / ``hermes auth`` which
-        performs a fresh device-code login and writes new tokens to
-        ``auth.json`` under ``_auth_store_lock``.  Without this sync the pool
-        entry stays frozen until ``last_error_reset_at`` elapses — even
-        though fresh credentials are sitting on disk — and every request
-        fails with "no available entries (all exhausted or empty)".
-
-        Mirrors the Nous/Anthropic resync paths above.  Only applies to
-        device_code-sourced entries; env/API-key-sourced entries have no
-        auth.json shadow to sync from. Refuse known account mismatches and
-        older token pairs; manual device-code rows may be independent accounts.
-        """
-        if self.provider != "openai-codex" or entry.source not in ("device_code", "manual:device_code"):
+        """Reread the explicitly owned row, never infer a singleton alias."""
+        if self.provider != "openai-codex" or self._auth_owner is None:
             return entry
-        try:
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
-                state = _load_provider_state(auth_store, "openai-codex")
-            if not isinstance(state, dict):
-                return entry
-            tokens = state.get("tokens")
-            if not isinstance(tokens, dict):
-                return entry
-            store_access = tokens.get("access_token", "")
-            store_refresh = tokens.get("refresh_token", "")
-            # Subject to the account/freshness checks below, adopt auth.json
-            # tokens when either side differs. Codex refresh tokens are
-            # single-use too, so a fresh refresh_token from
-            # another process means our entry's pair is consumed/stale.
-            #
-            # Also adopt when the store has a refresh_token but no
-            # access_token — another process may have rotated the pair
-            # and the store entry's access_token was already consumed;
-            # the important signal is the refresh_token difference.
-            entry_access = entry.access_token or ""
-            entry_refresh = entry.refresh_token or ""
-            # Manual device-code entries can represent independent accounts.
-            # Different token bytes imply rotation only within one account;
-            # unknown identities must still allow opaque-token recovery.
-            entry_account = get_codex_account_id(entry_access)
-            store_account = get_codex_account_id(store_access)
-            if entry_account and store_account and entry_account != store_account:
-                return entry
-
-            # A different pair can also be an older, already-consumed pair.
-            # Compare instants (not ISO strings); missing/unparseable refresh
-            # timestamps retain the existing rotation-recovery behavior.
-            entry_refreshed_at = _parse_absolute_timestamp(entry.last_refresh)
-            store_refreshed_at = _parse_absolute_timestamp(state.get("last_refresh"))
-            if (
-                entry_refreshed_at is not None
-                and store_refreshed_at is not None
-                and store_refreshed_at < entry_refreshed_at
-            ):
-                return entry
-
-            should_adopt = False
-            if store_access and (
-                store_access != entry_access
-                or (store_refresh and store_refresh != entry_refresh)
-            ):
-                should_adopt = True
-            elif (
-                store_refresh
-                and store_refresh != entry_refresh
-                and not store_access
-            ):
-                # Store has only a refresh_token (no access_token) —
-                # another process rotated the pair.  Adopt the
-                # refresh_token so we don't replay the consumed one.
-                logger.info(
-                    "Pool entry %s: auth.json has newer refresh_token "
-                    "but no access_token; adopting refresh_token to "
-                    "avoid replaying consumed token",
-                    entry.id,
-                )
-                should_adopt = True
-
-            if should_adopt:
-                logger.debug(
-                    "Pool entry %s: syncing Codex tokens from auth.json "
-                    "(refreshed by another process)",
-                    entry.id,
-                )
-                field_updates: Dict[str, Any] = {
-                    "access_token": store_access or entry.access_token,
-                    "refresh_token": store_refresh or entry.refresh_token,
-                    "last_status": None,
-                    "last_status_at": None,
-                    "last_error_code": None,
-                    "last_error_reason": None,
-                    "last_error_message": None,
-                    "last_error_reset_at": None,
-                }
-                if state.get("last_refresh"):
-                    field_updates["last_refresh"] = state["last_refresh"]
-                updated = replace(entry, **field_updates)
-                self._replace_entry(entry, updated)
-                self._persist()
-                return updated
-        except Exception as exc:
-            logger.debug("Failed to sync Codex entry from auth.json: %s", exc)
-        return entry
+        from agent.codex_owner import sync
+        return sync(self, entry)
 
     def _sync_xai_oauth_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
         """Sync an xAI OAuth pool entry from auth.json if tokens differ.
@@ -1654,6 +1557,15 @@ class CredentialPool:
                 self._mark_exhausted(entry, None)
             return None
 
+        if self.provider == "openai-codex" and self._auth_owner is None:
+            raise auth_mod.AuthError(
+                "Codex refresh requires a pool loaded with an explicit auth-store owner.",
+                provider="openai-codex", code="codex_owner_missing", relogin_required=False,
+            )
+        if self._auth_owner is not None:
+            from agent.codex_owner import refresh
+            return refresh(self, entry, force)
+
         # Codex and xAI OAuth refresh tokens are single-use.  The
         # sync→POST→write-back sequence below must run atomically across Hermes
         # processes: otherwise two processes can both adopt the same on-disk
@@ -1830,6 +1742,8 @@ class CredentialPool:
     def _refresh_entry_impl(
         self, entry: PooledCredential, *, force: bool
     ) -> Optional[PooledCredential]:
+        if self.provider == "openai-codex":
+            return self._refresh_entry(entry, force=force)
         try:
             if self.provider == "anthropic":
                 from agent.anthropic_credentials import (
@@ -2917,6 +2831,9 @@ class CredentialPool:
             return count
 
     def remove_index(self, index: int) -> Optional[PooledCredential]:
+        if self._auth_owner is not None:
+            from agent.codex_owner import require_local_admin
+            require_local_admin(self)
         with self._lock:
             if index < 1 or index > len(self._entries):
                 return None
@@ -2925,11 +2842,7 @@ class CredentialPool:
                 replace(entry, priority=new_priority)
                 for new_priority, entry in enumerate(self._entries)
             ]
-            write_credential_pool(
-                self.provider,
-                [entry.to_dict() for entry in self._entries],
-                removed_ids=[removed.id],
-            )
+            self._persist(removed_ids=[removed.id])
             if self._current_id == removed.id:
                 self._current_id = None
             return removed
@@ -2961,6 +2874,9 @@ class CredentialPool:
             return None, None, f'No credential matching "{raw}".'
 
     def add_entry(self, entry: PooledCredential) -> PooledCredential:
+        if self._auth_owner is not None:
+            from agent.codex_owner import require_local_admin
+            require_local_admin(self)
         with self._lock:
             entry = replace(entry, priority=_next_priority(self._entries))
             self._entries.append(entry)
@@ -3723,6 +3639,9 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
+    if provider == "openai-codex":
+        from agent.codex_owner import load
+        return load()
     raw_entries = read_credential_pool(provider)
     disk_ids = {
         entry.get("id")

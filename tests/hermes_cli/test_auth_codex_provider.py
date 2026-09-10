@@ -173,24 +173,9 @@ def test_save_codex_tokens_syncs_credential_pool(tmp_path, monkeypatch):
     assert auth["providers"]["openai-codex"]["tokens"]["access_token"] == "new-at"
 
 
-def test_save_codex_tokens_syncs_manual_device_code_entries(tmp_path, monkeypatch):
-    """Re-auth must refresh ``manual:device_code`` entries that are true
-    aliases of the singleton, while leaving INDEPENDENT entries alone.
-
-    Original regression for #33538: a user who hit #33000 before the #33164
-    fix landed would have run ``hermes auth add openai-codex`` as a
-    workaround, leaving a pool entry with ``source="manual:device_code"``.
-    On every subsequent re-auth via setup/model picker, the singleton-seeded
-    ``device_code`` entry got refreshed but the ``manual:device_code`` entry
-    stayed stale, recreating the same 401 token_invalidated symptom that
-    #33164 was supposed to fix.
-
-    Narrowed for #39236: the original fix treated every ``manual:device_code``
-    entry as a singleton-alias and refreshed them all, which silently
-    clobbered independent accounts added via ``hermes auth add openai-codex``.
-    The current behavior refreshes only entries whose access_token matches
-    the *previous* singleton access_token (true legacy aliases), and leaves
-    distinct-token entries alone (independent accounts).
+def test_save_codex_tokens_preserves_manual_rows_even_with_identical_tokens(tmp_path, monkeypatch):
+    """Only device_code declares singleton ownership; copied manual rows
+    require explicit migration, not token-equality-based automatic joining.
     """
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir(parents=True, exist_ok=True)
@@ -212,9 +197,8 @@ def test_save_codex_tokens_syncs_manual_device_code_entries(tmp_path, monkeypatc
                     "access_token": "old-at",
                     "refresh_token": "old-rt",
                 },
-                # Legacy alias from the #33000 workaround era — its tokens
-                # match the singleton, so it is a true alias and SHOULD be
-                # refreshed (preserves #33538 behavior).
+                # Suspected legacy alias: identical bytes are not ownership.
+                # Explicit migration must retire this independent row.
                 {
                     "id": "legacy-alias",
                     "source": "manual:device_code",
@@ -258,14 +242,14 @@ def test_save_codex_tokens_syncs_manual_device_code_entries(tmp_path, monkeypatc
     assert seeded["access_token"] == "fresh-at"
     assert seeded["refresh_token"] == "fresh-rt"
 
-    # Legacy alias (tokens matched previous singleton): ALSO refreshed.
+    # Suspected alias stays untouched until explicitly migrated.
     legacy = next(e for e in pool if e["id"] == "legacy-alias")
-    assert legacy["access_token"] == "fresh-at"
-    assert legacy["refresh_token"] == "fresh-rt"
-    assert legacy["last_refresh"] == "2026-05-28T00:00:00Z"
-    assert legacy["last_status"] is None
-    assert legacy["last_error_code"] is None
-    assert legacy["last_error_reason"] is None
+    assert legacy["access_token"] == "old-at"
+    assert legacy["refresh_token"] == "old-rt"
+    assert "last_refresh" not in legacy
+    assert legacy["last_status"] == "exhausted"
+    assert legacy["last_error_code"] == 401
+    assert legacy["last_error_reason"] == "token_invalidated"
 
     # Independent manual:device_code entry: NOT overwritten (#39236).
     independent = next(e for e in pool if e["id"] == "independent")

@@ -1,0 +1,208 @@
+{
+  "source_root": "/private/tmp/codex-owner-implementation",
+  "cases": {
+    "same_profile_lock_control": {
+      "events": [
+        {
+          "event": "POST",
+          "original": true
+        },
+        {
+          "event": "ERROR",
+          "kind": "TimeoutError"
+        },
+        {
+          "event": "DONE",
+          "returned": true
+        }
+      ],
+      "root_unchanged": null,
+      "profile_copies": 1
+    },
+    "mirrored_profiles": {
+      "events": [
+        {
+          "event": "POST",
+          "original": true
+        },
+        {
+          "event": "POST",
+          "original": true
+        },
+        {
+          "event": "DONE",
+          "returned": true
+        },
+        {
+          "event": "DONE",
+          "returned": true
+        }
+      ],
+      "root_unchanged": null,
+      "profile_copies": 2
+    },
+    "inherited_root": {
+      "events": [
+        {
+          "event": "POST",
+          "original": true
+        },
+        {
+          "event": "POST",
+          "original": true
+        },
+        {
+          "event": "DONE",
+          "returned": true
+        },
+        {
+          "event": "DONE",
+          "returned": true
+        }
+      ],
+      "root_unchanged": true,
+      "profile_copies": 2
+    },
+    "inherited_singleton": {
+      "events": [
+        {
+          "event": "POST",
+          "original": true
+        },
+        {
+          "event": "POST",
+          "original": true
+        },
+        {
+          "event": "DONE",
+          "returned": true
+        },
+        {
+          "event": "DONE",
+          "returned": true
+        }
+      ],
+      "root_unchanged": true,
+      "profile_copies": 2
+    },
+    "same_profile_serialized_manual": {
+      "events": [
+        {
+          "event": "POST",
+          "original": true
+        },
+        {
+          "event": "DONE",
+          "returned": true
+        },
+        {
+          "event": "POST",
+          "original": true
+        },
+        {
+          "event": "DONE",
+          "returned": true
+        }
+      ],
+      "root_unchanged": null,
+      "profile_copies": 1
+    },
+    "root_lock_only_serialized": {
+      "events": [
+        {
+          "event": "POST",
+          "original": true
+        },
+        {
+          "event": "DONE",
+          "returned": true
+        },
+        {
+          "event": "POST",
+          "original": true
+        },
+        {
+          "event": "DONE",
+          "returned": true
+        }
+      ],
+      "root_unchanged": true,
+      "profile_copies": 2
+    },
+    "same_account_independent_grants": {
+      "events": [
+        {
+          "event": "POST",
+          "original": true
+        },
+        {
+          "event": "POST",
+          "original": true
+        },
+        {
+          "event": "DONE",
+          "returned": true
+        },
+        {
+          "event": "DONE",
+          "returned": true
+        }
+      ],
+      "root_unchanged": null,
+      "profile_copies": 2
+    },
+    "crash_after_post": {
+      "events": [
+        {
+          "event": "POST",
+          "original": true
+        },
+        {
+          "event": "POST",
+          "original": true
+        },
+        {
+          "event": "DONE",
+          "returned": true
+        }
+      ],
+      "root_unchanged": true,
+      "profile_copies": 1
+    },
+    "write_failure_after_post": {
+      "events": [
+        {
+          "event": "POST",
+          "original": true
+        },
+        {
+          "event": "ERROR",
+          "kind": "OSError"
+        },
+        {
+          "event": "POST",
+          "original": true
+        },
+        {
+          "event": "DONE",
+          "returned": true
+        }
+      ],
+      "root_unchanged": true,
+      "profile_copies": 1
+    }
+  },
+  "checks": {
+    "same_profile_serializes": true,
+    "same_profile_manual_waiter_does_not_replay": false,
+    "singleton_inheritance_does_not_double_post": false,
+    "inherited_profiles_do_not_double_post": false,
+    "root_lock_only_does_not_replay": false,
+    "inherited_rotation_commits_to_root": false,
+    "inherited_rotation_does_not_create_local_shadows": false,
+    "independent_grants_remain_independent": true,
+    "crash_prevents_replay": false,
+    "failed_write_prevents_replay": false
+  },
+  "migration_safe": false
+}
