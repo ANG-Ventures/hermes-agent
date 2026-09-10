@@ -85,10 +85,11 @@ The original diagnostic is copied byte-for-byte from diagnostic commit
   exits 1. Saved tokenless evidence: `docs/codex-owner-original-red.json`.
 * Implementation: same nine scenarios, **10/10 predicates true**, exit 0.
   Mirrored local owners remain explicitly unsafe for shared-grant migration.
-* Sibling credential/auth suite (including real multiprocessing cases):
-  **431 passed, 2 skipped** before the final two unowned-entry guards' tests;
-  the final focused filesystem suite is **20 passed**. Full committed-tree
-  rerun is recorded in the handoff.
+* Committed implementation `44a68e034532feede73fb0ff94a9a71912e03524`:
+  sibling credential/auth suite (including real multiprocessing cases)
+  **433 passed, 2 skipped in 37.64s**; focused filesystem suite **20 passed**.
+  Ruff checks and `git diff --check` pass. All tests used disposable homes,
+  positively pinned imports, and a denied real-network boundary.
 * New filesystem tests on clean original source (initial 14-test subset): **11 failed, 2 passed,
   1 deselected**. Deselected test targets the newly introduced receipt-writing
   helper. Failures include duplicate original-token POST, root not updated,
