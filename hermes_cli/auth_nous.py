@@ -815,16 +815,34 @@ class _NousRuntimeResolve:
 
     def __init__(
         self, auth_store: Dict[str, Any], state: Dict[str, Any], state_source_path: Optional[Path],
-        *, force_refresh: bool, stale_access_token: Optional[str], timeout_seconds: float) -> None:
+        *, force_refresh: bool, stale_access_token: Optional[str], timeout_seconds: float,
+        pool_state: Optional[Dict[str, Any]] = None) -> None:
         self.auth_store, self.state, self._source_path = auth_store, state, state_source_path
         self.force_refresh, self.stale_access_token = force_refresh, stale_access_token
         self.timeout_seconds = timeout_seconds
         self.sequence_id = uuid.uuid4().hex[:12]
         self._persisted_state = dict(state)
+        self._pool_state = pool_state
+        self._retain_newer_pool_pair()
         self.persisted_any = False
         self.access_token = state.get("access_token")
         self.refresh_token = state.get("refresh_token")
         self._reload_routing()
+
+    def _retain_newer_pool_pair(self) -> bool:
+        """Keep the newer pool pair inside the locked refresh transaction."""
+        if not self._pool_state:
+            return False
+        from agent.credential_pool import _parse_absolute_timestamp
+
+        pool_at = _parse_absolute_timestamp(self._pool_state.get("obtained_at"))
+        state_at = _parse_absolute_timestamp(self.state.get("obtained_at"))
+        if pool_at is None or state_at is None or pool_at <= state_at:
+            return False
+        for key in ("access_token", "refresh_token", "expires_at", "obtained_at", "expires_in"):
+            if self._pool_state.get(key) is not None:
+                self.state[key] = self._pool_state[key]
+        return True
 
     def _reload_routing(self) -> None:
         (self.portal_base_url, self.stored_inference_base_url, self.inference_base_url,
@@ -863,7 +881,10 @@ class _NousRuntimeResolve:
 
     def merge_shared(self) -> bool:
         """Adopt fresher shared-store tokens (caller holds the shared lock). True when merged."""
-        if not _merge_shared_nous_oauth_state(self.state):
+        merged = _merge_shared_nous_oauth_state(self.state)
+        # A stale shared mirror must not undo the retained pool pair.
+        retained = self._retain_newer_pool_pair()
+        if not (merged or retained):
             return False
         self.access_token = self.state.get("access_token")
         self.refresh_token = self.state.get("refresh_token")
@@ -941,12 +962,15 @@ class _NousRuntimeResolve:
 def resolve_nous_runtime_credentials(
     *, timeout_seconds: float = 15.0, insecure: Optional[bool] = None,
     ca_bundle: Optional[str] = None, force_refresh: bool = False,
-    stale_access_token: Optional[str] = None) -> Dict[str, Any]:
+    stale_access_token: Optional[str] = None,
+    pool_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Resolve Nous inference credentials for runtime use (refreshing under the auth-store lock).
 
     ``stale_access_token`` is the bearer that just failed upstream (401): with ``force_refresh``,
     the refresh POST is skipped if the store (re-read under the lock) already holds a *different*
     usable token — a peer won the rotation; adopt it rather than invalidate a sibling's token.
+    ``pool_state`` is a singleton-seeded pool snapshot: only its strictly newer,
+    timestamped OAuth pair can replace the state read inside this transaction.
     """
     from hermes_cli.auth import (
         _assert_nous_inference_jwt_usable, _auth_file_path, _provider_state_transaction,
@@ -957,7 +981,8 @@ def resolve_nous_runtime_credentials(
             raise _nous_err("Hermes is not logged into Nous Portal.", relogin=True)
         run = _NousRuntimeResolve(
             auth_store, state, state_source_path, force_refresh=force_refresh,
-            stale_access_token=stale_access_token, timeout_seconds=timeout_seconds)
+            stale_access_token=stale_access_token, timeout_seconds=timeout_seconds,
+            pool_state=pool_state)
         verify = _resolve_verify(insecure=insecure, ca_bundle=ca_bundle, auth_state=state)
         _oauth_trace(
             "nous_runtime_credentials_start", sequence_id=run.sequence_id,

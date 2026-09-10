@@ -1234,12 +1234,21 @@ class CredentialPool(CredentialPoolAdminMixin):
         try:
             with _auth_store_lock():
                 state = _load_provider_state(_load_auth_store(), self.provider)
-            tokens = state.get("tokens") if isinstance(state, dict) else None
+            if not isinstance(state, dict):
+                return entry
+            tokens = state.get("tokens")
             if not isinstance(tokens, dict):
                 return entry
             store_access = tokens.get("access_token", "")
             store_refresh = tokens.get("refresh_token", "")
             entry_refresh = entry.refresh_token or ""
+            entry_at = _parse_absolute_timestamp(entry.last_refresh)
+            store_at = _parse_absolute_timestamp(state.get("last_refresh"))
+            # A different xAI pair need not be newer. Unknown timestamps retain
+            # rotation recovery; a demonstrably older singleton must not win.
+            if self.provider == "xai-oauth":
+                if entry_at is not None and store_at is not None and store_at < entry_at:
+                    return entry
             # Adopt when either side differs: a fresh refresh_token from
             # another process means our pair is consumed/stale.
             should_adopt = bool(store_access) and (
@@ -1257,6 +1266,11 @@ class CredentialPool(CredentialPoolAdminMixin):
                     entry.id,
                 )
                 should_adopt = True
+            if self.provider == "xai-oauth" and not should_adopt:
+                # Same tokens can still carry a newer watermark. Retain it so
+                # the next read cannot accept an intermediate, stale rotation.
+                if store_at is not None and (entry_at is None or store_at > entry_at):
+                    return self._adopt(entry, last_refresh=state["last_refresh"])
             if should_adopt:
                 logger.debug(
                     "Pool entry %s: syncing %s tokens from auth.json (refreshed by another process)",
@@ -1288,21 +1302,40 @@ class CredentialPool(CredentialPoolAdminMixin):
                 state = _load_provider_state(_load_auth_store(), "nous")
             if not state:
                 return entry
-            comparable = {
-                key: state.get(key)
-                for key in (
-                    "access_token", "refresh_token", "expires_at",
-                    "agent_key", "agent_key_expires_at", "inference_base_url",
-                )
-            }
-            if not any(v not in (None, "") and getattr(entry, k, None) != v for k, v in comparable.items()):
+            def older(clock: str) -> bool:
+                entry_at = _parse_absolute_timestamp(entry.extra.get(clock))
+                store_at = _parse_absolute_timestamp(state.get(clock))
+                return entry_at is not None and store_at is not None and store_at < entry_at
+
+            # OAuth and agent keys rotate independently. Routing has no clock.
+            pair_is_stale = older("obtained_at")
+            key_is_stale = older("agent_key_obtained_at") or (
+                pair_is_stale and bool(state.get("agent_key"))
+                and state.get("agent_key") == state.get("access_token")
+            )
+            fields = ["inference_base_url"]
+            extra_keys = []
+            if not pair_is_stale:
+                fields += ["access_token", "refresh_token", "expires_at"]
+                extra_keys += ["obtained_at", "expires_in"]
+            if not key_is_stale:
+                fields += ["agent_key", "agent_key_expires_at"]
+                extra_keys += ["agent_key_id", "agent_key_expires_in",
+                               "agent_key_reused", "agent_key_obtained_at"]
+            comparable = {key: state.get(key) for key in fields}
+            if not (
+                any(v not in (None, "") and getattr(entry, k, None) != v
+                    for k, v in comparable.items())
+                or any(state.get(k) is not None and entry.extra.get(k) != state[k]
+                       for k in extra_keys)
+            ):
                 return entry
             logger.debug("Pool entry %s: syncing Nous state from auth.json", entry.id)
             field_updates: Dict[str, Any] = dict(_CLEAR_STATUS)
             field_updates.update({k: v for k, v in comparable.items() if v})
             extra_updates = dict(entry.extra)
             extra_updates.update(
-                {k: state[k] for k in _NOUS_EXTRA_STATE_KEYS if state.get(k) is not None}
+                {k: state[k] for k in extra_keys if state.get(k) is not None}
             )
             return self._adopt(entry, extra=extra_updates, **field_updates)
         except Exception as exc:
@@ -1584,7 +1617,10 @@ class CredentialPool(CredentialPoolAdminMixin):
                     if force and entry.runtime_api_key and entry.runtime_api_key != stale_key:
                         logger.debug("Nous entry %s: adopting peer-rotated token, skipping refresh", entry.id)
                         return entry
-                auth_mod.resolve_nous_runtime_credentials(force_refresh=force, stale_access_token=stale_key or None)
+                auth_mod.resolve_nous_runtime_credentials(
+                    force_refresh=force, stale_access_token=stale_key or None,
+                    pool_state=entry.to_dict() if entry.source == "device_code" else None,
+                )
                 updated = self._sync_nous_entry_from_auth_store(entry)
             else:
                 return entry
