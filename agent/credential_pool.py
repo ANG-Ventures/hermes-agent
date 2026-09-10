@@ -1170,6 +1170,13 @@ class CredentialPool:
         Only applies to entries seeded from the singleton (``device_code``);
         manually added entries are independent credentials with their own
         refresh-token lifecycle.
+
+        A *different* pair is not automatically a *newer* pair: another
+        process can leave an older, already-consumed pair behind (or a
+        write-back can lose a race).  Refuse to adopt a store pair whose
+        ``last_refresh`` instant predates the entry's, mirroring the Codex
+        reader above.  Missing/unparseable timestamps on either side keep the
+        pre-existing rotation-recovery behavior.
         """
         if self.provider != "xai-oauth" or entry.source != "device_code":
             return entry
@@ -1186,6 +1193,14 @@ class CredentialPool:
             store_refresh = tokens.get("refresh_token", "")
             entry_access = entry.access_token or ""
             entry_refresh = entry.refresh_token or ""
+            entry_refreshed_at = _parse_absolute_timestamp(entry.last_refresh)
+            store_refreshed_at = _parse_absolute_timestamp(state.get("last_refresh"))
+            if (
+                entry_refreshed_at is not None
+                and store_refreshed_at is not None
+                and store_refreshed_at < entry_refreshed_at
+            ):
+                return entry
             if store_access and (
                 store_access != entry_access
                 or (store_refresh and store_refresh != entry_refresh)
@@ -1263,6 +1278,28 @@ class CredentialPool:
         auth.json under ``_auth_store_lock``.  The pool entry's tokens
         become stale.  This method detects that and adopts the newer pair,
         avoiding a "refresh token reuse" revocation on the Nous Portal.
+
+        Unlike Codex/xAI, the Nous singleton is not one clock: the OAuth
+        pair is stamped with ``obtained_at`` while the inference agent key
+        carries its own ``agent_key_obtained_at``, and routing metadata
+        (inference URL, portal, client id, TLS) carries no clock at all.
+        So freshness is enforced per group rather than over the whole
+        record:
+
+        * OAuth pair (``access_token``/``refresh_token``/``expires_at``,
+          plus ``obtained_at``/``expires_in``) — refused when the store's
+          ``obtained_at`` predates the entry's, so an older, already-consumed
+          pair cannot displace the pool's newer one.
+        * Agent key (``agent_key``/``agent_key_expires_at`` and its extras) —
+          gated independently on ``agent_key_obtained_at``, so a legitimately
+          newer key still lands even while an older OAuth pair is refused.
+          A key that merely mirrors a *refused* access token is refused with
+          it; otherwise the stale pair would ride in through ``agent_key``,
+          which is what ``runtime_api_key`` actually serves.
+        * Routing metadata — no token material, always adopted.
+
+        Missing/unparseable timestamps on either side keep the pre-existing
+        rotation-recovery behavior for that group.
         """
         if self.provider != "nous" or entry.source != "device_code":
             return entry
@@ -1274,17 +1311,56 @@ class CredentialPool:
                 return entry
             store_refresh = state.get("refresh_token", "")
             store_access = state.get("access_token", "")
-            comparable_updates = {
-                "access_token": store_access,
-                "refresh_token": store_refresh,
-                "expires_at": state.get("expires_at"),
-                "agent_key": state.get("agent_key"),
-                "agent_key_expires_at": state.get("agent_key_expires_at"),
+
+            entry_pair_at = _parse_absolute_timestamp(entry.extra.get("obtained_at"))
+            store_pair_at = _parse_absolute_timestamp(state.get("obtained_at"))
+            pair_is_stale = (
+                entry_pair_at is not None
+                and store_pair_at is not None
+                and store_pair_at < entry_pair_at
+            )
+            entry_key_at = _parse_absolute_timestamp(entry.extra.get("agent_key_obtained_at"))
+            store_key_at = _parse_absolute_timestamp(state.get("agent_key_obtained_at"))
+            key_is_stale = (
+                entry_key_at is not None
+                and store_key_at is not None
+                and store_key_at < entry_key_at
+            )
+            store_agent_key = state.get("agent_key")
+            if (
+                pair_is_stale
+                and store_agent_key
+                and store_agent_key == store_access
+            ):
+                # The agent key IS the refused access token (invoke-JWT path).
+                key_is_stale = True
+
+            candidate: Dict[str, Any] = {
                 "inference_base_url": state.get("inference_base_url"),
             }
+            candidate_extra_keys = ["agent_key_id"] if not key_is_stale else []
+            if not pair_is_stale:
+                candidate.update({
+                    "access_token": store_access,
+                    "refresh_token": store_refresh,
+                    "expires_at": state.get("expires_at"),
+                })
+                candidate_extra_keys += ["obtained_at", "expires_in"]
+            if not key_is_stale:
+                candidate.update({
+                    "agent_key": store_agent_key,
+                    "agent_key_expires_at": state.get("agent_key_expires_at"),
+                })
+                candidate_extra_keys += [
+                    "agent_key_expires_in", "agent_key_reused", "agent_key_obtained_at",
+                ]
+
             should_sync = any(
                 value not in (None, "") and getattr(entry, key, None) != value
-                for key, value in comparable_updates.items()
+                for key, value in candidate.items()
+            ) or any(
+                state.get(key) is not None and entry.extra.get(key) != state[key]
+                for key in candidate_extra_keys
             )
             if should_sync:
                 logger.debug(
@@ -1299,22 +1375,11 @@ class CredentialPool:
                     "last_error_message": None,
                     "last_error_reset_at": None,
                 }
-                if store_access:
-                    field_updates["access_token"] = store_access
-                if store_refresh:
-                    field_updates["refresh_token"] = store_refresh
-                if state.get("expires_at"):
-                    field_updates["expires_at"] = state["expires_at"]
-                if state.get("agent_key"):
-                    field_updates["agent_key"] = state["agent_key"]
-                if state.get("agent_key_expires_at"):
-                    field_updates["agent_key_expires_at"] = state["agent_key_expires_at"]
-                if state.get("inference_base_url"):
-                    field_updates["inference_base_url"] = state["inference_base_url"]
+                for key, value in candidate.items():
+                    if value not in (None, ""):
+                        field_updates[key] = value
                 extra_updates = dict(entry.extra)
-                for extra_key in ("obtained_at", "expires_in", "agent_key_id",
-                                  "agent_key_expires_in", "agent_key_reused",
-                                  "agent_key_obtained_at"):
+                for extra_key in candidate_extra_keys:
                     val = state.get(extra_key)
                     if val is not None:
                         extra_updates[extra_key] = val
@@ -1774,6 +1839,7 @@ class CredentialPool:
                     entry = synced
                 auth_mod.resolve_nous_runtime_credentials(
                     force_refresh=force,
+                    pool_state=entry.to_dict() if entry.source == "device_code" else None,
                 )
                 updated = self._sync_nous_entry_from_auth_store(entry)
             else:
