@@ -33,6 +33,7 @@ import stat
 import subprocess
 import threading
 from collections import OrderedDict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -1073,11 +1074,20 @@ def read_hermes_oauth_credentials() -> Optional[Dict[str, Any]]:
     return None
 
 
+# Instant this pair was committed to the singleton.  ``expiresAt`` cannot serve
+# as a freshness key: it is the ACCESS TOKEN's expiry, so two pairs minted
+# minutes apart can carry the same or an inverted value, and a consumer
+# comparing it would refuse the newer pair.  ``lastRefresh`` is a mint time,
+# mirroring the ``last_refresh`` that ``hermes_cli/auth.py`` stamps for the
+# Codex/xAI singletons.  camelCase matches this file's existing key convention.
+HERMES_OAUTH_LAST_REFRESH_KEY = "lastRefresh"
+
+
 def _write_hermes_oauth_credentials(
     access_token: str,
     refresh_token: Optional[str],
     expires_at_ms: Optional[int],
-) -> None:
+) -> str:
     """Write refreshed hermes_pkce tokens back to ~/.hermes/.anthropic_oauth.json.
 
     Without this, a successful pool-level refresh of a ``hermes_pkce``-sourced
@@ -1086,16 +1096,23 @@ def _write_hermes_oauth_credentials(
     overwrites the freshly-rotated pool entry with the pre-refresh (and, for
     single-use Anthropic refresh tokens, already-consumed) token pair.
 
+    Stamps ``lastRefresh`` and returns it, so the pool entry this rotation
+    belongs to can carry the same instant.  Without a stamp on BOTH sides, the
+    seeding freshness gate in ``credential_pool`` has nothing to compare and
+    silently degrades to adopt-always.
+
     Raises ``CredentialPersistError`` when the rotated pair does not reach the
     file, for the same reason ``_write_claude_code_credentials`` does: this is
     the commit step of the refresh transaction.
     """
     oauth_file = _get_hermes_oauth_file()
+    last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     try:
         oauth_data = {
             "accessToken": access_token,
             "refreshToken": refresh_token,
             "expiresAt": expires_at_ms,
+            HERMES_OAUTH_LAST_REFRESH_KEY: last_refresh,
         }
         oauth_file.parent.mkdir(parents=True, exist_ok=True)
         _tmp_oauth = oauth_file.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
@@ -1121,4 +1138,5 @@ def _write_hermes_oauth_credentials(
             "Failed to write refreshed Hermes OAuth credentials to %s: %s", oauth_file, e
         )
         raise CredentialPersistError(oauth_file, e) from e
+    return last_refresh
 
