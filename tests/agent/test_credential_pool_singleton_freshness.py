@@ -188,6 +188,7 @@ def nous_pool(tmp_path, monkeypatch):
 
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("HERMES_SHARED_AUTH_DIR", str(tmp_path / "shared"))
     assert auth._auth_file_path() == tmp_path / "hermes" / "auth.json"
     assert auth._global_auth_file_path() is None
     path = auth._auth_file_path()
@@ -246,6 +247,37 @@ def nous_pool(tmp_path, monkeypatch):
         }
 
     return build
+
+
+@pytest.mark.parametrize("clock", ["obtained_at", "agent_key_obtained_at"])
+def test_nous_sync_preserves_timestamp_only_watermark(nous_pool, clock):
+    pool, entry, path, _ = nous_pool()
+    raw = json.loads(path.read_text())
+    state = raw["providers"]["nous"]
+    for key in ("access_token", "refresh_token", "expires_at", "agent_key",
+                "agent_key_expires_at"):
+        state[key] = getattr(entry, key)
+    state["obtained_at"] = ENTRY_TIME
+    state["agent_key_obtained_at"] = ENTRY_TIME
+    state[clock] = NEWER
+    path.write_text(json.dumps(raw))
+    synced = pool._sync_nous_entry_from_auth_store(entry)
+    assert synced.extra[clock] == NEWER
+    persisted = next(e for e in json.loads(path.read_text())["credential_pool"]["nous"]
+                     if e["id"] == entry.id)
+    assert persisted[clock] == NEWER
+    state[clock] = ENTRY_TIME
+    if clock == "obtained_at":
+        state["refresh_token"] = "synthetic-intermediate-refresh"
+    else:
+        state["agent_key"] = "synthetic-intermediate-key"
+    raw = json.loads(path.read_text())
+    raw["providers"]["nous"] = state
+    path.write_text(json.dumps(raw))
+    retained = pool._sync_nous_entry_from_auth_store(synced)
+    assert retained.extra[clock] == NEWER
+    assert retained.refresh_token == entry.refresh_token
+    assert retained.agent_key == entry.agent_key
 
 
 def test_nous_sync_refuses_stale_pair(nous_pool):
@@ -336,25 +368,82 @@ def test_nous_manual_row_stays_independent(nous_pool):
     assert path.read_bytes() == before
 
 
-def test_nous_forced_refresh_does_not_spend_stale_refresh_token(nous_pool, monkeypatch):
-    """Real try_refresh_matching() path with a stale singleton on disk."""
-    pool, entry, path, store = nous_pool()
+@pytest.mark.parametrize("store_time,shared_time,expected", [
+    (OLDER, None, "synthetic-pool-refresh"),
+    (OLDER, OLDER, "synthetic-pool-refresh"),
+    (OLDER, NEWER, "synthetic-store-refresh"),
+    (NEWER, None, "synthetic-store-refresh"),
+    (None, None, "synthetic-store-refresh"),
+    ("invalid", None, "synthetic-store-refresh"),
+])
+def test_nous_forced_refresh_does_not_spend_stale_refresh_token(
+    nous_pool, monkeypatch, store_time, shared_time, expected,
+):
+    """Real try_refresh_matching() path with only the token POST stubbed."""
+    pool, entry, path, store = nous_pool(store_obtained_at=store_time)
+    if shared_time:
+        from hermes_cli.auth import _read_shared_nous_state, _write_shared_nous_state
+
+        shared = dict(json.loads(path.read_text())["providers"]["nous"])
+        shared["obtained_at"] = shared_time
+        _write_shared_nous_state(shared)
+        persisted_shared = _read_shared_nous_state()
+        assert persisted_shared is not None
+        assert persisted_shared["obtained_at"] == shared_time
     seen: list[str] = []
 
-    def _fake_resolve(*, force_refresh=False, **kwargs):
-        raw = json.loads(path.read_text())
-        seen.append(raw["providers"]["nous"]["refresh_token"])
-        return {"provider": "nous", "api_key": entry.agent_key}
+    def _fake_refresh(*, refresh_token, **kwargs):
+        from hermes_cli.auth import AuthError
 
-    monkeypatch.setattr("hermes_cli.auth.resolve_nous_runtime_credentials", _fake_resolve)
+        seen.append(refresh_token)
+        if refresh_token != expected:
+            raise AuthError("Consumed token", provider="nous", code="invalid_grant",
+                            relogin_required=True)
+        return {"access_token": _access(7200),
+                "refresh_token": "synthetic-rotated-refresh", "expires_in": 7200}
+
+    monkeypatch.setattr("hermes_cli.auth._refresh_access_token", _fake_refresh)
     updated = pool.try_refresh_matching(credential_id=entry.id)
+    assert seen == [expected]
     assert updated is not None
-    assert updated.refresh_token == "synthetic-pool-refresh"
-    assert updated.access_token == entry.access_token
-    # The pool's fresher pair is what gets written back to the singleton.
-    assert json.loads(path.read_text())["providers"]["nous"]["refresh_token"] == (
-        "synthetic-pool-refresh"
-    )
+    assert updated.refresh_token == "synthetic-rotated-refresh"
+    raw = json.loads(path.read_text())
+    assert raw["providers"]["nous"]["refresh_token"] == "synthetic-rotated-refresh"
+    persisted = next(e for e in raw["credential_pool"]["nous"] if e["id"] == entry.id)
+    assert persisted["refresh_token"] == "synthetic-rotated-refresh"
+
+
+def test_nous_refresh_rereads_newer_singleton_inside_transaction(nous_pool, monkeypatch):
+    from contextlib import contextmanager
+
+    import hermes_cli.auth as auth
+
+    pool, entry, path, _ = nous_pool()
+    transaction = auth._provider_state_transaction
+    seen = []
+
+    @contextmanager
+    def concurrent_winner(provider):
+        raw = json.loads(path.read_text())
+        raw["providers"]["nous"].update({
+            "obtained_at": NEWER,
+            "refresh_token": "synthetic-winner-refresh",
+        })
+        path.write_text(json.dumps(raw))
+        with transaction(provider) as loaded:
+            yield loaded
+
+    def refresh(*, refresh_token, **kwargs):
+        seen.append(refresh_token)
+        return {"access_token": _access(7200), "refresh_token": "synthetic-rotated-refresh",
+                "expires_in": 7200}
+
+    monkeypatch.setattr(auth, "_provider_state_transaction", concurrent_winner)
+    monkeypatch.setattr(auth, "_refresh_access_token", refresh)
+    updated = pool.try_refresh_matching(credential_id=entry.id)
+    assert seen == ["synthetic-winner-refresh"]
+    assert updated is not None
+    assert updated.refresh_token == "synthetic-rotated-refresh"
 
 
 def test_nous_exhausted_entry_select_refuses_stale_singleton(nous_pool):

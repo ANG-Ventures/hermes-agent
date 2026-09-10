@@ -1358,6 +1358,9 @@ class CredentialPool:
             should_sync = any(
                 value not in (None, "") and getattr(entry, key, None) != value
                 for key, value in candidate.items()
+            ) or any(
+                state.get(key) is not None and entry.extra.get(key) != state[key]
+                for key in candidate_extra_keys
             )
             if should_sync:
                 logger.debug(
@@ -1836,6 +1839,7 @@ class CredentialPool:
                     entry = synced
                 auth_mod.resolve_nous_runtime_credentials(
                     force_refresh=force,
+                    pool_state=entry.to_dict() if entry.source == "device_code" else None,
                 )
                 updated = self._sync_nous_entry_from_auth_store(entry)
             else:

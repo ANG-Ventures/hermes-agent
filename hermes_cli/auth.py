@@ -6478,12 +6478,15 @@ def resolve_nous_runtime_credentials(
     insecure: Optional[bool] = None,
     ca_bundle: Optional[str] = None,
     force_refresh: bool = False,
+    pool_state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Resolve Nous inference credentials for runtime use.
 
     Ensures access_token is a valid inference-scoped JWT, refreshing it when
     needed. Concurrent processes coordinate through the auth store file lock.
+    ``pool_state`` carries a singleton-seeded pool snapshot; only a strictly
+    newer timestamped OAuth pair may replace the state read under that lock.
 
     Returns dict with: provider, base_url, api_key, key_id, expires_at,
     expires_in, source ("invoke_jwt"), and auth_path.
@@ -6502,6 +6505,30 @@ def resolve_nous_runtime_credentials(
 
         persisted_state = dict(state)
         state_persisted = False
+
+        def _retain_newer_pool_pair() -> bool:
+            # Reconcile inside the refresh transaction, not via a best-effort
+            # pre-write: the singleton may have changed since the pool read it.
+            if not pool_state:
+                return False
+            from agent.credential_pool import _parse_absolute_timestamp
+
+            pool_at = _parse_absolute_timestamp(pool_state.get("obtained_at"))
+            state_at = _parse_absolute_timestamp(state.get("obtained_at"))
+            if pool_at is None or state_at is None or pool_at <= state_at:
+                return False
+            for key in ("access_token", "refresh_token", "expires_at",
+                        "obtained_at", "expires_in"):
+                if pool_state.get(key) is not None:
+                    state[key] = pool_state[key]
+            return True
+
+        def _merge_shared_state() -> bool:
+            merged = _merge_shared_nous_oauth_state(state)
+            # A stale shared mirror must not undo the retained pair either.
+            return _retain_newer_pool_pair() or merged
+
+        _retain_newer_pool_pair()
 
         def _resolve_effective_routing_metadata() -> tuple[str, str, str, str]:
             """Resolve every routing value that shared OAuth state can replace."""
@@ -6625,7 +6652,7 @@ def resolve_nous_runtime_credentials(
                 with _nous_shared_store_lock(
                     timeout_seconds=max(timeout_seconds + 5.0, AUTH_LOCK_TIMEOUT_SECONDS)
                 ):
-                    if _merge_shared_nous_oauth_state(state):
+                    if _merge_shared_state():
                         access_token = state.get("access_token")
                         refresh_token = state.get("refresh_token")
                         (
@@ -6647,7 +6674,7 @@ def resolve_nous_runtime_credentials(
             )
             if force_refresh or invoke_jwt_status is not None:
                 with _nous_shared_store_lock(timeout_seconds=max(timeout_seconds + 5.0, AUTH_LOCK_TIMEOUT_SECONDS)):
-                    if _merge_shared_nous_oauth_state(state):
+                    if _merge_shared_state():
                         access_token = state.get("access_token")
                         refresh_token = state.get("refresh_token")
                         (
