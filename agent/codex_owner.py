@@ -171,7 +171,7 @@ def _reserve(owner, entry):
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     _sync_dir(path.parent.parent)
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w") as handle:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
         # No tokens, account identifiers, or exception text in receipts.
         json.dump({"version": 2, "outcome": "uncertain"}, handle)
         handle.flush()

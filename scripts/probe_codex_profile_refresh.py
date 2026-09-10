@@ -35,7 +35,7 @@ def entry(grant=0):
 
 def store(path, row):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"version": 1, "credential_pool": {PROVIDER: [row]}}))
+    path.write_text(json.dumps({"version": 1, "credential_pool": {PROVIDER: [row]}}), encoding="utf-8")
 
 
 def emit(**row):
@@ -116,13 +116,13 @@ def run_case(*, inherited=False, same_profile=False, independent=False,
         if inherited:
             store(root / "auth.json", entry())
             if singleton:
-                state = json.loads((root / "auth.json").read_text())
+                state = json.loads((root / "auth.json").read_text(encoding="utf-8"))
                 state["credential_pool"][PROVIDER][0]["source"] = "device_code"
                 state["providers"] = {PROVIDER: {"tokens": {
                     "access_token": entry()["access_token"],
                     "refresh_token": entry()["refresh_token"],
                 }}}
-                (root / "auth.json").write_text(json.dumps(state))
+                (root / "auth.json").write_text(json.dumps(state), encoding="utf-8")
         for i, profile in enumerate(profiles):
             profile.mkdir(parents=True, exist_ok=True)
             if not inherited:
@@ -161,7 +161,7 @@ def run_case(*, inherited=False, same_profile=False, independent=False,
             assert exits == ([73, 0] if mode == "crash" else [0, 0]), exits
             root_unchanged = None
             if inherited:
-                root_unchanged = json.loads((root / "auth.json").read_text())["credential_pool"][PROVIDER][0]["refresh_token"] == entry()["refresh_token"]
+                root_unchanged = json.loads((root / "auth.json").read_text(encoding="utf-8"))["credential_pool"][PROVIDER][0]["refresh_token"] == entry()["refresh_token"]
             return {"events": events, "root_unchanged": root_unchanged,
                     "profile_copies": sum((p / "auth.json").exists() for p in set(profiles))}
         finally:
