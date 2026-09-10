@@ -75,14 +75,16 @@ def test_startup_merge_keeps_newest_session_and_older_pin(tmp_path, caplog):
     (tmp_path / "sessions.json").write_text(json.dumps({group: older.to_dict(), channel: newer.to_dict()}))
     store = SessionStore(config=GatewayConfig(), sessions_dir=tmp_path)
     store._db = None
-    store._ensure_loaded()
     with caplog.at_level("INFO"):
-        assert store.migrate_discord_session_keys({"123": "group"}) == 1
+        store._ensure_loaded()
+        # The shape-only alias is already folded at load (before any replay
+        # can write); the adapter-driven migration finds nothing left to do.
         assert store.migrate_discord_session_keys({"123": "group"}) == 0
     assert store.entry_for(channel) is None
     assert store.entry_for(group).session_id == "newer"
     assert store.entry_for(group).model_override == pin
-    assert sum("Merged Discord session" in record.message for record in caplog.records) == 1
+    assert sum("Redirecting legacy session route" in record.message for record in caplog.records) == 1
+    assert sum("Merged Discord session" in record.message for record in caplog.records) == 0
     restored = SessionStore(config=GatewayConfig(), sessions_dir=tmp_path)
     restored._db = None
     restored._ensure_loaded()

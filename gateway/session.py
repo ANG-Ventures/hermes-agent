@@ -1702,6 +1702,21 @@ class SessionStore:
             else {key: entry.to_dict() for key, entry in self._entries.items()}
         )
 
+        # Legacy spellings the resolver already retires (Discord ``channel`` →
+        # ``group``) are folded into the canonical key HERE, before any
+        # producer can write. The adapter-driven migration below runs only
+        # after every platform connects (one channel lookup per stored chat;
+        # 76s live on 2026-09-09), while the startup-restore gate releases
+        # inbound replay at 30s — so an alias still loaded at that point made
+        # the write guard refuse the user's own chat (SessionKeyConflict
+        # bubbled into #Home). A key-shape alias needs no channel object to
+        # resolve; two genuinely different spellings (dm vs group) still wait
+        # for the adapter and are still refused by the guard.
+        try:
+            self._redirect_legacy_alias_routes_locked()
+        except Exception:
+            logger.warning("Legacy session alias redirect failed", exc_info=True)
+
         # Prune any sessions.json entries that point to sessions already ended
         # in state.db. A hard gateway crash (exit code 1) skips the graceful
         # shutdown path, so sessions.json is never cleared and is left pointing
@@ -1751,6 +1766,125 @@ class SessionStore:
                     logger.exception("Session route conflict notification failed")
         raise conflict
 
+    @staticmethod
+    def _legacy_alias_canonical_key(session_key: str) -> Optional[str]:
+        """Canonical spelling for a key whose ONLY defect is a retired type label.
+
+        Mirrors ``canonical_chat_type`` (routing_identity): a Discord guild
+        channel keyed ``channel`` is the same lane as ``group``. Anything the
+        resolver would not rewrite by shape alone (dm vs group, thread) returns
+        None — those need the channel object and stay with the adapter-driven
+        migration / the write guard.
+        """
+        parts = str(session_key or "").split(":")
+        if len(parts) < 5 or parts[0] != "agent":
+            return None
+        from gateway.routing_identity import canonical_chat_type
+
+        canonical_type = canonical_chat_type(parts[2], parts[3])
+        if canonical_type == parts[3]:
+            return None
+        parts[3] = canonical_type
+        return ":".join(parts)
+
+    def _redirect_legacy_alias_routes_locked(self) -> int:
+        """Fold shape-only legacy aliases into their canonical keys at load.
+
+        Caller holds ``_lock``. Runs before any producer can route, so the
+        write guard never sees the alias alongside the live key. Each group is
+        trialled on a copy first: if the rewrite would itself collide (the
+        chat's live key is ``dm``/``thread``, so the alias was never a
+        shape-only defect) the alias is left for the adapter-driven migration,
+        which knows the real channel type. Returns the number of canonical
+        routes touched.
+        """
+        from gateway.routing_identity import SessionKeyConflict, assert_unique_routing_entries
+
+        groups: Dict[str, list] = {}
+        for key, entry in self._entries.items():
+            canonical = self._legacy_alias_canonical_key(key)
+            if canonical is None:
+                continue
+            groups.setdefault(canonical, []).append((key, entry))
+        if not groups:
+            return 0
+        merged = 0
+        retired_keys: set = set()
+        for canonical, aliases in groups.items():
+            live = self._entries.get(canonical)
+            if live is not None:
+                aliases.append((canonical, live))
+            trial = dict(self._entries)
+            trial_merged, trial_retired = self._merge_alias_groups({canonical: list(aliases)}, trial)
+            if not trial_merged:
+                continue
+            try:
+                assert_unique_routing_entries(
+                    {key: {"origin": entry.origin} for key, entry in trial.items()}
+                )
+            except SessionKeyConflict as conflict:
+                logger.warning(
+                    "Legacy session route %s not redirected to %s: %s — awaiting adapter migration",
+                    ", ".join(key for key, _ in aliases if key != canonical), canonical, conflict,
+                )
+                continue
+            for alias_key, entry in aliases:
+                if alias_key == canonical:
+                    continue
+                logger.warning(
+                    "Redirecting legacy session route %s -> %s (%s)",
+                    alias_key, canonical,
+                    f"merged with live route; session {trial[canonical].session_id} survives"
+                    if live is not None else f"rekeyed session {entry.session_id}",
+                )
+            for key in trial_retired:
+                self._entries.pop(key, None)
+            self._entries[canonical] = trial[canonical]
+            retired_keys |= trial_retired
+            merged += trial_merged
+        if merged:
+            self._save(retired_keys=retired_keys)
+            if not self._write_sessions_json and (self.sessions_dir / "sessions.json").exists():
+                self._save_sessions_json({key: entry.to_dict() for key, entry in self._entries.items()}, retired_keys=retired_keys)
+        return merged
+
+    @staticmethod
+    def _merge_alias_groups(groups: Dict[str, list], entries: Dict[str, "SessionEntry"]) -> tuple[int, set]:
+        """Collapse ``{canonical: [(key, entry), ...]}`` onto the canonical key in ``entries``.
+
+        Newest routing entry stays primary; the most recently updated pinned
+        entry's model preference survives. The caller persists with the
+        returned ``retired_keys`` so the guard accepts the rewrite.
+        """
+        merged = 0
+        retired_keys: set = set()
+        for canonical, aliases in groups.items():
+            if len(aliases) == 1 and aliases[0][0] == canonical:
+                continue
+            aliases.sort(key=lambda item: item[1].updated_at.timestamp(), reverse=True)
+            primary = replace(aliases[0][1], session_key=canonical)
+            # Preserve the most recently updated pinned entry when the
+            # newer, accidentally-created session has no preference.
+            for _, entry in aliases:
+                if entry.model_override_identity or entry.model_override or entry._model_override_identity_invalid:
+                    primary.model_override = entry.model_override
+                    primary.model_override_identity = entry.model_override_identity
+                    primary._model_override_identity_invalid = entry._model_override_identity_invalid
+                    break
+            for key, _ in aliases:
+                entries.pop(key)
+                retired_keys.add(key)
+            primary.session_key = canonical
+            if primary.origin:
+                primary.origin = replace(primary.origin, chat_type=canonical.split(":")[3])
+                if primary.origin.chat_type == "thread" and not primary.origin.prospective_thread_id:
+                    primary.origin.thread_id = primary.origin.chat_id
+                elif primary.origin.chat_type == "dm":
+                    primary.origin.thread_id = primary.origin.prospective_thread_id = None
+            entries[canonical] = primary
+            merged += 1
+        return merged, retired_keys
+
     def migrate_discord_session_keys(self, chat_types: Dict[str, str]) -> int:
         """Merge type-only aliases using channel types resolved by the adapter.
 
@@ -1760,7 +1894,6 @@ class SessionStore:
         with self._lock:
             self._ensure_loaded_locked()
             groups = {}
-            retired_keys = set()
             for key, entry in self._entries.items():
                 parts = key.split(":")
                 if len(parts) < 5 or parts[2] != "discord":
@@ -1786,32 +1919,7 @@ class SessionStore:
                     profile=parts[1],
                 )
                 groups.setdefault(canonical, []).append((key, entry))
-            merged = 0
-            for canonical, aliases in groups.items():
-                if len(aliases) == 1 and aliases[0][0] == canonical:
-                    continue
-                aliases.sort(key=lambda item: item[1].updated_at.timestamp(), reverse=True)
-                primary = replace(aliases[0][1], session_key=canonical)
-                # Preserve the most recently updated pinned entry when the
-                # newer, accidentally-created session has no preference.
-                for _, entry in aliases:
-                    if entry.model_override_identity or entry.model_override or entry._model_override_identity_invalid:
-                        primary.model_override = entry.model_override
-                        primary.model_override_identity = entry.model_override_identity
-                        primary._model_override_identity_invalid = entry._model_override_identity_invalid
-                        break
-                for key, _ in aliases:
-                    self._entries.pop(key)
-                    retired_keys.add(key)
-                primary.session_key = canonical
-                if primary.origin:
-                    primary.origin = replace(primary.origin, chat_type=canonical.split(":")[3])
-                    if primary.origin.chat_type == "thread" and not primary.origin.prospective_thread_id:
-                        primary.origin.thread_id = primary.origin.chat_id
-                    elif primary.origin.chat_type == "dm":
-                        primary.origin.thread_id = primary.origin.prospective_thread_id = None
-                self._entries[canonical] = primary
-                merged += 1
+            merged, retired_keys = self._merge_alias_groups(groups, self._entries)
             if merged:
                 self._save(retired_keys=retired_keys)
                 # Even if ongoing JSON mirroring is disabled, retire aliases
@@ -3881,6 +3989,20 @@ class SessionStore:
     ) -> bool:
         """Apply a resume mark without persistence while ``_lock`` is held."""
         entry = self._entries.get(session_key)
+        if entry is None:
+            # An external resume request (safe-restart/safe-reboot dropbox)
+            # written by an older script may still spell the chat with a
+            # retired type label. The load-time redirect has already folded
+            # that alias into the canonical route; honor the request there
+            # instead of dropping it as an unknown session.
+            canonical = self._legacy_alias_canonical_key(session_key)
+            if canonical is not None:
+                entry = self._entries.get(canonical)
+                if entry is not None:
+                    logger.warning(
+                        "Redirecting resume mark for legacy session route %s -> %s",
+                        session_key, canonical,
+                    )
         # Never override explicit suspension (/stop or breaker escalation).
         if entry is None or entry.suspended:
             return False
