@@ -6256,6 +6256,7 @@ def run_conversation(
                             agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
                         if agent._try_activate_fallback(
                             reason=classified.reason,
+                            display_reason=classified.display_reason,
                             error_context=error_context,
                         ):
                             active_system_prompt = _sync_failover_system_message(
@@ -6291,7 +6292,9 @@ def run_conversation(
                         "🔐 Authentication failed and could not be refreshed — "
                         "switching to fallback provider..."
                     )
-                    if agent._try_activate_fallback(reason=classified.reason):
+                    if agent._try_activate_fallback(
+                        reason=classified.reason, display_reason=classified.display_reason,
+                    ):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -6960,7 +6963,7 @@ def run_conversation(
                     # match the status prose emitted just above — not a bare
                     # line. (2026-07-12 reason-threading sweep.)
                     if _may_fallback and agent._try_activate_fallback(
-                        reason=classified.reason
+                        reason=classified.reason, display_reason=classified.display_reason,
                     ):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
@@ -7194,7 +7197,8 @@ def run_conversation(
                     # is cheap error-path insurance that degrades to the honest
                     # "connection issue" floor rather than crashing.
                     if agent._try_activate_fallback(
-                        reason=getattr(classified, "reason", None)
+                        reason=getattr(classified, "reason", None),
+                        display_reason=classified.display_reason,
                     ):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)

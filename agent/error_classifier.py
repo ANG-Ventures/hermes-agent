@@ -163,6 +163,17 @@ class ClassifiedError:
     should_fallback: bool = False
 
     @property
+    def display_reason(self) -> FailoverReason:
+        """Presentation only; never use this value for recovery decisions.
+
+        The Codex safety-systems message is not in the routing classifier:
+        adding it there would change retries, fallback and primary cooldowns.
+        """
+        if "this request was blocked by our safety systems" in self.message.lower():
+            return FailoverReason.content_policy_blocked
+        return self.reason
+
+    @property
     def is_auth(self) -> bool:
         # account_blocked is included deliberately: it is an authorization
         # failure for every CONTROL-FLOW purpose (escalate to the fallback
