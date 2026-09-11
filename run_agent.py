@@ -7553,10 +7553,14 @@ class AIAgent:
         self,
         reason: "FailoverReason | None" = None,
         error_context: Optional[Dict[str, Any]] = None,
+        *,
+        display_reason: "FailoverReason | None" = None,
     ) -> bool:
         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
         from agent.chat_completion_helpers import try_activate_fallback
-        return try_activate_fallback(self, reason, error_context=error_context)
+        return try_activate_fallback(
+            self, reason, error_context=error_context, display_reason=display_reason,
+        )
 
     def _has_pending_fallback(self) -> bool:
         """Whether a fallback provider is actually available to switch to.
