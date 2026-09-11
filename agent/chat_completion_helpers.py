@@ -1801,7 +1801,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
             except Exception:
                 pass
             agent._emit_wait_notice(
-                f"⚠ no response from provider in {int(_elapsed)}s — "
+                f"⚠️ no response from provider in {int(_elapsed)}s — "
                 f"reconnecting..."
             )
             agent._touch_activity(
@@ -3014,7 +3014,7 @@ def format_chat_pin_notice(model, provider, pin, *, reason=None):
     live = _format_model_route_label(provider, model)
     pinned = _format_model_route_label(pin.get("provider"), pin.get("model"))
     why = _fallback_reason_label(reason) if reason else None
-    return f"⚠ replying on {live} — this chat is pinned to {pinned}; {why or 'emitting session uses a different route'}"
+    return f"⚠️ replying on {live} — this chat is pinned to {pinned}; {why or 'emitting session uses a different route'}"
 
 
 def _format_switch_announce(
@@ -4500,7 +4500,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         if is_streaming_access_denied_error(_bedrock_exc):
                             agent._disable_streaming = True
                             agent._safe_print(
-                                "\n⚠  AWS IAM denied bedrock:InvokeModelWithResponseStream — "
+                                "\n⚠️  AWS IAM denied bedrock:InvokeModelWithResponseStream — "
                                 "falling back to non-streaming InvokeModel.\n"
                                 "   Grant that action to restore streaming output.\n"
                             )
@@ -6029,7 +6029,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         # additional INFO line needed.
                         try:
                             agent._fire_stream_delta(
-                                "\n\n⚠ Connection dropped mid tool-call; "
+                                "\n\n⚠️ Connection dropped mid tool-call; "
                                 "reconnecting…\n\n"
                             )
                         except Exception:
@@ -6196,11 +6196,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         if _is_stream_unsupported or _is_bedrock_stream_denied:
                             agent._disable_streaming = True
                             agent._safe_print(
-                                "\n⚠  AWS IAM denied bedrock:InvokeModelWithResponseStream. "
+                                "\n⚠️  AWS IAM denied bedrock:InvokeModelWithResponseStream. "
                                 "Switching to non-streaming.\n"
                                 "   Grant that action to restore streaming output.\n"
                                 if _is_bedrock_stream_denied else
-                                "\n⚠  Streaming is not supported for this "
+                                "\n⚠️  Streaming is not supported for this "
                                 "model/provider. Switching to non-streaming.\n"
                                 "   To avoid this delay, set display.streaming: false "
                                 "in config.yaml\n"
@@ -6398,7 +6398,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # the inner thread processes the closure.
             last_chunk_time["t"] = time.time()
             agent._emit_wait_notice(
-                f"⚠ no output from provider for {int(_stale_elapsed)}s — "
+                f"⚠️ no output from provider for {int(_stale_elapsed)}s — "
                 f"reconnecting..."
             )
             agent._touch_activity(
@@ -6467,7 +6467,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 if len(_partial_names) > 3:
                     _name_str += f", +{len(_partial_names) - 3} more"
                 _warn = (
-                    f"\n\n⚠ Stream stalled mid tool-call "
+                    f"\n\n⚠️ Stream stalled mid tool-call "
                     f"({_name_str}); the action was not executed. "
                     f"Ask me to retry if you want to continue."
                 )

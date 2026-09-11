@@ -383,7 +383,7 @@ def test_cross_session_pin_mismatch_announces_on_emitted_turn(monkeypatch, tmp_p
         assert result["final_response"] == "Recovered"
         notices = [text for _, text, _ in adapter.messages if "this chat is pinned to" in text]
         assert len(notices) == 1
-        assert notices[0].startswith("⚠ replying on openrouter/primary/model")
+        assert notices[0].startswith("⚠️ replying on openrouter/primary/model")
         assert "openrouter/user-pinned/model" in notices[0]
 
     asyncio.run(scenario())
