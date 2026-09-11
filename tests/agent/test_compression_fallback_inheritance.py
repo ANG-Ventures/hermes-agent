@@ -53,6 +53,19 @@ def test_inherited_route_pins_inferred_transport(routes, monkeypatch):
     assert route["api_mode"] == "chat_completions"
 
 
+def test_inherited_route_preserves_resolved_credentials(routes, monkeypatch):
+    config, entry = routes
+    config["api_key"] = "primary-only-key"
+    entry.pop("api_key")
+    monkeypatch.setattr(
+        aux, "_resolve_fallback_entry",
+        lambda candidate: (SimpleNamespace(api_key="resolved-backup-key"), candidate["model"]),
+    )
+    route = resolve_compression_fallback_route()
+    assert route is not None
+    assert route["api_key"] == "resolved-backup-key"
+
+
 def test_explicit_chain_precedes_main(routes):
     config, _ = routes
     config["fallback_chain"] = [{"provider": "other", "model": "task-backup"}]

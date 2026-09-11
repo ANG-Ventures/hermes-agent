@@ -1359,6 +1359,7 @@ def resolve_compression_fallback_route() -> Optional[dict]:
                 chain = [dict(
                     entry, model=model, base_url=destination.base_url,
                     api_mode=destination.api_mode,
+                    api_key=_fallback_entry_api_key(entry) or getattr(client, "api_key", None),
                 )]
                 inherited = True
     except Exception:
