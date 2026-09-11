@@ -1313,7 +1313,7 @@ def resolve_context_compression_timeouts(
 
 
 def resolve_compression_fallback_route() -> Optional[dict]:
-    """Return the first usable ``auxiliary.compression.fallback_chain`` entry.
+    """Return a task fallback route, or an eligible inherited main route for auto.
 
     The chain is the user's declared answer to "the configured compression
     route is unhealthy". The auxiliary client applies it from its exception
@@ -1334,7 +1334,33 @@ def resolve_compression_fallback_route() -> Optional[dict]:
             _get_auxiliary_task_config,
         )
 
-        chain = _get_auxiliary_task_config("compression").get("fallback_chain")
+        task_config = _get_auxiliary_task_config("compression")
+        chain = task_config.get("fallback_chain")
+        # Explicit task routes retain precedence. Auto tasks without one use
+        # the same eligibility policy as the auxiliary client's error path.
+        has_task_route = isinstance(chain, list) and any(
+            isinstance(entry, dict)
+            and str(entry.get("provider") or "").strip()
+            and str(entry.get("model") or "").strip()
+            for entry in chain
+        )
+        inherited = False
+        if not has_task_route and str(task_config.get("provider") or "auto").strip().lower() == "auto":
+            from agent.auxiliary_client import (
+                _fallback_destination_from_entry,
+                _select_main_fallback_entry,
+            )
+
+            client, model, _provider, entry = _select_main_fallback_entry(
+                "compression", reason="summary stalled"
+            )
+            if entry is not None:
+                destination = _fallback_destination_from_entry(entry, client, model)
+                chain = [dict(
+                    entry, model=model, base_url=destination.base_url,
+                    api_mode=destination.api_mode,
+                )]
+                inherited = True
     except Exception:
         logger.debug("compression fallback_chain lookup failed", exc_info=True)
         return None
@@ -1363,7 +1389,10 @@ def resolve_compression_fallback_route() -> Optional[dict]:
 
         timeout = _coerce_positive_timeout(entry.get("timeout"))
         return {
-            "label": f"fallback_chain[{index}]({provider})",
+            "label": (
+                f"main fallback ({provider})" if inherited
+                else f"fallback_chain[{index}]({provider})"
+            ),
             "provider": provider,
             "model": model,
             "base_url": str(entry.get("base_url") or "").strip() or None,
