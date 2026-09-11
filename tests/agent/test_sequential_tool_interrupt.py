@@ -54,17 +54,24 @@ def _fast_polls(monkeypatch):
 
 
 def test_interrupt_abandons_noncooperative_tool(monkeypatch, fake_agent, _fast_polls):
-    """A blocking tool is abandoned within ~poll+grace once interrupted."""
+    """Interrupt returns cancellation while the non-cooperative tool is still running."""
 
-    started = threading.Event()
+    release = threading.Event()
+    worker_returned = threading.Event()
+    worker_threads = []
 
     def _fake_middleware(agent_arg, **kwargs):
-        started.set()
-        time.sleep(30)  # non-cooperative: never checks is_interrupted()
-        return _ManagedToolResult(
-            result="late result", args={}, middleware_trace=[],
-            blocked=False, dispatched=True,
-        )
+        worker_threads.append(threading.current_thread())
+        # Interrupt only once the worker is running; no scheduler-dependent sleep.
+        fake_agent._interrupt_requested = True
+        try:
+            release.wait(30)  # hang guard, not the assertion's timing oracle
+            return _ManagedToolResult(
+                result="late result", args={}, middleware_trace=[],
+                blocked=False, dispatched=True,
+            )
+        finally:
+            worker_returned.set()
 
     monkeypatch.setattr(
         tool_executor, "_run_agent_tool_execution_middleware", _fake_middleware
@@ -73,31 +80,27 @@ def test_interrupt_abandons_noncooperative_tool(monkeypatch, fake_agent, _fast_p
         tool_executor, "_resolve_sequential_tool_timeout", lambda: None
     )
 
-    def _interrupt_soon():
-        started.wait(5)
-        time.sleep(0.1)
-        fake_agent._interrupt_requested = True
+    try:
+        managed = _run_sequential_tool_execution_middleware(
+            fake_agent,
+            function_name="image_generate",
+            function_args={"prompt": "x"},
+            effective_task_id="t",
+            tool_call_id="call_1",
+            execute=lambda a: "unused",
+        )
 
-    threading.Thread(target=_interrupt_soon, daemon=True).start()
-
-    t0 = time.monotonic()
-    managed = _run_sequential_tool_execution_middleware(
-        fake_agent,
-        function_name="image_generate",
-        function_args={"prompt": "x"},
-        effective_task_id="t",
-        tool_call_id="call_1",
-        execute=lambda a: "unused",
-    )
-    elapsed = time.monotonic() - t0
-
-    assert isinstance(managed.result, _ToolCancelledResult)
-    assert "cancelled" in str(managed.result)
-    # poll (0.05s) + interrupt delay (0.1s) + grace (3s) + slack — nowhere
-    # near the 30s tool runtime.
-    assert elapsed < 10.0
-    # The executor emitted the terminal post_tool_call itself.
-    assert any(kw.get("status") == "cancelled" for kw in _fast_polls)
+        assert worker_threads, "tool worker never started"
+        assert not worker_returned.is_set(), "executor waited for the interrupted worker"
+        assert isinstance(managed.result, _ToolCancelledResult)
+        assert "cancelled" in str(managed.result)
+        # The executor emitted the terminal post_tool_call itself.
+        assert any(kw.get("status") == "cancelled" for kw in _fast_polls)
+    finally:
+        release.set()
+        for worker in worker_threads:
+            worker.join(timeout=10)
+            assert not worker.is_alive(), "tool worker leaked past test teardown"
 
 
 def test_interrupt_prefers_real_result_from_cooperative_tool(
