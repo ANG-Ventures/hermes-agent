@@ -6174,6 +6174,17 @@ def _try_main_fallback_chain(
     failed_provider: str = "",
     reason: str = "error",
 ) -> Tuple[Optional[Any], Optional[str], str]:
+    client, model, provider, _entry = _select_main_fallback_entry(
+        task, failed_provider, reason
+    )
+    return client, model, provider
+
+
+def _select_main_fallback_entry(
+    task: Optional[str],
+    failed_provider: str = "",
+    reason: str = "error",
+) -> Tuple[Optional[Any], Optional[str], str, Optional[Dict[str, Any]]]:
     """Try the top-level main-agent fallback chain for an auxiliary call.
 
     ``provider: auto`` auxiliary tasks should respect the user's declared
@@ -6189,10 +6200,10 @@ def _try_main_fallback_chain(
         chain = get_fallback_chain(load_config_readonly())
     except Exception as exc:
         logger.debug("Auxiliary %s: could not load main fallback chain: %s", task or "call", exc)
-        return None, None, ""
+        return None, None, "", None
 
     if not chain:
-        return None, None, ""
+        return None, None, "", None
 
     failed_norm = (failed_provider or "").strip().lower()
     main_norm = (_read_main_provider() or "").strip().lower()
@@ -6241,7 +6252,7 @@ def _try_main_fallback_chain(
                 task or "call", reason, failed_provider or "auto", label,
                 resolved_model or fb_model,
             )
-            return fb_client, resolved_model or fb_model, fb_provider
+            return fb_client, resolved_model or fb_model, fb_provider, entry
         tried.append(label)
 
     if tried:
@@ -6249,7 +6260,7 @@ def _try_main_fallback_chain(
             "Auxiliary %s: main fallback chain exhausted (tried: %s)",
             task or "call", ", ".join(tried),
         )
-    return None, None, ""
+    return None, None, "", None
 
 
 def _resolve_single_provider(
