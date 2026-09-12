@@ -123,7 +123,7 @@ gateway:
     nothing_to_do: Nothing to compress yet (the transcript is still all protected context).
     persist_failed: ⚠️ Compression ran, but the result could not be saved — the session database was busy (locked). Nothing was lost; your transcript is unchanged. Run /compress again in a moment to retry.
     summary_failed: ⚠️ Summary generation failed ({error}). {count} historical message(s) were removed and replaced with a placeholder; earlier context is no longer recoverable. Consider checking your auxiliary.compression model configuration.
-    timed_out: ⚠️ Compression could not finish — the summarizer stalled and the attempt timed out before producing anything. Nothing was lost; your transcript is unchanged. Run /compress again in a moment to retry.
+    timed_out: ⚠️ Compression could not finish — the attempt ran past its time budget and was discarded. Nothing was lost; your transcript is unchanged. Run /compress again in a moment to retry.
     turnhold_deferred: ℹ️ Context compression deferred — summary still streaming. Continuing without compression this turn.
   config_read_failed: '⚠️ Could not read config.yaml: {error}'
   config_save_failed: '⚠️ Could not save config: {error}'

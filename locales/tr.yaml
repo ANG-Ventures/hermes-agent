@@ -123,7 +123,7 @@ gateway:
     nothing_to_do: Henüz sıkıştırılacak bir şey yok (transkript hâlâ tamamen korunan bağlam).
     persist_failed: ⚠️ Sıkıştırma çalıştı, ancak sonuç kaydedilemedi — oturum veritabanı meşguldü (kilitli). Hiçbir şey kaybolmadı; dökümünüz değişmedi. Yeniden denemek için birazdan tekrar /compress çalıştırın.
     summary_failed: ⚠️ Özet oluşturma başarısız ({error}). {count} geçmiş mesaj kaldırılıp yer tutucuyla değiştirildi; önceki bağlam artık kurtarılamaz. auxiliary.compression model yapılandırmanızı kontrol edin.
-    timed_out: ⚠️ Sıkıştırma tamamlanamadı — özetleyici takıldı ve girişim hiçbir şey üretmeden zaman aşımına uğradı. Hiçbir şey kaybolmadı; dökümünüz değişmedi. Birazdan /compress komutunu yeniden çalıştırın.
+    timed_out: ⚠️ Sıkıştırma tamamlanamadı — deneme zaman bütçesini aştı ve iptal edildi. Hiçbir şey kaybolmadı; dökümünüz değişmedi. Birazdan /compress komutunu yeniden çalıştırın.
     turnhold_deferred: ℹ️ Bağlam sıkıştırma ertelendi — özet hâlâ akışta. Bu tur sıkıştırma olmadan devam ediliyor.
   config_read_failed: '⚠️ config.yaml okunamadı: {error}'
   config_save_failed: '⚠️ Yapılandırma kaydedilemedi: {error}'

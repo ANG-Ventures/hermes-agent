@@ -23,6 +23,8 @@ from __future__ import annotations
 import pytest
 
 from agent.compression_timeout_floor import (
+    DERIVED_CEILING_CAP_SECONDS,
+    reconcile_ceiling,
     DERIVED_IDLE_CAP_SECONDS,
     reconcile_idle_timeout,
     reconcile_timeouts,
@@ -329,3 +331,98 @@ class TestSummarizerFollowsLiveRoute:
 
         assert resolved == ("claude-apr", "claude-opus-5")
         assert resolved[0] != "claude-apx-7"
+
+
+# ── B3: the total ceiling must admit a primary AND one stall-fallback ─────
+#
+# Incident 2026-09-12 (session 20260910_184357_8af1ed): /compress on a
+# ~276K-token session was killed twice at the 600 s default ceiling. Both
+# workers COMPLETED their summaries (336 -> 106 messages) ~4 min AFTER the
+# host stopped waiting, and the commit fence correctly refused the late
+# commits. Measured durations: 807 s and 864 s against a 600 s ceiling.
+#
+# The idle axis was already reconciled (120 -> 360 s). The CEILING was not
+# derived from anything, so the stall-fallback was admitted into a budget
+# that could not contain it.
+
+
+class TestCeilingAdmitsAFallbackAttempt:
+    def test_default_ceiling_is_lifted_to_admit_a_fallback(self):
+        """The regression: 600 s default could not contain idle + a fallback."""
+        idle, ceiling = reconcile_timeouts(120.0, 600.0, 300.0)
+        # idle is lifted to inner + 60 = 360 by the pre-existing rule.
+        assert idle == 360.0
+        # The ceiling must now hold that idle window PLUS one full inner
+        # attempt (the fallback), plus bookkeeping headroom.
+        assert ceiling >= idle + 300.0, (
+            "ceiling cannot contain a stall-fallback attempt: "
+            f"idle={idle} ceiling={ceiling}"
+        )
+        assert ceiling == 720.0
+
+    def test_incident_durations_now_fit(self):
+        """Both real aborted attempts (807 s, 864 s) must fit the budget."""
+        _, ceiling = reconcile_timeouts(120.0, 600.0, 300.0)
+        # The 600 s default killed both; assert the derived budget is the
+        # reason they would now survive is NOT claimed here — only that the
+        # ceiling is no longer the binding constraint at the idle+inner mark.
+        assert ceiling > 600.0
+
+    def test_explicit_operator_ceiling_is_honoured_verbatim(self):
+        """An operator value is NOT lifted to admit a fallback.
+
+        Tested above the idle window: the pre-existing ``ceiling >= idle``
+        invariant is orthogonal and still applies, so a value below idle
+        would legitimately be raised by that rule instead.
+        """
+        _, ceiling = reconcile_timeouts(
+            120.0, 500.0, 300.0, explicit_ceiling=True
+        )
+        assert ceiling == 500.0
+        # ...and the pure helper is verbatim even below idle.
+        assert reconcile_ceiling(300.0, 360.0, 300.0, explicit=True) == 300.0
+
+    def test_a_generous_ceiling_is_never_lowered(self):
+        _, ceiling = reconcile_timeouts(120.0, 3600.0, 300.0)
+        assert ceiling == 3600.0
+
+    def test_derived_ceiling_is_capped(self):
+        _, ceiling = reconcile_timeouts(120.0, 600.0, 10_000.0)
+        assert ceiling == DERIVED_CEILING_CAP_SECONDS
+
+    def test_unknown_inner_deadline_is_a_noop(self):
+        assert reconcile_ceiling(600.0, 360.0, None) == 600.0
+        assert reconcile_ceiling(600.0, 360.0, 0) == 600.0
+
+    def test_ceiling_still_never_below_the_idle_window(self):
+        idle, ceiling = reconcile_timeouts(120.0, 600.0, 300.0)
+        assert ceiling >= idle
+
+    def test_resolver_applies_the_ceiling_invariant(self, monkeypatch):
+        """The RESOLVER must wire it, not just the pure helper.
+
+        This is the axis that shipped inert before: a helper fix that the
+        production resolver never consults.
+        """
+        from agent import conversation_compression as cc
+
+        monkeypatch.setattr(
+            "agent.auxiliary_client._effective_aux_timeout",
+            lambda task, timeout: 300.0,
+        )
+        idle, ceiling = cc.resolve_context_compression_timeouts({})
+        assert ceiling >= idle + 300.0, (
+            "resolver did not apply the fallback-admitting ceiling"
+        )
+
+    def test_resolver_honours_an_operator_set_ceiling(self, monkeypatch):
+        from agent import conversation_compression as cc
+
+        monkeypatch.setattr(
+            "agent.auxiliary_client._effective_aux_timeout",
+            lambda task, timeout: 300.0,
+        )
+        _, ceiling = cc.resolve_context_compression_timeouts(
+            {"context_total_ceiling_seconds": 450.0}
+        )
+        assert ceiling == 450.0

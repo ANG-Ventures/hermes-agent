@@ -1240,6 +1240,7 @@ def resolve_context_compression_timeouts(
     idle = DEFAULT_CONTEXT_TIMEOUT_SECONDS
     ceiling = DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS
     explicit_idle = False
+    explicit_ceiling = False
     from agent.config_provenance import is_operator_set
 
     cfg = compression_cfg
@@ -1281,6 +1282,15 @@ def resolve_context_compression_timeouts(
                 parsed = float(raw_ceiling)
                 if parsed > 0:
                     ceiling = parsed
+                # Same provenance rule as context_timeout_seconds above:
+                # load_config() deep-merges DEFAULT_CONFIG, so presence of the
+                # key proves nothing. Only an OPERATOR-set value is honoured
+                # verbatim; the shipped default stays eligible for the
+                # fallback-admitting lift in reconcile_ceiling().
+                explicit_ceiling = is_operator_set(
+                    cfg, "context_total_ceiling_seconds",
+                    "compression", "context_total_ceiling_seconds",
+                )
             except (TypeError, ValueError):
                 pass
 
@@ -1308,7 +1318,9 @@ def resolve_context_compression_timeouts(
         )
 
     return reconcile_timeouts(
-        idle, ceiling, inner_deadline, explicit_idle=explicit_idle
+        idle, ceiling, inner_deadline,
+        explicit_idle=explicit_idle,
+        explicit_ceiling=explicit_ceiling,
     )
 
 

@@ -123,7 +123,7 @@ gateway:
     nothing_to_do: Noch nichts zu komprimieren (das Transkript ist weiterhin vollständig geschützter Kontext).
     persist_failed: ⚠️ Die Komprimierung lief, aber das Ergebnis konnte nicht gespeichert werden — die Sitzungsdatenbank war belegt (gesperrt). Es ging nichts verloren; dein Transkript ist unverändert. Führe gleich noch einmal /compress aus, um es erneut zu versuchen.
     summary_failed: ⚠️ Zusammenfassungsgenerierung fehlgeschlagen ({error}). {count} historische Nachricht(en) wurden entfernt und durch einen Platzhalter ersetzt; früherer Kontext ist nicht mehr wiederherstellbar. Überprüfen Sie die Konfiguration des auxiliary.compression-Modells.
-    timed_out: ⚠️ Die Komprimierung konnte nicht abgeschlossen werden — der Summarizer blieb stehen und der Versuch lief ab, bevor etwas erzeugt wurde. Es ging nichts verloren; Ihr Transkript ist unverändert. Führen Sie /compress gleich erneut aus.
+    timed_out: ⚠️ Die Komprimierung konnte nicht abgeschlossen werden — der Versuch überschritt sein Zeitbudget und wurde verworfen. Es ging nichts verloren; Ihr Transkript ist unverändert. Führen Sie /compress in einem Moment erneut aus.
     turnhold_deferred: ℹ️ Kontextkomprimierung aufgeschoben — die Zusammenfassung streamt noch. Dieser Zug wird ohne Komprimierung fortgesetzt.
   config_read_failed: '⚠️ config.yaml konnte nicht gelesen werden: {error}'
   config_save_failed: '⚠️ Konfiguration konnte nicht gespeichert werden: {error}'

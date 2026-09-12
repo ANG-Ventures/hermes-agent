@@ -123,7 +123,7 @@ gateway:
     nothing_to_do: Niente da comprimere per ora (la trascrizione è ancora tutta contesto protetto).
     persist_failed: ⚠️ La compressione è stata eseguita, ma il risultato non è stato salvato — il database della sessione era occupato (bloccato). Nulla è andato perso; la tua trascrizione è invariata. Esegui di nuovo /compress tra un momento per riprovare.
     summary_failed: ⚠️ Generazione del riepilogo non riuscita ({error}). {count} messaggio/i storico/i sono stati rimossi e sostituiti con un segnaposto; il contesto precedente non è più recuperabile. Considera di controllare la configurazione del modello auxiliary.compression.
-    timed_out: ⚠️ La compressione non è riuscita a completarsi — il riassuntore si è bloccato e il tentativo è scaduto prima di produrre qualcosa. Non è andato perso nulla; la tua trascrizione è invariata. Esegui di nuovo /compress tra un momento.
+    timed_out: ⚠️ La compressione non è riuscita a completarsi — il tentativo ha superato il proprio budget di tempo ed è stato scartato. Non è andato perso nulla; la trascrizione è invariata. Riesegui /compress tra un momento.
     turnhold_deferred: ℹ️ Compressione del contesto rinviata — il riepilogo è ancora in streaming. Si continua senza compressione per questo turno.
   config_read_failed: '⚠️ Impossibile leggere config.yaml: {error}'
   config_save_failed: '⚠️ Impossibile salvare la configurazione: {error}'
