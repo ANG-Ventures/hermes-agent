@@ -617,7 +617,31 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
+def acknowledge_event_outbox(
+    evt: Dict[str, Any], *, outcome: str, reason: Optional[str] = None,
+) -> None:
+    """Acknowledge the restart outbox, using the producer's profile and event ID.
+
+    The legacy SQLite delivery row may not exist for JSON-backed dispatches.
+    A successful update there is therefore not a substitute for this receipt.
+    Restart notices have no SQLite claim but still own a durable outbox event.
+    """
+    if evt.get("type") not in {"async_delegation", "async_delegation_restarted"}:
+        return
+    event_id = str(evt.get("event_id") or "")
+    if not event_id:
+        return  # Legacy events have only their SQLite delivery ledger.
+    profile_home = evt.get("_registry_profile_home")
+    acknowledged = acknowledge_outbox_event(
+        event_id, outcome=outcome, reason=reason,
+        profile_home=Path(profile_home) if profile_home else None,
+    )
+    if not acknowledged:
+        logger.warning("Async delegation outbox receipt not found: %s", event_id)
+
+
 def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
+    acknowledge_event_outbox(evt, outcome="delivered")
     if claim_id and evt.get("type") == "async_delegation":
         complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
 
