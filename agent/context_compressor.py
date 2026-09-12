@@ -3752,6 +3752,7 @@ class ContextCompressor(ContextEngine):
         # the session unchanged instead of destroying the middle window for a
         # deterministic placeholder (#94448). Independent of abort_on_summary_failure.
         self._last_summary_empty_content_failure: bool = False
+        self._last_summary_refusal_failure: bool = False
         # retrying on the main model, record the failure so gateway /
         # CLI callers can still warn the user even though compression
         # succeeded.  Silent recovery would hide the broken config.
@@ -5512,6 +5513,23 @@ This compaction should PRIORITISE preserving all information related to the focu
                 message = choices[0].get("message") if isinstance(choices[0], dict) else getattr(choices[0], "message", None)
             else:
                 message = response.choices[0].message
+            choice = response.get("choices", [{}])[0] if isinstance(response, dict) else response.choices[0]
+            finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else getattr(choice, "finish_reason", None)
+            if finish_reason == "content_filter":
+                data = response.get("provider_data") if isinstance(response, dict) else getattr(response, "provider_data", None)
+                details = data.get("stop_details") if isinstance(data, dict) else None
+                # Never echo untrusted explanation text, URLs, or arbitrary
+                # category values into notices. Unknown categories stay generic.
+                category = details.get("category") if isinstance(details, dict) else None
+                category = "cyber" if category == "cyber" else "unspecified"
+                route = _redact_compaction_text(f"provider={_aux_provider} model={_aux_model}")
+                route = re.sub(r"[\x00-\x1f\x7f]", "", route)[:160]
+                error = f"Context compression refused ({route}; category={category}). Original context preserved; review the provider refusal."
+                self._last_summary_error = error
+                self._last_summary_refusal_failure = True
+                self._record_compression_failure_cooldown(60, error)
+                logger.warning("%s", error)
+                return None
             if isinstance(message, dict):
                 content = message.get("content")
             else:
@@ -5532,8 +5550,8 @@ This compaction should PRIORITISE preserving all information related to the focu
             if not content.strip():
                 raise RuntimeError(
                     "Context compression LLM returned empty content "
-                    f"(provider={self.provider or 'auto'} "
-                    f"model={self.summary_model or self.model})"
+                    f"(provider={_aux_provider or 'auto'} "
+                    f"model={_aux_model})"
                 )
             # Strip reasoning blocks the summarizer model may have emitted
             # (<think>...</think> etc. from thinking models like MiniMax,
@@ -5562,6 +5580,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._last_summary_auth_failure = False
             self._last_summary_network_failure = False
             self._last_summary_empty_content_failure = False
+            self._last_summary_refusal_failure = False
             return self._with_summary_prefix(summary)
         except Exception as e:
             # ``call_llm`` raises ``RuntimeError`` for two very different cases:
@@ -8159,12 +8178,15 @@ This compaction should PRIORITISE preserving all information related to the focu
             or self._last_summary_auth_failure
             or self._last_summary_network_failure
             or self._last_summary_empty_content_failure
+            or self._last_summary_refusal_failure
         ):
             n_skipped = compress_end - compress_start
             self._last_summary_dropped_count = 0  # nothing actually dropped
             self._last_summary_fallback_used = False
             self._last_compress_aborted = True
-            if self._last_summary_auth_failure:
+            if self._last_summary_refusal_failure:
+                telemetry["failure_class"] = "summary_refusal_failure"
+            elif self._last_summary_auth_failure:
                 telemetry["failure_class"] = "summary_auth_failure"
             elif self._last_summary_network_failure:
                 telemetry["failure_class"] = "summary_network_failure"
@@ -8178,7 +8200,9 @@ This compaction should PRIORITISE preserving all information related to the focu
             # and discarding a legitimately rehydrated fossil (#57835).
             self._previous_summary = _previous_summary_before_scan
             if not self.quiet_mode:
-                if self._last_summary_auth_failure:
+                if self._last_summary_refusal_failure:
+                    logger.warning("%s The session was NOT rotated.", self._last_summary_error)
+                elif self._last_summary_auth_failure:
                     logger.warning(
                         "Summary generation failed with a terminal access or "
                         "quota error — aborting compression. %d message(s) "

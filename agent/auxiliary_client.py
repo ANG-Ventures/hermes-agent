@@ -2503,6 +2503,7 @@ class _AnthropicCompletionsAdapter:
             choices=[choice],
             model=model,
             usage=usage,
+            provider_data=_nr.provider_data,
         )
 
 
