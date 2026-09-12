@@ -3,7 +3,7 @@
 The gateway contract here is deliberately narrower than exactly-once: one live
 GatewayRunner suppresses concurrent/replayed copies after successful adapter
 injection, failed injection remains retryable, and durable async-delegation
-state (when available) is acknowledged through its authoritative SQLite API.
+state is acknowledged in the producer's JSON outbox and legacy SQLite ledger.
 """
 
 import asyncio
@@ -67,6 +67,122 @@ def _async_event(delegation_id="deleg_duplicate"):
         "origin_profile": "default",
         "origin_hermes_home": "/tmp/hermes-default",
     }
+
+
+def _seed_json_outbox(events, home):
+    """Seed the real restart outbox, independently of the legacy SQLite ledger."""
+    from tools import async_delegation_store as store
+
+    registry = store.empty_registry()
+    for event in events:
+        event.setdefault("event_id", f"{event['delegation_id']}:terminal:g1")
+        event["_registry_profile_home"] = str(home)
+        event.setdefault("attempt_generation", 1)
+        registry["records"][event["delegation_id"]] = {
+            "delegation_id": event["delegation_id"],
+            "state": "done",
+            "attempt": {"generation": 1},
+            "outbox": [{
+                "event_id": event["event_id"],
+                "type": event["type"],
+                "state": "pending",
+                "queued_boot_id": None,
+                "payload": dict(event),
+                "delivered_at": None,
+                "drop_reason": None,
+            }],
+        }
+    store.write_for_tests(registry, profile_home=home)
+
+
+def _json_outbox_states(home):
+    from tools import async_delegation_store as store
+
+    return [
+        event["state"]
+        for record in store.read_registry(profile_home=home)["records"].values()
+        for event in record["outbox"]
+    ]
+
+
+@pytest.mark.parametrize("event_type", ["async_delegation", "async_delegation_restarted"])
+def test_json_outbox_delivery_is_not_replayed_after_restart(
+    event_type, tmp_path, isolated_registry,
+):
+    from tools import async_delegation as ad
+
+    event = dict(_async_event(), type=event_type)
+    _seed_json_outbox([event], tmp_path)
+    assert ad.get_durable_delegation(event["delegation_id"]) is None
+    assert ad.enqueue_pending_outbox(current_boot_id="boot-one", profile_home=tmp_path) == 1
+    queued = isolated_registry.completion_queue.get_nowait()
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    assert asyncio.run(runner._deliver_completion_notification("finished", queued)) == "delivered"
+    adapter.handle_message.assert_awaited_once()
+    assert _json_outbox_states(tmp_path) == ["delivered"]
+    assert ad.enqueue_pending_outbox(current_boot_id="boot-two", profile_home=tmp_path) == 0
+    assert isolated_registry.completion_queue.empty()
+
+
+def test_coalesced_json_outbox_siblings_are_all_acknowledged(tmp_path, isolated_registry):
+    from tools import async_delegation as ad
+
+    events = [_async_event("deleg_primary"), _async_event("deleg_sibling")]
+    _seed_json_outbox(events, tmp_path)
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    assert asyncio.run(_runner(adapter)._deliver_async_delegation_group(events)) == "delivered"
+    adapter.handle_message.assert_awaited_once()
+    delivered = adapter.handle_message.call_args.args[0].text
+    assert "deleg_primary" in delivered and "deleg_sibling" in delivered
+    assert _json_outbox_states(tmp_path) == ["delivered", "delivered"]
+    assert ad.enqueue_pending_outbox(current_boot_id="next-boot", profile_home=tmp_path) == 0
+
+
+def test_json_outbox_temporary_failure_remains_retryable(tmp_path):
+    event = _async_event()
+    _seed_json_outbox([event], tmp_path)
+    adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=[RuntimeError("offline"), None]))
+    runner = _runner(adapter)
+    assert asyncio.run(runner._deliver_completion_notification("finished", event)) == "temporary"
+    assert _json_outbox_states(tmp_path) == ["pending"]
+    assert asyncio.run(runner._deliver_completion_notification("finished", event)) == "delivered"
+    assert adapter.handle_message.await_count == 2
+    assert _json_outbox_states(tmp_path) == ["delivered"]
+
+
+@pytest.mark.parametrize("gone_parent", [False, True])
+def test_json_outbox_terminal_drop_does_not_replay(tmp_path, monkeypatch, gone_parent):
+    from tools import async_delegation as ad
+
+    event = _async_event()
+    if gone_parent:
+        event["parent_session_id"] = "closed-parent"
+    else:
+        event["session_key"] = ""
+    _seed_json_outbox([event], tmp_path)
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    monkeypatch.setattr(runner, "_classify_completion_target", AsyncMock(return_value="terminal"))
+    assert asyncio.run(runner._deliver_completion_notification("finished", event)) == "dropped"
+    adapter.handle_message.assert_not_awaited()
+    assert _json_outbox_states(tmp_path) == ["dropped"]
+    assert ad.enqueue_pending_outbox(current_boot_id="next-boot", profile_home=tmp_path) == 0
+
+
+@pytest.mark.parametrize("event_type", ["async_delegation", "async_delegation_restarted"])
+def test_shared_delivery_ack_uses_outbox_profile_not_current_home(event_type, tmp_path):
+    from tools import async_delegation as ad
+
+    owner_home = tmp_path / "other-profile"
+    event = dict(_async_event(), type=event_type)
+    _seed_json_outbox([dict(event)], tmp_path)
+    _seed_json_outbox([event], owner_home)
+    claim = ad.claim_event_delivery(event, "test-consumer")
+    assert claim is not None
+    ad.complete_event_delivery(event, claim)
+    assert _json_outbox_states(owner_home) == ["delivered"]
+    assert _json_outbox_states(tmp_path) == ["pending"]
 
 
 def _completion_event(*, started_at, session_id="proc_reused"):
