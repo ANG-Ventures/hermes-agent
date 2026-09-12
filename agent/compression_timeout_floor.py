@@ -49,6 +49,18 @@ DERIVED_IDLE_HEADROOM_SECONDS = 60.0
 # wedged compression would hang a session for an unreasonable time.
 DERIVED_IDLE_CAP_SECONDS = 900.0
 
+# Headroom added when deriving the TOTAL ceiling.  The ceiling has to admit the
+# idle window (the primary attempt's full no-progress budget) PLUS one complete
+# fallback attempt, because ``run_compress_context_with_progress_timeout``
+# starts the stall-fallback against the SAME remaining ceiling.  Without this,
+# the fallback is admitted into a budget that cannot possibly contain it.
+DERIVED_CEILING_HEADROOM_SECONDS = 60.0
+
+# Absolute bound for a DERIVED total ceiling.  Same rationale as
+# :data:`DERIVED_IDLE_CAP_SECONDS`: a pathological inner deadline must not be
+# able to pin a session to a multi-hour compression.
+DERIVED_CEILING_CAP_SECONDS = 1800.0
+
 
 def _coerce_positive_float(value: object) -> Optional[float]:
     """Return ``value`` as a positive float, or ``None`` when unusable."""
@@ -106,23 +118,79 @@ def reconcile_idle_timeout(
     return max(idle_timeout_seconds, derived)
 
 
+def reconcile_ceiling(
+    total_ceiling_seconds: float,
+    idle_timeout_seconds: float,
+    inner_deadline_seconds: Optional[float],
+    *,
+    explicit: bool = False,
+) -> float:
+    """Return a total ceiling that can contain a primary AND one fallback.
+
+    The progress-aware wrapper treats ``total_ceiling_seconds`` as a HARD stop
+    on the whole compression pass.  When the primary attempt stalls, the
+    stall-fallback path starts a second attempt against the *same* remaining
+    ceiling.  A ceiling sized for only one attempt therefore kills the
+    fallback mid-stream — and because the summary work happens in a detached
+    executor thread, the worker keeps running and COMPLETES after the host
+    stopped waiting.  The commit fence then (correctly) refuses the late
+    commit, so a fully-successful summary is discarded and the user is told
+    the summariser "stalled".
+
+    The fix is the same shape as :func:`reconcile_idle_timeout`, one axis
+    over: a DEFAULT ceiling is lifted so it admits ``idle + inner + headroom``
+    — the primary's no-progress budget plus one complete fallback attempt.
+
+    Rules mirror the idle reconciler:
+
+    * ``explicit=True`` (the operator set ``context_total_ceiling_seconds``)
+      is honoured verbatim — an operator who names a number means it, and
+      hermetic tests pin tiny values.
+    * ``total_ceiling_seconds <= 0`` is left alone (the caller's own
+      ``max(ceiling, idle)`` invariant still applies downstream).
+    * An unknown inner deadline is a no-op.
+    * The function never LOWERS a configured ceiling.
+    """
+    if explicit:
+        return total_ceiling_seconds
+    if total_ceiling_seconds <= 0:
+        return total_ceiling_seconds
+
+    inner = _coerce_positive_float(inner_deadline_seconds)
+    if inner is None:
+        return total_ceiling_seconds
+
+    idle = max(float(idle_timeout_seconds), 0.0)
+    required = idle + inner + DERIVED_CEILING_HEADROOM_SECONDS
+    derived = min(required, DERIVED_CEILING_CAP_SECONDS)
+    return max(total_ceiling_seconds, derived)
+
+
 def reconcile_timeouts(
     idle_timeout_seconds: float,
     total_ceiling_seconds: float,
     inner_deadline_seconds: Optional[float],
     *,
     explicit_idle: bool = False,
+    explicit_ceiling: bool = False,
 ) -> tuple[float, float]:
     """Reconcile ``(idle, ceiling)`` against the inner auxiliary deadline.
 
-    Applies :func:`reconcile_idle_timeout`, then restores the existing
-    invariant that the total ceiling is at least one idle window (a ceiling
-    below the idle budget would make the idle budget unreachable).
+    Applies :func:`reconcile_idle_timeout`, then :func:`reconcile_ceiling` so
+    the total budget can contain a primary attempt AND one stall-fallback,
+    then restores the existing invariant that the total ceiling is at least
+    one idle window (a ceiling below the idle budget would make the idle
+    budget unreachable).
     """
     idle = reconcile_idle_timeout(
         idle_timeout_seconds, inner_deadline_seconds, explicit=explicit_idle
     )
-    ceiling = total_ceiling_seconds
+    ceiling = reconcile_ceiling(
+        total_ceiling_seconds,
+        idle,
+        inner_deadline_seconds,
+        explicit=explicit_ceiling,
+    )
     if idle > 0:
         ceiling = max(ceiling, idle)
     return idle, ceiling

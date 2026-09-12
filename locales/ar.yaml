@@ -123,7 +123,7 @@ gateway:
     nothing_to_do: لا شيء للضغط بعد (النص كله لا يزال سياقًا محميًا).
     persist_failed: ⚠️ Compression ran, but the result could not be saved — the session database was busy (locked). Nothing was lost; your transcript is unchanged. Run /compress again in a moment to retry.
     summary_failed: ⚠️ فشل توليد الملخّص ({error}). أُزيلت {count} رسالة تاريخية واستُبدلت بعنصر نائب؛ لم يعد السياق الأقدم قابلًا للاسترجاع. فكّر في مراجعة إعداد نموذج auxiliary.compression.
-    timed_out: ⚠️ Compression could not finish — the summarizer stalled and the attempt timed out before producing anything. Nothing was lost; your transcript is unchanged. Run /compress again in a moment to retry.
+    timed_out: ⚠️ Compression could not finish — the attempt ran past its time budget and was discarded. Nothing was lost; your transcript is unchanged. Run /compress again in a moment to retry.
     turnhold_deferred: ℹ️ تم تأجيل ضغط السياق — الملخص لا يزال قيد البث. نواصل هذا الدور دون ضغط.
   config_read_failed: '⚠️ تعذّر قراءة config.yaml: {error}'
   config_save_failed: '⚠️ تعذّر حفظ الإعدادات: {error}'

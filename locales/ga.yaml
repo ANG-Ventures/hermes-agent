@@ -123,7 +123,7 @@ gateway:
     nothing_to_do: Níl aon rud le dlúthú fós (tá an traschríbhinn fós uile mar chomhthéacs cosanta).
     persist_failed: ⚠️ Rith an comhbhrú, ach níorbh fhéidir an toradh a shábháil — bhí bunachar sonraí an tseisiúin gnóthach (faoi ghlas). Níor cailleadh aon rud; tá do thras-scríbhinn gan athrú. Rith /compress arís i gceann nóiméid chun triail eile a bhaint as.
     summary_failed: ⚠️ Theip ar ghiniúint achoimre ({error}). Baineadh {count} teachtaireacht stairiúil agus cuireadh ionadaí ina n-áit; níl an comhthéacs roimhe seo in-aisghabhála a thuilleadh. Smaoinigh ar an gcumraíocht auxiliary.compression a sheiceáil.
-    timed_out: ⚠️ Níorbh fhéidir an comhbhrú a chríochnú — stad an achoimreoir agus chuaigh an iarracht thar am sular táirgeadh aon rud. Níor cailleadh aon rud; tá do thraslitriú gan athrú. Rith /compress arís i gceann nóiméid.
+    timed_out: ⚠️ Níorbh fhéidir an comhbhrú a chríochnú — chuaigh an iarracht thar a buiséad ama agus caitheadh i leataobh í. Níor caillead aon rud; tá do thras-scríbhinn gan athrú. Rith /compress arís i gceann nóiméid.
     turnhold_deferred: ℹ️ Cuireadh comhbhrú comhthéacs siar — tá an achoimre fós á sruthú. Ag leanúint ar aghaidh gan chomhbhrú don seal seo.
   config_read_failed: '⚠️ Níorbh fhéidir config.yaml a léamh: {error}'
   config_save_failed: '⚠️ Níorbh fhéidir an chumraíocht a shábháil: {error}'
