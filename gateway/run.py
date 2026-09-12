@@ -30987,6 +30987,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         means another same-lifecycle caller owns/delivered the producer event.
         No cross-process exactly-once guarantee is claimed.
         """
+        from tools.async_delegation import acknowledge_event_outbox
+
         identity = self._completion_delivery_identity(evt)
         durable_claim_id = ""
         durable_delegation_id = ""
@@ -31052,6 +31054,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "Could not drop durable completion claim",
                                 exc_info=True,
                             )
+                    acknowledge_event_outbox(
+                        evt, outcome="dropped", reason="target_permanently_gone",
+                    )
                     return "dropped"
                 if verdict == "retry":
                     if durable_claim_id:
@@ -31106,6 +31111,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             injection_result = await self._inject_watch_notification(synth_text, evt)
             if injection_result != "delivered":
+                if injection_result == "dropped":
+                    acknowledge_event_outbox(
+                        evt, outcome="dropped", reason="unroutable",
+                    )
                 return injection_result
             accepted = True
 
@@ -31119,21 +31128,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     ):
                         self._completion_deliveries_delivered.popitem(last=False)
 
-            # If the durable async-delegation producer branch is present, its
-            # SQLite row remains the authoritative replay state. Acknowledge it
-            # after adapter acceptance; this gateway keeps no parallel ledger.
-            if durable_claim_id:
-                try:
-                    from tools.async_delegation import complete_completion_delivery
+            # Acknowledge BOTH producer formats after adapter acceptance.
+            # JSON restart notices need a receipt even without a SQLite claim;
+            # the same helper covers coalesced siblings, CLI and TUI consumers.
+            try:
+                from tools.async_delegation import complete_event_delivery
 
-                    complete_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Could not acknowledge durable async completion %s: %s",
-                        durable_delegation_id, exc,
-                    )
+                complete_event_delivery(evt, durable_claim_id)
+            except Exception as exc:
+                logger.warning(
+                    "Could not acknowledge durable completion %s: %s",
+                    evt.get("event_id") or durable_delegation_id, exc,
+                )
             return "delivered"
         finally:
             if identity is not None and not accepted:
