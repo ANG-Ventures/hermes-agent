@@ -3880,10 +3880,20 @@ def _cmd_notify_repair(args: argparse.Namespace) -> int:
     try:
         from gateway.routing_identity import (
             creator_stamp_is_session_key as _stamp_is_key,
+            effective_routing_lane as _effective_lane,
         )
     except Exception:  # pragma: no cover - same guard as the index import
         def _stamp_is_key(stamp):
             return ":" in str(stamp or "")
+
+        def _effective_lane(**_kwargs):
+            # Fail CLOSED, never fall back to a raw tuple. A hand-built lane
+            # is the 2026-09-12 bug itself: it cannot match the canonicalized
+            # index and would silently report "no evidence" for every row.
+            # ``_routing_participant_index`` shares this import, so if it is
+            # unavailable the index is already ``None`` and the caller treats
+            # evidence as unavailable rather than as absent.
+            return None
 
     def _resolve(row: dict) -> "dict[str, str | None] | None":
         platform = str(row.get("platform") or "").strip().lower()
@@ -3896,9 +3906,16 @@ def _cmd_notify_repair(args: argparse.Namespace) -> int:
             # never adopt on lane evidence alone (negative-control contract —
             # cron/CLI/home-channel origins are legitimately user-less).
             return None
-        evidence = set((index or {}).get(
-            (platform, chat_id, chat_type, thread_id), set()
-        ))
+        lane = _effective_lane(
+            platform=platform,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            thread_id=thread_id,
+        )
+        if lane is None:
+            # Canonicalizer unavailable => no trustworthy lane => no repair.
+            return None
+        evidence = set((index or {}).get(lane, set()))
         # ``tasks.session_id`` holds the creating turn's session KEY for
         # gateway-created tasks (always contains ':') but a RAW session id
         # for worker/CLI-created ones (never does). #568 compared it against
