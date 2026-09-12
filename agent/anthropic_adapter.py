@@ -1240,11 +1240,16 @@ def create_anthropic_message(
                                 "%son_response callback failed",
                                 log_prefix, exc_info=True,
                             )
-                    if callable(on_stream_event):
-                        # Consume the event stream manually so each event can
-                        # tick the caller's progress callback; get_final_message
-                        # then returns the accumulated snapshot.
-                        for _event in stream:
+                    # SDK versions may omit message_delta.stop_details from
+                    # their final snapshot. Retain the optional wire metadata
+                    # even when no progress callback is installed.
+                    stop_details = None
+                    for _event in stream:
+                        if getattr(_event, "type", None) == "message_delta":
+                            details = getattr(getattr(_event, "delta", None), "stop_details", None)
+                            if details is not None:
+                                stop_details = details
+                        if callable(on_stream_event):
                             try:
                                 on_stream_event(_event)
                             except Exception:
@@ -1252,7 +1257,10 @@ def create_anthropic_message(
                                     "%son_stream_event callback failed",
                                     log_prefix, exc_info=True,
                                 )
-                    return stream.get_final_message()
+                    message = stream.get_final_message()
+                    if stop_details is not None:
+                        message.stop_details = stop_details
+                    return message
                 except Exception as exc:
                     # Only classify after stream.__enter__ exposed a successful
                     # response. ValueError from request construction/opening must

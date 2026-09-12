@@ -16,6 +16,8 @@ def _capture_anthropic_kwargs(
         _AsyncAnthropicCompletionsAdapter,
     )
 
+    from agent.transports.types import NormalizedResponse
+
     captured = {}
     sync_adapter = _AnthropicCompletionsAdapter(
         MagicMock(name="anthropic_client"), model, is_oauth=False,
@@ -30,7 +32,7 @@ def _capture_anthropic_kwargs(
         captured.update(api_kwargs)
         return SimpleNamespace()
 
-    normalized = SimpleNamespace(
+    normalized = NormalizedResponse(
         content="ok",
         tool_calls=None,
         reasoning=None,

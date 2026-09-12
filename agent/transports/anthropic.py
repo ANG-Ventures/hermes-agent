@@ -162,6 +162,9 @@ class AnthropicTransport(ProviderTransport):
         finish_reason = self._STOP_REASON_MAP.get(response.stop_reason, "stop")
 
         provider_data = {}
+        stop_details = _to_plain_data(getattr(response, "stop_details", None))
+        if stop_details is not None:
+            provider_data["stop_details"] = stop_details
         if reasoning_details:
             provider_data["reasoning_details"] = reasoning_details
         # Only worth carrying the ordered-blocks channel when the turn
