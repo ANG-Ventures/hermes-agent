@@ -432,6 +432,23 @@ class GatewayKanbanWatchersMixin:
         want_chat = str(chat_id)
         want_thread = str(thread_id or "")
         want_chat_type = str(chat_type or "")
+        # 🔴 BOTH operands of the lane comparison must be canonicalized.
+        # ``origin_lane`` below runs through ``effective_routing_lane``, which
+        # rewrites a Discord guild ``channel`` to ``group`` (the spelling
+        # ``build_session_key`` actually keys on). Building this side from the
+        # RAW subscription string made a ``channel``-spelled row structurally
+        # unmatchable — a 0% match rate, not a flaky one — so the wake found no
+        # identity, keyed a bare ``group:<chat>`` session and minted the
+        # phantom. #659 linted the SOURCE axis (no adapter may label a Discord
+        # chat ``channel``); rows persisted before that, and any non-adapter
+        # producer, still arrive spelled the legacy way. Normalizing one side
+        # of a compared pair is the whole bug (2026-09-12, Discord #curator).
+        want_lane = effective_routing_lane(
+            platform=platform_value,
+            chat_id=want_chat,
+            chat_type=want_chat_type,
+            thread_id=want_thread,
+        )
         want_creator_key = str(creator_session_key or "")
         found: set[_WakeRoutingIdentity] = set()
         try:
@@ -497,9 +514,6 @@ class GatewayKanbanWatchersMixin:
                 prospective_thread_id=getattr(
                     origin, "prospective_thread_id", None
                 ),
-            )
-            want_lane = (
-                str(platform_value), want_chat, want_chat_type, want_thread,
             )
             if origin_lane != want_lane:
                 continue
