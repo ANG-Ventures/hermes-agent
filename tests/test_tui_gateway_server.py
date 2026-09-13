@@ -6926,6 +6926,64 @@ def test_prompt_submit_empty_truncation_allowed_with_confirm(monkeypatch):
         server._sessions.pop("confirm-empty-sid", None)
 
 
+@pytest.mark.parametrize("phase", ["live", "shutdown", "post_turn"])
+@pytest.mark.parametrize("refusal", ["closing", "replaced"])
+@pytest.mark.parametrize("event_type", ["async_delegation", "async_delegation_restarted"])
+def test_refused_completion_submission_preserves_durable_receipt(
+    monkeypatch, tmp_path, phase, refusal, event_type,
+):
+    import queue
+    from tools.process_registry import process_registry
+    from tests.gateway.test_completion_delivery import (
+        _async_event, _seed_json_outbox, _json_outbox_states, _persist_pending_completion,
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    event = dict(_async_event("deleg_refused"), type=event_type, session_key="receipt-parent")
+    _seed_json_outbox([event], tmp_path)
+    if event_type == "async_delegation":
+        _persist_pending_completion(event)
+    turns = []
+    session = _session(session_key="receipt-parent", agent=_RecordingAgent(turns))
+    sid = "receipt-refusal-sid"
+    monkeypatch.setitem(server._sessions, sid, session)
+    pending = queue.Queue()
+    pending.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", pending)
+    original = server._run_prompt_submit
+    accepted = []
+
+    def refuse(*args, **kwargs):
+        if refusal == "closing":
+            session["_closing"] = True
+        else:
+            monkeypatch.setitem(server._sessions, sid, _session(session_key="receipt-parent"))
+        result = original(*args, **kwargs)
+        accepted.append(result)
+        return result
+
+    monkeypatch.setattr(server, "_run_prompt_submit", refuse)
+    if phase == "post_turn":
+        session["running"] = True
+        assert original("outer-rid", sid, session, "outer turn") is True
+        assert turns == ["outer turn"]
+    else:
+        stop = _StopAfterOneNotificationPoll()
+        if phase == "shutdown":
+            stop._checks = 1
+        server._notification_poller_loop(stop, sid, session)
+        assert turns == []
+    assert accepted == [False]
+    assert session["running"] is False
+    assert _json_outbox_states(tmp_path) == ["pending"]
+    if event_type == "async_delegation":
+        claim = ad.claim_event_delivery(event, "later-consumer")
+        assert claim
+        ad.release_event_delivery(event, claim)
+    assert ad.enqueue_pending_outbox(current_boot_id="later-boot", profile_home=tmp_path) == 1
+
+
 class _StopAfterOneNotificationPoll:
     def __init__(self):
         self._checks = 0
@@ -6954,6 +7012,7 @@ def test_completion_receipt_error_does_not_reset_accepted_turn(monkeypatch, capl
         submitted.append(args)
         if submission_fails:
             raise RuntimeError("submission failed")
+        return True
 
     def receipt(*args):
         raise OSError("receipt unavailable")

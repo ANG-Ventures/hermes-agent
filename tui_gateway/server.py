@@ -13047,7 +13047,7 @@ def _notification_poller_loop(
         try:
             _emit("message.start", sid)
             if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
+                _accepted = _run_prompt_submit(
                     rid,
                     sid,
                     session,
@@ -13056,7 +13056,7 @@ def _notification_poller_loop(
                     display_metadata=_async_delegation_display_metadata(evt),
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _accepted = _run_prompt_submit(rid, sid, session, text)
         except Exception as exc:
             release_event_delivery(evt, _claim)
             print(
@@ -13067,7 +13067,10 @@ def _notification_poller_loop(
             with session["history_lock"]:
                 session["running"] = False
         else:
-            complete_event_delivery_with_retry(evt, _claim)
+            if _accepted:
+                complete_event_delivery_with_retry(evt, _claim)
+            else:
+                release_event_delivery(evt, _claim)
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
@@ -13128,7 +13131,7 @@ def _notification_poller_loop(
         try:
             _emit("message.start", sid)
             if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
+                _accepted = _run_prompt_submit(
                     rid,
                     sid,
                     session,
@@ -13137,7 +13140,7 @@ def _notification_poller_loop(
                     display_metadata=_async_delegation_display_metadata(evt),
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _accepted = _run_prompt_submit(rid, sid, session, text)
         except Exception as exc:
             release_event_delivery(evt, _claim)
             print(
@@ -13148,7 +13151,10 @@ def _notification_poller_loop(
             with session["history_lock"]:
                 session["running"] = False
         else:
-            complete_event_delivery_with_retry(evt, _claim)
+            if _accepted:
+                complete_event_delivery_with_retry(evt, _claim)
+            else:
+                release_event_delivery(evt, _claim)
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
@@ -14449,7 +14455,7 @@ def _run_prompt_submit(
                     continue
                 try:
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
+                    _accepted = _run_prompt_submit(rid, sid, session, synth)
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)
                     print(
@@ -14460,7 +14466,10 @@ def _run_prompt_submit(
                     with session["history_lock"]:
                         session["running"] = False
                 else:
-                    complete_event_delivery_with_retry(_evt, _claim)
+                    if _accepted:
+                        complete_event_delivery_with_retry(_evt, _claim)
+                    else:
+                        release_event_delivery(_evt, _claim)
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "
