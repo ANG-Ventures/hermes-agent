@@ -483,6 +483,24 @@ def _recover_abandoned_delegations(registry, invalid_ids=None) -> int:
                 continue
             canonical = registry["records"].get(delegation_id) or {}
             if canonical.get("state") in {"done", "failed", "cancelled"}:
+                metadata = canonical.get("terminal")
+                if metadata is not None and metadata.get("completed_at") is not None:
+                    # No envelope means no delivery or acceptance to synthesize.
+                    # Only an unbound dispatch mirror can receive these facts;
+                    # keep any existing event, receipt, claim and raw result.
+                    conn.execute(
+                        """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
+                           result_json=COALESCE(result_json, ?)
+                           WHERE delegation_id=? AND event_json IS NULL
+                             AND delivery_claim IS NULL""",
+                        (metadata["status"], metadata["completed_at"], now,
+                         json.dumps(metadata["result"] if metadata.get("result") is not None else {
+                             "status": metadata["status"], "error": metadata.get("error"),
+                         }) if metadata.get("result") is not None or metadata.get("error") else None,
+                         delegation_id),
+                    )
+                    conn.commit()
+                    continue
                 logger.warning(
                     "Terminal delegation %s lacks execution evidence; retaining mirror",
                     delegation_id,
@@ -862,6 +880,10 @@ def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
 
 
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
+    """Read mirror facts; result may be absent or only recovery-error metadata.
+
+    Full raw execution results are available only when JSON archival succeeded.
+    """
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
             """SELECT origin_session, state, dispatched_at, completed_at,

@@ -498,6 +498,7 @@ def _terminal_payload(record: dict[str, Any], result: dict[str, Any], status: st
     source = record.get("source") or {}
     execution = record.get("execution") or {}
     tasks = source.get("tasks") or []
+    tasks = [task for task in tasks if isinstance(task, dict)] if isinstance(tasks, list) else []
     goals = [str(task.get("goal") or "") for task in tasks if isinstance(task, dict)]
     dispatched_at = record.get("created_at") or time.time()
     completed_at = time.time()
@@ -823,18 +824,26 @@ def _restart_payload(
 
 
 def _fail_recovery_record(
-    record: dict[str, Any], error: str, now: float, *, emit_event: bool
+    record: dict[str, Any], error: str, now: float, *, emit_event: bool,
+    event_suffix: str | None = None,
 ) -> None:
     record["state"] = "failed"
     record["updated_at"] = now
     record["terminal"] = {"status": "error", "error": error, "completed_at": now}
-    if not emit_event:
+    route = record.get("route") or {}
+    if (not emit_event
+            or not all(str(route.get(key) or "").strip()
+                       for key in ("platform", "session_key", "parent_session_id"))
+            or (route.get("profile") or record.get("profile")) != record.get("profile")):
+        logger.warning("Delegation %s failed (%s) without a safe notification route",
+                       record.get("delegation_id"), error)
         return
     payload = _terminal_payload(record, {"error": error}, "error")
-    event_id = f"{record.get('delegation_id')}:terminal:{error}"
+    payload["completed_at"] = now
+    event_id = f"{record.get('delegation_id')}:terminal:{event_suffix or error}"
     payload["event_id"] = event_id
     if not any(event.get("event_id") == event_id for event in record.get("outbox", [])):
-        record.setdefault("outbox", []).append({
+        entry = {
             "event_id": event_id,
             "type": "async_delegation",
             "state": "pending",
@@ -843,7 +852,17 @@ def _fail_recovery_record(
             "delivered_at": None,
             "drop_reason": None,
             "payload": payload,
-        })
+        }
+        # Validate before publishing; never normalize conflicting identity.
+        candidate = {**record, "outbox": [*record.get("outbox", []), entry]}
+        try:
+            canonical_terminal({"records": {record["delegation_id"]: candidate}},
+                               record["delegation_id"])
+        except RegistryError:
+            logger.warning("Delegation %s failed (%s) without a valid notification identity",
+                           record.get("delegation_id"), error, exc_info=True)
+            return
+        record.setdefault("outbox", []).append(entry)
 
 
 def claim_recoveries(
@@ -917,17 +936,8 @@ def claim_recoveries(
                 continue
             summary["eligible"] += 1
             if now - float(record.get("created_at") or now) > ACTIVE_STALE_SECONDS:
-                payload = _terminal_payload(record, {"error": "stale_record"}, "error")
-                event_id = f"{delegation_id}:terminal:stale"
-                payload["event_id"] = event_id
-                record["state"] = "failed"
-                record["updated_at"] = now
-                record["terminal"] = {"status": "error", "error": "stale_record", "completed_at": now}
-                record.setdefault("outbox", []).append({
-                    "event_id": event_id, "type": "async_delegation", "state": "pending",
-                    "queued_boot_id": None, "created_at": now, "delivered_at": None,
-                    "drop_reason": None, "payload": payload,
-                })
+                _fail_recovery_record(record, "stale_record", now,
+                                      emit_event=True, event_suffix="stale")
                 continue
             # RC-1: a dead boot's claim with no executor-submission telemetry did
             # not launch replacement work and therefore does not consume retry budget.
@@ -935,20 +945,8 @@ def claim_recoveries(
             if int(attempt.get("generation") or 0) > 0 and attempt.get("submitted_at") is None:
                 redispatch_count = max(0, redispatch_count - 1)
             if redispatch_count >= MAX_REDISPATCH_ATTEMPTS:
-                payload = _terminal_payload(record, {"error": "restart_attempts_exhausted"}, "error")
-                event_id = f"{delegation_id}:terminal:exhausted"
-                payload["event_id"] = event_id
-                record["state"] = "failed"
-                record["updated_at"] = now
-                record["terminal"] = {
-                    "status": "error", "error": "restart_attempts_exhausted", "completed_at": now,
-                }
-                if not any(event.get("event_id") == event_id for event in record.get("outbox", [])):
-                    record.setdefault("outbox", []).append({
-                        "event_id": event_id, "type": "async_delegation", "state": "pending",
-                        "queued_boot_id": None, "created_at": now, "delivered_at": None,
-                        "drop_reason": None, "payload": payload,
-                    })
+                _fail_recovery_record(record, "restart_attempts_exhausted", now,
+                                      emit_event=True, event_suffix="exhausted")
                 summary["exhausted"] += 1
                 logger.warning(
                     "async_delegation_retry_exhausted delegation_id=%s redispatch_count=%d",
@@ -1028,6 +1026,18 @@ def canonical_terminal(registry, delegation_id):
     entries = [entry for entry in record.get("outbox", [])
                if entry.get("type") == "async_delegation"]
     if not entries:
+        terminal = record["terminal"]
+        if (record.get("delegation_id") != delegation_id
+                or type(attempt.get("generation")) is not int
+                or attempt["generation"] < 0
+                or not attempt.get("attempt_id")
+                or not isinstance(terminal, dict)
+                or terminal.get("status") not in {"completed", "success", "error", "interrupted", "cancelled"}
+                or (terminal.get("result") is not None
+                    and not isinstance(terminal["result"], dict))
+                or (terminal.get("completed_at") is not None
+                    and not isinstance(terminal["completed_at"], (int, float)))):
+            raise RegistryError(f"invalid non-deliverable terminal evidence for {delegation_id}")
         return None
     if len(entries) != 1:
         raise RegistryError(f"ambiguous terminal outbox for {delegation_id}")

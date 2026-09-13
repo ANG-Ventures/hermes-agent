@@ -71,6 +71,125 @@ def registry_record(delegation_id):
     return json.loads(ad._registry_path().read_text())["records"][delegation_id]
 
 
+@pytest.mark.parametrize("case", ["profile", "no-route", "no-parent", "tasks", "scalar-tasks", "stale", "exhausted"])
+@pytest.mark.parametrize("batch", [False, True])
+def test_store_generated_recovery_failures(monkeypatch, case, batch):
+    identifier, _, _ = dispatch(monkeypatch, batch=batch)
+    healthy, worker, _ = dispatch(monkeypatch)
+    worker()
+    process_registry.completion_queue.get_nowait()
+    with ad._store.locked_registry() as registry:
+        rec = registry["records"][identifier]
+        if case == "profile":
+            rec["route"]["profile"] = "conflicting-profile"
+        elif case == "no-route":
+            rec["route"].update(platform=None, session_key="")
+        elif case == "no-parent":
+            rec["route"]["parent_session_id"] = ""
+        elif case == "tasks":
+            rec["source"]["tasks"] = [None, 7]
+        elif case == "scalar-tasks":
+            rec["source"]["tasks"] = 7
+        elif case == "stale":
+            rec["created_at"] = time.time() - ad._store.ACTIVE_STALE_SECONDS - 10
+        else:
+            rec["attempt"]["redispatch_count"] = ad._store.MAX_REDISPATCH_ATTEMPTS
+    claimed, _ = ad._store.claim_recoveries(
+        current_boot_id="200:2", resume_enabled=True, owner_alive=lambda _: False)
+    assert claimed == []
+    rec = registry_record(identifier)
+    assert rec["state"] == "failed"
+    deliverable = case not in {"profile", "no-route", "no-parent"}
+    assert len(rec["outbox"]) == int(deliverable)
+    expected = [healthy, identifier] if deliverable else [healthy]
+    assert ad.enqueue_pending_outbox(current_boot_id="failure-test") == len(expected)
+    canonical_events = list(process_registry.completion_queue.queue)
+    assert sorted(e["delegation_id"] for e in canonical_events) == sorted(expected)
+    q = queue.Queue()
+    assert ad.restore_undelivered_completions(q) == len(expected)
+    assert sorted(e["delegation_id"] for e in q.queue) == sorted(expected)
+    failed = row(identifier)
+    assert failed["state"] == "error"
+    assert failed["completed_at"] == rec["terminal"]["completed_at"]
+    if not deliverable:
+        assert failed["event_json"] is None
+        assert failed["delivery_state"] == "pending"
+        assert json.loads(failed["result_json"])["error"] == rec["terminal"]["error"]
+    for event in canonical_events:
+        claim = ad.claim_event_delivery(event, "failure-consumer")
+        assert claim
+        ad.complete_event_delivery(event, claim)
+        assert row(event["delegation_id"])["delivery_state"] == "delivered"
+        assert registry_record(event["delegation_id"])["outbox"][0]["state"] == "delivered"
+    assert ad.restore_undelivered_completions(queue.Queue()) == 0
+    assert ad.enqueue_pending_outbox(current_boot_id="next-boot") == 0
+
+
+@pytest.mark.parametrize("disposition", ["delivered", "dropped", "parked"])
+def test_non_deliverable_failure_preserves_receipt_and_result(monkeypatch, disposition):
+    identifier, _, _ = dispatch(monkeypatch)
+    original = {"summary": "previously recorded", "structured_output": [1, 2]}
+    with ad._transaction() as conn:
+        conn.execute("""UPDATE async_delegations SET delivery_state=?, result_json=?,
+                        delivered_at=123, delivery_attempts=4 WHERE delegation_id=?""",
+                     (disposition, json.dumps(original), identifier))
+    with ad._store.locked_registry() as registry:
+        registry["records"][identifier]["route"]["platform"] = None
+    ad._store.claim_recoveries(current_boot_id="200:2", resume_enabled=True,
+                              owner_alive=lambda _: False)
+    assert ad.restore_undelivered_completions(queue.Queue()) == 0
+    mirror = row(identifier)
+    assert mirror["state"] == "error"
+    assert mirror["event_json"] is None
+    assert mirror["delivery_state"] == disposition
+    assert mirror["delivered_at"] == 123
+    assert mirror["delivery_attempts"] == 4
+    assert json.loads(mirror["result_json"]) == original
+
+
+@pytest.mark.parametrize("bound", ["event", "claim"])
+def test_non_deliverable_failure_does_not_replace_bound_mirror(monkeypatch, bound):
+    identifier, _, _ = dispatch(monkeypatch)
+    with ad._transaction() as conn:
+        if bound == "event":
+            conn.execute("UPDATE async_delegations SET event_json=? WHERE delegation_id=?",
+                         (json.dumps({"event_id": "other-attempt"}), identifier))
+        else:
+            conn.execute("UPDATE async_delegations SET delivery_claim=? WHERE delegation_id=?",
+                         ("held-claim", identifier))
+    before = row(identifier)
+    with ad._store.locked_registry() as registry:
+        registry["records"][identifier]["route"]["platform"] = None
+    ad._store.claim_recoveries(current_boot_id="200:2", resume_enabled=True,
+                              owner_alive=lambda _: False)
+    ad.recover_abandoned_delegations()
+    assert row(identifier) == before
+
+
+def test_non_deliverable_failure_mirror_is_profile_local(monkeypatch, tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    identifier, _, _ = dispatch(monkeypatch)
+    foreign = tmp_path / "profiles/foreign"
+    token = set_hermes_home_override(foreign)
+    try:
+        legacy(identifier, "delivered")
+        before = row(identifier)
+    finally:
+        reset_hermes_home_override(token)
+    with ad._store.locked_registry() as registry:
+        registry["records"][identifier]["route"]["profile"] = "conflicting-profile"
+    ad._store.claim_recoveries(current_boot_id="200:2", resume_enabled=True,
+                              owner_alive=lambda _: False)
+    assert ad.restore_undelivered_completions(queue.Queue()) == 0
+    assert row(identifier)["state"] == "error"
+    token = set_hermes_home_override(foreign)
+    try:
+        assert row(identifier) == before
+    finally:
+        reset_hermes_home_override(token)
+
+
 @pytest.mark.parametrize("batch", [False, True])
 @pytest.mark.parametrize("secondary", [False, True])
 def test_dead_producer_exhausted_mirror_recovered_by_fresh_consumer(tmp_path, batch, secondary):
