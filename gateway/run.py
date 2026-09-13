@@ -30982,9 +30982,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     @staticmethod
     async def _claim_completion_notification(evt: dict, consumer: str) -> str | None:
         """Recover a cancelled executor claim before abandoning its ownership."""
+        from contextvars import copy_context
         from tools.async_delegation import claim_event_delivery, release_event_delivery
 
-        operation = asyncio.create_task(asyncio.to_thread(claim_event_delivery, evt, consumer))
+        operation = asyncio.get_running_loop().run_in_executor(
+            None, copy_context().run, claim_event_delivery, evt, consumer,
+        )
         cancelled = False
         try:
             while True:
