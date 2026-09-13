@@ -44,6 +44,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
@@ -424,42 +425,11 @@ def _sync_completion(conn, event, result, disposition=None):
 
 def _canonical_terminal(registry, delegation_id):
     """Resolve current-attempt terminal evidence while holding the JSON lock."""
-    if delegation_id in registry.get("_invalid_record_ids", []):
-        raise _store.RegistryError(f"record {delegation_id} failed integrity validation")
-    record = registry["records"].get(delegation_id)
-    if record is None or record.get("state") not in {"done", "failed", "cancelled"}:
+    terminal = _store.canonical_terminal(registry, delegation_id)
+    if terminal is None:
         return None
-    # Historical outbox-only records lack execution evidence. They retain the
-    # legacy event/receipt path; do not reclassify them from a delivery envelope.
-    if record.get("terminal") is None:
-        return None
-    attempt = record.get("attempt") or {}
-    entries = [entry for entry in record.get("outbox", [])
-               if entry.get("type") == "async_delegation"]
-    if not entries:
-        return None
-    if len(entries) != 1:
-        raise _store.RegistryError(f"ambiguous terminal outbox for {delegation_id}")
-    entry = entries[0]
-    payload = entry.get("payload") or {}
-    if (record.get("delegation_id") != delegation_id
-            or not entry.get("event_id")
-            or payload.get("event_id") != entry["event_id"]
-            or payload.get("delegation_id") != delegation_id
-            or payload.get("type") != "async_delegation"
-            or type(payload.get("attempt_generation")) is not int
-            or type(attempt.get("generation")) is not int
-            or payload["attempt_generation"] < 0
-            or payload["attempt_generation"] != attempt.get("generation")
-            or payload.get("attempt_id") != attempt.get("attempt_id")
-            or payload.get("profile") != record.get("profile")
-            or payload.get("status") != record["terminal"].get("status")):
-        raise _store.RegistryError(f"invalid terminal identity for {delegation_id}")
-    result = record["terminal"].get("result")
-    if result is not None and not isinstance(result, dict):
-        raise _store.RegistryError(f"invalid terminal result for {delegation_id}")
-    return {**entry, "execution_result": result,
-            "payload": {**payload, "_registry_profile_home": str(_registry_path().parent.parent)}}
+    return {**terminal, "payload": {**terminal["payload"],
+            "_registry_profile_home": str(_registry_path().parent.parent)}}
 
 
 def _note_delivery_attempt(delegation_id: str) -> None:
@@ -633,6 +603,7 @@ def restore_undelivered_completions(target_queue) -> int:
             evt = json.loads(payload)
             if isinstance(evt, dict):
                 evt["restored"] = True
+                evt["_registry_profile_home"] = str(_registry_path().parent.parent)
             target_queue.put(evt)
             restored += 1
     return restored
@@ -691,6 +662,23 @@ def _claim_completion_delivery(delegation_id, claim_id, *, event=None, terminal=
         return cur.rowcount == 1
 
 
+def _producer_scoped(operation):
+    """Shared queue consumers run outside the producer's profile context."""
+    @wraps(operation)
+    def scoped(evt, *args, **kwargs):
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        home = evt.get("_registry_profile_home")
+        token = set_hermes_home_override(Path(home)) if home else None
+        try:
+            return operation(evt, *args, **kwargs)
+        finally:
+            if token is not None:
+                reset_hermes_home_override(token)
+    return scoped
+
+
+@_producer_scoped
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     """Claim a durable delegation event; non-durable events need no token."""
     if evt.get("type") != "async_delegation":
@@ -705,6 +693,7 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     return None
 
 
+@_producer_scoped
 def _reconcile_terminal_event_receipt(evt: Dict[str, Any]) -> None:
     """Repair JSON only from an unambiguous same-event SQLite terminal receipt.
 
@@ -811,6 +800,7 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
+@_producer_scoped
 def acknowledge_event_outbox(
     evt: Dict[str, Any], *, outcome: str, reason: Optional[str] = None,
 ) -> None:
@@ -834,6 +824,7 @@ def acknowledge_event_outbox(
         logger.warning("Async delegation outbox receipt not found: %s", event_id)
 
 
+@_producer_scoped
 def complete_event_delivery(evt: Dict[str, Any], claim_id: Optional[str]) -> None:
     """Record consumer acceptance, not completion of the resulting model turn."""
     try:
@@ -864,6 +855,7 @@ def complete_event_delivery_with_retry(evt: Dict[str, Any], claim_id: Optional[s
     return False
 
 
+@_producer_scoped
 def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
     if claim_id and evt.get("type") == "async_delegation":
         release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
@@ -1966,6 +1958,7 @@ def recover_async_delegations(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
 ) -> Dict[str, int]:
     """Claim and submit restartable records once for one profile/boot."""
+    profile_home = _store.registry_path(profile_home).parent.parent
     claimed, summary = _store.claim_recoveries(
         current_boot_id=current_boot_id,
         resume_enabled=resume_enabled,
@@ -2106,6 +2099,7 @@ def enqueue_pending_outbox(
     *, current_boot_id: str, profile_home=None
 ) -> int:
     """Replay both restart and terminal events through the existing queue."""
+    profile_home = _store.registry_path(profile_home).parent.parent
     payloads = _store.enqueue_pending_outbox(
         current_boot_id=current_boot_id,
         profile_home=profile_home,

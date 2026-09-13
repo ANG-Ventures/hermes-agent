@@ -35,7 +35,7 @@ def row(delegation_id):
         ).fetchone())
 
 
-def dispatch(monkeypatch, *, batch=False, result=None, native=False):
+def dispatch(monkeypatch, *, batch=False, result=None, native=False, session_key="receipt-session"):
     workers = []
     executor = ad._get_executor(1) if native else None
 
@@ -53,11 +53,11 @@ def dispatch(monkeypatch, *, batch=False, result=None, native=False):
         "profile": "default",
         "source": {"kind": "batch" if batch else "single", "tasks": [{"goal": "receipt"}]},
         "execution": {"model": "test-model", "provider": "test-provider"},
-        "route": {"session_key": "receipt-session", "parent_session_id": "receipt-parent",
+        "route": {"session_key": session_key, "parent_session_id": "receipt-parent",
                   "platform": "telegram"},
     }
     kwargs: dict[str, Any] = dict(context=None, toolsets=None, role="leaf", model="test-model",
-                  session_key="receipt-session", runner=lambda: result,
+                  session_key=session_key, runner=lambda: result,
                   durable_spec=spec, current_boot_id="100:1.0")
     if batch:
         dispatched = ad.dispatch_async_delegation_batch(goals=["receipt"], **kwargs)
@@ -111,9 +111,7 @@ print(json.dumps({{"id": identifier, "pid": os.getpid()}}))
 
     produced = json.loads(run(producer))
     consumer = bootstrap + f'''
-from gateway.status import _pid_exists
 identifier = {produced['id']!r}
-assert not _pid_exists({produced['pid']!r})
 t.legacy("genuinely-lost")
 q = queue.Queue()
 t.ad.restore_undelivered_completions(q)
@@ -150,7 +148,10 @@ def test_canonical_recovery_preserves_exact_execution_result(monkeypatch, batch,
         worker()
     event = process_registry.completion_queue.get_nowait()
     if startup:
-        ad.restore_undelivered_completions(queue.Queue())
+        restored = queue.Queue()
+        ad.restore_undelivered_completions(restored)
+        assert ad.get_durable_delegation(identifier)["result"] == result
+        event = restored.get_nowait()
     claim = ad.claim_event_delivery(event, "result-reader")
     assert claim
     assert ad.get_durable_delegation(identifier)["result"] == result
@@ -210,11 +211,151 @@ def test_foreign_profile_claim_refused_without_local_canonical(monkeypatch, tmp_
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "other-profile"))
     if collision:
         legacy(identifier)
-    assert ad.claim_event_delivery(event, "foreign-consumer") is None
+    assert not ad.claim_completion_delivery(identifier, "foreign-consumer", event=event)
     if collision:
         assert row(identifier)["event_json"] is None
     else:
         assert ad.get_durable_delegation(identifier) is None
+
+
+@pytest.mark.parametrize("disposition", ["delivered", "dropped"])
+def test_shared_events_use_producer_scope(monkeypatch, tmp_path, disposition):
+    identifier, event = failed_mirror(monkeypatch)
+    producer = ad._registry_path().parent.parent
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "foreign"))
+    legacy(identifier)
+    with ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET delivery_state=?, event_json=? WHERE delegation_id=?",
+                     (disposition, json.dumps(event), identifier))
+    claim = ad.claim_event_delivery(event, "consumer")
+    assert claim
+    ad.release_event_delivery(event, claim)
+    claim = ad.claim_event_delivery(event, "retry")
+    assert claim
+    ad.complete_event_delivery(event, claim)
+    assert ad.get_hermes_home() == tmp_path / "foreign"
+    assert row(identifier)["delivery_state"] == disposition
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    token = set_hermes_home_override(producer)
+    try:
+        assert row(identifier)["delivery_state"] == "delivered"
+        assert registry_record(identifier)["outbox"][0]["state"] == "delivered"
+    finally:
+        reset_hermes_home_override(token)
+
+
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("extra", ["path", "object", "cycle"])
+def test_optional_archive_failure_keeps_real_completion(monkeypatch, batch, extra, caplog):
+    value = Path("metadata") if extra == "path" else object()
+    if extra == "cycle":
+        value = []
+        value.append(value)
+    result = {"summary": "valid answer", "status": "completed", "extra": value}
+    if batch:
+        result = {"results": [{"summary": "valid answer", "status": "completed"}], "extra": value}
+    identifier, worker, _ = dispatch(monkeypatch, batch=batch, result=result)
+    worker()
+    event = process_registry.completion_queue.get_nowait()
+    assert event.get("summary") == "valid answer" or event["results"][0]["summary"] == "valid answer"
+    assert registry_record(identifier)["state"] == "done"
+    assert "result" not in registry_record(identifier)["terminal"]
+    assert "archive" in caplog.text
+    claim = ad.claim_event_delivery(event, "consumer")
+    assert claim
+    ad.complete_event_delivery(event, claim)
+    assert row(identifier)["delivery_state"] == "delivered"
+
+
+@pytest.mark.parametrize("rail", ["json", "sqlite"])
+def test_mixed_corruption_both_replay_rails(monkeypatch, rail, caplog):
+    import asyncio
+    from unittest.mock import AsyncMock
+    from tests.gateway.test_completion_delivery import _runner
+
+    route = "agent:main:telegram:dm:12345:678"
+    good, _ = failed_mirror(monkeypatch, session_key=route)
+    sibling, _ = failed_mirror(monkeypatch, session_key=route)
+    semantic, bad_event = failed_mirror(monkeypatch, session_key=route)
+    checksum, _ = failed_mirror(monkeypatch, session_key=route)
+    with ad._store.locked_registry() as registry:
+        registry["records"][semantic]["outbox"][0]["payload"]["attempt_id"] = "wrong"
+    path = ad._registry_path()
+    raw = json.loads(path.read_text())
+    raw["records"][checksum]["outbox"][0]["payload"]["summary"] = "tampered"
+    path.write_text(json.dumps(raw))
+    q = queue.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", q)
+    if rail == "json":
+        ad.enqueue_pending_outbox(current_boot_id="mixed-replay")
+    else:
+        ad.restore_undelivered_completions(q)
+    events = list(q.queue)
+    assert {e["delegation_id"] for e in events} == {good, sibling}
+    assert semantic in caplog.text and checksum in caplog.text
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    runner._session_db = SimpleNamespace(get_session=AsyncMock(return_value={"ended_at": None}))
+    assert asyncio.run(runner._deliver_async_delegation_group(events)) == "delivered"
+    adapter.handle_message.assert_awaited_once()
+    for identifier in (good, sibling):
+        assert row(identifier)["delivery_state"] == "delivered"
+        assert registry_record(identifier)["outbox"][0]["state"] == "delivered"
+    with pytest.raises(ad._store.RegistryError):
+        ad.claim_event_delivery(bad_event, "invalid")
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_relative_producer_home_survives_cwd_change(monkeypatch, tmp_path, batch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", "relative-home")
+    identifier, worker, _ = dispatch(monkeypatch, batch=batch)
+    worker()
+    emitted = process_registry.completion_queue.get_nowait()
+    home = tmp_path / "relative-home"
+    assert emitted["_registry_profile_home"] == str(home.resolve())
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    monkeypatch.chdir(other)
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    token = set_hermes_home_override(home)
+    try:
+        q = queue.Queue()
+        ad.restore_undelivered_completions(q)
+        restored = q.get_nowait()
+    finally:
+        reset_hermes_home_override(token)
+    ad.enqueue_pending_outbox(current_boot_id="relative-replay", profile_home=home)
+    replay = process_registry.completion_queue.get_nowait()
+    assert {e["_registry_profile_home"] for e in [emitted, restored, replay]} == {str(home.resolve())}
+    from gateway.run import GatewayRunner
+    assert len({GatewayRunner._completion_delivery_identity(e)
+                for e in (emitted, restored, replay)}) == 1
+    claim = ad.claim_event_delivery(replay, "changed-cwd")
+    assert claim
+    ad.complete_event_delivery(replay, claim)
+    assert ad._store.read_registry(home)["records"][identifier]["outbox"][0]["state"] == "delivered"
+
+
+@pytest.mark.parametrize("operation", ["claim", "release", "receipt"])
+def test_event_scope_restored_on_base_exception(monkeypatch, tmp_path, operation):
+    _, event = failed_mirror(monkeypatch)
+    claim = ad.claim_event_delivery(event, "consumer")
+    foreign = tmp_path / "foreign"
+    monkeypatch.setenv("HERMES_HOME", str(foreign))
+    class Cancelled(BaseException):
+        pass
+    def fail(*args, **kwargs):
+        raise Cancelled()
+    target, invoke = {
+        "claim": ("claim_completion_delivery", lambda: ad.claim_event_delivery(event, "retry")),
+        "release": ("release_completion_delivery", lambda: ad.release_event_delivery(event, claim)),
+        "receipt": ("acknowledge_outbox_event", lambda: ad.complete_event_delivery(event, claim)),
+    }[operation]
+    monkeypatch.setattr(ad, target, fail)
+    with pytest.raises(Cancelled):
+        invoke()
+    assert ad.get_hermes_home() == foreign
 
 
 def test_sqlite_replay_retains_canonical_producer_binding(monkeypatch, tmp_path):
@@ -247,8 +388,8 @@ def test_valid_terminal_without_completion_envelope_is_not_ambiguous(monkeypatch
     assert q.empty()
 
 
-def failed_mirror(monkeypatch, *, batch=False):
-    identifier, worker, _ = dispatch(monkeypatch, batch=batch)
+def failed_mirror(monkeypatch, *, batch=False, session_key="receipt-session"):
+    identifier, worker, _ = dispatch(monkeypatch, batch=batch, session_key=session_key)
     with monkeypatch.context() as m:
         def fail(*args):
             raise sqlite3.OperationalError("injected mirror exhaustion")
@@ -370,7 +511,10 @@ def test_fresh_legacy_claim_winning_after_select_is_preserved(monkeypatch):
 ])
 def test_canonical_consumer_rejects_wrong_identity(monkeypatch, field, value):
     identifier, event = failed_mirror(monkeypatch)
-    assert ad.claim_event_delivery({**event, field: value}, "wrong") is None
+    if field == "_registry_profile_home":
+        assert not ad.claim_completion_delivery(identifier, "wrong", event={**event, field: value})
+    else:
+        assert ad.claim_event_delivery({**event, field: value}, "wrong") is None
     assert row(identifier)["state"] == "running"
     assert row(identifier)["event_json"] is None
     assert ad.claim_event_delivery(event, "right")

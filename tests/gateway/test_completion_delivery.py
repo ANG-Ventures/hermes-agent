@@ -485,14 +485,7 @@ def test_shared_delivery_ack_uses_outbox_profile_not_current_home(event_type, tm
     event = dict(_async_event(), type=event_type)
     _seed_json_outbox([dict(event)], tmp_path)
     _seed_json_outbox([event], owner_home)
-    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-
-    # Claim in the producer scope; the assertion below targets outbox ACK routing.
-    token = set_hermes_home_override(owner_home)
-    try:
-        claim = ad.claim_event_delivery(event, "test-consumer")
-    finally:
-        reset_hermes_home_override(token)
+    claim = ad.claim_event_delivery(event, "test-consumer")
     assert claim is not None
     ad.complete_event_delivery(event, claim)
     assert _json_outbox_states(owner_home) == ["delivered"]

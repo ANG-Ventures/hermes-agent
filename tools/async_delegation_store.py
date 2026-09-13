@@ -135,7 +135,7 @@ def _stamp_cancel_attribution(
 
 def registry_path(profile_home: Path | None = None) -> Path:
     home = Path(profile_home) if profile_home is not None else get_hermes_home()
-    return home / "state" / "async-delegations.json"
+    return home.resolve() / "state" / "async-delegations.json"
 
 
 def lock_path(profile_home: Path | None = None) -> Path:
@@ -581,13 +581,22 @@ def append_terminal(
         payload = _terminal_payload(record, result, status)
         event_id = f"{delegation_id}:terminal:g{record['attempt']['generation']}"
         payload["event_id"] = event_id
+        # The full runner result is optional archival data, not the delivery
+        # envelope. Unsupported extras must not discard a valid flattened answer.
+        try:
+            archived_result = json.loads(json.dumps(result, allow_nan=False))
+        except (TypeError, ValueError, RecursionError):
+            archived_result = None
+            logger.warning("Async delegation %s: optional result archive unavailable",
+                           delegation_id, exc_info=True)
         record["state"] = terminal_state
         record["terminal"] = {
             "status": status,
             "completed_at": payload["completed_at"],
             "error": result.get("error"),
-            "result": copy.deepcopy(result),
         }
+        if archived_result is not None:
+            record["terminal"]["result"] = archived_result
         record["updated_at"] = payload["completed_at"]
         append_lifecycle_event(
             record,
@@ -1002,6 +1011,47 @@ def claim_recoveries(
     return claimed, summary
 
 
+def canonical_terminal(registry, delegation_id):
+    """Validate terminal identity for both canonical and mirror consumers.
+
+    Caller holds the registry lock. Sparse historical outboxes and terminal
+    work intentionally emitted without an envelope have no execution evidence.
+    """
+    if delegation_id in registry.get("_invalid_record_ids", []):
+        raise RegistryError(f"record {delegation_id} failed integrity validation")
+    record = registry["records"].get(delegation_id)
+    if record is None or record.get("state") not in {"done", "failed", "cancelled"}:
+        return None
+    if record.get("terminal") is None:
+        return None
+    attempt = record.get("attempt") or {}
+    entries = [entry for entry in record.get("outbox", [])
+               if entry.get("type") == "async_delegation"]
+    if not entries:
+        return None
+    if len(entries) != 1:
+        raise RegistryError(f"ambiguous terminal outbox for {delegation_id}")
+    entry = entries[0]
+    payload = entry.get("payload") or {}
+    if (record.get("delegation_id") != delegation_id
+            or not entry.get("event_id")
+            or payload.get("event_id") != entry["event_id"]
+            or payload.get("delegation_id") != delegation_id
+            or payload.get("type") != "async_delegation"
+            or type(payload.get("attempt_generation")) is not int
+            or type(attempt.get("generation")) is not int
+            or payload["attempt_generation"] < 0
+            or payload["attempt_generation"] != attempt.get("generation")
+            or payload.get("attempt_id") != attempt.get("attempt_id")
+            or payload.get("profile") != record.get("profile")
+            or payload.get("status") != record["terminal"].get("status")):
+        raise RegistryError(f"invalid terminal identity for {delegation_id}")
+    result = record["terminal"].get("result")
+    if result is not None and not isinstance(result, dict):
+        raise RegistryError(f"invalid terminal result for {delegation_id}")
+    return {**entry, "execution_result": result}
+
+
 def enqueue_pending_outbox(
     *,
     current_boot_id: str,
@@ -1015,6 +1065,12 @@ def enqueue_pending_outbox(
             if str(delegation_id) in invalid_record_ids:
                 continue
             if not isinstance(record, dict):
+                continue
+            try:
+                canonical_terminal(registry, delegation_id)
+            except Exception:
+                logger.warning("Could not replay delegation %s; invalid canonical evidence",
+                               delegation_id, exc_info=True)
                 continue
             generation = int((record.get("attempt") or {}).get("generation") or 0)
             for event in record.get("outbox", []):

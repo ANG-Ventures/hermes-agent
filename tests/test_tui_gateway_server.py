@@ -6929,8 +6929,9 @@ def test_prompt_submit_empty_truncation_allowed_with_confirm(monkeypatch):
 @pytest.mark.parametrize("phase", ["live", "shutdown", "post_turn"])
 @pytest.mark.parametrize("refusal", ["closing", "replaced"])
 @pytest.mark.parametrize("event_type", ["async_delegation", "async_delegation_restarted"])
+@pytest.mark.parametrize("foreign_home", [False, True])
 def test_refused_completion_submission_preserves_durable_receipt(
-    monkeypatch, tmp_path, phase, refusal, event_type,
+    monkeypatch, tmp_path, phase, refusal, event_type, foreign_home,
 ):
     import queue
     from tools.process_registry import process_registry
@@ -6944,6 +6945,8 @@ def test_refused_completion_submission_preserves_durable_receipt(
     _seed_json_outbox([event], tmp_path)
     if event_type == "async_delegation":
         _persist_pending_completion(event)
+    if foreign_home:
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "foreign"))
     turns = []
     session = _session(session_key="receipt-parent", agent=_RecordingAgent(turns))
     sid = "receipt-refusal-sid"
@@ -6982,6 +6985,54 @@ def test_refused_completion_submission_preserves_durable_receipt(
         assert claim
         ad.release_event_delivery(event, claim)
     assert ad.enqueue_pending_outbox(current_boot_id="later-boot", profile_home=tmp_path) == 1
+
+
+@pytest.mark.parametrize("phase", ["live", "shutdown", "post_turn"])
+@pytest.mark.parametrize("disposition", ["delivered", "dropped"])
+def test_completion_consumer_uses_event_profile(monkeypatch, tmp_path, phase, disposition):
+    import queue
+    from tools.process_registry import process_registry
+    from tests.gateway.test_completion_delivery import (
+        _async_event, _seed_json_outbox, _json_outbox_states, _persist_pending_completion,
+    )
+    from hermes_constants import get_hermes_home, set_hermes_home_override, reset_hermes_home_override
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    producer = tmp_path / "producer"
+    monkeypatch.setenv("HERMES_HOME", str(producer))
+    event = dict(_async_event("deleg_profile"), session_key="receipt-parent")
+    _seed_json_outbox([event], producer)
+    _persist_pending_completion(event)
+    foreign = tmp_path / "foreign"
+    monkeypatch.setenv("HERMES_HOME", str(foreign))
+    _persist_pending_completion(event)
+    with ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET delivery_state=?", (disposition,))
+    turns = []
+    session = _session(session_key="receipt-parent", agent=_RecordingAgent(turns))
+    sid = "receipt-profile-sid"
+    monkeypatch.setitem(server._sessions, sid, session)
+    pending = queue.Queue()
+    pending.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", pending)
+    if phase == "post_turn":
+        session["running"] = True
+        assert server._run_prompt_submit("outer-rid", sid, session, "outer turn") is True
+        assert len(turns) == 2
+    else:
+        stop = _StopAfterOneNotificationPoll()
+        if phase == "shutdown":
+            stop._checks = 1
+        server._notification_poller_loop(stop, sid, session)
+        assert len(turns) == 1
+    assert get_hermes_home() == foreign
+    assert ad.get_durable_delegation(event["delegation_id"])["delivery_state"] == disposition
+    token = set_hermes_home_override(producer)
+    try:
+        assert ad.get_durable_delegation(event["delegation_id"])["delivery_state"] == "delivered"
+    finally:
+        reset_hermes_home_override(token)
+    assert _json_outbox_states(producer) == ["delivered"]
 
 
 class _StopAfterOneNotificationPoll:
