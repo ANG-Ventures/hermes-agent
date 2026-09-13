@@ -457,7 +457,8 @@ def test_json_receipts_run_off_the_gateway_event_loop(mode, tmp_path, monkeypatc
         events[0]["parent_session_id"] = "closed-parent"
     _seed_json_outbox(events, tmp_path)
     runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
-    monkeypatch.setattr(runner, "_classify_completion_target", AsyncMock(return_value="terminal"))
+    if mode == "terminal":
+        monkeypatch.setattr(runner, "_classify_completion_target", AsyncMock(return_value="terminal"))
     original = ad.acknowledge_outbox_event
     receipt_threads = []
 
