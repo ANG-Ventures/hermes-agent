@@ -234,6 +234,7 @@ def test_sqlite_acceptance_is_delivered_and_never_restored(monkeypatch, isolated
             row = ad.get_durable_delegation(event["delegation_id"])
             assert row is not None
             assert row["delivery_state"] == "pending"
+        _event._gateway_accepted = True
 
     adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=accept))
     runner = _runner(adapter)
