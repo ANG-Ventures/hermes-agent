@@ -256,6 +256,7 @@ async def test_cancel_does_not_release_while_service_thread_is_running(harness, 
     b = runner()
     entered = asyncio.Event()
     released = asyncio.Event()
+    work_done = asyncio.Event()
     finish = threading.Event()
     loop = asyncio.get_running_loop()
     target = h.reaper if work == "reaper" else h.dispatch
@@ -263,8 +264,11 @@ async def test_cancel_does_not_release_while_service_thread_is_running(harness, 
 
     def blocking_work(*args, **kwargs):
         loop.call_soon_threadsafe(entered.set)
-        assert finish.wait(5), "test did not release service thread"
-        return original(*args, **kwargs) if original else []
+        try:
+            assert finish.wait(5), "test did not release service thread"
+            return original(*args, **kwargs) if original else []
+        finally:
+            loop.call_soon_threadsafe(work_done.set)
 
     target.side_effect = blocking_work
     real_release = b._release_kanban_dispatcher_lock
@@ -294,6 +298,8 @@ async def test_cancel_does_not_release_while_service_thread_is_running(harness, 
         assert all(handle.closed for handle in h.handles)
     finally:
         finish.set()
+        if entered.is_set():
+            await asyncio.wait_for(work_done.wait(), 5)
         await cancel(task, b)
 
 
@@ -312,3 +318,41 @@ async def test_unavailable_lock_preserves_config_only_dispatch(harness, monkeypa
         assert "on config control alone" in caplog.text
     finally:
         await cancel(task, b)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw, expected", [
+    ("invalid", 60), (-10, 1), (1.5, 1.5), (float("nan"), 60), (float("inf"), 60),
+])
+async def test_standby_retry_interval_is_finite_and_has_a_floor(harness, monkeypatch, raw, expected):
+    h = harness
+    h.cfg["kanban"]["dispatch_interval_seconds"] = raw
+    owner, state = watchers._acquire_singleton_lock(h.path)
+    assert state == "held"
+    acquire = watchers._acquire_singleton_lock
+    attempts = 0
+
+    def bounded_acquire(path):
+        nonlocal attempts
+        attempts += 1
+        assert attempts <= 3, "busy-loop: repeated lock attempts without sleeping"
+        return acquire(path)
+
+    monkeypatch.setattr(watchers, "_acquire_singleton_lock", bounded_acquire)
+    b = runner()
+    task = asyncio.create_task(b._kanban_dispatcher_watcher())
+    try:
+        slept = 0
+        while slept < expected:
+            delay, resume = await h.clock.paused(task)
+            assert attempts == 1
+            assert 0 < delay <= 1
+            slept += delay
+            resume.set_result(None)
+        await h.clock.paused(task)
+        assert attempts == 2, "standby never retried after the bounded interval"
+        h.dispatch.assert_not_called()
+        h.reaper.assert_not_called()
+    finally:
+        await cancel(task, b)
+        watchers._release_singleton_lock(owner)

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -1667,7 +1668,7 @@ class GatewayKanbanWatchersMixin:
         try:
             await self._run_kanban_dispatcher(service)
         finally:
-            if pending is not None and not pending.done():
+            if pending is not None and (not pending.done() or pending.cancelled()):
                 pending.add_done_callback(release)
             else:
                 self._release_kanban_dispatcher_lock()
@@ -1732,6 +1733,8 @@ class GatewayKanbanWatchersMixin:
         # (shared across profiles by design), so it serialises ALL gateways.
         try:
             interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
+            if not math.isfinite(interval):
+                raise ValueError("dispatch interval must be finite")
         except (ValueError, TypeError):
             logger.warning(
                 "kanban dispatcher: invalid dispatch_interval_seconds=%r, using default 60",
