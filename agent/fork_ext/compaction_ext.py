@@ -250,6 +250,8 @@ def _format_compaction_announce(
     recovery_hint: "str | None" = None,
     in_place: bool = False,
     real_prompt_tokens: "int | None" = None,
+    wire_before: "int | None" = None,
+    wire_after: "int | None" = None,
 ) -> "str | None":
     """Build the engine-aware announce line, or ``None`` if gating says skip."""
     is_lcm = engine_name == "lcm"
@@ -327,6 +329,8 @@ def _format_compaction_announce(
         line = _format_granular_announce(
             head, stats, model_part, after_fallback, window_from, window_to,
             real_prompt_tokens=real_prompt_tokens,
+            wire_before=wire_before,
+            wire_after=wire_after,
         )
     else:
         parts = [f"{head}: {old_messages}→{new_messages} messages"]
@@ -390,17 +394,29 @@ def _counter_divergence_line(
 ) -> "str | None":
     """Render a 'the two counters disagree' line, or None when they agree.
 
-    The compaction banner reports a LOCAL ESTIMATE over messages; the runtime
-    footer reports the PROVIDER's real ``prompt_tokens``. These are different
-    counters and they can diverge substantially — a measured session showed
-    estimate 503,180 vs provider 693,766 (1.38x). With only one number visible,
-    that reads as an unexplained compaction ("the banner says ~503K but the
-    footer said 733.5k"), which is expensive to diagnose after the fact.
+    🔴 SAMPLING RULE (2026-09-12): the two inputs must describe the SAME
+    message list. They frequently do not, and the old wording turned that into
+    a false accusation against the estimator.
 
-    Only rendered past ``tolerance`` so an ordinary few-percent difference does
-    not add noise to every compaction. Direction is named explicitly, because
-    UNDER-counting is the dangerous one: it means the real prompt is larger than
-    the number the threshold gate compared against, so compaction fires LATE.
+    ``estimated_tokens`` (``stats.pre_tokens``) estimates the messages being
+    compacted. ``real_prompt_tokens`` is the provider's last full-request
+    reading, sampled mid-tool-loop — and within ONE agentic turn the context
+    GROWS with every appended tool result (measured 2026-09-12 from the
+    Blackbox ledger: 372K → 427K across four turns, 22 API calls on the
+    compaction turn). So the provider figure routinely covers MORE messages
+    than the estimate, and the gap is a sampling offset, not estimator skew.
+
+    Measured that day: banner 369K vs provider 554K rendered "local estimate
+    reads 1.50x under" — yet the estimator scores 1.03x against a real
+    tokenizer over identical wire-shaped objects, and per-class density is
+    3.48 chars/token against the 3.50 assumed. The estimator was never wrong;
+    the comparison was, and that false claim cost three rounds of
+    investigation.
+
+    Therefore this line NEVER blames the estimator. It reports the two
+    readings and names the reason they differ. Prefer the measured-before
+    renderer (``wire_mode``) instead, which matches the runtime footer; this
+    line is only a fallback for when no measured pair is available.
     """
     try:
         est = int(estimated_tokens or 0)
@@ -412,11 +428,10 @@ def _counter_divergence_line(
     ratio = real / est
     if abs(ratio - 1.0) <= tolerance:
         return None
-    direction = "under" if ratio > 1.0 else "over"
     return (
-        f"   ⚠ Counters disagree: estimate {_abbrev_tokens(est)}"
-        f" vs provider-measured {_abbrev_tokens(real)}"
-        f"   (local estimate reads {ratio:.2f}x {direction})"
+        f"   ⓘ Provider measured {_abbrev_tokens(real)} for its last request"
+        f" vs ~{_abbrev_tokens(est)} estimated for the compacted set"
+        f"   (different message sets — the turn grew between the two readings)"
     )
 
 
@@ -439,7 +454,15 @@ def _format_granular_announce(
     the divergence inline makes that class of question self-answering.
     """
     stored = basis == "stored"
-    wire_mode = bool(stored and (wire_before or 0) > 0 and (wire_after or 0) > 0)
+    # Footer parity (2026-09-12): wire_mode is the MEASURED-before renderer.
+    # It was originally reachable only on the stored basis (manual /compress),
+    # which left the automatic announce rendering an estimate headline that
+    # could silently disagree with the runtime footer Ace reads after every
+    # message. The measured-before presentation is correct on EITHER basis —
+    # it only requires that both wire numbers are present — so gate it on the
+    # data being available, not on which surface asked. `basis="live"` with no
+    # wire kwargs stays byte-identical (auto-announce back-compat).
+    wire_mode = bool((wire_before or 0) > 0 and (wire_after or 0) > 0)
     ctx_label = "Stored transcript:" if (stored and not wire_mode) else "Context:  "
     freed_verb = "reclaimed" if (stored and not wire_mode) else "freed"
     removed_hdr = "stored transcript" if stored else "live context"
