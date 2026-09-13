@@ -7260,8 +7260,9 @@ def test_notification_poller_live_loop_drops_addressed_orphan(
             isolated_queue.get_nowait()
 
 
+@pytest.mark.parametrize("foreign_caller", [False, True])
 def test_tui_drop_of_unowned_async_delegation_advances_delivery_attempts(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, foreign_caller
 ):
     """The TUI live-loop drop-path must bump delivery_attempts for an orphan
     async_delegation so the durable parking threshold is eventually reached.
@@ -7303,6 +7304,18 @@ def test_tui_drop_of_unowned_async_delegation_advances_delivery_attempts(
         "session_key": "dead-owner-session",
         "summary": "nobody home",
     }
+    if foreign_caller:
+        import sqlite3
+        from hermes_constants import get_hermes_home
+
+        foreign = tmp_path / "foreign"
+        foreign.mkdir()
+        with sqlite3.connect(ad._db_path()) as source:
+            with sqlite3.connect(foreign / "state.db") as target:
+                source.backup(target)
+        event["_registry_profile_home"] = str(tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(foreign))
+        foreign_before = ad.get_durable_delegation(did)["delivery_attempts"]
     isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
     isolated_queue.put(event)
     monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
@@ -7322,6 +7335,10 @@ def test_tui_drop_of_unowned_async_delegation_advances_delivery_attempts(
         # advanced by exactly one — so repeated boots eventually cross the
         # park gate.
         assert isolated_queue.empty()
+        if foreign_caller:
+            assert get_hermes_home() == foreign
+            assert ad.get_durable_delegation(did)["delivery_attempts"] == foreign_before
+            monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         assert (
             ad.get_durable_delegation(did)["delivery_attempts"]
             == _attempts_before + 1
@@ -7331,6 +7348,7 @@ def test_tui_drop_of_unowned_async_delegation_advances_delivery_attempts(
         process_registry._completion_consumed.discard(event["session_id"])
         while not isolated_queue.empty():
             isolated_queue.get_nowait()
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         ad._reset_for_tests()
 
 

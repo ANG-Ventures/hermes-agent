@@ -697,6 +697,14 @@ def _producer_scoped(operation):
 
 
 @_producer_scoped
+def note_event_delivery_attempt(evt: Dict[str, Any]) -> None:
+    """Count a pre-claim refusal in the producer ledger, not the consumer's."""
+    delegation_id = str(evt.get("delegation_id") or "")
+    if evt.get("type") == "async_delegation" and delegation_id:
+        _note_delivery_attempt(delegation_id)
+
+
+@_producer_scoped
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     """Claim a durable delegation event; non-durable events need no token."""
     if evt.get("type") != "async_delegation":
