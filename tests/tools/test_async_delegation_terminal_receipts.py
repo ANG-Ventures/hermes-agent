@@ -72,6 +72,225 @@ def registry_record(delegation_id):
 
 
 @pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("secondary", [False, True])
+def test_dead_producer_exhausted_mirror_recovered_by_fresh_consumer(tmp_path, batch, secondary):
+    """Two real processes: durable completed work must not become unknown."""
+    root = Path(__file__).resolve().parents[2]
+    home = tmp_path / ("profiles/secondary" if secondary else "root")
+    home.mkdir(parents=True)
+    bootstrap = '''
+import importlib.util, json, os, queue, sqlite3
+from pathlib import Path
+from pytest import MonkeyPatch
+spec = importlib.util.spec_from_file_location("receipt_tests", Path.cwd() / "tests/tools/test_async_delegation_terminal_receipts.py")
+t = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(t)
+assert Path(t.ad.__file__).resolve() == Path.cwd() / "tools/async_delegation.py"
+'''
+    producer = bootstrap + f'''
+m = MonkeyPatch()
+identifier, worker, result = t.dispatch(m, batch={batch!r})
+calls = []
+def fail(*args):
+    calls.append(1)
+    raise sqlite3.OperationalError("injected terminal mirror failure")
+m.setattr(t.ad, "_persist_completion", fail)
+worker()
+assert len(calls) == 3
+assert t.row(identifier)["state"] == "running"
+assert t.registry_record(identifier)["state"] == "done"
+print(json.dumps({{"id": identifier, "pid": os.getpid()}}))
+'''
+    env = {**os.environ, "HOME": str(tmp_path), "HERMES_HOME": str(home), "PYTHONPATH": str(root)}
+
+    def run(code):
+        proc = subprocess.run([sys.executable, "-c", code], cwd=root, env=env,
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return proc.stdout
+
+    produced = json.loads(run(producer))
+    consumer = bootstrap + f'''
+from gateway.status import _pid_exists
+identifier = {produced['id']!r}
+assert not _pid_exists({produced['pid']!r})
+t.legacy("genuinely-lost")
+q = queue.Queue()
+t.ad.restore_undelivered_completions(q)
+events = list(q.queue)
+canonical = t.ad._store.enqueue_pending_outbox(current_boot_id="fresh-consumer")
+event = next(e for e in canonical if e["delegation_id"] == identifier)
+assert event["summary"] == "receipt-nonce"
+claim = t.ad.claim_event_delivery(event, "fresh-consumer")
+assert claim, "true canonical result was made permanently unclaimable"
+assert [e["delegation_id"] for e in events if e["status"] == "unknown"] == ["genuinely-lost"]
+assert t.row(identifier)["state"] == "completed"
+t.ad.complete_event_delivery(event, claim)
+assert t.row(identifier)["delivery_state"] == "delivered"
+assert t.registry_record(identifier)["outbox"][0]["state"] == "delivered"
+q = queue.Queue()
+t.ad.restore_undelivered_completions(q)
+assert identifier not in [e["delegation_id"] for e in list(q.queue)]
+'''
+    run(consumer)
+
+
+def failed_mirror(monkeypatch, *, batch=False):
+    identifier, worker, _ = dispatch(monkeypatch, batch=batch)
+    with monkeypatch.context() as m:
+        def fail(*args):
+            raise sqlite3.OperationalError("injected mirror exhaustion")
+        m.setattr(ad, "_persist_completion", fail)
+        worker()
+    with ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET owner_pid=NULL WHERE delegation_id=?", (identifier,))
+    return identifier, process_registry.completion_queue.get_nowait()
+
+
+@pytest.mark.parametrize("lifecycle", ["held", "released", "expired", "accepted"])
+def test_canonical_claim_survives_owner_recovery(monkeypatch, lifecycle):
+    identifier, event = failed_mirror(monkeypatch)
+    claim = ad.claim_event_delivery(event, "first")
+    assert claim
+    if lifecycle == "released":
+        ad.release_event_delivery(event, claim)
+    elif lifecycle == "expired":
+        with ad._transaction() as conn:
+            conn.execute("UPDATE async_delegations SET delivery_claimed_at=?", (time.time() - 301,))
+    elif lifecycle == "accepted":
+        ad.complete_event_delivery(event, claim)
+    assert ad.recover_abandoned_delegations() == 0
+    assert row(identifier)["state"] == "completed"
+    assert json.loads(row(identifier)["event_json"])["event_id"] == event["event_id"]
+    if lifecycle in {"released", "expired"}:
+        replacement = ad.claim_event_delivery(event, "second")
+        assert replacement
+        assert not ad.complete_completion_delivery(identifier, claim)
+        ad.complete_event_delivery(event, replacement)
+    elif lifecycle == "held":
+        assert row(identifier)["delivery_claim"] == claim
+        assert ad.claim_event_delivery(event, "competitor") is None
+        ad.complete_event_delivery(event, claim)
+    assert row(identifier)["delivery_state"] == "delivered"
+
+
+@pytest.mark.parametrize("disposition", ["delivered", "dropped", "parked"])
+def test_canonical_terminal_repairs_old_receipt_identity(monkeypatch, disposition):
+    identifier, event = failed_mirror(monkeypatch)
+    old = {"type": "async_delegation", "delegation_id": identifier,
+           "status": "unknown", "completed_at": time.time() - 10}
+    ad._persist_completion(old, old)
+    claim = ad.claim_completion_delivery(identifier, "old", event=old)
+    # Claim is refused against authoritative terminal identity, even before sync.
+    assert not claim
+    with ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET delivery_state=?", (disposition,))
+    assert ad.recover_abandoned_delegations() == 0
+    assert row(identifier)["delivery_state"] == "pending"
+    current = ad.claim_event_delivery(event, "current")
+    assert current
+    ad.complete_event_delivery(event, current)
+
+
+@pytest.mark.parametrize("disposition", ["delivered", "dropped", "parked"])
+def test_canonical_sync_preserves_same_event_receipt(monkeypatch, disposition):
+    identifier, event = failed_mirror(monkeypatch)
+    claim = ad.claim_event_delivery(event, "consumer")
+    assert claim
+    with ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET state='running', delivery_state=?", (disposition,))
+    assert ad.restore_undelivered_completions(queue.Queue()) == 0
+    assert row(identifier)["state"] == "completed"
+    assert row(identifier)["delivery_state"] == disposition
+    assert ad.claim_event_delivery(event, "retry") is None
+
+
+def test_invalid_canonical_record_is_not_unknown(monkeypatch, caplog):
+    identifier, event = failed_mirror(monkeypatch)
+    path = ad._registry_path()
+    raw = path.read_text()
+    path.write_text(raw.replace("receipt-nonce", "corrupted-nonce"))
+    with pytest.raises(ad._store.RegistryError):
+        ad.restore_undelivered_completions(queue.Queue())
+    with pytest.raises(ad._store.RegistryError):
+        ad.claim_event_delivery(event, "consumer")
+    assert row(identifier)["state"] == "running"
+    assert row(identifier)["event_json"] is None
+    assert "Could not recover" in caplog.text
+    path.write_text(raw)
+    assert ad.claim_event_delivery(event, "retry")
+
+
+@pytest.mark.parametrize("disposition", ["delivered", "dropped"])
+def test_canonical_receipt_alone_repairs_pending_mirror(monkeypatch, disposition):
+    identifier, event = failed_mirror(monkeypatch)
+    ad.acknowledge_event_outbox(event, outcome=disposition)
+    assert row(identifier)["delivery_state"] == "pending"
+    assert ad.restore_undelivered_completions(queue.Queue()) == 0
+    assert row(identifier)["state"] == "completed"
+    assert row(identifier)["delivery_state"] == disposition
+    assert ad.claim_event_delivery(event, "retry") is None
+
+
+def test_fresh_legacy_claim_winning_after_select_is_preserved(monkeypatch):
+    legacy("late-claim", pid=123)
+
+    def claim_then_die(pid):
+        # Race the SQLite UPDATE directly, without waiting on the JSON lock.
+        proc = subprocess.run(
+            [sys.executable, "-c", "from tools import async_delegation as ad; "
+             "assert ad._claim_completion_delivery('late-claim', 'new-consumer')"],
+            cwd=Path(__file__).resolve().parents[2], env=os.environ.copy(),
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10,
+        )
+        assert proc.returncode == 0, proc.stderr
+        return False
+
+    monkeypatch.setattr("gateway.status._pid_exists", claim_then_die)
+    assert ad.recover_abandoned_delegations() == 0
+    assert row("late-claim")["delivery_claim"] == "new-consumer"
+    assert row("late-claim")["state"] == "running"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("attempt_generation", 9), ("event_id", "other"),
+    ("profile", "other"), ("attempt_id", "other"),
+    ("_registry_profile_home", "/unrelated/profile"),
+])
+def test_canonical_consumer_rejects_wrong_identity(monkeypatch, field, value):
+    identifier, event = failed_mirror(monkeypatch)
+    assert ad.claim_event_delivery({**event, field: value}, "wrong") is None
+    assert row(identifier)["state"] == "running"
+    assert row(identifier)["event_json"] is None
+    assert ad.claim_event_delivery(event, "right")
+
+
+@pytest.mark.parametrize("field,value", [
+    ("attempt_generation", 1), ("profile", "wrong"), ("event_id", "wrong"),
+])
+def test_valid_checksum_does_not_bless_wrong_terminal_identity(monkeypatch, field, value):
+    identifier, event = failed_mirror(monkeypatch)
+    with ad._store.locked_registry() as registry:
+        registry["records"][identifier]["outbox"][0]["payload"][field] = value
+    with pytest.raises(ad._store.RegistryError):
+        ad.restore_undelivered_completions(queue.Queue())
+    with pytest.raises(ad._store.RegistryError):
+        ad.claim_event_delivery(event, "consumer")
+    assert row(identifier)["state"] == "running"
+    assert row(identifier)["event_json"] is None
+
+
+def test_incomplete_terminal_evidence_is_not_owner_loss(monkeypatch, caplog):
+    identifier, _ = failed_mirror(monkeypatch)
+    with ad._store.locked_registry() as registry:
+        registry["records"][identifier].pop("terminal")
+    assert ad.restore_undelivered_completions(queue.Queue()) == 0
+    assert row(identifier)["state"] == "running"
+    assert row(identifier)["event_json"] is None
+    assert "lacks execution evidence" in caplog.text
+
+
+@pytest.mark.parametrize("batch", [False, True])
 @pytest.mark.parametrize("native", [False, True])
 def test_restartable_completion_synchronizes_before_receipt(monkeypatch, batch, native):
     observed = []
@@ -472,12 +691,14 @@ def test_late_old_claim_in_other_process_cannot_accept_replacement():
     assert ad.claim_event_delivery(new, "current")
 
 
-def test_owner_loss_replacement_invalidates_early_claim():
+def test_owner_loss_replacement_invalidates_expired_legacy_claim():
     legacy("early")
     early = {"type": "async_delegation", "delegation_id": "early",
              "event_id": "terminal", "attempt_generation": 0}
     claim = ad.claim_event_delivery(early, "before-mirror")
     assert claim
+    with ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET delivery_claimed_at=?", (time.time() - 301,))
     restored = queue.Queue()
     assert ad.restore_undelivered_completions(restored) == 1
     assert not ad.complete_completion_delivery("early", claim)
