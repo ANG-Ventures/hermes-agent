@@ -666,6 +666,28 @@ def test_sqlite_acceptance_is_delivered_and_never_restored(monkeypatch, isolated
     assert after_restart.empty()
 
 
+def test_sqlite_session_switch_is_dropped_not_falsely_acknowledged():
+    import time
+    from tools import async_delegation as ad
+
+    event = _distinct_async_event("deleg_closed_parent")
+    event["dispatched_at"] = time.time() - 12
+    event["completed_at"] = time.time()
+    event["parent_session_id"] = "closed-parent"
+    _persist_pending_completion(event)
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    runner._session_db = SimpleNamespace(get_session=AsyncMock(return_value={
+        "id": "closed-parent", "ended_at": time.time(), "end_reason": "session_switch",
+    }))
+    assert asyncio.run(runner._deliver_completion_notification("completion", event)) == "dropped"
+    adapter.handle_message.assert_not_awaited()
+    row = ad.get_durable_delegation(event["delegation_id"])
+    assert row is not None
+    assert row["delivery_state"] == "dropped"
+    assert ad.restore_undelivered_completions(queue.Queue()) == 0
+
+
 def test_explicit_kill_returns_output_before_consuming_notification(monkeypatch):
     import tools.process_registry as pr_module
 
