@@ -177,6 +177,76 @@ def test_canonical_invalid_execution_result_fails_visibly(monkeypatch):
     assert row(identifier)["delivery_state"] == "pending"
 
 
+@pytest.mark.parametrize("mirrored", [False, True])
+def test_invalid_canonical_record_cannot_poison_other_restores(monkeypatch, mirrored, caplog):
+    if mirrored:
+        bad, worker, _ = dispatch(monkeypatch)
+        worker()
+        bad_event = process_registry.completion_queue.get_nowait()
+    else:
+        bad, bad_event = failed_mirror(monkeypatch)
+    good, _ = failed_mirror(monkeypatch)
+    legacy("genuinely-lost")
+    path = ad._registry_path()
+    raw = json.loads(path.read_text())
+    raw["records"][bad]["outbox"][0]["payload"]["summary"] = "tampered"
+    path.write_text(json.dumps(raw))  # deliberately leave that record's checksum stale
+    q = queue.Queue()
+    ad.restore_undelivered_completions(q)
+    events = list(q.queue)
+    assert {e["delegation_id"] for e in events} == {good, "genuinely-lost"}
+    assert bad in caplog.text
+    with pytest.raises(ad._store.RegistryError):
+        ad.claim_event_delivery(bad_event, "invalid-consumer")
+    current = next(e for e in events if e["delegation_id"] == good)
+    claim = ad.claim_event_delivery(current, "healthy-consumer")
+    assert claim
+    ad.complete_event_delivery(current, claim)
+
+
+@pytest.mark.parametrize("collision", [False, True])
+def test_foreign_profile_claim_refused_without_local_canonical(monkeypatch, tmp_path, collision):
+    identifier, event = failed_mirror(monkeypatch)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "other-profile"))
+    if collision:
+        legacy(identifier)
+    assert ad.claim_event_delivery(event, "foreign-consumer") is None
+    if collision:
+        assert row(identifier)["event_json"] is None
+    else:
+        assert ad.get_durable_delegation(identifier) is None
+
+
+def test_sqlite_replay_retains_canonical_producer_binding(monkeypatch, tmp_path):
+    identifier, _ = failed_mirror(monkeypatch)
+    home = ad._registry_path().parent.parent
+    q = queue.Queue()
+    ad.restore_undelivered_completions(q)
+    sql_event = next(e for e in list(q.queue) if e["delegation_id"] == identifier)
+    assert ad.enqueue_pending_outbox(current_boot_id="binding-check", profile_home=home) == 1
+    json_event = process_registry.completion_queue.get_nowait()
+    assert sql_event.get("_registry_profile_home") == json_event["_registry_profile_home"]
+    assert sql_event["event_id"] == json_event["event_id"]
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "other-profile"))
+    ad.acknowledge_event_outbox(sql_event, outcome="delivered")
+    record = json.loads((home / "state/async-delegations.json").read_text())["records"][identifier]
+    assert record["outbox"][0]["state"] == "delivered"
+
+
+def test_valid_terminal_without_completion_envelope_is_not_ambiguous(monkeypatch):
+    identifier, _ = failed_mirror(monkeypatch)
+    with ad._store.locked_registry() as registry:
+        record = registry["records"][identifier]
+        record["state"] = "failed"
+        record["terminal"] = {"status": "interrupted", "error": "no routable target"}
+        record["outbox"] = []
+    with ad._store.locked_registry(write=False) as registry:
+        assert ad._canonical_terminal(registry, identifier) is None
+    q = queue.Queue()
+    assert ad.restore_undelivered_completions(q) == 0
+    assert q.empty()
+
+
 def failed_mirror(monkeypatch, *, batch=False):
     identifier, worker, _ = dispatch(monkeypatch, batch=batch)
     with monkeypatch.context() as m:
@@ -252,8 +322,7 @@ def test_invalid_canonical_record_is_not_unknown(monkeypatch, caplog):
     path = ad._registry_path()
     raw = path.read_text()
     path.write_text(raw.replace("receipt-nonce", "corrupted-nonce"))
-    with pytest.raises(ad._store.RegistryError):
-        ad.restore_undelivered_completions(queue.Queue())
+    assert ad.restore_undelivered_completions(queue.Queue()) == 0
     with pytest.raises(ad._store.RegistryError):
         ad.claim_event_delivery(event, "consumer")
     assert row(identifier)["state"] == "running"
@@ -314,8 +383,7 @@ def test_valid_checksum_does_not_bless_wrong_terminal_identity(monkeypatch, fiel
     identifier, event = failed_mirror(monkeypatch)
     with ad._store.locked_registry() as registry:
         registry["records"][identifier]["outbox"][0]["payload"][field] = value
-    with pytest.raises(ad._store.RegistryError):
-        ad.restore_undelivered_completions(queue.Queue())
+    assert ad.restore_undelivered_completions(queue.Queue()) == 0
     with pytest.raises(ad._store.RegistryError):
         ad.claim_event_delivery(event, "consumer")
     assert row(identifier)["state"] == "running"
