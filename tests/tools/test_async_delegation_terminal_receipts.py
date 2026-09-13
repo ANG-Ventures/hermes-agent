@@ -53,7 +53,8 @@ def dispatch(monkeypatch, *, batch=False, result=None, native=False):
         "profile": "default",
         "source": {"kind": "batch" if batch else "single", "tasks": [{"goal": "receipt"}]},
         "execution": {"model": "test-model", "provider": "test-provider"},
-        "route": {"session_key": "receipt-session", "parent_session_id": "receipt-parent"},
+        "route": {"session_key": "receipt-session", "parent_session_id": "receipt-parent",
+                  "platform": "telegram"},
     }
     kwargs: dict[str, Any] = dict(context=None, toolsets=None, role="leaf", model="test-model",
                   session_key="receipt-session", runner=lambda: result,
@@ -272,3 +273,215 @@ def test_import_provenance():
     root = Path(__file__).resolve().parents[2]
     assert Path(ad.__file__).resolve() == root / "tools" / "async_delegation.py"
     assert Path(ad._store.__file__).resolve() == root / "tools" / "async_delegation_store.py"
+
+
+@pytest.mark.parametrize("disposition", ["delivered", "dropped", "parked", "claimed"])
+@pytest.mark.parametrize("secondary", [False, True])
+def test_recovered_result_does_not_inherit_owner_loss_receipt(monkeypatch, tmp_path, disposition, secondary):
+    root_home = ad._db_path().parent
+    if secondary:
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "secondary"))
+    delegation_id, _, result = dispatch(monkeypatch)
+    if secondary:
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        token = set_hermes_home_override(root_home)
+        try:
+            legacy(delegation_id, "parked")
+        finally:
+            reset_hermes_home_override(token)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 1
+    old = restored.get_nowait()
+    old_claim = ad.claim_event_delivery(old, "owner-loss")
+    assert old_claim
+    if disposition == "delivered":
+        ad.complete_event_delivery(old, old_claim)
+    elif disposition == "dropped":
+        assert ad.drop_completion_delivery(delegation_id, old_claim)
+    elif disposition == "parked":
+        with ad._transaction() as conn:
+            conn.execute("UPDATE async_delegations SET delivery_state='parked'")
+    workers = []
+    monkeypatch.setattr(ad, "_get_executor", lambda *args: SimpleNamespace(
+        submit=lambda fn: workers.append(fn)))
+    monkeypatch.setattr(ad, "is_boot_id_alive", lambda boot: False)
+    stats = ad.recover_async_delegations(
+        current_boot_id="200:2.0", profile_home=ad._db_path().parent,
+        runner_factory=lambda record, note: lambda: result,
+    )
+    assert stats["failed_validation"] == 0
+    assert len(workers) == 1
+    workers[0]()
+    new = process_registry.completion_queue.get_nowait()
+    assert new["attempt_generation"] == 1
+    assert new["summary"] == result["summary"]
+    assert row(delegation_id)["delivery_state"] == "pending"
+    assert row(delegation_id)["delivery_attempts"] == 0
+    assert not ad.complete_completion_delivery(delegation_id, old_claim)
+    assert ad.claim_event_delivery(old, "late-owner-loss") is None
+    claim = ad.claim_event_delivery(new, "recovered-result")
+    assert claim
+    ad.complete_event_delivery(new, claim)
+    event = next(e for e in registry_record(delegation_id)["outbox"]
+                 if e["event_id"] == new["event_id"])
+    assert event["state"] == "delivered"
+    assert row(delegation_id)["delivery_state"] == "delivered"
+    if secondary:
+        monkeypatch.setenv("HERMES_HOME", str(root_home))
+        assert row(delegation_id)["delivery_state"] == "parked"
+        assert row(delegation_id)["event_json"] is None
+
+
+@pytest.mark.parametrize("generation", [0, 1])
+def test_acceptance_before_mirror_sync_binds_current_identity(monkeypatch, generation):
+    delegation_id, worker, _ = dispatch(monkeypatch)
+    persist = ad._persist_completion
+    accepted = []
+
+    def accept_before_sync(event, result):
+        # The canonical outbox is already durable and can be replayed here.
+        claim = ad.claim_event_delivery(event, "early-consumer")
+        assert claim
+        ad.complete_event_delivery(event, claim)
+        accepted.append(dict(event))
+        persist(event, result)
+
+    if generation:
+        workers = []
+        monkeypatch.setattr(ad, "_get_executor", lambda *args: SimpleNamespace(
+            submit=lambda fn: workers.append(fn)))
+        monkeypatch.setattr(ad, "is_boot_id_alive", lambda boot: False)
+        stats = ad.recover_async_delegations(
+            current_boot_id="200:2.0", profile_home=ad._db_path().parent,
+            runner_factory=lambda record, note: lambda: {"summary": "recovered"},
+        )
+        assert stats["failed_validation"] == 0
+        worker = workers.pop()
+    monkeypatch.setattr(ad, "_persist_completion", accept_before_sync)
+    worker()
+    assert len(accepted) == 1
+    assert accepted[0]["attempt_generation"] == generation
+    assert row(delegation_id)["delivery_state"] == "delivered"
+    assert json.loads(row(delegation_id)["event_json"])["event_id"] == accepted[0]["event_id"]
+
+
+@pytest.mark.parametrize("generation", [0, 1])
+@pytest.mark.parametrize("disposition", ["delivered", "dropped", "parked", "claimed"])
+def test_event_replacement_invalidates_only_old_receipt(generation, disposition):
+    legacy("replace")
+    old = {"type": "async_delegation", "delegation_id": "replace",
+           "event_id": "old", "attempt_generation": generation}
+    new = {**old, "event_id": "new"}
+    ad._persist_completion(old, {})
+    old_claim = ad.claim_event_delivery(old, "old")
+    assert old_claim
+    if disposition == "delivered":
+        assert ad.complete_completion_delivery("replace", old_claim)
+    elif disposition == "dropped":
+        assert ad.drop_completion_delivery("replace", old_claim)
+    elif disposition == "parked":
+        with ad._transaction() as conn:
+            conn.execute("UPDATE async_delegations SET delivery_state='parked'")
+    ad._persist_completion(old, {})
+    assert row("replace")["delivery_state"] == (
+        "pending" if disposition == "claimed" else disposition
+    )
+    if disposition == "claimed":
+        assert row("replace")["delivery_claim"] == old_claim
+    ad._persist_completion(new, {})
+    assert row("replace")["delivery_state"] == "pending"
+    assert row("replace")["delivery_claim"] is None
+    assert row("replace")["delivered_at"] is None
+    assert not ad.complete_completion_delivery("replace", old_claim)
+    assert not ad.release_completion_delivery("replace", old_claim)
+    assert not ad.drop_completion_delivery("replace", old_claim)
+    assert ad.claim_event_delivery(old, "late-old") is None
+    current = ad.claim_event_delivery(new, "new")
+    assert current
+    ad._persist_completion(new, {})
+    assert row("replace")["delivery_claim"] == current
+    assert ad.complete_completion_delivery("replace", current)
+    ad._persist_completion(new, {})
+    assert row("replace")["delivery_state"] == "delivered"
+
+
+def test_legacy_identity_survives_restore_but_not_new_result():
+    legacy("legacy")
+    old = {"type": "async_delegation", "delegation_id": "legacy",
+           "status": "unknown", "completed_at": time.time()}
+    ad._persist_completion(old, {})
+    claim = ad.claim_event_delivery({**old, "restored": True}, "restored")
+    assert claim
+    assert ad.complete_completion_delivery("legacy", claim)
+    ad._persist_completion(old, {})
+    assert row("legacy")["delivery_state"] == "delivered"
+    new = {**old, "status": "completed", "completed_at": old["completed_at"] + 1}
+    ad._persist_completion(new, {})
+    assert row("legacy")["delivery_state"] == "pending"
+    assert ad.claim_event_delivery(old, "stale") is None
+    assert ad.claim_event_delivery(new, "actual")
+
+
+def test_missing_identity_cannot_transfer_legacy_receipt_to_outbox():
+    legacy("legacy", "delivered")
+    event = {"type": "async_delegation", "delegation_id": "legacy",
+             "event_id": "first-known-event", "attempt_generation": 0}
+    ad._persist_completion(event, {})
+    assert row("legacy")["delivery_state"] == "pending"
+    assert ad.claim_event_delivery(event, "new")
+
+
+def test_same_event_id_different_attempt_has_no_receipt():
+    legacy("attempt")
+    old = {"type": "async_delegation", "delegation_id": "attempt",
+           "event_id": "event", "attempt_generation": 0}
+    new = {**old, "attempt_generation": 1}
+    ad._persist_completion(old, {})
+    claim = ad.claim_event_delivery(old, "old")
+    assert claim
+    assert ad.complete_completion_delivery("attempt", claim)
+    ad._persist_completion(new, {})
+    assert row("attempt")["delivery_state"] == "pending"
+    assert ad.claim_event_delivery(old, "old") is None
+    assert ad.claim_event_delivery(new, "new")
+
+
+def test_late_old_claim_in_other_process_cannot_accept_replacement():
+    legacy("cross-process")
+    old = {"type": "async_delegation", "delegation_id": "cross-process",
+           "event_id": "old", "attempt_generation": 0}
+    new = {**old, "event_id": "new", "attempt_generation": 1}
+    ad._persist_completion(old, {})
+    claim = ad.claim_event_delivery(old, "old")
+    assert claim
+    ad._persist_completion(new, {})
+    completed = subprocess.run(
+        [sys.executable, "-c",
+         "import json,sys; from tools import async_delegation as ad; "
+         "evt=json.loads(sys.argv[1]); "
+         "assert not ad.complete_completion_delivery(evt['delegation_id'],sys.argv[2]); "
+         "assert ad.claim_event_delivery(evt,'late') is None",
+         json.dumps(old), claim],
+        cwd=Path(__file__).resolve().parents[2],
+        env={**os.environ, "HERMES_HOME": str(ad._db_path().parent)},
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert row("cross-process")["delivery_state"] == "pending"
+    assert ad.claim_event_delivery(new, "current")
+
+
+def test_owner_loss_replacement_invalidates_early_claim():
+    legacy("early")
+    early = {"type": "async_delegation", "delegation_id": "early",
+             "event_id": "terminal", "attempt_generation": 0}
+    claim = ad.claim_event_delivery(early, "before-mirror")
+    assert claim
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 1
+    assert not ad.complete_completion_delivery("early", claim)
+    assert ad.claim_event_delivery(early, "late") is None
+    unknown = restored.get_nowait()
+    assert unknown["status"] == "unknown"
+    assert ad.claim_event_delivery(unknown, "recovery")

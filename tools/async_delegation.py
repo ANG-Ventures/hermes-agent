@@ -354,11 +354,51 @@ def _prune_durable_records() -> None:
             )
 
 
+def _same_completion_event(persisted: Optional[Dict[str, Any]], event: Dict[str, Any]) -> bool:
+    """Receipts belong to an event, not to every result of a delegation."""
+    previous = persisted or {}
+    if previous.get("event_id") or event.get("event_id"):
+        return (
+            bool(previous.get("event_id"))
+            and (
+                (type(previous.get("attempt_generation")) is int
+                 and type(event.get("attempt_generation")) is int)
+                or ("attempt_generation" not in previous
+                    and "attempt_generation" not in event)
+            )
+            and all(previous.get(key) == event.get(key) for key in (
+                "event_id", "attempt_generation", "delegation_id", "type",
+            ))
+        )
+    # Pre-outbox dispatches had no identity until terminal persistence. Keep
+    # their historical receipt behavior, but distinguish recorded legacy
+    # owner-loss notices from later results. Ignore replay-only annotations.
+    return persisted is None or all(previous.get(key) == event.get(key) for key in (
+        "delegation_id", "type", "status", "completed_at",
+    ))
+
+
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
-    # Execution and delivery are independent: an outbox consumer may already
-    # have accepted this result before the legacy mirror is synchronized.
+    # An outbox consumer may accept THIS event before mirror synchronization.
+    # Serializing identity replacement with claims prevents a late old token
+    # from acknowledging the new result (including across processes).
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT event_json FROM async_delegations WHERE delegation_id=?",
+            (event["delegation_id"],),
+        ).fetchone()
+        if row is None:
+            return
+        if not _same_completion_event(json.loads(row[0] or "null"), event):
+            conn.execute(
+                """UPDATE async_delegations SET delivery_state='pending',
+                   delivery_attempts=0, delivered_at=NULL,
+                   delivery_claim=NULL, delivery_claimed_at=NULL
+                   WHERE delegation_id=?""",
+                (event["delegation_id"],),
+            )
         conn.execute(
             """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
                event_json=?, result_json=?
@@ -428,7 +468,8 @@ def recover_abandoned_delegations() -> int:
             # Never replace that result or turn its terminal receipt pending.
             cur = conn.execute(
                 """UPDATE async_delegations SET state='unknown', completed_at=?,
-                   updated_at=?, event_json=?, result_json=?, delivery_state='pending'
+                   updated_at=?, event_json=?, result_json=?, delivery_state='pending',
+                   delivery_claim=NULL, delivery_claimed_at=NULL
                    WHERE delegation_id=? AND state IN ('running','finalizing')
                      AND delivery_state='pending'""",
                 (now, now, json.dumps(event), json.dumps(result), delegation_id),
@@ -507,16 +548,22 @@ def restore_undelivered_completions(target_queue) -> int:
     return restored
 
 
-def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+def claim_completion_delivery(
+    delegation_id: str, claim_id: str, *, event: Optional[Dict[str, Any]] = None,
+) -> bool:
     """Claim one pending completion across competing consumers/processes."""
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
+            "SELECT delivery_state, event_json FROM async_delegations WHERE delegation_id=?",
             (delegation_id,),
         ).fetchone()
         if row is None:
             return True  # legacy event created before durable dispatch
+        if event is not None and row[1] is not None:
+            if not _same_completion_event(json.loads(row[1]), event):
+                return False
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_claim=?, delivery_claimed_at=?,
                       delivery_attempts=delivery_attempts+1, updated_at=?
@@ -524,6 +571,13 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
             (claim_id, now, now, delegation_id, now - 300),
         )
+        if cur.rowcount == 1 and event is not None and row[1] is None:
+            # Canonical publication can win before the terminal mirror write.
+            # Bind the claim now so later synchronization recognizes its receipt.
+            conn.execute(
+                "UPDATE async_delegations SET event_json=? WHERE delegation_id=?",
+                (json.dumps(event), delegation_id),
+            )
         return cur.rowcount == 1
 
 
@@ -535,7 +589,7 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     if not delegation_id:
         return ""
     claim_id = f"{consumer}:{__import__('os').getpid()}:{uuid.uuid4().hex}"
-    if claim_completion_delivery(delegation_id, claim_id):
+    if claim_completion_delivery(delegation_id, claim_id, event=evt):
         return claim_id
     _reconcile_terminal_event_receipt(evt)
     return None
