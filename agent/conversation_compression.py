@@ -5557,6 +5557,21 @@ def compress_context(
                     stats=_inturn_stats,
                     in_place=in_place,
                     real_prompt_tokens=_real_prompt_tokens_pre or None,
+                    # Footer parity (2026-09-12). `_real_prompt_tokens_pre` is
+                    # the SAME basis the runtime footer renders: the provider's
+                    # last full-request reading
+                    # (gateway/run.py:25414 footer <- agent_result
+                    # ["last_prompt_tokens"] <- context_compressor
+                    # .last_prompt_tokens, persisted to
+                    # session_entry.last_prompt_tokens at run.py:25744 — which
+                    # is what manual /compress already passes as wire_before).
+                    # Passing it as wire_before/wire_after routes the auto
+                    # announce through the SAME measured-before renderer the
+                    # manual path uses, so the banner's headline agrees with
+                    # the number Ace sees after every message instead of
+                    # reporting an estimate that silently disagrees with it.
+                    wire_before=_real_prompt_tokens_pre or None,
+                    wire_after=_compressed_est or None,
                 )
         except Exception:
             logger.debug("compaction announce skipped (non-fatal)", exc_info=True)
