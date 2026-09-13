@@ -541,7 +541,43 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     if not delegation_id:
         return ""
     claim_id = f"{consumer}:{__import__('os').getpid()}:{uuid.uuid4().hex}"
-    return claim_id if claim_completion_delivery(delegation_id, claim_id) else None
+    if claim_completion_delivery(delegation_id, claim_id):
+        return claim_id
+    _reconcile_terminal_event_receipt(evt)
+    return None
+
+
+def _reconcile_terminal_event_receipt(evt: Dict[str, Any]) -> None:
+    """Repair JSON only from an unambiguous same-event SQLite terminal receipt.
+
+    A live claim, parked row or legacy payload without generation evidence is
+    not proof of acceptance. Leave the outbox pending in all ambiguous cases.
+    """
+    event_id = evt.get("event_id")
+    generation = evt.get("attempt_generation")
+    if not event_id or type(generation) is not int or generation < 1:
+        return
+    try:
+        with _DB_LOCK, _transaction() as conn:
+            row = conn.execute(
+                "SELECT delivery_state, event_json FROM async_delegations WHERE delegation_id=?",
+                (evt.get("delegation_id"),),
+            ).fetchone()
+        if row is None or row[0] not in {"delivered", "dropped"}:
+            return
+        persisted = json.loads(row[1] or "null")
+        if not isinstance(persisted, dict):
+            return
+        if any(persisted.get(key) != evt.get(key) for key in (
+            "event_id", "attempt_generation", "delegation_id", "type",
+        )) or type(persisted.get("attempt_generation")) is not int:
+            return
+        acknowledge_event_outbox(
+            evt, outcome=row[0],
+            reason="matching_sqlite_terminal_receipt" if row[0] == "dropped" else None,
+        )
+    except Exception:
+        logger.warning("Could not reconcile completion receipt for %s", event_id, exc_info=True)
 
 
 def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -648,6 +684,26 @@ def complete_event_delivery(evt: Dict[str, Any], claim_id: Optional[str]) -> Non
         # A JSON storage failure must not skip the independent legacy receipt.
         if claim_id and evt.get("type") == "async_delegation":
             complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+
+
+def complete_event_delivery_with_retry(evt: Dict[str, Any], claim_id: Optional[str]) -> bool:
+    """Retry only receipts, never an already accepted submission.
+
+    Persistent storage failure retains the at-least-once crash limitation.
+    """
+    for attempt in range(3):
+        try:
+            complete_event_delivery(evt, claim_id)
+            return True
+        except Exception:
+            logger.warning(
+                "Completion receipt failed (attempt %d/3, event=%s)",
+                attempt + 1, evt.get("event_id") or evt.get("delegation_id"),
+                exc_info=True,
+            )
+            if attempt < 2:
+                time.sleep(0.05 * (attempt + 1))
+    return False
 
 
 def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
