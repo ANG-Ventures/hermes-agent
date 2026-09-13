@@ -187,16 +187,18 @@ def _load(path: Path, *, allow_invalid_records: bool = False) -> dict[str, Any]:
         # Sparse historical terminal outboxes may lack an embedded self ID;
         # active records and any explicitly supplied self ID must match the key.
         outbox = record.get("outbox", [])
+        state = record.get("state", "")
+        invalid_state = not isinstance(state, str)
         invalid_identity = (
-            (record.get("state") in {"running", "recoverable"}
+            ((not invalid_state and state in {"running", "recoverable"})
              or "delegation_id" in record)
             and record.get("delegation_id") != delegation_id
         )
         invalid_outbox = (not isinstance(outbox, list)
                           or any(not isinstance(event, dict) for event in outbox))
-        if invalid_identity or invalid_outbox:
+        if invalid_state or invalid_identity or invalid_outbox:
             if not allow_invalid_records:
-                raise RegistryError(f"record {delegation_id} has invalid identity/outbox structure")
+                raise RegistryError(f"record {delegation_id} has invalid state/identity/outbox structure")
             invalid_record_ids.append(str(delegation_id))
             logger.error("async_delegation_registry_invalid delegation_id=%s reason=structure",
                          delegation_id)

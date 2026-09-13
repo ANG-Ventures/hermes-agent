@@ -74,3 +74,50 @@ def test_bad_active_record_is_quarantined_before_recovery_and_replay(
         assert after == before  # Quarantine does not repair or reseal the bad record.
     finally:
         ad._reset_for_tests()
+
+
+@pytest.mark.parametrize("state", [[], {}, None, 1])
+@pytest.mark.parametrize("valid_checksum", [False, True])
+def test_malformed_state_does_not_block_healthy_replay(
+    monkeypatch, tmp_path, state, valid_checksum
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        bad, worker, _ = helpers.dispatch(monkeypatch)
+        worker()
+        good, worker, _ = helpers.dispatch(monkeypatch)
+        worker()
+        for _ in range(2):
+            helpers.process_registry.completion_queue.get_nowait()
+        path = store.registry_path()
+        registry = json.loads(path.read_text())
+        damaged = registry["records"][bad]
+        damaged["state"] = state
+        if valid_checksum:
+            damaged["integrity"] = store._record_checksum(damaged)
+        path.write_text(json.dumps(registry))
+
+        assert ad.enqueue_pending_outbox(current_boot_id="state-replay") == 1
+        events = list(helpers.process_registry.completion_queue.queue)
+        assert [event["delegation_id"] for event in events] == [good]
+        claimed, summary = store.claim_recoveries(
+            current_boot_id="200:2", resume_enabled=True, owner_alive=lambda _: False
+        )
+        assert claimed == []
+        assert summary["failed_validation"] == 1
+        restored = queue.Queue()
+        assert ad.restore_undelivered_completions(restored) == 1
+        assert [event["delegation_id"] for event in restored.queue] == [good]
+        claim = ad.claim_event_delivery(events[0], "state-consumer")
+        assert claim
+        ad.complete_event_delivery(events[0], claim)
+        assert helpers.row(good)["delivery_state"] == "delivered"
+        assert ad.enqueue_pending_outbox(current_boot_id="next-boot") == 0
+        assert ad.restore_undelivered_completions(queue.Queue()) == 0
+        assert json.loads(path.read_text())["records"][bad] == damaged
+        with pytest.raises(store.RegistryError):
+            store.read_registry()
+    finally:
+        ad._reset_for_tests()
