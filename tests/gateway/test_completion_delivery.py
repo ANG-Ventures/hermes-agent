@@ -302,22 +302,24 @@ def test_completion_dedup_keeps_profiles_and_generations_distinct(tmp_path):
 
 
 @pytest.mark.parametrize("consumer", ["gateway", "cli-tui"])
-@pytest.mark.parametrize("state", ["held", "delivered", "dropped", "parked", "old-generation", "missing-generation", "other-event"])
-def test_false_claim_reconciles_only_matching_terminal_receipt(tmp_path, state, consumer):
+@pytest.mark.parametrize("generation", [0, 1])
+@pytest.mark.parametrize("state", ["held", "delivered", "dropped", "parked", "other-generation", "missing-generation", "other-event"])
+def test_false_claim_reconciles_only_matching_terminal_receipt(tmp_path, state, consumer, generation):
     from tools import async_delegation as ad
 
-    event = _async_event()
+    event = dict(_async_event(), attempt_generation=generation,
+                 event_id=f"deleg_duplicate:terminal:g{generation}")
     _seed_json_outbox([event], tmp_path)
     persisted = dict(event)
-    if state == "old-generation":
-        persisted["attempt_generation"] = 0
+    if state == "other-generation":
+        persisted["attempt_generation"] = 1 - generation
     if state == "missing-generation":
         persisted.pop("attempt_generation")
     if state == "other-event":
         persisted["event_id"] = "another-event"
     _persist_pending_completion(persisted)
     claim = ad.claim_event_delivery(persisted, "first-holder")
-    if state in {"delivered", "old-generation", "missing-generation", "other-event"}:
+    if state in {"delivered", "other-generation", "missing-generation", "other-event"}:
         assert ad.complete_completion_delivery(event["delegation_id"], claim)
     elif state == "dropped":
         assert ad.drop_completion_delivery(event["delegation_id"], claim)

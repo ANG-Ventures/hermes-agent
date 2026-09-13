@@ -555,7 +555,7 @@ def _reconcile_terminal_event_receipt(evt: Dict[str, Any]) -> None:
     """
     event_id = evt.get("event_id")
     generation = evt.get("attempt_generation")
-    if not event_id or type(generation) is not int or generation < 1:
+    if not event_id or type(generation) is not int or generation < 0:
         return
     try:
         with _DB_LOCK, _transaction() as conn:
