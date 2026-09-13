@@ -408,11 +408,19 @@ def _sync_completion(conn, event, result, disposition=None):
                WHERE delegation_id=?""",
             (event["delegation_id"],),
         )
+    # Same contract as the canonical archive: the mirror stores the exact
+    # result or none at all. json.dumps would otherwise persist a silently
+    # transformed object that later reads back as the original result.
+    archived = _store.exact_json_archive(result)
+    if archived is None and result is not None:
+        logger.warning("Async delegation %s: durable result mirror unavailable",
+                       event["delegation_id"])
     conn.execute(
         """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
            event_json=?, result_json=? WHERE delegation_id=?""",
         (event.get("status", "completed"), event.get("completed_at", now), now,
-         json.dumps(event), json.dumps(result), event["delegation_id"]),
+         json.dumps(event), json.dumps(archived) if archived is not None else None,
+         event["delegation_id"]),
     )
     if disposition in {"delivered", "dropped", "parked"}:
         conn.execute(

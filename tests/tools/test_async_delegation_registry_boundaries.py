@@ -121,3 +121,68 @@ def test_malformed_state_does_not_block_healthy_replay(
             store.read_registry()
     finally:
         ad._reset_for_tests()
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        pytest.param({1: "a"}, id="int-keys-become-strings"),
+        pytest.param(("a", "b"), id="tuples-become-lists"),
+        pytest.param({1: "int", "1": "str"}, id="colliding-keys-discard-a-value"),
+        pytest.param(float("nan"), id="non-finite-floats"),
+    ],
+)
+def test_inexact_archive_is_unavailable_not_silently_transformed(
+    monkeypatch, tmp_path, extra
+):
+    """An archive that would not round-trip exactly must be omitted.
+
+    The declared contract is: the optional raw archive holds the EXACT
+    JSON-safe execution result, or it is unavailable. A JSON round trip
+    silently rewrites int keys to strings, tuples to lists, and can drop a
+    value outright on key collision -- returning that transformed object as
+    the original result would be a wrong answer, not a lossy convenience.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        result = {"status": "completed", "summary": "inexact-archive", "extra": extra}
+        delegation_id, worker, _ = helpers.dispatch(monkeypatch, result=result)
+        worker()
+        stored = ad.get_durable_delegation(delegation_id)
+        # The flattened delivery answer still survives ...
+        assert stored["state"] == "completed"
+        event = helpers.process_registry.completion_queue.get_nowait()
+        assert event["summary"] == "inexact-archive"
+        # ... and the raw archive is absent rather than silently rewritten,
+        # on BOTH durable paths (canonical registry and the SQLite mirror).
+        with store.locked_registry() as registry:
+            terminal = registry["records"][delegation_id]["terminal"]
+        assert "result" not in terminal
+        assert stored["result"] is None
+    finally:
+        ad._reset_for_tests()
+
+
+def test_exact_json_native_archive_is_still_retained(monkeypatch, tmp_path):
+    """The guard must not throw away results that DO round-trip exactly."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        result = {
+            "status": "completed",
+            "summary": "exact-archive",
+            "structured_output": {"rows": [1, 2.5, None, True], "nested": {"k": "v"}},
+        }
+        delegation_id, worker, _ = helpers.dispatch(monkeypatch, result=result)
+        worker()
+        with store.locked_registry() as registry:
+            terminal = registry["records"][delegation_id]["terminal"]
+        assert terminal["result"] == result
+        assert terminal["result"]["structured_output"] == result["structured_output"]
+        # The mirror keeps the exact same value, not a lossy projection.
+        assert ad.get_durable_delegation(delegation_id)["result"] == result
+    finally:
+        ad._reset_for_tests()

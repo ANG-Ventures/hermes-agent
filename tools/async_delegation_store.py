@@ -603,12 +603,10 @@ def append_terminal(
         payload["event_id"] = event_id
         # The full runner result is optional archival data, not the delivery
         # envelope. Unsupported extras must not discard a valid flattened answer.
-        try:
-            archived_result = json.loads(json.dumps(result, allow_nan=False))
-        except (TypeError, ValueError, RecursionError):
-            archived_result = None
+        archived_result = exact_json_archive(result)
+        if archived_result is None and result is not None:
             logger.warning("Async delegation %s: optional result archive unavailable",
-                           delegation_id, exc_info=True)
+                           delegation_id)
         record["state"] = terminal_state
         record["terminal"] = {
             "status": status,
@@ -1026,6 +1024,22 @@ def claim_recoveries(
                 attempt["redispatch_count"],
             )
     return claimed, summary
+
+
+def exact_json_archive(result: Any) -> Any | None:
+    """Return ``result`` only if JSON preserves it EXACTLY, else ``None``.
+
+    A round trip succeeds while silently rewriting non-JSON-native shapes:
+    int keys become strings, tuples become lists, and a ``{1: ..., "1": ...}``
+    collision discards a value outright. Presenting that transformed object as
+    the original execution result is a wrong answer, so the archive is exact or
+    it is unavailable.
+    """
+    try:
+        archived = json.loads(json.dumps(result, allow_nan=False))
+    except (TypeError, ValueError, RecursionError):
+        return None
+    return archived if archived == result else None
 
 
 def canonical_terminal(registry, delegation_id):
