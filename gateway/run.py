@@ -9418,7 +9418,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # credential cache too. Absence of a pin is NOT an instruction to clear.
         store = getattr(self, "session_store", None)
         if lookup.state == "absent" and getattr(type(store), "get_chat_model_pin", None):
-            present, pin = store.get_chat_model_pin(session_key)
+            try:
+                present, pin = store.get_chat_model_pin(session_key)
+            except Exception:
+                # Read failures can carry credential-bearing paths or URLs.
+                logger.warning("Chat model pin reconciliation unavailable")
+                return PersistedSessionRouteLookup("unavailable")
             if present and pin is None:
                 # NOTE(P3b/RC-2): cache reconciliation only; the durable user
                 # action already happened in the chat preference store.

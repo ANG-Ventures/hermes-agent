@@ -293,7 +293,8 @@ class GatewaySlashCommandsMixin:
         # lightweight stores without that capability use the returned entry.
         # No user-action setter is called, so this cannot announce a switch.
         identity = getattr(entry, "model_override_identity", None) if entry else None
-        if callable(getattr(type(self.session_store), "lookup_persisted_route_identity", None)):
+        store = getattr(self, "session_store", None)
+        if callable(getattr(type(store), "lookup_persisted_route_identity", None)):
             route_lookup = self._persisted_session_route_identity(session_key)
             identity = route_lookup.identity
             if route_lookup.state == "unavailable":

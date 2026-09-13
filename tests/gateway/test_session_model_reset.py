@@ -465,9 +465,9 @@ async def test_new_command_only_rotates_own_session_preferences():
 
 
 @pytest.mark.parametrize("command", ["/new", "/reset"])
-@pytest.mark.parametrize("route", ["pin", "clear", "absent", "legacy", "unavailable", "credentials-unavailable"])
+@pytest.mark.parametrize("route", ["pin", "clear", "absent", "legacy", "unavailable", "credentials-unavailable", "reconciliation-unavailable"])
 @pytest.mark.asyncio
-async def test_reset_banner_matches_durable_chat_route(tmp_path, monkeypatch, command, route):
+async def test_reset_banner_matches_durable_chat_route(tmp_path, monkeypatch, caplog, command, route):
     import agent.model_metadata as model_metadata
     import gateway.run as gateway_run
     from gateway.chat_model_pins import ChatModelPins
@@ -497,6 +497,17 @@ async def test_reset_banner_matches_durable_chat_route(tmp_path, monkeypatch, co
             raise OSError("read unavailable")
 
         monkeypatch.setattr(ChatModelPins, "get", unavailable)
+    pin_reads = []
+    if route == "reconciliation-unavailable":
+        real_get_pin = runner.session_store.get_chat_model_pin
+
+        def alternating_pin_read(session_key):
+            pin_reads.append(session_key)
+            if len(pin_reads) % 2 == 0:
+                raise OSError("pin-read-secret")
+            return real_get_pin(session_key)
+
+        monkeypatch.setattr(runner.session_store, "get_chat_model_pin", alternating_pin_read)
     if route == "credentials-unavailable":
         runner._reresolve_model_override_credentials = lambda identity: None
     config = {"model": {"default": "global-model", "provider": "openrouter", "context_length": 100_000}}
@@ -521,7 +532,7 @@ async def test_reset_banner_matches_durable_chat_route(tmp_path, monkeypatch, co
         assert fresh.session_id != old.session_id
         if route not in {"legacy", "clear"}:
             assert fresh.model_override_identity is None
-        if route in {"unavailable", "credentials-unavailable"}:
+        if route in {"unavailable", "credentials-unavailable", "reconciliation-unavailable"}:
             assert "◆ Model:" not in notice
             assert "unavailable" in notice.lower()
             with pytest.raises(gateway_run.SessionRouteUnavailableError):
@@ -534,6 +545,7 @@ async def test_reset_banner_matches_durable_chat_route(tmp_path, monkeypatch, co
                 assert model == "pinned-model"
                 assert "◆ Context: 400K tokens" in notice
                 assert "model and reasoning" in notice
+                assert len(probes) == 1
                 assert probes[0][2] is None
             else:
                 assert model == "global-model"
@@ -541,6 +553,13 @@ async def test_reset_banner_matches_durable_chat_route(tmp_path, monkeypatch, co
             assert "◆ Reasoning: high" in notice
             assert "Preserved explicit" in notice
             assert "reasoning preferences" in notice
+        if route == "reconciliation-unavailable":
+            assert len(pin_reads) >= 2
+            assert not probes
+            assert "global-model" not in notice
+            assert "Chat model pin reconciliation unavailable" in caplog.text
+            assert "pin-read-secret" not in caplog.text
+            assert "pin-read-secret" not in notice
         assert "test-only" not in notice
         assert "fresh-key" not in notice
         if route == "pin":
