@@ -151,11 +151,12 @@ def test_json_outbox_temporary_failure_remains_retryable(tmp_path):
     assert _json_outbox_states(tmp_path) == ["delivered"]
 
 
+@pytest.mark.parametrize("event_type", ["async_delegation", "async_delegation_restarted"])
 @pytest.mark.parametrize("gone_parent", [False, True])
-def test_json_outbox_terminal_drop_does_not_replay(tmp_path, monkeypatch, gone_parent):
+def test_json_outbox_drop_requires_proven_terminal_target(tmp_path, monkeypatch, gone_parent, event_type):
     from tools import async_delegation as ad
 
-    event = _async_event()
+    event = dict(_async_event(), type=event_type)
     if gone_parent:
         event["parent_session_id"] = "closed-parent"
     else:
@@ -166,8 +167,100 @@ def test_json_outbox_terminal_drop_does_not_replay(tmp_path, monkeypatch, gone_p
     monkeypatch.setattr(runner, "_classify_completion_target", AsyncMock(return_value="terminal"))
     assert asyncio.run(runner._deliver_completion_notification("finished", event)) == "dropped"
     adapter.handle_message.assert_not_awaited()
-    assert _json_outbox_states(tmp_path) == ["dropped"]
-    assert ad.enqueue_pending_outbox(current_boot_id="next-boot", profile_home=tmp_path) == 0
+    assert _json_outbox_states(tmp_path) == ["dropped" if gone_parent else "pending"]
+    # This consumer lacking a route is not proof no future consumer can deliver.
+    assert ad.enqueue_pending_outbox(
+        current_boot_id="next-boot", profile_home=tmp_path,
+    ) == (0 if gone_parent else 1)
+
+
+def test_json_outbox_transient_pinned_lookup_failure_retries(tmp_path, monkeypatch):
+    event = dict(_async_event(), parent_session_id="parent")
+    _seed_json_outbox([event], tmp_path)
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    live = {"ended_at": None}
+    runner._session_db = SimpleNamespace(
+        get_session=AsyncMock(side_effect=[live, RuntimeError("db unavailable"), live, live]),
+        get_compression_tip=AsyncMock(return_value="parent"),
+    )
+    monkeypatch.setattr(runner, "_async_session_store", SimpleNamespace(
+        get_or_create_session=AsyncMock(return_value=SimpleNamespace(session_id="other")),
+    ), raising=False)
+    assert asyncio.run(runner._deliver_completion_notification("done", event)) == "temporary"
+    adapter.handle_message.assert_not_awaited()
+    assert _json_outbox_states(tmp_path) == ["pending"]
+    assert asyncio.run(runner._deliver_completion_notification("done", event)) == "delivered"
+    adapter.handle_message.assert_awaited_once()
+    assert _json_outbox_states(tmp_path) == ["delivered"]
+
+
+def test_json_receipt_failure_does_not_skip_legacy_sqlite_ack(tmp_path, monkeypatch):
+    from tools import async_delegation as ad
+
+    event = _async_event()
+    _seed_json_outbox([event], tmp_path)
+    _persist_pending_completion(event)
+    claim = ad.claim_event_delivery(event, "test-consumer")
+
+    def unavailable(*args, **kwargs):
+        raise OSError("JSON store unavailable")
+
+    monkeypatch.setattr(ad, "acknowledge_outbox_event", unavailable)
+    with pytest.raises(OSError, match="JSON store unavailable"):
+        ad.complete_event_delivery(event, claim)
+    assert ad.get_durable_delegation(event["delegation_id"])["delivery_state"] == "delivered"
+    assert _json_outbox_states(tmp_path) == ["pending"]
+
+
+def test_terminal_receipt_failure_is_retryable_without_losing_sqlite_claim(tmp_path, monkeypatch):
+    from tools import async_delegation as ad
+
+    event = dict(_async_event(), parent_session_id="closed-parent")
+    _seed_json_outbox([event], tmp_path)
+    _persist_pending_completion(event)
+    runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
+    monkeypatch.setattr(runner, "_classify_completion_target", AsyncMock(return_value="terminal"))
+
+    def unavailable(*args, **kwargs):
+        raise OSError("JSON store unavailable")
+
+    monkeypatch.setattr(ad, "acknowledge_outbox_event", unavailable)
+    assert asyncio.run(runner._deliver_completion_notification("done", event)) is False
+    assert _json_outbox_states(tmp_path) == ["pending"]
+    assert ad.get_durable_delegation(event["delegation_id"])["delivery_state"] == "pending"
+    assert ad.claim_completion_delivery(event["delegation_id"], "next-attempt")
+
+
+@pytest.mark.parametrize("mode", ["single", "coalesced", "terminal"])
+def test_json_receipts_run_off_the_gateway_event_loop(mode, tmp_path, monkeypatch):
+    import threading
+    from tools import async_delegation as ad
+
+    events = [_async_event("deleg_primary")]
+    if mode == "coalesced":
+        events.append(_async_event("deleg_sibling"))
+    if mode == "terminal":
+        events[0]["parent_session_id"] = "closed-parent"
+    _seed_json_outbox(events, tmp_path)
+    runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
+    monkeypatch.setattr(runner, "_classify_completion_target", AsyncMock(return_value="terminal"))
+    original = ad.acknowledge_outbox_event
+    receipt_threads = []
+
+    def observe(*args, **kwargs):
+        receipt_threads.append(threading.get_ident())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(ad, "acknowledge_outbox_event", observe)
+    loop_thread = threading.get_ident()
+    if mode == "coalesced":
+        result = asyncio.run(runner._deliver_async_delegation_group(events))
+    else:
+        result = asyncio.run(runner._deliver_completion_notification("done", events[0]))
+    assert result == ("dropped" if mode == "terminal" else "delivered")
+    assert len(receipt_threads) == len(events)
+    assert all(thread != loop_thread for thread in receipt_threads)
 
 
 @pytest.mark.parametrize("event_type", ["async_delegation", "async_delegation_restarted"])

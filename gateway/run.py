@@ -30832,13 +30832,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=True,
                     )
                 if parent_session_id != current_session_id:
-                    pinned_row = None
+                    session_db = getattr(self, "_session_db", None)
+                    if session_db is None:
+                        return "temporary"
                     try:
-                        session_db = getattr(self, "_session_db", None)
-                        if session_db is not None:
-                            pinned_row = await session_db.get_session(parent_session_id)
+                        pinned_row = await session_db.get_session(parent_session_id)
                     except Exception:
-                        pinned_row = None
+                        logger.warning("Pinned completion lookup unavailable", exc_info=True)
+                        return "temporary"
                     # Drop only for a genuinely-gone parent: unknown row, or a
                     # row the USER explicitly closed (/new, exit, switch).
                     # Idle/timeout ends are the norm on scale-to-zero relay
@@ -30992,9 +30993,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         identity = self._completion_delivery_identity(evt)
         durable_claim_id = ""
         durable_delegation_id = ""
-        if evt.get("type") == "async_delegation":
+        if evt.get("type") in {"async_delegation", "async_delegation_restarted"}:
             durable_delegation_id = str(evt.get("delegation_id") or "")
-            if durable_delegation_id:
+            if durable_delegation_id and evt.get("type") == "async_delegation":
                 try:
                     from tools.async_delegation import claim_completion_delivery
 
@@ -31042,22 +31043,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "delegation records).",
                         durable_delegation_id or "<legacy>", parent_session_id,
                     )
-                    if durable_claim_id:
-                        try:
-                            from tools.async_delegation import drop_completion_delivery
+                    try:
+                        await asyncio.to_thread(
+                            acknowledge_event_outbox, evt, outcome="dropped",
+                            reason="target_permanently_gone",
+                        )
+                    except Exception:
+                        logger.warning("Could not persist terminal outbox receipt", exc_info=True)
+                        verdict = "retry"
+                    else:
+                        if durable_claim_id:
+                            try:
+                                from tools.async_delegation import drop_completion_delivery
 
-                            drop_completion_delivery(
-                                durable_delegation_id, durable_claim_id,
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Could not drop durable completion claim",
-                                exc_info=True,
-                            )
-                    acknowledge_event_outbox(
-                        evt, outcome="dropped", reason="target_permanently_gone",
-                    )
-                    return "dropped"
+                                drop_completion_delivery(
+                                    durable_delegation_id, durable_claim_id,
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "Could not drop durable completion claim",
+                                    exc_info=True,
+                                )
+                        return "dropped"
                 if verdict == "retry":
                     if durable_claim_id:
                         try:
@@ -31111,10 +31118,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             injection_result = await self._inject_watch_notification(synth_text, evt)
             if injection_result != "delivered":
-                if injection_result == "dropped":
-                    acknowledge_event_outbox(
-                        evt, outcome="dropped", reason="unroutable",
-                    )
+                # A route unavailable to this consumer is not a terminal target.
+                # Keep the outbox pending for recovery by another boot/consumer.
                 return injection_result
             accepted = True
 
@@ -31134,7 +31139,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 from tools.async_delegation import complete_event_delivery
 
-                complete_event_delivery(evt, durable_claim_id)
+                await asyncio.to_thread(complete_event_delivery, evt, durable_claim_id)
             except Exception as exc:
                 logger.warning(
                     "Could not acknowledge durable completion %s: %s",
@@ -31669,7 +31674,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if delivered == "delivered":
                 for evt, claim_id in siblings:
                     try:
-                        complete_event_delivery(evt, claim_id)
+                        await asyncio.to_thread(complete_event_delivery, evt, claim_id)
                     except Exception:
                         logger.debug(
                             "Could not acknowledge coalesced durable completion",
