@@ -9418,7 +9418,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # credential cache too. Absence of a pin is NOT an instruction to clear.
         store = getattr(self, "session_store", None)
         if lookup.state == "absent" and getattr(type(store), "get_chat_model_pin", None):
-            present, pin = store.get_chat_model_pin(session_key)
+            try:
+                present, pin = store.get_chat_model_pin(session_key)
+            except Exception:
+                # Read failures can carry credential-bearing paths or URLs.
+                logger.warning("Chat model pin reconciliation unavailable")
+                return PersistedSessionRouteLookup("unavailable")
             if present and pin is None:
                 # NOTE(P3b/RC-2): cache reconciliation only; the durable user
                 # action already happened in the chat preference store.
@@ -26054,21 +26059,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pass
 
         if session_key:
-            persisted_route_lookup = None
-            if session_entry is not None:
-                if getattr(session_entry, "_model_override_identity_invalid", False):
-                    persisted_route_lookup = PersistedSessionRouteLookup("unavailable")
-                else:
-                    identity = getattr(session_entry, "model_override_identity", None)
-                    persisted_route_lookup = PersistedSessionRouteLookup(
-                        "valid" if identity else "absent",
-                        identity if identity else None,
-                    )
+            # A fresh transcript entry can have no identity while its chat
+            # still has a durable pin. Use the same authority as the next turn.
             model, runtime = self._resolve_session_agent_runtime(
                 source=source,
                 session_key=session_key,
                 user_config=data,
-                persisted_route_lookup=persisted_route_lookup,
             )
             provider = runtime.get("provider")
             base_url = runtime.get("base_url")
