@@ -31041,127 +31041,118 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         identity = self._completion_delivery_identity(evt)
         durable_claim_id = ""
         durable_delegation_id = ""
-        if evt.get("type") in {"async_delegation", "async_delegation_restarted"}:
-            durable_delegation_id = str(evt.get("delegation_id") or "")
-            if durable_delegation_id and evt.get("type") == "async_delegation":
-                try:
-                    durable_claim_id = await self._claim_completion_notification(
-                        evt, f"gateway:{id(self)}",
-                    )
-                    if durable_claim_id is None:
-                        return None
-                except Exception as exc:
-                    logger.warning(
-                        "Could not claim durable async completion %s: %s",
-                        durable_delegation_id, exc,
-                    )
-                    return "temporary"
-            parent_session_id = str(evt.get("parent_session_id") or "").strip()
-            if parent_session_id:
-                # Pre-flight (#65838-class): adapter acceptance is NOT proof of
-                # delivery — the inner #55578 resolver can still fail closed
-                # inside the message pipeline AFTER the adapter accepted, which
-                # would falsely acknowledge the durable row as delivered.
-                # Verify the target here, before acceptance, and give drops an
-                # honest durable disposition.
-                verdict = await self._classify_completion_target(parent_session_id)
-                if verdict == "deliver":
-                    # Compression rotation: retarget the pinned delivery at the
-                    # live tip so downstream pinning follows the continuation,
-                    # not the rotated-out parent (fork delivery contract).
+        accepted = False
+        inflight_owned = False
+        # Own cleanup before any claim can be adopted or preflight can await.
+        try:
+            if evt.get("type") in {"async_delegation", "async_delegation_restarted"}:
+                durable_delegation_id = str(evt.get("delegation_id") or "")
+                if durable_delegation_id and evt.get("type") == "async_delegation":
                     try:
-                        _tip = await self._session_db.get_compression_tip(
-                            parent_session_id
+                        durable_claim_id = await self._claim_completion_notification(
+                            evt, f"gateway:{id(self)}",
                         )
-                        if _tip and _tip != parent_session_id:
-                            _tip_row = await self._session_db.get_session(_tip)
-                            if _tip_row is not None and not _tip_row.get("ended_at"):
-                                evt["parent_session_id"] = _tip
-                    except Exception:
-                        logger.debug(
-                            "Completion tip retarget failed; delivering to "
-                            "original parent", exc_info=True,
+                        if durable_claim_id is None:
+                            return None
+                    except Exception as exc:
+                        logger.warning(
+                            "Could not claim durable async completion %s: %s",
+                            durable_delegation_id, exc,
                         )
-                if verdict == "terminal":
-                    logger.warning(
-                        "Async delegation %s targets permanently-gone session %s; "
-                        "terminally dropping delivery (result remains in the "
-                        "delegation records).",
-                        durable_delegation_id or "<legacy>", parent_session_id,
-                    )
-                    try:
-                        await asyncio.to_thread(
-                            acknowledge_event_outbox, evt, outcome="dropped",
-                            reason="target_permanently_gone",
-                        )
-                    except Exception:
-                        logger.warning("Could not persist terminal outbox receipt", exc_info=True)
-                        verdict = "retry"
-                    else:
-                        if durable_claim_id:
-                            try:
-                                from tools.async_delegation import drop_completion_delivery
-
-                                drop_completion_delivery(
-                                    durable_delegation_id, durable_claim_id,
-                                )
-                            except Exception:
-                                logger.debug(
-                                    "Could not drop durable completion claim",
-                                    exc_info=True,
-                                )
-                        return "dropped"
-                if verdict == "retry":
-                    if durable_claim_id:
+                        return "temporary"
+                parent_session_id = str(evt.get("parent_session_id") or "").strip()
+                if parent_session_id:
+                    # Pre-flight (#65838-class): adapter acceptance is NOT proof of
+                    # delivery — the inner #55578 resolver can still fail closed
+                    # inside the message pipeline AFTER the adapter accepted, which
+                    # would falsely acknowledge the durable row as delivered.
+                    # Verify the target here, before acceptance, and give drops an
+                    # honest durable disposition.
+                    verdict = await self._classify_completion_target(parent_session_id)
+                    if verdict == "deliver":
+                        # Compression rotation: retarget the pinned delivery at the
+                        # live tip so downstream pinning follows the continuation,
+                        # not the rotated-out parent (fork delivery contract).
                         try:
-                            from tools.async_delegation import release_completion_delivery
-
-                            release_completion_delivery(
-                                durable_delegation_id, durable_claim_id,
+                            _tip = await self._session_db.get_compression_tip(
+                                parent_session_id
                             )
+                            if _tip and _tip != parent_session_id:
+                                _tip_row = await self._session_db.get_session(_tip)
+                                if _tip_row is not None and not _tip_row.get("ended_at"):
+                                    evt["parent_session_id"] = _tip
                         except Exception:
                             logger.debug(
-                                "Could not release durable completion claim",
-                                exc_info=True,
+                                "Completion tip retarget failed; delivering to "
+                                "original parent", exc_info=True,
                             )
-                    return False
-        elif evt.get("type") == "completion":
-            # Background-process completions carry only session_key (chat/
-            # thread routing), so after /new the notification from the OLD
-            # session would land in the chat's NEW session. Stamped events
-            # (spawn-time parent_session_id from terminal_tool) get the same
-            # session-boundary pre-flight as async delegations — one policy
-            # owner (_classify_completion_target), never a forked predicate.
-            # Legacy/unstamped events keep today's behavior and deliver.
-            parent_session_id = str(evt.get("parent_session_id") or "").strip()
-            if parent_session_id:
-                verdict = await self._classify_completion_target(parent_session_id)
-                if verdict == "terminal":
-                    logger.warning(
-                        "Background process %s completion targets "
-                        "permanently-gone session %s (user boundary such as "
-                        "/new); dropping notification (output remains "
-                        "available via process(action='log')).",
-                        evt.get("session_id") or "<unknown>", parent_session_id,
-                    )
-                    return None
-                if verdict == "retry":
-                    # Transient uncertainty (session DB unavailable or a
-                    # compression rotation mid-flight): signal the watcher to
-                    # re-poll and try again rather than dropping or
-                    # misrouting the result.
-                    return False
-        if identity is not None:
-            with self._completion_delivery_lock:
-                if (
-                    identity in self._completion_deliveries_inflight
-                    or identity in self._completion_deliveries_delivered
-                ):
-                    return None
-                self._completion_deliveries_inflight.add(identity)
+                    if verdict == "terminal":
+                        logger.warning(
+                            "Async delegation %s targets permanently-gone session %s; "
+                            "terminally dropping delivery (result remains in the "
+                            "delegation records).",
+                            durable_delegation_id or "<legacy>", parent_session_id,
+                        )
+                        try:
+                            await asyncio.to_thread(
+                                acknowledge_event_outbox, evt, outcome="dropped",
+                                reason="target_permanently_gone",
+                            )
+                        except Exception:
+                            logger.warning("Could not persist terminal outbox receipt", exc_info=True)
+                            verdict = "retry"
+                        else:
+                            if durable_claim_id:
+                                try:
+                                    from tools.async_delegation import drop_completion_delivery
 
-        accepted = False
-        try:
+                                    drop_completion_delivery(
+                                        durable_delegation_id, durable_claim_id,
+                                    )
+                                except Exception:
+                                    logger.debug(
+                                        "Could not drop durable completion claim",
+                                        exc_info=True,
+                                    )
+                            return "dropped"
+                    if verdict == "retry":
+                        return False
+            elif evt.get("type") == "completion":
+                # Background-process completions carry only session_key (chat/
+                # thread routing), so after /new the notification from the OLD
+                # session would land in the chat's NEW session. Stamped events
+                # (spawn-time parent_session_id from terminal_tool) get the same
+                # session-boundary pre-flight as async delegations — one policy
+                # owner (_classify_completion_target), never a forked predicate.
+                # Legacy/unstamped events keep today's behavior and deliver.
+                parent_session_id = str(evt.get("parent_session_id") or "").strip()
+                if parent_session_id:
+                    verdict = await self._classify_completion_target(parent_session_id)
+                    if verdict == "terminal":
+                        logger.warning(
+                            "Background process %s completion targets "
+                            "permanently-gone session %s (user boundary such as "
+                            "/new); dropping notification (output remains "
+                            "available via process(action='log')).",
+                            evt.get("session_id") or "<unknown>", parent_session_id,
+                        )
+                        return None
+                    if verdict == "retry":
+                        # Transient uncertainty (session DB unavailable or a
+                        # compression rotation mid-flight): signal the watcher to
+                        # re-poll and try again rather than dropping or
+                        # misrouting the result.
+                        return False
+            if identity is not None:
+                with self._completion_delivery_lock:
+                    if (
+                        identity in self._completion_deliveries_inflight
+                        or identity in self._completion_deliveries_delivered
+                    ):
+                        return None
+                    self._completion_deliveries_inflight.add(identity)
+                inflight_owned = True
+
             injection_result = await self._inject_watch_notification(synth_text, evt)
             if injection_result != "delivered":
                 # A route unavailable to this consumer is not a terminal target.
@@ -31198,7 +31189,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
             return "delivered"
         finally:
-            if identity is not None and not accepted:
+            if inflight_owned and not accepted:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
             if durable_claim_id and not accepted:

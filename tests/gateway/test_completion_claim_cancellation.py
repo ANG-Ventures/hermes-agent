@@ -151,3 +151,141 @@ def test_cancel_claim_preserves_other_owner_and_cancellation(
     _assert_reclaimable(events, tmp_path)
     if outcome == "raises":
         assert "cancelled worker storage failure" in caplog.text
+
+
+@pytest.mark.parametrize("count", [1, 3])
+@pytest.mark.parametrize("phase", ["classify", "retarget", "terminal_receipt"])
+def test_cancel_preflight_releases_primary_and_siblings(
+    tmp_path, monkeypatch, count, phase,
+):
+    secondary = tmp_path / "secondary"
+    root = tmp_path / "root"
+    secondary.mkdir()
+    root.mkdir()
+    events = _events(secondary, count)
+    for event in events:
+        event["parent_session_id"] = "parent-target"
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    async def exercise():
+        entered = asyncio.Event()
+
+        async def blocked(*args, **kwargs):
+            assert get_hermes_home() == secondary
+            entered.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(
+            runner, "_classify_completion_target",
+            blocked if phase == "classify" else AsyncMock(
+                return_value="terminal" if phase == "terminal_receipt" else "deliver",
+            ),
+        )
+        if phase == "retarget":
+            runner._session_db = SimpleNamespace(
+                get_compression_tip=blocked,
+            )
+        if phase == "terminal_receipt":
+            original = asyncio.to_thread
+
+            async def pause_receipt(func, *args, **kwargs):
+                if func is ad.acknowledge_event_outbox:
+                    return await blocked()
+                return await original(func, *args, **kwargs)
+
+            monkeypatch.setattr(asyncio, "to_thread", pause_receipt)
+        task = asyncio.create_task(runner._deliver_async_delegation_group(events))
+        try:
+            await asyncio.wait_for(entered.wait(), 10)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            adapter.handle_message.assert_not_awaited()
+            _assert_reclaimable(events, secondary)
+            assert get_hermes_home() == root
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("count", [1, 3])
+def test_preflight_exception_releases_primary_and_siblings(tmp_path, monkeypatch, count):
+    events = _events(tmp_path, count)
+    for event in events:
+        event["parent_session_id"] = "parent-target"
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    monkeypatch.setattr(runner, "_classify_completion_target", AsyncMock(
+        side_effect=RuntimeError("preflight failed"),
+    ))
+    with pytest.raises(RuntimeError, match="preflight failed"):
+        asyncio.run(runner._deliver_async_delegation_group(events))
+    adapter.handle_message.assert_not_awaited()
+    _assert_reclaimable(events, tmp_path)
+
+
+@pytest.mark.parametrize("cache_state", ["inflight", "delivered"])
+def test_deduplicated_claim_releases_only_its_own_ownership(tmp_path, cache_state):
+    events = _events(tmp_path, 1)
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    identity = runner._completion_delivery_identity(events[0])
+    assert identity is not None
+    if cache_state == "inflight":
+        runner._completion_deliveries_inflight.add(identity)
+    else:
+        runner._completion_deliveries_delivered[identity] = None
+    assert asyncio.run(runner._deliver_completion_notification("finished", events[0])) is None
+    adapter.handle_message.assert_not_awaited()
+    cache = getattr(runner, f"_completion_deliveries_{cache_state}")
+    assert identity in cache
+    _assert_reclaimable(events, tmp_path)
+
+
+@pytest.mark.parametrize("count", [1, 3])
+def test_cancel_running_terminal_receipt_releases_claims(tmp_path, monkeypatch, count):
+    events = _events(tmp_path, count)
+    for event in events:
+        event["parent_session_id"] = "closed-parent"
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    monkeypatch.setattr(runner, "_classify_completion_target", AsyncMock(return_value="terminal"))
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original = ad.acknowledge_event_outbox
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        assert release.wait(10)
+        try:
+            return original(*args, **kwargs)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(ad, "acknowledge_event_outbox", blocked)
+
+    async def exercise():
+        task = asyncio.create_task(runner._deliver_async_delegation_group(events))
+        try:
+            assert await asyncio.to_thread(entered.wait, 10)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            adapter.handle_message.assert_not_awaited()
+            # The receipt worker is still blocked: cleanup cannot rely on it
+            # finishing or on asyncio.run shutting down the executor.
+            _assert_reclaimable(events, tmp_path)
+            release.set()
+            assert await asyncio.to_thread(finished.wait, 10)
+            assert _json_outbox_states(tmp_path) == ["dropped"] + ["pending"] * (count - 1)
+        finally:
+            release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(exercise())
