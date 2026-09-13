@@ -139,8 +139,7 @@ def registry_path(profile_home: Path | None = None) -> Path:
 
 
 def lock_path(profile_home: Path | None = None) -> Path:
-    home = Path(profile_home) if profile_home is not None else get_hermes_home()
-    return home / "state" / "async-delegations.lock"
+    return registry_path(profile_home).with_suffix(".lock")
 
 
 def empty_registry() -> dict[str, Any]:
@@ -183,6 +182,24 @@ def _load(path: Path, *, allow_invalid_records: bool = False) -> dict[str, Any]:
                 "async_delegation_registry_invalid delegation_id=%s reason=record_not_object",
                 delegation_id,
             )
+            continue
+        # Reuse the existing per-record quarantine for malformed structures.
+        # Sparse historical terminal outboxes may lack an embedded self ID;
+        # active records and any explicitly supplied self ID must match the key.
+        outbox = record.get("outbox", [])
+        invalid_identity = (
+            (record.get("state") in {"running", "recoverable"}
+             or "delegation_id" in record)
+            and record.get("delegation_id") != delegation_id
+        )
+        invalid_outbox = (not isinstance(outbox, list)
+                          or any(not isinstance(event, dict) for event in outbox))
+        if invalid_identity or invalid_outbox:
+            if not allow_invalid_records:
+                raise RegistryError(f"record {delegation_id} has invalid identity/outbox structure")
+            invalid_record_ids.append(str(delegation_id))
+            logger.error("async_delegation_registry_invalid delegation_id=%s reason=structure",
+                         delegation_id)
             continue
         expected = record.get("integrity")
         if not expected or expected != _record_checksum(record):
@@ -232,7 +249,7 @@ def locked_registry(
 ) -> Iterator[dict[str, Any]]:
     """Lock, load, and optionally atomically persist one profile registry."""
     path = registry_path(profile_home)
-    lpath = lock_path(profile_home)
+    lpath = path.with_suffix(".lock")  # Same captured home, even if cwd/symlink changes.
     _prepare_directory(path)
     deadline = time.monotonic() + max(0.0, timeout)
     handle = lpath.open("a+b")
