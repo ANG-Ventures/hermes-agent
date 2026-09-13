@@ -640,10 +640,14 @@ def acknowledge_event_outbox(
         logger.warning("Async delegation outbox receipt not found: %s", event_id)
 
 
-def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
-    acknowledge_event_outbox(evt, outcome="delivered")
-    if claim_id and evt.get("type") == "async_delegation":
-        complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+def complete_event_delivery(evt: Dict[str, Any], claim_id: Optional[str]) -> None:
+    """Record consumer acceptance, not completion of the resulting model turn."""
+    try:
+        acknowledge_event_outbox(evt, outcome="delivered")
+    finally:
+        # A JSON storage failure must not skip the independent legacy receipt.
+        if claim_id and evt.get("type") == "async_delegation":
+            complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
 
 
 def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:

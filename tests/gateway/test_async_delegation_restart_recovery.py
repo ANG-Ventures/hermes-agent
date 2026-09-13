@@ -259,5 +259,7 @@ async def test_async_injection_ack_outcome_distinguishes_delivery_from_ended_ses
     adapter.handle_message.assert_awaited_once()
 
     current.session_id = "sess-new"
+    assert await runner._inject_watch_notification("done", event) == "temporary"
+    runner._session_db = SimpleNamespace(get_session=AsyncMock(return_value=None))
     assert await runner._inject_watch_notification("done", event) == "dropped"
     assert adapter.handle_message.await_count == 1
