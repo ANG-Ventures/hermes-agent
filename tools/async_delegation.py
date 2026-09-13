@@ -501,18 +501,6 @@ def restore_undelivered_completions(target_queue) -> int:
     return restored
 
 
-def mark_completion_delivered(delegation_id: str) -> bool:
-    """Atomically acknowledge successful injection of a durable completion."""
-    now = time.time()
-    with _DB_LOCK, _transaction() as conn:
-        cur = conn.execute(
-            """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
-               WHERE delegation_id=? AND delivery_state!='delivered'""",
-            (now, now, delegation_id),
-        )
-        return cur.rowcount == 1
-
-
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Claim one pending completion across competing consumers/processes."""
     now = time.time()
