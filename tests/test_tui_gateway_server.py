@@ -6935,6 +6935,66 @@ class _StopAfterOneNotificationPoll:
         return self._checks > 1
 
 
+@pytest.mark.parametrize("shutdown", [False, True])
+@pytest.mark.parametrize("submission_fails", [False, True])
+def test_completion_receipt_error_does_not_reset_accepted_turn(monkeypatch, caplog, shutdown, submission_fails):
+    import queue
+    from tools.process_registry import process_registry
+
+    session = _session(session_key="receipt-parent")
+    event = {"type": "async_delegation", "delegation_id": "receipt", "session_key": "receipt-parent", "summary": "done"}
+    pending = queue.Queue()
+    pending.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", pending)
+    monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
+    submitted = []
+    released = []
+
+    def submit(*args, **kwargs):
+        submitted.append(args)
+        if submission_fails:
+            raise RuntimeError("submission failed")
+
+    def receipt(*args):
+        raise OSError("receipt unavailable")
+
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
+    monkeypatch.setattr(ad, "claim_event_delivery", lambda *a: "claim")
+    monkeypatch.setattr(ad, "complete_event_delivery", receipt)
+    monkeypatch.setattr(ad, "release_event_delivery", lambda *a: released.append(a))
+    stop = _StopAfterOneNotificationPoll()
+    if shutdown:
+        stop._checks = 1
+    server._notification_poller_loop(stop, "receipt-sid", session)
+    assert len(submitted) == 1
+    assert session["running"] is (not submission_fails)
+    assert bool(released) is submission_fails
+    if not submission_fails:
+        assert "receipt" in caplog.text.lower()
+
+
+@pytest.mark.parametrize("shutdown", [False, True])
+def test_completion_unclaimed_event_does_not_reserve_turn(monkeypatch, shutdown):
+    import queue
+    from tools.process_registry import process_registry
+
+    session = _session(session_key="claim-parent")
+    event = {"type": "async_delegation", "delegation_id": "held", "session_key": "claim-parent", "summary": "done"}
+    pending = queue.Queue()
+    pending.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", pending)
+    monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
+    submit = Mock()
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
+    monkeypatch.setattr(ad, "claim_event_delivery", lambda *a: None)
+    stop = _StopAfterOneNotificationPoll()
+    if shutdown:
+        stop._checks = 1
+    server._notification_poller_loop(stop, "claim-sid", session)
+    submit.assert_not_called()
+    assert session["running"] is False
+
+
 def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     monkeypatch,
 ):
@@ -7520,8 +7580,9 @@ def test_run_prompt_submit_delivers_completion_observed_by_poll(monkeypatch, tmp
         process_registry._poll_observed.discard(event["session_id"])
 
 
-def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_threading(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize("receipt_fails", [False, True])
+def test_run_prompt_submit_requeues_all_unstarted_completion_notifications_with_real_threading(
+    monkeypatch, tmp_path, receipt_fails, caplog
 ):
     import queue as _queue_mod
 
@@ -7536,10 +7597,15 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
     release_nested = threading.Event()
     turns = []
 
-    def _recording_thread(*args, **kwargs):
-        thread = real_thread_class(*args, **kwargs)
-        threads.append(thread)
-        return thread
+    if receipt_fails:
+        def unavailable(*args):
+            raise OSError("receipt unavailable")
+        monkeypatch.setattr(ad, "complete_event_delivery", unavailable)
+
+    class _RecordingThread(real_thread_class):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            threads.append(self)
 
     class _BlockingNotificationAgent(_RecordingAgent):
         def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
@@ -7550,7 +7616,7 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
                     raise TimeoutError("notification turn was not released")
             return {"final_response": "", "messages": []}
 
-    monkeypatch.setattr(server.threading, "Thread", _recording_thread)
+    monkeypatch.setattr(server.threading, "Thread", _RecordingThread)
     session = _session(
         session_key="session-a",
         agent=_BlockingNotificationAgent(turns),
@@ -7579,6 +7645,9 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         assert nested_started.wait(timeout=5)
         threads[0].join(timeout=5)
         assert not threads[0].is_alive()
+        assert session["running"] is True
+        if receipt_fails:
+            assert "receipt" in caplog.text.lower()
         # Membership, not order: the completion_queue is process-global, and
         # notification pollers leaked by earlier session.init tests in this
         # file legitimately steal-and-requeue foreign-session events (see

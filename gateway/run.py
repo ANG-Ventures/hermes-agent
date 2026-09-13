@@ -30900,6 +30900,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         rather than risking suppression of a real completion.
         """
         evt_type = str(evt.get("type") or "")
+        if evt_type in {"async_delegation", "async_delegation_restarted"} and evt.get("event_id"):
+            return (evt_type, str(evt["event_id"]), str(evt.get("_registry_profile_home") or ""))
         if evt_type == "async_delegation":
             producer_id = str(evt.get("delegation_id") or "")
             return (evt_type, producer_id, "") if producer_id else None
@@ -30980,6 +30982,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _deliver_completion_notification(
         self, synth_text: str, evt: dict,
     ) -> str | None:
+        """Keep classification, injection and receipts in the producer's scope."""
+        home = evt.get("_registry_profile_home")
+        if home:
+            with _profile_runtime_scope(Path(home)):
+                return await self._deliver_completion_notification_in_scope(synth_text, evt)
+        return await self._deliver_completion_notification_in_scope(synth_text, evt)
+
+    async def _deliver_completion_notification_in_scope(
+        self, synth_text: str, evt: dict,
+    ) -> str | None:
         """Deliver once per live gateway, or return False for a retry.
 
         ``"delivered"`` means this caller reached adapter acceptance,
@@ -30997,12 +31009,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             durable_delegation_id = str(evt.get("delegation_id") or "")
             if durable_delegation_id and evt.get("type") == "async_delegation":
                 try:
-                    from tools.async_delegation import claim_completion_delivery
+                    from tools.async_delegation import claim_event_delivery
 
-                    durable_claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
-                    if not claim_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    ):
+                    durable_claim_id = await asyncio.to_thread(
+                        claim_event_delivery, evt, f"gateway:{id(self)}",
+                    )
+                    if durable_claim_id is None:
                         return None
                 except Exception as exc:
                     logger.warning(
@@ -31137,9 +31149,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # JSON restart notices need a receipt even without a SQLite claim;
             # the same helper covers coalesced siblings, CLI and TUI consumers.
             try:
-                from tools.async_delegation import complete_event_delivery
+                from tools.async_delegation import complete_event_delivery_with_retry
 
-                await asyncio.to_thread(complete_event_delivery, evt, durable_claim_id)
+                await asyncio.to_thread(complete_event_delivery_with_retry, evt, durable_claim_id)
             except Exception as exc:
                 logger.warning(
                     "Could not acknowledge durable completion %s: %s",
@@ -31573,6 +31585,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         the full gateway route. Events for different sessions never coalesce.
         """
         return tuple(str(evt.get(field) or "") for field in (
+            "_registry_profile_home",
             "session_key",
             "parent_session_id",
             "platform",
@@ -31595,6 +31608,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return "\n\n".join([header, *blocks])
 
     async def _deliver_async_delegation_group(
+        self, group: list[dict],
+    ) -> Optional[bool]:
+        """Scope coalesced claims and sibling receipts like the primary event."""
+        home = group[0].get("_registry_profile_home") if group else None
+        if home:
+            with _profile_runtime_scope(Path(home)):
+                return await self._deliver_async_delegation_group_in_scope(group)
+        return await self._deliver_async_delegation_group_in_scope(group)
+
+    async def _deliver_async_delegation_group_in_scope(
         self, group: list[dict],
     ) -> Optional[bool]:
         """Deliver a same-session batch of async completions as ONE turn.
@@ -31640,7 +31663,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         from tools.async_delegation import (
             claim_event_delivery,
-            complete_event_delivery,
+            complete_event_delivery_with_retry,
             release_event_delivery,
         )
 
@@ -31648,7 +31671,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         blocks = [primary_text]
         siblings: list[tuple[dict, str]] = []
         for evt, synth_text in deliverable[1:]:
-            claim_id = claim_event_delivery(evt, f"gateway-batch:{id(self)}")
+            claim_id = await asyncio.to_thread(
+                claim_event_delivery, evt, f"gateway-batch:{id(self)}",
+            )
             if claim_id is None:
                 # Another consumer owns this row's delivery; keep its result
                 # out of our consolidated text so it is never double-injected.
@@ -31674,7 +31699,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if delivered == "delivered":
                 for evt, claim_id in siblings:
                     try:
-                        await asyncio.to_thread(complete_event_delivery, evt, claim_id)
+                        await asyncio.to_thread(complete_event_delivery_with_retry, evt, claim_id)
                     except Exception:
                         logger.debug(
                             "Could not acknowledge coalesced durable completion",

@@ -13635,7 +13635,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         from tools.process_registry import process_registry
         from tools.async_delegation import (
             claim_event_delivery,
-            complete_event_delivery,
+            complete_event_delivery_with_retry,
         )
 
         session_key = getattr(self, "session_id", "") or ""
@@ -13647,7 +13647,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if claim is None:
                 continue
             self._pending_input.put(synthetic_message)
-            complete_event_delivery(event, claim)
+            complete_event_delivery_with_retry(event, claim)
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
         """Move stray messages from ``_interrupt_queue`` into ``_pending_input``.

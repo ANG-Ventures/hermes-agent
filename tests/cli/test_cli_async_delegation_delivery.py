@@ -2,6 +2,8 @@
 
 import queue
 
+import pytest
+
 from cli import HermesCLI
 
 
@@ -55,6 +57,31 @@ def test_cli_completion_ownership_rejects_foreign_session():
     assert not cli._owns_process_notification(
         {"type": "async_delegation", "session_key": "foreign-session"}
     )
+
+
+@pytest.mark.parametrize("failures", [1, 100])
+def test_cli_receipt_failure_preserves_accepted_input_and_siblings(monkeypatch, caplog, failures):
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.session_id = "visible-session"
+    cli._pending_input = queue.Queue()
+    events = [{"type": "async_delegation", "event_id": "receipt-test"}, {"type": "completion"}]
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry",
+        type("Registry", (), {"drain_notifications": lambda self, **kw: list(zip(events, ["first", "sibling"]))})(),
+    )
+    monkeypatch.setattr("tools.async_delegation.claim_event_delivery", lambda *a: "claim")
+    attempts = []
+
+    def receipt(evt, claim):
+        attempts.append(evt)
+        if evt is events[0] and attempts.count(evt) <= failures:
+            raise OSError("receipt storage unavailable")
+
+    monkeypatch.setattr("tools.async_delegation.complete_event_delivery", receipt)
+    cli._drain_process_notifications("cli-idle")
+    assert list(cli._pending_input.queue) == ["first", "sibling"]
+    assert attempts.count(events[0]) == (2 if failures == 1 else 3)
+    assert "receipt" in caplog.text.lower()
 
 
 def test_cli_completion_ownership_accepts_compression_lineage():
