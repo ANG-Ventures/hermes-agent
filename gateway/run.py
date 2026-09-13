@@ -30979,6 +30979,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "retry"
         return "deliver"
 
+    @staticmethod
+    async def _claim_completion_notification(evt: dict, consumer: str) -> str | None:
+        """Recover a cancelled executor claim before abandoning its ownership."""
+        from tools.async_delegation import claim_event_delivery, release_event_delivery
+
+        operation = asyncio.create_task(asyncio.to_thread(claim_event_delivery, evt, consumer))
+        cancelled = False
+        try:
+            while True:
+                try:
+                    claim_id = await asyncio.shield(operation)
+                    break
+                except asyncio.CancelledError:
+                    cancelled = True
+                    # Repeated cancellation must not detach a still-mutating
+                    # worker. Its existing storage timeout bounds this wait.
+                    if operation.done():
+                        claim_id = operation.result()
+                        break
+            if cancelled and claim_id:
+                release_event_delivery(evt, claim_id)
+            return claim_id
+        except Exception:
+            if cancelled:
+                logger.warning("Completion claim cleanup failed during cancellation", exc_info=True)
+            raise
+        finally:
+            if cancelled:
+                raise asyncio.CancelledError
+
     async def _deliver_completion_notification(
         self, synth_text: str, evt: dict, *,
         receipt_batch: list[tuple[dict, str | None]] | None = None,
@@ -31015,10 +31045,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             durable_delegation_id = str(evt.get("delegation_id") or "")
             if durable_delegation_id and evt.get("type") == "async_delegation":
                 try:
-                    from tools.async_delegation import claim_event_delivery
-
-                    durable_claim_id = await asyncio.to_thread(
-                        claim_event_delivery, evt, f"gateway:{id(self)}",
+                    durable_claim_id = await self._claim_completion_notification(
+                        evt, f"gateway:{id(self)}",
                     )
                     if durable_claim_id is None:
                         return None
@@ -31673,7 +31701,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._deliver_completion_notification(synth_text, evt)
 
         from tools.async_delegation import (
-            claim_event_delivery,
             complete_event_delivery_with_retry,
             release_event_delivery,
         )
@@ -31681,26 +31708,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         primary_evt, primary_text = deliverable[0]
         blocks = [primary_text]
         siblings: list[tuple[dict, str]] = []
-        for evt, synth_text in deliverable[1:]:
-            claim_id = await asyncio.to_thread(
-                claim_event_delivery, evt, f"gateway-batch:{id(self)}",
-            )
-            if claim_id is None:
-                # Another consumer owns this row's delivery; keep its result
-                # out of our consolidated text so it is never double-injected.
-                continue
-            siblings.append((evt, claim_id))
-            blocks.append(synth_text)
-
-        if not siblings:
-            return await self._deliver_completion_notification(
-                primary_text, primary_evt,
-            )
-
-        consolidated = self._format_coalesced_async_delegations(blocks)
         receipt_batch: list[tuple[dict, str | None]] = []
         delivered: Optional[bool] = False
         try:
+            for evt, synth_text in deliverable[1:]:
+                claim_id = await self._claim_completion_notification(
+                    evt, f"gateway-batch:{id(self)}",
+                )
+                if claim_id is None:
+                    # Another consumer owns this row's delivery; keep its result
+                    # out of our consolidated text so it is never double-injected.
+                    continue
+                siblings.append((evt, claim_id))
+                blocks.append(synth_text)
+
+            if not siblings:
+                return await self._deliver_completion_notification(
+                    primary_text, primary_evt,
+                )
+
+            consolidated = self._format_coalesced_async_delegations(blocks)
             delivered = await self._deliver_completion_notification(
                 consolidated, primary_evt, receipt_batch=receipt_batch,
             )
