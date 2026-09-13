@@ -1689,6 +1689,25 @@ def subscribe_calling_session(
             chat_id = session_key
         is_gateway_session = platform != "tui"
         chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
+        if chat_type:
+            # Canonicalize on WRITE, not only on read. A Discord guild chat is
+            # keyed 'group' by build_session_key; persisting the raw envelope
+            # spelling ('channel') writes a row that cannot match its own
+            # chat's routing entry, so the wake keys an identity-less session
+            # and mints a phantom (2026-09-12, fixed read-side in #682).
+            #
+            # #682 fixed the two READERS. This is the WRITER — the fourth
+            # producer of the same value, and the reason drifted rows kept
+            # appearing after that deploy. Reading and writing must agree on
+            # the spelling or the reader's fix only papers over fresh rows.
+            # Non-Discord platforms are untouched: canonical_chat_type is a
+            # no-op for them, and Teams/Telegram/HomeAssistant own 'channel'
+            # as a real type.
+            try:
+                from gateway.routing_identity import canonical_chat_type
+                chat_type = canonical_chat_type(platform, chat_type)
+            except Exception:  # pragma: no cover - never block a subscription
+                pass
         delivery_mode = "notify+wake" if is_gateway_session else None
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
