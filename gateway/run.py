@@ -30980,17 +30980,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return "deliver"
 
     async def _deliver_completion_notification(
-        self, synth_text: str, evt: dict,
+        self, synth_text: str, evt: dict, *,
+        receipt_batch: list[tuple[dict, str | None]] | None = None,
     ) -> str | None:
         """Keep classification, injection and receipts in the producer's scope."""
         home = evt.get("_registry_profile_home")
         if home:
             with _profile_runtime_scope(Path(home)):
-                return await self._deliver_completion_notification_in_scope(synth_text, evt)
-        return await self._deliver_completion_notification_in_scope(synth_text, evt)
+                return await self._deliver_completion_notification_in_scope(
+                    synth_text, evt, receipt_batch=receipt_batch,
+                )
+        return await self._deliver_completion_notification_in_scope(
+            synth_text, evt, receipt_batch=receipt_batch,
+        )
 
     async def _deliver_completion_notification_in_scope(
-        self, synth_text: str, evt: dict,
+        self, synth_text: str, evt: dict, *,
+        receipt_batch: list[tuple[dict, str | None]] | None = None,
     ) -> str | None:
         """Deliver once per live gateway, or return False for a retry.
 
@@ -31148,15 +31154,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Acknowledge BOTH producer formats after adapter acceptance.
             # JSON restart notices need a receipt even without a SQLite claim;
             # the same helper covers coalesced siblings, CLI and TUI consumers.
-            try:
-                from tools.async_delegation import complete_event_delivery_with_retry
+            if receipt_batch is not None:
+                # Return acceptance without an intervening cancellation point;
+                # the caller will write primary and sibling receipts together.
+                receipt_batch.append((evt, durable_claim_id))
+            else:
+                try:
+                    from tools.async_delegation import complete_event_delivery_with_retry
 
-                await asyncio.to_thread(complete_event_delivery_with_retry, evt, durable_claim_id)
-            except Exception as exc:
-                logger.warning(
-                    "Could not acknowledge durable completion %s: %s",
-                    evt.get("event_id") or durable_delegation_id, exc,
-                )
+                    await asyncio.to_thread(complete_event_delivery_with_retry, evt, durable_claim_id)
+                except Exception as exc:
+                    logger.warning(
+                        "Could not acknowledge durable completion %s: %s",
+                        evt.get("event_id") or durable_delegation_id, exc,
+                    )
             return "delivered"
         finally:
             if identity is not None and not accepted:
@@ -31687,27 +31698,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
         consolidated = self._format_coalesced_async_delegations(blocks)
+        receipt_batch: list[tuple[dict, str | None]] = []
         delivered: Optional[bool] = False
         try:
             delivered = await self._deliver_completion_notification(
-                consolidated, primary_evt,
+                consolidated, primary_evt, receipt_batch=receipt_batch,
             )
         finally:
             # Vocabulary seam (2026-08 parity merge): the delivery function
             # returns the fork's outcome strings; "delivered" is adapter
             # acceptance.
             if delivered == "delivered":
-                for evt, claim_id in siblings:
-                    try:
-                        await asyncio.to_thread(complete_event_delivery_with_retry, evt, claim_id)
-                    except Exception:
-                        logger.debug(
-                            "Could not acknowledge coalesced durable completion",
-                            exc_info=True,
-                        )
+                receipt_batch.extend(siblings)
                 self._record_coalesced_completion_siblings(
                     [evt for evt, _claim_id in siblings]
                 )
+
+                def acknowledge_batch():
+                    # One off-thread operation: cancellation of its awaiter must
+                    # not skip later receipts for content already accepted.
+                    for event, claim in receipt_batch:
+                        try:
+                            complete_event_delivery_with_retry(event, claim)
+                        except Exception:
+                            logger.warning(
+                                "Could not acknowledge coalesced durable completion",
+                                exc_info=True,
+                            )
+
+                await asyncio.to_thread(acknowledge_batch)
             else:
                 # Not delivered — release every sibling claim so a retry (or
                 # another consumer) can claim it, honestly leaving the durable
