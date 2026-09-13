@@ -355,11 +355,13 @@ def _prune_durable_records() -> None:
 
 
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
+    # Execution and delivery are independent: an outbox consumer may already
+    # have accepted this result before the legacy mirror is synchronized.
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
-               event_json=?, result_json=?, delivery_state='pending'
+               event_json=?, result_json=?
                WHERE delegation_id=?""",
             (event.get("status", "completed"), event.get("completed_at", now), now,
              json.dumps(event), json.dumps(result), event["delegation_id"]),
@@ -387,7 +389,8 @@ def recover_abandoned_delegations() -> int:
             """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
                       owner_started_at, task_json, origin_session_id
-               FROM async_delegations WHERE state IN ('running','finalizing')"""
+               FROM async_delegations WHERE state IN ('running','finalizing')
+                 AND delivery_state='pending'"""
         ).fetchall()
         for row in rows:
             (delegation_id, session_key, origin_ui, parent_id, dispatched_at,
@@ -421,13 +424,16 @@ def recover_abandoned_delegations() -> int:
                 if task.get(_k):
                     event[_k] = task[_k]
             result = {"status": "unknown", "summary": None, "error": event["error"]}
-            conn.execute(
+            # A different process can acknowledge or finalize after SELECT.
+            # Never replace that result or turn its terminal receipt pending.
+            cur = conn.execute(
                 """UPDATE async_delegations SET state='unknown', completed_at=?,
                    updated_at=?, event_json=?, result_json=?, delivery_state='pending'
-                   WHERE delegation_id=?""",
+                   WHERE delegation_id=? AND state IN ('running','finalizing')
+                     AND delivery_state='pending'""",
                 (now, now, json.dumps(event), json.dumps(result), delegation_id),
             )
-            recovered += 1
+            recovered += cur.rowcount
     return recovered
 
 
@@ -1124,10 +1130,7 @@ def _finalize(
         )
         if payload is None:
             return
-        from tools.process_registry import process_registry
-
-        payload["_registry_profile_home"] = str(profile_home or "")
-        process_registry.completion_queue.put(payload)
+        _publish_restartable_completion(payload, result, status, profile_home)
         return
     _push_completion_event(event_record, result, status)
     _finish_finalization(delegation_id, status)
@@ -1165,6 +1168,44 @@ def _finish_finalization(delegation_id: str, status: str) -> None:
         if record is not None:
             record["status"] = status
         _prune_completed_locked()
+
+
+def _publish_restartable_completion(
+    payload: Dict[str, Any], result: Dict[str, Any], status: str,
+    profile_home: Optional[Path],
+) -> None:
+    """Synchronize the legacy mirror before exposing the canonical outbox event."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.process_registry import process_registry
+
+    delegation_id = payload["delegation_id"]
+    payload["_registry_profile_home"] = str(profile_home or "")
+    token = set_hermes_home_override(profile_home) if profile_home is not None else None
+    try:
+        # The JSON outbox is already durable. A failed mirror write must not
+        # lose that result or prevent delivery; bound retries and log the gap.
+        for attempt in range(3):
+            try:
+                _persist_completion(payload, result)
+                break
+            except Exception:
+                logger.warning(
+                    "Async delegation %s: terminal mirror failed (attempt %d/3)",
+                    delegation_id, attempt + 1, exc_info=True,
+                )
+                if attempt < 2:
+                    time.sleep(0.05 * (attempt + 1))
+        try:
+            process_registry.completion_queue.put(payload)
+        except Exception:
+            logger.error(
+                "Async delegation %s: enqueue failed; terminal result retained in outbox",
+                delegation_id, exc_info=True,
+            )
+    finally:
+        if token is not None:
+            reset_hermes_home_override(token)
+        _finish_finalization(delegation_id, status)
 
 
 def _push_completion_event(
@@ -1457,12 +1498,9 @@ def _finalize_batch(
         )
         if payload is None:
             return
-        from tools.process_registry import process_registry
-
-        payload["_registry_profile_home"] = str(
-            _record_profile_home(event_record) or ""
+        _publish_restartable_completion(
+            payload, combined, status, _record_profile_home(event_record)
         )
-        process_registry.completion_queue.put(payload)
         return
     _push_batch_completion_event(event_record, combined, status)
     _finish_finalization(delegation_id, status)
