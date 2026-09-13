@@ -138,11 +138,11 @@ def _notif_log_failure(what: str, exc: BaseException) -> None:
     print(f"[tui_gateway] {what}: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
-def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> None:
-    """message.start + _run_prompt_submit for a claimed (running=True) turn; releases on failure."""
+def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> bool:
+    """Return submission acceptance for a claimed turn; release on exception."""
     try:
         _emit("message.start", sid)
-        _run_prompt_submit(rid, sid, session, text, **kwargs)
+        return _run_prompt_submit(rid, sid, session, text, **kwargs)
     except Exception as exc:
         _notif_log_failure(what, exc)
         _notif_release_turn(session)
@@ -389,11 +389,12 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None
     kwargs = ({"display_kind": "async_delegation_complete", "display_metadata": _async_delegation_display_metadata(evt)}
               if evt.get("type") == "async_delegation" else {})
     try:
-        _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text, "notification poller dispatch failed", **kwargs)
+        accepted = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
+                                 "notification poller dispatch failed", **kwargs)
     except Exception:
         release_event_delivery(evt, claim)
         return
-    complete_event_delivery(evt, claim)
+    (complete_event_delivery if accepted else release_event_delivery)(evt, claim)
 
 
 def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, completions=None, *, owned=False) -> bool:
@@ -465,16 +466,17 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
     text = ProcessNotificationBatch(tuple((event, text) for event, text, _claim in claimed)).render(registry)
     if text is None:
         _notif_release_turn(session)
+    accepted = text is None  # Already-consumed process results are intentionally suppressed.
     try:
         if text is not None:
-            _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
-                          "completion batch dispatch failed")
+            accepted = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
+                                     "completion batch dispatch failed")
     except Exception:
         for event, _text, claim in claimed:
             release_event_delivery(event, claim)
         return
     for event, _text, claim in claimed:
-        complete_event_delivery(event, claim)
+        (complete_event_delivery if accepted else release_event_delivery)(event, claim)
 
 
 def _notif_handle_ready(sid, session, events, emitted, registry, fmt, deferred, *, owned=False):
