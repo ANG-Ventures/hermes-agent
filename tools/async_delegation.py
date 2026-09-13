@@ -354,16 +354,106 @@ def _prune_durable_records() -> None:
             )
 
 
-def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
-    now = time.time()
-    with _DB_LOCK, _transaction() as conn:
-        conn.execute(
-            """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
-               event_json=?, result_json=?, delivery_state='pending'
-               WHERE delegation_id=?""",
-            (event.get("status", "completed"), event.get("completed_at", now), now,
-             json.dumps(event), json.dumps(result), event["delegation_id"]),
+def _same_completion_event(persisted: Optional[Dict[str, Any]], event: Dict[str, Any]) -> bool:
+    """Receipts belong to an event, not to every result of a delegation."""
+    previous = persisted or {}
+    if previous.get("event_id") or event.get("event_id"):
+        return (
+            bool(previous.get("event_id"))
+            and (
+                (type(previous.get("attempt_generation")) is int
+                 and type(event.get("attempt_generation")) is int)
+                or ("attempt_generation" not in previous
+                    and "attempt_generation" not in event)
+            )
+            and all(previous.get(key) == event.get(key) for key in (
+                "event_id", "attempt_generation", "delegation_id", "type",
+            ))
         )
+    # Pre-outbox dispatches had no identity until terminal persistence. Keep
+    # their historical receipt behavior, but distinguish recorded legacy
+    # owner-loss notices from later results. Ignore replay-only annotations.
+    return persisted is None or all(previous.get(key) == event.get(key) for key in (
+        "delegation_id", "type", "status", "completed_at",
+    ))
+
+
+def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
+    # An outbox consumer may accept THIS event before mirror synchronization.
+    # Serializing identity replacement with claims prevents a late old token
+    # from acknowledging the new result (including across processes).
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _sync_completion(conn, event, result)
+
+
+def _sync_completion(conn, event, result, disposition=None):
+    """Synchronize under the caller's SQLite write transaction."""
+    now = time.time()
+    row = conn.execute(
+        "SELECT event_json, result_json FROM async_delegations WHERE delegation_id=?",
+        (event["delegation_id"],),
+    ).fetchone()
+    if row is None:
+        return
+    same_event = _same_completion_event(json.loads(row[0] or "null"), event)
+    if result is None:
+        result = json.loads(row[1]) if same_event and row[1] else event
+    if not same_event:
+        conn.execute(
+            """UPDATE async_delegations SET delivery_state='pending',
+               delivery_attempts=0, delivered_at=NULL,
+               delivery_claim=NULL, delivery_claimed_at=NULL
+               WHERE delegation_id=?""",
+            (event["delegation_id"],),
+        )
+    conn.execute(
+        """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
+           event_json=?, result_json=? WHERE delegation_id=?""",
+        (event.get("status", "completed"), event.get("completed_at", now), now,
+         json.dumps(event), json.dumps(result), event["delegation_id"]),
+    )
+    if disposition in {"delivered", "dropped", "parked"}:
+        conn.execute(
+            """UPDATE async_delegations SET delivery_state=?,
+               delivery_claim=NULL, delivery_claimed_at=NULL
+               WHERE delegation_id=? AND delivery_state='pending'""",
+            (disposition, event["delegation_id"]),
+        )
+
+
+def _canonical_terminal(registry, delegation_id):
+    """Resolve current-attempt terminal evidence while holding the JSON lock."""
+    if delegation_id in registry.get("_invalid_record_ids", []):
+        raise _store.RegistryError(f"record {delegation_id} failed integrity validation")
+    record = registry["records"].get(delegation_id)
+    if record is None or record.get("state") not in {"done", "failed", "cancelled"}:
+        return None
+    # Historical outbox-only records lack execution evidence. They retain the
+    # legacy event/receipt path; do not reclassify them from a delivery envelope.
+    if record.get("terminal") is None:
+        return None
+    attempt = record.get("attempt") or {}
+    entries = [entry for entry in record.get("outbox", [])
+               if entry.get("type") == "async_delegation"]
+    if len(entries) != 1:
+        raise _store.RegistryError(f"ambiguous terminal outbox for {delegation_id}")
+    entry = entries[0]
+    payload = entry.get("payload") or {}
+    if (record.get("delegation_id") != delegation_id
+            or not entry.get("event_id")
+            or payload.get("event_id") != entry["event_id"]
+            or payload.get("delegation_id") != delegation_id
+            or payload.get("type") != "async_delegation"
+            or type(payload.get("attempt_generation")) is not int
+            or type(attempt.get("generation")) is not int
+            or payload["attempt_generation"] < 0
+            or payload["attempt_generation"] != attempt.get("generation")
+            or payload.get("attempt_id") != attempt.get("attempt_id")
+            or payload.get("profile") != record.get("profile")
+            or payload.get("status") != record["terminal"].get("status")):
+        raise _store.RegistryError(f"invalid terminal identity for {delegation_id}")
+    return entry
 
 
 def _note_delivery_attempt(delegation_id: str) -> None:
@@ -375,6 +465,16 @@ def _note_delivery_attempt(delegation_id: str) -> None:
 
 
 def recover_abandoned_delegations() -> int:
+    # Lock order is canonical JSON, then SQLite. Failed reads remain retryable.
+    try:
+        with _store.locked_registry(write=False) as registry:
+            return _recover_abandoned_delegations(registry)
+    except Exception:
+        logger.warning("Could not recover delegation terminal mirrors", exc_info=True)
+        raise
+
+
+def _recover_abandoned_delegations(registry) -> int:
     """Classify records whose owning process disappeared as outcome unknown."""
     try:
         from gateway.status import _pid_exists, get_process_start_time
@@ -386,12 +486,27 @@ def recover_abandoned_delegations() -> int:
         rows = conn.execute(
             """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
-                      owner_started_at, task_json, origin_session_id
-               FROM async_delegations WHERE state IN ('running','finalizing')"""
+                      owner_started_at, task_json, origin_session_id, state, delivery_state
+               FROM async_delegations"""
         ).fetchall()
         for row in rows:
             (delegation_id, session_key, origin_ui, parent_id, dispatched_at,
-             pid, started, task_json, origin_session_id) = row
+             pid, started, task_json, origin_session_id, state, disposition) = row
+            terminal = _canonical_terminal(registry, delegation_id)
+            if terminal is not None:
+                conn.execute("BEGIN IMMEDIATE")
+                _sync_completion(conn, terminal["payload"], None, terminal["state"])
+                conn.commit()
+                continue
+            canonical = registry["records"].get(delegation_id) or {}
+            if canonical.get("state") in {"done", "failed", "cancelled"}:
+                logger.warning(
+                    "Terminal delegation %s lacks execution evidence; retaining mirror",
+                    delegation_id,
+                )
+                continue
+            if state not in {"running", "finalizing"} or disposition != "pending":
+                continue
             live = False
             if pid:
                 live = _pid_exists(int(pid))
@@ -421,13 +536,19 @@ def recover_abandoned_delegations() -> int:
                 if task.get(_k):
                     event[_k] = task[_k]
             result = {"status": "unknown", "summary": None, "error": event["error"]}
-            conn.execute(
+            # A different process can acknowledge or finalize after SELECT.
+            # Never replace that result or turn its terminal receipt pending.
+            cur = conn.execute(
                 """UPDATE async_delegations SET state='unknown', completed_at=?,
-                   updated_at=?, event_json=?, result_json=?, delivery_state='pending'
-                   WHERE delegation_id=?""",
-                (now, now, json.dumps(event), json.dumps(result), delegation_id),
+                   updated_at=?, event_json=?, result_json=?, delivery_state='pending',
+                   delivery_claim=NULL, delivery_claimed_at=NULL
+                   WHERE delegation_id=? AND state IN ('running','finalizing')
+                     AND delivery_state='pending'
+                     AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
+                (now, now, json.dumps(event), json.dumps(result), delegation_id, now - 300),
             )
-            recovered += 1
+            recovered += cur.rowcount
+            conn.commit()
     return recovered
 
 
@@ -501,16 +622,42 @@ def restore_undelivered_completions(target_queue) -> int:
     return restored
 
 
-def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+def claim_completion_delivery(
+    delegation_id: str, claim_id: str, *, event: Optional[Dict[str, Any]] = None,
+) -> bool:
+    try:
+        with _store.locked_registry(write=False) as registry:
+            terminal = _canonical_terminal(registry, delegation_id)
+            if terminal is not None and event is not None:
+                if (not _same_completion_event(terminal["payload"], event)
+                        or any(event.get(key) != terminal["payload"].get(key)
+                               for key in ("profile", "attempt_id"))):
+                    return False
+                profile_home = event.get("_registry_profile_home")
+                if profile_home and Path(profile_home).resolve() != _registry_path().parent.parent.resolve():
+                    return False
+            return _claim_completion_delivery(delegation_id, claim_id, event=event, terminal=terminal)
+    except Exception:
+        logger.warning("Could not claim canonical completion %s", delegation_id, exc_info=True)
+        raise
+
+
+def _claim_completion_delivery(delegation_id, claim_id, *, event=None, terminal=None):
     """Claim one pending completion across competing consumers/processes."""
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if terminal is not None:
+            _sync_completion(conn, terminal["payload"], None, terminal["state"])
         row = conn.execute(
-            "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
+            "SELECT delivery_state, event_json FROM async_delegations WHERE delegation_id=?",
             (delegation_id,),
         ).fetchone()
         if row is None:
             return True  # legacy event created before durable dispatch
+        if event is not None and row[1] is not None:
+            if not _same_completion_event(json.loads(row[1]), event):
+                return False
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_claim=?, delivery_claimed_at=?,
                       delivery_attempts=delivery_attempts+1, updated_at=?
@@ -518,6 +665,13 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
             (claim_id, now, now, delegation_id, now - 300),
         )
+        if cur.rowcount == 1 and event is not None and row[1] is None:
+            # Canonical publication can win before the terminal mirror write.
+            # Bind the claim now so later synchronization recognizes its receipt.
+            conn.execute(
+                "UPDATE async_delegations SET event_json=? WHERE delegation_id=?",
+                (json.dumps(event), delegation_id),
+            )
         return cur.rowcount == 1
 
 
@@ -529,7 +683,7 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     if not delegation_id:
         return ""
     claim_id = f"{consumer}:{__import__('os').getpid()}:{uuid.uuid4().hex}"
-    if claim_completion_delivery(delegation_id, claim_id):
+    if claim_completion_delivery(delegation_id, claim_id, event=evt):
         return claim_id
     _reconcile_terminal_event_receipt(evt)
     return None
@@ -1124,10 +1278,7 @@ def _finalize(
         )
         if payload is None:
             return
-        from tools.process_registry import process_registry
-
-        payload["_registry_profile_home"] = str(profile_home or "")
-        process_registry.completion_queue.put(payload)
+        _publish_restartable_completion(payload, result, status, profile_home)
         return
     _push_completion_event(event_record, result, status)
     _finish_finalization(delegation_id, status)
@@ -1165,6 +1316,44 @@ def _finish_finalization(delegation_id: str, status: str) -> None:
         if record is not None:
             record["status"] = status
         _prune_completed_locked()
+
+
+def _publish_restartable_completion(
+    payload: Dict[str, Any], result: Dict[str, Any], status: str,
+    profile_home: Optional[Path],
+) -> None:
+    """Synchronize the legacy mirror before exposing the canonical outbox event."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.process_registry import process_registry
+
+    delegation_id = payload["delegation_id"]
+    payload["_registry_profile_home"] = str(profile_home or "")
+    token = set_hermes_home_override(profile_home) if profile_home is not None else None
+    try:
+        # The JSON outbox is already durable. A failed mirror write must not
+        # lose that result or prevent delivery; bound retries and log the gap.
+        for attempt in range(3):
+            try:
+                _persist_completion(payload, result)
+                break
+            except Exception:
+                logger.warning(
+                    "Async delegation %s: terminal mirror failed (attempt %d/3)",
+                    delegation_id, attempt + 1, exc_info=True,
+                )
+                if attempt < 2:
+                    time.sleep(0.05 * (attempt + 1))
+        try:
+            process_registry.completion_queue.put(payload)
+        except Exception:
+            logger.error(
+                "Async delegation %s: enqueue failed; terminal result retained in outbox",
+                delegation_id, exc_info=True,
+            )
+    finally:
+        if token is not None:
+            reset_hermes_home_override(token)
+        _finish_finalization(delegation_id, status)
 
 
 def _push_completion_event(
@@ -1457,12 +1646,9 @@ def _finalize_batch(
         )
         if payload is None:
             return
-        from tools.process_registry import process_registry
-
-        payload["_registry_profile_home"] = str(
-            _record_profile_home(event_record) or ""
+        _publish_restartable_completion(
+            payload, combined, status, _record_profile_home(event_record)
         )
-        process_registry.completion_queue.put(payload)
         return
     _push_batch_completion_event(event_record, combined, status)
     _finish_finalization(delegation_id, status)
