@@ -436,6 +436,8 @@ def _canonical_terminal(registry, delegation_id):
     attempt = record.get("attempt") or {}
     entries = [entry for entry in record.get("outbox", [])
                if entry.get("type") == "async_delegation"]
+    if not entries:
+        return None
     if len(entries) != 1:
         raise _store.RegistryError(f"ambiguous terminal outbox for {delegation_id}")
     entry = entries[0]
@@ -456,7 +458,8 @@ def _canonical_terminal(registry, delegation_id):
     result = record["terminal"].get("result")
     if result is not None and not isinstance(result, dict):
         raise _store.RegistryError(f"invalid terminal result for {delegation_id}")
-    return {**entry, "execution_result": result}
+    return {**entry, "execution_result": result,
+            "payload": {**payload, "_registry_profile_home": str(_registry_path().parent.parent)}}
 
 
 def _note_delivery_attempt(delegation_id: str) -> None:
@@ -467,17 +470,17 @@ def _note_delivery_attempt(delegation_id: str) -> None:
         )
 
 
-def recover_abandoned_delegations() -> int:
+def recover_abandoned_delegations(*, invalid_ids: Optional[set[str]] = None) -> int:
     # Lock order is canonical JSON, then SQLite. Failed reads remain retryable.
     try:
         with _store.locked_registry(write=False) as registry:
-            return _recover_abandoned_delegations(registry)
+            return _recover_abandoned_delegations(registry, invalid_ids)
     except Exception:
         logger.warning("Could not recover delegation terminal mirrors", exc_info=True)
         raise
 
 
-def _recover_abandoned_delegations(registry) -> int:
+def _recover_abandoned_delegations(registry, invalid_ids=None) -> int:
     """Classify records whose owning process disappeared as outcome unknown."""
     try:
         from gateway.status import _pid_exists, get_process_start_time
@@ -495,7 +498,14 @@ def _recover_abandoned_delegations(registry) -> int:
         for row in rows:
             (delegation_id, session_key, origin_ui, parent_id, dispatched_at,
              pid, started, task_json, origin_session_id, state, disposition) = row
-            terminal = _canonical_terminal(registry, delegation_id)
+            try:
+                terminal = _canonical_terminal(registry, delegation_id)
+            except Exception:
+                if invalid_ids is not None:
+                    invalid_ids.add(delegation_id)
+                logger.warning("Could not recover delegation %s; invalid canonical evidence",
+                               delegation_id, exc_info=True)
+                continue
             if terminal is not None:
                 conn.execute("BEGIN IMMEDIATE")
                 _sync_completion(conn, terminal["payload"], terminal["execution_result"], terminal["state"])
@@ -574,7 +584,8 @@ def restore_undelivered_completions(target_queue) -> int:
     102K-token context on the staging fleet) for a result nobody is waiting
     on anymore; the payload stays queryable on the dropped row.
     """
-    recover_abandoned_delegations()
+    invalid_ids: set[str] = set()
+    recover_abandoned_delegations(invalid_ids=invalid_ids)
     now = time.time()
     restored = 0
     with _DB_LOCK, _transaction() as conn:
@@ -587,6 +598,8 @@ def restore_undelivered_completions(target_queue) -> int:
         ).fetchall()
         restored = 0
         for delegation_id, payload, _attempts, completed_at, dispatched_at in rows:
+            if delegation_id in invalid_ids:
+                continue
             # Park a completion that has exhausted its delivery budget: its origin
             # session is permanently gone (dead owner pid), so every boot it
             # re-enqueues, fails the fail-closed ownership gate, gets dropped
@@ -629,15 +642,15 @@ def claim_completion_delivery(
     delegation_id: str, claim_id: str, *, event: Optional[Dict[str, Any]] = None,
 ) -> bool:
     try:
+        profile_home = (event or {}).get("_registry_profile_home")
+        if profile_home and Path(profile_home).resolve() != _registry_path().parent.parent.resolve():
+            return False
         with _store.locked_registry(write=False) as registry:
             terminal = _canonical_terminal(registry, delegation_id)
             if terminal is not None and event is not None:
                 if (not _same_completion_event(terminal["payload"], event)
                         or any(event.get(key) != terminal["payload"].get(key)
                                for key in ("profile", "attempt_id"))):
-                    return False
-                profile_home = event.get("_registry_profile_home")
-                if profile_home and Path(profile_home).resolve() != _registry_path().parent.parent.resolve():
                     return False
             return _claim_completion_delivery(delegation_id, claim_id, event=event, terminal=terminal)
     except Exception:
