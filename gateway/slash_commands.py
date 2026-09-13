@@ -772,8 +772,22 @@ class GatewaySlashCommandsMixin:
                     delivery_metadata = self._thread_metadata_for_source(
                         source, self._reply_anchor_for_event(event)
                     ) or None
+                    # Canonicalize on WRITE (see tools/kanban_tools.py): a
+                    # Discord guild chat is keyed 'group', so persisting the
+                    # raw 'channel' envelope spelling writes a row that cannot
+                    # match its own chat's routing entry -> identity-less wake
+                    # -> phantom session (2026-09-12; readers fixed in #682).
+                    # Hoisted out of the delivery_metadata branch below: it was
+                    # only assigned when metadata happened to be a dict, so the
+                    # subscription could be written with chat_type unset.
+                    chat_type = str(getattr(source, "chat_type", "") or "")
+                    if chat_type:
+                        try:
+                            from gateway.routing_identity import canonical_chat_type
+                            chat_type = canonical_chat_type(platform_str, chat_type)
+                        except Exception:  # pragma: no cover - never block a sub
+                            pass
                     if isinstance(delivery_metadata, dict):
-                        chat_type = str(getattr(source, "chat_type", "") or "")
                         if chat_type:
                             delivery_metadata.setdefault("chat_type", chat_type)
                     if platform_str and chat_id:
