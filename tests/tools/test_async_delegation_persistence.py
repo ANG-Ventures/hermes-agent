@@ -331,6 +331,44 @@ def test_terminal_outbox_replays_and_acknowledges():
     assert ad.enqueue_pending_outbox(current_boot_id="300:3.0") == 0
 
 
+@pytest.mark.parametrize("age", [48 * 3600 - 1, 48 * 3600, 48 * 3600 + 1])
+@pytest.mark.parametrize("event_type", ["async_delegation", "async_delegation_restarted"])
+def test_json_only_outbox_replay_expires_without_sqlite_row(monkeypatch, age, event_type):
+    """The JSON replay rail must enforce the same age cap as SQLite recovery."""
+    now = time.time()
+    monkeypatch.setattr(time, "time", lambda: now)
+    record = _running_record()
+    event_id = f"{record['delegation_id']}:terminal:g1"
+    payload = {
+        "type": event_type, "event_id": event_id,
+        "delegation_id": record["delegation_id"],
+        "session_key": record["route"]["session_key"],
+        "attempt_generation": 1,
+        "summary": "retained result",
+    }
+    record["state"] = "done"
+    record["outbox"] = [{
+        "event_id": event_id, "type": event_type, "state": "pending",
+        "queued_boot_id": "old-boot", "created_at": now - age,
+        "delivered_at": None, "drop_reason": None, "payload": payload,
+    }]
+    _write_record(record)
+    assert ad.get_durable_delegation(record["delegation_id"]) is None
+
+    expired = age > ad._MAX_COMPLETION_REPLAY_AGE_S
+    assert ad.enqueue_pending_outbox(current_boot_id="new-boot") == (0 if expired else 1)
+    saved = _load()["records"][record["delegation_id"]]["outbox"][0]
+    assert saved["payload"] == payload
+    if expired:
+        assert saved["state"] == "dropped"
+        assert saved["drop_reason"] == "stale_completion"
+        assert ad.enqueue_pending_outbox(current_boot_id="third-boot") == 0
+        assert process_registry.completion_queue.empty()
+    else:
+        assert saved["state"] == "pending"
+        assert process_registry.completion_queue.get_nowait()["event_id"] == event_id
+
+
 def test_session_cancel_persists_before_interrupt_signal():
     result, gate = _dispatch()
     observed = []
