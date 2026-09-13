@@ -337,8 +337,8 @@ def test_json_only_outbox_replay_expires_without_sqlite_row(monkeypatch, age, ev
     """The JSON replay rail must enforce the same age cap as SQLite recovery."""
     now = time.time()
     monkeypatch.setattr(time, "time", lambda: now)
-    record = _running_record()
-    event_id = f"{record['delegation_id']}:terminal:g1"
+    record = _running_record(generation=1)
+    event_id = f"{record['delegation_id']}:{event_type}:g1"
     payload = {
         "type": event_type, "event_id": event_id,
         "delegation_id": record["delegation_id"],
@@ -367,6 +367,59 @@ def test_json_only_outbox_replay_expires_without_sqlite_row(monkeypatch, age, ev
     else:
         assert saved["state"] == "pending"
         assert process_registry.completion_queue.get_nowait()["event_id"] == event_id
+
+
+def test_json_outbox_ages_completion_not_dispatch_and_preserves_unknown_age(monkeypatch):
+    from tools import async_delegation_store as store
+
+    now = time.time()
+    monkeypatch.setattr(time, "time", lambda: now)
+    record = _running_record()
+    record["created_at"] = now - 3 * 24 * 3600
+    _write_record(record)
+    payload = store.append_terminal(
+        record["delegation_id"], record["attempt"]["attempt_id"],
+        {"summary": "new result from old task"}, "completed",
+    )
+    assert payload is not None
+    assert ad.enqueue_pending_outbox(current_boot_id="next-boot") == 1
+    assert process_registry.completion_queue.get_nowait()["event_id"] == payload["event_id"]
+    # The cap must not infer age from dispatch when an old-format event lacks
+    # a timestamp, and must leave already-accepted receipts unchanged.
+    with store.locked_registry() as registry:
+        events = registry["records"][record["delegation_id"]]["outbox"]
+        events[0].pop("created_at")
+    monkeypatch.setattr(time, "time", lambda: now + 3 * 24 * 3600)
+    assert ad.enqueue_pending_outbox(current_boot_id="third-boot") == 1
+    assert ad.acknowledge_outbox_event(payload["event_id"], outcome="delivered")
+    assert ad.enqueue_pending_outbox(current_boot_id="fourth-boot") == 0
+    assert _load()["records"][record["delegation_id"]]["outbox"][0]["state"] == "delivered"
+
+
+def test_json_outbox_staleness_is_profile_scoped(tmp_path, monkeypatch):
+    from tools import async_delegation_store as store
+
+    now = time.time()
+    monkeypatch.setattr(time, "time", lambda: now)
+    profile = tmp_path / "other-profile"
+    record = _running_record()
+    with store.locked_registry(profile) as registry:
+        registry["records"][record["delegation_id"]] = record
+    payload = store.append_terminal(
+        record["delegation_id"], record["attempt"]["attempt_id"],
+        {"summary": "old result"}, "completed", profile_home=profile,
+    )
+    assert payload is not None
+    monkeypatch.setattr(time, "time", lambda: now + 3 * 24 * 3600)
+    assert ad.enqueue_pending_outbox(current_boot_id="other-boot") == 0
+    with store.locked_registry(profile) as registry:
+        assert registry["records"][record["delegation_id"]]["outbox"][0]["state"] == "pending"
+    assert ad.enqueue_pending_outbox(current_boot_id="other-boot", profile_home=profile) == 0
+    with store.locked_registry(profile) as registry:
+        event = registry["records"][record["delegation_id"]]["outbox"][0]
+        assert event["state"] == "dropped"
+        assert event["payload"] == payload
+    assert process_registry.completion_queue.empty()
 
 
 def test_session_cancel_persists_before_interrupt_signal():
