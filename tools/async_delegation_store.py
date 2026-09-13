@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 MAX_REDISPATCH_ATTEMPTS = 2
+MAX_COMPLETION_REPLAY_AGE_SECONDS = 48 * 3600.0
 MAX_REGISTRY_RECORDS = 256
 TERMINAL_RETENTION_SECONDS = 7 * 24 * 60 * 60
 ABSOLUTE_RETENTION_SECONDS = 30 * 24 * 60 * 60
@@ -1006,6 +1007,7 @@ def enqueue_pending_outbox(
     profile_home: Path | None = None,
 ) -> list[dict[str, Any]]:
     queued: list[dict[str, Any]] = []
+    now = time.time()
     with locked_registry(profile_home) as registry:
         invalid_record_ids = set(registry.get("_invalid_record_ids", []))
         for delegation_id, record in registry["records"].items():
@@ -1024,6 +1026,20 @@ def enqueue_pending_outbox(
                     event["delivered_at"] = time.time()
                     continue
                 if event.get("queued_boot_id") == current_boot_id:
+                    continue
+                # JSON outbox events need not have a legacy SQLite row. Apply
+                # the replay horizon here, before any consumer can inject them.
+                # Age the event, not the dispatch: a long-running task may have
+                # completed just now. Missing timestamps are not proof of age.
+                created_at = event.get("created_at")
+                if isinstance(created_at, (int, float)) and now - created_at > MAX_COMPLETION_REPLAY_AGE_SECONDS:
+                    event["state"] = "dropped"
+                    event["drop_reason"] = "stale_completion"
+                    event["delivered_at"] = now
+                    logger.warning(
+                        "async_delegation_outbox_dropped event_id=%s reason=stale_completion age_hours=%.1f",
+                        event.get("event_id"), (now - created_at) / 3600.0,
+                    )
                     continue
                 event["queued_boot_id"] = current_boot_id
                 queued.append(copy.deepcopy(payload))
