@@ -121,7 +121,7 @@ _MAX_DELIVERY_ATTEMPTS = 10
 # terminally dropped instead of re-run as a fresh full-context turn (see
 # restore_undelivered_completions). 48h keeps overnight/weekend results
 # deliverable while stopping weeks-old sessions from replaying after upgrades.
-_MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
+_MAX_COMPLETION_REPLAY_AGE_S = _store.MAX_COMPLETION_REPLAY_AGE_SECONDS
 _DB_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
