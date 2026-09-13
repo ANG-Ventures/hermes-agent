@@ -26054,21 +26054,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pass
 
         if session_key:
-            persisted_route_lookup = None
-            if session_entry is not None:
-                if getattr(session_entry, "_model_override_identity_invalid", False):
-                    persisted_route_lookup = PersistedSessionRouteLookup("unavailable")
-                else:
-                    identity = getattr(session_entry, "model_override_identity", None)
-                    persisted_route_lookup = PersistedSessionRouteLookup(
-                        "valid" if identity else "absent",
-                        identity if identity else None,
-                    )
+            # A fresh transcript entry can have no identity while its chat
+            # still has a durable pin. Use the same authority as the next turn.
             model, runtime = self._resolve_session_agent_runtime(
                 source=source,
                 session_key=session_key,
                 user_config=data,
-                persisted_route_lookup=persisted_route_lookup,
             )
             provider = runtime.get("provider")
             base_url = runtime.get("base_url")
