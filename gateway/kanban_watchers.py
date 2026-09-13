@@ -243,8 +243,8 @@ def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     :func:`_release_singleton_lock` when done. ``(None, "contended")`` when
     another process holds the lock (caller must NOT dispatch). ``(None,
     "unavailable")`` when locking cannot be performed (non-POSIX filesystem
-    without flock, or the status.py helpers are unimportable) — caller falls
-    back to config-only control.
+    without flock, or the status.py helpers are unimportable) — caller must
+    not dispatch without proven exclusion.
     """
     try:
         from gateway.status import _try_acquire_file_lock  # deferred; same package
@@ -1646,7 +1646,13 @@ class GatewayKanbanWatchersMixin:
 
     async def _kanban_dispatcher_watcher(self) -> None:
         """Own leadership until the watcher and any in-flight service work exit."""
-        self._kanban_dispatcher_lock_handle = None
+        if getattr(self, "_kanban_dispatcher_watcher_active", False):
+            logger.warning("kanban dispatcher: watcher already active; ignoring duplicate start")
+            return
+        if self._owns_kanban_dispatcher_lock():
+            logger.error("kanban dispatcher: retained leadership; refusing duplicate start")
+            return
+        self._kanban_dispatcher_watcher_active = True
         pending = None
 
         async def service(func, *args):
@@ -1661,9 +1667,14 @@ class GatewayKanbanWatchersMixin:
                 # Event-loop teardown may cancel even the shielded service.
                 # Its thread can still be writing: retain the lock until process
                 # exit rather than allowing another gateway to race that work.
+                logger.error(
+                    "kanban dispatcher: service cancelled at loop teardown; "
+                    "leadership retained until process exit to protect in-flight writes"
+                )
                 return
             finished.exception()  # consume failures after watcher cancellation
             self._release_kanban_dispatcher_lock()
+            self._kanban_dispatcher_watcher_active = False
 
         try:
             await self._run_kanban_dispatcher(service)
@@ -1672,6 +1683,7 @@ class GatewayKanbanWatchersMixin:
                 pending.add_done_callback(release)
             else:
                 self._release_kanban_dispatcher_lock()
+                self._kanban_dispatcher_watcher_active = False
 
     async def _run_kanban_dispatcher(self, service) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
@@ -1679,6 +1691,9 @@ class GatewayKanbanWatchersMixin:
         Gated by `kanban.dispatch_in_gateway` in config.yaml (default True).
         When true, the gateway competes for the machine-global dispatcher lock;
         a contending gateway retries on the dispatch cadence until shutdown.
+        Takeover waits at most one retry interval plus the existing five-second
+        startup grace (normally about 65 seconds), excluding in-flight work.
+        A missing lock backend never authorizes unprotected dispatch.
         No separate `hermes kanban daemon` process needed. When false, the
         loop exits immediately and an external daemon is expected.
 
@@ -1745,11 +1760,32 @@ class GatewayKanbanWatchersMixin:
 
         _lock_path = _kb.kanban_home() / "kanban" / ".dispatcher.lock"
         waiting_logged = False
+        unavailable_logged = False
         while self._running:
+            # A standby may wait for days: honor disablement before each attempt,
+            # and use fresh leader policy rather than its stale boot snapshot.
+            env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
+            if env_override in {"0", "false", "no", "off"}:
+                return
+            try:
+                cfg = _load_config()
+                kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+            except Exception:
+                logger.exception("kanban dispatcher: cannot refresh standby configuration; disabled")
+                return
+            if not kanban_cfg.get("dispatch_in_gateway", True):
+                return
             _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
-            if _lock_state != "contended":
+            if _lock_state == "held":
                 break
-            if not waiting_logged:
+            if _lock_state == "unavailable":
+                if not unavailable_logged:
+                    logger.error(
+                        "kanban dispatcher: lock unavailable at %s; "
+                        "dispatch disabled until exclusion can be established", _lock_path,
+                    )
+                    unavailable_logged = True
+            elif not waiting_logged:
                 logger.info(
                     "kanban dispatcher: another gateway holds the dispatcher "
                     "lock (%s); standing by, retrying every %.1fs.", _lock_path, interval,
@@ -1763,14 +1799,11 @@ class GatewayKanbanWatchersMixin:
                 slept += 1.0
         else:
             return
-        if _lock_state == "held":
-            self._kanban_dispatcher_lock_handle = _lock_handle
-            logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", _lock_path)
+        self._kanban_dispatcher_lock_handle = _lock_handle
+        if waiting_logged or unavailable_logged:
+            logger.warning("kanban dispatcher: assumed leadership after standby (%s)", _lock_path)
         else:
-            logger.warning(
-                "kanban dispatcher: advisory lock unavailable at %s; proceeding "
-                "on config control alone.", _lock_path,
-            )
+            logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", _lock_path)
 
         # Read max_spawn config to limit concurrent kanban tasks
         max_spawn = kanban_cfg.get("max_spawn", None)

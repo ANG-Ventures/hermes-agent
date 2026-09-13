@@ -20,15 +20,17 @@ class Clock:
     """Advance watcher sleeps explicitly, without patching the asyncio module."""
 
     def __init__(self):
-        self.sleeps = asyncio.Queue()
+        self.sleeps = {}
 
     async def sleep(self, delay):
         resume = asyncio.get_running_loop().create_future()
-        await self.sleeps.put((delay, resume))
+        queue = self.sleeps.setdefault(asyncio.current_task(), asyncio.Queue())
+        await queue.put((delay, resume))
         await resume
 
     async def paused(self, task):
-        waiter = asyncio.create_task(self.sleeps.get())
+        queue = self.sleeps.setdefault(task, asyncio.Queue())
+        waiter = asyncio.create_task(queue.get())
         try:
             done, _ = await asyncio.wait(
                 (task, waiter), timeout=5, return_when=asyncio.FIRST_COMPLETED,
@@ -304,20 +306,95 @@ async def test_cancel_does_not_release_while_service_thread_is_running(harness, 
 
 
 @pytest.mark.asyncio
-async def test_unavailable_lock_preserves_config_only_dispatch(harness, monkeypatch, caplog):
+async def test_unavailable_lock_never_dispatches_without_exclusion(harness, monkeypatch, caplog):
     h = harness
     b = runner()
     monkeypatch.setattr(watchers, "_acquire_singleton_lock", lambda path: (None, "unavailable"))
     task = asyncio.create_task(b._kanban_dispatcher_watcher())
     try:
-        _, resume = await h.clock.paused(task)
-        resume.set_result(None)
-        await h.clock.paused(task)
-        assert h.dispatch.call_count == 1
+        for _ in range(4):
+            delay, resume = await h.clock.paused(task)
+            assert delay <= 1
+            h.dispatch.assert_not_called()
+            h.reaper.assert_not_called()
+            resume.set_result(None)
         assert not b._owns_kanban_dispatcher_lock()
-        assert "on config control alone" in caplog.text
+        assert "lock unavailable" in caplog.text
     finally:
         await cancel(task, b)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disabled_by", ["config", "env"])
+async def test_standby_rechecks_disable_before_taking_leadership(harness, monkeypatch, disabled_by):
+    h = harness
+    owner, state = watchers._acquire_singleton_lock(h.path)
+    assert state == "held"
+    b = runner()
+    task = asyncio.create_task(b._kanban_dispatcher_watcher())
+    try:
+        for _ in range(2):
+            _, resume = await h.clock.paused(task)
+            if disabled_by == "config":
+                h.cfg["kanban"]["dispatch_in_gateway"] = False
+            else:
+                monkeypatch.setenv("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "off")
+            watchers._release_singleton_lock(owner)
+            owner = None
+            resume.set_result(None)
+        await asyncio.wait_for(task, 2)
+        h.dispatch.assert_not_called()
+        h.reaper.assert_not_called()
+        assert not b._owns_kanban_dispatcher_lock()
+    finally:
+        await cancel(task, b)
+        watchers._release_singleton_lock(owner)
+
+
+@pytest.mark.asyncio
+async def test_second_watcher_cannot_drop_existing_leadership(harness):
+    h = harness
+    b = runner()
+    first = asyncio.create_task(b._kanban_dispatcher_watcher())
+    try:
+        await h.clock.paused(first)
+        original_handle = b._kanban_dispatcher_lock_handle
+        assert original_handle is not None
+        await asyncio.wait_for(b._kanban_dispatcher_watcher(), 1)
+        assert b._kanban_dispatcher_lock_handle is original_handle
+        assert not original_handle.closed
+        other, state = watchers._acquire_singleton_lock(h.path)
+        try:
+            assert state == "contended"
+        finally:
+            watchers._release_singleton_lock(other)
+    finally:
+        await cancel(first, b)
+
+
+@pytest.mark.asyncio
+async def test_many_contended_attempts_do_not_leak_descriptors(harness):
+    import psutil
+
+    if not hasattr(psutil.Process(), "num_fds"):
+        pytest.skip("POSIX descriptor-count probe")
+    h = harness
+    owner, state = watchers._acquire_singleton_lock(h.path)
+    assert state == "held"
+    initial_fds = psutil.Process().num_fds()
+    b = runner()
+    task = asyncio.create_task(b._kanban_dispatcher_watcher())
+    try:
+        for _ in range(44):
+            _, resume = await h.clock.paused(task)
+            resume.set_result(None)
+        await h.clock.paused(task)
+        assert len(h.handles) >= 22
+        assert psutil.Process().num_fds() <= initial_fds
+        assert all(handle.closed for handle in h.handles if handle is not owner)
+    finally:
+        await cancel(task, b)
+        watchers._release_singleton_lock(owner)
 
 
 @pytest.mark.asyncio
