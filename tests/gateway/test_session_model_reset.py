@@ -512,6 +512,9 @@ async def test_reset_banner_matches_durable_chat_route(tmp_path, monkeypatch, co
 
     monkeypatch.setattr(model_metadata, "get_model_context_length", context_length)
     try:
+        if route == "pin":
+            assert old.model_override_identity is None
+            assert runner.session_store.lookup_persisted_route_identity(key).identity == identity
         notice = await runner._handle_reset_command(_make_event(command))
         fresh = runner.session_store.entry_for(key)
         assert fresh is not None
@@ -535,7 +538,9 @@ async def test_reset_banner_matches_durable_chat_route(tmp_path, monkeypatch, co
             else:
                 assert model == "global-model"
                 assert "model and reasoning" not in notice
-            assert "reasoning" in notice
+            assert "◆ Reasoning: high" in notice
+            assert "Preserved explicit" in notice
+            assert "reasoning preferences" in notice
         assert "test-only" not in notice
         assert "fresh-key" not in notice
         if route == "pin":
