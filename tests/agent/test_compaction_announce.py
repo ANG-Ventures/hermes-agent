@@ -863,14 +863,44 @@ class TestGranularWireFirst:
             assert "token-est reclaimed from archive" not in out
 
     def test_wire_kwargs_ignored_on_live_basis(self):
-        # Auto-announce path must stay byte-identical even if kwargs leak in
+        # SUPERSEDED 2026-09-12 (footer parity). This originally asserted that
+        # the live/auto basis IGNORED wire kwargs, so the auto-announce could
+        # not drift if kwargs leaked in. That guard also blocked the intended
+        # fix: the automatic banner rendered an ESTIMATE headline that silently
+        # disagreed with the runtime footer (which renders
+        # context_compressor.last_prompt_tokens — gateway/run.py:25414 <- 7413).
+        # Measured 2026-09-12: banner ~369K vs footer/provider ~554K, which the
+        # old divergence line then blamed on the estimator ("1.50x under")
+        # despite the estimator scoring 1.03x against a real tokenizer.
+        #
+        # New contract: wire kwargs are HONORED on either basis (the
+        # measured-before presentation is correct regardless of which surface
+        # asked), and the back-compat guarantee is narrowed to what it was
+        # actually protecting — an auto-announce that passes NO wire kwargs is
+        # byte-identical to before.
         s = _good_stats()
         live_plain = _format_granular_announce("h", s, "m", False, None, None)
-        live_kw = _format_granular_announce(
+        live_absent = _format_granular_announce(
+            "h", s, "m", False, None, None,
+            wire_before=None, wire_after=None,
+        )
+        assert live_absent == live_plain
+
+        # Partial/zero wire numbers must also fall back to the estimate shape.
+        for wb, wa in ((0, 80_143), (236_012, 0)):
+            assert _format_granular_announce(
+                "h", s, "m", False, None, None, wire_before=wb, wire_after=wa,
+            ) == live_plain
+
+        # With a complete measured pair, the live basis NOW leads with the
+        # measured number so the banner agrees with the footer.
+        live_measured = _format_granular_announce(
             "h", s, "m", False, None, None,
             wire_before=236_012, wire_after=80_143,
         )
-        assert live_kw == live_plain
+        assert live_measured != live_plain
+        assert "236,012" in live_measured
+        assert "before measured" in live_measured
 
 
 class TestProviderModelSplit:

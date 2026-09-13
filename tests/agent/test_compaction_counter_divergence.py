@@ -61,14 +61,34 @@ def _Stats(pre_tokens=503_180, post_tokens=62_000):
 # ── _counter_divergence_line ────────────────────────────────────────────────
 
 
-def test_divergence_line_reports_the_real_measured_incident():
-    """The exact numbers Ace reported must produce a visible divergence line."""
+def test_divergence_line_reports_both_readings_without_blaming_the_estimator():
+    """The line must report both numbers and NAME the sampling offset.
+
+    The old wording ("local estimate reads 1.38x under") was a false
+    accusation: the estimator scores 1.03x against a real tokenizer over
+    identical wire-shaped objects. The gap is a sampling offset — the provider
+    reading covers more messages than the compacted set.
+    """
     line = _counter_divergence_line(503_180, 693_766)
-    assert line is not None, "a 1.38x counter gap must not be silent"
+    assert line is not None, "a large reading gap must not be silent"
     assert "503K" in line
     assert "693K" in line
-    assert "1.38x" in line
-    assert "under" in line, "direction must be named; under-counting is the risky one"
+    # The accusation must be gone.
+    assert "1.38x" not in line
+    assert "under" not in line
+    assert "Counters disagree" not in line
+    # The real reason must be named.
+    assert "different message sets" in line
+
+
+def test_divergence_line_never_blames_the_estimator_in_either_direction():
+    """Neither direction may render an estimator-skew claim."""
+    for est, real in ((700_000, 400_000), (400_000, 700_000)):
+        line = _counter_divergence_line(est, real)
+        assert line is not None
+        assert "x under" not in line
+        assert "x over" not in line
+        assert "local estimate reads" not in line
 
 
 def test_agreeing_counters_stay_silent():
@@ -84,12 +104,13 @@ def test_tolerance_boundary_is_respected():
     assert _counter_divergence_line(100_000, 116_000) is not None  # 1.16x
 
 
-def test_over_counting_is_reported_with_the_other_direction():
-    """An over-counting estimate is benign but still worth naming correctly."""
+def test_over_counting_is_reported_without_a_direction_claim():
+    """An over-reading provider figure is reported, but not as estimator skew."""
     line = _counter_divergence_line(700_000, 400_000)
     assert line is not None
-    assert "over" in line
+    assert "over" not in line
     assert "under" not in line
+    assert "different message sets" in line
 
 
 @pytest.mark.parametrize(
@@ -118,7 +139,7 @@ def test_non_numeric_input_does_not_raise():
 # ── rendered into the actual announce ───────────────────────────────────────
 
 
-def test_announce_includes_divergence_when_counters_disagree():
+def test_announce_includes_divergence_when_readings_differ():
     out = _format_granular_announce(
         "🗜️ Context compacted",
         _Stats(),
@@ -128,8 +149,9 @@ def test_announce_includes_divergence_when_counters_disagree():
         None,
         real_prompt_tokens=693_766,
     )
-    assert "Counters disagree" in out
     assert "693K" in out
+    assert "different message sets" in out
+    assert "Counters disagree" not in out
 
 
 def test_announce_omits_divergence_when_counters_agree():
@@ -160,14 +182,81 @@ def test_announce_unchanged_without_a_provider_reading():
 
 
 def test_divergence_renders_on_the_no_reduction_branch_too():
-    """Both Context-line branches must carry the divergence, not just one."""
+    """Both Context-line branches must carry the note, not just one."""
     stats = _Stats(pre_tokens=503_180, post_tokens=503_180)  # freed == 0
     out = _format_granular_announce(
         "🗜️ Context compacted", stats, "m", False, None, None,
         real_prompt_tokens=693_766,
     )
     assert "no net token reduction" in out
-    assert "Counters disagree" in out
+    assert "different message sets" in out
+
+
+# ── 🔴 FOOTER PARITY (2026-09-12) ───────────────────────────────────────────
+#
+# Ace reads the runtime footer after every message, so the compaction banner's
+# headline must agree with it. The footer renders
+# context_compressor.last_prompt_tokens (gateway/run.py:25414 <- 7413); manual
+# /compress already passes that same basis as wire_before
+# (slash_commands.py:5566 <- session_entry.last_prompt_tokens, persisted from
+# the same agent_result value at run.py:25744). These pin that the AUTOMATIC
+# announce now reaches the same measured-before renderer.
+
+
+def test_measured_before_renderer_reachable_on_the_live_basis():
+    """The auto announce (basis='live') must reach wire_mode when given wire numbers.
+
+    Regression for the inert-fix shape: wire_mode used to be gated on
+    basis=='stored', so passing wire_before/wire_after from the automatic path
+    changed nothing and the banner kept rendering an estimate headline that
+    disagreed with the footer.
+    """
+    out = _format_granular_announce(
+        "🗜️ Context compacted", _Stats(), "m", False, None, None,
+        basis="live",
+        wire_before=554_000,
+        wire_after=149_000,
+    )
+    # The MEASURED provider number leads, exactly as the footer shows it.
+    assert "554,000" in out
+    assert "before measured" in out
+    # And the estimate-only headline must not be what we shipped.
+    assert "~503K → " not in out
+
+
+def test_measured_before_headline_matches_the_footer_value():
+    """The headline's leading number must be the footer's number, verbatim."""
+    footer_value = 427_526  # a real context_used reading from the Blackbox ledger
+    out = _format_granular_announce(
+        "🗜️ Context compacted", _Stats(), "m", False, None, None,
+        basis="live",
+        wire_before=footer_value,
+        wire_after=133_476,
+    )
+    assert f"{footer_value:,}" in out
+
+
+def test_no_estimator_accusation_when_measured_pair_present():
+    """With a measured pair, the misleading comparison must not appear at all."""
+    out = _format_granular_announce(
+        "🗜️ Context compacted", _Stats(), "m", False, None, None,
+        basis="live",
+        wire_before=554_000,
+        wire_after=149_000,
+        real_prompt_tokens=554_000,
+    )
+    assert "Counters disagree" not in out
+    assert "local estimate reads" not in out
+
+
+def test_live_basis_without_wire_numbers_is_unchanged():
+    """Back-compat: no wire kwargs on the live basis renders the old shape."""
+    stats = _Stats()
+    baseline = _format_granular_announce(
+        "🗜️ Context compacted", stats, "m", False, None, None, basis="live",
+    )
+    assert "before measured" not in baseline
+    assert "Context:" in baseline
 
 
 # ── the clamp that hid this ─────────────────────────────────────────────────
