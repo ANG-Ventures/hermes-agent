@@ -13718,6 +13718,33 @@ def add_notify_sub(
         # carrying a session_id always woke. Explicit modes still win.
         "notify+wake" if platform == "api_server" else "notify"
     )
+    # 🔴 CHOKE POINT: canonicalize here, not at each caller.
+    #
+    # A Discord guild chat is keyed 'group' by build_session_key. A row stored
+    # as chat_type='channel' cannot match its own chat's routing entry, so the
+    # wake finds no identity, keys a bare group:<chat> session, and mints a
+    # phantom that replies into the user's channel at the config default
+    # (2026-09-12 incident; readers fixed in #682, two writers in #684).
+    #
+    # #684 put the guard at two of the FOUR callers — the classic per-caller
+    # placement bug, blind to every call site added later. Measured after that
+    # deploy: subscribe_calling_session() correctly stored 'group' while a
+    # direct add_notify_sub(chat_type='channel') still persisted 'channel'.
+    # This function is the single layer every writer shares (the CLI's
+    # --chat-type, the dashboard plugin, the gateway tools), so the invariant
+    # belongs here and cannot be bypassed by a future caller.
+    #
+    # Non-Discord platforms are untouched: canonical_chat_type is a no-op for
+    # them, and Teams/Telegram/HomeAssistant own 'channel' as a real type.
+    # Fails open — a canonicalizer import error must never block a
+    # subscription (losing the sub is worse than storing a legacy spelling,
+    # which the fleet data-lint still repairs).
+    if chat_type:
+        try:
+            from gateway.routing_identity import canonical_chat_type
+            chat_type = canonical_chat_type(platform, chat_type)
+        except Exception:  # pragma: no cover - never block a subscription
+            pass
     insert_chat_type = chat_type or "dm"
     now = int(time.time())
     metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
