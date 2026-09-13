@@ -289,11 +289,16 @@ class GatewaySlashCommandsMixin:
         if isinstance(reasoning, dict):
             self._session_reasoning_overrides[session_key] = dict(reasoning)
 
-        # Resolve the identity from the exact entry returned by reset_session.
-        # This avoids consulting a stale/mocked store map between rotation and
-        # cache rebuild. No user-action setter is called, so reset cannot emit a
-        # fake switch/recovery announcement.
+        # Prefer the same chat-pin-aware authority as the next turn. Only
+        # lightweight stores without that capability use the returned entry.
+        # No user-action setter is called, so this cannot announce a switch.
         identity = getattr(entry, "model_override_identity", None) if entry else None
+        store = getattr(self, "session_store", None)
+        if callable(getattr(type(store), "lookup_persisted_route_identity", None)):
+            route_lookup = self._persisted_session_route_identity(session_key)
+            identity = route_lookup.identity
+            if route_lookup.state == "unavailable":
+                self._session_model_override_unavailable.add(session_key)
         if (
             isinstance(identity, dict)
             and identity.get("model")
@@ -528,10 +533,14 @@ class GatewaySlashCommandsMixin:
         preserved_preferences = []
         unavailable_model_preference = False
         if preserve_route_preferences and new_entry:
-            invalid_model_preference = bool(
-                getattr(new_entry, "_model_override_identity_invalid", False)
-            )
-            if new_entry.model_override_identity or invalid_model_preference:
+            route_lookup = self._persisted_session_route_identity(session_key)
+            invalid_model_preference = route_lookup.state == "unavailable"
+            if (
+                route_lookup.identity
+                or self._session_model_overrides.get(session_key)
+                or session_key in getattr(self, "_session_model_override_unavailable", set())
+                or invalid_model_preference
+            ):
                 unavailable_model_preference = invalid_model_preference or session_key in getattr(
                     self, "_session_model_override_unavailable", set()
                 )

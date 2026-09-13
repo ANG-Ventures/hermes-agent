@@ -462,3 +462,107 @@ async def test_new_command_only_rotates_own_session_preferences():
     assert other_key in runner._session_reasoning_overrides
     assert session_key not in runner._pending_model_notes
     assert other_key in runner._pending_model_notes
+
+
+@pytest.mark.parametrize("command", ["/new", "/reset"])
+@pytest.mark.parametrize("route", ["pin", "clear", "absent", "legacy", "unavailable", "credentials-unavailable", "reconciliation-unavailable"])
+@pytest.mark.asyncio
+async def test_reset_banner_matches_durable_chat_route(tmp_path, monkeypatch, caplog, command, route):
+    import agent.model_metadata as model_metadata
+    import gateway.run as gateway_run
+    from gateway.chat_model_pins import ChatModelPins
+    from gateway.session import SessionStore
+    from hermes_state import SessionDB
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    db = SessionDB(tmp_path / "state.db")
+    monkeypatch.setattr("hermes_state.SessionDB", lambda: db)
+    runner = _make_runner()
+    del runner._format_session_info
+    runner.session_store = SessionStore(tmp_path / "sessions", runner.config)
+    source = _make_source()
+    old = runner.session_store.get_or_create_session(source)
+    key = old.session_key
+    identity = {"model": "pinned-model", "provider": "openai-codex", "api_mode": "codex_responses"}
+    old.reasoning_override = {"enabled": True, "effort": "high"}
+    if route in {"legacy", "clear"}:
+        old.model_override_identity = dict(identity)
+    runner.session_store.persist()
+    pins = ChatModelPins(runner.session_store.sessions_dir)
+    if route in {"pin", "clear", "unavailable", "credentials-unavailable"}:
+        pins.set("main", "telegram", source.chat_id, identity if route != "clear" else None)
+    if route == "unavailable":
+        def unavailable(*args):
+            raise OSError("read unavailable")
+
+        monkeypatch.setattr(ChatModelPins, "get", unavailable)
+    pin_reads = []
+    if route == "reconciliation-unavailable":
+        real_get_pin = runner.session_store.get_chat_model_pin
+
+        def alternating_pin_read(session_key):
+            pin_reads.append(session_key)
+            if len(pin_reads) % 2 == 0:
+                raise OSError("pin-read-secret")
+            return real_get_pin(session_key)
+
+        monkeypatch.setattr(runner.session_store, "get_chat_model_pin", alternating_pin_read)
+    if route == "credentials-unavailable":
+        runner._reresolve_model_override_credentials = lambda identity: None
+    config = {"model": {"default": "global-model", "provider": "openrouter", "context_length": 100_000}}
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: config)
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda _config=None: "global-model")
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"provider": "openrouter", "api_key": "test-only"})
+    monkeypatch.setattr(gateway_run, "_credential_pool_for_provider", lambda *_: None)
+    probes = []
+
+    def context_length(model, **kwargs):
+        probes.append((model, kwargs.get("provider"), kwargs.get("config_context_length")))
+        return 400_000 if model == "pinned-model" else 100_000
+
+    monkeypatch.setattr(model_metadata, "get_model_context_length", context_length)
+    try:
+        if route == "pin":
+            assert old.model_override_identity is None
+            assert runner.session_store.lookup_persisted_route_identity(key).identity == identity
+        notice = await runner._handle_reset_command(_make_event(command))
+        fresh = runner.session_store.entry_for(key)
+        assert fresh is not None
+        assert fresh.session_id != old.session_id
+        if route not in {"legacy", "clear"}:
+            assert fresh.model_override_identity is None
+        if route in {"unavailable", "credentials-unavailable", "reconciliation-unavailable"}:
+            assert "◆ Model:" not in notice
+            assert "unavailable" in notice.lower()
+            with pytest.raises(gateway_run.SessionRouteUnavailableError):
+                runner._resolve_session_agent_runtime(source=source, session_key=key, user_config=config)
+        else:
+            model, runtime = runner._resolve_session_agent_runtime(source=source, session_key=key, user_config=config)
+            assert f"◆ Model: `{model}`" in notice
+            assert f"◆ Provider: {runtime['provider']}" in notice
+            if route in {"pin", "legacy"}:
+                assert model == "pinned-model"
+                assert "◆ Context: 400K tokens" in notice
+                assert "model and reasoning" in notice
+                assert len(probes) == 1
+                assert probes[0][2] is None
+            else:
+                assert model == "global-model"
+                assert "model and reasoning" not in notice
+            assert "◆ Reasoning: high" in notice
+            assert "Preserved explicit" in notice
+            assert "reasoning preferences" in notice
+        if route == "reconciliation-unavailable":
+            assert len(pin_reads) >= 2
+            assert not probes
+            assert "global-model" not in notice
+            assert "Chat model pin reconciliation unavailable" in caplog.text
+            assert "pin-read-secret" not in caplog.text
+            assert "pin-read-secret" not in notice
+        assert "test-only" not in notice
+        assert "fresh-key" not in notice
+        if route == "pin":
+            assert pins.get("main", "telegram", source.chat_id) == (True, identity)
+    finally:
+        db.close()
