@@ -586,6 +586,7 @@ def append_terminal(
             "status": status,
             "completed_at": payload["completed_at"],
             "error": result.get("error"),
+            "result": copy.deepcopy(result),
         }
         record["updated_at"] = payload["completed_at"]
         append_lifecycle_event(

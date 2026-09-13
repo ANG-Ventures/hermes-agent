@@ -135,6 +135,48 @@ assert identifier not in [e["delegation_id"] for e in list(q.queue)]
     run(consumer)
 
 
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("startup", [False, True])
+def test_canonical_recovery_preserves_exact_execution_result(monkeypatch, batch, startup):
+    result = {"status": "completed", "summary": "structured result", "api_calls": 7,
+              "schema_valid": True, "structured_output": {"answer": [1, 2, 3]}}
+    if batch:
+        result = {"results": [result], "total_duration_seconds": 0.25}
+    identifier, worker, _ = dispatch(monkeypatch, batch=batch, result=result)
+    with monkeypatch.context() as m:
+        def fail(*args):
+            raise sqlite3.OperationalError("injected mirror failure")
+        m.setattr(ad, "_persist_completion", fail)
+        worker()
+    event = process_registry.completion_queue.get_nowait()
+    if startup:
+        ad.restore_undelivered_completions(queue.Queue())
+    claim = ad.claim_event_delivery(event, "result-reader")
+    assert claim
+    assert ad.get_durable_delegation(identifier)["result"] == result
+    ad.complete_event_delivery(event, claim)
+    assert ad.get_durable_delegation(identifier)["result"] == result
+
+
+def test_legacy_canonical_without_raw_result_does_not_invent_one(monkeypatch):
+    identifier, event = failed_mirror(monkeypatch)
+    with ad._store.locked_registry() as registry:
+        registry["records"][identifier]["terminal"].pop("result", None)
+    assert ad.claim_event_delivery(event, "legacy-result-reader")
+    # Legacy outboxes retain the answer but cannot reconstruct the original dict.
+    assert ad.get_durable_delegation(identifier)["result"] is None
+    assert json.loads(row(identifier)["event_json"])["summary"] == "receipt-nonce"
+
+
+def test_canonical_invalid_execution_result_fails_visibly(monkeypatch):
+    identifier, event = failed_mirror(monkeypatch)
+    with ad._store.locked_registry() as registry:
+        registry["records"][identifier]["terminal"]["result"] = ["not a result object"]
+    with pytest.raises(ad._store.RegistryError, match="invalid terminal result"):
+        ad.claim_event_delivery(event, "reader")
+    assert row(identifier)["delivery_state"] == "pending"
+
+
 def failed_mirror(monkeypatch, *, batch=False):
     identifier, worker, _ = dispatch(monkeypatch, batch=batch)
     with monkeypatch.context() as m:

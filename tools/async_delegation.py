@@ -398,7 +398,7 @@ def _sync_completion(conn, event, result, disposition=None):
         return
     same_event = _same_completion_event(json.loads(row[0] or "null"), event)
     if result is None:
-        result = json.loads(row[1]) if same_event and row[1] else event
+        result = json.loads(row[1]) if same_event and row[1] else None
     if not same_event:
         conn.execute(
             """UPDATE async_delegations SET delivery_state='pending',
@@ -453,7 +453,10 @@ def _canonical_terminal(registry, delegation_id):
             or payload.get("profile") != record.get("profile")
             or payload.get("status") != record["terminal"].get("status")):
         raise _store.RegistryError(f"invalid terminal identity for {delegation_id}")
-    return entry
+    result = record["terminal"].get("result")
+    if result is not None and not isinstance(result, dict):
+        raise _store.RegistryError(f"invalid terminal result for {delegation_id}")
+    return {**entry, "execution_result": result}
 
 
 def _note_delivery_attempt(delegation_id: str) -> None:
@@ -495,7 +498,7 @@ def _recover_abandoned_delegations(registry) -> int:
             terminal = _canonical_terminal(registry, delegation_id)
             if terminal is not None:
                 conn.execute("BEGIN IMMEDIATE")
-                _sync_completion(conn, terminal["payload"], None, terminal["state"])
+                _sync_completion(conn, terminal["payload"], terminal["execution_result"], terminal["state"])
                 conn.commit()
                 continue
             canonical = registry["records"].get(delegation_id) or {}
@@ -648,7 +651,7 @@ def _claim_completion_delivery(delegation_id, claim_id, *, event=None, terminal=
     with _DB_LOCK, _transaction() as conn:
         conn.execute("BEGIN IMMEDIATE")
         if terminal is not None:
-            _sync_completion(conn, terminal["payload"], None, terminal["state"])
+            _sync_completion(conn, terminal["payload"], terminal["execution_result"], terminal["state"])
         row = conn.execute(
             "SELECT delivery_state, event_json FROM async_delegations WHERE delegation_id=?",
             (delegation_id,),
