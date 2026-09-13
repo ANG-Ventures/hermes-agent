@@ -13037,10 +13037,12 @@ def _notification_poller_loop(
 
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
+            claim_event_delivery, complete_event_delivery_with_retry, release_event_delivery,
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            with session["history_lock"]:
+                session["running"] = False
             continue
         try:
             _emit("message.start", sid)
@@ -13055,7 +13057,6 @@ def _notification_poller_loop(
                 )
             else:
                 _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
             print(
@@ -13065,6 +13066,8 @@ def _notification_poller_loop(
             )
             with session["history_lock"]:
                 session["running"] = False
+        else:
+            complete_event_delivery_with_retry(evt, _claim)
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
@@ -13115,10 +13118,12 @@ def _notification_poller_loop(
 
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
+            claim_event_delivery, complete_event_delivery_with_retry, release_event_delivery,
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            with session["history_lock"]:
+                session["running"] = False
             continue
         try:
             _emit("message.start", sid)
@@ -13133,7 +13138,6 @@ def _notification_poller_loop(
                 )
             else:
                 _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
             print(
@@ -13143,6 +13147,8 @@ def _notification_poller_loop(
             )
             with session["history_lock"]:
                 session["running"] = False
+        else:
+            complete_event_delivery_with_retry(evt, _claim)
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
@@ -14434,15 +14440,16 @@ def _run_prompt_submit(
                         break
                     session["running"] = True
                 from tools.async_delegation import (
-                    claim_event_delivery, complete_event_delivery, release_event_delivery,
+                    claim_event_delivery, complete_event_delivery_with_retry, release_event_delivery,
                 )
                 _claim = claim_event_delivery(_evt, "tui-post-turn")
                 if _claim is None:
+                    with session["history_lock"]:
+                        session["running"] = False
                     continue
                 try:
                     _emit("message.start", sid)
                     _run_prompt_submit(rid, sid, session, synth)
-                    complete_event_delivery(_evt, _claim)
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)
                     print(
@@ -14452,6 +14459,8 @@ def _run_prompt_submit(
                     )
                     with session["history_lock"]:
                         session["running"] = False
+                else:
+                    complete_event_delivery_with_retry(_evt, _claim)
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "

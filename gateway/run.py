@@ -30832,13 +30832,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=True,
                     )
                 if parent_session_id != current_session_id:
-                    pinned_row = None
+                    session_db = getattr(self, "_session_db", None)
+                    if session_db is None:
+                        return "temporary"
                     try:
-                        session_db = getattr(self, "_session_db", None)
-                        if session_db is not None:
-                            pinned_row = await session_db.get_session(parent_session_id)
+                        pinned_row = await session_db.get_session(parent_session_id)
                     except Exception:
-                        pinned_row = None
+                        logger.warning("Pinned completion lookup unavailable", exc_info=True)
+                        return "temporary"
                     # Drop only for a genuinely-gone parent: unknown row, or a
                     # row the USER explicitly closed (/new, exit, switch).
                     # Idle/timeout ends are the norm on scale-to-zero relay
@@ -30899,6 +30900,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         rather than risking suppression of a real completion.
         """
         evt_type = str(evt.get("type") or "")
+        if evt_type in {"async_delegation", "async_delegation_restarted"} and evt.get("event_id"):
+            return (evt_type, str(evt["event_id"]), str(evt.get("_registry_profile_home") or ""))
         if evt_type == "async_delegation":
             producer_id = str(evt.get("delegation_id") or "")
             return (evt_type, producer_id, "") if producer_id else None
@@ -30976,8 +30979,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "retry"
         return "deliver"
 
+    @staticmethod
+    async def _claim_completion_notification(evt: dict, consumer: str) -> str | None:
+        """Recover a cancelled executor claim before abandoning its ownership."""
+        from tools.async_delegation import claim_event_delivery, release_event_delivery
+
+        operation = asyncio.create_task(asyncio.to_thread(claim_event_delivery, evt, consumer))
+        cancelled = False
+        try:
+            while True:
+                try:
+                    claim_id = await asyncio.shield(operation)
+                    break
+                except asyncio.CancelledError:
+                    cancelled = True
+                    # Repeated cancellation must not detach a still-mutating
+                    # worker. Its existing storage timeout bounds this wait.
+                    if operation.done():
+                        claim_id = operation.result()
+                        break
+            if cancelled and claim_id:
+                release_event_delivery(evt, claim_id)
+            return claim_id
+        except Exception:
+            if cancelled:
+                logger.warning("Completion claim cleanup failed during cancellation", exc_info=True)
+            raise
+        finally:
+            if cancelled:
+                raise asyncio.CancelledError
+
     async def _deliver_completion_notification(
-        self, synth_text: str, evt: dict,
+        self, synth_text: str, evt: dict, *,
+        receipt_batch: list[tuple[dict, str | None]] | None = None,
+    ) -> str | None:
+        """Keep classification, injection and receipts in the producer's scope."""
+        home = evt.get("_registry_profile_home")
+        if home:
+            with _profile_runtime_scope(Path(home)):
+                return await self._deliver_completion_notification_in_scope(
+                    synth_text, evt, receipt_batch=receipt_batch,
+                )
+        return await self._deliver_completion_notification_in_scope(
+            synth_text, evt, receipt_batch=receipt_batch,
+        )
+
+    async def _deliver_completion_notification_in_scope(
+        self, synth_text: str, evt: dict, *,
+        receipt_batch: list[tuple[dict, str | None]] | None = None,
     ) -> str | None:
         """Deliver once per live gateway, or return False for a retry.
 
@@ -30987,125 +31036,127 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         means another same-lifecycle caller owns/delivered the producer event.
         No cross-process exactly-once guarantee is claimed.
         """
+        from tools.async_delegation import acknowledge_event_outbox
+
         identity = self._completion_delivery_identity(evt)
         durable_claim_id = ""
         durable_delegation_id = ""
-        if evt.get("type") == "async_delegation":
-            durable_delegation_id = str(evt.get("delegation_id") or "")
-            if durable_delegation_id:
-                try:
-                    from tools.async_delegation import claim_completion_delivery
+        accepted = False
+        inflight_owned = False
+        # Own cleanup before any claim can be adopted or preflight can await.
+        try:
+            if evt.get("type") in {"async_delegation", "async_delegation_restarted"}:
+                durable_delegation_id = str(evt.get("delegation_id") or "")
+                if durable_delegation_id and evt.get("type") == "async_delegation":
+                    try:
+                        durable_claim_id = await self._claim_completion_notification(
+                            evt, f"gateway:{id(self)}",
+                        )
+                        if durable_claim_id is None:
+                            return None
+                    except Exception as exc:
+                        logger.warning(
+                            "Could not claim durable async completion %s: %s",
+                            durable_delegation_id, exc,
+                        )
+                        return "temporary"
+                parent_session_id = str(evt.get("parent_session_id") or "").strip()
+                if parent_session_id:
+                    # Pre-flight (#65838-class): adapter acceptance is NOT proof of
+                    # delivery — the inner #55578 resolver can still fail closed
+                    # inside the message pipeline AFTER the adapter accepted, which
+                    # would falsely acknowledge the durable row as delivered.
+                    # Verify the target here, before acceptance, and give drops an
+                    # honest durable disposition.
+                    verdict = await self._classify_completion_target(parent_session_id)
+                    if verdict == "deliver":
+                        # Compression rotation: retarget the pinned delivery at the
+                        # live tip so downstream pinning follows the continuation,
+                        # not the rotated-out parent (fork delivery contract).
+                        try:
+                            _tip = await self._session_db.get_compression_tip(
+                                parent_session_id
+                            )
+                            if _tip and _tip != parent_session_id:
+                                _tip_row = await self._session_db.get_session(_tip)
+                                if _tip_row is not None and not _tip_row.get("ended_at"):
+                                    evt["parent_session_id"] = _tip
+                        except Exception:
+                            logger.debug(
+                                "Completion tip retarget failed; delivering to "
+                                "original parent", exc_info=True,
+                            )
+                    if verdict == "terminal":
+                        logger.warning(
+                            "Async delegation %s targets permanently-gone session %s; "
+                            "terminally dropping delivery (result remains in the "
+                            "delegation records).",
+                            durable_delegation_id or "<legacy>", parent_session_id,
+                        )
+                        try:
+                            await asyncio.to_thread(
+                                acknowledge_event_outbox, evt, outcome="dropped",
+                                reason="target_permanently_gone",
+                            )
+                        except Exception:
+                            logger.warning("Could not persist terminal outbox receipt", exc_info=True)
+                            verdict = "retry"
+                        else:
+                            if durable_claim_id:
+                                try:
+                                    from tools.async_delegation import drop_completion_delivery
 
-                    durable_claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
-                    if not claim_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
+                                    drop_completion_delivery(
+                                        durable_delegation_id, durable_claim_id,
+                                    )
+                                except Exception:
+                                    logger.debug(
+                                        "Could not drop durable completion claim",
+                                        exc_info=True,
+                                    )
+                            return "dropped"
+                    if verdict == "retry":
+                        return False
+            elif evt.get("type") == "completion":
+                # Background-process completions carry only session_key (chat/
+                # thread routing), so after /new the notification from the OLD
+                # session would land in the chat's NEW session. Stamped events
+                # (spawn-time parent_session_id from terminal_tool) get the same
+                # session-boundary pre-flight as async delegations — one policy
+                # owner (_classify_completion_target), never a forked predicate.
+                # Legacy/unstamped events keep today's behavior and deliver.
+                parent_session_id = str(evt.get("parent_session_id") or "").strip()
+                if parent_session_id:
+                    verdict = await self._classify_completion_target(parent_session_id)
+                    if verdict == "terminal":
+                        logger.warning(
+                            "Background process %s completion targets "
+                            "permanently-gone session %s (user boundary such as "
+                            "/new); dropping notification (output remains "
+                            "available via process(action='log')).",
+                            evt.get("session_id") or "<unknown>", parent_session_id,
+                        )
+                        return None
+                    if verdict == "retry":
+                        # Transient uncertainty (session DB unavailable or a
+                        # compression rotation mid-flight): signal the watcher to
+                        # re-poll and try again rather than dropping or
+                        # misrouting the result.
+                        return False
+            if identity is not None:
+                with self._completion_delivery_lock:
+                    if (
+                        identity in self._completion_deliveries_inflight
+                        or identity in self._completion_deliveries_delivered
                     ):
                         return None
-                except Exception as exc:
-                    logger.warning(
-                        "Could not claim durable async completion %s: %s",
-                        durable_delegation_id, exc,
-                    )
-                    return "temporary"
-            parent_session_id = str(evt.get("parent_session_id") or "").strip()
-            if parent_session_id:
-                # Pre-flight (#65838-class): adapter acceptance is NOT proof of
-                # delivery — the inner #55578 resolver can still fail closed
-                # inside the message pipeline AFTER the adapter accepted, which
-                # would falsely acknowledge the durable row as delivered.
-                # Verify the target here, before acceptance, and give drops an
-                # honest durable disposition.
-                verdict = await self._classify_completion_target(parent_session_id)
-                if verdict == "deliver":
-                    # Compression rotation: retarget the pinned delivery at the
-                    # live tip so downstream pinning follows the continuation,
-                    # not the rotated-out parent (fork delivery contract).
-                    try:
-                        _tip = await self._session_db.get_compression_tip(
-                            parent_session_id
-                        )
-                        if _tip and _tip != parent_session_id:
-                            _tip_row = await self._session_db.get_session(_tip)
-                            if _tip_row is not None and not _tip_row.get("ended_at"):
-                                evt["parent_session_id"] = _tip
-                    except Exception:
-                        logger.debug(
-                            "Completion tip retarget failed; delivering to "
-                            "original parent", exc_info=True,
-                        )
-                if verdict == "terminal":
-                    logger.warning(
-                        "Async delegation %s targets permanently-gone session %s; "
-                        "terminally dropping delivery (result remains in the "
-                        "delegation records).",
-                        durable_delegation_id or "<legacy>", parent_session_id,
-                    )
-                    if durable_claim_id:
-                        try:
-                            from tools.async_delegation import drop_completion_delivery
+                    self._completion_deliveries_inflight.add(identity)
+                inflight_owned = True
 
-                            drop_completion_delivery(
-                                durable_delegation_id, durable_claim_id,
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Could not drop durable completion claim",
-                                exc_info=True,
-                            )
-                    return "dropped"
-                if verdict == "retry":
-                    if durable_claim_id:
-                        try:
-                            from tools.async_delegation import release_completion_delivery
-
-                            release_completion_delivery(
-                                durable_delegation_id, durable_claim_id,
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Could not release durable completion claim",
-                                exc_info=True,
-                            )
-                    return False
-        elif evt.get("type") == "completion":
-            # Background-process completions carry only session_key (chat/
-            # thread routing), so after /new the notification from the OLD
-            # session would land in the chat's NEW session. Stamped events
-            # (spawn-time parent_session_id from terminal_tool) get the same
-            # session-boundary pre-flight as async delegations — one policy
-            # owner (_classify_completion_target), never a forked predicate.
-            # Legacy/unstamped events keep today's behavior and deliver.
-            parent_session_id = str(evt.get("parent_session_id") or "").strip()
-            if parent_session_id:
-                verdict = await self._classify_completion_target(parent_session_id)
-                if verdict == "terminal":
-                    logger.warning(
-                        "Background process %s completion targets "
-                        "permanently-gone session %s (user boundary such as "
-                        "/new); dropping notification (output remains "
-                        "available via process(action='log')).",
-                        evt.get("session_id") or "<unknown>", parent_session_id,
-                    )
-                    return None
-                if verdict == "retry":
-                    # Transient uncertainty (session DB unavailable or a
-                    # compression rotation mid-flight): signal the watcher to
-                    # re-poll and try again rather than dropping or
-                    # misrouting the result.
-                    return False
-        if identity is not None:
-            with self._completion_delivery_lock:
-                if (
-                    identity in self._completion_deliveries_inflight
-                    or identity in self._completion_deliveries_delivered
-                ):
-                    return None
-                self._completion_deliveries_inflight.add(identity)
-
-        accepted = False
-        try:
             injection_result = await self._inject_watch_notification(synth_text, evt)
             if injection_result != "delivered":
+                # A route unavailable to this consumer is not a terminal target.
+                # Keep the outbox pending for recovery by another boot/consumer.
                 return injection_result
             accepted = True
 
@@ -31119,24 +31170,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     ):
                         self._completion_deliveries_delivered.popitem(last=False)
 
-            # If the durable async-delegation producer branch is present, its
-            # SQLite row remains the authoritative replay state. Acknowledge it
-            # after adapter acceptance; this gateway keeps no parallel ledger.
-            if durable_claim_id:
+            # Acknowledge BOTH producer formats after adapter acceptance.
+            # JSON restart notices need a receipt even without a SQLite claim;
+            # the same helper covers coalesced siblings, CLI and TUI consumers.
+            if receipt_batch is not None:
+                # Return acceptance without an intervening cancellation point;
+                # the caller will write primary and sibling receipts together.
+                receipt_batch.append((evt, durable_claim_id))
+            else:
                 try:
-                    from tools.async_delegation import complete_completion_delivery
+                    from tools.async_delegation import complete_event_delivery_with_retry
 
-                    complete_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    )
+                    await asyncio.to_thread(complete_event_delivery_with_retry, evt, durable_claim_id)
                 except Exception as exc:
                     logger.warning(
-                        "Could not acknowledge durable async completion %s: %s",
-                        durable_delegation_id, exc,
+                        "Could not acknowledge durable completion %s: %s",
+                        evt.get("event_id") or durable_delegation_id, exc,
                     )
             return "delivered"
         finally:
-            if identity is not None and not accepted:
+            if inflight_owned and not accepted:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
             if durable_claim_id and not accepted:
@@ -31562,6 +31615,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         the full gateway route. Events for different sessions never coalesce.
         """
         return tuple(str(evt.get(field) or "") for field in (
+            "_registry_profile_home",
             "session_key",
             "parent_session_id",
             "platform",
@@ -31584,6 +31638,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return "\n\n".join([header, *blocks])
 
     async def _deliver_async_delegation_group(
+        self, group: list[dict],
+    ) -> Optional[bool]:
+        """Scope coalesced claims and sibling receipts like the primary event."""
+        home = group[0].get("_registry_profile_home") if group else None
+        if home:
+            with _profile_runtime_scope(Path(home)):
+                return await self._deliver_async_delegation_group_in_scope(group)
+        return await self._deliver_async_delegation_group_in_scope(group)
+
+    async def _deliver_async_delegation_group_in_scope(
         self, group: list[dict],
     ) -> Optional[bool]:
         """Deliver a same-session batch of async completions as ONE turn.
@@ -31628,50 +31692,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._deliver_completion_notification(synth_text, evt)
 
         from tools.async_delegation import (
-            claim_event_delivery,
-            complete_event_delivery,
+            complete_event_delivery_with_retry,
             release_event_delivery,
         )
 
         primary_evt, primary_text = deliverable[0]
         blocks = [primary_text]
         siblings: list[tuple[dict, str]] = []
-        for evt, synth_text in deliverable[1:]:
-            claim_id = claim_event_delivery(evt, f"gateway-batch:{id(self)}")
-            if claim_id is None:
-                # Another consumer owns this row's delivery; keep its result
-                # out of our consolidated text so it is never double-injected.
-                continue
-            siblings.append((evt, claim_id))
-            blocks.append(synth_text)
-
-        if not siblings:
-            return await self._deliver_completion_notification(
-                primary_text, primary_evt,
-            )
-
-        consolidated = self._format_coalesced_async_delegations(blocks)
+        receipt_batch: list[tuple[dict, str | None]] = []
         delivered: Optional[bool] = False
         try:
+            for evt, synth_text in deliverable[1:]:
+                claim_id = await self._claim_completion_notification(
+                    evt, f"gateway-batch:{id(self)}",
+                )
+                if claim_id is None:
+                    # Another consumer owns this row's delivery; keep its result
+                    # out of our consolidated text so it is never double-injected.
+                    continue
+                siblings.append((evt, claim_id))
+                blocks.append(synth_text)
+
+            if not siblings:
+                return await self._deliver_completion_notification(
+                    primary_text, primary_evt,
+                )
+
+            consolidated = self._format_coalesced_async_delegations(blocks)
             delivered = await self._deliver_completion_notification(
-                consolidated, primary_evt,
+                consolidated, primary_evt, receipt_batch=receipt_batch,
             )
         finally:
             # Vocabulary seam (2026-08 parity merge): the delivery function
             # returns the fork's outcome strings; "delivered" is adapter
             # acceptance.
             if delivered == "delivered":
-                for evt, claim_id in siblings:
-                    try:
-                        complete_event_delivery(evt, claim_id)
-                    except Exception:
-                        logger.debug(
-                            "Could not acknowledge coalesced durable completion",
-                            exc_info=True,
-                        )
+                receipt_batch.extend(siblings)
                 self._record_coalesced_completion_siblings(
                     [evt for evt, _claim_id in siblings]
                 )
+
+                def acknowledge_batch():
+                    # One off-thread operation: cancellation of its awaiter must
+                    # not skip later receipts for content already accepted.
+                    for event, claim in receipt_batch:
+                        try:
+                            complete_event_delivery_with_retry(event, claim)
+                        except Exception:
+                            logger.warning(
+                                "Could not acknowledge coalesced durable completion",
+                                exc_info=True,
+                            )
+
+                await asyncio.to_thread(acknowledge_batch)
             else:
                 # Not delivered — release every sibling claim so a retry (or
                 # another consumer) can claim it, honestly leaving the durable
