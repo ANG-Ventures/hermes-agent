@@ -792,3 +792,52 @@ def test_hostile_dict_subclass_child_cannot_abort_finalization(monkeypatch, tmp_
         assert ad.restore_undelivered_completions(queue.Queue()) == 0
     finally:
         ad._reset_for_tests()
+
+
+def test_raising_status_eq_cannot_destroy_a_healthy_sibling(monkeypatch, tmp_path):
+    """Guarding the LOOKUP is not enough: the COMPARISON is untrusted too.
+
+    A plain dict can carry a status whose __eq__ raises, so membership blew up
+    after a successful get(). The handler then discarded every child, and the
+    wrong result was accepted on both stores.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+
+    class RaisingEq(str):
+        def __eq__(self, other):
+            raise RuntimeError("hostile eq")
+
+        def __ne__(self, other):
+            raise RuntimeError("hostile ne")
+
+        def __hash__(self):
+            return 0
+
+    try:
+        hostile = {"task_index": 0, "status": RaisingEq("completed"),
+                   "summary": "A"}
+        healthy = {"task_index": 1, "status": "completed",
+                   "summary": "HEALTHY-SIBLING"}
+        delegation_id, worker, _ = helpers.dispatch(
+            monkeypatch, batch=True, result={"results": [hostile, healthy]})
+        worker()  # must not raise
+        with store.locked_registry() as registry:
+            assert registry["records"][delegation_id]["state"] == "done"
+
+        event = helpers.process_registry.completion_queue.get_nowait()
+        assert event["status"] == "completed"
+        assert len(event["results"]) == 2
+        survivor = event["results"][1]
+        assert survivor["task_index"] == 1
+        assert survivor["summary"] == "HEALTHY-SIBLING"
+
+        claim = ad.claim_event_delivery(event, "test-consumer")
+        assert claim
+        ad.complete_event_delivery(event, claim)
+        assert ad.get_durable_delegation(delegation_id)["delivery_state"] == "delivered"
+        assert store.enqueue_pending_outbox(current_boot_id="replay-probe") == []
+        assert ad.restore_undelivered_completions(queue.Queue()) == 0
+    finally:
+        ad._reset_for_tests()

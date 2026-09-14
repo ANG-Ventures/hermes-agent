@@ -1673,19 +1673,31 @@ def dispatch_async_delegation_batch(
     return {"status": "dispatched", "delegation_id": delegation_id}
 
 
-def _child_status(child: Any) -> Any:
+def _child_status(child: Any) -> str | None:
     """Read a batch child's status without trusting the child.
 
-    ``isinstance`` accepts a dict SUBCLASS, whose ``get`` can raise. Raising
-    here aborts classification, and the handler then discards EVERY returned
-    child -- destroying healthy siblings' real answers alongside the hostile
-    one. Read exact dicts only, and never let a lookup escape.
+    Two ways an untrusted child breaks classification, both of which discard
+    EVERY child in the handler and destroy healthy siblings' real answers:
+
+    1. ``isinstance`` accepts a dict SUBCLASS whose ``get`` raises.
+    2. Even a plain dict can hold a status object whose ``__eq__`` raises, so
+       the membership COMPARISON blows up after a successful lookup.
+
+    Return an exact ``str`` or ``None`` so the caller only ever compares
+    trusted values. A child must never break the batch.
     """
     if type(child) is not dict:
         return None
     try:
-        return child.get("status")
+        status = child.get("status")
     except Exception:  # noqa: BLE001 - a child must never break the batch
+        return None
+    # Coerce to an EXACT str: a str subclass can still override __eq__.
+    if type(status) is str:
+        return status
+    try:
+        return str(status) if isinstance(status, str) else None
+    except Exception:  # noqa: BLE001
         return None
 
 
