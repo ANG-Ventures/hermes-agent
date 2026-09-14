@@ -1011,6 +1011,23 @@ class _RaisingBoolValue:
         raise RuntimeError("hostile bool")
 
 
+class _HostileMeta(type):
+    """Even ``type(x) == known`` is user-defined via the metaclass."""
+
+    def __eq__(cls, other):
+        raise RuntimeError("hostile metaclass eq")
+
+    def __ne__(cls, other):
+        raise RuntimeError("hostile metaclass ne")
+
+    def __hash__(cls):
+        return 0
+
+
+class _HostileMetaValue(metaclass=_HostileMeta):
+    pass
+
+
 class _RaisingClassObj:
     @property
     def __class__(self):
@@ -1048,6 +1065,10 @@ def _hostile_cases():
         "results-lying-tuple": {"results": _LyingTuple((_KEEP,))},
         "model-raising-bool": {"results": [_KEEP],
                                "model": _RaisingBoolValue()},
+        "model-hostile-metaclass": {"results": [_KEEP],
+                                    "model": _HostileMetaValue()},
+        "summary-hostile-metaclass": {"results": [_KEEP],
+                                      "summary": _HostileMetaValue()},
         "surrogate-everywhere": {"results": [_KEEP], "summary": "\ud800",
                                  "error": "\ud800", "model": "\ud800",
                                  "exit_reason": "\ud800"},

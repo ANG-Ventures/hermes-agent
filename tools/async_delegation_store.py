@@ -1123,11 +1123,15 @@ def _first_present(primary: Any, fallback: Any) -> Any:
     """``primary or fallback`` without truth-testing untrusted data."""
     if primary is None:
         return fallback
-    if type(primary) in (str, bytes, list, tuple, dict, set):
-        try:
-            return primary if len(primary) else fallback
-        except Exception:  # noqa: BLE001
-            return fallback
+    # `type(x) in (...)` compares with ==, which a hostile METACLASS can
+    # override. Use identity only -- `is` cannot be intercepted.
+    primary_type = type(primary)
+    for known in (str, bytes, list, tuple, dict, set):
+        if primary_type is known:
+            try:
+                return primary if len(primary) else fallback
+            except Exception:  # noqa: BLE001
+                return fallback
     return primary
 
 
