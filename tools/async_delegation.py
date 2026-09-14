@@ -1622,13 +1622,18 @@ def dispatch_async_delegation_batch(
             # report a completed batch as an error.
             raw_children = combined.get("results") if isinstance(combined, dict) else None
             child_results = raw_children if type(raw_children) is list else []
-            if child_results and all(
-                _child_status(r) not in ("completed", "success")
-                for r in child_results
-            ):
-                status = "error"
-            else:
-                status = "completed"
+            try:
+                all_failed = bool(child_results) and all(
+                    _child_status(r) not in ("completed", "success")
+                    for r in child_results
+                )
+            except Exception:  # noqa: BLE001 - classification must never lose children
+                logger.warning(
+                    "async_delegation_child_classification_failed delegation_id=%s",
+                    delegation_id, exc_info=True,
+                )
+                all_failed = False
+            status = "error" if all_failed else "completed"
         except Exception as exc:  # noqa: BLE001 — must never crash the worker
             logger.exception("Async delegation batch %s crashed", delegation_id)
             combined = {
@@ -1693,19 +1698,15 @@ def _child_status(child: Any) -> str | None:
     except Exception:  # noqa: BLE001 - a child must never break the batch
         return None
     # Return an EXACT str or None -- never anything the caller must trust.
-    # type() not isinstance(): a str subclass can override __eq__. And str()
-    # is NOT a safe coercion, because a subclass whose __str__ returns self
-    # hands the hostile object straight back.
-    if type(status) is str:
-        return status
-    if isinstance(status, str):
-        try:
-            coerced = str.__str__(status)
-        except Exception:  # noqa: BLE001 - a child must never break the batch
-            return None
-        # Verify rather than assume the coercion escaped the subclass.
-        return coerced if type(coerced) is str else None
-    return None
+    #
+    # Only ``type(x) is str`` is safe here. Every softer test has already been
+    # escaped by a hostile child in review:
+    #   * ``isinstance`` invokes a ``__class__`` property,
+    #   * ``==`` invokes ``__eq__``,
+    #   * ``str()`` invokes ``__str__``, which may return self.
+    # ``type()`` reads the real type slot and cannot be overridden, so anything
+    # that is not exactly a str is simply refused rather than inspected.
+    return status if type(status) is str else None
 
 
 def _finalize_batch(

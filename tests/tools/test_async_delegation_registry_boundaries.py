@@ -893,3 +893,71 @@ def test_self_returning_str_subclass_cannot_destroy_a_sibling(monkeypatch, tmp_p
         assert ad.restore_undelivered_completions(queue.Queue()) == 0
     finally:
         ad._reset_for_tests()
+
+
+class _HostileClass:
+    """__class__ is a property that raises -- defeats isinstance().
+
+    Deliberately NOT a str subclass: subclassing str makes ``type(x) is str``
+    fail fast and never reach the isinstance() call, which is exactly why an
+    earlier version of this test passed against the broken code.
+    """
+
+    @property
+    def __class__(self):
+        raise RuntimeError("hostile __class__")
+
+
+class _HostileHash:
+    def __hash__(self):
+        raise RuntimeError("hostile hash")
+
+    def __eq__(self, other):
+        raise RuntimeError("hostile eq")
+
+
+class _HostileBool:
+    def __bool__(self):
+        raise RuntimeError("hostile bool")
+
+
+@pytest.mark.parametrize("make_status", [
+    pytest.param(_HostileClass, id="hostile-class"),
+    pytest.param(_HostileHash, id="hostile-hash"),
+    pytest.param(lambda: _HostileBool(), id="hostile-bool"),
+    pytest.param(lambda: None, id="none-status"),
+], )
+def test_no_hostile_child_status_can_destroy_a_sibling(
+    monkeypatch, tmp_path, make_status
+):
+    """Close the CLASS, not one symptom at a time.
+
+    Review escaped three successive guards: isinstance (via a __class__
+    property), == (via __eq__), and str() (via a self-returning __str__). Only
+    ``type(x) is str`` reads the real type slot and cannot be overridden.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        hostile = {"task_index": 0, "status": make_status(), "summary": "A"}
+        healthy = {"task_index": 1, "status": "completed",
+                   "summary": "HEALTHY-SIBLING"}
+        delegation_id, worker, _ = helpers.dispatch(
+            monkeypatch, batch=True, result={"results": [hostile, healthy]})
+        worker()  # must not raise
+
+        event = helpers.process_registry.completion_queue.get_nowait()
+        assert event["status"] == "completed"
+        survivor = event["results"][1]
+        assert survivor["task_index"] == 1
+        assert survivor["summary"] == "HEALTHY-SIBLING"
+
+        claim = ad.claim_event_delivery(event, "test-consumer")
+        assert claim
+        ad.complete_event_delivery(event, claim)
+        assert ad.get_durable_delegation(delegation_id)["delivery_state"] == "delivered"
+        assert store.enqueue_pending_outbox(current_boot_id="replay-probe") == []
+        assert ad.restore_undelivered_completions(queue.Queue()) == 0
+    finally:
+        ad._reset_for_tests()
