@@ -1614,7 +1614,19 @@ def dispatch_async_delegation_batch(
                 )
                 return
         try:
-            combined = runner() or {}
+            raw_combined = runner()
+            # No truth test on a runner-controlled object (__bool__ can raise),
+            # and a non-mapping return is NOT a success: reporting it completed
+            # would deliver a fabricated green to the user.
+            if raw_combined is None:
+                combined = {}
+            elif _store.isinstance_safe(raw_combined, dict):
+                combined = raw_combined
+            else:
+                raise TypeError(
+                    f"batch runner returned {type(raw_combined).__name__}, "
+                    "expected a mapping"
+                )
             # Batch status: completed unless every child errored/was interrupted.
             # Children are runner-controlled: a non-list "results", or an entry
             # that is not a dict, must NOT crash this classification. Raising
@@ -1627,13 +1639,17 @@ def dispatch_async_delegation_batch(
                 # entry (scalar, None, hostile object) is unjudgeable, and
                 # counting it as a failure would report a batch the runner
                 # said completed as an error.
-                judgeable = [
-                    child for child in child_results
-                    if _store.isinstance_safe(child, dict)
+                # Only children whose status we can actually READ get a vote.
+                # A missing/non-string/hostile status is unjudgeable: counting
+                # it as a failure reports a batch the runner said completed as
+                # an error.
+                votes = [
+                    status for status in (
+                        _child_status(child) for child in child_results
+                    ) if status is not None
                 ]
-                all_failed = bool(judgeable) and all(
-                    _child_status(child) not in ("completed", "success")
-                    for child in judgeable
+                all_failed = bool(votes) and all(
+                    status not in ("completed", "success") for status in votes
                 )
             except Exception:  # noqa: BLE001 - classification must never lose children
                 logger.warning(

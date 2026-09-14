@@ -677,8 +677,11 @@ def append_terminal(
         # status is runner-controlled: an unhashable value (e.g. a list) would
         # raise on the set-membership test before the terminal record or outbox
         # exist, durably stranding a completed job as running.
+        # type() not isinstance(), and only AFTER that is the value hashed:
+        # a str subclass with a raising/unhashable __hash__ would otherwise
+        # blow up the set-membership test before anything is persisted.
         terminal_state = (
-            "done" if isinstance(status, str) and status in {"completed", "success"}
+            "done" if type(status) is str and status in {"completed", "success"}
             else "failed"
         )
         payload = _terminal_payload(record, result, status)

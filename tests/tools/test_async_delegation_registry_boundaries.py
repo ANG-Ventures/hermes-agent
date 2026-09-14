@@ -1130,3 +1130,93 @@ def test_hostile_runner_result_never_loses_work(monkeypatch, tmp_path, case):
         assert store.enqueue_pending_outbox(current_boot_id="replay-probe") == []
     finally:
         ad._reset_for_tests()
+
+
+def test_unreadable_child_statuses_do_not_vote_as_failures(monkeypatch, tmp_path):
+    """An unjudgeable status must not be counted as a failure.
+
+    Children with a missing/non-string/hostile status yield None. Treating
+    None as "not completed" reported a batch the runner said completed as an
+    error -- a wrong aggregate answer handed to the parent.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        result = {"results": [{"task_index": 0, "summary": "A"},
+                              {"task_index": 1, "summary": "B"}]}
+        delegation_id, worker, _ = helpers.dispatch(
+            monkeypatch, batch=True, result=result)
+        worker()
+        event = helpers.process_registry.completion_queue.get_nowait()
+        assert event["status"] == "completed"
+        assert len(event["results"]) == 2
+        assert delegation_id
+    finally:
+        ad._reset_for_tests()
+
+
+def test_a_real_child_failure_is_still_reported(monkeypatch, tmp_path):
+    """Negative control: readable failures must STILL classify as error."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        result = {"results": [{"task_index": 0, "status": "error",
+                               "summary": "boom"}]}
+        delegation_id, worker, _ = helpers.dispatch(
+            monkeypatch, batch=True, result=result)
+        worker()
+        event = helpers.process_registry.completion_queue.get_nowait()
+        assert event["status"] == "error"
+        assert delegation_id
+    finally:
+        ad._reset_for_tests()
+
+
+def test_non_mapping_runner_result_is_not_reported_as_success(
+    monkeypatch, tmp_path
+):
+    """A malformed runner return must not be delivered as a fabricated green.
+
+    Regression: hardening the readers made a truthy non-dict return produce
+    zero children, so the all-failed vote was False and the batch was
+    delivered as COMPLETED. Base reported error; this restores that.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        delegation_id, worker, _ = helpers.dispatch(
+            monkeypatch, batch=True, result="a bare string, not a mapping")
+        worker()  # must not raise
+        event = helpers.process_registry.completion_queue.get_nowait()
+        assert event["status"] == "error"
+        assert delegation_id
+    finally:
+        ad._reset_for_tests()
+
+
+def test_unhashable_status_cannot_abort_terminal_persistence(
+    monkeypatch, tmp_path
+):
+    """terminal_state hashed the status for set membership before persisting."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+
+    class Unhashable(str):
+        def __hash__(self):
+            raise RuntimeError("hostile hash")
+
+    try:
+        result = {"status": Unhashable("completed"), "summary": "ok"}
+        delegation_id, worker, _ = helpers.dispatch(monkeypatch, result=result)
+        worker()  # must not raise
+        with store.locked_registry() as registry:
+            record = registry["records"][delegation_id]
+        assert record["terminal"]
+        assert len(record.get("outbox") or []) == 1
+        assert helpers.process_registry.completion_queue.get_nowait()
+    finally:
+        ad._reset_for_tests()
