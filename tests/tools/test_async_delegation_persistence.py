@@ -20,10 +20,32 @@ def _isolated_registry(tmp_path, monkeypatch):
     ad._reset_for_tests()
     while not process_registry.completion_queue.empty():
         process_registry.completion_queue.get_nowait()
-    yield tmp_path
-    ad._reset_for_tests()
-    while not process_registry.completion_queue.empty():
-        process_registry.completion_queue.get_nowait()
+    executors = []
+    executor_type = ad._DaemonThreadPoolExecutor
+
+    def owned_executor(*args, **kwargs):
+        executor = executor_type(*args, **kwargs)
+        executors.append(executor)
+        return executor
+
+    # Keep retired pools too: growth and restart simulations can replace _executor.
+    monkeypatch.setattr(ad, "_DaemonThreadPoolExecutor", owned_executor)
+    try:
+        yield tmp_path
+    finally:
+        for executor in executors:
+            executor.shutdown(wait=False)
+        deadline = time.monotonic() + 10
+        for executor in executors:
+            for thread in executor._threads:
+                thread.join(timeout=max(0, deadline - time.monotonic()))
+                if thread.is_alive():
+                    pytest.fail(f"Async delegation worker did not quiesce: {thread.name}")
+        # A terminal record is not a completion barrier: _finalize can still put
+        # onto the global queue. Preserve registry, env and patches until it exits.
+        ad._reset_for_tests()
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
 
 
 def _spec(*, goal="continue the report", generation=0):
@@ -129,6 +151,81 @@ def _running_record(*, delegation_id="deleg_rc", owner="100:1.0", generation=0,
         "terminal": None,
         "outbox": [],
     }
+
+
+@pytest.mark.parametrize("retire_pool", ["current", "grow", "reset"])
+def test_isolated_registry_quiesces_late_finalization(tmp_path, retire_pool):
+    """A real worker held at publication must finish before fixture cleanup."""
+    entered = threading.Event()
+    release = threading.Event()
+    workers = []
+    published = []
+    with pytest.MonkeyPatch.context() as patches:
+        fixture = _isolated_registry.__wrapped__(tmp_path / "nested", patches)
+        next(fixture)
+        completion_queue = process_registry.completion_queue
+        original_put = completion_queue.put
+        original_join = threading.Thread.join
+
+        def held_put(event, *args, **kwargs):
+            workers.append(threading.current_thread())
+            entered.set()
+            assert release.wait(10), "fixture never joined the publishing worker"
+            original_put(event, *args, **kwargs)
+            published.append(event)
+
+        def release_on_join(thread, *args, **kwargs):
+            if thread in workers:
+                release.set()
+            return original_join(thread, *args, **kwargs)
+
+        patches.setattr(completion_queue, "put", held_put)
+        patches.setattr(threading.Thread, "join", release_on_join)
+        result, gate = _dispatch()
+        gate.set()
+        try:
+            assert entered.wait(10), "real worker did not reach completion publication"
+            if retire_pool == "grow":
+                ad._get_executor(4)
+            elif retire_pool == "reset":
+                ad._reset_for_tests()
+            with pytest.raises(StopIteration):
+                next(fixture)
+        finally:
+            release.set()
+            for worker in workers:
+                original_join(worker, timeout=10)
+                assert not worker.is_alive()
+        assert len(published) == 1
+        assert published[0]["delegation_id"] == result["delegation_id"]
+        assert process_registry.completion_queue.empty()
+
+
+def test_isolated_registry_fails_loudly_if_worker_cannot_quiesce(tmp_path):
+    with pytest.MonkeyPatch.context() as patches:
+        fixture = _isolated_registry.__wrapped__(tmp_path / "nested", patches)
+        next(fixture)
+        result, gate = _dispatch()
+        workers = list(ad._executor._threads)
+        original_join = threading.Thread.join
+        joins = []
+
+        def timed_out_join(thread, timeout=None):
+            assert thread in workers
+            assert 0 <= timeout <= 10
+            joins.append(thread)
+
+        patches.setattr(threading.Thread, "join", timed_out_join)
+        try:
+            with pytest.raises(pytest.fail.Exception, match="worker did not quiesce"):
+                next(fixture)
+            assert joins
+            assert result["delegation_id"] in ad._records
+        finally:
+            gate.set()
+            for worker in workers:
+                original_join(worker, timeout=10)
+                assert not worker.is_alive()
 
 
 def test_dispatch_persists_generation_zero_before_success():
