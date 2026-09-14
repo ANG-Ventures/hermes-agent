@@ -992,6 +992,25 @@ class _RaisingLen(list):
         raise RuntimeError("hostile len")
 
 
+class _LyingIndex(list):
+    """Indexing is virtual: hands back a DIFFERENT object, fabricating answers."""
+
+    def __getitem__(self, index):
+        return {"task_index": 99, "status": "completed", "summary": "FAKE"}
+
+
+class _LyingTuple(tuple):
+    """len() is virtual on tuples too: hides every entry."""
+
+    def __len__(self):
+        return 0
+
+
+class _RaisingBoolValue:
+    def __bool__(self):
+        raise RuntimeError("hostile bool")
+
+
 class _RaisingClassObj:
     @property
     def __class__(self):
@@ -1025,6 +1044,10 @@ def _hostile_cases():
         "summary-hostile": {"results": [_KEEP], "summary": _RaisingClassObj()},
         "total-duration-hostile": {"results": [_KEEP],
                                    "total_duration_seconds": _RaisingClassObj()},
+        "results-lying-index": {"results": _LyingIndex([_KEEP, _KEEP])},
+        "results-lying-tuple": {"results": _LyingTuple((_KEEP,))},
+        "model-raising-bool": {"results": [_KEEP],
+                               "model": _RaisingBoolValue()},
         "surrogate-everywhere": {"results": [_KEEP], "summary": "\ud800",
                                  "error": "\ud800", "model": "\ud800",
                                  "exit_reason": "\ud800"},

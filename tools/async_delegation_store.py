@@ -589,7 +589,10 @@ def _terminal_payload(record: dict[str, Any], result: dict[str, Any], status: st
         "context": source.get("shared_context"),
         "toolsets": execution.get("toolsets"),
         "role": (tasks[0].get("role") if tasks else "leaf"),
-        "model": _safe_get(result, "model") or execution.get("model"),
+        # No truth test on runner data: `x or y` calls __bool__, which a
+        # hostile value can make raise before any normalization happens.
+        "model": _first_present(
+            _safe_get(result, "model"), execution.get("model")),
         "status": status,
         "summary": _safe_get(result, "summary"),
         "error": _safe_get(result, "error"),
@@ -1116,6 +1119,18 @@ def claim_recoveries(
 _MISSING = object()
 
 
+def _first_present(primary: Any, fallback: Any) -> Any:
+    """``primary or fallback`` without truth-testing untrusted data."""
+    if primary is None:
+        return fallback
+    if type(primary) in (str, bytes, list, tuple, dict, set):
+        try:
+            return primary if len(primary) else fallback
+        except Exception:  # noqa: BLE001
+            return fallback
+    return primary
+
+
 def _safe_get(mapping: Any, key: str, default: Any = None) -> Any:
     """Read one key from an untrusted mapping without running its code.
 
@@ -1154,12 +1169,19 @@ def _safe_sequence(value: Any) -> list:
         return value
     if value is None:
         return []
-    if isinstance_safe(value, (list, tuple)):
-        # Rebuild through the C-level slots so an overridden __len__/__iter__
-        # cannot hide entries from every downstream consumer.
+    # Rebuild through the CONCRETE type's own slots. len()/tuple()/value[i]
+    # are all virtual: a subclass can lie about its length or hand back
+    # different items on indexing, silently dropping or fabricating answers.
+    if isinstance_safe(value, list):
         try:
-            size = list.__len__(value) if isinstance_safe(value, list) else len(value)
-            return [value[index] for index in range(size)]
+            size = list.__len__(value)
+            return [list.__getitem__(value, index) for index in range(size)]
+        except Exception:  # noqa: BLE001
+            return []
+    if isinstance_safe(value, tuple):
+        try:
+            size = tuple.__len__(value)
+            return [tuple.__getitem__(value, index) for index in range(size)]
         except Exception:  # noqa: BLE001
             return []
     return [value]
