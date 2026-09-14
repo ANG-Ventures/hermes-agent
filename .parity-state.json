@@ -1548,7 +1548,7 @@
     },
     {
       "at": "2026-08-30T13:49:00.946534+00:00",
-      "path": "tests/test_hermes_state.py",
+      "path": "tests/test_hermes_state_core.py",
       "reason": "BUCKET-1/2 RESOLVED-CONFLICT (tailored). staged conflict UU/9h, resolved to 0 markers. D10 audit: test_writable_close_retains_truncate_checkpoint absent tree-wide, but it is BASE-OWNED (present at merge-base 1e5b5074) and UPSTREAM DELETED IT in ba80f3b86d 'fix(state): PASSIVE not TRUNCATE for all state.db checkpoints (#45383)' - the test pinned the TRUNCATE behavior upstream deliberately removed. D8 rung 3: upstream-intentional deletion, restoring it would re-break the fix. 0 fork-AUTHORED symbols lost."
     },
     {
