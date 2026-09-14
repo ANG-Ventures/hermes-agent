@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import logging
 import os
 import time
@@ -194,9 +195,42 @@ def _load(path: Path, *, allow_invalid_records: bool = False) -> dict[str, Any]:
              or "delegation_id" in record)
             and record.get("delegation_id") != delegation_id
         )
-        invalid_outbox = (not isinstance(outbox, list)
-                          or any(not isinstance(event, dict) for event in outbox))
-        if invalid_state or invalid_identity or invalid_outbox:
+        invalid_outbox = (
+            not isinstance(outbox, list)
+            or any(
+                not isinstance(event, dict)
+                or (event.get("payload") is not None
+                    and not isinstance(event.get("payload"), dict))
+                for event in outbox
+            )
+        )
+        # The recovery loops convert these without guards (float(created_at),
+        # int(generation/redispatch_count)) and .get() into attempt. A
+        # valid-checksum record carrying a bad scalar would raise out of the
+        # per-record loop and abort the WHOLE profile's recovery/replay, so it
+        # is quarantined here like any other malformed structure. bool is
+        # rejected explicitly: it is an int subclass, so `completed_at: true`
+        # would otherwise persist as timestamp 1.
+        attempt_field = record.get("attempt")
+        invalid_numeric = (
+            (attempt_field is not None and not isinstance(attempt_field, dict))
+            or not _is_optional_number(record.get("created_at"))
+            or not _is_optional_number(record.get("updated_at"))
+        )
+        if isinstance(attempt_field, dict) and not invalid_numeric:
+            invalid_numeric = (
+                not _is_optional_number(attempt_field.get("generation"))
+                or not _is_optional_number(attempt_field.get("redispatch_count"))
+                or not _is_optional_number(attempt_field.get("started_at"))
+                or not _is_optional_number(attempt_field.get("submitted_at"))
+            )
+        terminal_field = record.get("terminal")
+        if not invalid_numeric and terminal_field is not None:
+            invalid_numeric = (
+                not isinstance(terminal_field, dict)
+                or not _is_optional_number(terminal_field.get("completed_at"))
+            )
+        if invalid_state or invalid_identity or invalid_outbox or invalid_numeric:
             if not allow_invalid_records:
                 raise RegistryError(f"record {delegation_id} has invalid state/identity/outbox structure")
             invalid_record_ids.append(str(delegation_id))
@@ -1026,6 +1060,51 @@ def claim_recoveries(
     return claimed, summary
 
 
+def _is_optional_number(value: Any) -> bool:
+    """True for None or a real finite number. ``bool`` is NOT a number here.
+
+    ``bool`` is a subclass of ``int``, so an ``isinstance`` check would accept
+    ``completed_at: true`` and persist it as timestamp ``1``.
+    """
+    if value is None:
+        return True
+    if type(value) is int:
+        return True
+    if type(value) is float:
+        return math.isfinite(value)
+    return False
+
+
+def _is_exact_json_value(value: Any, _seen: frozenset[int] = frozenset()) -> bool:
+    """True only for values JSON preserves EXACTLY, using exact types.
+
+    ``type(x) is T`` (not ``isinstance``) so that ``dict``/``list``/``str``
+    subclasses -- which may override ``__eq__`` -- are refused rather than
+    trusted. ``bool`` is checked before ``int`` because ``bool`` is a subclass
+    of ``int``; both round-trip exactly, so both are accepted. Containers track
+    identity along the current path: a self-referential structure is simply not
+    JSON-representable, and must be REFUSED rather than recursed into (a
+    RecursionError here would abort the completion this archive is optional to).
+    """
+    if value is None or type(value) is bool or type(value) is str:
+        return True
+    if type(value) is int:
+        return True
+    if type(value) is float:
+        return math.isfinite(value)
+    if type(value) is list or type(value) is dict:
+        if id(value) in _seen:
+            return False
+        nested = _seen | {id(value)}
+        if type(value) is list:
+            return all(_is_exact_json_value(item, nested) for item in value)
+        return all(
+            type(key) is str and _is_exact_json_value(item, nested)
+            for key, item in value.items()
+        )
+    return False
+
+
 def exact_json_archive(result: Any) -> Any | None:
     """Return ``result`` only if JSON preserves it EXACTLY, else ``None``.
 
@@ -1035,15 +1114,17 @@ def exact_json_archive(result: Any) -> Any | None:
     the original execution result is a wrong answer, so the archive is exact or
     it is unavailable.
     """
+    # Exactness is decided STRUCTURALLY, never by caller-controlled __eq__:
+    # a dict subclass can serialize fine, be rewritten by JSON (int keys ->
+    # strings, tuples -> lists, colliding 1/"1" dropping a value), and still
+    # return True from __eq__, which would certify transformed data as the
+    # original execution result.
+    if not _is_exact_json_value(result):
+        return None
     try:
-        archived = json.loads(json.dumps(result, allow_nan=False))
-        # The comparison itself runs caller-supplied __eq__, which may raise.
-        # This helper gates an OPTIONAL archive: it must degrade to
-        # "unavailable", never abort terminal persistence and delivery.
-        exact = bool(archived == result)
+        return json.loads(json.dumps(result, allow_nan=False))
     except Exception:
         return None
-    return archived if exact else None
 
 
 def canonical_terminal(registry, delegation_id):
@@ -1060,11 +1141,15 @@ def canonical_terminal(registry, delegation_id):
     if record.get("terminal") is None:
         return None
     attempt = record.get("attempt") or {}
+    # Sparse historical records may omit the redundant record-level id (the
+    # loader permits exactly that); a PRESENT id must still match the key.
+    self_id_conflicts = ("delegation_id" in record
+                        and record.get("delegation_id") != delegation_id)
     entries = [entry for entry in record.get("outbox", [])
                if entry.get("type") == "async_delegation"]
     if not entries:
         terminal = record["terminal"]
-        if (record.get("delegation_id") != delegation_id
+        if (self_id_conflicts
                 or type(attempt.get("generation")) is not int
                 or attempt["generation"] < 0
                 or not attempt.get("attempt_id")
@@ -1080,7 +1165,7 @@ def canonical_terminal(registry, delegation_id):
         raise RegistryError(f"ambiguous terminal outbox for {delegation_id}")
     entry = entries[0]
     payload = entry.get("payload") or {}
-    if (record.get("delegation_id") != delegation_id
+    if (self_id_conflicts
             or not entry.get("event_id")
             or payload.get("event_id") != entry["event_id"]
             or payload.get("delegation_id") != delegation_id

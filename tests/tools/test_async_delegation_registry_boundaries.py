@@ -255,3 +255,137 @@ def test_sqlite_mirror_archives_exact_and_rejects_lossy_on_the_normal_path(
         assert stored["state"] == "completed"
     finally:
         ad._reset_for_tests()
+
+
+class _LyingEq(dict):
+    """JSON-serializable, integer keys, and __eq__ that always claims equal."""
+
+    def __eq__(self, other):  # noqa: D105
+        return True
+
+    __hash__ = None
+
+
+class _LyingBool:
+    def __bool__(self):
+        raise RuntimeError("hostile __bool__")
+
+
+class _BoolTrapEq(dict):
+    """__eq__ returns an object whose __bool__ raises."""
+
+    def __eq__(self, other):  # noqa: D105
+        return _LyingBool()
+
+    __hash__ = None
+
+
+@pytest.mark.parametrize("factory", [_LyingEq, _BoolTrapEq],
+                         ids=["lying-eq", "raising-bool"])
+def test_caller_equality_cannot_certify_a_transformed_archive(
+    monkeypatch, tmp_path, factory
+):
+    """Exactness must be decided structurally, not by caller-controlled __eq__.
+
+    A dict subclass serializes fine, gets rewritten by JSON (int key 1 -> "1"),
+    and can still claim equality -- which would archive transformed data as the
+    original execution result. A __eq__ returning an object with a raising
+    __bool__ must likewise degrade, not abort the completion.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        result = {"status": "completed", "summary": "lying-archive",
+                  "extra": factory({1: "a"})}
+        delegation_id, worker, _ = helpers.dispatch(monkeypatch, result=result)
+        worker()  # must not raise
+        with store.locked_registry() as registry:
+            record = registry["records"][delegation_id]
+        assert record["state"] == "done"
+        assert "result" not in record["terminal"]
+        assert ad.get_durable_delegation(delegation_id)["result"] is None
+        event = helpers.process_registry.completion_queue.get_nowait()
+        assert event["summary"] == "lying-archive"
+    finally:
+        ad._reset_for_tests()
+
+
+@pytest.mark.parametrize(
+    "mutate,label",
+    [
+        (lambda rec: rec.__setitem__("created_at", "bad"), "created_at"),
+        (lambda rec: rec["attempt"].__setitem__("redispatch_count", "bad"),
+         "redispatch_count"),
+        (lambda rec: rec["attempt"].__setitem__("generation", "bad"), "generation"),
+        (lambda rec: rec.__setitem__("attempt", [1]), "attempt-not-dict"),
+        (lambda rec: rec.__setitem__("terminal", {"status": "completed",
+                                                  "completed_at": True}),
+         "bool-timestamp"),
+    ],
+)
+def test_malformed_scalars_are_quarantined_not_profile_fatal(
+    monkeypatch, tmp_path, mutate, label
+):
+    """One bad record must not abort recovery for every healthy delegation."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        bad, _, _ = helpers.dispatch(monkeypatch)
+        good, _, _ = helpers.dispatch(monkeypatch)
+        with store.locked_registry() as registry:
+            mutate(registry["records"][bad])
+        claimed, summary = store.claim_recoveries(
+            current_boot_id="200:2", resume_enabled=True, owner_alive=lambda _: False
+        )
+        assert [record["delegation_id"] for record in claimed] == [good]
+        assert summary["failed_validation"] == 1
+        # The replay rail must survive the same record.
+        store.enqueue_pending_outbox(current_boot_id="replay-probe")
+    finally:
+        ad._reset_for_tests()
+
+
+def test_historical_terminal_without_self_id_still_replays(monkeypatch, tmp_path):
+    """Sparse historical records omit the redundant record-level id.
+
+    The loader permits that, so canonical_terminal must too -- otherwise a real
+    completed result is rejected on both replay rails and never delivered.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        delegation_id, worker, _ = helpers.dispatch(monkeypatch)
+        worker()
+        with store.locked_registry() as registry:
+            record = registry["records"][delegation_id]
+            record.pop("delegation_id", None)
+            for event in record.get("outbox", []):
+                event["state"] = "pending"
+            record["integrity"] = store._record_checksum(record)
+        payloads = store.enqueue_pending_outbox(current_boot_id="replay-probe")
+        assert [p["delegation_id"] for p in payloads] == [delegation_id]
+    finally:
+        ad._reset_for_tests()
+
+
+def test_conflicting_self_id_is_still_rejected(monkeypatch, tmp_path):
+    """Permitting an ABSENT id must not permit a WRONG one."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        delegation_id, worker, _ = helpers.dispatch(monkeypatch)
+        worker()
+        with store.locked_registry() as registry:
+            record = registry["records"][delegation_id]
+            record["delegation_id"] = "deleg_someone_else"
+            for event in record.get("outbox", []):
+                event["state"] = "pending"
+            record["integrity"] = store._record_checksum(record)
+        payloads = store.enqueue_pending_outbox(current_boot_id="replay-probe")
+        assert payloads == []
+    finally:
+        ad._reset_for_tests()
