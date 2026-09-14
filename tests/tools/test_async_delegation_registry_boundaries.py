@@ -186,3 +186,72 @@ def test_exact_json_native_archive_is_still_retained(monkeypatch, tmp_path):
         assert ad.get_durable_delegation(delegation_id)["result"] == result
     finally:
         ad._reset_for_tests()
+
+
+class _HostileEq(dict):
+    """JSON-serializable, but every comparison raises."""
+
+    def __eq__(self, other):  # noqa: D105
+        raise RuntimeError("hostile __eq__")
+
+    def __ne__(self, other):  # noqa: D105
+        raise RuntimeError("hostile __ne__")
+
+    __hash__ = None
+
+
+def test_hostile_equality_degrades_archive_without_losing_the_completion(
+    monkeypatch, tmp_path
+):
+    """A raising __eq__ must not abort terminal persistence or delivery.
+
+    exact_json_archive runs caller-supplied comparison code. If that escapes,
+    append_terminal dies before writing the terminal record or queueing the
+    event, and the completed work is lost entirely -- a far worse outcome than
+    an unavailable OPTIONAL archive.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        result = {
+            "status": "completed",
+            "summary": "hostile-eq",
+            "extra": _HostileEq({"a": 1}),
+        }
+        delegation_id, worker, _ = helpers.dispatch(monkeypatch, result=result)
+        worker()  # must not raise
+        with store.locked_registry() as registry:
+            record = registry["records"][delegation_id]
+        assert record["state"] == "done"
+        assert record["terminal"]["status"] == "completed"
+        assert "result" not in record["terminal"]
+        event = helpers.process_registry.completion_queue.get_nowait()
+        assert event["summary"] == "hostile-eq"
+        assert ad.get_durable_delegation(delegation_id)["result"] is None
+    finally:
+        ad._reset_for_tests()
+
+
+def test_sqlite_mirror_archives_exact_and_rejects_lossy_on_the_normal_path(
+    monkeypatch, tmp_path
+):
+    """Verify the SQLite archive directly, without forcing a mirror failure."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        exact = {"status": "completed", "summary": "mirror-exact",
+                 "structured_output": {"rows": [1, 2.5, None, True]}}
+        did_exact, worker, _ = helpers.dispatch(monkeypatch, result=exact)
+        worker()
+        assert ad.get_durable_delegation(did_exact)["result"] == exact
+
+        lossy = {"status": "completed", "summary": "mirror-lossy", "extra": {1: "a"}}
+        did_lossy, worker, _ = helpers.dispatch(monkeypatch, result=lossy)
+        worker()
+        stored = ad.get_durable_delegation(did_lossy)
+        assert stored["result"] is None
+        assert stored["state"] == "completed"
+    finally:
+        ad._reset_for_tests()

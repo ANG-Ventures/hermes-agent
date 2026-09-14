@@ -1037,9 +1037,13 @@ def exact_json_archive(result: Any) -> Any | None:
     """
     try:
         archived = json.loads(json.dumps(result, allow_nan=False))
-    except (TypeError, ValueError, RecursionError):
+        # The comparison itself runs caller-supplied __eq__, which may raise.
+        # This helper gates an OPTIONAL archive: it must degrade to
+        # "unavailable", never abort terminal persistence and delivery.
+        exact = bool(archived == result)
+    except Exception:
         return None
-    return archived if archived == result else None
+    return archived if exact else None
 
 
 def canonical_terminal(registry, delegation_id):
