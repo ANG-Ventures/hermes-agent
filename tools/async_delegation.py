@@ -1692,13 +1692,20 @@ def _child_status(child: Any) -> str | None:
         status = child.get("status")
     except Exception:  # noqa: BLE001 - a child must never break the batch
         return None
-    # Coerce to an EXACT str: a str subclass can still override __eq__.
+    # Return an EXACT str or None -- never anything the caller must trust.
+    # type() not isinstance(): a str subclass can override __eq__. And str()
+    # is NOT a safe coercion, because a subclass whose __str__ returns self
+    # hands the hostile object straight back.
     if type(status) is str:
         return status
-    try:
-        return str(status) if isinstance(status, str) else None
-    except Exception:  # noqa: BLE001
-        return None
+    if isinstance(status, str):
+        try:
+            coerced = str.__str__(status)
+        except Exception:  # noqa: BLE001 - a child must never break the batch
+            return None
+        # Verify rather than assume the coercion escaped the subclass.
+        return coerced if type(coerced) is str else None
+    return None
 
 
 def _finalize_batch(

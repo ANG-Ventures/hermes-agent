@@ -841,3 +841,55 @@ def test_raising_status_eq_cannot_destroy_a_healthy_sibling(monkeypatch, tmp_pat
         assert ad.restore_undelivered_completions(queue.Queue()) == 0
     finally:
         ad._reset_for_tests()
+
+
+def test_self_returning_str_subclass_cannot_destroy_a_sibling(monkeypatch, tmp_path):
+    """str() is NOT a safe coercion.
+
+    A str subclass whose __str__ returns self hands the hostile object back, so
+    its raising __eq__ escaped the guard and destroyed every child again. The
+    coercion must be VERIFIED to have produced an exact str.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+
+    class SelfStr(str):
+        def __eq__(self, other):
+            raise RuntimeError("hostile eq")
+
+        def __ne__(self, other):
+            raise RuntimeError("hostile ne")
+
+        def __hash__(self):
+            return 0
+
+        def __str__(self):
+            return self
+
+    try:
+        hostile = {"task_index": 0, "status": SelfStr("completed"),
+                   "summary": "A"}
+        healthy = {"task_index": 1, "status": "completed",
+                   "summary": "HEALTHY-SIBLING"}
+        delegation_id, worker, _ = helpers.dispatch(
+            monkeypatch, batch=True, result={"results": [hostile, healthy]})
+        worker()  # must not raise
+        with store.locked_registry() as registry:
+            assert registry["records"][delegation_id]["state"] == "done"
+
+        event = helpers.process_registry.completion_queue.get_nowait()
+        assert event["status"] == "completed"
+        assert len(event["results"]) == 2
+        survivor = event["results"][1]
+        assert survivor["task_index"] == 1
+        assert survivor["summary"] == "HEALTHY-SIBLING"
+
+        claim = ad.claim_event_delivery(event, "test-consumer")
+        assert claim
+        ad.complete_event_delivery(event, claim)
+        assert ad.get_durable_delegation(delegation_id)["delivery_state"] == "delivered"
+        assert store.enqueue_pending_outbox(current_boot_id="replay-probe") == []
+        assert ad.restore_undelivered_completions(queue.Queue()) == 0
+    finally:
+        ad._reset_for_tests()
