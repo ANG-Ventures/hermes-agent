@@ -245,7 +245,7 @@
     "feature": "state pure fork helpers preserve denorm gate and platform session search",
     "tests": [
       "tests/hermes_state/test_session_list_denorm_reland.py::test_session_list_denorm_flag_is_live_config_only",
-      "tests/test_hermes_state.py::TestSearchSessionsByTitle"
+      "tests/test_hermes_state_core.py::TestSearchSessionsByTitle"
     ],
     "paths": [
       "hermes_state_ext.py",

@@ -3203,7 +3203,7 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                 # final fallback deletes the messages_fts% schema
                 # (hermes_state.py:645-723). The supported degraded-runtime
                 # path (SessionDB._is_fts5_unavailable_error + the
-                # regression suite in tests/test_hermes_state.py:600-632)
+                # regression suite in tests/test_hermes_state_*.py)
                 # treats both "no such module: fts5" and
                 # "no such tokenizer: trigram" as the capability error.
                 if SessionDB._is_fts5_unavailable_error(exc):
