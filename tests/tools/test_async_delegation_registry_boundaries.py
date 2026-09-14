@@ -1265,3 +1265,103 @@ def test_non_dict_child_stays_deliverable_through_the_formatter(
         assert delegation_id
     finally:
         ad._reset_for_tests()
+
+
+@pytest.mark.parametrize("shape", ["raising", "lying", "hostile-metaclass"])
+def test_unrepresentable_child_is_described_without_running_its_code(
+    monkeypatch, tmp_path, shape
+):
+    """Describing a degraded child must not invoke runner-controlled code.
+
+    ``repr(entry)`` is user-defined: a child whose ``__repr__`` raises aborted
+    ``_terminal_payload`` inside ``append_terminal`` before the terminal record
+    or the outbox existed -- both stores left ``running``, nothing queued, and
+    the healthy sibling's completed answer destroyed. A ``__repr__`` that
+    LIES (returns a hostile str subclass) smuggled a raising ``__eq__`` into
+    the envelope instead. The description now reads the type name through the
+    C-level slot, which neither the instance nor a hostile metaclass can
+    intercept.
+    """
+    from tools import process_registry as real_registry
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+
+    class RaisingEq(str):
+        def __eq__(self, other):
+            raise RuntimeError("hostile eq")
+
+        def __ne__(self, other):
+            raise RuntimeError("hostile ne")
+
+        def __hash__(self):
+            raise RuntimeError("hostile hash")
+
+    class RaisingRepr:
+        def __repr__(self):
+            raise RuntimeError("hostile child repr")
+
+    class LyingRepr:
+        def __repr__(self):
+            return RaisingEq("completed")
+
+    class HostileMeta(type):
+        @property
+        def __name__(cls):
+            raise RuntimeError("hostile type name")
+
+        def __getattribute__(cls, name):
+            raise RuntimeError("hostile type getattr")
+
+    class HostileMetaChild(metaclass=HostileMeta):
+        def __repr__(self):
+            raise RuntimeError("hostile child repr")
+
+    hostile = {"raising": RaisingRepr, "lying": LyingRepr,
+               "hostile-metaclass": HostileMetaChild}[shape]()
+    try:
+        healthy = {"task_index": 1, "status": "completed",
+                   "summary": "HEALTHY-SIBLING"}
+        delegation_id, worker, _ = helpers.dispatch(
+            monkeypatch, batch=True, result={"results": [hostile, healthy]})
+        # Catch here rather than letting it propagate: pytest's own traceback
+        # reporter calls repr()/type(obj).__name__ on the arguments of every
+        # frame it renders, so an escaping failure would crash the REPORTER on
+        # these objects (INTERNALERROR) instead of showing the real defect.
+        aborted = None
+        try:
+            worker()
+        except BaseException as exc:  # noqa: BLE001 - reported, not raised
+            aborted = type(exc).__name__
+        assert aborted is None, f"finalization aborted with {aborted}"
+
+        with store.locked_registry() as registry:
+            record = registry["records"][delegation_id]
+        assert record["state"] == "done"
+        assert record.get("terminal")
+        assert len(record.get("outbox") or []) == 1
+
+        event = helpers.process_registry.completion_queue.get_nowait()
+        assert event["status"] == "completed"
+        assert len(event["results"]) == 2
+        assert all(type(child) is dict for child in event["results"])
+        survivor = event["results"][1]
+        assert survivor["task_index"] == 1
+        assert survivor["summary"] == "HEALTHY-SIBLING"
+        # The degraded child carries an exact-str description, never the
+        # runner's own object.
+        degraded = event["results"][0]
+        assert degraded["status"] == "error"
+        assert type(degraded["raw"]) is str
+
+        # The real consumer renders it, and it accepts with no replay.
+        assert "HEALTHY-SIBLING" in real_registry._format_async_delegation(event)
+        claim = ad.claim_event_delivery(event, "test-consumer")
+        assert claim
+        ad.complete_event_delivery(event, claim)
+        assert ad.get_durable_delegation(delegation_id)["delivery_state"] == "delivered"
+        assert store.enqueue_pending_outbox(current_boot_id="replay-probe") == []
+        assert ad.restore_undelivered_completions(queue.Queue()) == 0
+    finally:
+        ad._reset_for_tests()

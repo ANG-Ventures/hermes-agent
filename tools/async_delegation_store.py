@@ -650,13 +650,14 @@ def _terminal_payload(record: dict[str, Any], result: dict[str, Any], status: st
                 # Consumers (process_registry._format_async_delegation,
                 # tui_gateway) call .get() on every child, so a bare scalar
                 # would raise in the FORMATTER and the completion would never
-                # reach the user. Always emit a dict, preserving the original
-                # value as text so nothing is silently dropped.
+                # reach the user. Always emit a dict, and describe the entry
+                # WITHOUT running any runner-controlled code: repr()/str() are
+                # user-defined, so a raising __repr__ aborted the terminal
+                # write and lost the healthy siblings' answers.
                 entries.append({
                     "status": "error",
                     "error": "result entry was not representable",
-                    "raw": _envelope_safe(
-                        repr(entry) if type(entry) is not str else entry),
+                    "raw": _envelope_safe(_untrusted_type_name(entry)),
                 })
         payload.update({
             "is_batch": True,
@@ -1136,6 +1137,10 @@ def claim_recoveries(
 
 
 _MISSING = object()
+# The real ``__name__`` descriptor on ``type`` itself. Bound to a type object
+# directly, it cannot be intercepted by a hostile metaclass ``__getattribute__``
+# or ``__name__`` property.
+_TYPE_NAME_SLOT = type.__dict__["__name__"]
 
 
 def _first_present(primary: Any, fallback: Any) -> Any:
@@ -1190,6 +1195,25 @@ def isinstance_safe(value: Any, kind: type) -> bool:
         return isinstance(value, kind)
     except Exception:  # noqa: BLE001
         return False
+
+
+def _untrusted_type_name(value: Any) -> str:
+    """Describe an unrepresentable entry without running its code.
+
+    ``repr()``/``str()`` are user-defined: a runner child whose ``__repr__``
+    raises aborted ``_terminal_payload`` before the terminal record or outbox
+    existed, destroying its healthy siblings' answers. Read the name through
+    ``type.__dict__["__name__"]`` -- the C-level slot on the real type object,
+    which neither the instance nor a hostile metaclass can intercept -- and
+    verify the result is an exact ``str`` before using it.
+    """
+    try:
+        name = _TYPE_NAME_SLOT.__get__(type(value))
+    except Exception:  # noqa: BLE001 - never break the terminal write
+        return "<unrepresentable>"
+    if type(name) is not str:
+        return "<unrepresentable>"
+    return f"<unrepresentable {name}>"
 
 
 def _safe_sequence(value: Any) -> list:
