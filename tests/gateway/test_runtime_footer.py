@@ -729,9 +729,11 @@ def test_resolve_ignores_malformed_config():
         # bare model, no provider anywhere
         ("", "gpt-5.4", ("", "gpt-5.4")),
         (None, None, ("", "")),
-        # BOTH provider given AND model carries a prefix -> model's prefix wins
-        # (no ugly triple openai-codex/claude-app/claude-opus-4-8)
-        ("openai-codex", "claude-app/claude-opus-4-8", ("claude-app", "claude-opus-4-8")),
+        # An explicit runtime route wins; a different model namespace survives.
+        ("openai-codex", "claude-app/claude-opus-4-8", ("openai-codex", "claude-app/claude-opus-4-8")),
+        # Avoid duplicating an identical route prefix.
+        ("openai", "openai/gpt-5.4", ("openai", "gpt-5.4")),
+        ("  ", "anthropic/claude-sonnet-4.6", ("anthropic", "claude-sonnet-4.6")),
     ],
 )
 def test_split_provider_model(provider, model, expected):

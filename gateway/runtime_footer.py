@@ -76,17 +76,18 @@ def _split_provider_model(
     prefix, split it so the footer reads cleanly (``provider/model``, not
     ``unset/a/b``).
 
-    When the ``model`` ALREADY carries a ``provider/`` prefix, that embedded
-    prefix wins and any separately-supplied ``provider`` is ignored — this
-    avoids an ugly triple like ``openai-codex/claude-app/claude-opus-4-8`` when
-    a caller passes both a provider and a prefixed model. The model's own
-    prefix is the more specific source.
+    An explicit runtime provider is authoritative. Aggregators retain a
+    vendor/model ID, whose vendor is NOT the serving route. Preserve that
+    namespace, stripping only a redundant prefix identical to the route.
     """
     prov = (provider or "").strip()
     mdl = (model or "").strip()
     if "/" in mdl:
-        # The model carries its own provider prefix — it's authoritative.
-        prov, _, mdl = mdl.partition("/")
+        prefix, _, remainder = mdl.partition("/")
+        if not prov:
+            prov, mdl = prefix, remainder
+        elif prefix == prov:
+            mdl = remainder
     return prov, mdl
 
 
