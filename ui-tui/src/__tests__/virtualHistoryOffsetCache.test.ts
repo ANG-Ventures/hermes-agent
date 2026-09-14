@@ -489,19 +489,31 @@ describe('useVirtualHistory offset cache reuse', () => {
     const streams = makeStreams()
     const initialHeights = new Map(outgoing.map(item => [item.key, item.height]))
 
-    const instance = renderSync(React.createElement(Harness, { expose, initialHeights, items: outgoing }), {
-      patchConsole: false,
-      stderr: streams.stderr as NodeJS.WriteStream,
-      stdin: streams.stdin as NodeJS.ReadStream,
-      stdout: streams.stdout as NodeJS.WriteStream
-    })
+    vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true)
+
+    const instance = await act(async () =>
+      renderSync(React.createElement(Harness, { expose, initialHeights, items: outgoing }), {
+        patchConsole: false,
+        stderr: streams.stderr as NodeJS.WriteStream,
+        stdin: streams.stdin as NodeJS.ReadStream,
+        stdout: streams.stdout as NodeJS.WriteStream
+      })
+    )
 
     try {
-      await delay(20)
       const scroll = expose.current!.scroll!
 
-      scroll.scrollTo(5)
-      await delay(20)
+      // The negative assertion below passes vacuously if no outgoing row ever
+      // mounted. Drain React's work and require a mounted range first, so the
+      // rerender genuinely has outgoing refs it must refuse to compensate.
+      await act(async () => {
+        scroll.scrollTo(0)
+      })
+      expect(expose.current!.virtualHistory.start).toBe(0)
+      expect(expose.current!.virtualHistory.offsets[1]).toBe(2)
+      await act(async () => {
+        scroll.scrollTo(5)
+      })
       const adjustScrollTop = vi.spyOn(scroll, 'adjustScrollTop')
 
       const replacementCache = new Map<string, number>([
@@ -509,22 +521,25 @@ describe('useVirtualHistory offset cache reuse', () => {
         ...incoming.map(item => [item.key, item.height] as const)
       ])
 
-      instance.rerender(
-        React.createElement(Harness, {
-          expose,
-          generation: 1,
-          initialHeights: replacementCache,
-          items: incoming
-        })
-      )
-      await delay(40)
+      await act(async () => {
+        instance.rerender(
+          React.createElement(Harness, {
+            expose,
+            generation: 1,
+            initialHeights: replacementCache,
+            items: incoming
+          })
+        )
+      })
 
       expect(adjustScrollTop).not.toHaveBeenCalled()
       expect(scroll.getScrollTop()).toBe(5)
       expect(expose.current!.virtualHistory.offsets[incoming.length]).toBe(40)
     } finally {
-      instance.unmount()
-      instance.cleanup()
+      await act(async () => {
+        instance.unmount()
+        instance.cleanup()
+      })
     }
   })
 
