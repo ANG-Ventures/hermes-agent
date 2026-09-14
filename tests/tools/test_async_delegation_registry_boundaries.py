@@ -1,4 +1,5 @@
 """Real file-path and malformed-record isolation boundaries."""
+import copy
 import json
 import queue
 import time
@@ -341,8 +342,11 @@ def test_malformed_scalars_are_quarantined_not_profile_fatal(
         )
         assert [record["delegation_id"] for record in claimed] == [good]
         assert summary["failed_validation"] == 1
-        # The replay rail must survive the same record.
-        store.enqueue_pending_outbox(current_boot_id="replay-probe")
+        # The replay rail must survive the same record -- and still return the
+        # HEALTHY payload. Discarding the result let a scan that skipped every
+        # record (including the good one) pass this test.
+        payloads = store.enqueue_pending_outbox(current_boot_id="replay-probe")
+        assert good in [payload.get("delegation_id") for payload in payloads]
     finally:
         ad._reset_for_tests()
 
@@ -492,11 +496,14 @@ def test_exact_batch_children_are_preserved_unchanged(monkeypatch, tmp_path):
         children = [{"status": "completed", "summary": "a",
                      "structured_output": {"rows": [1, 2]}},
                     {"status": "completed", "summary": "b"}]
+        # Compare against an INDEPENDENT snapshot: asserting against the same
+        # list object passes even if the envelope builder mutates it in place.
+        expected = copy.deepcopy(children)
         delegation_id, worker, _ = helpers.dispatch(
             monkeypatch, batch=True, result={"results": children})
         worker()
         event = helpers.process_registry.completion_queue.get_nowait()
-        assert event["results"] == children
+        assert event["results"] == expected
         assert delegation_id
     finally:
         ad._reset_for_tests()
@@ -529,7 +536,10 @@ def test_unconvertible_timestamp_is_quarantined_not_profile_fatal(
         )
         assert good in [record["delegation_id"] for record in claimed]
         assert summary["failed_validation"] == 1
-        store.enqueue_pending_outbox(current_boot_id="replay-probe")
+        # Assert the replay rail returns the healthy payload, not just that it
+        # did not raise -- a scan that skips every record would pass otherwise.
+        payloads = store.enqueue_pending_outbox(current_boot_id="replay-probe")
+        assert good in [payload.get("delegation_id") for payload in payloads]
     finally:
         ad._reset_for_tests()
 
@@ -1363,5 +1373,57 @@ def test_unrepresentable_child_is_described_without_running_its_code(
         assert ad.get_durable_delegation(delegation_id)["delivery_state"] == "delivered"
         assert store.enqueue_pending_outbox(current_boot_id="replay-probe") == []
         assert ad.restore_undelivered_completions(queue.Queue()) == 0
+    finally:
+        ad._reset_for_tests()
+
+
+def test_non_dict_route_does_not_abort_recovery_failure(monkeypatch, tmp_path):
+    """A truthy NON-DICT route must fail only its own record.
+
+    `record.get("route") or {}` only catches FALSY values, so a checksum-valid
+    row with route="..." raised AttributeError inside the claim_recoveries
+    loop and stranded every later healthy delegation in the profile.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    record = {
+        "delegation_id": "d-bad", "state": "running", "profile": "default",
+        "route": "not-a-dict",
+        "attempt": {"attempt_id": "a", "generation": 0, "redispatch_count": 0},
+        "outbox": [], "created_at": 0.0,
+    }
+    try:
+        store._fail_recovery_record(record, "stale", 1.0, emit_event=True)
+        assert record["state"] == "failed"
+        assert record["terminal"]["status"] == "error"
+    finally:
+        ad._reset_for_tests()
+
+
+def test_non_mapping_archive_is_not_stored_as_terminal_result(
+    monkeypatch, tmp_path
+):
+    """terminal.result must match what canonical_terminal accepts.
+
+    exact_json_archive happily stores ["ok"] / "done" / 3, but
+    canonical_terminal requires a mapping and rejects the record on restart --
+    so an already-queued completion would never replay.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        delegation_id, worker, _ = helpers.dispatch(monkeypatch, result=["ok"])
+        worker()
+        with store.locked_registry() as registry:
+            record = registry["records"][delegation_id]
+            stored = record["terminal"].get("result", _UNSET := object())
+            for event in record.get("outbox", []):
+                event["state"] = "pending"
+        assert stored is _UNSET or type(stored) is dict
+
+        # The flattened completion must still replay after a restart.
+        payloads = store.enqueue_pending_outbox(current_boot_id="after-restart")
+        assert delegation_id in [p.get("delegation_id") for p in payloads]
     finally:
         ad._reset_for_tests()

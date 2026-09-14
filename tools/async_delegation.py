@@ -1237,8 +1237,24 @@ def dispatch_async_delegation(
                 )
                 return
         try:
-            result = runner() or {}
-            status = result.get("status") or "completed"
+            raw_result = runner()
+            # Same contract as the batch worker: no truth test on runner output
+            # (__bool__ can raise) and a non-mapping return is NOT a success.
+            if raw_result is None:
+                result = {}
+            elif _store.isinstance_safe(raw_result, dict):
+                result = raw_result
+            else:
+                raise TypeError(
+                    f"runner returned {type(raw_result).__name__}, "
+                    "expected a mapping"
+                )
+            # No == on runner data (__eq__ is user-defined). Default only on a
+            # genuinely absent status; the store's guarded terminal_state and
+            # _envelope_safe already handle hostile values safely.
+            status = _store._safe_get(result, "status")
+            if status is None or (type(status) is str and not status):
+                status = "completed"
         except Exception as exc:  # noqa: BLE001 — must never crash the worker
             logger.exception("Async delegation %s crashed", delegation_id)
             result = {

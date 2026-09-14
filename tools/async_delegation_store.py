@@ -722,8 +722,15 @@ def append_terminal(
             # here aborts the terminal write and loses the completed job.
             "error": payload.get("error"),
         }
-        if archived_result is not None:
+        # canonical_terminal requires terminal.result to be a dict; storing a
+        # JSON-native non-dict (["ok"], "done", 3) makes it reject the record
+        # on restart and the already-queued completion never replays.
+        if type(archived_result) is dict:
             record["terminal"]["result"] = archived_result
+        elif archived_result is not None:
+            logger.warning(
+                "Async delegation %s: non-mapping result archive omitted",
+                delegation_id)
         record["updated_at"] = payload["completed_at"]
         append_lifecycle_event(
             record,
@@ -957,7 +964,12 @@ def _fail_recovery_record(
     record["updated_at"] = now
     record["terminal"] = {"status": "error", "error": _envelope_safe(error),
                           "completed_at": now}
-    route = record.get("route") or {}
+    # A checksum-valid record can carry a truthy NON-DICT route; `or {}` only
+    # catches falsy values, so route.get() below would raise and abort the
+    # whole claim_recoveries loop, stranding every later healthy delegation.
+    route = record.get("route")
+    if not isinstance_safe(route, dict):
+        route = {}
     if (not emit_event
             or not all(str(route.get(key) or "").strip()
                        for key in ("platform", "session_key", "parent_session_id"))
