@@ -702,7 +702,12 @@ def test_non_list_results_container_cannot_strand_the_completion(monkeypatch, tm
             assert registry["records"][delegation_id]["state"] == "done"
         event = helpers.process_registry.completion_queue.get_nowait()
         assert event["status"] == "completed"
-        assert event["results"] == [1]
+        # The scalar must survive as DATA, and every child must stay a mapping
+        # so the real consumer can format it (see the formatter test below).
+        assert len(event["results"]) == 1
+        child = event["results"][0]
+        assert type(child) is dict
+        assert child.get("value") == 1
     finally:
         ad._reset_for_tests()
 
@@ -744,7 +749,12 @@ def test_json_null_child_is_preserved_not_replaced_by_a_fabricated_error(
             monkeypatch, batch=True, result=result)
         worker()
         event = helpers.process_registry.completion_queue.get_nowait()
-        assert event["results"][0] is None
+        # A valid JSON null must NOT become a fabricated error, and must stay
+        # formattable: it is carried as data on a mapping child.
+        first = event["results"][0]
+        assert type(first) is dict
+        assert first.get("value") is None
+        assert "error" not in first
         assert event["results"][1]["summary"] == "B"
         assert event["status"] == "completed"
         assert delegation_id
@@ -1218,5 +1228,40 @@ def test_unhashable_status_cannot_abort_terminal_persistence(
         assert record["terminal"]
         assert len(record.get("outbox") or []) == 1
         assert helpers.process_registry.completion_queue.get_nowait()
+    finally:
+        ad._reset_for_tests()
+
+
+def test_non_dict_child_stays_deliverable_through_the_formatter(
+    monkeypatch, tmp_path
+):
+    """A JSON-safe SCALAR child is representable but not FORMATTABLE.
+
+    Every consumer treats children as mappings
+    (process_registry._format_async_delegation, tui_gateway) and calls .get()
+    on each one, so emitting a bare scalar raised AttributeError in the
+    formatter and the completion never reached the user. Children must always
+    be dicts, and the healthy sibling must still arrive.
+    """
+    from tools import process_registry as real_registry
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        result = {"results": [42, {"task_index": 1, "status": "completed",
+                                   "summary": "KEEP-B"}]}
+        delegation_id, worker, _ = helpers.dispatch(
+            monkeypatch, batch=True, result=result)
+        worker()
+        event = helpers.process_registry.completion_queue.get_nowait()
+
+        assert all(type(child) is dict for child in event["results"])
+        assert any(child.get("summary") == "KEEP-B" for child in event["results"])
+
+        # The real consumer must render it without raising.
+        rendered = real_registry._format_async_delegation(event)
+        assert "KEEP-B" in rendered
+        assert delegation_id
     finally:
         ad._reset_for_tests()

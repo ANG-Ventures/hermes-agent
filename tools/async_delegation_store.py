@@ -626,8 +626,15 @@ def _terminal_payload(record: dict[str, Any], result: dict[str, Any], status: st
         # {"results": 1} would raise TypeError here, before the terminal record
         # and outbox exist, losing the completed job.
         for entry in _safe_sequence(_safe_get(result, "results")):
-            if _envelope_representable(entry):
+            if type(entry) is dict and _envelope_representable(entry):
                 entries.append(entry)
+            elif entry is None or _envelope_representable(entry):
+                # Representable but NOT formattable: every consumer calls
+                # .get() on each child, so a bare scalar/None raises in
+                # process_registry._format_async_delegation and the completion
+                # never reaches the user. Wrap it, keeping the value as data.
+                entries.append({"status": "completed", "summary": None,
+                                "value": entry})
             elif type(entry) is dict:
                 # Exact dict only: a dict SUBCLASS can override get/__eq__ and
                 # raise during extraction. task_index is the child's IDENTITY;
@@ -640,8 +647,17 @@ def _terminal_payload(record: dict[str, Any], result: dict[str, Any], status: st
                     if _safe_get(entry, key, _MISSING) is not _MISSING
                 })
             else:
-                entries.append({"status": "error",
-                                "error": "result entry was not representable"})
+                # Consumers (process_registry._format_async_delegation,
+                # tui_gateway) call .get() on every child, so a bare scalar
+                # would raise in the FORMATTER and the completion would never
+                # reach the user. Always emit a dict, preserving the original
+                # value as text so nothing is silently dropped.
+                entries.append({
+                    "status": "error",
+                    "error": "result entry was not representable",
+                    "raw": _envelope_safe(
+                        repr(entry) if type(entry) is not str else entry),
+                })
         payload.update({
             "is_batch": True,
             "results": entries,
