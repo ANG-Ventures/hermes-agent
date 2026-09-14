@@ -389,3 +389,38 @@ def test_conflicting_self_id_is_still_rejected(monkeypatch, tmp_path):
         assert payloads == []
     finally:
         ad._reset_for_tests()
+
+
+@pytest.mark.parametrize("depth", [600], ids=["deep-acyclic"])
+def test_deep_acyclic_result_never_loses_the_completion(monkeypatch, tmp_path, depth):
+    """A deeply nested but ORDINARY result must not abort finalization.
+
+    json.dumps handles this fine; only our structural traversal hits the
+    recursion limit. The archive is optional, so the whole decision -- traversal
+    included -- must sit inside the guard. Before containment this raised
+    RecursionError and left the record running with no terminal, no outbox
+    entry and nothing queued.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        nested: object = "leaf"
+        for _ in range(depth):
+            nested = [nested]
+        result = {"status": "completed", "summary": "deep-acyclic", "extra": nested}
+        delegation_id, worker, _ = helpers.dispatch(monkeypatch, result=result)
+        worker()  # must not raise
+        with store.locked_registry() as registry:
+            record = registry["records"][delegation_id]
+        assert record["state"] == "done"
+        assert record["terminal"]["status"] == "completed"
+        assert len(record.get("outbox") or []) == 1
+        event = helpers.process_registry.completion_queue.get_nowait()
+        assert event["summary"] == "deep-acyclic"
+        # Both durable paths agree: the flattened answer survives either way.
+        stored = ad.get_durable_delegation(delegation_id)
+        assert stored["state"] == "completed"
+        assert stored["result"] in (None, result)
+    finally:
+        ad._reset_for_tests()

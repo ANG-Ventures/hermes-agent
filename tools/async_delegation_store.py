@@ -1119,9 +1119,15 @@ def exact_json_archive(result: Any) -> Any | None:
     # strings, tuples -> lists, colliding 1/"1" dropping a value), and still
     # return True from __eq__, which would certify transformed data as the
     # original execution result.
-    if not _is_exact_json_value(result):
-        return None
+    #
+    # The ENTIRE decision -- traversal included -- sits inside the guard. The
+    # traversal itself can fail on input the caller controls (a deeply nested
+    # but perfectly ordinary result exhausts the recursion limit), and this
+    # archive is OPTIONAL: any failure must degrade to "unavailable", never
+    # abort the terminal write and delivery of a completed job.
     try:
+        if not _is_exact_json_value(result):
+            return None
         return json.loads(json.dumps(result, allow_nan=False))
     except Exception:
         return None
