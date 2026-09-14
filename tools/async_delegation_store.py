@@ -600,10 +600,34 @@ def _terminal_payload(record: dict[str, Any], result: dict[str, Any], status: st
         "exit_reason": result.get("exit_reason"),
     }
     if source.get("kind") == "batch" or len(goals) > 1 or "results" in result:
+        # The delivery envelope is MANDATORY: it must always be persistable.
+        # Child entries come from arbitrary runner output, so keep each one only
+        # if it is exactly JSON-representable; otherwise fall back to its
+        # flattened, known-safe fields. Copying them wholesale lets one
+        # unsupported child value abort the terminal write and lose the job.
+        entries = []
+        for entry in (result.get("results") or []):
+            if exact_json_archive(entry) is not None:
+                entries.append(entry)
+            elif isinstance(entry, dict):
+                entries.append({
+                    key: entry.get(key)
+                    for key in ("status", "summary", "error", "model", "role",
+                                "goal", "api_calls", "duration_seconds",
+                                "exit_reason")
+                    if exact_json_archive(entry.get(key)) is not None
+                })
+            else:
+                entries.append({"status": "error",
+                                "error": "result entry was not representable"})
         payload.update({
             "is_batch": True,
-            "results": result.get("results") or [],
-            "total_duration_seconds": result.get("total_duration_seconds"),
+            "results": entries,
+            "total_duration_seconds": (
+                result.get("total_duration_seconds")
+                if exact_json_archive(result.get("total_duration_seconds")) is not None
+                else None
+            ),
         })
     return payload
 
@@ -1128,6 +1152,12 @@ def exact_json_archive(result: Any) -> Any | None:
     try:
         if not _is_exact_json_value(result):
             return None
+        # Validate with the registry's OWN serialization (ensure_ascii=False, then
+        # UTF-8). json.dumps' default ensure_ascii=True happily encodes a lone
+        # surrogate, so an archive accepted here could later raise
+        # UnicodeEncodeError inside _record_checksum -- aborting the terminal
+        # write and losing a completed job.
+        json.dumps(result, allow_nan=False, ensure_ascii=False).encode("utf-8")
         return json.loads(json.dumps(result, allow_nan=False))
     except Exception:
         return None

@@ -424,3 +424,79 @@ def test_deep_acyclic_result_never_loses_the_completion(monkeypatch, tmp_path, d
         assert stored["result"] in (None, result)
     finally:
         ad._reset_for_tests()
+
+
+def test_lone_surrogate_result_degrades_instead_of_losing_the_completion(
+    monkeypatch, tmp_path
+):
+    """The archive validator must use the registry's OWN encoding.
+
+    json.dumps defaults to ensure_ascii=True, which encodes a lone surrogate
+    happily. _record_checksum serializes with ensure_ascii=False and UTF-8
+    encodes, which raises UnicodeEncodeError -- aborting the terminal write
+    before the record or outbox event exist, losing a completed job.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        result = {"status": "completed", "summary": "surrogate", "extra": "\ud800"}
+        delegation_id, worker, _ = helpers.dispatch(monkeypatch, result=result)
+        worker()  # must not raise
+        with store.locked_registry() as registry:
+            record = registry["records"][delegation_id]
+        assert record["state"] == "done"
+        assert "result" not in record["terminal"]
+        assert len(record.get("outbox") or []) == 1
+        event = helpers.process_registry.completion_queue.get_nowait()
+        assert event["summary"] == "surrogate"
+    finally:
+        ad._reset_for_tests()
+
+
+def test_batch_child_extra_cannot_abort_the_mandatory_envelope(monkeypatch, tmp_path):
+    """The delivery envelope is mandatory and must always be persistable.
+
+    A batch child carrying an unsupported value previously flowed straight into
+    the outbox payload, so _record_checksum raised and the completed batch was
+    left running with no terminal record and nothing queued.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        result = {"results": [{"status": "completed", "summary": "child-ok",
+                               "extra": object()}]}
+        delegation_id, worker, _ = helpers.dispatch(
+            monkeypatch, batch=True, result=result)
+        worker()  # must not raise
+        with store.locked_registry() as registry:
+            record = registry["records"][delegation_id]
+        assert record["state"] == "done"
+        assert len(record.get("outbox") or []) == 1
+        event = helpers.process_registry.completion_queue.get_nowait()
+        assert event["is_batch"] is True
+        # The child's usable answer survives even though its extra did not.
+        assert event["results"][0]["summary"] == "child-ok"
+        assert event["results"][0]["status"] == "completed"
+    finally:
+        ad._reset_for_tests()
+
+
+def test_exact_batch_children_are_preserved_unchanged(monkeypatch, tmp_path):
+    """Positive control: a fully JSON-native batch keeps its children intact."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        children = [{"status": "completed", "summary": "a",
+                     "structured_output": {"rows": [1, 2]}},
+                    {"status": "completed", "summary": "b"}]
+        delegation_id, worker, _ = helpers.dispatch(
+            monkeypatch, batch=True, result={"results": children})
+        worker()
+        event = helpers.process_registry.completion_queue.get_nowait()
+        assert event["results"] == children
+        assert delegation_id
+    finally:
+        ad._reset_for_tests()
