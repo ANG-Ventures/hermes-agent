@@ -589,15 +589,16 @@ def _terminal_payload(record: dict[str, Any], result: dict[str, Any], status: st
         "context": source.get("shared_context"),
         "toolsets": execution.get("toolsets"),
         "role": (tasks[0].get("role") if tasks else "leaf"),
-        "model": result.get("model") or execution.get("model"),
+        "model": _safe_get(result, "model") or execution.get("model"),
         "status": status,
-        "summary": result.get("summary"),
-        "error": result.get("error"),
-        "api_calls": result.get("api_calls", 0),
-        "duration_seconds": result.get("duration_seconds", round(completed_at - dispatched_at, 2)),
+        "summary": _safe_get(result, "summary"),
+        "error": _safe_get(result, "error"),
+        "api_calls": _safe_get(result, "api_calls", 0),
+        "duration_seconds": _safe_get(
+            result, "duration_seconds", round(completed_at - dispatched_at, 2)),
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
-        "exit_reason": result.get("exit_reason"),
+        "exit_reason": _safe_get(result, "exit_reason"),
     }
     # The envelope is MANDATORY and whole-record checksummed. Any
     # runner-controlled value the durable registry cannot serialize would abort
@@ -605,7 +606,13 @@ def _terminal_payload(record: dict[str, Any], result: dict[str, Any], status: st
     # than guarding them one at a time.
     for key, value in list(payload.items()):
         payload[key] = _envelope_safe(value)
-    if source.get("kind") == "batch" or len(goals) > 1 or "results" in result:
+    is_batch = (
+        source.get("kind") == "batch"
+        or len(goals) > 1
+        # "in" is user-defined (__contains__); read the key instead.
+        or _safe_get(result, "results", _MISSING) is not _MISSING
+    )
+    if is_batch:
         # The delivery envelope is MANDATORY: it must always be persistable.
         # Child entries come from arbitrary runner output, so keep each one only
         # if it is exactly JSON-representable; otherwise fall back to its
@@ -615,10 +622,7 @@ def _terminal_payload(record: dict[str, Any], result: dict[str, Any], status: st
         # Only an EXACT list is iterable safely: a JSON-valid scalar such as
         # {"results": 1} would raise TypeError here, before the terminal record
         # and outbox exist, losing the completed job.
-        raw_entries = result.get("results")
-        if type(raw_entries) is not list:
-            raw_entries = [] if raw_entries is None else [raw_entries]
-        for entry in raw_entries:
+        for entry in _safe_sequence(_safe_get(result, "results")):
             if _envelope_representable(entry):
                 entries.append(entry)
             elif type(entry) is dict:
@@ -626,11 +630,11 @@ def _terminal_payload(record: dict[str, Any], result: dict[str, Any], status: st
                 # raise during extraction. task_index is the child's IDENTITY;
                 # without it a degraded child renders under another task's goal.
                 entries.append({
-                    key: _envelope_safe(entry.get(key))
+                    key: _envelope_safe(_safe_get(entry, key))
                     for key in ("task_index", "status", "summary", "error",
                                 "model", "role", "goal", "api_calls",
                                 "duration_seconds", "exit_reason")
-                    if key in entry
+                    if _safe_get(entry, key, _MISSING) is not _MISSING
                 })
             else:
                 entries.append({"status": "error",
@@ -639,7 +643,7 @@ def _terminal_payload(record: dict[str, Any], result: dict[str, Any], status: st
             "is_batch": True,
             "results": entries,
             "total_duration_seconds": _envelope_safe(
-                result.get("total_duration_seconds")),
+                _safe_get(result, "total_duration_seconds")),
         })
     return payload
 
@@ -1107,6 +1111,58 @@ def claim_recoveries(
                 attempt["redispatch_count"],
             )
     return claimed, summary
+
+
+_MISSING = object()
+
+
+def _safe_get(mapping: Any, key: str, default: Any = None) -> Any:
+    """Read one key from an untrusted mapping without running its code.
+
+    A runner result (or a child entry) can be a dict SUBCLASS overriding
+    ``get``/``__contains__``/``keys``/``__iter__``, or an object whose
+    ``__class__`` raises. Any of those turns a plain lookup into an exception
+    -- or, worse, silently drops real data. Read through ``dict`` itself so
+    only the C-level slot is used, and never let a lookup escape.
+    """
+    if type(mapping) is dict:
+        return dict.get(mapping, key, default)
+    if isinstance_safe(mapping, dict):
+        try:
+            return dict.get(mapping, key, default)  # bypass overridden get()
+        except Exception:  # noqa: BLE001 - never break the terminal write
+            return default
+    return default
+
+
+def isinstance_safe(value: Any, kind: type) -> bool:
+    """``isinstance`` that cannot be defeated by a hostile ``__class__``."""
+    try:
+        return isinstance(value, kind)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _safe_sequence(value: Any) -> list:
+    """Return an EXACT list of entries from an untrusted sequence value.
+
+    ``len()``/iteration are user-defined on a list subclass, so a hostile
+    ``__len__`` can make a populated list look empty and silently discard every
+    child's real answer.
+    """
+    if type(value) is list:
+        return value
+    if value is None:
+        return []
+    if isinstance_safe(value, (list, tuple)):
+        # Rebuild through the C-level slots so an overridden __len__/__iter__
+        # cannot hide entries from every downstream consumer.
+        try:
+            size = list.__len__(value) if isinstance_safe(value, list) else len(value)
+            return [value[index] for index in range(size)]
+        except Exception:  # noqa: BLE001
+            return []
+    return [value]
 
 
 def _envelope_representable(value: Any) -> bool:

@@ -961,3 +961,103 @@ def test_no_hostile_child_status_can_destroy_a_sibling(
         assert ad.restore_undelivered_completions(queue.Queue()) == 0
     finally:
         ad._reset_for_tests()
+
+
+# --- Hostile-input contract for the terminal-write boundary -----------------
+#
+# A runner result is UNTRUSTED. Six review rounds each found one more way a
+# user-defined dunder escaped a guard and destroyed a completed job or a
+# healthy sibling's answer. These cases pin the whole class at once: for every
+# shape below, finalization must not raise, the terminal record and outbox
+# event must exist, and the healthy sibling's real answer must survive.
+
+
+class _RaisingGet(dict):
+    def get(self, key, default=None):
+        raise RuntimeError("hostile get")
+
+
+class _RaisingContains(dict):
+    def __contains__(self, key):
+        raise RuntimeError("hostile contains")
+
+
+class _RaisingIter(dict):
+    def __iter__(self):
+        raise RuntimeError("hostile iter")
+
+
+class _RaisingLen(list):
+    def __len__(self):
+        raise RuntimeError("hostile len")
+
+
+class _RaisingClassObj:
+    @property
+    def __class__(self):
+        raise RuntimeError("hostile class")
+
+
+class _RaisingBoolObj:
+    def __bool__(self):
+        raise RuntimeError("hostile bool")
+
+
+_KEEP = {"task_index": 1, "status": "completed", "summary": "KEEP-B"}
+
+
+def _hostile_cases():
+    return {
+        "result-raising-get": _RaisingGet(results=[_KEEP], status="completed"),
+        "result-raising-contains": _RaisingContains(
+            results=[_KEEP], status="completed"),
+        "result-raising-iter": _RaisingIter(results=[_KEEP], status="completed"),
+        "results-raising-len": {"results": _RaisingLen([_KEEP])},
+        "child-raising-class": {"results": [
+            {"task_index": 0, "status": _RaisingClassObj()}, _KEEP]},
+        "child-raising-bool": {"results": [
+            {"task_index": 0, "status": _RaisingBoolObj()}, _KEEP]},
+        "child-is-raising-get": {"results": [
+            _RaisingGet(task_index=0, status="completed"), _KEEP]},
+        "child-is-scalar": {"results": [42, _KEEP]},
+        "child-is-none": {"results": [None, _KEEP]},
+        "model-hostile": {"results": [_KEEP], "model": _RaisingClassObj()},
+        "summary-hostile": {"results": [_KEEP], "summary": _RaisingClassObj()},
+        "total-duration-hostile": {"results": [_KEEP],
+                                   "total_duration_seconds": _RaisingClassObj()},
+        "surrogate-everywhere": {"results": [_KEEP], "summary": "\ud800",
+                                 "error": "\ud800", "model": "\ud800",
+                                 "exit_reason": "\ud800"},
+    }
+
+
+@pytest.mark.parametrize("case", sorted(_hostile_cases()))
+def test_hostile_runner_result_never_loses_work(monkeypatch, tmp_path, case):
+    """No untrusted shape may strand a completion or destroy a sibling."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        result = _hostile_cases()[case]
+        delegation_id, worker, _ = helpers.dispatch(
+            monkeypatch, batch=True, result=result)
+        worker()  # must not raise
+
+        with store.locked_registry() as registry:
+            record = registry["records"][delegation_id]
+        assert record["terminal"], f"{case}: no terminal record"
+        assert len(record.get("outbox") or []) == 1, f"{case}: nothing queued"
+
+        event = helpers.process_registry.completion_queue.get_nowait()
+        survivors = [child for child in (event.get("results") or [])
+                     if type(child) is dict and child.get("summary") == "KEEP-B"]
+        assert survivors, f"{case}: healthy sibling destroyed"
+        assert survivors[0]["task_index"] == 1
+
+        claim = ad.claim_event_delivery(event, "test-consumer")
+        assert claim
+        ad.complete_event_delivery(event, claim)
+        assert ad.get_durable_delegation(delegation_id)["delivery_state"] == "delivered"
+        assert store.enqueue_pending_outbox(current_boot_id="replay-probe") == []
+    finally:
+        ad._reset_for_tests()

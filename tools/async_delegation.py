@@ -1620,12 +1620,20 @@ def dispatch_async_delegation_batch(
             # that is not a dict, must NOT crash this classification. Raising
             # here would discard the real children in the handler below and
             # report a completed batch as an error.
-            raw_children = combined.get("results") if isinstance(combined, dict) else None
-            child_results = raw_children if type(raw_children) is list else []
+            child_results = _store._safe_sequence(
+                _store._safe_get(combined, "results"))
             try:
-                all_failed = bool(child_results) and all(
-                    _child_status(r) not in ("completed", "success")
-                    for r in child_results
+                # Only children we can actually READ get a vote. A malformed
+                # entry (scalar, None, hostile object) is unjudgeable, and
+                # counting it as a failure would report a batch the runner
+                # said completed as an error.
+                judgeable = [
+                    child for child in child_results
+                    if _store.isinstance_safe(child, dict)
+                ]
+                all_failed = bool(judgeable) and all(
+                    _child_status(child) not in ("completed", "success")
+                    for child in judgeable
                 )
             except Exception:  # noqa: BLE001 - classification must never lose children
                 logger.warning(
@@ -1691,12 +1699,9 @@ def _child_status(child: Any) -> str | None:
     Return an exact ``str`` or ``None`` so the caller only ever compares
     trusted values. A child must never break the batch.
     """
-    if type(child) is not dict:
+    if not _store.isinstance_safe(child, dict):
         return None
-    try:
-        status = child.get("status")
-    except Exception:  # noqa: BLE001 - a child must never break the batch
-        return None
+    status = _store._safe_get(child, "status")
     # Return an EXACT str or None -- never anything the caller must trust.
     #
     # Only ``type(x) is str`` is safe here. Every softer test has already been
