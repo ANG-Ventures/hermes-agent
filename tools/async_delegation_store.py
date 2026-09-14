@@ -591,16 +591,20 @@ def _terminal_payload(record: dict[str, Any], result: dict[str, Any], status: st
         "role": (tasks[0].get("role") if tasks else "leaf"),
         "model": result.get("model") or execution.get("model"),
         "status": status,
-        # These land in the mandatory envelope; an unencodable string here
-        # aborts the terminal write and loses the completed job.
-        "summary": _envelope_safe(result.get("summary")),
-        "error": _envelope_safe(result.get("error")),
+        "summary": result.get("summary"),
+        "error": result.get("error"),
         "api_calls": result.get("api_calls", 0),
         "duration_seconds": result.get("duration_seconds", round(completed_at - dispatched_at, 2)),
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
     }
+    # The envelope is MANDATORY and whole-record checksummed. Any
+    # runner-controlled value the durable registry cannot serialize would abort
+    # the terminal write and lose a completed job, so sweep every field rather
+    # than guarding them one at a time.
+    for key, value in list(payload.items()):
+        payload[key] = _envelope_safe(value)
     if source.get("kind") == "batch" or len(goals) > 1 or "results" in result:
         # The delivery envelope is MANDATORY: it must always be persistable.
         # Child entries come from arbitrary runner output, so keep each one only
@@ -612,12 +616,14 @@ def _terminal_payload(record: dict[str, Any], result: dict[str, Any], status: st
             if exact_json_archive(entry) is not None:
                 entries.append(entry)
             elif isinstance(entry, dict):
+                # task_index is the child's IDENTITY: without it a degraded
+                # child is rendered under another task's goal.
                 entries.append({
-                    key: entry.get(key)
-                    for key in ("status", "summary", "error", "model", "role",
-                                "goal", "api_calls", "duration_seconds",
-                                "exit_reason")
-                    if exact_json_archive(entry.get(key)) is not None
+                    key: _envelope_safe(entry.get(key))
+                    for key in ("task_index", "status", "summary", "error",
+                                "model", "role", "goal", "api_calls",
+                                "duration_seconds", "exit_reason")
+                    if key in entry
                 })
             else:
                 entries.append({"status": "error",
@@ -669,7 +675,10 @@ def append_terminal(
                            delegation_id)
         record["state"] = terminal_state
         record["terminal"] = {
-            "status": status,
+            # Guarded copies, as in the envelope: terminal_state above already
+            # captured the real disposition, so an unencodable status string
+            # must not be allowed to abort the write.
+            "status": payload.get("status"),
             "completed_at": payload["completed_at"],
             # Same guarded value the envelope carries. Both copies are
             # mandatory and whole-record checksummed, so an unencodable error
@@ -682,7 +691,7 @@ def append_terminal(
         append_lifecycle_event(
             record,
             terminal_state,
-            f"status={status} attempt={attempt_id}",
+            f"status={payload.get('status')} attempt={attempt_id}",
             now=payload["completed_at"],
         )
         if not any(event.get("event_id") == event_id for event in record.get("outbox", [])):

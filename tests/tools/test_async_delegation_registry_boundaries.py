@@ -626,3 +626,58 @@ def test_ordinary_error_string_is_preserved_verbatim(monkeypatch, tmp_path):
         assert event["error"] == "worker exploded"
     finally:
         ad._reset_for_tests()
+
+
+@pytest.mark.parametrize(
+    "field", ["model", "exit_reason", "api_calls", "duration_seconds", "status"])
+def test_no_runner_field_can_abort_the_mandatory_envelope(monkeypatch, tmp_path, field):
+    """EVERY runner-controlled envelope field, not just summary/error.
+
+    Guarding fields one at a time left model, exit_reason, api_calls,
+    duration_seconds and status each able to abort the terminal write and lose
+    a completed job. status reached the record through the lifecycle event
+    message as well as the envelope.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        result = {"status": "completed", "summary": "ok", field: "\ud800"}
+        delegation_id, worker, _ = helpers.dispatch(monkeypatch, result=result)
+        worker()  # must not raise
+        with store.locked_registry() as registry:
+            record = registry["records"][delegation_id]
+        assert record["state"] in {"done", "failed"}
+        assert len(record.get("outbox") or []) == 1
+        assert helpers.process_registry.completion_queue.get_nowait()
+    finally:
+        ad._reset_for_tests()
+
+
+def test_degraded_batch_child_keeps_its_task_index(monkeypatch, tmp_path):
+    """task_index is the child's IDENTITY.
+
+    Dropping it while degrading an unrepresentable child renders that child's
+    result under a DIFFERENT task's goal -- silent misattribution.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        result = {"results": [
+            {"task_index": 0, "goal": "first goal", "status": "completed",
+             "summary": "A", "extra": object()},
+            {"task_index": 1, "goal": "second goal", "status": "completed",
+             "summary": "B"},
+        ]}
+        delegation_id, worker, _ = helpers.dispatch(
+            monkeypatch, batch=True, result=result)
+        worker()
+        event = helpers.process_registry.completion_queue.get_nowait()
+        children = event["results"]
+        assert [child["task_index"] for child in children] == [0, 1]
+        assert children[0]["summary"] == "A"
+        assert children[0]["goal"] == "first goal"
+        assert delegation_id
+    finally:
+        ad._reset_for_tests()
