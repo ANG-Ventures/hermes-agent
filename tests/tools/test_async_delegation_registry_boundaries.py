@@ -1028,6 +1028,26 @@ class _HostileMetaValue(metaclass=_HostileMeta):
     pass
 
 
+class _HostileKey:
+    """A stored KEY whose __eq__ fires during an ordinary dict lookup."""
+
+    def __hash__(self):
+        return hash("model")
+
+    def __eq__(self, other):
+        raise RuntimeError("hostile extra-key equality")
+
+
+class _LyingKey(str):
+    """Impersonates a real field name to smuggle a value in."""
+
+    def __hash__(self):
+        return hash("summary")
+
+    def __eq__(self, other):
+        return True
+
+
 class _RaisingClassObj:
     @property
     def __class__(self):
@@ -1067,6 +1087,11 @@ def _hostile_cases():
                                "model": _RaisingBoolValue()},
         "model-hostile-metaclass": {"results": [_KEEP],
                                     "model": _HostileMetaValue()},
+        "hostile-stored-key": {"results": [_KEEP], _HostileKey(): "x",
+                               "status": "completed"},
+        "lying-key-impersonation": {"results": [_KEEP],
+                                    _LyingKey("zzz"): "IMPOSTOR",
+                                    "status": "completed"},
         "summary-hostile-metaclass": {"results": [_KEEP],
                                       "summary": _HostileMetaValue()},
         "surrogate-everywhere": {"results": [_KEEP], "summary": "\ud800",

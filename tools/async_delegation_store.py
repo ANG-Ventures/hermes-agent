@@ -1144,13 +1144,24 @@ def _safe_get(mapping: Any, key: str, default: Any = None) -> Any:
     -- or, worse, silently drops real data. Read through ``dict`` itself so
     only the C-level slot is used, and never let a lookup escape.
     """
-    if type(mapping) is dict:
-        return dict.get(mapping, key, default)
-    if isinstance_safe(mapping, dict):
-        try:
-            return dict.get(mapping, key, default)  # bypass overridden get()
-        except Exception:  # noqa: BLE001 - never break the terminal write
-            return default
+    if not isinstance_safe(mapping, dict):
+        return default
+    # Even dict.get() is not safe: a lookup hashes the probe key and, on a
+    # hash collision, compares it against STORED keys with ==. A hostile key
+    # sitting in the runner's result therefore executes its own __eq__ during
+    # an ordinary get() and aborts the terminal write.
+    #
+    # Walk the real items instead and match by identity/exact-str value, so no
+    # stored key's __eq__ or __hash__ is ever invoked.
+    try:
+        items = list(dict.items(mapping))
+    except Exception:  # noqa: BLE001 - never break the terminal write
+        return default
+    for stored_key, stored_value in items:
+        if stored_key is key:
+            return stored_value
+        if type(stored_key) is str and str.__eq__(stored_key, key) is True:
+            return stored_value
     return default
 
 
