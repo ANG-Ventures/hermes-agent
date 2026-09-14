@@ -7,7 +7,7 @@ activation (not a simulation of its reasoning assignment).
 """
 
 from datetime import datetime
-from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -51,10 +51,11 @@ def footer_turn(monkeypatch, tmp_path):
     monkeypatch.setattr(run_agent, "get_tool_definitions", lambda *a, **kw: [])
     monkeypatch.setattr(run_agent, "check_toolset_requirements", lambda *a, **kw: {})
     monkeypatch.setattr("agent.model_metadata.get_model_context_length", lambda *a, **kw: 100_000)
+    monkeypatch.setattr("agent.context_compressor.get_model_context_length", lambda *a, **kw: 100_000)
     monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *a, **kw: set())
     monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
 
-    runner = gateway_run.GatewayRunner(GatewayConfig())
+    runner: Any = gateway_run.GatewayRunner(GatewayConfig())
     runner.adapters = {}
     runner._session_db = None
     runner._is_user_authorized = lambda _source: True
@@ -113,6 +114,8 @@ def footer_turn(monkeypatch, tmp_path):
     monkeypatch.setattr(gateway_run.TurnRunner, "run_sync", capture_result)
 
     async def run_turn():
+        import yaml
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump(config))
         event = MessageEvent(text="hello", source=source, message_id="footer-message")
         return await runner._handle_message_with_agent(event, source, session_key, 1)
 
@@ -132,3 +135,89 @@ async def test_named_custom_provider_footer_uses_resolved_requested_name(footer_
     assert agents[0].provider == "custom"
     assert agents[0].requested_provider == name
     assert response == f"done\n\n{name}/claude-opus-4-8"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_reason", ["auth", "rate_limit"])
+@pytest.mark.parametrize("final_response", ["done", ""])
+async def test_fallback_footer_uses_actual_agent_reasoning(
+    footer_turn, monkeypatch, failure_reason, final_response,
+):
+    from agent.error_classifier import FailoverReason
+
+    config, runner, key, run_turn, agents, results, callbacks, response_text = footer_turn
+    config["display"]["runtime_footer"]["fields"] = ["reasoning"]
+    config["fallback_providers"] = [{
+        "provider": "openrouter", "model": "openai/gpt-5.4",
+        "base_url": "https://openrouter.ai/api/v1", "api_key": "test-key",
+        "api_mode": "chat_completions",
+    }]
+    runner._set_session_reasoning_override(key, {"enabled": True, "effort": "high"})
+    response_text[0] = final_response
+    fallback_client = MagicMock()
+    fallback_client.api_key = "test-key"
+    fallback_client.base_url = "https://openrouter.ai/api/v1"
+    fallback_client._custom_headers = {}
+    fallback_client.default_headers = {}
+    monkeypatch.setattr(
+        "agent.auxiliary_client.resolve_provider_client",
+        lambda *args, **kwargs: (fallback_client, "openai/gpt-5.4"),
+    )
+
+    def activate_fallback(agent):
+        # The real gateway applies the session override before running the agent.
+        assert agent.reasoning_config == {"enabled": True, "effort": "high"}
+        assert agent._try_activate_fallback(FailoverReason(failure_reason)) is True
+        assert agent.reasoning_config == {"enabled": True, "effort": "low"}
+        # Confirm the request builder uses this same effective value.
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hello"}])
+        assert kwargs["extra_body"]["reasoning"]["effort"] == "low"
+
+    callbacks.append(activate_fallback)
+    response = await run_turn()
+    assert len(agents) == len(results) == 1
+    assert agents[0].model == "openai/gpt-5.4"
+    assert runner._resolve_session_reasoning_config(session_key=key) == {
+        "enabled": True, "effort": "high",
+    }
+    assert response.endswith("\n\nr:low")
+    assert results[0]["reasoning_config"] == agents[0].reasoning_config
+    assert results[0]["reasoning_config"] is not agents[0].reasoning_config
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("effective,expected", [(None, "done"), ({}, "done"), ({"enabled": False}, "done\n\nr:none")])
+async def test_footer_does_not_guess_reasoning_when_agent_has_no_effort(
+    footer_turn, effective, expected,
+):
+    config, runner, key, run_turn, agents, results, callbacks, response_text = footer_turn
+    config["display"]["runtime_footer"]["fields"] = ["reasoning"]
+    runner._set_session_reasoning_override(key, {"enabled": True, "effort": "high"})
+    callbacks.append(lambda agent: setattr(agent, "reasoning_config", effective))
+    response = await run_turn()
+    assert len(agents) == len(results) == 1
+    assert response == expected
+
+
+@pytest.mark.asyncio
+async def test_default_gateway_footer_ignores_new_runtime_metadata(footer_turn):
+    import os
+
+    config, runner, key, run_turn, agents, results, callbacks, response_text = footer_turn
+    config["display"]["runtime_footer"].pop("fields")
+    runner._set_session_reasoning_override(key, {"enabled": True, "effort": "high"})
+    response = await run_turn()
+    assert len(agents) == len(results) == 1
+    assert response.encode() == (
+        "done\n\nclaude-opus-4-8 · 0% · " + os.environ["TERMINAL_CWD"]
+    ).encode()
+
+
+@pytest.mark.asyncio
+async def test_stable_session_reasoning_footer_matches_agent(footer_turn):
+    config, runner, key, run_turn, agents, results, callbacks, response_text = footer_turn
+    config["display"]["runtime_footer"]["fields"] = ["reasoning"]
+    runner._set_session_reasoning_override(key, {"enabled": True, "effort": "high"})
+    response = await run_turn()
+    assert agents[0].reasoning_config == {"enabled": True, "effort": "high"}
+    assert response == "done\n\nr:high"

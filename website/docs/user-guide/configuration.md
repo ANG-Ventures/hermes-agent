@@ -2011,7 +2011,7 @@ Supported fields:
 | `provider_model` | `provider/model` — useful behind bridges/proxies/failover, where the same model is served by different providers | `claude-bridge-f3/claude-opus-4-8` |
 | `context_pct` | Last-call context occupancy as a percent | `5%` |
 | `context_full` | `used/window (pct)`, both humanized | `50.2k/1M (5%)` |
-| `reasoning` | Effective reasoning-effort level, `r:<level>` (honors a session-scoped `/reasoning`) | `r:xhigh` |
+| `reasoning` | Completed agent's effective reasoning effort, `r:<level>` (including fallback changes; unset effort is omitted) | `r:xhigh` |
 | `latency` | Wall-clock duration of the turn | `22s`, `1m05s` |
 | `cwd` | Home-relative working directory | `~` |
 

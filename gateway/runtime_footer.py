@@ -44,6 +44,7 @@ from typing import Any, Iterable, Optional
 
 _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
+_UNSET_REASONING_CONFIG = object()
 
 
 def _home_relative_cwd(cwd: str) -> str:
@@ -239,8 +240,8 @@ def _reasoning_from_config(
     "disabled" spelling exactly as the agent does, rather than re-reading
     ``agent.reasoning_effort`` raw.
 
-    Session-scoped ``/reasoning`` overrides are resolved by the CALLER (they
-    always win) and passed to :func:`build_footer_line` as ``reasoning_config``.
+    Callers with a live agent pass its effective ``reasoning_config`` to
+    :func:`build_footer_line` instead of resolving configuration again.
     """
     try:
         from hermes_constants import resolve_reasoning_config
@@ -263,7 +264,7 @@ def build_footer_line(
     turn_seconds: Optional[float] = None,
     provider: Optional[str] = None,
     reasoning: Optional[str] = None,
-    reasoning_config: Any = None,
+    reasoning_config: Any = _UNSET_REASONING_CONFIG,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -275,20 +276,19 @@ def build_footer_line(
     the caller with ``time.monotonic()``.  Callers that don't measure it leave
     it ``None`` and the ``latency`` field is skipped.
 
-    ``reasoning_config`` is the caller's ALREADY-RESOLVED reasoning config for
-    this session (gateway/run.py's ``_resolve_session_reasoning_config``, which
-    honors a session-scoped ``/reasoning <level>``).  Passing it keeps the
-    footer in step with what the session actually runs; without it the footer
-    falls back to the config-level resolution, which can be stale for a session
-    that set a session-scoped override.
+    ``reasoning_config`` is the caller's snapshot of the completed agent's
+    effective configuration, including changes made by fallback activation.
+    Passing ``None`` explicitly means no known effort and drops the field.
+    Only callers that OMIT this argument fall back to config-level resolution;
+    gateway callers must not re-resolve session intent after a run.
     """
     cfg = resolve_footer_config(user_config, platform_key)
     if not cfg.get("enabled"):
         return ""
-    # Reasoning: prefer an explicit label, then the caller's session-resolved
-    # config, then config-level resolution for this model.
+    # Prefer an explicit label, then the caller's actual agent snapshot.
+    # Config-level resolution is only for callers without runtime metadata.
     if reasoning is None:
-        if reasoning_config is not None:
+        if reasoning_config is not _UNSET_REASONING_CONFIG:
             reasoning = _reasoning_label(reasoning_config)
         else:
             reasoning = _reasoning_from_config(user_config, model)

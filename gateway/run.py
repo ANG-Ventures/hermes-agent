@@ -6946,6 +6946,11 @@ class TurnRunner:
         _resolved_model = getattr(_agent, "model", None) if _agent else None
         _resolved_provider = getattr(_agent, "provider", None) if _agent else None
         _requested_provider = getattr(_agent, "requested_provider", None) if _agent else None
+        # Fallback can change reasoning after the session override was applied.
+        # Snapshot the live agent, not the gateway's original configuration.
+        _resolved_reasoning = getattr(_agent, "reasoning_config", None) if _agent else None
+        if isinstance(_resolved_reasoning, dict):
+            _resolved_reasoning = dict(_resolved_reasoning)
 
         # Sync session_id immediately after run_conversation(). Compression
         # can rotate before a follow-up model call fails; the failure return
@@ -7083,6 +7088,7 @@ class TurnRunner:
                 "model": _resolved_model,
                 "provider": _resolved_provider,
                 "requested_provider": _requested_provider,
+                "reasoning_config": _resolved_reasoning,
                 "context_length": _context_length,
             }
 
@@ -7166,6 +7172,7 @@ class TurnRunner:
             "model": _resolved_model,
             "provider": _resolved_provider,
             "requested_provider": _requested_provider,
+            "reasoning_config": _resolved_reasoning,
             "context_length": _context_length,
             "session_id": effective_session_id,
             "response_previewed": result.get("response_previewed", False),
@@ -21877,11 +21884,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
                     turn_seconds=_turn_seconds,
-                    # Session-scoped /reasoning wins over config; resolve it
-                    # here so the footer reports what the session actually ran.
-                    reasoning_config=self._resolve_session_reasoning_config(
-                        source=source, model=agent_result.get("model") or ""
-                    ),
+                    # Report the completed run, including fallback changes.
+                    # None means no known effort, not permission to guess.
+                    reasoning_config=agent_result.get("reasoning_config"),
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
