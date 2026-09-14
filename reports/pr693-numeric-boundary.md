@@ -181,3 +181,95 @@ over-reject; they are not claimed as gates.
 - The refuted bad-shape cases were not modified.
 - No live state, queue, config, cron or profile touched; nothing pushed.
 - Review required. Apollo integrates into PR693 and owns CI/merge/deploy.
+
+---
+
+# Addendum — run 89 (review changes-requested round)
+
+Review run 88 blocked the first pass: the same defect class still escaped
+through two **unguarded conversions in the replay consumer itself**, both
+inside the same per-record loop. Apollo independently confirmed the finding and
+scoped the fix to this card. This addendum records that work.
+
+## What was still broken (reproduced, not inherited)
+
+`enqueue_pending_outbox` (`tools/async_delegation_store.py`) performs two
+conversions on outbox event fields that `_load` never validated:
+
+| Line | Conversion | Raises on |
+|---|---|---|
+| `:1491` | `now - created_at`, `(now - created_at) / 3600.0` | `-(10**400)` → `OverflowError: int too large to convert to float` |
+| `:1479` | `int(payload.get("attempt_generation") or -1)` | `inf` → `OverflowError`; `nan` → `ValueError` |
+
+Measured on the pre-fix head `ef35977041` in this worktree, with an imported SUT
+asserted to be this tree and a disposable `HOME`/`HERMES_HOME`:
+
+```
+SUT: .../.worktrees/t_72ee25ec/tools/async_delegation_store.py
+RESULT control:    queued=['bad', 'good']        <- control arm: loop works
+RESULT created_at: ABORTED ALL -> OverflowError: int too large to convert to float
+RESULT gen_inf:    ABORTED ALL -> OverflowError: cannot convert float infinity to integer
+RESULT gen_nan:    ABORTED ALL -> ValueError: cannot convert float NaN to integer
+```
+
+The control arm passes, so these are behavior failures, not fixture artifacts.
+Post-fix, the same probe:
+
+```
+RESULT control:    queued=['bad', 'good']
+RESULT created_at: queued=['good']              <- healthy sibling still replays
+RESULT gen_inf:    queued=['good']
+RESULT gen_nan:    queued=['good']
+```
+
+## The change
+
+`tools/async_delegation_store.py`, same canonical `_load` `invalid_outbox`
+computation the first pass already touched, `+13 / -0`:
+
+- reject an outbox event whose `created_at` fails `_is_optional_number`
+- reject an event whose `payload["attempt_generation"]` fails `_is_optional_number`
+
+No new error handling, no coercion, no blanket `except`, no new dependency.
+Rejection routes through the **pre-existing** per-record quarantine, so the
+malformed record is retained unmodified and healthy siblings still replay.
+`_is_optional_number` already carries the signed-64 int bound established in the
+first pass, so `2**100` in either field is rejected too.
+
+`attempt_generation` is **not** narrowed for valid values: ordinary ints
+(`0, 1, 7, 2**63-1`) still replay, asserted with the record's own
+`attempt.generation` kept consistent (the payload↔attempt identity is a
+separate pre-existing guard in `canonical_terminal` and was not touched).
+
+## Evidence
+
+| Check | Result |
+|---|---|
+| Pre-fix probe, 4 arms (control + 3) | control queues both; all 3 bad arms abort the whole profile |
+| Post-fix probe, same 4 arms | control unchanged; each bad arm quarantines only the bad record |
+| Regression file `test_async_delegation_numeric_binding_boundary.py` | **60 passed, 0 failed** |
+| Per-guard mutation: revert ONLY the new `created_at` + `attempt_generation` block | **8 failed / 52 passed** — exactly the 8 new discriminating rows; all controls stay green |
+| Restore after mutation | md5 `2f58560786271e53113e7696c207f592`, byte-identical to pristine |
+| 11-file delegation suite via `scripts/run_tests.sh` | **373 passed, 0 failed**, exit 0, 22.3s |
+
+New test cases (all with a healthy-sibling witness asserting the good
+delegation is still **queued by id**, plus a passing control arm):
+
+- `test_control_healthy_outbox_replays_every_record` — control
+- `test_unconvertible_outbox_created_at_spares_sibling` — `-(10**400)`, `10**400`, `2**100`, `2**63`
+- `test_unconvertible_attempt_generation_spares_sibling` — `inf`, `-inf`, `nan`, `2**100`
+- `test_ordinary_attempt_generation_is_not_narrowed` — `0, 1, 7, 2**63-1`
+- `test_ordinary_outbox_created_at_is_not_narrowed` — `0, 1234.5, 1789390471, 2**63-1`
+
+Evidence preservation is asserted on the `created_at` and `attempt_generation`
+paths by comparing the full persisted record before and after the replay pass
+(`after == before`).
+
+## Scope caveats (run 89)
+
+- Inputs remain **synthetic**; still no production-incidence claim.
+- Only the 11 delegation files were run; full repo suite not run (budget).
+- The `1191-style` matrix still has no runnable artifact I could locate.
+- Changes confined to `tools/async_delegation_store.py` and its regression file
+  plus this report. No push/PR/merge/deploy; no live state/config/cron/profile
+  change; `~/.hermes/runtime/hermes-agent` untouched.

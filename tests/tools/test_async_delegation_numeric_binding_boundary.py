@@ -124,6 +124,124 @@ def test_unbindable_envelope_payload_timestamp_spares_sibling(
         ad._reset_for_tests()
 
 
+# --- the replay consumer's own unguarded conversions ---------------------
+#
+# enqueue_pending_outbox ages each event with `now - created_at` and supersedes
+# restart notices with `int(payload["attempt_generation"] or -1)`. Neither
+# conversion is guarded, both run inside the same per-record replay loop, and
+# both raise on a value that merely LOOKS numeric -- aborting replay for every
+# healthy delegation in the profile.
+
+
+def _damage_outbox(registry, delegation_id, mutate):
+    events = registry["records"][delegation_id]["outbox"]
+    assert events, "fixture must carry at least one outbox event"
+    for event in events:
+        mutate(event)
+
+
+def _replay_both(monkeypatch, tmp_path, mutate):
+    """Return (bad_id, good_id, queued_ids) after a replay pass."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        bad, good = _two_terminal_records(monkeypatch, deliverable=True)
+        if mutate is not None:
+            with store.locked_registry() as registry:
+                _damage_outbox(registry, bad, mutate)
+        before = json.loads(store.registry_path().read_text())["records"][bad]
+        payloads = store.enqueue_pending_outbox(current_boot_id="replay-probe")
+        after = json.loads(store.registry_path().read_text())["records"][bad]
+        return bad, good, [p["delegation_id"] for p in payloads], before, after
+    finally:
+        ad._reset_for_tests()
+
+
+def test_control_healthy_outbox_replays_every_record(monkeypatch, tmp_path):
+    """Control arm: without damage the replay loop queues BOTH records."""
+    bad, good, queued, _, _ = _replay_both(monkeypatch, tmp_path, None)
+    assert sorted(queued) == sorted([bad, good])
+
+
+@pytest.mark.parametrize("bad_created_at", [
+    -(10 ** 400),        # float() overflows -> now - created_at raises
+    10 ** 400,
+    2 ** 100,            # finite JSON int the mirror cannot bind either
+    SQLITE_INT_MAX + 1,
+])
+def test_unconvertible_outbox_created_at_spares_sibling(
+    monkeypatch, tmp_path, bad_created_at
+):
+    def mutate(event):
+        event["created_at"] = bad_created_at
+
+    bad, good, queued, before, after = _replay_both(monkeypatch, tmp_path, mutate)
+    # Healthy-sibling witness: the good delegation still REPLAYS.
+    assert queued == [good]
+    assert bad not in queued
+    # Evidence preserved: quarantine neither repairs nor reseals the record.
+    assert after == before
+    assert all(event["created_at"] == bad_created_at for event in after["outbox"])
+
+
+@pytest.mark.parametrize("bad_generation", [
+    float("inf"),        # int() -> OverflowError
+    float("-inf"),
+    float("nan"),        # int() -> ValueError
+    2 ** 100,            # unbindable finite int
+])
+def test_unconvertible_attempt_generation_spares_sibling(
+    monkeypatch, tmp_path, bad_generation
+):
+    def mutate(event):
+        event["type"] = "async_delegation_restarted"
+        event["payload"]["attempt_generation"] = bad_generation
+
+    bad, good, queued, before, after = _replay_both(monkeypatch, tmp_path, mutate)
+    assert queued == [good]
+    assert bad not in queued
+    assert after == before
+
+
+@pytest.mark.parametrize("good_generation", [0, 1, 7, SQLITE_INT_MAX])
+def test_ordinary_attempt_generation_is_not_narrowed(
+    monkeypatch, tmp_path, good_generation
+):
+    """enqueue_pending_outbox compares generation for supersession; keep ints.
+
+    The payload's generation must stay equal to the record's own
+    ``attempt.generation`` -- that identity is a separate, pre-existing guard
+    (``canonical_terminal``) and this test must not trip it.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        bad, good = _two_terminal_records(monkeypatch, deliverable=True)
+        with store.locked_registry() as registry:
+            record = registry["records"][bad]
+            record["attempt"]["generation"] = good_generation
+            for event in record["outbox"]:
+                event["payload"]["attempt_generation"] = good_generation
+        queued = [p["delegation_id"] for p in
+                  store.enqueue_pending_outbox(current_boot_id="replay-probe")]
+        assert sorted(queued) == sorted([bad, good])
+    finally:
+        ad._reset_for_tests()
+
+
+@pytest.mark.parametrize("good_created_at", [0, 1234.5, 1789390471, SQLITE_INT_MAX])
+def test_ordinary_outbox_created_at_is_not_narrowed(
+    monkeypatch, tmp_path, good_created_at
+):
+    def mutate(event):
+        event["created_at"] = good_created_at
+
+    bad, good, queued, _, _ = _replay_both(monkeypatch, tmp_path, mutate)
+    assert good in queued
+
+
 # --- healthy values must still restore (no over-rejection) ---------------
 
 

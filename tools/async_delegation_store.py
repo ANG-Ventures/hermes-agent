@@ -215,6 +215,19 @@ def _load(path: Path, *, allow_invalid_records: bool = False) -> dict[str, Any]:
                 or (isinstance(event, dict)
                     and isinstance(event.get("payload"), dict)
                     and not _is_optional_number(event["payload"].get("completed_at")))
+                # enqueue_pending_outbox ages the event with `now - created_at`
+                # and supersedes restart notices with
+                # `int(payload["attempt_generation"] or -1)`. Both conversions
+                # are unguarded, sit in the same per-record replay loop as the
+                # timestamps above, and raise on a value that merely LOOKS
+                # numeric: `-(10 ** 400)` overflows float(), and inf/nan cannot
+                # convert to int. One malformed sibling field would abort replay
+                # for every healthy delegation in the profile.
+                or (isinstance(event, dict)
+                    and not _is_optional_number(event.get("created_at")))
+                or (isinstance(event, dict)
+                    and isinstance(event.get("payload"), dict)
+                    and not _is_optional_number(event["payload"].get("attempt_generation")))
                 for event in outbox
             )
         )
