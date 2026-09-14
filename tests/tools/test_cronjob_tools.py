@@ -839,3 +839,102 @@ class TestModelProviderVendorConsistency:
             cronjob(action="update", job_id=job_id, name="Renamed Check")
         )
         assert result["success"] is True
+
+
+class TestCustomProviderVendorAdmission:
+    """A custom provider's label is not the vendor of its served models."""
+
+    model = "llama-3.3-70b-instruct"
+
+    @pytest.fixture(autouse=True)
+    def _configured_custom_provider(self, tmp_path, monkeypatch):
+        from hermes_cli.config import get_config_path
+
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        config_path = get_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps({
+            "providers": {
+                "openai-compatible": {
+                    "base_url": "http://127.0.0.1:8000/v1",
+                    "transport": "chat_completions",
+                    "default_model": self.model,
+                },
+            },
+        }))
+
+    def _create(self, provider, model=None):
+        return json.loads(cronjob(
+            action="create", schedule="every 1h", prompt="Check server status",
+            deliver="local", model=model or self.model, provider=provider,
+        ))
+
+    def test_raw_and_qualified_names_admit_the_same_resolved_runtime(self):
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        from tools.cronjob_tools import _validate_model_provider_vendors
+
+        providers = ("openai-compatible", "custom:openai-compatible")
+        runtimes = [
+            resolve_runtime_provider(requested=provider, target_model=self.model)
+            for provider in providers
+        ]
+        for runtime in runtimes:
+            assert runtime["provider"] == "custom"
+            assert runtime["base_url"] == "http://127.0.0.1:8000/v1"
+            assert runtime["model"] == self.model
+            assert runtime["api_mode"] == "chat_completions"
+        assert {
+            key: value for key, value in runtimes[0].items()
+            if key != "requested_provider"
+        } == {
+            key: value for key, value in runtimes[1].items()
+            if key != "requested_provider"
+        }
+        assert [
+            model_provider_vendor_mismatch(self.model, provider)
+            for provider in providers
+        ] == [None, None]
+        assert [
+            _validate_model_provider_vendors(self.model, provider)
+            for provider in providers
+        ] == [None, None]
+
+    @pytest.mark.parametrize("provider", [
+        "openai-compatible", "custom:openai-compatible",
+    ])
+    def test_create_persists_either_custom_provider_spelling(self, provider):
+        from cron.jobs import get_job
+
+        result = self._create(provider)
+        assert result["success"] is True, result
+        stored = get_job(result["job"]["job_id"])
+        assert stored is not None
+        assert stored["provider"] == provider
+        assert stored["model"] == self.model
+
+    def test_update_from_qualified_to_raw_custom_name_persists(self):
+        from cron.jobs import get_job
+
+        created = self._create("custom:openai-compatible")
+        assert created["success"] is True, created
+        job_id = created["job"]["job_id"]
+        result = json.loads(cronjob(
+            action="update", job_id=job_id, provider="openai-compatible",
+        ))
+        assert result["success"] is True, result
+        stored = get_job(job_id)
+        assert stored is not None
+        assert stored["provider"] == "openai-compatible"
+        assert stored["model"] == self.model
+
+    def test_builtin_cross_vendor_pair_still_rejected(self):
+        from cron.jobs import list_jobs
+
+        assert model_provider_vendor_mismatch("gpt-5-codex", "anthropic") == (
+            "openai", "anthropic",
+        )
+        result = self._create("anthropic", model="gpt-5-codex")
+        assert result["success"] is False
+        assert "retrying will not help" in result["error"]
+        assert list_jobs() == []

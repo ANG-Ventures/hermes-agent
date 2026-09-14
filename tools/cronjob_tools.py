@@ -637,10 +637,10 @@ def _resolve_cron_context_deliver(deliver: Optional[str]) -> Optional[str]:
 # serves" -- a mis-paired pin, not a transient outage, so every retry and
 # every future tick fails the same way.
 #
-# The check is mechanical: infer each side's vendor from its name prefix and
-# refuse a provably cross-vendor pair at create/update time. The prefix maps
-# are deliberately conservative -- an unrecognized model or provider name
-# yields vendor None and is NOT flagged (fail-open on unknowns). This exists to
+# Infer the model's vendor from its prefix, but resolve the provider's identity
+# first: a configured custom provider's label says nothing about its models.
+# The prefix maps are deliberately conservative -- an unrecognized model or
+# resolved provider yields vendor None and is NOT flagged (fail-open). This exists to
 # catch obvious mis-pairs, not to maintain a model catalog: a brand new model
 # name simply falls through and is allowed.
 _MODEL_VENDOR_PREFIXES: Tuple[Tuple[str, str], ...] = (
@@ -684,9 +684,30 @@ def model_provider_vendor_mismatch(
 ) -> Optional[Tuple[str, str]]:
     """Return ``(model_vendor, provider_vendor)`` when the pair is provably
     cross-vendor, else None. Unknown names on either side -> None (fail-open).
+    Provider labels are resolved before inferring their vendor.
     """
     model_vendor = _vendor_of(model_name, _MODEL_VENDOR_PREFIXES)
-    provider_vendor = _vendor_of(provider_name, _PROVIDER_VENDOR_PREFIXES)
+    requested = str(provider_name or "").strip().lower()
+    if not model_vendor or not requested or requested == "auto":
+        return None
+
+    from hermes_cli.auth import AuthError, resolve_provider
+    from hermes_cli.runtime_provider import has_named_custom_provider
+
+    # Match runtime resolution's custom-before-built-in ordering without
+    # resolving credentials (which can refresh tokens or contact a provider).
+    # The shared lookup also preserves canonical built-ins over custom labels.
+    if has_named_custom_provider(requested):
+        resolved_provider = "custom"
+    else:
+        try:
+            resolved_provider = resolve_provider(requested)
+        except AuthError:
+            # Preserve the guard's existing coverage of legacy vendor labels
+            # (e.g. "openai") not registered by this runtime. Configured custom
+            # names have already resolved above and must never take this path.
+            resolved_provider = requested
+    provider_vendor = _vendor_of(resolved_provider, _PROVIDER_VENDOR_PREFIXES)
     if model_vendor and provider_vendor and model_vendor != provider_vendor:
         return (model_vendor, provider_vendor)
     return None
