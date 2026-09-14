@@ -6945,6 +6945,7 @@ class TurnRunner:
             _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
         _resolved_model = getattr(_agent, "model", None) if _agent else None
         _resolved_provider = getattr(_agent, "provider", None) if _agent else None
+        _requested_provider = getattr(_agent, "requested_provider", None) if _agent else None
 
         # Sync session_id immediately after run_conversation(). Compression
         # can rotate before a follow-up model call fails; the failure return
@@ -7081,6 +7082,7 @@ class TurnRunner:
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "provider": _resolved_provider,
+                "requested_provider": _requested_provider,
                 "context_length": _context_length,
             }
 
@@ -7163,6 +7165,7 @@ class TurnRunner:
             "output_tokens": _output_toks,
             "model": _resolved_model,
             "provider": _resolved_provider,
+            "requested_provider": _requested_provider,
             "context_length": _context_length,
             "session_id": effective_session_id,
             "response_previewed": result.get("response_previewed", False),
@@ -21864,7 +21867,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     user_config=_load_gateway_config(),
                     platform_key=_platform_config_key(source.platform),
                     model=agent_result.get("model"),
-                    provider=agent_result.get("provider"),
+                    # Keep the backend kind in result metadata, but display
+                    # the configured route name for generic custom backends.
+                    provider=(
+                        agent_result.get("requested_provider")
+                        if agent_result.get("provider") == "custom" else None
+                    ) or agent_result.get("provider"),
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
