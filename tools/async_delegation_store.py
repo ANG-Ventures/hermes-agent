@@ -591,8 +591,10 @@ def _terminal_payload(record: dict[str, Any], result: dict[str, Any], status: st
         "role": (tasks[0].get("role") if tasks else "leaf"),
         "model": result.get("model") or execution.get("model"),
         "status": status,
-        "summary": result.get("summary"),
-        "error": result.get("error"),
+        # These land in the mandatory envelope; an unencodable string here
+        # aborts the terminal write and loses the completed job.
+        "summary": _envelope_safe(result.get("summary")),
+        "error": _envelope_safe(result.get("error")),
         "api_calls": result.get("api_calls", 0),
         "duration_seconds": result.get("duration_seconds", round(completed_at - dispatched_at, 2)),
         "dispatched_at": dispatched_at,
@@ -1084,16 +1086,37 @@ def claim_recoveries(
     return claimed, summary
 
 
+def _envelope_safe(value: Any) -> Any:
+    """Return ``value`` if the durable registry can persist it, else a marker.
+
+    The delivery envelope is mandatory: it must always be writable. A lone
+    surrogate (or any value the registry's UTF-8 serialization rejects) would
+    otherwise raise inside ``_record_checksum`` and lose a completed job.
+    """
+    if value is None or exact_json_archive(value) is not None:
+        return value
+    return "<unrepresentable>"
+
+
 def _is_optional_number(value: Any) -> bool:
-    """True for None or a real finite number. ``bool`` is NOT a number here.
+    """True for None or a real finite number the consumers can actually use.
 
     ``bool`` is a subclass of ``int``, so an ``isinstance`` check would accept
     ``completed_at: true`` and persist it as timestamp ``1``.
+
+    An ``int`` must also survive the ``float()`` conversion the recovery and
+    replay loops perform: a checksum-valid ``created_at`` of ``10**400`` passes
+    a bare type check, then raises ``OverflowError`` mid-scan and aborts
+    recovery for every healthy delegation in the profile. A value the consumer
+    cannot convert is not a valid number.
     """
     if value is None:
         return True
     if type(value) is int:
-        return True
+        try:
+            return math.isfinite(float(value))
+        except (OverflowError, ValueError):
+            return False
     if type(value) is float:
         return math.isfinite(value)
     return False

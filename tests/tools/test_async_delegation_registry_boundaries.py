@@ -500,3 +500,74 @@ def test_exact_batch_children_are_preserved_unchanged(monkeypatch, tmp_path):
         assert delegation_id
     finally:
         ad._reset_for_tests()
+
+
+@pytest.mark.parametrize("field", ["created_at", "updated_at"])
+def test_unconvertible_timestamp_is_quarantined_not_profile_fatal(
+    monkeypatch, tmp_path, field
+):
+    """A checksum-VALID timestamp the consumers cannot convert must quarantine.
+
+    10**400 is under the 4300-digit JSON limit, so it writes through
+    locked_registry with a valid checksum and passes a strict load. The recovery
+    loop then calls float() on it and raises OverflowError mid-scan, aborting
+    recovery for every healthy delegation in the profile.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        bad, _, _ = helpers.dispatch(monkeypatch)
+        good, _, _ = helpers.dispatch(monkeypatch)
+        with store.locked_registry() as registry:
+            registry["records"][bad][field] = 10 ** 400
+        # Precondition: this really is a valid, strictly-loadable record.
+        raw = json.loads(store.registry_path().read_text())["records"][bad]
+        assert raw["integrity"] == store._record_checksum(raw)
+        claimed, summary = store.claim_recoveries(
+            current_boot_id="200:2", resume_enabled=True, owner_alive=lambda _: False
+        )
+        assert good in [record["delegation_id"] for record in claimed]
+        assert summary["failed_validation"] == 1
+        store.enqueue_pending_outbox(current_boot_id="replay-probe")
+    finally:
+        ad._reset_for_tests()
+
+
+def test_unencodable_summary_cannot_abort_the_completion(monkeypatch, tmp_path):
+    """summary/error ride in the mandatory envelope, same class as batch extras."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        result = {"status": "completed", "summary": "bad \ud800 summary"}
+        delegation_id, worker, _ = helpers.dispatch(monkeypatch, result=result)
+        worker()  # must not raise
+        with store.locked_registry() as registry:
+            record = registry["records"][delegation_id]
+        assert record["state"] == "done"
+        assert len(record.get("outbox") or []) == 1
+        event = helpers.process_registry.completion_queue.get_nowait()
+        assert event["status"] == "completed"
+    finally:
+        ad._reset_for_tests()
+
+
+def test_ordinary_timestamps_and_summaries_are_untouched(monkeypatch, tmp_path):
+    """Positive control: the guards must not refuse legitimate values."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        result = {"status": "completed", "summary": "a normal summary"}
+        delegation_id, worker, _ = helpers.dispatch(monkeypatch, result=result)
+        worker()
+        claimed, summary = store.claim_recoveries(
+            current_boot_id="200:2", resume_enabled=True, owner_alive=lambda _: False
+        )
+        assert summary["failed_validation"] == 0
+        event = helpers.process_registry.completion_queue.get_nowait()
+        assert event["summary"] == "a normal summary"
+        assert delegation_id
+    finally:
+        ad._reset_for_tests()
