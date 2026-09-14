@@ -1079,6 +1079,8 @@ class _RaisingBoolObj:
         raise RuntimeError("hostile bool")
 
 
+_UNSET = object()
+
 _KEEP = {"task_index": 1, "status": "completed", "summary": "KEEP-B"}
 
 
@@ -1194,8 +1196,9 @@ def test_a_real_child_failure_is_still_reported(monkeypatch, tmp_path):
         ad._reset_for_tests()
 
 
+@pytest.mark.parametrize("batch", [False, True])
 def test_non_mapping_runner_result_is_not_reported_as_success(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, batch
 ):
     """A malformed runner return must not be delivered as a fabricated green.
 
@@ -1208,11 +1211,20 @@ def test_non_mapping_runner_result_is_not_reported_as_success(
     monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
     try:
         delegation_id, worker, _ = helpers.dispatch(
-            monkeypatch, batch=True, result="a bare string, not a mapping")
+            monkeypatch, batch=batch, result=["ok"])
         worker()  # must not raise
         event = helpers.process_registry.completion_queue.get_nowait()
         assert event["status"] == "error"
-        assert delegation_id
+        assert event["delegation_id"] == delegation_id
+        assert helpers.row(delegation_id)["state"] == "error"
+        assert helpers.registry_record(delegation_id)["terminal"]["status"] == "error"
+        claim = ad.claim_event_delivery(event, "non-mapping-consumer")
+        assert claim
+        ad.complete_event_delivery(event, claim)
+        assert helpers.row(delegation_id)["delivery_state"] == "delivered"
+        assert helpers.registry_record(delegation_id)["outbox"][0]["state"] == "delivered"
+        assert store.enqueue_pending_outbox(current_boot_id="next-boot") == []
+        assert ad.restore_undelivered_completions(queue.Queue()) == 0
     finally:
         ad._reset_for_tests()
 
@@ -1413,16 +1425,26 @@ def test_non_mapping_archive_is_not_stored_as_terminal_result(
     ad._reset_for_tests()
     monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
     try:
-        delegation_id, worker, _ = helpers.dispatch(monkeypatch, result=["ok"])
-        worker()
+        # Drive append_terminal DIRECTLY. Going through the worker is useless
+        # here: it converts a non-mapping runner result into an error DICT, so
+        # append_terminal never sees a non-mapping and the guard is not gated.
+        delegation_id, _worker, _ = helpers.dispatch(monkeypatch)
+        with store.locked_registry() as registry:
+            attempt_id = registry["records"][delegation_id]["attempt"]["attempt_id"]
+
+        payload = store.append_terminal(
+            delegation_id, attempt_id, ["ok"], "completed")
+        assert payload is not None
+
         with store.locked_registry() as registry:
             record = registry["records"][delegation_id]
-            stored = record["terminal"].get("result", _UNSET := object())
+            stored = record["terminal"].get("result", _UNSET)
             for event in record.get("outbox", []):
                 event["state"] = "pending"
+        # A non-mapping archive must NOT be stored: canonical_terminal rejects
+        # it and the already-queued completion would never replay.
         assert stored is _UNSET or type(stored) is dict
 
-        # The flattened completion must still replay after a restart.
         payloads = store.enqueue_pending_outbox(current_boot_id="after-restart")
         assert delegation_id in [p.get("delegation_id") for p in payloads]
     finally:
