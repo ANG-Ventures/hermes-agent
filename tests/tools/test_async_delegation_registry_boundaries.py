@@ -763,13 +763,32 @@ def test_hostile_dict_subclass_child_cannot_abort_finalization(monkeypatch, tmp_
             raise RuntimeError("hostile get")
 
     try:
-        child = Hostile(task_index=0, status="completed", summary="A",
-                        extra=object())
+        hostile = Hostile(task_index=0, status="completed", summary="A",
+                          extra=object())
+        healthy = {"task_index": 1, "status": "completed",
+                   "summary": "HEALTHY-SIBLING"}
         delegation_id, worker, _ = helpers.dispatch(
-            monkeypatch, batch=True, result={"results": [child]})
+            monkeypatch, batch=True, result={"results": [hostile, healthy]})
         worker()  # must not raise
         with store.locked_registry() as registry:
-            assert registry["records"][delegation_id]["state"] in {"done", "failed"}
-        assert helpers.process_registry.completion_queue.get_nowait()
+            assert registry["records"][delegation_id]["state"] == "done"
+
+        event = helpers.process_registry.completion_queue.get_nowait()
+        # A hostile neighbour must NOT destroy a healthy sibling's real answer.
+        # Asserting only "an event exists" let this bug through once already.
+        assert event["status"] == "completed"
+        assert len(event["results"]) == 2
+        survivor = event["results"][1]
+        assert survivor["task_index"] == 1
+        assert survivor["summary"] == "HEALTHY-SIBLING"
+        assert event["results"][0]["status"] == "error"
+
+        # ...and it must survive real acceptance with no replay on either rail.
+        claim = ad.claim_event_delivery(event, "test-consumer")
+        assert claim
+        ad.complete_event_delivery(event, claim)
+        assert ad.get_durable_delegation(delegation_id)["delivery_state"] == "delivered"
+        assert store.enqueue_pending_outbox(current_boot_id="replay-probe") == []
+        assert ad.restore_undelivered_completions(queue.Queue()) == 0
     finally:
         ad._reset_for_tests()
