@@ -8425,9 +8425,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source=source, session_key=session_key, model=model,
         )
         if cfg is None:
-            # ``resolve_reasoning_config`` returns None when nothing is set;
-            # the provider default in that case is medium.
-            return "medium"
+            # ``resolve_reasoning_config`` returns None when NOTHING is configured.
+            # We cannot know the provider's own default from here, and guessing a
+            # constant is wrong in both directions: on a provider defaulting to
+            # ``high``, re-selecting ``high`` announced a phantom ``medium -> high``,
+            # while a real ``high -> medium`` switch compared ``medium == medium``
+            # and stayed SILENT — the exact failure this feature exists to remove.
+            # Return an explicit unknown sentinel so the caller suppresses the
+            # announce instead of asserting a baseline it does not have.
+            from hermes_constants import REASONING_BASELINE_UNKNOWN
+
+            return REASONING_BASELINE_UNKNOWN
         if not cfg.get("enabled", True):
             return "none"
         return str(cfg.get("effort", "medium") or "medium").strip()

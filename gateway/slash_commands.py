@@ -3452,8 +3452,17 @@ class GatewaySlashCommandsMixin:
         async def _announce() -> None:
             if source is None:
                 return
+            new_effort = _effort_now()
+            # Suppress whenever EITHER side is an unresolvable baseline. We only
+            # announce a change we can actually prove happened; guessing the
+            # provider default produced both phantom announcements and silent
+            # real switches (see ``_resolved_effort_label``).
+            from hermes_constants import REASONING_BASELINE_UNKNOWN
+
+            if REASONING_BASELINE_UNKNOWN in (old_effort, new_effort):
+                return
             await self._announce_switch(
-                source, "reasoning", old_effort, _effort_now(),
+                source, "reasoning", old_effort, new_effort,
             )
 
         if value == "reset":

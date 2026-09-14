@@ -144,21 +144,28 @@ class TestReasoningSwitchAnnounce:
         assert any("🔀 Reasoning: low → xhigh" in text for text in texts), texts
 
     @pytest.mark.asyncio
-    async def test_unconfigured_effort_still_announces(self, tmp_path, monkeypatch):
-        """With no ``agent.reasoning_effort`` at all, a switch still announces.
+    async def test_unconfigured_effort_does_not_announce_a_guessed_baseline(
+        self, tmp_path, monkeypatch
+    ):
+        """With no ``agent.reasoning_effort`` at all, the switch stays silent.
 
-        The resolver returns None for an unconfigured effort. If the baseline
-        passed that through as "", the announce's own empty-string guard would
-        swallow a genuine switch and the channel would see nothing — the exact
-        silence this feature exists to remove. The baseline resolves the
-        provider default (medium) instead.
+        The resolver returns None for an unconfigured effort, and the provider's
+        own default is not knowable from here. This previously substituted the
+        constant ``medium``, which was wrong in both directions: on a provider
+        already running ``high``, ``/reasoning high`` announced a phantom
+        ``medium → high``; and a genuine ``high → medium`` switch compared
+        ``medium == medium`` and announced nothing at all.
+
+        Announcing a transition we cannot prove is worse than silence, so an
+        unresolvable baseline now suppresses the announce. A *configured*
+        baseline still announces — see ``test_reasoning_switch_announces``.
         """
         runner, adapter = _make_runner(monkeypatch, tmp_path, "agent: {}\n")
 
         await runner._handle_reasoning_command(_make_event("/reasoning high"))
 
         texts = _sent_texts(adapter)
-        assert any("🔀 Reasoning: medium → high" in text for text in texts), texts
+        assert not any("🔀 Reasoning:" in text for text in texts), texts
 
     @pytest.mark.asyncio
     async def test_display_toggle_does_not_announce(self, tmp_path, monkeypatch):
