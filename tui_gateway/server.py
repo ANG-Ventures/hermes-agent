@@ -12998,10 +12998,11 @@ def _notification_poller_loop(
                 _did = str(evt.get("delegation_id") or "")
                 if _did:
                     try:
-                        from tools.async_delegation import _note_delivery_attempt
-                        _note_delivery_attempt(_did)
+                        from tools.async_delegation import note_event_delivery_attempt
+                        note_event_delivery_attempt(evt)
                     except Exception:
-                        pass
+                        logger.warning("Could not record orphan delegation attempt: %s",
+                                       _did, exc_info=True)
             continue
 
         _evt_sid = evt.get("session_id", "")

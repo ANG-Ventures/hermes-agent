@@ -44,6 +44,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
@@ -398,7 +399,7 @@ def _sync_completion(conn, event, result, disposition=None):
         return
     same_event = _same_completion_event(json.loads(row[0] or "null"), event)
     if result is None:
-        result = json.loads(row[1]) if same_event and row[1] else event
+        result = json.loads(row[1]) if same_event and row[1] else None
     if not same_event:
         conn.execute(
             """UPDATE async_delegations SET delivery_state='pending',
@@ -407,11 +408,19 @@ def _sync_completion(conn, event, result, disposition=None):
                WHERE delegation_id=?""",
             (event["delegation_id"],),
         )
+    # Same contract as the canonical archive: the mirror stores the exact
+    # result or none at all. json.dumps would otherwise persist a silently
+    # transformed object that later reads back as the original result.
+    archived = _store.exact_json_archive(result)
+    if archived is None and result is not None:
+        logger.warning("Async delegation %s: durable result mirror unavailable",
+                       event["delegation_id"])
     conn.execute(
         """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
            event_json=?, result_json=? WHERE delegation_id=?""",
         (event.get("status", "completed"), event.get("completed_at", now), now,
-         json.dumps(event), json.dumps(result), event["delegation_id"]),
+         json.dumps(event), json.dumps(archived) if archived is not None else None,
+         event["delegation_id"]),
     )
     if disposition in {"delivered", "dropped", "parked"}:
         conn.execute(
@@ -424,36 +433,11 @@ def _sync_completion(conn, event, result, disposition=None):
 
 def _canonical_terminal(registry, delegation_id):
     """Resolve current-attempt terminal evidence while holding the JSON lock."""
-    if delegation_id in registry.get("_invalid_record_ids", []):
-        raise _store.RegistryError(f"record {delegation_id} failed integrity validation")
-    record = registry["records"].get(delegation_id)
-    if record is None or record.get("state") not in {"done", "failed", "cancelled"}:
+    terminal = _store.canonical_terminal(registry, delegation_id)
+    if terminal is None:
         return None
-    # Historical outbox-only records lack execution evidence. They retain the
-    # legacy event/receipt path; do not reclassify them from a delivery envelope.
-    if record.get("terminal") is None:
-        return None
-    attempt = record.get("attempt") or {}
-    entries = [entry for entry in record.get("outbox", [])
-               if entry.get("type") == "async_delegation"]
-    if len(entries) != 1:
-        raise _store.RegistryError(f"ambiguous terminal outbox for {delegation_id}")
-    entry = entries[0]
-    payload = entry.get("payload") or {}
-    if (record.get("delegation_id") != delegation_id
-            or not entry.get("event_id")
-            or payload.get("event_id") != entry["event_id"]
-            or payload.get("delegation_id") != delegation_id
-            or payload.get("type") != "async_delegation"
-            or type(payload.get("attempt_generation")) is not int
-            or type(attempt.get("generation")) is not int
-            or payload["attempt_generation"] < 0
-            or payload["attempt_generation"] != attempt.get("generation")
-            or payload.get("attempt_id") != attempt.get("attempt_id")
-            or payload.get("profile") != record.get("profile")
-            or payload.get("status") != record["terminal"].get("status")):
-        raise _store.RegistryError(f"invalid terminal identity for {delegation_id}")
-    return entry
+    return {**terminal, "payload": {**terminal["payload"],
+            "_registry_profile_home": str(_registry_path().parent.parent)}}
 
 
 def _note_delivery_attempt(delegation_id: str) -> None:
@@ -464,17 +448,17 @@ def _note_delivery_attempt(delegation_id: str) -> None:
         )
 
 
-def recover_abandoned_delegations() -> int:
+def recover_abandoned_delegations(*, invalid_ids: Optional[set[str]] = None) -> int:
     # Lock order is canonical JSON, then SQLite. Failed reads remain retryable.
     try:
         with _store.locked_registry(write=False) as registry:
-            return _recover_abandoned_delegations(registry)
+            return _recover_abandoned_delegations(registry, invalid_ids)
     except Exception:
         logger.warning("Could not recover delegation terminal mirrors", exc_info=True)
         raise
 
 
-def _recover_abandoned_delegations(registry) -> int:
+def _recover_abandoned_delegations(registry, invalid_ids=None) -> int:
     """Classify records whose owning process disappeared as outcome unknown."""
     try:
         from gateway.status import _pid_exists, get_process_start_time
@@ -492,14 +476,39 @@ def _recover_abandoned_delegations(registry) -> int:
         for row in rows:
             (delegation_id, session_key, origin_ui, parent_id, dispatched_at,
              pid, started, task_json, origin_session_id, state, disposition) = row
-            terminal = _canonical_terminal(registry, delegation_id)
+            try:
+                terminal = _canonical_terminal(registry, delegation_id)
+            except Exception:
+                if invalid_ids is not None:
+                    invalid_ids.add(delegation_id)
+                logger.warning("Could not recover delegation %s; invalid canonical evidence",
+                               delegation_id, exc_info=True)
+                continue
             if terminal is not None:
                 conn.execute("BEGIN IMMEDIATE")
-                _sync_completion(conn, terminal["payload"], None, terminal["state"])
+                _sync_completion(conn, terminal["payload"], terminal["execution_result"], terminal["state"])
                 conn.commit()
                 continue
             canonical = registry["records"].get(delegation_id) or {}
             if canonical.get("state") in {"done", "failed", "cancelled"}:
+                metadata = canonical.get("terminal")
+                if metadata is not None and metadata.get("completed_at") is not None:
+                    # No envelope means no delivery or acceptance to synthesize.
+                    # Only an unbound dispatch mirror can receive these facts;
+                    # keep any existing event, receipt, claim and raw result.
+                    conn.execute(
+                        """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
+                           result_json=COALESCE(result_json, ?)
+                           WHERE delegation_id=? AND event_json IS NULL
+                             AND delivery_claim IS NULL""",
+                        (metadata["status"], metadata["completed_at"], now,
+                         json.dumps(metadata["result"] if metadata.get("result") is not None else {
+                             "status": metadata["status"], "error": metadata.get("error"),
+                         }) if metadata.get("result") is not None or metadata.get("error") else None,
+                         delegation_id),
+                    )
+                    conn.commit()
+                    continue
                 logger.warning(
                     "Terminal delegation %s lacks execution evidence; retaining mirror",
                     delegation_id,
@@ -571,7 +580,8 @@ def restore_undelivered_completions(target_queue) -> int:
     102K-token context on the staging fleet) for a result nobody is waiting
     on anymore; the payload stays queryable on the dropped row.
     """
-    recover_abandoned_delegations()
+    invalid_ids: set[str] = set()
+    recover_abandoned_delegations(invalid_ids=invalid_ids)
     now = time.time()
     restored = 0
     with _DB_LOCK, _transaction() as conn:
@@ -584,6 +594,8 @@ def restore_undelivered_completions(target_queue) -> int:
         ).fetchall()
         restored = 0
         for delegation_id, payload, _attempts, completed_at, dispatched_at in rows:
+            if delegation_id in invalid_ids:
+                continue
             # Park a completion that has exhausted its delivery budget: its origin
             # session is permanently gone (dead owner pid), so every boot it
             # re-enqueues, fails the fail-closed ownership gate, gets dropped
@@ -617,6 +629,7 @@ def restore_undelivered_completions(target_queue) -> int:
             evt = json.loads(payload)
             if isinstance(evt, dict):
                 evt["restored"] = True
+                evt["_registry_profile_home"] = str(_registry_path().parent.parent)
             target_queue.put(evt)
             restored += 1
     return restored
@@ -626,15 +639,15 @@ def claim_completion_delivery(
     delegation_id: str, claim_id: str, *, event: Optional[Dict[str, Any]] = None,
 ) -> bool:
     try:
+        profile_home = (event or {}).get("_registry_profile_home")
+        if profile_home and Path(profile_home).resolve() != _registry_path().parent.parent.resolve():
+            return False
         with _store.locked_registry(write=False) as registry:
             terminal = _canonical_terminal(registry, delegation_id)
             if terminal is not None and event is not None:
                 if (not _same_completion_event(terminal["payload"], event)
                         or any(event.get(key) != terminal["payload"].get(key)
                                for key in ("profile", "attempt_id"))):
-                    return False
-                profile_home = event.get("_registry_profile_home")
-                if profile_home and Path(profile_home).resolve() != _registry_path().parent.parent.resolve():
                     return False
             return _claim_completion_delivery(delegation_id, claim_id, event=event, terminal=terminal)
     except Exception:
@@ -648,7 +661,7 @@ def _claim_completion_delivery(delegation_id, claim_id, *, event=None, terminal=
     with _DB_LOCK, _transaction() as conn:
         conn.execute("BEGIN IMMEDIATE")
         if terminal is not None:
-            _sync_completion(conn, terminal["payload"], None, terminal["state"])
+            _sync_completion(conn, terminal["payload"], terminal["execution_result"], terminal["state"])
         row = conn.execute(
             "SELECT delivery_state, event_json FROM async_delegations WHERE delegation_id=?",
             (delegation_id,),
@@ -675,6 +688,31 @@ def _claim_completion_delivery(delegation_id, claim_id, *, event=None, terminal=
         return cur.rowcount == 1
 
 
+def _producer_scoped(operation):
+    """Shared queue consumers run outside the producer's profile context."""
+    @wraps(operation)
+    def scoped(evt, *args, **kwargs):
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        home = evt.get("_registry_profile_home")
+        token = set_hermes_home_override(Path(home)) if home else None
+        try:
+            return operation(evt, *args, **kwargs)
+        finally:
+            if token is not None:
+                reset_hermes_home_override(token)
+    return scoped
+
+
+@_producer_scoped
+def note_event_delivery_attempt(evt: Dict[str, Any]) -> None:
+    """Count a pre-claim refusal in the producer ledger, not the consumer's."""
+    delegation_id = str(evt.get("delegation_id") or "")
+    if evt.get("type") == "async_delegation" and delegation_id:
+        _note_delivery_attempt(delegation_id)
+
+
+@_producer_scoped
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     """Claim a durable delegation event; non-durable events need no token."""
     if evt.get("type") != "async_delegation":
@@ -689,6 +727,7 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     return None
 
 
+@_producer_scoped
 def _reconcile_terminal_event_receipt(evt: Dict[str, Any]) -> None:
     """Repair JSON only from an unambiguous same-event SQLite terminal receipt.
 
@@ -795,6 +834,7 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
+@_producer_scoped
 def acknowledge_event_outbox(
     evt: Dict[str, Any], *, outcome: str, reason: Optional[str] = None,
 ) -> None:
@@ -818,6 +858,7 @@ def acknowledge_event_outbox(
         logger.warning("Async delegation outbox receipt not found: %s", event_id)
 
 
+@_producer_scoped
 def complete_event_delivery(evt: Dict[str, Any], claim_id: Optional[str]) -> None:
     """Record consumer acceptance, not completion of the resulting model turn."""
     try:
@@ -848,12 +889,17 @@ def complete_event_delivery_with_retry(evt: Dict[str, Any], claim_id: Optional[s
     return False
 
 
+@_producer_scoped
 def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
     if claim_id and evt.get("type") == "async_delegation":
         release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
 
 
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
+    """Read mirror facts; result may be absent or only recovery-error metadata.
+
+    Full raw execution results are available only when JSON archival succeeded.
+    """
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
             """SELECT origin_session, state, dispatched_at, completed_at,
@@ -1191,8 +1237,24 @@ def dispatch_async_delegation(
                 )
                 return
         try:
-            result = runner() or {}
-            status = result.get("status") or "completed"
+            raw_result = runner()
+            # Same contract as the batch worker: no truth test on runner output
+            # (__bool__ can raise) and a non-mapping return is NOT a success.
+            if raw_result is None:
+                result = {}
+            elif _store.isinstance_safe(raw_result, dict):
+                result = raw_result
+            else:
+                raise TypeError(
+                    f"runner returned {type(raw_result).__name__}, "
+                    "expected a mapping"
+                )
+            # No == on runner data (__eq__ is user-defined). Default only on a
+            # genuinely absent status; the store's guarded terminal_state and
+            # _envelope_safe already handle hostile values safely.
+            status = _store._safe_get(result, "status")
+            if status is None or (type(status) is str and not status):
+                status = "completed"
         except Exception as exc:  # noqa: BLE001 — must never crash the worker
             logger.exception("Async delegation %s crashed", delegation_id)
             result = {
@@ -1568,16 +1630,50 @@ def dispatch_async_delegation_batch(
                 )
                 return
         try:
-            combined = runner() or {}
-            # Batch status: completed unless every child errored/was interrupted.
-            child_results = combined.get("results") or []
-            if child_results and all(
-                (r.get("status") not in ("completed", "success"))
-                for r in child_results
-            ):
-                status = "error"
+            raw_combined = runner()
+            # No truth test on a runner-controlled object (__bool__ can raise),
+            # and a non-mapping return is NOT a success: reporting it completed
+            # would deliver a fabricated green to the user.
+            if raw_combined is None:
+                combined = {}
+            elif _store.isinstance_safe(raw_combined, dict):
+                combined = raw_combined
             else:
-                status = "completed"
+                raise TypeError(
+                    f"batch runner returned {type(raw_combined).__name__}, "
+                    "expected a mapping"
+                )
+            # Batch status: completed unless every child errored/was interrupted.
+            # Children are runner-controlled: a non-list "results", or an entry
+            # that is not a dict, must NOT crash this classification. Raising
+            # here would discard the real children in the handler below and
+            # report a completed batch as an error.
+            child_results = _store._safe_sequence(
+                _store._safe_get(combined, "results"))
+            try:
+                # Only children we can actually READ get a vote. A malformed
+                # entry (scalar, None, hostile object) is unjudgeable, and
+                # counting it as a failure would report a batch the runner
+                # said completed as an error.
+                # Only children whose status we can actually READ get a vote.
+                # A missing/non-string/hostile status is unjudgeable: counting
+                # it as a failure reports a batch the runner said completed as
+                # an error.
+                votes = [
+                    status for status in (
+                        _child_status(child) for child in child_results
+                    ) if status is not None
+                ]
+                all_failed = bool(votes) and all(
+                    status not in ("completed", "success") for status in votes
+                )
+            except Exception:  # noqa: BLE001 - classification must never lose children
+                logger.warning(
+                    "async_delegation_child_classification_failed delegation_id=%s",
+                    delegation_id, exc_info=True,
+                )
+                all_failed = False
+            status = "error" if all_failed else "completed"
         except Exception as exc:  # noqa: BLE001 — must never crash the worker
             logger.exception("Async delegation batch %s crashed", delegation_id)
             combined = {
@@ -1620,6 +1716,34 @@ def dispatch_async_delegation_batch(
         delegation_id, n, session_key or "<cli>",
     )
     return {"status": "dispatched", "delegation_id": delegation_id}
+
+
+def _child_status(child: Any) -> str | None:
+    """Read a batch child's status without trusting the child.
+
+    Two ways an untrusted child breaks classification, both of which discard
+    EVERY child in the handler and destroy healthy siblings' real answers:
+
+    1. ``isinstance`` accepts a dict SUBCLASS whose ``get`` raises.
+    2. Even a plain dict can hold a status object whose ``__eq__`` raises, so
+       the membership COMPARISON blows up after a successful lookup.
+
+    Return an exact ``str`` or ``None`` so the caller only ever compares
+    trusted values. A child must never break the batch.
+    """
+    if not _store.isinstance_safe(child, dict):
+        return None
+    status = _store._safe_get(child, "status")
+    # Return an EXACT str or None -- never anything the caller must trust.
+    #
+    # Only ``type(x) is str`` is safe here. Every softer test has already been
+    # escaped by a hostile child in review:
+    #   * ``isinstance`` invokes a ``__class__`` property,
+    #   * ``==`` invokes ``__eq__``,
+    #   * ``str()`` invokes ``__str__``, which may return self.
+    # ``type()`` reads the real type slot and cannot be overridden, so anything
+    # that is not exactly a str is simply refused rather than inspected.
+    return status if type(status) is str else None
 
 
 def _finalize_batch(
@@ -1950,6 +2074,7 @@ def recover_async_delegations(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
 ) -> Dict[str, int]:
     """Claim and submit restartable records once for one profile/boot."""
+    profile_home = _store.registry_path(profile_home).parent.parent
     claimed, summary = _store.claim_recoveries(
         current_boot_id=current_boot_id,
         resume_enabled=resume_enabled,
@@ -2090,6 +2215,7 @@ def enqueue_pending_outbox(
     *, current_boot_id: str, profile_home=None
 ) -> int:
     """Replay both restart and terminal events through the existing queue."""
+    profile_home = _store.registry_path(profile_home).parent.parent
     payloads = _store.enqueue_pending_outbox(
         current_boot_id=current_boot_id,
         profile_home=profile_home,

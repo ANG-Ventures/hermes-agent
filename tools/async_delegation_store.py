@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import logging
 import os
 import time
@@ -33,6 +34,11 @@ ACTIVE_STALE_SECONDS = 30 * 24 * 60 * 60
 MAX_LIFECYCLE_EVENTS = 50
 # Caller-stack frames captured for cancel attribution (innermost frames).
 MAX_ATTRIBUTION_FRAMES = 12
+# sqlite3 binds Python ints as signed 64-bit INTEGER and raises OverflowError
+# outside this range. Persisted timestamps are bound as parameters by the
+# recovery/replay mirrors, so a wider int is not a usable number here.
+_SQLITE_INT_MIN = -(2 ** 63)
+_SQLITE_INT_MAX = 2 ** 63 - 1
 
 class RegistryError(RuntimeError):
     """Registry cannot be safely read or mutated."""
@@ -135,12 +141,11 @@ def _stamp_cancel_attribution(
 
 def registry_path(profile_home: Path | None = None) -> Path:
     home = Path(profile_home) if profile_home is not None else get_hermes_home()
-    return home / "state" / "async-delegations.json"
+    return home.resolve() / "state" / "async-delegations.json"
 
 
 def lock_path(profile_home: Path | None = None) -> Path:
-    home = Path(profile_home) if profile_home is not None else get_hermes_home()
-    return home / "state" / "async-delegations.lock"
+    return registry_path(profile_home).with_suffix(".lock")
 
 
 def empty_registry() -> dict[str, Any]:
@@ -183,6 +188,81 @@ def _load(path: Path, *, allow_invalid_records: bool = False) -> dict[str, Any]:
                 "async_delegation_registry_invalid delegation_id=%s reason=record_not_object",
                 delegation_id,
             )
+            continue
+        # Reuse the existing per-record quarantine for malformed structures.
+        # Sparse historical terminal outboxes may lack an embedded self ID;
+        # active records and any explicitly supplied self ID must match the key.
+        outbox = record.get("outbox", [])
+        state = record.get("state", "")
+        invalid_state = not isinstance(state, str)
+        invalid_identity = (
+            ((not invalid_state and state in {"running", "recoverable"})
+             or "delegation_id" in record)
+            and record.get("delegation_id") != delegation_id
+        )
+        invalid_outbox = (
+            not isinstance(outbox, list)
+            or any(
+                not isinstance(event, dict)
+                or (event.get("payload") is not None
+                    and not isinstance(event.get("payload"), dict))
+                # The deliverable path binds the ENVELOPE's own completed_at:
+                # _sync_completion writes payload["completed_at"] straight into
+                # the mirror's REAL column. Validating only the record-level
+                # terminal timestamp below let the same unbindable int reach
+                # SQLite through this sibling field and abort recovery for every
+                # healthy delegation in the profile.
+                or (isinstance(event, dict)
+                    and isinstance(event.get("payload"), dict)
+                    and not _is_optional_number(event["payload"].get("completed_at")))
+                # enqueue_pending_outbox ages the event with `now - created_at`
+                # and supersedes restart notices with
+                # `int(payload["attempt_generation"] or -1)`. Both conversions
+                # are unguarded, sit in the same per-record replay loop as the
+                # timestamps above, and raise on a value that merely LOOKS
+                # numeric: `-(10 ** 400)` overflows float(), and inf/nan cannot
+                # convert to int. One malformed sibling field would abort replay
+                # for every healthy delegation in the profile.
+                or (isinstance(event, dict)
+                    and not _is_optional_number(event.get("created_at")))
+                or (isinstance(event, dict)
+                    and isinstance(event.get("payload"), dict)
+                    and not _is_optional_number(event["payload"].get("attempt_generation")))
+                for event in outbox
+            )
+        )
+        # The recovery loops convert these without guards (float(created_at),
+        # int(generation/redispatch_count)) and .get() into attempt. A
+        # valid-checksum record carrying a bad scalar would raise out of the
+        # per-record loop and abort the WHOLE profile's recovery/replay, so it
+        # is quarantined here like any other malformed structure. bool is
+        # rejected explicitly: it is an int subclass, so `completed_at: true`
+        # would otherwise persist as timestamp 1.
+        attempt_field = record.get("attempt")
+        invalid_numeric = (
+            (attempt_field is not None and not isinstance(attempt_field, dict))
+            or not _is_optional_number(record.get("created_at"))
+            or not _is_optional_number(record.get("updated_at"))
+        )
+        if isinstance(attempt_field, dict) and not invalid_numeric:
+            invalid_numeric = (
+                not _is_optional_number(attempt_field.get("generation"))
+                or not _is_optional_number(attempt_field.get("redispatch_count"))
+                or not _is_optional_number(attempt_field.get("started_at"))
+                or not _is_optional_number(attempt_field.get("submitted_at"))
+            )
+        terminal_field = record.get("terminal")
+        if not invalid_numeric and terminal_field is not None:
+            invalid_numeric = (
+                not isinstance(terminal_field, dict)
+                or not _is_optional_number(terminal_field.get("completed_at"))
+            )
+        if invalid_state or invalid_identity or invalid_outbox or invalid_numeric:
+            if not allow_invalid_records:
+                raise RegistryError(f"record {delegation_id} has invalid state/identity/outbox structure")
+            invalid_record_ids.append(str(delegation_id))
+            logger.error("async_delegation_registry_invalid delegation_id=%s reason=structure",
+                         delegation_id)
             continue
         expected = record.get("integrity")
         if not expected or expected != _record_checksum(record):
@@ -232,7 +312,7 @@ def locked_registry(
 ) -> Iterator[dict[str, Any]]:
     """Lock, load, and optionally atomically persist one profile registry."""
     path = registry_path(profile_home)
-    lpath = lock_path(profile_home)
+    lpath = path.with_suffix(".lock")  # Same captured home, even if cwd/symlink changes.
     _prepare_directory(path)
     deadline = time.monotonic() + max(0.0, timeout)
     handle = lpath.open("a+b")
@@ -498,6 +578,7 @@ def _terminal_payload(record: dict[str, Any], result: dict[str, Any], status: st
     source = record.get("source") or {}
     execution = record.get("execution") or {}
     tasks = source.get("tasks") or []
+    tasks = [task for task in tasks if isinstance(task, dict)] if isinstance(tasks, list) else []
     goals = [str(task.get("goal") or "") for task in tasks if isinstance(task, dict)]
     dispatched_at = record.get("created_at") or time.time()
     completed_at = time.time()
@@ -535,21 +616,81 @@ def _terminal_payload(record: dict[str, Any], result: dict[str, Any], status: st
         "context": source.get("shared_context"),
         "toolsets": execution.get("toolsets"),
         "role": (tasks[0].get("role") if tasks else "leaf"),
-        "model": result.get("model") or execution.get("model"),
+        # No truth test on runner data: `x or y` calls __bool__, which a
+        # hostile value can make raise before any normalization happens.
+        "model": _first_present(
+            _safe_get(result, "model"), execution.get("model")),
         "status": status,
-        "summary": result.get("summary"),
-        "error": result.get("error"),
-        "api_calls": result.get("api_calls", 0),
-        "duration_seconds": result.get("duration_seconds", round(completed_at - dispatched_at, 2)),
+        "summary": _safe_get(result, "summary"),
+        "error": _safe_get(result, "error"),
+        "api_calls": _safe_get(result, "api_calls", 0),
+        "duration_seconds": _safe_get(
+            result, "duration_seconds", round(completed_at - dispatched_at, 2)),
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
-        "exit_reason": result.get("exit_reason"),
+        "exit_reason": _safe_get(result, "exit_reason"),
     }
-    if source.get("kind") == "batch" or len(goals) > 1 or "results" in result:
+    # The envelope is MANDATORY and whole-record checksummed. Any
+    # runner-controlled value the durable registry cannot serialize would abort
+    # the terminal write and lose a completed job, so sweep every field rather
+    # than guarding them one at a time.
+    for key, value in list(payload.items()):
+        payload[key] = _envelope_safe(value)
+    is_batch = (
+        source.get("kind") == "batch"
+        or len(goals) > 1
+        # "in" is user-defined (__contains__); read the key instead.
+        or _safe_get(result, "results", _MISSING) is not _MISSING
+    )
+    if is_batch:
+        # The delivery envelope is MANDATORY: it must always be persistable.
+        # Child entries come from arbitrary runner output, so keep each one only
+        # if it is exactly JSON-representable; otherwise fall back to its
+        # flattened, known-safe fields. Copying them wholesale lets one
+        # unsupported child value abort the terminal write and lose the job.
+        entries = []
+        # Only an EXACT list is iterable safely: a JSON-valid scalar such as
+        # {"results": 1} would raise TypeError here, before the terminal record
+        # and outbox exist, losing the completed job.
+        for entry in _safe_sequence(_safe_get(result, "results")):
+            if type(entry) is dict and _envelope_representable(entry):
+                entries.append(entry)
+            elif entry is None or _envelope_representable(entry):
+                # Representable but NOT formattable: every consumer calls
+                # .get() on each child, so a bare scalar/None raises in
+                # process_registry._format_async_delegation and the completion
+                # never reaches the user. Wrap it, keeping the value as data.
+                entries.append({"status": "completed", "summary": None,
+                                "value": entry})
+            elif type(entry) is dict:
+                # Exact dict only: a dict SUBCLASS can override get/__eq__ and
+                # raise during extraction. task_index is the child's IDENTITY;
+                # without it a degraded child renders under another task's goal.
+                entries.append({
+                    key: _envelope_safe(_safe_get(entry, key))
+                    for key in ("task_index", "status", "summary", "error",
+                                "model", "role", "goal", "api_calls",
+                                "duration_seconds", "exit_reason")
+                    if _safe_get(entry, key, _MISSING) is not _MISSING
+                })
+            else:
+                # Consumers (process_registry._format_async_delegation,
+                # tui_gateway) call .get() on every child, so a bare scalar
+                # would raise in the FORMATTER and the completion would never
+                # reach the user. Always emit a dict, and describe the entry
+                # WITHOUT running any runner-controlled code: repr()/str() are
+                # user-defined, so a raising __repr__ aborted the terminal
+                # write and lost the healthy siblings' answers.
+                entries.append({
+                    "status": "error",
+                    "error": "result entry was not representable",
+                    "raw": _envelope_safe(_untrusted_type_name(entry)),
+                })
         payload.update({
             "is_batch": True,
-            "results": result.get("results") or [],
-            "total_duration_seconds": result.get("total_duration_seconds"),
+            "results": entries,
+            "total_duration_seconds": _envelope_safe(
+                _safe_get(result, "total_duration_seconds")),
         })
     return payload
 
@@ -577,21 +718,51 @@ def append_terminal(
                 record.get("state"),
             )
             return None
-        terminal_state = "done" if status in {"completed", "success"} else "failed"
+        # status is runner-controlled: an unhashable value (e.g. a list) would
+        # raise on the set-membership test before the terminal record or outbox
+        # exist, durably stranding a completed job as running.
+        # type() not isinstance(), and only AFTER that is the value hashed:
+        # a str subclass with a raising/unhashable __hash__ would otherwise
+        # blow up the set-membership test before anything is persisted.
+        terminal_state = (
+            "done" if type(status) is str and status in {"completed", "success"}
+            else "failed"
+        )
         payload = _terminal_payload(record, result, status)
         event_id = f"{delegation_id}:terminal:g{record['attempt']['generation']}"
         payload["event_id"] = event_id
+        # The full runner result is optional archival data, not the delivery
+        # envelope. Unsupported extras must not discard a valid flattened answer.
+        archived_result = exact_json_archive(result)
+        if archived_result is None and result is not None:
+            logger.warning("Async delegation %s: optional result archive unavailable",
+                           delegation_id)
         record["state"] = terminal_state
         record["terminal"] = {
-            "status": status,
+            # Guarded copies, as in the envelope: terminal_state above already
+            # captured the real disposition, so an unencodable status string
+            # must not be allowed to abort the write.
+            "status": payload.get("status"),
             "completed_at": payload["completed_at"],
-            "error": result.get("error"),
+            # Same guarded value the envelope carries. Both copies are
+            # mandatory and whole-record checksummed, so an unencodable error
+            # here aborts the terminal write and loses the completed job.
+            "error": payload.get("error"),
         }
+        # canonical_terminal requires terminal.result to be a dict; storing a
+        # JSON-native non-dict (["ok"], "done", 3) makes it reject the record
+        # on restart and the already-queued completion never replays.
+        if type(archived_result) is dict:
+            record["terminal"]["result"] = archived_result
+        elif archived_result is not None:
+            logger.warning(
+                "Async delegation %s: non-mapping result archive omitted",
+                delegation_id)
         record["updated_at"] = payload["completed_at"]
         append_lifecycle_event(
             record,
             terminal_state,
-            f"status={status} attempt={attempt_id}",
+            f"status={payload.get('status')} attempt={attempt_id}",
             now=payload["completed_at"],
         )
         if not any(event.get("event_id") == event_id for event in record.get("outbox", [])):
@@ -813,18 +984,32 @@ def _restart_payload(
 
 
 def _fail_recovery_record(
-    record: dict[str, Any], error: str, now: float, *, emit_event: bool
+    record: dict[str, Any], error: str, now: float, *, emit_event: bool,
+    event_suffix: str | None = None,
 ) -> None:
     record["state"] = "failed"
     record["updated_at"] = now
-    record["terminal"] = {"status": "error", "error": error, "completed_at": now}
-    if not emit_event:
+    record["terminal"] = {"status": "error", "error": _envelope_safe(error),
+                          "completed_at": now}
+    # A checksum-valid record can carry a truthy NON-DICT route; `or {}` only
+    # catches falsy values, so route.get() below would raise and abort the
+    # whole claim_recoveries loop, stranding every later healthy delegation.
+    route = record.get("route")
+    if not isinstance_safe(route, dict):
+        route = {}
+    if (not emit_event
+            or not all(str(route.get(key) or "").strip()
+                       for key in ("platform", "session_key", "parent_session_id"))
+            or (route.get("profile") or record.get("profile")) != record.get("profile")):
+        logger.warning("Delegation %s failed (%s) without a safe notification route",
+                       record.get("delegation_id"), error)
         return
     payload = _terminal_payload(record, {"error": error}, "error")
-    event_id = f"{record.get('delegation_id')}:terminal:{error}"
+    payload["completed_at"] = now
+    event_id = f"{record.get('delegation_id')}:terminal:{event_suffix or error}"
     payload["event_id"] = event_id
     if not any(event.get("event_id") == event_id for event in record.get("outbox", [])):
-        record.setdefault("outbox", []).append({
+        entry = {
             "event_id": event_id,
             "type": "async_delegation",
             "state": "pending",
@@ -833,7 +1018,17 @@ def _fail_recovery_record(
             "delivered_at": None,
             "drop_reason": None,
             "payload": payload,
-        })
+        }
+        # Validate before publishing; never normalize conflicting identity.
+        candidate = {**record, "outbox": [*record.get("outbox", []), entry]}
+        try:
+            canonical_terminal({"records": {record["delegation_id"]: candidate}},
+                               record["delegation_id"])
+        except RegistryError:
+            logger.warning("Delegation %s failed (%s) without a valid notification identity",
+                           record.get("delegation_id"), error, exc_info=True)
+            return
+        record.setdefault("outbox", []).append(entry)
 
 
 def claim_recoveries(
@@ -907,17 +1102,8 @@ def claim_recoveries(
                 continue
             summary["eligible"] += 1
             if now - float(record.get("created_at") or now) > ACTIVE_STALE_SECONDS:
-                payload = _terminal_payload(record, {"error": "stale_record"}, "error")
-                event_id = f"{delegation_id}:terminal:stale"
-                payload["event_id"] = event_id
-                record["state"] = "failed"
-                record["updated_at"] = now
-                record["terminal"] = {"status": "error", "error": "stale_record", "completed_at": now}
-                record.setdefault("outbox", []).append({
-                    "event_id": event_id, "type": "async_delegation", "state": "pending",
-                    "queued_boot_id": None, "created_at": now, "delivered_at": None,
-                    "drop_reason": None, "payload": payload,
-                })
+                _fail_recovery_record(record, "stale_record", now,
+                                      emit_event=True, event_suffix="stale")
                 continue
             # RC-1: a dead boot's claim with no executor-submission telemetry did
             # not launch replacement work and therefore does not consume retry budget.
@@ -925,20 +1111,8 @@ def claim_recoveries(
             if int(attempt.get("generation") or 0) > 0 and attempt.get("submitted_at") is None:
                 redispatch_count = max(0, redispatch_count - 1)
             if redispatch_count >= MAX_REDISPATCH_ATTEMPTS:
-                payload = _terminal_payload(record, {"error": "restart_attempts_exhausted"}, "error")
-                event_id = f"{delegation_id}:terminal:exhausted"
-                payload["event_id"] = event_id
-                record["state"] = "failed"
-                record["updated_at"] = now
-                record["terminal"] = {
-                    "status": "error", "error": "restart_attempts_exhausted", "completed_at": now,
-                }
-                if not any(event.get("event_id") == event_id for event in record.get("outbox", [])):
-                    record.setdefault("outbox", []).append({
-                        "event_id": event_id, "type": "async_delegation", "state": "pending",
-                        "queued_boot_id": None, "created_at": now, "delivered_at": None,
-                        "drop_reason": None, "payload": payload,
-                    })
+                _fail_recovery_record(record, "restart_attempts_exhausted", now,
+                                      emit_event=True, event_suffix="exhausted")
                 summary["exhausted"] += 1
                 logger.warning(
                     "async_delegation_retry_exhausted delegation_id=%s redispatch_count=%d",
@@ -1001,6 +1175,296 @@ def claim_recoveries(
     return claimed, summary
 
 
+_MISSING = object()
+# The real ``__name__`` descriptor on ``type`` itself. Bound to a type object
+# directly, it cannot be intercepted by a hostile metaclass ``__getattribute__``
+# or ``__name__`` property.
+_TYPE_NAME_SLOT = type.__dict__["__name__"]
+
+
+def _first_present(primary: Any, fallback: Any) -> Any:
+    """``primary or fallback`` without truth-testing untrusted data."""
+    if primary is None:
+        return fallback
+    # `type(x) in (...)` compares with ==, which a hostile METACLASS can
+    # override. Use identity only -- `is` cannot be intercepted.
+    primary_type = type(primary)
+    for known in (str, bytes, list, tuple, dict, set):
+        if primary_type is known:
+            try:
+                return primary if len(primary) else fallback
+            except Exception:  # noqa: BLE001
+                return fallback
+    return primary
+
+
+def _safe_get(mapping: Any, key: str, default: Any = None) -> Any:
+    """Read one key from an untrusted mapping without running its code.
+
+    A runner result (or a child entry) can be a dict SUBCLASS overriding
+    ``get``/``__contains__``/``keys``/``__iter__``, or an object whose
+    ``__class__`` raises. Any of those turns a plain lookup into an exception
+    -- or, worse, silently drops real data. Read through ``dict`` itself so
+    only the C-level slot is used, and never let a lookup escape.
+    """
+    if not isinstance_safe(mapping, dict):
+        return default
+    # Even dict.get() is not safe: a lookup hashes the probe key and, on a
+    # hash collision, compares it against STORED keys with ==. A hostile key
+    # sitting in the runner's result therefore executes its own __eq__ during
+    # an ordinary get() and aborts the terminal write.
+    #
+    # Walk the real items instead and match by identity/exact-str value, so no
+    # stored key's __eq__ or __hash__ is ever invoked.
+    try:
+        items = list(dict.items(mapping))
+    except Exception:  # noqa: BLE001 - never break the terminal write
+        return default
+    for stored_key, stored_value in items:
+        if stored_key is key:
+            return stored_value
+        if type(stored_key) is str and str.__eq__(stored_key, key) is True:
+            return stored_value
+    return default
+
+
+def isinstance_safe(value: Any, kind: type) -> bool:
+    """``isinstance`` that cannot be defeated by a hostile ``__class__``."""
+    try:
+        return isinstance(value, kind)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _untrusted_type_name(value: Any) -> str:
+    """Describe an unrepresentable entry without running its code.
+
+    ``repr()``/``str()`` are user-defined: a runner child whose ``__repr__``
+    raises aborted ``_terminal_payload`` before the terminal record or outbox
+    existed, destroying its healthy siblings' answers. Read the name through
+    ``type.__dict__["__name__"]`` -- the C-level slot on the real type object,
+    which neither the instance nor a hostile metaclass can intercept -- and
+    verify the result is an exact ``str`` before using it.
+    """
+    try:
+        name = _TYPE_NAME_SLOT.__get__(type(value))
+    except Exception:  # noqa: BLE001 - never break the terminal write
+        return "<unrepresentable>"
+    if type(name) is not str:
+        return "<unrepresentable>"
+    return f"<unrepresentable {name}>"
+
+
+def _safe_sequence(value: Any) -> list:
+    """Return an EXACT list of entries from an untrusted sequence value.
+
+    ``len()``/iteration are user-defined on a list subclass, so a hostile
+    ``__len__`` can make a populated list look empty and silently discard every
+    child's real answer.
+    """
+    if type(value) is list:
+        return value
+    if value is None:
+        return []
+    # Rebuild through the CONCRETE type's own slots. len()/tuple()/value[i]
+    # are all virtual: a subclass can lie about its length or hand back
+    # different items on indexing, silently dropping or fabricating answers.
+    if isinstance_safe(value, list):
+        try:
+            size = list.__len__(value)
+            return [list.__getitem__(value, index) for index in range(size)]
+        except Exception:  # noqa: BLE001
+            return []
+    if isinstance_safe(value, tuple):
+        try:
+            size = tuple.__len__(value)
+            return [tuple.__getitem__(value, index) for index in range(size)]
+        except Exception:  # noqa: BLE001
+            return []
+    return [value]
+
+
+def _envelope_representable(value: Any) -> bool:
+    """True if the durable registry can persist ``value`` exactly.
+
+    ``exact_json_archive`` returns ``None`` both for a VALID JSON null and for
+    an unavailable archive, so it cannot be used directly as a validity test --
+    doing so replaces a legitimate ``None`` result with a fabricated error.
+    """
+    if value is None:
+        return True
+    return exact_json_archive(value) is not None
+
+
+def _envelope_safe(value: Any) -> Any:
+    """Return ``value`` if the durable registry can persist it, else a marker.
+
+    The delivery envelope is mandatory: it must always be writable. A lone
+    surrogate (or any value the registry's UTF-8 serialization rejects) would
+    otherwise raise inside ``_record_checksum`` and lose a completed job.
+    """
+    if _envelope_representable(value):
+        return value
+    return "<unrepresentable>"
+
+
+def _is_optional_number(value: Any) -> bool:
+    """True for None or a real finite number the consumers can actually use.
+
+    ``bool`` is a subclass of ``int``, so an ``isinstance`` check would accept
+    ``completed_at: true`` and persist it as timestamp ``1``.
+
+    An ``int`` must also survive the ``float()`` conversion the recovery and
+    replay loops perform: a checksum-valid ``created_at`` of ``10**400`` passes
+    a bare type check, then raises ``OverflowError`` mid-scan and aborts
+    recovery for every healthy delegation in the profile. A value the consumer
+    cannot convert is not a valid number.
+
+    ``float()`` is not the only conversion, and it is not the tightest one:
+    these numbers are bound as SQLite parameters, and sqlite3 refuses any int
+    outside the signed 64-bit range with ``OverflowError: Python int too large
+    to convert to SQLite INTEGER``. ``2 ** 100`` is a finite JSON integer whose
+    ``float()`` succeeds, so the isfinite check alone let it through validation
+    and it then raised out of the per-record recovery loop, aborting
+    restoration of every healthy sibling. Bound ints to what the consumer can
+    actually bind. Floats are NOT range-limited: sqlite3 binds any finite float
+    as REAL.
+    """
+    if value is None:
+        return True
+    if type(value) is int:
+        if not (_SQLITE_INT_MIN <= value <= _SQLITE_INT_MAX):
+            return False
+        try:
+            return math.isfinite(float(value))
+        except (OverflowError, ValueError):
+            return False
+    if type(value) is float:
+        return math.isfinite(value)
+    return False
+
+
+def _is_exact_json_value(value: Any, _seen: frozenset[int] = frozenset()) -> bool:
+    """True only for values JSON preserves EXACTLY, using exact types.
+
+    ``type(x) is T`` (not ``isinstance``) so that ``dict``/``list``/``str``
+    subclasses -- which may override ``__eq__`` -- are refused rather than
+    trusted. ``bool`` is checked before ``int`` because ``bool`` is a subclass
+    of ``int``; both round-trip exactly, so both are accepted. Containers track
+    identity along the current path: a self-referential structure is simply not
+    JSON-representable, and must be REFUSED rather than recursed into (a
+    RecursionError here would abort the completion this archive is optional to).
+    """
+    if value is None or type(value) is bool or type(value) is str:
+        return True
+    if type(value) is int:
+        return True
+    if type(value) is float:
+        return math.isfinite(value)
+    if type(value) is list or type(value) is dict:
+        if id(value) in _seen:
+            return False
+        nested = _seen | {id(value)}
+        if type(value) is list:
+            return all(_is_exact_json_value(item, nested) for item in value)
+        return all(
+            type(key) is str and _is_exact_json_value(item, nested)
+            for key, item in value.items()
+        )
+    return False
+
+
+def exact_json_archive(result: Any) -> Any | None:
+    """Return ``result`` only if JSON preserves it EXACTLY, else ``None``.
+
+    A round trip succeeds while silently rewriting non-JSON-native shapes:
+    int keys become strings, tuples become lists, and a ``{1: ..., "1": ...}``
+    collision discards a value outright. Presenting that transformed object as
+    the original execution result is a wrong answer, so the archive is exact or
+    it is unavailable.
+    """
+    # Exactness is decided STRUCTURALLY, never by caller-controlled __eq__:
+    # a dict subclass can serialize fine, be rewritten by JSON (int keys ->
+    # strings, tuples -> lists, colliding 1/"1" dropping a value), and still
+    # return True from __eq__, which would certify transformed data as the
+    # original execution result.
+    #
+    # The ENTIRE decision -- traversal included -- sits inside the guard. The
+    # traversal itself can fail on input the caller controls (a deeply nested
+    # but perfectly ordinary result exhausts the recursion limit), and this
+    # archive is OPTIONAL: any failure must degrade to "unavailable", never
+    # abort the terminal write and delivery of a completed job.
+    try:
+        if not _is_exact_json_value(result):
+            return None
+        # Validate with the registry's OWN serialization (ensure_ascii=False, then
+        # UTF-8). json.dumps' default ensure_ascii=True happily encodes a lone
+        # surrogate, so an archive accepted here could later raise
+        # UnicodeEncodeError inside _record_checksum -- aborting the terminal
+        # write and losing a completed job.
+        json.dumps(result, allow_nan=False, ensure_ascii=False).encode("utf-8")
+        return json.loads(json.dumps(result, allow_nan=False))
+    except Exception:
+        return None
+
+
+def canonical_terminal(registry, delegation_id):
+    """Validate terminal identity for both canonical and mirror consumers.
+
+    Caller holds the registry lock. Sparse historical outboxes and terminal
+    work intentionally emitted without an envelope have no execution evidence.
+    """
+    if delegation_id in registry.get("_invalid_record_ids", []):
+        raise RegistryError(f"record {delegation_id} failed integrity validation")
+    record = registry["records"].get(delegation_id)
+    if record is None or record.get("state") not in {"done", "failed", "cancelled"}:
+        return None
+    if record.get("terminal") is None:
+        return None
+    attempt = record.get("attempt") or {}
+    # Sparse historical records may omit the redundant record-level id (the
+    # loader permits exactly that); a PRESENT id must still match the key.
+    self_id_conflicts = ("delegation_id" in record
+                        and record.get("delegation_id") != delegation_id)
+    entries = [entry for entry in record.get("outbox", [])
+               if entry.get("type") == "async_delegation"]
+    if not entries:
+        terminal = record["terminal"]
+        if (self_id_conflicts
+                or type(attempt.get("generation")) is not int
+                or attempt["generation"] < 0
+                or not attempt.get("attempt_id")
+                or not isinstance(terminal, dict)
+                or terminal.get("status") not in {"completed", "success", "error", "interrupted", "cancelled"}
+                or (terminal.get("result") is not None
+                    and not isinstance(terminal["result"], dict))
+                or (terminal.get("completed_at") is not None
+                    and not isinstance(terminal["completed_at"], (int, float)))):
+            raise RegistryError(f"invalid non-deliverable terminal evidence for {delegation_id}")
+        return None
+    if len(entries) != 1:
+        raise RegistryError(f"ambiguous terminal outbox for {delegation_id}")
+    entry = entries[0]
+    payload = entry.get("payload") or {}
+    if (self_id_conflicts
+            or not entry.get("event_id")
+            or payload.get("event_id") != entry["event_id"]
+            or payload.get("delegation_id") != delegation_id
+            or payload.get("type") != "async_delegation"
+            or type(payload.get("attempt_generation")) is not int
+            or type(attempt.get("generation")) is not int
+            or payload["attempt_generation"] < 0
+            or payload["attempt_generation"] != attempt.get("generation")
+            or payload.get("attempt_id") != attempt.get("attempt_id")
+            or payload.get("profile") != record.get("profile")
+            or payload.get("status") != record["terminal"].get("status")):
+        raise RegistryError(f"invalid terminal identity for {delegation_id}")
+    result = record["terminal"].get("result")
+    if result is not None and not isinstance(result, dict):
+        raise RegistryError(f"invalid terminal result for {delegation_id}")
+    return {**entry, "execution_result": result}
+
+
 def enqueue_pending_outbox(
     *,
     current_boot_id: str,
@@ -1014,6 +1478,12 @@ def enqueue_pending_outbox(
             if str(delegation_id) in invalid_record_ids:
                 continue
             if not isinstance(record, dict):
+                continue
+            try:
+                canonical_terminal(registry, delegation_id)
+            except Exception:
+                logger.warning("Could not replay delegation %s; invalid canonical evidence",
+                               delegation_id, exc_info=True)
                 continue
             generation = int((record.get("attempt") or {}).get("generation") or 0)
             for event in record.get("outbox", []):
