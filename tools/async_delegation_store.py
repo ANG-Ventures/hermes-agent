@@ -34,6 +34,11 @@ ACTIVE_STALE_SECONDS = 30 * 24 * 60 * 60
 MAX_LIFECYCLE_EVENTS = 50
 # Caller-stack frames captured for cancel attribution (innermost frames).
 MAX_ATTRIBUTION_FRAMES = 12
+# sqlite3 binds Python ints as signed 64-bit INTEGER and raises OverflowError
+# outside this range. Persisted timestamps are bound as parameters by the
+# recovery/replay mirrors, so a wider int is not a usable number here.
+_SQLITE_INT_MIN = -(2 ** 63)
+_SQLITE_INT_MAX = 2 ** 63 - 1
 
 class RegistryError(RuntimeError):
     """Registry cannot be safely read or mutated."""
@@ -201,6 +206,15 @@ def _load(path: Path, *, allow_invalid_records: bool = False) -> dict[str, Any]:
                 not isinstance(event, dict)
                 or (event.get("payload") is not None
                     and not isinstance(event.get("payload"), dict))
+                # The deliverable path binds the ENVELOPE's own completed_at:
+                # _sync_completion writes payload["completed_at"] straight into
+                # the mirror's REAL column. Validating only the record-level
+                # terminal timestamp below let the same unbindable int reach
+                # SQLite through this sibling field and abort recovery for every
+                # healthy delegation in the profile.
+                or (isinstance(event, dict)
+                    and isinstance(event.get("payload"), dict)
+                    and not _is_optional_number(event["payload"].get("completed_at")))
                 for event in outbox
             )
         )
@@ -1292,10 +1306,22 @@ def _is_optional_number(value: Any) -> bool:
     a bare type check, then raises ``OverflowError`` mid-scan and aborts
     recovery for every healthy delegation in the profile. A value the consumer
     cannot convert is not a valid number.
+
+    ``float()`` is not the only conversion, and it is not the tightest one:
+    these numbers are bound as SQLite parameters, and sqlite3 refuses any int
+    outside the signed 64-bit range with ``OverflowError: Python int too large
+    to convert to SQLite INTEGER``. ``2 ** 100`` is a finite JSON integer whose
+    ``float()`` succeeds, so the isfinite check alone let it through validation
+    and it then raised out of the per-record recovery loop, aborting
+    restoration of every healthy sibling. Bound ints to what the consumer can
+    actually bind. Floats are NOT range-limited: sqlite3 binds any finite float
+    as REAL.
     """
     if value is None:
         return True
     if type(value) is int:
+        if not (_SQLITE_INT_MIN <= value <= _SQLITE_INT_MAX):
+            return False
         try:
             return math.isfinite(float(value))
         except (OverflowError, ValueError):
