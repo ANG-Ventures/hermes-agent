@@ -12964,9 +12964,14 @@ def _notification_poller_loop(
                         # re-queued, so this buffer is the ONLY copy. A refused
                         # submit (session closing / replaced) must hand the
                         # batch back instead of dropping the notification.
-                        if not _run_prompt_submit(
+                        # Only an explicit False is a refusal. A None return
+                        # means "submitted" for callers that predate the
+                        # boolean contract; treating it as a refusal would
+                        # re-buffer an ALREADY-DELIVERED batch and duplicate
+                        # the notification on the next idle turn.
+                        if _run_prompt_submit(
                             rid, sid, session, "\n".join(_batch)
-                        ):
+                        ) is False:
                             _restore_kanban_batch(session, _batch)
                     except Exception as exc:
                         print(
