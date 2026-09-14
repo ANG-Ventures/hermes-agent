@@ -1616,9 +1616,15 @@ def dispatch_async_delegation_batch(
         try:
             combined = runner() or {}
             # Batch status: completed unless every child errored/was interrupted.
-            child_results = combined.get("results") or []
+            # Children are runner-controlled: a non-list "results", or an entry
+            # that is not a dict, must NOT crash this classification. Raising
+            # here would discard the real children in the handler below and
+            # report a completed batch as an error.
+            raw_children = combined.get("results") if isinstance(combined, dict) else None
+            child_results = raw_children if type(raw_children) is list else []
             if child_results and all(
-                (r.get("status") not in ("completed", "success"))
+                (r.get("status") if isinstance(r, dict) else None)
+                not in ("completed", "success")
                 for r in child_results
             ):
                 status = "error"

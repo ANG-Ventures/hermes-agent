@@ -681,3 +681,95 @@ def test_degraded_batch_child_keeps_its_task_index(monkeypatch, tmp_path):
         assert delegation_id
     finally:
         ad._reset_for_tests()
+
+
+def test_non_list_results_container_cannot_strand_the_completion(monkeypatch, tmp_path):
+    """A JSON-valid but non-iterable ``results`` must not abort finalization.
+
+    {"results": 1} raised TypeError while iterating -- in the batch classifier
+    AND in the envelope builder -- before the terminal record and outbox
+    existed, durably stranding a completed job as running.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        result = {"status": "completed", "summary": "ok", "results": 1}
+        delegation_id, worker, _ = helpers.dispatch(
+            monkeypatch, batch=True, result=result)
+        worker()  # must not raise
+        with store.locked_registry() as registry:
+            assert registry["records"][delegation_id]["state"] == "done"
+        event = helpers.process_registry.completion_queue.get_nowait()
+        assert event["status"] == "completed"
+        assert event["results"] == [1]
+    finally:
+        ad._reset_for_tests()
+
+
+def test_unhashable_status_cannot_strand_the_completion(monkeypatch, tmp_path):
+    """An unhashable status raised on the set-membership test."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        result = {"status": ["completed"], "summary": "done"}
+        delegation_id, worker, _ = helpers.dispatch(monkeypatch, result=result)
+        worker()  # must not raise
+        with store.locked_registry() as registry:
+            record = registry["records"][delegation_id]
+        assert record["state"] == "failed"
+        assert len(record.get("outbox") or []) == 1
+        assert helpers.process_registry.completion_queue.get_nowait()
+    finally:
+        ad._reset_for_tests()
+
+
+def test_json_null_child_is_preserved_not_replaced_by_a_fabricated_error(
+    monkeypatch, tmp_path
+):
+    """JSON null is a VALID result, distinct from an unavailable archive.
+
+    exact_json_archive returns None for both, so using it as the validity test
+    replaced a legitimate null child with a fabricated error object -- handing
+    the user a wrong result.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        result = {"results": [
+            None, {"task_index": 1, "status": "completed", "summary": "B"}]}
+        delegation_id, worker, _ = helpers.dispatch(
+            monkeypatch, batch=True, result=result)
+        worker()
+        event = helpers.process_registry.completion_queue.get_nowait()
+        assert event["results"][0] is None
+        assert event["results"][1]["summary"] == "B"
+        assert event["status"] == "completed"
+        assert delegation_id
+    finally:
+        ad._reset_for_tests()
+
+
+def test_hostile_dict_subclass_child_cannot_abort_finalization(monkeypatch, tmp_path):
+    """A dict SUBCLASS can override get/__eq__ and raise during extraction."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+
+    class Hostile(dict):
+        def get(self, key, default=None):
+            raise RuntimeError("hostile get")
+
+    try:
+        child = Hostile(task_index=0, status="completed", summary="A",
+                        extra=object())
+        delegation_id, worker, _ = helpers.dispatch(
+            monkeypatch, batch=True, result={"results": [child]})
+        worker()  # must not raise
+        with store.locked_registry() as registry:
+            assert registry["records"][delegation_id]["state"] in {"done", "failed"}
+        assert helpers.process_registry.completion_queue.get_nowait()
+    finally:
+        ad._reset_for_tests()

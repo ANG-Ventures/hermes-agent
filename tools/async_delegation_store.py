@@ -612,12 +612,19 @@ def _terminal_payload(record: dict[str, Any], result: dict[str, Any], status: st
         # flattened, known-safe fields. Copying them wholesale lets one
         # unsupported child value abort the terminal write and lose the job.
         entries = []
-        for entry in (result.get("results") or []):
-            if exact_json_archive(entry) is not None:
+        # Only an EXACT list is iterable safely: a JSON-valid scalar such as
+        # {"results": 1} would raise TypeError here, before the terminal record
+        # and outbox exist, losing the completed job.
+        raw_entries = result.get("results")
+        if type(raw_entries) is not list:
+            raw_entries = [] if raw_entries is None else [raw_entries]
+        for entry in raw_entries:
+            if _envelope_representable(entry):
                 entries.append(entry)
-            elif isinstance(entry, dict):
-                # task_index is the child's IDENTITY: without it a degraded
-                # child is rendered under another task's goal.
+            elif type(entry) is dict:
+                # Exact dict only: a dict SUBCLASS can override get/__eq__ and
+                # raise during extraction. task_index is the child's IDENTITY;
+                # without it a degraded child renders under another task's goal.
                 entries.append({
                     key: _envelope_safe(entry.get(key))
                     for key in ("task_index", "status", "summary", "error",
@@ -631,11 +638,8 @@ def _terminal_payload(record: dict[str, Any], result: dict[str, Any], status: st
         payload.update({
             "is_batch": True,
             "results": entries,
-            "total_duration_seconds": (
-                result.get("total_duration_seconds")
-                if exact_json_archive(result.get("total_duration_seconds")) is not None
-                else None
-            ),
+            "total_duration_seconds": _envelope_safe(
+                result.get("total_duration_seconds")),
         })
     return payload
 
@@ -663,7 +667,13 @@ def append_terminal(
                 record.get("state"),
             )
             return None
-        terminal_state = "done" if status in {"completed", "success"} else "failed"
+        # status is runner-controlled: an unhashable value (e.g. a list) would
+        # raise on the set-membership test before the terminal record or outbox
+        # exist, durably stranding a completed job as running.
+        terminal_state = (
+            "done" if isinstance(status, str) and status in {"completed", "success"}
+            else "failed"
+        )
         payload = _terminal_payload(record, result, status)
         event_id = f"{delegation_id}:terminal:g{record['attempt']['generation']}"
         payload["event_id"] = event_id
@@ -1099,6 +1109,18 @@ def claim_recoveries(
     return claimed, summary
 
 
+def _envelope_representable(value: Any) -> bool:
+    """True if the durable registry can persist ``value`` exactly.
+
+    ``exact_json_archive`` returns ``None`` both for a VALID JSON null and for
+    an unavailable archive, so it cannot be used directly as a validity test --
+    doing so replaces a legitimate ``None`` result with a fabricated error.
+    """
+    if value is None:
+        return True
+    return exact_json_archive(value) is not None
+
+
 def _envelope_safe(value: Any) -> Any:
     """Return ``value`` if the durable registry can persist it, else a marker.
 
@@ -1106,7 +1128,7 @@ def _envelope_safe(value: Any) -> Any:
     surrogate (or any value the registry's UTF-8 serialization rejects) would
     otherwise raise inside ``_record_checksum`` and lose a completed job.
     """
-    if value is None or exact_json_archive(value) is not None:
+    if _envelope_representable(value):
         return value
     return "<unrepresentable>"
 
