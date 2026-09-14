@@ -671,7 +671,10 @@ def append_terminal(
         record["terminal"] = {
             "status": status,
             "completed_at": payload["completed_at"],
-            "error": result.get("error"),
+            # Same guarded value the envelope carries. Both copies are
+            # mandatory and whole-record checksummed, so an unencodable error
+            # here aborts the terminal write and loses the completed job.
+            "error": payload.get("error"),
         }
         if archived_result is not None:
             record["terminal"]["result"] = archived_result
@@ -906,7 +909,8 @@ def _fail_recovery_record(
 ) -> None:
     record["state"] = "failed"
     record["updated_at"] = now
-    record["terminal"] = {"status": "error", "error": error, "completed_at": now}
+    record["terminal"] = {"status": "error", "error": _envelope_safe(error),
+                          "completed_at": now}
     route = record.get("route") or {}
     if (not emit_event
             or not all(str(route.get(key) or "").strip()

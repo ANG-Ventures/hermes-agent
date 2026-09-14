@@ -571,3 +571,58 @@ def test_ordinary_timestamps_and_summaries_are_untouched(monkeypatch, tmp_path):
         assert delegation_id
     finally:
         ad._reset_for_tests()
+
+
+def test_unencodable_error_survives_dispatch_acceptance_and_no_replay(
+    monkeypatch, tmp_path
+):
+    """A FAILING worker with an unencodable error must not lose the job.
+
+    terminal.error is a second mandatory copy of the same string; guarding only
+    the envelope left this path raising UnicodeEncodeError during the
+    whole-record checksum, with state=running and nothing queued. Covers the
+    full lane: dispatch -> claimed acceptance -> no replay.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        result = {"status": "error", "error": "bad \ud800 error", "summary": None}
+        delegation_id, worker, _ = helpers.dispatch(monkeypatch, result=result)
+        worker()  # must not raise
+        with store.locked_registry() as registry:
+            record = registry["records"][delegation_id]
+        assert record["state"] == "failed"
+        assert record["terminal"]["status"] == "error"
+        assert len(record.get("outbox") or []) == 1
+
+        event = helpers.process_registry.completion_queue.get_nowait()
+        assert event["status"] == "error"
+        claim = ad.claim_event_delivery(event, "test-consumer")
+        assert claim
+        ad.complete_event_delivery(event, claim)
+        assert ad.get_durable_delegation(delegation_id)["delivery_state"] == "delivered"
+
+        # An accepted terminal must not replay on either rail.
+        assert store.enqueue_pending_outbox(current_boot_id="replay-probe") == []
+        assert ad.restore_undelivered_completions(queue.Queue()) == 0
+    finally:
+        ad._reset_for_tests()
+
+
+def test_ordinary_error_string_is_preserved_verbatim(monkeypatch, tmp_path):
+    """Positive control: a normal error must reach both copies unchanged."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    monkeypatch.setattr(helpers.process_registry, "completion_queue", queue.Queue())
+    try:
+        result = {"status": "error", "error": "worker exploded", "summary": None}
+        delegation_id, worker, _ = helpers.dispatch(monkeypatch, result=result)
+        worker()
+        with store.locked_registry() as registry:
+            record = registry["records"][delegation_id]
+        assert record["terminal"]["error"] == "worker exploded"
+        event = helpers.process_registry.completion_queue.get_nowait()
+        assert event["error"] == "worker exploded"
+    finally:
+        ad._reset_for_tests()
