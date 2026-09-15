@@ -169,13 +169,15 @@ def test_malformed_config_is_a_noop(cfg, picker):
     assert _slugs(_apply_picker_preferences(rows)) == ["a", "b"]
 
 
-def test_config_load_failure_is_a_noop(monkeypatch):
+def test_config_load_failure_is_a_noop(monkeypatch, caplog):
     def _boom():
         raise RuntimeError("config unreadable")
 
     monkeypatch.setattr("hermes_cli.config.load_config", _boom)
     rows = [_row("a"), _row("b")]
-    assert _slugs(_apply_picker_preferences(rows)) == ["a", "b"]
+    with caplog.at_level("DEBUG", logger="hermes_cli.model_switch"):
+        assert _slugs(_apply_picker_preferences(rows)) == ["a", "b"]
+    assert "RuntimeError" in caplog.text
 
 
 # ─── surface parity: payload pickers apply the same prefs ───────────────

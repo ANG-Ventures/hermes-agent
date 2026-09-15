@@ -1213,7 +1213,8 @@ def _apply_picker_preferences(
         try:
             from hermes_cli.config import load_config
             config = load_config()
-        except Exception:
+        except Exception as exc:
+            logger.debug("Picker preferences config load failed: %s", type(exc).__name__)
             config = {}
     config = config if isinstance(config, dict) else {}
     catalog = config.get("model_catalog") or {}

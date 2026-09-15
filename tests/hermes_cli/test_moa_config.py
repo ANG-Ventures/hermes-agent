@@ -90,6 +90,56 @@ def test_moa_slot_retains_only_its_current_hidden_provider(picker_config, monkey
     assert prompts[0] == (["second  (second)", "first  (first)"], 0)
 
 
+def test_custom_slot_order_and_exclusions_do_not_depend_on_base_url(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from hermes_cli import model_switch_providers as providers
+
+    # Keep real custom-endpoint discovery, config loading and preference handling;
+    # isolate unrelated built-in auth/network discovery and presentation metadata.
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers, "_build_curated_lists", lambda *args: {})
+    monkeypatch.setattr(providers, "_collect_authed_provider_slugs", lambda *args: [])
+    for name in ("_lap_builtin_rows", "_lap_overlay_rows", "_lap_canonical_rows"):
+        monkeypatch.setattr(providers, name, lambda *args: None)
+    for name in ("_local_runtime_row", "_moa_provider_row"):
+        monkeypatch.setattr(inventory, name, lambda *args: None)
+    for name in ("_apply_picker_hints", "_apply_pricing", "_apply_capabilities", "_apply_custom_aliases"):
+        monkeypatch.setattr(inventory, name, lambda *args, **kwargs: None)
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    endpoints = {
+        name: {"base_url": f"https://{name}.example/v1", "models": [f"{name}-model"],
+               "discover_models": False}
+        for name in ("slot", "other", "excluded")
+    }
+    config = {
+        "model": {"provider": "other", "default": "other-model",
+                  "base_url": endpoints["other"]["base_url"]},
+        "providers": endpoints,
+        "model_catalog": {"excluded_providers": ["excluded"]},
+    }
+    slot = {"provider": "slot", "model": "slot-model"}
+    for prefs, expected in (({}, ["slot", "other"]),
+                            ({"hide": ["slot"], "order": ["other", "slot"]}, ["other", "slot"])):
+        config["model"]["picker"] = prefs
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump(config))
+        ctx = replace(inventory.load_picker_context(), current_provider=slot["provider"],
+                      current_model=slot["model"], current_base_url=endpoints["slot"]["base_url"])
+        for apply_prefs in (False, True):
+            with_url = inventory.build_models_payload(ctx, canonical_order=True, apply_picker_prefs=apply_prefs)
+            without_url = inventory.build_models_payload(
+                replace(ctx, current_base_url=""), canonical_order=True, apply_picker_prefs=apply_prefs)
+            assert with_url == without_url
+            slugs = [row["slug"] for row in with_url["providers"]]
+            if apply_prefs:
+                assert slugs == expected
+            else:
+                # Raw inventory can retain excluded custom rows; compare the
+                # visible order without pinning that separate discovery gap.
+                assert [slug for slug in slugs if slug != "excluded"] == ["slot", "other"]
+        assert [row["slug"] for row in moa_cmd._model_options(slot)] == expected
+
+
 def _enabled_refs(refs):
     return [{**slot, "enabled": True} for slot in refs]
 
