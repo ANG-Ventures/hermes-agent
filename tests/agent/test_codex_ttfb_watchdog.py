@@ -617,7 +617,10 @@ def test_ttfb_fires_before_stale_at_default_config(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_CODEX_TTFB_FAST_RECONNECT_SECONDS", raising=False)
     # Shrink the fast-reconnect target so the test is quick but still exercises
     # the real coupling logic (the cutoff is derived from it, not hardcoded).
-    monkeypatch.setenv("HERMES_CODEX_TTFB_FAST_RECONNECT_SECONDS", "2")
+    (tmp_path / "config.yaml").write_text("agent:\n  codex:\n    ttfb_fast_reconnect_seconds: 2\n")
+    # Retired knobs must not override the config-only value.
+    monkeypatch.setenv("HERMES_CODEX_TTFB_FAST_RECONNECT_SECONDS", "999")
+    monkeypatch.setenv("HERMES_CODEX_TTFB_BELOW_STALE", "0")
 
     closes: list = []
     dummy_client = SimpleNamespace()
@@ -655,8 +658,8 @@ def test_ttfb_fires_before_stale_at_default_config(tmp_path, monkeypatch):
         stop["flag"] = True
 
 
-def test_ttfb_below_stale_coupling_disabled_via_env(tmp_path, monkeypatch):
-    """HERMES_CODEX_TTFB_BELOW_STALE=0 restores the legacy behavior: the TTFB
+def test_ttfb_below_stale_coupling_disabled_via_config(tmp_path, monkeypatch):
+    """agent.codex.ttfb_below_stale=false restores the legacy behavior: the TTFB
     cutoff is NOT pulled below the stale timer, so a request whose first event
     is merely slow is not killed early by the coupling."""
     from agent import chat_completion_helpers as h
@@ -664,11 +667,11 @@ def test_ttfb_below_stale_coupling_disabled_via_env(tmp_path, monkeypatch):
     agent = _make_codex_agent(tmp_path, monkeypatch)
     monkeypatch.setattr(agent, "_compute_non_stream_stale_timeout", lambda *a, **k: 60.0)
     monkeypatch.delenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", raising=False)
-    monkeypatch.setenv("HERMES_CODEX_TTFB_BELOW_STALE", "0")
+    (tmp_path / "config.yaml").write_text(
+        "agent:\n  codex:\n    ttfb_below_stale: false\n    ttfb_fast_reconnect_seconds: 1\n")
     # Aggressive fast-reconnect target would kill at ~1s if the coupling ran;
     # disabling it means the default 120s TTFB applies and a 2s slow first
     # event survives.
-    monkeypatch.setenv("HERMES_CODEX_TTFB_FAST_RECONNECT_SECONDS", "1")
 
     closes: list = []
     dummy_client = SimpleNamespace()

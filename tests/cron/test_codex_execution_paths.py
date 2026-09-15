@@ -2,6 +2,8 @@ import asyncio
 import sys
 import types
 from types import SimpleNamespace
+from pathlib import Path
+import pytest
 
 
 sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
@@ -212,7 +214,7 @@ class _RetryCaptureAgent(run_agent.AIAgent):
 
 
 def _patch_codex_runtime(monkeypatch):
-    monkeypatch.setattr(run_agent, "OpenAI", _FakeOpenAI)
+    monkeypatch.setattr("agent.process_bootstrap.OpenAI", _FakeOpenAI)
     monkeypatch.setattr(run_agent, "AIAgent", _RetryCaptureAgent)
     monkeypatch.setattr(
         "hermes_cli.runtime_provider.resolve_runtime_provider",
@@ -228,13 +230,16 @@ def _patch_codex_runtime(monkeypatch):
     )
 
 
-def test_cron_per_job_api_max_retries_override(monkeypatch):
+@pytest.mark.parametrize("inherited, requested, expected", [(3, 6, 6), (3, 1, 3), (8, 6, 8)])
+def test_cron_per_job_api_max_retries_override(monkeypatch, inherited, requested, expected):
     """A job that sets ``api_max_retries`` raises the agent's retry budget so
     transient backend hangs are retried more times on the requested model
     before the fallback chain swaps models."""
     _patch_agent_bootstrap(monkeypatch)
     _patch_codex_runtime(monkeypatch)
 
+    from hermes_constants import get_hermes_home
+    (Path(get_hermes_home()) / "config.yaml").write_text(f"agent:\n  api_max_retries: {inherited}\n")
     _RetryCaptureAgent.captured_retries = None
     success, output, final_response, error = cron_scheduler.run_job(
         {
@@ -243,12 +248,12 @@ def test_cron_per_job_api_max_retries_override(monkeypatch):
             "prompt": "ping",
             "model": "gpt-5.5",
             "provider": "openai-codex",
-            "api_max_retries": 6,
+            "api_max_retries": requested,
         }
     )
 
     assert success is True, error
-    assert _RetryCaptureAgent.captured_retries == 6
+    assert _RetryCaptureAgent.captured_retries == expected
 
 
 def test_cron_without_override_inherits_agent_default(monkeypatch):
