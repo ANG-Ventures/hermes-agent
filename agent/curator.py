@@ -1079,6 +1079,7 @@ def _build_rename_summary(
     after_report: List[Dict[str, Any]],
     tool_calls: List[Dict[str, Any]],
     model_final: str,
+    after_names: Optional[Set[str]] = None,
 ) -> str:
     """Format the user-visible rename map for a curator run.
 
@@ -1103,7 +1104,8 @@ def _build_rename_summary(
     pinning (pruned-only runs skip it).
     """
     after_by_name = {r.get("name"): r for r in after_report if isinstance(r, dict)}
-    after_names = set(after_by_name.keys())
+    if after_names is None:
+        after_names = {name for name in after_by_name if isinstance(name, str)}
     removed = sorted(before_names - after_names)
     added = sorted(after_names - before_names)
     if not removed:
@@ -1173,6 +1175,7 @@ def _write_run_report(
     before_names: Set[str],
     after_report: List[Dict[str, Any]],
     llm_meta: Dict[str, Any],
+    after_names: Optional[Set[str]] = None,
 ) -> Optional[Path]:
     """Write run.json + REPORT.md under logs/curator/{YYYYMMDD-HHMMSS}/.
 
@@ -1201,7 +1204,8 @@ def _write_run_report(
 
     # Diff before/after
     after_by_name = {r.get("name"): r for r in after_report if isinstance(r, dict)}
-    after_names = set(after_by_name.keys())
+    if after_names is None:
+        after_names = {name for name in after_by_name if isinstance(name, str)}
     removed = sorted(before_names - after_names)   # archived during this run
     added = sorted(after_names - before_names)     # new skills this run
     before_by_name = {r.get("name"): r for r in before_report if isinstance(r, dict)}
@@ -1813,6 +1817,21 @@ def _render_candidate_list() -> str:
     return "\n".join(lines)
 
 
+def _snapshot_skill_names() -> Set[str]:
+    """Inventory active on-disk skills, independent of usage-row coverage."""
+    from agent.skill_utils import get_shared_skills_root, is_excluded_skill_path
+
+    names: Set[str] = set()
+    for root in (get_hermes_home() / "skills", get_shared_skills_root()):
+        if root.is_dir():
+            names.update(
+                skill_md.parent.name
+                for skill_md in root.rglob("SKILL.md")
+                if skill_md.is_file() and not is_excluded_skill_path(skill_md, root=root)
+            )
+    return names
+
+
 def run_curator_review(
     on_summary: Optional[Callable[[str], None]] = None,
     synchronous: bool = False,
@@ -1850,6 +1869,12 @@ def run_curator_review(
     if consolidate is None:
         consolidate = get_consolidate()
     start = datetime.now(timezone.utc)
+    # Include deterministic archives, not just mutations in the LLM pass.
+    before_names = _snapshot_skill_names()
+    try:
+        before_report = skill_usage.curated_report()
+    except Exception:
+        before_report = []
     if dry_run:
         # Count candidates without mutating state.
         try:
@@ -1946,12 +1971,6 @@ def run_curator_review(
 
     def _llm_pass():
         nonlocal auto_summary
-        # Snapshot skill state BEFORE the LLM pass so the report can diff.
-        try:
-            before_report = skill_usage.curated_report()
-        except Exception:
-            before_report = []
-        before_names = {r.get("name") for r in before_report if isinstance(r, dict)}
 
         # Consolidation gate. When off (the default), the curator does ONLY the
         # deterministic inactivity prune above — no forked aux-model review, no
@@ -1986,6 +2005,7 @@ def run_curator_review(
                     before_report=before_report,
                     before_names=before_names,
                     after_report=after_report,
+                    after_names=_snapshot_skill_names(),
                     llm_meta=llm_meta,
                 )
                 if report_path is not None:
@@ -2064,6 +2084,7 @@ def run_curator_review(
                 "error": str(e),
             }
 
+        after_names = _snapshot_skill_names()
         # Append the rename map (`old-name → umbrella`) to the user-visible
         # summary so people don't have to dig into REPORT.md to find out where
         # their skills went. Best-effort: classification is pure but never
@@ -2072,6 +2093,7 @@ def run_curator_review(
             rename_lines = _build_rename_summary(
                 before_names=before_names,
                 after_report=skill_usage.curated_report(),
+                after_names=after_names,
                 tool_calls=llm_meta.get("tool_calls", []) or [],
                 model_final=llm_meta.get("final", "") or "",
             )
@@ -2101,6 +2123,7 @@ def run_curator_review(
                 before_report=before_report,
                 before_names=before_names,
                 after_report=after_report,
+                after_names=after_names,
                 llm_meta=llm_meta,
             )
             if report_path is not None:
