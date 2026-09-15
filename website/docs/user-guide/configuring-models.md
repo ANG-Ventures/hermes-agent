@@ -280,9 +280,9 @@ model:
 - **`hide`** takes exact slugs (`openai-api`) or glob patterns (`claude-apx-*`, `*-preview`), so one line can collapse a whole provider family. Matching is case-insensitive; unknown slugs are ignored.
 - **`order`** front-anchors the slugs you list, in the order you list them. Everything else keeps its existing relative order behind them. Listing a provider in `order` does **not** hide the others — the two knobs are independent.
 
-Both are **purely cosmetic**. Hiding a provider does not disable it: typed `/model <slug>/<model>` still reaches it, and it remains available to the resolver and to auxiliary tasks. The provider you are **currently on is never hidden**, so you can always see and switch off it.
+Both are **purely cosmetic**. Hiding a provider does not disable it: typed `/model <slug>/<model>` still reaches it, and it remains available to the resolver and to auxiliary tasks. The eligible provider you are **currently on is retained**. The hard availability filter `model_catalog.excluded_providers` takes precedence even for the current provider. Ordering is stable within provider groups; saved custom providers and action rows are not mixed into the canonical group.
 
-These prefs apply to every picker surface — the CLI and Discord `/model` pickers, and the desktop / TUI / dashboard model dialogs.
+These prefs apply to classic `/model`, `hermes model`, the desktop / TUI / dashboard model-options backends, messaging pickers using `list_picker_providers`, and the auxiliary model and vision pickers. Auxiliary pickers retain their own current provider, not the main model's provider. MoA slot pickers are excluded from this change: `hermes_cli/moa_cmd.py::_model_options` still calls the full `build_models_payload` inventory without the preference opt-in.
 
 ## Troubleshooting
 
