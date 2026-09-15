@@ -6261,7 +6261,7 @@ class TestRepairDetectsIncompleteFtsSchema:
             assert surviving, "setup: triggers must outlive the table"
 
             # Ground truth: the store really cannot accept a message.
-            with pytest.raises(sqlite3.OperationalError):
+            with pytest.raises(sqlite3.OperationalError, match="no such table: main.messages_fts_trigram"):
                 conn.execute(
                     "INSERT INTO sessions (id, source, started_at) "
                     "VALUES ('s2', 'cli', 0)"
@@ -6274,7 +6274,9 @@ class TestRepairDetectsIncompleteFtsSchema:
         finally:
             conn.close()
 
-        reason = hermes_state._db_opens_cleanly(db_path)
+        from hermes_state_repair import _db_opens_cleanly
+
+        reason = _db_opens_cleanly(db_path)
         assert reason is not None, (
             "repair reported a write-broken store as opening cleanly"
         )
@@ -6289,7 +6291,9 @@ class TestRepairDetectsIncompleteFtsSchema:
         """
         db_path = tmp_path / "state.db"
         self._seed(db_path, n=10)
-        assert hermes_state._db_opens_cleanly(db_path) is None
+        from hermes_state_repair import _db_opens_cleanly
+
+        assert _db_opens_cleanly(db_path) is None
 
         # Same store with the trigram index cleanly removed (table AND its
         # triggers) — the supported trigram-disabled shape, not damage.
@@ -6305,7 +6309,17 @@ class TestRepairDetectsIncompleteFtsSchema:
             conn.commit()
         finally:
             conn.close()
-        assert hermes_state._db_opens_cleanly(db_path) is None
+        assert _db_opens_cleanly(db_path) is None
+
+        empty_path = tmp_path / "empty.db"
+        assert _db_opens_cleanly(empty_path) == "no such table: sessions"
+        conn = sqlite3.connect(str(empty_path))
+        try:
+            conn.execute("CREATE TABLE sessions (id TEXT, source TEXT, started_at REAL)")
+            conn.commit()
+        finally:
+            conn.close()
+        assert _db_opens_cleanly(empty_path) is None
 
     def test_repair_drives_the_real_recovery_path_to_drop_fts_rebuild(self, tmp_path):
         """Detection is only half of it — prove the pipeline actually repairs.
@@ -6317,42 +6331,52 @@ class TestRepairDetectsIncompleteFtsSchema:
 
         Strategy 0 (``rebuild_fts``) issues ``INSERT INTO <t>(<t>)
         VALUES('rebuild')`` per table and swallows the ``OperationalError``
-        raised by an ABSENT table via ``continue`` (``hermes_state.py:3628``),
+        raised by an ABSENT table via ``continue`` in ``hermes_state_repair``,
         so it cannot recreate a dropped virtual table and its post-pass probe
         still fails. Recovery falls through to the FTS-schema drop, which
         clears the orphaned ``messages_fts%`` entries and lets the indexes
         rebuild from the canonical ``messages`` table on next open.
         """
         db_path = tmp_path / "state.db"
-        high_water = self._seed(db_path, n=10)
+        from hermes_state_repair import _db_opens_cleanly, repair_state_db_schema
+
+        self._seed(db_path, n=10)
 
         conn = sqlite3.connect(str(db_path))
         try:
             conn.execute("DROP TABLE IF EXISTS messages_fts_trigram")
             conn.commit()
+            sessions = conn.execute("SELECT * FROM sessions ORDER BY id").fetchall()
+            messages = conn.execute("SELECT * FROM messages ORDER BY id").fetchall()
         finally:
             conn.close()
 
-        # Precondition: the store is genuinely write-broken and detected.
-        assert hermes_state._db_opens_cleanly(db_path) is not None
+        report = repair_state_db_schema(db_path, backup=False)
 
-        report = hermes_state.repair_state_db_schema(db_path, backup=False)
-
-        assert report["repaired"] is True
         assert report["strategy"] == "drop_fts_rebuild"
+        assert report["repaired"] is True
         # The probe must now agree the store is healthy...
-        assert hermes_state._db_opens_cleanly(db_path) is None
+        assert _db_opens_cleanly(db_path) is None
 
         # ...and the canonical rows must have survived the surgery, which is
         # the whole point of preferring this over a restore-from-backup.
         reopened = SessionDB(db_path=db_path)
         try:
-            surviving = reopened._conn.execute(
-                "SELECT COUNT(*) FROM messages"
-            ).fetchone()[0]
-            assert surviving == high_water
+            assert [tuple(row) for row in reopened._conn.execute(
+                "SELECT * FROM sessions ORDER BY id"
+            )] == sessions
+            assert [tuple(row) for row in reopened._conn.execute(
+                "SELECT * FROM messages ORDER BY id"
+            )] == messages
             # And the store can record a new message again — the symptom the
             # user actually reported.
             reopened.append_message("s1", role="user", content="after repair zebra")
+            found = reopened._conn.execute(
+                "SELECT content FROM messages_fts WHERE messages_fts MATCH 'zebra'"
+            ).fetchall()
+            assert sorted(row[0] for row in found) == sorted(
+                [f"sentinel payload {i} zebra" for i in range(10)]
+                + ["after repair zebra"]
+            )
         finally:
             reopened.close()
