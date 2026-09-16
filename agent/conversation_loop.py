@@ -7420,12 +7420,25 @@ def run_conversation(
                 _ra_raw = None
                 if _resp_headers and hasattr(_resp_headers, "get"):
                     _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
+                # A rate-limit Retry-After is only meaningful while the seat we
+                # rode still has a future. Once the pool has marked it exhausted
+                # with nothing to rotate to, the header's window (600s cap) and
+                # the seat's real reset (which can be a day-plus out on a weekly
+                # cap) are different clocks — sleeping the former guarantees a
+                # re-429 on the same dead seat and eats the caller's whole
+                # budget before the fallback chain is reached. Measured
+                # 2026-09-16: 3 cron sessions, 600s honored each, 0 output.
+                from agent.agent_runtime_helpers import pool_seat_exhaustion_state
+
+                _seat_exhausted, _seat_recovery_s = pool_seat_exhaustion_state(agent)
                 _retry_after = resolve_retry_after(
                     raw_value=_ra_raw,
                     is_rate_limit=is_rate_limited,
                     is_overload=(classified.reason == FailoverReason.overloaded),
                     retry_count=retry_count,
                     max_retries=max_retries,
+                    seat_exhausted=_seat_exhausted,
+                    seat_recovery_seconds=_seat_recovery_s,
                 )
                 if _retry_after:
                     # RC-3: make the honored-vs-jitter decision visible so triage
@@ -7435,6 +7448,16 @@ def run_conversation(
                         "Honoring server Retry-After=%ss (reason=%s, attempt=%s/%s)",
                         _retry_after, classified.reason.value,
                         retry_count + 1, max_retries,
+                    )
+                elif _ra_raw and is_rate_limited and _seat_exhausted:
+                    # The counterpart line: say WHY a present Retry-After was
+                    # declined, so triage can tell this from "no header sent".
+                    logger.info(
+                        "Declining server Retry-After=%s on an exhausted seat "
+                        "(pool reports no available entry; recovery=%ss) — "
+                        "falling through to fallback chain",
+                        _ra_raw,
+                        "unknown" if _seat_recovery_s is None else f"{_seat_recovery_s:.0f}",
                     )
                 wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                 _backoff_policy = None
