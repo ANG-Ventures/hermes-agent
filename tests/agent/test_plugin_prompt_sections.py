@@ -109,6 +109,16 @@ def test_fresh_process_resume_restores_identical_full_prompt_without_callback(tm
             session_id=session_id,
             session_db=db,
         )
+        # Pin the toolchain probe off, for the same reason the sibling test
+        # pins build_coding_workspace_block: tools/env_probe.py shells out to
+        # python3/pip/uv on every fresh process with a 3s per-call timeout, and
+        # under CI load one call can time out in one process and succeed in the
+        # other. The two prompts then differ in the "Python toolchain:" line
+        # (measured on the self-hosted pool: `pip=missing` vs
+        # `pip→python3.12 (mismatch)`) — a host flake unrelated to what this
+        # test asserts (plugin-section resume). The probe's own byte-stability
+        # is covered by tests/tools/test_env_probe.py.
+        agent._environment_probe = False
 
         manager = PluginManager()
         manager._discovered = True
