@@ -152,6 +152,14 @@ class TestSnapshotRealProfile:
         src = self._make_profile(tmp_path / "real")
         home = tmp_path / "hermes-home"
         monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
+        # _secure_file/_secure_dir deliberately no-op inside a container
+        # (hermes_cli.config._is_container -> /.dockerenv), a production
+        # carve-out for volume-mounted multi-UID setups. CI runs these tests
+        # inside a container on the self-hosted pool, so without this the
+        # assertion below measures the carve-out instead of the hardening and
+        # the files stay 0644. Pin the non-container branch: this test is
+        # about what the tightening does when it is in force.
+        monkeypatch.setattr("hermes_cli.config._is_container", lambda: False)
         old_umask = os.umask(0o022)  # the common default that produced 0644
         try:
             dst, err = bc.snapshot_real_profile("chrome", src=str(src))
@@ -178,6 +186,10 @@ class TestSnapshotRealProfile:
         src = self._make_profile(tmp_path / "real")
         home = tmp_path / "hermes-home"
         monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
+        # Same container carve-out as test_snapshot_files_are_owner_only: the
+        # heal only runs when _secure_file is in force, which it is not inside
+        # a container (CI on the self-hosted pool).
+        monkeypatch.setattr("hermes_cli.config._is_container", lambda: False)
         dst, err = bc.snapshot_real_profile("chrome", src=str(src))
         assert err is None and dst
         cookies = os.path.join(dst, "Default", "Cookies")
@@ -964,12 +976,29 @@ class TestReviewRound3:
         import tools.browser_tool as bt
         bt._real_profile_cdp_cache.clear()
         proc = Mock(returncode=0, stdout="", stderr="")
+
+        class FakeChrome:
+            def poll(self):
+                return None
+
+        def fake_popen(argv, **kw):
+            (tmp_path / "DevToolsActivePort").write_text("9251\n/devtools/browser/x\n")
+            return FakeChrome()
+
+        # chromium_executable + Popen must both be mocked, exactly as the
+        # sibling test_launch_returns_http_cdp does: without them this test
+        # only passes on a host that has a real Chrome installed, and the
+        # self-hosted CI containers do not. It was passing on GitHub-hosted
+        # runners by accident of the image shipping Chrome.
         with patch.object(bt, "_use_real_profile", return_value=True), \
              patch.object(bt, "_using_lightpanda_engine", return_value=False), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
              patch("hermes_cli.browser_connect.real_profile_copy_dir", return_value=str(tmp_path)), \
              patch("hermes_cli.browser_connect.snapshot_real_profile",
                    return_value=(str(tmp_path), None)) as snap, \
+             patch("hermes_cli.browser_connect.chromium_executable",
+                   return_value="/usr/bin/chrome"), \
+             patch.object(bt.subprocess, "Popen", side_effect=fake_popen), \
              patch.object(bt, "_agent_browser_get_cdp",
                           side_effect=[None, "http://127.0.0.1:9251"]), \
              patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
