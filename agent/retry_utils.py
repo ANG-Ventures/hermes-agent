@@ -199,6 +199,26 @@ RETRY_AFTER_CAP_RATE_LIMIT_S = 600.0
 RETRY_AFTER_CAP_OVERLOAD_S = 60.0
 
 
+def _seat_recovers_within(seat_recovery_seconds: Any, wait: float) -> bool:
+    """True when a pool-reported seat recovery lands inside ``wait`` seconds.
+
+    ``None`` (the credential pool's documented "no wait information" value on
+    ``next_available_at``) and any unparseable/negative-infinite value are
+    treated as NOT recovering in time: on an exhausted seat the safe default is
+    to release the caller toward its fallback chain, not to sleep blind.
+    A non-positive recovery means the seat is already due back → in time.
+    """
+    if seat_recovery_seconds is None or isinstance(seat_recovery_seconds, bool):
+        return False
+    try:
+        recovery = float(seat_recovery_seconds)
+    except (TypeError, ValueError):
+        return False
+    if recovery != recovery:  # NaN
+        return False
+    return recovery <= wait
+
+
 def resolve_retry_after(
     *,
     raw_value: Any,
@@ -206,6 +226,8 @@ def resolve_retry_after(
     is_overload: bool,
     retry_count: int,
     max_retries: int,
+    seat_exhausted: bool = False,
+    seat_recovery_seconds: float | None = None,
 ) -> float | None:
     """Decide whether to honor a server ``Retry-After`` and for how long.
 
@@ -229,6 +251,27 @@ def resolve_retry_after(
         not a bare number) is NOT parsed here → ``None`` (jitter). This is
         deliberate: overload/backpressure sources emit numeric seconds; date
         parsing would be scope creep.
+      * ``seat_exhausted`` / ``seat_recovery_seconds`` — the caller's credential
+        pool has ALREADY declared the seat this request rode exhausted and has
+        nothing to rotate to, and (optionally) says how many seconds until that
+        seat re-enters rotation. On a ``rate_limit`` this makes the server's
+        ``Retry-After`` meaningless: the window it advertises is a per-request
+        throttle hint, while the seat's real reset can be a day-plus out
+        (measured 2026-09-16: a 7-day-capped sub-vps seat sent Retry-After=600
+        with ~31h until reset). Sleeping the full cap guarantees the retry
+        re-429s on the same dead seat and burns the caller's whole budget
+        before the fallback chain is reached — 3 cron sessions, 0 output.
+        So a rate-limit on an exhausted seat → ``None`` (jitter, then
+        fallback), EXCEPT when the pool reports a recovery that lands within
+        the honored wait: there the seat genuinely does come back inside the
+        window, so honoring it still beats leaving the primary.
+        ``seat_recovery_seconds=None`` means "no recovery information" (the
+        pool's own contract for ``next_available_at``) and is treated as
+        beyond the window — fail toward the chain, not toward a blind sleep.
+        Scoped to ``rate_limit`` deliberately. An OVERLOAD Retry-After stays
+        honored even on an exhausted seat: overload is a transient about the
+        SERVER's capacity, not the seat's quota, its cap is already a tight
+        60s, and the relay's bounded hint still beats blind jitter.
       * The honored value is clamped to a class-specific cap
         (rate-limit 600s, overload 60s) and floored at 0.
 
@@ -255,7 +298,18 @@ def resolve_retry_after(
     if secs <= 0:
         return None
     cap = RETRY_AFTER_CAP_RATE_LIMIT_S if is_rate_limit else RETRY_AFTER_CAP_OVERLOAD_S
-    return min(secs, cap)
+    wait = min(secs, cap)
+    # A rate-limit Retry-After on a seat the pool has already benched is a hint
+    # about a window we are no longer waiting on — honoring it sleeps the full
+    # cap and wakes to the same dead seat. Fall through to jitter so the caller
+    # reaches its fallback chain on THIS 429 instead of ~10 minutes later. The
+    # carve-out: a pool-reported recovery landing inside the wait we were about
+    # to serve anyway. Overload is excluded entirely (see docstring).
+    if is_rate_limit and seat_exhausted and not _seat_recovers_within(
+        seat_recovery_seconds, wait
+    ):
+        return None
+    return wait
 
 
 def zai_coding_overload_retry_ceiling(short_attempts: int = _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS) -> int:
