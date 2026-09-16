@@ -3193,6 +3193,7 @@ from gateway.restart import (
     parse_restart_after_turn_timeout,
     parse_restart_drain_timeout,
     resolve_cron_drain_budget,
+    resolve_replace_takeover_grace_s,
 )
 
 
@@ -36362,6 +36363,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return response
 
 
+# Captured at definition time so ``--replace`` can read the stop budget even
+# when a test monkeypatches the module-level ``GatewayRunner`` name.
+_REAL_GATEWAY_RUNNER_CLASS = GatewayRunner
+
+
 def _run_planned_stop_watcher(
     stop_event: threading.Event,
     runner,
@@ -37034,24 +37040,53 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 except Exception:
                     pass
                 return False
-            # Wait up to 10 seconds for the old process to exit.
+            # Wait for the old process to exit before escalating to SIGKILL.
+            #
+            # The wait MUST cover the old gateway's graceful stop budget. Its
+            # SIGTERM handler drains in-flight turns for up to
+            # ``restart_drain_timeout`` (and cron for ``cron_drain_timeout``),
+            # then checkpoints + closes SQLite. A fixed 10s grace (the
+            # historical value) SIGKILLed a draining gateway MID-WRITE on
+            # every busy restart — the incident signature is
+            # ``gateway.previous_unclean_exit`` followed days later by
+            # ``database disk image is malformed`` in state.db. The budget is
+            # the same one ``resolve_systemd_timeout_stop_sec`` derives for
+            # ``TimeoutStopSec`` (#94759), so --replace and systemd agree.
+            #
             # ``os.kill(pid, 0)`` on Windows is NOT a no-op — use the
             # handle-based existence check instead.
             from gateway.status import _pid_exists
+            # Resolve the loaders from the REAL class, not the module-level
+            # ``GatewayRunner`` name (tests stub that with a bare runner).
+            _real_runner = _REAL_GATEWAY_RUNNER_CLASS
+            try:
+                _drain_s = _real_runner._load_restart_drain_timeout()
+                _cron_s = _real_runner._load_cron_drain_timeout()
+            except Exception:  # config unreadable → same floor as systemd
+                _drain_s, _cron_s = 0.0, 0.0
+            grace_s = resolve_replace_takeover_grace_s(_drain_s, _cron_s)
+            logger.info(
+                "Waiting up to %.0fs for old gateway (PID %d) to drain and exit "
+                "before force-kill", grace_s, existing_pid,
+            )
             old_gateway_exited = False
-            for _ in range(20):
+            _grace_deadline = time.monotonic() + grace_s
+            while True:
                 if not _pid_exists(existing_pid):
                     old_gateway_exited = True
                     break  # Process is gone
+                if time.monotonic() >= _grace_deadline:
+                    break
                 # start_gateway is async: a blocking sleep here froze the
                 # event loop (signal handlers, health checks, every other
                 # coroutine) for up to 10s per replacement (#36163).
                 await asyncio.sleep(0.5)
-            else:
-                # Still alive after 10s — force kill
+            if not old_gateway_exited:
+                # Still alive after the full drain budget — force kill
                 logger.warning(
-                    "Old gateway (PID %d) did not exit after SIGTERM, sending SIGKILL.",
+                    "Old gateway (PID %d) did not exit within %.0fs after SIGTERM, sending SIGKILL.",
                     existing_pid,
+                    grace_s,
                 )
                 try:
                     terminate_pid(existing_pid, force=True)
