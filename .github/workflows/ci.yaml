@@ -13,6 +13,25 @@ name: CI
 # SECURITY: this workflow runs PR-controlled actions, workflows, and code.
 # Do not add ``secrets: inherit`` or GitHub App credentials here. Trusted
 # main-only automation uses protected environments in its own workflows.
+#
+# RUNNERS (fork, 2026-09-16). Jobs here say
+# ``runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}``,
+# so the repo variable ``CI_RUNNER_LABELS`` moves the whole matrix between
+# GitHub-hosted and the ACE-AI self-hosted pool in one edit. The pool runs
+# ephemeral containers with ``--security-opt no-new-privileges`` and no docker
+# socket, which is why a handful of jobs are pinned to ``ubuntu-latest``
+# instead and carry a comment naming the reason at their ``runs-on``:
+#
+#   nix.yml         nix install needs root (cachix/install-nix-action uses sudo)
+#   rust-tests.yml  sudo apt-get for webkit2gtk; the pool image ships none
+#   e2e-desktop.yml sudo apt-get for gtk/nss/xvfb
+#   docker-lint.yml hadolint is a Docker container action; no socket on the pool
+#   js-tests.yml    683-file vitest suite exceeds the 4-CPU/8g container
+#
+# ``installer-tests``, the ``tests-os`` matrix and ``ci-review-comment`` use a
+# literal ``runs-on`` and are hosted by design. Everything else runs on the
+# pool. Any PR touching ``.github/workflows/**`` also needs the ``ci-reviewed``
+# label or the Review label gate hard-blocks it.
 
 on:
   pull_request:
