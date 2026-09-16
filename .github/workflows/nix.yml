@@ -56,7 +56,9 @@ jobs:
     # wider runner with no more configuration.
     # fork 2026-08-30: upstream's paid 32-core pool doesn't exist in this org
     # (jobs queue forever). Standard runner + the 60-min timeout is fine.
-    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    # Nix install needs root (cachix/install-nix-action uses sudo); the hardened
+    # self-hosted pool runs no-new-privileges, so this job stays on GitHub-hosted.
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - name: Checkout code
