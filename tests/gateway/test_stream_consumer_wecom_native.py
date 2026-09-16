@@ -626,7 +626,12 @@ class TestClarifyEagerReseed:
 
         # User answered → request an eager re-seed.  NO on_delta yet.
         consumer.request_reopen_seed()
-        await self._drain(consumer, 0.05)  # let run() process _REOPEN_SEED
+        # 同 test_double_clarify_boundary_reseed_chain：轮询而不是固定睡眠，
+        # 固定 _drain 在 CPU 争用下会抢跑。
+        await self._wait_until(
+            lambda: len([f for f in adapter.frames if f["text"] == "" and not f["finalize"]])
+            == seeds_before + 1
+        )
 
         seeds_after = len(
             [f for f in adapter.frames if f["text"] == "" and not f["finalize"]]
@@ -1060,7 +1065,13 @@ class TestClarifyEagerReseed:
 
         # 第二轮 eager seed：即便标志有残留，仍能正确再次开流。
         consumer.request_reopen_seed()
-        await self._drain(consumer, 0.05)
+        # 用 _wait_until 轮询而不是固定 _drain(0.05)：seed 帧是异步发出的，
+        # 固定睡眠在 CPU 争用下会抢跑（self-hosted pool 上实测 before=2,
+        # after=2）。这正是本文件 _wait_until 的存在理由。
+        await self._wait_until(
+            lambda: len([f for f in adapter.frames if f["text"] == "" and not f["finalize"]])
+            == seeds_before_second_boundary + 1
+        )
 
         seeds_after = len(
             [f for f in adapter.frames if f["text"] == "" and not f["finalize"]]
