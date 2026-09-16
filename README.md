@@ -262,3 +262,5 @@ scripts/run_tests.sh
 MIT — see [LICENSE](LICENSE).
 
 Built by [Nous Research](https://nousresearch.com).
+
+<!-- ci probe 2026-09-16: first job on the ACE-AI self-hosted pool after un-park -->
