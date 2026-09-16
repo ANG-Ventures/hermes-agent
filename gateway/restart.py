@@ -167,6 +167,31 @@ def resolve_systemd_timeout_stop_sec(
     return int(max(_seconds(floor_s), max(drain, cron_budget) + _seconds(headroom_s)))
 
 
+# ``--replace`` takeover: how long the NEW gateway waits for the OLD one to finish its graceful
+# stop before escalating SIGTERM -> SIGKILL. Must cover the same stop budget systemd's
+# TimeoutStopSec covers (#94759); a fixed 10s SIGKILLs a draining gateway mid-drain / mid-SQLite
+# write and leaves ``state.db`` malformed. The 10s historical floor keeps an idle gateway fast.
+REPLACE_TAKEOVER_GRACE_FLOOR_S = 10.0
+REPLACE_TAKEOVER_GRACE_HEADROOM_S = 30.0
+
+
+def resolve_replace_takeover_grace_s(
+    drain_timeout: float, cron_drain_timeout: float = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, *,
+    cleanup_reserve_s: float = CRON_DRAIN_CLEANUP_RESERVE_S,
+    headroom_s: float = REPLACE_TAKEOVER_GRACE_HEADROOM_S,
+    floor_s: float = REPLACE_TAKEOVER_GRACE_FLOOR_S,
+) -> float:
+    """Seconds ``--replace`` waits for the old gateway before SIGKILL.
+
+    Same budget model as :func:`resolve_systemd_timeout_stop_sec` (max(drain, cron+reserve) +
+    headroom, floored) so both supervisors agree on "stuck" versus merely draining.
+    """
+    return float(resolve_systemd_timeout_stop_sec(
+        drain_timeout, cron_drain_timeout, cleanup_reserve_s=cleanup_reserve_s,
+        headroom_s=headroom_s, floor_s=floor_s))
+
+
+
 def resolve_restart_exit_wait_budget(drain_timeout: float, after_turn_timeout: float, *, headroom: float = 15.0) -> float:
     """Seconds a CLI should wait for the gateway PID to exit after SIGUSR1: in-band restart may
     defer ``stop()`` until turns finish, then spend ``drain_timeout`` inside it — cover both."""

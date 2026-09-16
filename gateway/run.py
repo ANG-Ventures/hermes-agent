@@ -2138,7 +2138,8 @@ from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
-    DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT)
+    DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT,
+    resolve_replace_takeover_grace_s)
 
 
 logger = logging.getLogger(__name__)
@@ -4405,6 +4406,11 @@ class GatewayRunner(
         is_current: Any = None
 
 
+# Captured at definition time so ``--replace`` can read the stop budget even when a test
+# monkeypatches the module-level ``GatewayRunner`` name.
+_REAL_GATEWAY_RUNNER_CLASS = GatewayRunner
+
+
 def _run_planned_stop_watcher(
     stop_event: threading.Event, runner, loop: asyncio.AbstractEventLoop, shutdown_handler, *,
     poll_interval: float = 0.5) -> None:
@@ -4866,6 +4872,18 @@ async def _wait_for_pid_exit(pid: int, attempts: int, delay: float) -> bool:
     return False
 
 
+def _replace_takeover_grace_s() -> float:
+    """Drain-aware SIGKILL grace for ``--replace``; falls back to the floor if config is unreadable.
+    Reads the loaders off the real class so a test that stubs the module-level ``GatewayRunner``
+    name still resolves the budget."""
+    try:
+        drain_s = _REAL_GATEWAY_RUNNER_CLASS._load_restart_drain_timeout()
+        cron_s = _REAL_GATEWAY_RUNNER_CLASS._load_cron_drain_timeout()
+    except Exception:
+        drain_s, cron_s = 0.0, 0.0
+    return resolve_replace_takeover_grace_s(drain_s, cron_s)
+
+
 async def _start_gateway_replace_existing_instance(existing_pid: int, replace: bool) -> bool:
     """Handle a live gateway PID under this HERMES_HOME: replace it (``--replace``) or refuse.
     Returns False when startup must abort (refused, permission denied, target still alive)."""
@@ -4914,9 +4932,15 @@ async def _start_gateway_replace_existing_instance(existing_pid: int, replace: b
         logger.error("Permission denied killing PID %d. Cannot replace.", existing_pid)
         _clear_takeover_marker_quiet()
         return False
-    # Up to 10s for SIGTERM, then SIGKILL.
-    if not await _wait_for_pid_exit(existing_pid, 20, 0.5):
-        logger.warning("Old gateway (PID %d) did not exit after SIGTERM, sending SIGKILL.", existing_pid)
+    # Wait the old gateway's FULL graceful-stop budget (restart_drain_timeout / cron_drain_timeout
+    # + headroom) before SIGKILL — the same budget systemd's TimeoutStopSec covers. A fixed 10s
+    # force-killed a draining gateway mid-SQLite-write on every busy restart (state.db malformed).
+    grace_s = _replace_takeover_grace_s()
+    logger.info("Waiting up to %.0fs for old gateway (PID %d) to drain and exit before force-kill",
+                grace_s, existing_pid)
+    if not await _wait_for_pid_exit(existing_pid, max(1, int(grace_s / 0.5)), 0.5):
+        logger.warning("Old gateway (PID %d) did not exit within %.0fs after SIGTERM, sending SIGKILL.",
+                       existing_pid, grace_s)
         old_gateway_exited = False
         try:
             terminate_pid(existing_pid, force=True, expected_start_time=existing_start_time)
