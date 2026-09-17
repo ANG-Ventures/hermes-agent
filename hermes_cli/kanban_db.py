@@ -678,6 +678,191 @@ def _warn_if_override_escapes_hermes_home(override: Path) -> None:
     )
 
 
+# ``(board slug, raw HERMES_KANBAN_DB)`` pairs already evaluated by
+# ``_warn_if_pin_contradicts_board_arg``. Same warn-once + resolve-once role as
+# ``_CHECKED_OVERRIDE_ESCAPES``: ``kanban_db_path()`` sits on the ``connect()``
+# path, so the two ``Path.resolve()`` calls must not run per call.
+_CHECKED_PIN_BOARD_CONTRADICTIONS: set[tuple[str, str]] = set()
+
+# Depth of the innermost ``enumerating_boards()`` scope on THIS thread. Thread-
+# local because the dispatcher ticks boards in parallel via ``asyncio.to_thread``
+# (``_tick_once_for_board``), and a module-global counter would let one thread's
+# enumeration silence another thread's genuine single-board contradiction.
+_ENUMERATION_DEPTH = threading.local()
+
+
+def _enumeration_depth() -> int:
+    return getattr(_ENUMERATION_DEPTH, "value", 0)
+
+
+@contextlib.contextmanager
+def enumerating_boards():
+    """Mark a dynamic extent as ENUMERATING boards rather than ADDRESSING one.
+
+    The pin-contradiction guard exists for a caller that names ONE board and
+    silently gets another. A caller sweeping every board on disk is a different
+    shape: under a ``HERMES_KANBAN_DB`` pin every non-active slug trivially
+    disagrees with the pin, so an unscoped sweep emits one warning per board
+    (measured: 64 on a single dispatcher sweep across 65 live boards) and trains
+    operators to ignore the signal.
+
+    This is a DYNAMIC EXTENT, not a per-call flag, and that distinction is the
+    whole fix. The first cut passed ``warn_on_pin_contradiction=False`` at each
+    ``kanban_db_path()`` call site, which cannot work: enumerators also call
+    ``connect(board=slug)`` / ``connect_closing(board=slug)``, which re-resolve
+    the path internally with no flag to thread through. Measured on that design,
+    ``_board_task_counts`` still emitted 8 warnings over 8 boards *despite* its
+    call site being flagged. Wrapping the LOOP covers every nested resolution,
+    however deep, including ones added later.
+
+    Scoped to the current thread, and re-entrant.
+    """
+    _ENUMERATION_DEPTH.value = _enumeration_depth() + 1
+    try:
+        yield
+    finally:
+        _ENUMERATION_DEPTH.value = max(0, _enumeration_depth() - 1)
+
+
+def enumerating_each(boards):
+    """Iterate ``boards`` with :func:`enumerating_boards` held for each BODY.
+
+    ``for meta in enumerating_each(boards):`` puts the whole loop body inside
+    the extent, which is the shape that cannot half-apply. Wrapping only the
+    path resolve inside a per-board loop does not work: the body then calls
+    ``connect(board=slug)`` / ``count_notify_subs(board=slug)``, which
+    re-resolve internally and land OUTSIDE the extent. Measured on a simulated
+    dispatcher tick with the fingerprint scoped and the ``connect`` not: the
+    sweep still emitted warnings, and a genuine single-board contradiction
+    probed straight afterwards went silent. With the body inside the extent the
+    same sweep emitted 0 and the probe stayed loud.
+
+    The generator is suspended inside the context manager while the consumer
+    runs the body, so ``continue``, ``break``, ``return`` and exceptions all
+    unwind it correctly.
+    """
+    for board in boards:
+        with enumerating_boards():
+            yield board
+
+
+# Hard ceiling on contradiction warnings, charged PER CALL SITE. The warn-once
+# ledger is keyed on (slug, pin), so a host with many boards can still emit one
+# line per board from un-enumerated addressing paths. Past a handful of distinct
+# boards that one site has given the operator its signal; the rest is noise, so
+# collapse to a single summary line. Zero risk of hiding the FIRST occurrence
+# from any site, which is the one that diagnoses the misreading.
+_PIN_CONTRADICTION_WARN_BUDGET = 5
+
+# Slugs already reported by the guard, in emission order, keyed by the CALL SITE
+# that asked (``file:lineno`` of the first frame outside this module).
+#
+# Per-site rather than per-process, and that is load-bearing. A process-global
+# budget reintroduces this card's own defect one level up: any per-board loop
+# that forgets :func:`enumerating_boards` looks like N addressing calls, burns
+# the whole budget, and then the genuine single-board misreading the guard
+# exists to surface goes SILENT. Measured on the process-global design: 8
+# unscoped ``connect(board=slug)`` calls emitted 5 warnings, after which
+# ``kanban_db_path('account-health')`` returned the pin path with 0 warnings —
+# run-1022's exact probe, silent again. Charging the ceiling to the site that
+# made the noise bounds a forgetful enumerator without ever spending another
+# caller's first warning.
+_PIN_CONTRADICTION_WARNED: dict[str, list[str]] = {}
+
+
+def _pin_contradiction_call_site() -> str:
+    """``file:lineno`` of the first frame outside this module, or ``"?"``.
+
+    Only reached for a genuine, not-yet-reported ``(slug, pin)`` contradiction,
+    so the frame walk is bounded by distinct offending boards, not by call
+    volume — it is not on the ``connect()`` hot path.
+    """
+    try:
+        frame = sys._getframe(1)
+    except Exception:  # pragma: no cover - no frame introspection available
+        return "?"
+    this_file = __file__
+    while frame is not None:
+        if frame.f_code.co_filename != this_file:
+            return f"{frame.f_code.co_filename}:{frame.f_lineno}"
+        frame = frame.f_back
+    return "?"
+
+
+def _warn_if_pin_contradicts_board_arg(board: Optional[str], override: Path) -> None:
+    """Log once when an EXPLICIT ``board`` arg disagrees with the pinned DB.
+
+    The ``HERMES_KANBAN_DB`` pin is checked before anything derived from the
+    ``board`` argument, and the dispatcher injects it into every worker env. So
+    inside a worker, ``kanban_db_path("some-other-board")`` silently returns the
+    pinned path and the caller reads the wrong board with no signal at all.
+
+    That is not hypothetical: it produced two wrong readings inside one task
+    (t_a1e6e877) — a repro that wrote junk cards to the live default board, and
+    a review probe whose ``kanban_db_path('ban-forensics')`` answer read exactly
+    like the board-alias feature being broken when in fact it was the pin.
+    Both operators knew about the trap and hit it anyway.
+
+    Resolution is deliberately UNCHANGED — the pin still wins, because it is the
+    dispatcher→worker handoff's defense in depth (``_default_spawn`` sets
+    ``HERMES_KANBAN_DB`` precisely so a worker that re-resolves paths under a
+    rewritten ``HERMES_HOME`` still converges on the DB the dispatcher claimed
+    its task from). Only the silence is fixed.
+
+    Silent by design in the shapes that are not contradictions: ``board`` is
+    None (the pin is then the intended source of truth), the pin already
+    resolves to the requested board's DB (the normal worker case), and the call
+    happens inside an :func:`enumerating_boards` extent (a sweep over every
+    board on disk is not a claim to be addressing any one of them).
+    """
+    if board is None:
+        return
+    if _enumeration_depth() > 0:
+        return  # sweeping every board, not addressing the one named.
+    try:
+        slug = _normalize_board_slug(board)
+    except ValueError:
+        return  # invalid slug: the pin path short-circuits before validation.
+    if slug is None:
+        return
+    key = (slug, str(override))
+    if key in _CHECKED_PIN_BOARD_CONTRADICTIONS:
+        return
+    _CHECKED_PIN_BOARD_CONTRADICTIONS.add(key)
+    try:
+        requested = _board_db_path_ignoring_pin(slug).resolve(strict=False)
+        pinned = override.resolve(strict=False)
+    except (OSError, ValueError):
+        return
+    if requested == pinned:
+        return  # pin agrees with the argument: the normal worker case.
+    site = _pin_contradiction_call_site()
+    reported = _PIN_CONTRADICTION_WARNED.setdefault(site, [])
+    reported.append(slug)
+    emitted = len(reported)
+    if emitted > _PIN_CONTRADICTION_WARN_BUDGET:
+        if emitted == _PIN_CONTRADICTION_WARN_BUDGET + 1:
+            _log.warning(
+                "kanban_db_path: more than %d distinct boards have now been "
+                "requested from %s while HERMES_KANBAN_DB pins %s — suppressing "
+                "further per-board contradiction warnings from that call site. "
+                "Set HERMES_KANBAN_SANDBOX=1 (or unset the HERMES_KANBAN_* path "
+                "pins) if you meant to address the boards you named; if that "
+                "site sweeps every board, wrap its loop in "
+                "kanban_db.enumerating_boards().",
+                _PIN_CONTRADICTION_WARN_BUDGET, site, override,
+            )
+        return
+    _log.warning(
+        "kanban_db_path(board=%r) returned the HERMES_KANBAN_DB pin %s, NOT "
+        "that board's DB %s — the pin outranks the board argument, so this "
+        "caller is reading a different board than it asked for. Set "
+        "HERMES_KANBAN_SANDBOX=1 (or unset the HERMES_KANBAN_* path pins) if "
+        "you meant to address the board you named.",
+        slug, pinned, requested,
+    )
+
+
 # Slug validator: lowercase alphanumerics, digits, hyphens; 1–64 chars.
 # Strict enough to stop traversal (`..`) and embedded path separators, loose
 # enough that kebab-case names like ``atm10-server`` or ``hermes-agent``
@@ -968,15 +1153,39 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     When ``HERMES_HOME`` is set and the override resolves outside the
     ``HERMES_HOME``-derived kanban root, a warning is logged once — the
     override still wins, but the escape is no longer silent.
+
+    Likewise, when an EXPLICIT ``board`` argument is passed and the override
+    resolves to a *different* board's DB, a warning is logged once naming both
+    the board you asked for and the path you actually got. Resolution is
+    unchanged; the contradiction is simply no longer invisible to the caller.
+
+    A caller that sweeps every board on disk is not addressing any one of them,
+    and under a pin every non-active slug trivially disagrees — so wrap such a
+    loop in :func:`enumerating_boards`, which suppresses the warning for the
+    whole dynamic extent (including the nested ``connect()`` resolutions a
+    per-call flag could never reach). Do NOT wrap a single-board lookup: that is
+    exactly the case the guard exists to catch.
     """
     override = _kanban_path_override("HERMES_KANBAN_DB")
     if override:
         path = Path(override).expanduser()
         _warn_if_override_escapes_hermes_home(path)
+        _warn_if_pin_contradicts_board_arg(board, path)
         return path
     slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
+    return _board_db_path_ignoring_pin(slug)
+
+
+def _board_db_path_ignoring_pin(slug: str) -> Path:
+    """Map an already-normalized board slug to its DB path, ignoring the pin.
+
+    The single definition of the board→DB layout, shared by
+    :func:`kanban_db_path` and the contradiction guard
+    :func:`_warn_if_pin_contradicts_board_arg` — so the guard can never drift
+    from the resolution it is describing.
+    """
     if slug == DEFAULT_BOARD:
         return kanban_home() / "kanban.db"
     return board_dir(slug) / "kanban.db"
@@ -1203,6 +1412,7 @@ def write_board_metadata(
         json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
+    # Display metadata for the board just written.
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
 
@@ -1284,54 +1494,59 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
 
     Returns a list of metadata dicts, sorted with ``default`` first and
     the rest alphabetically.
+
+    The whole scan runs inside :func:`enumerating_boards`: it resolves a DB path
+    per board, which under a ``HERMES_KANBAN_DB`` pin would otherwise trip the
+    contradiction guard once for every non-active board on disk.
     """
     entries: list[dict] = []
     seen: set[str] = set()
 
-    # Default board is always first.
-    entries.append(read_board_metadata(DEFAULT_BOARD))
-    seen.add(DEFAULT_BOARD)
+    with enumerating_boards():
+        # Default board is always first.
+        entries.append(read_board_metadata(DEFAULT_BOARD))
+        seen.add(DEFAULT_BOARD)
 
-    root = boards_root()
-    if root.is_dir():
-        for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
-            if not child.is_dir():
-                continue
-            slug = child.name
-            # Keep slug normalisation soft for discovery — but skip dirs
-            # that don't parse as valid slugs so we don't surface junk.
-            try:
-                normed = _normalize_board_slug(slug)
-            except ValueError:
-                continue
-            if not normed or normed in seen:
-                continue
-            has_db = (child / "kanban.db").exists()
-            has_meta = (child / "board.json").exists()
-            if not (has_db or has_meta):
-                continue
-            # A dir holding a kanban.db but NO board.json was never created
-            # through create_board() — it is almost always a phantom: some
-            # consumer resolved a stale/typo slug and connect() initialised an
-            # empty schema beside the real board. Surfacing it as a board is a
-            # silent card-loss path (cards created against the stale slug land
-            # in the empty DB, invisible on the real one). Skip it only when it
-            # is genuinely empty; a dir with real cards is someone's data and
-            # must stay visible even if board.json was lost.
-            if has_db and not has_meta and _board_db_is_empty(child / "kanban.db"):
-                _log.warning(
-                    "kanban: ignoring phantom board dir %s (kanban.db with 0 "
-                    "tasks and no board.json). If this slug was renamed, add "
-                    "it to %s; otherwise remove the directory.",
-                    child,
-                    board_aliases_path(),
-                )
-                continue
-            meta = read_board_metadata(normed)
-            if meta.get("archived") and not include_archived:
-                continue
-            entries.append(meta)
-            seen.add(normed)
+        root = boards_root()
+        if root.is_dir():
+            for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+                if not child.is_dir():
+                    continue
+                slug = child.name
+                # Keep slug normalisation soft for discovery — but skip dirs
+                # that don't parse as valid slugs so we don't surface junk.
+                try:
+                    normed = _normalize_board_slug(slug)
+                except ValueError:
+                    continue
+                if not normed or normed in seen:
+                    continue
+                has_db = (child / "kanban.db").exists()
+                has_meta = (child / "board.json").exists()
+                if not (has_db or has_meta):
+                    continue
+                # A dir holding a kanban.db but NO board.json was never created
+                # through create_board() — it is almost always a phantom: some
+                # consumer resolved a stale/typo slug and connect() initialised an
+                # empty schema beside the real board. Surfacing it as a board is a
+                # silent card-loss path (cards created against the stale slug land
+                # in the empty DB, invisible on the real one). Skip it only when it
+                # is genuinely empty; a dir with real cards is someone's data and
+                # must stay visible even if board.json was lost.
+                if has_db and not has_meta and _board_db_is_empty(child / "kanban.db"):
+                    _log.warning(
+                        "kanban: ignoring phantom board dir %s (kanban.db with 0 "
+                        "tasks and no board.json). If this slug was renamed, add "
+                        "it to %s; otherwise remove the directory.",
+                        child,
+                        board_aliases_path(),
+                    )
+                    continue
+                meta = read_board_metadata(normed)
+                if meta.get("archived") and not include_archived:
+                    continue
+                entries.append(meta)
+                seen.add(normed)
     return entries
 
 
@@ -11974,16 +12189,23 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     except Exception:
         return 0
     total = 0
-    for meta in boards:
+    # Extent spans each loop body (belt and braces with the inner
+    # ``enumerating_boards()`` below, which stays so a direct call to this
+    # helper is covered too).
+    for meta in enumerating_each(boards):
         slug = meta.get("slug") or DEFAULT_BOARD
         try:
-            path = kanban_db_path(board=slug).expanduser()
-            resolved = str(path.resolve())
-            if current_path is not None and resolved == current_path:
-                continue
-            if not path.exists():
-                continue
-            other = connect(board=slug)
+            # Enumerating every board on disk, not addressing the named one.
+            # The extent also covers the ``connect(board=slug)`` below, which
+            # re-resolves the path internally.
+            with enumerating_boards():
+                path = kanban_db_path(board=slug).expanduser()
+                resolved = str(path.resolve())
+                if current_path is not None and resolved == current_path:
+                    continue
+                if not path.exists():
+                    continue
+                other = connect(board=slug)
             try:
                 total += count_running_tasks(other)
             finally:

@@ -709,7 +709,11 @@ class GatewayKanbanWatchersMixin:
                     except Exception:
                         boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
                     seen_db_paths: set[str] = set()
-                    for board_meta in boards:
+                    # The extent spans each loop BODY, not just the path
+                    # resolve: the body's `count_notify_subs(board=slug)` and
+                    # `connect(board=slug)` re-resolve internally and would
+                    # otherwise land outside it.
+                    for board_meta in _kb.enumerating_each(boards):
                         slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
                         db_path = board_meta.get("db_path")
                         try:
@@ -1952,7 +1956,11 @@ class GatewayKanbanWatchersMixin:
         ] = {}
 
         def _board_db_fingerprint(slug: str) -> tuple[str, int | None, int | None]:
-            path = _kb.kanban_db_path(slug)
+            # Called once per board per dispatch tick — enumeration, not
+            # addressing. Unscoped this is the single loudest source of pin
+            # contradiction warnings on the dispatcher's own path.
+            with _kb.enumerating_boards():
+                path = _kb.kanban_db_path(slug)
             try:
                 resolved = str(path.expanduser().resolve())
             except Exception:
@@ -2076,7 +2084,12 @@ class GatewayKanbanWatchersMixin:
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             out: list[tuple[str, "Optional[object]"]] = []
-            for b in boards:
+            # Enumeration extent spans the whole per-board tick body, not just
+            # the fingerprint's path resolve: `_tick_once_for_board` also calls
+            # `connect(board=slug)`, which re-resolves internally. Scoping only
+            # the resolve left the tick emitting a burst of contradiction
+            # warnings that then silenced later single-board misreadings.
+            for b in _kb.enumerating_each(boards):
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 out.append((slug, _tick_once_for_board(slug)))
             return out
@@ -2104,7 +2117,7 @@ class GatewayKanbanWatchersMixin:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
-            for b in boards:
+            for b in _kb.enumerating_each(boards):
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 conn = None
                 try:
@@ -2160,7 +2173,11 @@ class GatewayKanbanWatchersMixin:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             attempted = 0
             successes = 0
-            for b in boards:
+            # Enumeration: sweeps every board on disk looking for triage cards.
+            # The body pins HERMES_KANBAN_BOARD and lets the decomposer connect
+            # with no board kwarg, so the resolves happen deep inside the call —
+            # only a body-spanning extent reaches them.
+            for b in _kb.enumerating_each(boards):
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 if attempted >= auto_decompose_per_tick:
                     break
