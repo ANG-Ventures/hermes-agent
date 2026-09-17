@@ -678,6 +678,66 @@ def _warn_if_override_escapes_hermes_home(override: Path) -> None:
     )
 
 
+# ``(board slug, raw HERMES_KANBAN_DB)`` pairs already evaluated by
+# ``_warn_if_pin_contradicts_board_arg``. Same warn-once + resolve-once role as
+# ``_CHECKED_OVERRIDE_ESCAPES``: ``kanban_db_path()`` sits on the ``connect()``
+# path, so the two ``Path.resolve()`` calls must not run per call.
+_CHECKED_PIN_BOARD_CONTRADICTIONS: set[tuple[str, str]] = set()
+
+
+def _warn_if_pin_contradicts_board_arg(board: Optional[str], override: Path) -> None:
+    """Log once when an EXPLICIT ``board`` arg disagrees with the pinned DB.
+
+    The ``HERMES_KANBAN_DB`` pin is checked before anything derived from the
+    ``board`` argument, and the dispatcher injects it into every worker env. So
+    inside a worker, ``kanban_db_path("some-other-board")`` silently returns the
+    pinned path and the caller reads the wrong board with no signal at all.
+
+    That is not hypothetical: it produced two wrong readings inside one task
+    (t_a1e6e877) — a repro that wrote junk cards to the live default board, and
+    a review probe whose ``kanban_db_path('ban-forensics')`` answer read exactly
+    like the board-alias feature being broken when in fact it was the pin.
+    Both operators knew about the trap and hit it anyway.
+
+    Resolution is deliberately UNCHANGED — the pin still wins, because it is the
+    dispatcher→worker handoff's defense in depth (``_default_spawn`` sets
+    ``HERMES_KANBAN_DB`` precisely so a worker that re-resolves paths under a
+    rewritten ``HERMES_HOME`` still converges on the DB the dispatcher claimed
+    its task from). Only the silence is fixed.
+
+    Silent by design in the two shapes that are not contradictions: ``board`` is
+    None (the pin is then the intended source of truth), and the pin already
+    resolves to the requested board's DB (the normal worker case).
+    """
+    if board is None:
+        return
+    try:
+        slug = _normalize_board_slug(board)
+    except ValueError:
+        return  # invalid slug: the pin path short-circuits before validation.
+    if slug is None:
+        return
+    key = (slug, str(override))
+    if key in _CHECKED_PIN_BOARD_CONTRADICTIONS:
+        return
+    _CHECKED_PIN_BOARD_CONTRADICTIONS.add(key)
+    try:
+        requested = _board_db_path_ignoring_pin(slug).resolve(strict=False)
+        pinned = override.resolve(strict=False)
+    except (OSError, ValueError):
+        return
+    if requested == pinned:
+        return  # pin agrees with the argument: the normal worker case.
+    _log.warning(
+        "kanban_db_path(board=%r) returned the HERMES_KANBAN_DB pin %s, NOT "
+        "that board's DB %s — the pin outranks the board argument, so this "
+        "caller is reading a different board than it asked for. Set "
+        "HERMES_KANBAN_SANDBOX=1 (or unset the HERMES_KANBAN_* path pins) if "
+        "you meant to address the board you named.",
+        slug, pinned, requested,
+    )
+
+
 # Slug validator: lowercase alphanumerics, digits, hyphens; 1–64 chars.
 # Strict enough to stop traversal (`..`) and embedded path separators, loose
 # enough that kebab-case names like ``atm10-server`` or ``hermes-agent``
@@ -932,7 +992,11 @@ def board_exists(board: Optional[str] = None) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
-def kanban_db_path(board: Optional[str] = None) -> Path:
+def kanban_db_path(
+    board: Optional[str] = None,
+    *,
+    warn_on_pin_contradiction: bool = True,
+) -> Path:
     """Return the path to the ``kanban.db`` for ``board``.
 
     Resolution (highest precedence first):
@@ -968,15 +1032,40 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     When ``HERMES_HOME`` is set and the override resolves outside the
     ``HERMES_HOME``-derived kanban root, a warning is logged once — the
     override still wins, but the escape is no longer silent.
+
+    Likewise, when an EXPLICIT ``board`` argument is passed and the override
+    resolves to a *different* board's DB, a warning is logged once naming both
+    the board you asked for and the path you actually got. Resolution is
+    unchanged; the contradiction is simply no longer invisible to the caller.
+
+    ``warn_on_pin_contradiction=False`` suppresses only that second warning, for
+    the one legitimate shape it would otherwise spam: bulk enumeration over
+    every board on disk (``read_board_metadata`` filling a display ``db_path``),
+    where every non-active board trivially disagrees with the pin and the caller
+    is not claiming to address the board it names. Do NOT pass it to silence a
+    single-board lookup — that is exactly the case the guard exists to catch.
     """
     override = _kanban_path_override("HERMES_KANBAN_DB")
     if override:
         path = Path(override).expanduser()
         _warn_if_override_escapes_hermes_home(path)
+        if warn_on_pin_contradiction:
+            _warn_if_pin_contradicts_board_arg(board, path)
         return path
     slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
+    return _board_db_path_ignoring_pin(slug)
+
+
+def _board_db_path_ignoring_pin(slug: str) -> Path:
+    """Map an already-normalized board slug to its DB path, ignoring the pin.
+
+    The single definition of the board→DB layout, shared by
+    :func:`kanban_db_path` and the contradiction guard
+    :func:`_warn_if_pin_contradicts_board_arg` — so the guard can never drift
+    from the resolution it is describing.
+    """
     if slug == DEFAULT_BOARD:
         return kanban_home() / "kanban.db"
     return board_dir(slug) / "kanban.db"
@@ -1151,7 +1240,12 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
                 meta.update(raw)
     except (OSError, json.JSONDecodeError):
         pass
-    meta["db_path"] = str(kanban_db_path(slug))
+    # Display metadata, and called once per board by ``list_boards``. Under a
+    # HERMES_KANBAN_DB pin every non-active board trivially disagrees with it,
+    # so the contradiction guard would fire once per board on disk (measured:
+    # 64 warnings on one dispatcher sweep) for a caller that is enumerating,
+    # not addressing, these boards. Consumers already dedupe by resolved path.
+    meta["db_path"] = str(kanban_db_path(slug, warn_on_pin_contradiction=False))
     return meta
 
 
@@ -1203,7 +1297,9 @@ def write_board_metadata(
         json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    meta["db_path"] = str(kanban_db_path(slug))
+    # Display metadata for the board just written — same enumeration-not-
+    # addressing shape as ``read_board_metadata``; see the note there.
+    meta["db_path"] = str(kanban_db_path(slug, warn_on_pin_contradiction=False))
     return meta
 
 
@@ -11977,7 +12073,12 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     for meta in boards:
         slug = meta.get("slug") or DEFAULT_BOARD
         try:
-            path = kanban_db_path(board=slug).expanduser()
+            # Enumerating every board on disk, not addressing the named one —
+            # under a pin each non-active slug trivially disagrees with it and
+            # is skipped two lines down. See ``kanban_db_path``'s note.
+            path = kanban_db_path(
+                board=slug, warn_on_pin_contradiction=False,
+            ).expanduser()
             resolved = str(path.resolve())
             if current_path is not None and resolved == current_path:
                 continue

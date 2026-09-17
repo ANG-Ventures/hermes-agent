@@ -1518,7 +1518,10 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
 def _board_task_counts(slug: str) -> dict[str, int]:
     """Return ``{status: count}`` for a board. Safe to call on an empty DB."""
     try:
-        path = kb.kanban_db_path(board=slug)
+        # Called once per board by ``boards list`` — enumeration, not
+        # addressing. Under a HERMES_KANBAN_DB pin every non-active slug
+        # trivially disagrees with it; see ``kanban_db_path``'s note.
+        path = kb.kanban_db_path(board=slug, warn_on_pin_contradiction=False)
         if not path.exists():
             return {}
         with kb.connect_closing(board=slug) as conn:

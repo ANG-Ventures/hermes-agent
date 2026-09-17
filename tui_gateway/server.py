@@ -12805,7 +12805,10 @@ def _collect_kanban_notifications(session: dict) -> list:
         try:
             resolved = (
                 str(Path(db_path).expanduser().resolve())
-                if db_path else str(_kb.kanban_db_path(slug).resolve())
+                if db_path
+                else str(_kb.kanban_db_path(
+                    slug, warn_on_pin_contradiction=False,
+                ).resolve())
             )
         except Exception:
             resolved = f"slug:{slug}"

@@ -743,6 +743,182 @@ def test_no_warning_when_override_lives_inside_hermes_home(tmp_path, monkeypatch
     assert [r for r in caplog.records if "did NOT" in r.getMessage()] == []
 
 
+# --- pin vs EXPLICIT board argument ----------------------------------------
+#
+# The other silent shape: the caller passes a board argument, the pin resolves
+# to a DIFFERENT board's DB, and the pin wins with no signal — so the caller
+# reads a board it did not ask for. Produced two wrong readings inside one task
+# (t_a1e6e877): a repro that wrote junk cards to the live default board, and a
+# review probe that nearly became a false BEHAVIOUR finding against correct
+# code. Resolution stays pin-wins (the dispatcher->worker handoff depends on
+# it); only the silence is fixed.
+
+_CONTRADICTION_MARKER = "outranks the board argument"
+
+
+@pytest.fixture
+def _pin_contradiction_env(tmp_path, monkeypatch):
+    """Worker-shaped env: a pin on one board, callers asking for another."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
+    monkeypatch.setattr(kb, "_CHECKED_PIN_BOARD_CONTRADICTIONS", set())
+    pinned = kb.board_dir("pinned-board") / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
+    return pinned
+
+
+def test_pin_contradicting_explicit_board_arg_warns_once(
+    _pin_contradiction_env, caplog,
+):
+    """The contradiction is loud, names both paths, and fires once."""
+    pinned = _pin_contradiction_env
+    with caplog.at_level("WARNING", logger=kb.__name__):
+        # Resolution is UNCHANGED: the pin still wins.
+        assert kb.kanban_db_path("other-board") == pinned
+        assert kb.kanban_db_path("other-board") == pinned
+    warnings = [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    # Must name the board asked for AND both paths, or it can't be acted on.
+    assert "other-board" in message
+    assert str(pinned) in message
+    assert str(kb.board_dir("other-board") / "kanban.db") in message
+    assert "HERMES_KANBAN_SANDBOX=1" in message
+
+
+def test_pin_contradiction_warns_without_hermes_home(
+    _pin_contradiction_env, monkeypatch, caplog,
+):
+    """The gap shape: no HERMES_HOME, so the escape warning cannot fire.
+
+    ``_warn_if_override_escapes_hermes_home`` returns early with no
+    ``HERMES_HOME`` set. This case must still be loud, or the exact situation
+    that produced the two wrong readings stays silent.
+    """
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    with caplog.at_level("WARNING", logger=kb.__name__):
+        kb.kanban_db_path("other-board")
+    assert [r for r in caplog.records if "did NOT" in r.getMessage()] == []
+    assert [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()]
+
+
+def test_no_contradiction_warning_when_pin_matches_requested_board(
+    _pin_contradiction_env, caplog,
+):
+    """The normal worker case: pin and board argument agree. Must be silent."""
+    with caplog.at_level("WARNING", logger=kb.__name__):
+        assert kb.kanban_db_path("pinned-board") == _pin_contradiction_env
+    assert [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()] == []
+
+
+def test_no_contradiction_warning_when_board_arg_is_none(
+    _pin_contradiction_env, caplog,
+):
+    """board=None means the pin IS the intended source of truth — no conflict."""
+    with caplog.at_level("WARNING", logger=kb.__name__):
+        assert kb.kanban_db_path() == _pin_contradiction_env
+    assert [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()] == []
+
+
+def test_sandbox_flag_suppresses_contradiction_warning(
+    _pin_contradiction_env, monkeypatch, caplog,
+):
+    """Under the sandbox the pin is neutralised, so there is nothing to warn about."""
+    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")
+    with caplog.at_level("WARNING", logger=kb.__name__):
+        resolved = kb.kanban_db_path("other-board")
+    assert resolved == kb.board_dir("other-board") / "kanban.db"
+    assert [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()] == []
+
+
+def test_board_enumeration_does_not_spam_contradiction_warnings(
+    _pin_contradiction_env, caplog,
+):
+    """Bulk enumeration must stay quiet, or the guard gets trained away.
+
+    ``read_board_metadata`` fills a display ``db_path`` for every board on
+    disk; under a pin every non-active slug trivially disagrees. Measured at
+    64 warnings on one dispatcher sweep before this was scoped out.
+    """
+    for slug in ("alpha-board", "beta-board", "gamma-board"):
+        (kb.board_dir(slug)).mkdir(parents=True, exist_ok=True)
+        (kb.board_dir(slug) / "board.json").write_text("{}", encoding="utf-8")
+    with caplog.at_level("WARNING", logger=kb.__name__):
+        boards = kb.list_boards(include_archived=False)
+        kb.count_running_tasks_other_boards(board="pinned-board")
+    assert len(boards) >= 4  # default + the three created above
+    assert [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()] == []
+
+
+def test_no_board_enumerator_spams_contradiction_warnings(
+    _pin_contradiction_env, caplog,
+):
+    """Class gate: EVERY known board-enumerating caller must stay quiet.
+
+    The guard is only useful if it stays rare. Each of these iterates
+    ``list_boards()`` and resolves a DB path per slug, so under a pin each would
+    emit one warning per board on disk (measured: 64 per sweep) and train
+    operators to ignore the signal. A NEW enumerator added without
+    ``warn_on_pin_contradiction=False`` fails here rather than in production.
+    """
+    from hermes_cli import kanban as kc
+
+    for slug in ("alpha-board", "beta-board", "gamma-board"):
+        kb.board_dir(slug).mkdir(parents=True, exist_ok=True)
+        (kb.board_dir(slug) / "board.json").write_text("{}", encoding="utf-8")
+
+    enumerators = {
+        "list_boards": lambda: kb.list_boards(include_archived=False),
+        "count_running_tasks_other_boards": (
+            lambda: kb.count_running_tasks_other_boards(board="pinned-board")
+        ),
+        "_board_task_counts": lambda: [
+            kc._board_task_counts(b["slug"])
+            for b in kb.list_boards(include_archived=False)
+        ],
+    }
+    offenders = {}
+    for name, call in enumerators.items():
+        caplog.clear()
+        with caplog.at_level("WARNING", logger=kb.__name__):
+            call()
+        hits = [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()]
+        if hits:
+            offenders[name] = len(hits)
+    assert offenders == {}, f"board enumerators spamming the pin guard: {offenders}"
+
+
+def test_dispatcher_worker_pin_handoff_still_wins_over_board_arg(
+    _pin_contradiction_env, caplog,
+):
+    """The contract option (b) would have broken: pin beats the board argument.
+
+    ``_default_spawn`` injects ``HERMES_KANBAN_DB`` so a worker that re-resolves
+    kanban paths (e.g. under a profile-rewritten HERMES_HOME) still converges on
+    the DB the dispatcher claimed its task from. Honouring the board argument
+    over the pin would silently undo that. This asserts the precedence the
+    warning is explicitly NOT changing — including through ``connect()``, which
+    is what a worker's board-scoped reads actually go through.
+    """
+    pinned = _pin_contradiction_env
+    with caplog.at_level("WARNING", logger=kb.__name__):
+        assert kb.kanban_db_path("other-board") == pinned
+        # A worker asking for a different board still lands on the pinned DB.
+        kb.init_db()
+        with kb.connect(board="other-board") as conn:
+            task_id = kb.create_task(conn, title="handoff card", assignee="alice")
+        assert pinned.exists()
+        assert not (kb.board_dir("other-board") / "kanban.db").exists()
+        # And the card is readable back through the pin, board arg or not.
+        with kb.connect() as conn:
+            assert kb.get_task(conn, task_id) is not None
+    # The contradiction was still reported — pin-wins is not silent any more.
+    assert [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()]
+
+
 # ---------------------------------------------------------------------------
 # Comments / events / worker context
 # ---------------------------------------------------------------------------
