@@ -2521,7 +2521,10 @@ def list_boards(include_archived: bool = Query(False)):
     boards = kanban_db.list_boards(include_archived=include_archived)
     current = kanban_db.get_current_board()
     proj_map = _projects_by_id()
-    for b in boards:
+    # Enumeration: this enrich loop asks every board on disk for its counts.
+    # The extent spans the body so a per-board call added here later is
+    # covered without anyone remembering.
+    for b in kanban_db.enumerating_each(boards):
         b["is_current"] = (b["slug"] == current)
         b["counts"] = _board_counts(b["slug"])
         # Live cards only — archived tasks are hidden from every default

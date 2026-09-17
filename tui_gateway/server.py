@@ -12799,16 +12799,18 @@ def _collect_kanban_notifications(session: dict) -> list:
     # DB when HERMES_KANBAN_DB pins the board path (same guard as the gateway
     # notifier).
     seen_db_paths: set = set()
-    for board_meta in boards:
+    # Extent spans each loop BODY: `count_notify_subs(board=slug)` and
+    # `connect(board=slug)` below re-resolve internally and would land outside
+    # an extent that only wrapped the path resolve.
+    for board_meta in _kb.enumerating_each(boards):
         slug = (board_meta or {}).get("slug") or _kb.DEFAULT_BOARD
         db_path = (board_meta or {}).get("db_path")
         try:
-            with _kb.enumerating_boards():
-                resolved = (
-                    str(Path(db_path).expanduser().resolve())
-                    if db_path
-                    else str(_kb.kanban_db_path(slug).resolve())
-                )
+            resolved = (
+                str(Path(db_path).expanduser().resolve())
+                if db_path
+                else str(_kb.kanban_db_path(slug).resolve())
+            )
         except Exception:
             resolved = f"slug:{slug}"
         if resolved in seen_db_paths:

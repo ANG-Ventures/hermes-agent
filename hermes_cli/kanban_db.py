@@ -724,18 +724,69 @@ def enumerating_boards():
         _ENUMERATION_DEPTH.value = max(0, _enumeration_depth() - 1)
 
 
-# Hard ceiling on contradiction warnings emitted by ONE process. The warn-once
+def enumerating_each(boards):
+    """Iterate ``boards`` with :func:`enumerating_boards` held for each BODY.
+
+    ``for meta in enumerating_each(boards):`` puts the whole loop body inside
+    the extent, which is the shape that cannot half-apply. Wrapping only the
+    path resolve inside a per-board loop does not work: the body then calls
+    ``connect(board=slug)`` / ``count_notify_subs(board=slug)``, which
+    re-resolve internally and land OUTSIDE the extent. Measured on a simulated
+    dispatcher tick with the fingerprint scoped and the ``connect`` not: the
+    sweep still emitted warnings, and a genuine single-board contradiction
+    probed straight afterwards went silent. With the body inside the extent the
+    same sweep emitted 0 and the probe stayed loud.
+
+    The generator is suspended inside the context manager while the consumer
+    runs the body, so ``continue``, ``break``, ``return`` and exceptions all
+    unwind it correctly.
+    """
+    for board in boards:
+        with enumerating_boards():
+            yield board
+
+
+# Hard ceiling on contradiction warnings, charged PER CALL SITE. The warn-once
 # ledger is keyed on (slug, pin), so a host with many boards can still emit one
 # line per board from un-enumerated addressing paths. Past a handful of distinct
-# boards the operator has the signal; the rest is noise, so collapse to a single
-# summary line. Zero risk of hiding the FIRST occurrence, which is the one that
-# diagnoses the misreading.
+# boards that one site has given the operator its signal; the rest is noise, so
+# collapse to a single summary line. Zero risk of hiding the FIRST occurrence
+# from any site, which is the one that diagnoses the misreading.
 _PIN_CONTRADICTION_WARN_BUDGET = 5
 
-# Slugs already reported by the guard, in emission order. Length is the budget
-# counter; the list (rather than a bare int) keeps the offending boards
-# inspectable from a test and from a debugger on a live process.
-_PIN_CONTRADICTION_WARNED: list[str] = []
+# Slugs already reported by the guard, in emission order, keyed by the CALL SITE
+# that asked (``file:lineno`` of the first frame outside this module).
+#
+# Per-site rather than per-process, and that is load-bearing. A process-global
+# budget reintroduces this card's own defect one level up: any per-board loop
+# that forgets :func:`enumerating_boards` looks like N addressing calls, burns
+# the whole budget, and then the genuine single-board misreading the guard
+# exists to surface goes SILENT. Measured on the process-global design: 8
+# unscoped ``connect(board=slug)`` calls emitted 5 warnings, after which
+# ``kanban_db_path('account-health')`` returned the pin path with 0 warnings —
+# run-1022's exact probe, silent again. Charging the ceiling to the site that
+# made the noise bounds a forgetful enumerator without ever spending another
+# caller's first warning.
+_PIN_CONTRADICTION_WARNED: dict[str, list[str]] = {}
+
+
+def _pin_contradiction_call_site() -> str:
+    """``file:lineno`` of the first frame outside this module, or ``"?"``.
+
+    Only reached for a genuine, not-yet-reported ``(slug, pin)`` contradiction,
+    so the frame walk is bounded by distinct offending boards, not by call
+    volume — it is not on the ``connect()`` hot path.
+    """
+    try:
+        frame = sys._getframe(1)
+    except Exception:  # pragma: no cover - no frame introspection available
+        return "?"
+    this_file = __file__
+    while frame is not None:
+        if frame.f_code.co_filename != this_file:
+            return f"{frame.f_code.co_filename}:{frame.f_lineno}"
+        frame = frame.f_back
+    return "?"
 
 
 def _warn_if_pin_contradicts_board_arg(board: Optional[str], override: Path) -> None:
@@ -785,17 +836,21 @@ def _warn_if_pin_contradicts_board_arg(board: Optional[str], override: Path) -> 
         return
     if requested == pinned:
         return  # pin agrees with the argument: the normal worker case.
-    _PIN_CONTRADICTION_WARNED.append(slug)
-    emitted = len(_PIN_CONTRADICTION_WARNED)
+    site = _pin_contradiction_call_site()
+    reported = _PIN_CONTRADICTION_WARNED.setdefault(site, [])
+    reported.append(slug)
+    emitted = len(reported)
     if emitted > _PIN_CONTRADICTION_WARN_BUDGET:
         if emitted == _PIN_CONTRADICTION_WARN_BUDGET + 1:
             _log.warning(
                 "kanban_db_path: more than %d distinct boards have now been "
-                "requested while HERMES_KANBAN_DB pins %s — suppressing further "
-                "per-board contradiction warnings in this process. Set "
-                "HERMES_KANBAN_SANDBOX=1 (or unset the HERMES_KANBAN_* path "
-                "pins) if you meant to address the boards you named.",
-                _PIN_CONTRADICTION_WARN_BUDGET, override,
+                "requested from %s while HERMES_KANBAN_DB pins %s — suppressing "
+                "further per-board contradiction warnings from that call site. "
+                "Set HERMES_KANBAN_SANDBOX=1 (or unset the HERMES_KANBAN_* path "
+                "pins) if you meant to address the boards you named; if that "
+                "site sweeps every board, wrap its loop in "
+                "kanban_db.enumerating_boards().",
+                _PIN_CONTRADICTION_WARN_BUDGET, site, override,
             )
         return
     _log.warning(
@@ -12134,7 +12189,10 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     except Exception:
         return 0
     total = 0
-    for meta in boards:
+    # Extent spans each loop body (belt and braces with the inner
+    # ``enumerating_boards()`` below, which stays so a direct call to this
+    # helper is covered too).
+    for meta in enumerating_each(boards):
         slug = meta.get("slug") or DEFAULT_BOARD
         try:
             # Enumerating every board on disk, not addressing the named one.

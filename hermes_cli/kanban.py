@@ -1539,7 +1539,10 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     boards = kb.list_boards(include_archived=include_archived)
     # Enrich each entry with task counts + whether it's the current board.
     current = kb.get_current_board()
-    for b in boards:
+    # Enumeration: the enrich loop asks every board on disk for its counts.
+    # Scoping the loop body (not just `_board_task_counts`' own extent) keeps
+    # any future per-board call added here covered by construction.
+    for b in kb.enumerating_each(boards):
         b["is_current"] = (b["slug"] == current)
         b["counts"] = _board_task_counts(b["slug"])
         b["total"] = sum(b["counts"].values())
@@ -3960,7 +3963,10 @@ def _cmd_notify_repair(args: argparse.Namespace) -> int:
 
     if getattr(args, "all_boards", False):
         results = []
-        for meta in kb.list_boards():
+        # --all-boards sweeps every board on disk: enumeration, not addressing.
+        # The extent spans the body so the `connect_closing(board=slug)` below
+        # is covered too.
+        for meta in kb.enumerating_each(kb.list_boards()):
             slug = str(meta.get("slug") or "").strip()
             if not slug:
                 continue

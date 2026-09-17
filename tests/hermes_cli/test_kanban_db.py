@@ -765,7 +765,7 @@ def _pin_contradiction_env(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
     monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
     monkeypatch.setattr(kb, "_CHECKED_PIN_BOARD_CONTRADICTIONS", set())
-    monkeypatch.setattr(kb, "_PIN_CONTRADICTION_WARNED", [])
+    monkeypatch.setattr(kb, "_PIN_CONTRADICTION_WARNED", {})
     pinned = kb.board_dir("pinned-board") / "kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
     return pinned
@@ -883,6 +883,16 @@ def test_no_board_enumerator_spams_contradiction_warnings(
         kb.board_dir(slug).mkdir(parents=True, exist_ok=True)
         (kb.board_dir(slug) / "board.json").write_text("{}", encoding="utf-8")
 
+    # The pinned DB must actually EXIST, or every enumerator short-circuits on
+    # its `path.exists()` guard and never reaches the `connect()` leg — the gate
+    # would then pass against a half-applied extent (resolve scoped, open not),
+    # which is exactly the defect that shipped. Under the pin every slug
+    # resolves to this one file, so creating it makes the open leg reachable
+    # for all of them, matching the live worker shape.
+    with kb.enumerating_boards():
+        kb.connect(board="pinned-board").close()
+    assert kb.kanban_db_path("alpha-board").exists()
+
     def _slugs():
         return [b["slug"] for b in kb.list_boards(include_archived=False)]
 
@@ -896,6 +906,12 @@ def test_no_board_enumerator_spams_contradiction_warnings(
         ),
         "dashboard GET /boards/_board_counts": (
             lambda: [plugin_api._board_counts(s) for s in _slugs()]
+        ),
+        # The enrich loops themselves, driven end-to-end. These are the
+        # body-spanning extents; a half-applied one (resolve scoped, open not)
+        # shows up here as a non-zero count.
+        "dashboard GET /boards (enrich loop)": (
+            lambda: plugin_api.list_boards(include_archived=False)
         ),
     }
     offenders = {}
@@ -948,6 +964,89 @@ def test_pin_contradiction_warnings_are_capped_regardless_of_board_count(
         f"contradiction warnings scale with board count: {small} at 8 boards, "
         f"{large} at 80 — the per-process ceiling is not holding"
     )
+
+
+def test_enumeration_noise_cannot_silence_a_later_addressing_warning(
+    _pin_contradiction_env, caplog,
+):
+    """The ceiling must not reintroduce this card's own defect one level up.
+
+    With a PROCESS-GLOBAL budget, any per-board loop that forgot the extent
+    looked like N addressing calls, burned the whole budget, and the genuine
+    single-board misreading the guard exists to surface went SILENT afterwards.
+    Measured on that design: 8 unscoped ``connect(board=slug)`` calls emitted 5
+    warnings, then ``kanban_db_path('account-health')`` returned the pin path
+    with 0 warnings — run-1022's exact probe, silent again, in a process that
+    merely enumerated boards first.
+
+    The budget is therefore charged PER CALL SITE. This drives both the loud
+    and the silent shapes of enumeration noise and asserts a subsequent
+    addressing call still warns in every one.
+    """
+    def _addressing_is_loud(slug: str) -> bool:
+        caplog.clear()
+        with caplog.at_level("WARNING", logger=kb.__name__):
+            kb.kanban_db_path(slug)
+        return bool([
+            r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()
+        ])
+
+    # (a) an UNSCOPED per-board sweep — the forgetful-author shape.
+    with caplog.at_level("WARNING", logger=kb.__name__):
+        for i in range(kb._PIN_CONTRADICTION_WARN_BUDGET * 4):
+            kb.kanban_db_path(f"noisy-sweep-board-{i}")
+    assert _addressing_is_loud("addressed-after-unscoped"), (
+        "enumeration noise consumed the budget and silenced a genuine "
+        "single-board contradiction"
+    )
+
+    # (b) a correctly SCOPED sweep must equally not spend anyone's budget.
+    with caplog.at_level("WARNING", logger=kb.__name__):
+        for i in range(kb._PIN_CONTRADICTION_WARN_BUDGET * 4):
+            with kb.enumerating_boards():
+                kb.kanban_db_path(f"scoped-sweep-board-{i}")
+    assert _addressing_is_loud("addressed-after-scoped")
+
+
+def test_enumerating_each_scopes_the_whole_loop_body(
+    _pin_contradiction_env, caplog,
+):
+    """The extent must cover the OPEN, not just the path resolve.
+
+    Wrapping only ``kanban_db_path`` inside a per-board loop half-applies: the
+    body then calls ``connect(board=slug)`` / ``count_notify_subs(board=slug)``,
+    which re-resolve internally and land outside the extent. That is what the
+    dispatcher tick shipped as, and it both spammed and then went silent.
+    ``enumerating_each`` wraps the body, which cannot half-apply.
+    """
+    slugs = [f"body-board-{i}" for i in range(6)]
+
+    def _sweep(iterator) -> int:
+        kb._CHECKED_PIN_BOARD_CONTRADICTIONS.clear()
+        kb._PIN_CONTRADICTION_WARNED.clear()
+        caplog.clear()
+        with caplog.at_level("WARNING", logger=kb.__name__):
+            for slug in iterator:
+                # A resolve AND an open, the real per-board loop shape.
+                kb.kanban_db_path(slug)
+                kb.count_notify_subs(board=slug)
+        return len([
+            r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()
+        ])
+
+    assert _sweep(iter(slugs)) > 0  # control: unscoped really does warn
+    assert _sweep(kb.enumerating_each(slugs)) == 0
+
+    # `break` must not leak the extent past the loop.
+    for slug in kb.enumerating_each(slugs):
+        break
+    assert kb._enumeration_depth() == 0
+
+    # Nor must an exception raised from the body.
+    with pytest.raises(RuntimeError):
+        for slug in kb.enumerating_each(slugs):
+            raise RuntimeError("body blew up")
+    assert kb._enumeration_depth() == 0
 
 
 def test_pin_contradiction_ceiling_announces_itself_before_going_quiet(
