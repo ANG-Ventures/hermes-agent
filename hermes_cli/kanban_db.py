@@ -821,6 +821,84 @@ def clear_current_board() -> None:
         pass
 
 
+_BOARD_ALIAS_CACHE: tuple[Optional[tuple[int, int]], dict[str, str]] = (None, {})
+
+
+def board_aliases_path() -> Path:
+    """Return ``<root>/kanban/board-aliases.json``.
+
+    Maps a retired board slug to its current one, so consumers pinned to
+    the old name (a worker's spawn env, a script, a bookmark) resolve to
+    the live board instead of silently initialising an empty phantom.
+    """
+    return kanban_home() / "kanban" / "board-aliases.json"
+
+
+def _read_board_aliases() -> dict[str, str]:
+    """Return the ``{old_slug: new_slug}`` map. Never raises.
+
+    A malformed or missing file yields ``{}`` — board resolution must not
+    break because a hand-edited JSON file lost a brace.
+
+    Cached on (mtime, size) because :func:`board_dir` is on the hot path
+    for every :func:`connect`; an edit to the file is still picked up on
+    the next call without a restart.
+    """
+    global _BOARD_ALIAS_CACHE
+    try:
+        p = board_aliases_path()
+        st = p.stat()
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        _BOARD_ALIAS_CACHE = (None, {})
+        return {}
+    cached_stamp, cached_val = _BOARD_ALIAS_CACHE
+    if cached_stamp == stamp:
+        return cached_val
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        _BOARD_ALIAS_CACHE = (stamp, {})
+        return {}
+    if not isinstance(raw, dict):
+        _BOARD_ALIAS_CACHE = (stamp, {})
+        return {}
+    out: dict[str, str] = {}
+    for old, new in raw.items():
+        try:
+            o = _normalize_board_slug(old)
+            n = _normalize_board_slug(new)
+        except ValueError:
+            continue
+        if o and n and o != n:
+            out[o] = n
+    _BOARD_ALIAS_CACHE = (stamp, out)
+    return out
+
+
+def resolve_board_alias(slug: Optional[str]) -> Optional[str]:
+    """Follow the alias map for ``slug``; return the canonical slug.
+
+    Chains are followed (``a -> b -> c``) with a bounded walk and a
+    cycle guard, so a self-referential or looping map degrades to the
+    last good slug rather than hanging board resolution.
+    """
+    if slug is None:
+        return None
+    aliases = _read_board_aliases()
+    if not aliases:
+        return slug
+    seen = {slug}
+    cur = slug
+    for _ in range(len(aliases) + 1):
+        nxt = aliases.get(cur)
+        if not nxt or nxt in seen:
+            break
+        seen.add(nxt)
+        cur = nxt
+    return cur
+
+
 def board_dir(board: Optional[str] = None) -> Path:
     """Return the on-disk directory for ``board``.
 
@@ -830,8 +908,13 @@ def board_dir(board: Optional[str] = None) -> Path:
 
     All other boards live at ``<root>/kanban/boards/<slug>/`` with
     everything inside that directory including the ``kanban.db``.
+
+    Retired slugs are redirected through :func:`resolve_board_alias`, so
+    a consumer still pinned to an old board name lands on the live board
+    rather than initialising an empty phantom beside it.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    slug = resolve_board_alias(slug) or slug
     return boards_root() / slug
 
 
@@ -1157,6 +1240,40 @@ def create_board(
     return meta
 
 
+def _board_db_is_empty(db_path: Path) -> bool:
+    """Return True if ``db_path`` is a kanban DB holding zero tasks.
+
+    Read-only and fail-CLOSED: any error (unreadable, locked, corrupt, not
+    a kanban schema) returns ``False`` so the caller keeps the board
+    visible. Never hide a board we could not positively prove is empty.
+
+    ``mode=ro`` only — deliberately NOT ``immutable=1``. Every board DB is
+    ``journal_mode=wal``, and ``immutable=1`` tells SQLite the file cannot
+    change so it skips the ``-wal`` entirely: a board whose cards are
+    committed but not yet checkpointed (the normal state while a worker or
+    the dispatcher holds the connection open) reads back as zero tasks and
+    the caller HIDES a board full of real cards. Measured: with a writer
+    open on a 3-card board, ``immutable=1`` returns 0 and plain ``mode=ro``
+    returns 3. ``mode=ro`` still refuses to create a missing file, so this
+    probe cannot itself become a phantom-creator.
+    """
+    try:
+        uri = f"file:{db_path}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=0.5)
+    except sqlite3.Error:
+        return False
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()
+    except sqlite3.Error:
+        return False
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+    return bool(row) and row[0] == 0
+
+
 def list_boards(*, include_archived: bool = True) -> list[dict]:
     """Enumerate all boards that exist on disk.
 
@@ -1192,6 +1309,23 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
             has_db = (child / "kanban.db").exists()
             has_meta = (child / "board.json").exists()
             if not (has_db or has_meta):
+                continue
+            # A dir holding a kanban.db but NO board.json was never created
+            # through create_board() — it is almost always a phantom: some
+            # consumer resolved a stale/typo slug and connect() initialised an
+            # empty schema beside the real board. Surfacing it as a board is a
+            # silent card-loss path (cards created against the stale slug land
+            # in the empty DB, invisible on the real one). Skip it only when it
+            # is genuinely empty; a dir with real cards is someone's data and
+            # must stay visible even if board.json was lost.
+            if has_db and not has_meta and _board_db_is_empty(child / "kanban.db"):
+                _log.warning(
+                    "kanban: ignoring phantom board dir %s (kanban.db with 0 "
+                    "tasks and no board.json). If this slug was renamed, add "
+                    "it to %s; otherwise remove the directory.",
+                    child,
+                    board_aliases_path(),
+                )
                 continue
             meta = read_board_metadata(normed)
             if meta.get("archived") and not include_archived:
