@@ -765,6 +765,7 @@ def _pin_contradiction_env(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
     monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
     monkeypatch.setattr(kb, "_CHECKED_PIN_BOARD_CONTRADICTIONS", set())
+    monkeypatch.setattr(kb, "_PIN_CONTRADICTION_WARNED", [])
     pinned = kb.board_dir("pinned-board") / "kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
     return pinned
@@ -856,39 +857,178 @@ def test_board_enumeration_does_not_spam_contradiction_warnings(
 def test_no_board_enumerator_spams_contradiction_warnings(
     _pin_contradiction_env, caplog,
 ):
-    """Class gate: EVERY known board-enumerating caller must stay quiet.
+    """Class gate, part 1: every REACHABLE board-enumerating entry point.
 
-    The guard is only useful if it stays rare. Each of these iterates
-    ``list_boards()`` and resolves a DB path per slug, so under a pin each would
-    emit one warning per board on disk (measured: 64 per sweep) and train
-    operators to ignore the signal. A NEW enumerator added without
-    ``warn_on_pin_contradiction=False`` fails here rather than in production.
+    Discovery is derived from ``list_boards()`` rather than from a hand-written
+    list of slugs, and each entry point is driven end-to-end so the nested
+    ``connect()`` / ``connect_closing()`` resolutions are covered too. That
+    nesting is why the first cut failed review: it passed a per-call
+    ``warn_on_pin_contradiction=False`` flag at each ``kanban_db_path()`` site,
+    but ``_board_task_counts`` and ``_board_counts`` also open the board, and
+    ``connect()`` re-resolves the path internally with no flag to thread
+    through. Measured on that design, ``_board_task_counts`` still emitted 8
+    warnings over 8 boards despite its call site being flagged.
+
+    DOES NOT COVER: enumerators that are nested closures inside a running
+    coroutine (``gateway/kanban_watchers.py``'s ``_board_db_fingerprint``) are
+    not importable and cannot be driven from here. Those are bounded instead by
+    the per-process ceiling — see
+    ``test_pin_contradiction_warnings_are_capped_regardless_of_board_count``,
+    which is the part of this gate that does not require registration.
     """
     from hermes_cli import kanban as kc
+    from plugins.kanban.dashboard import plugin_api
 
     for slug in ("alpha-board", "beta-board", "gamma-board"):
         kb.board_dir(slug).mkdir(parents=True, exist_ok=True)
         (kb.board_dir(slug) / "board.json").write_text("{}", encoding="utf-8")
 
-    enumerators = {
-        "list_boards": lambda: kb.list_boards(include_archived=False),
-        "count_running_tasks_other_boards": (
+    def _slugs():
+        return [b["slug"] for b in kb.list_boards(include_archived=False)]
+
+    entry_points = {
+        "kanban_db.list_boards": lambda: kb.list_boards(include_archived=False),
+        "kanban_db.count_running_tasks_other_boards": (
             lambda: kb.count_running_tasks_other_boards(board="pinned-board")
         ),
-        "_board_task_counts": lambda: [
-            kc._board_task_counts(b["slug"])
-            for b in kb.list_boards(include_archived=False)
-        ],
+        "kanban.boards_list/_board_task_counts": (
+            lambda: [kc._board_task_counts(s) for s in _slugs()]
+        ),
+        "dashboard GET /boards/_board_counts": (
+            lambda: [plugin_api._board_counts(s) for s in _slugs()]
+        ),
     }
     offenders = {}
-    for name, call in enumerators.items():
+    for name, call in entry_points.items():
         caplog.clear()
+        kb._CHECKED_PIN_BOARD_CONTRADICTIONS.clear()
+        kb._PIN_CONTRADICTION_WARNED.clear()
         with caplog.at_level("WARNING", logger=kb.__name__):
             call()
         hits = [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()]
         if hits:
             offenders[name] = len(hits)
     assert offenders == {}, f"board enumerators spamming the pin guard: {offenders}"
+
+
+def test_pin_contradiction_warnings_are_capped_regardless_of_board_count(
+    _pin_contradiction_env, caplog,
+):
+    """Class gate, part 2: the ceiling holds for an UNREGISTERED enumerator.
+
+    Part 1 can only drive enumerators a test can reach. The failure it cannot
+    prevent is the one that already happened twice: a new per-board loop lands
+    somewhere nobody registers, and at 65 live boards it burns 65 log lines per
+    process and trains operators to ignore the guard.
+
+    So the bound is structural rather than registered. This drives a
+    deliberately UNSCOPED sweep — exactly what a forgetful author would
+    write — over two board counts an order of magnitude apart, and asserts the
+    emitted volume is capped and SCALE-INVARIANT. No registration required for
+    a new site to be bounded; forgetting the extent costs a handful of lines,
+    never one per board.
+    """
+    def _unscoped_sweep(n: int) -> int:
+        kb._CHECKED_PIN_BOARD_CONTRADICTIONS.clear()
+        kb._PIN_CONTRADICTION_WARNED.clear()
+        caplog.clear()
+        with caplog.at_level("WARNING", logger=kb.__name__):
+            for i in range(n):
+                kb.kanban_db_path(f"sweep{n}-board-{i}")  # no enumerating_boards()
+        return len([
+            r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()
+        ])
+
+    small = _unscoped_sweep(8)
+    large = _unscoped_sweep(80)
+    assert small <= kb._PIN_CONTRADICTION_WARN_BUDGET
+    # Scale invariance is the property: 10x the boards must not mean 10x the
+    # noise. A per-board warning would make this 8 vs 80.
+    assert small == large, (
+        f"contradiction warnings scale with board count: {small} at 8 boards, "
+        f"{large} at 80 — the per-process ceiling is not holding"
+    )
+
+
+def test_pin_contradiction_ceiling_announces_itself_before_going_quiet(
+    _pin_contradiction_env, caplog,
+):
+    """Suppression must be visible, or the ceiling becomes a silent gap.
+
+    Going quiet without saying so would reintroduce this card's whole defect
+    class one level up: an operator reading 5 warnings on a 65-board host must
+    be able to tell that more were withheld.
+    """
+    with caplog.at_level("WARNING", logger=kb.__name__):
+        for i in range(kb._PIN_CONTRADICTION_WARN_BUDGET + 4):
+            kb.kanban_db_path(f"ceiling-board-{i}")
+    per_board = [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()]
+    suppressed = [
+        r for r in caplog.records
+        if "suppressing further per-board contradiction warnings" in r.getMessage()
+    ]
+    assert len(per_board) == kb._PIN_CONTRADICTION_WARN_BUDGET
+    # Exactly one summary line, not one per suppressed board.
+    assert len(suppressed) == 1
+    assert "HERMES_KANBAN_SANDBOX=1" in suppressed[0].getMessage()
+
+
+def test_enumerating_boards_extent_is_thread_local(_pin_contradiction_env):
+    """One thread's sweep must not silence another thread's real contradiction.
+
+    The dispatcher ticks boards in parallel through ``asyncio.to_thread``
+    (``_tick_once_for_board``), so a module-global suppression counter would let
+    a sweep on one thread hide a genuine single-board misreading on another —
+    the exact silence this card exists to remove, reintroduced by the fix.
+    """
+    import threading
+
+    seen = {}
+    started = threading.Event()
+    release = threading.Event()
+
+    def _holder():
+        with kb.enumerating_boards():
+            seen["inside_holder"] = kb._enumeration_depth()
+            started.set()
+            release.wait(timeout=5)
+
+    t = threading.Thread(target=_holder)
+    t.start()
+    assert started.wait(timeout=5)
+    try:
+        # The other thread is mid-enumeration; this thread must be unaffected.
+        seen["other_thread"] = kb._enumeration_depth()
+    finally:
+        release.set()
+        t.join(timeout=5)
+
+    assert seen["inside_holder"] == 1
+    assert seen["other_thread"] == 0
+
+
+def test_enumerating_boards_is_reentrant_and_restores_depth(_pin_contradiction_env):
+    """Nested extents must not leak depth, or the guard silently dies.
+
+    ``list_boards()`` opens an extent and enumerators wrap it in their own, so
+    nesting is the normal case. A depth that failed to unwind would leave the
+    whole process permanently silent.
+    """
+    assert kb._enumeration_depth() == 0
+    with kb.enumerating_boards():
+        assert kb._enumeration_depth() == 1
+        with kb.enumerating_boards():
+            assert kb._enumeration_depth() == 2
+        assert kb._enumeration_depth() == 1
+    assert kb._enumeration_depth() == 0
+
+    # And it unwinds through an exception.
+    import contextlib
+
+    with contextlib.suppress(RuntimeError):
+        with kb.enumerating_boards():
+            raise RuntimeError("boom")
+    assert kb._enumeration_depth() == 0
 
 
 def test_dispatcher_worker_pin_handoff_still_wins_over_board_arg(

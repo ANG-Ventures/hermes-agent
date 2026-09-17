@@ -2457,10 +2457,14 @@ def _projects_by_id() -> dict[str, Any]:
 def _board_counts(slug: str) -> dict[str, int]:
     """Return ``{status: count}`` for a board. Safe on an empty DB."""
     try:
-        path = kanban_db.kanban_db_path(board=slug)
-        if not path.exists():
-            return {}
-        conn = kanban_db.connect(board=slug)
+        # Called once per board by the /boards handler — enumeration, not
+        # addressing. The extent covers ``connect`` too, which re-resolves
+        # the path internally.
+        with kanban_db.enumerating_boards():
+            path = kanban_db.kanban_db_path(board=slug)
+            if not path.exists():
+                return {}
+            conn = kanban_db.connect(board=slug)
         try:
             rows = conn.execute(
                 "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"

@@ -713,7 +713,8 @@ class GatewayKanbanWatchersMixin:
                         slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
                         db_path = board_meta.get("db_path")
                         try:
-                            resolved_db_path = str(Path(db_path).expanduser().resolve()) if db_path else str(_kb.kanban_db_path(slug).resolve())
+                            with _kb.enumerating_boards():
+                                resolved_db_path = str(Path(db_path).expanduser().resolve()) if db_path else str(_kb.kanban_db_path(slug).resolve())
                         except Exception:
                             resolved_db_path = f"slug:{slug}"
                         if resolved_db_path in seen_db_paths:
@@ -1952,7 +1953,11 @@ class GatewayKanbanWatchersMixin:
         ] = {}
 
         def _board_db_fingerprint(slug: str) -> tuple[str, int | None, int | None]:
-            path = _kb.kanban_db_path(slug)
+            # Called once per board per dispatch tick — enumeration, not
+            # addressing. Unscoped this is the single loudest source of pin
+            # contradiction warnings on the dispatcher's own path.
+            with _kb.enumerating_boards():
+                path = _kb.kanban_db_path(slug)
             try:
                 resolved = str(path.expanduser().resolve())
             except Exception:

@@ -684,6 +684,59 @@ def _warn_if_override_escapes_hermes_home(override: Path) -> None:
 # path, so the two ``Path.resolve()`` calls must not run per call.
 _CHECKED_PIN_BOARD_CONTRADICTIONS: set[tuple[str, str]] = set()
 
+# Depth of the innermost ``enumerating_boards()`` scope on THIS thread. Thread-
+# local because the dispatcher ticks boards in parallel via ``asyncio.to_thread``
+# (``_tick_once_for_board``), and a module-global counter would let one thread's
+# enumeration silence another thread's genuine single-board contradiction.
+_ENUMERATION_DEPTH = threading.local()
+
+
+def _enumeration_depth() -> int:
+    return getattr(_ENUMERATION_DEPTH, "value", 0)
+
+
+@contextlib.contextmanager
+def enumerating_boards():
+    """Mark a dynamic extent as ENUMERATING boards rather than ADDRESSING one.
+
+    The pin-contradiction guard exists for a caller that names ONE board and
+    silently gets another. A caller sweeping every board on disk is a different
+    shape: under a ``HERMES_KANBAN_DB`` pin every non-active slug trivially
+    disagrees with the pin, so an unscoped sweep emits one warning per board
+    (measured: 64 on a single dispatcher sweep across 65 live boards) and trains
+    operators to ignore the signal.
+
+    This is a DYNAMIC EXTENT, not a per-call flag, and that distinction is the
+    whole fix. The first cut passed ``warn_on_pin_contradiction=False`` at each
+    ``kanban_db_path()`` call site, which cannot work: enumerators also call
+    ``connect(board=slug)`` / ``connect_closing(board=slug)``, which re-resolve
+    the path internally with no flag to thread through. Measured on that design,
+    ``_board_task_counts`` still emitted 8 warnings over 8 boards *despite* its
+    call site being flagged. Wrapping the LOOP covers every nested resolution,
+    however deep, including ones added later.
+
+    Scoped to the current thread, and re-entrant.
+    """
+    _ENUMERATION_DEPTH.value = _enumeration_depth() + 1
+    try:
+        yield
+    finally:
+        _ENUMERATION_DEPTH.value = max(0, _enumeration_depth() - 1)
+
+
+# Hard ceiling on contradiction warnings emitted by ONE process. The warn-once
+# ledger is keyed on (slug, pin), so a host with many boards can still emit one
+# line per board from un-enumerated addressing paths. Past a handful of distinct
+# boards the operator has the signal; the rest is noise, so collapse to a single
+# summary line. Zero risk of hiding the FIRST occurrence, which is the one that
+# diagnoses the misreading.
+_PIN_CONTRADICTION_WARN_BUDGET = 5
+
+# Slugs already reported by the guard, in emission order. Length is the budget
+# counter; the list (rather than a bare int) keeps the offending boards
+# inspectable from a test and from a debugger on a live process.
+_PIN_CONTRADICTION_WARNED: list[str] = []
+
 
 def _warn_if_pin_contradicts_board_arg(board: Optional[str], override: Path) -> None:
     """Log once when an EXPLICIT ``board`` arg disagrees with the pinned DB.
@@ -705,12 +758,16 @@ def _warn_if_pin_contradicts_board_arg(board: Optional[str], override: Path) -> 
     rewritten ``HERMES_HOME`` still converges on the DB the dispatcher claimed
     its task from). Only the silence is fixed.
 
-    Silent by design in the two shapes that are not contradictions: ``board`` is
-    None (the pin is then the intended source of truth), and the pin already
-    resolves to the requested board's DB (the normal worker case).
+    Silent by design in the shapes that are not contradictions: ``board`` is
+    None (the pin is then the intended source of truth), the pin already
+    resolves to the requested board's DB (the normal worker case), and the call
+    happens inside an :func:`enumerating_boards` extent (a sweep over every
+    board on disk is not a claim to be addressing any one of them).
     """
     if board is None:
         return
+    if _enumeration_depth() > 0:
+        return  # sweeping every board, not addressing the one named.
     try:
         slug = _normalize_board_slug(board)
     except ValueError:
@@ -728,6 +785,19 @@ def _warn_if_pin_contradicts_board_arg(board: Optional[str], override: Path) -> 
         return
     if requested == pinned:
         return  # pin agrees with the argument: the normal worker case.
+    _PIN_CONTRADICTION_WARNED.append(slug)
+    emitted = len(_PIN_CONTRADICTION_WARNED)
+    if emitted > _PIN_CONTRADICTION_WARN_BUDGET:
+        if emitted == _PIN_CONTRADICTION_WARN_BUDGET + 1:
+            _log.warning(
+                "kanban_db_path: more than %d distinct boards have now been "
+                "requested while HERMES_KANBAN_DB pins %s — suppressing further "
+                "per-board contradiction warnings in this process. Set "
+                "HERMES_KANBAN_SANDBOX=1 (or unset the HERMES_KANBAN_* path "
+                "pins) if you meant to address the boards you named.",
+                _PIN_CONTRADICTION_WARN_BUDGET, override,
+            )
+        return
     _log.warning(
         "kanban_db_path(board=%r) returned the HERMES_KANBAN_DB pin %s, NOT "
         "that board's DB %s — the pin outranks the board argument, so this "
@@ -992,11 +1062,7 @@ def board_exists(board: Optional[str] = None) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
-def kanban_db_path(
-    board: Optional[str] = None,
-    *,
-    warn_on_pin_contradiction: bool = True,
-) -> Path:
+def kanban_db_path(board: Optional[str] = None) -> Path:
     """Return the path to the ``kanban.db`` for ``board``.
 
     Resolution (highest precedence first):
@@ -1038,19 +1104,18 @@ def kanban_db_path(
     the board you asked for and the path you actually got. Resolution is
     unchanged; the contradiction is simply no longer invisible to the caller.
 
-    ``warn_on_pin_contradiction=False`` suppresses only that second warning, for
-    the one legitimate shape it would otherwise spam: bulk enumeration over
-    every board on disk (``read_board_metadata`` filling a display ``db_path``),
-    where every non-active board trivially disagrees with the pin and the caller
-    is not claiming to address the board it names. Do NOT pass it to silence a
-    single-board lookup — that is exactly the case the guard exists to catch.
+    A caller that sweeps every board on disk is not addressing any one of them,
+    and under a pin every non-active slug trivially disagrees — so wrap such a
+    loop in :func:`enumerating_boards`, which suppresses the warning for the
+    whole dynamic extent (including the nested ``connect()`` resolutions a
+    per-call flag could never reach). Do NOT wrap a single-board lookup: that is
+    exactly the case the guard exists to catch.
     """
     override = _kanban_path_override("HERMES_KANBAN_DB")
     if override:
         path = Path(override).expanduser()
         _warn_if_override_escapes_hermes_home(path)
-        if warn_on_pin_contradiction:
-            _warn_if_pin_contradicts_board_arg(board, path)
+        _warn_if_pin_contradicts_board_arg(board, path)
         return path
     slug = _normalize_board_slug(board)
     if slug is None:
@@ -1240,12 +1305,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
                 meta.update(raw)
     except (OSError, json.JSONDecodeError):
         pass
-    # Display metadata, and called once per board by ``list_boards``. Under a
-    # HERMES_KANBAN_DB pin every non-active board trivially disagrees with it,
-    # so the contradiction guard would fire once per board on disk (measured:
-    # 64 warnings on one dispatcher sweep) for a caller that is enumerating,
-    # not addressing, these boards. Consumers already dedupe by resolved path.
-    meta["db_path"] = str(kanban_db_path(slug, warn_on_pin_contradiction=False))
+    meta["db_path"] = str(kanban_db_path(slug))
     return meta
 
 
@@ -1297,9 +1357,8 @@ def write_board_metadata(
         json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    # Display metadata for the board just written — same enumeration-not-
-    # addressing shape as ``read_board_metadata``; see the note there.
-    meta["db_path"] = str(kanban_db_path(slug, warn_on_pin_contradiction=False))
+    # Display metadata for the board just written.
+    meta["db_path"] = str(kanban_db_path(slug))
     return meta
 
 
@@ -1380,54 +1439,59 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
 
     Returns a list of metadata dicts, sorted with ``default`` first and
     the rest alphabetically.
+
+    The whole scan runs inside :func:`enumerating_boards`: it resolves a DB path
+    per board, which under a ``HERMES_KANBAN_DB`` pin would otherwise trip the
+    contradiction guard once for every non-active board on disk.
     """
     entries: list[dict] = []
     seen: set[str] = set()
 
-    # Default board is always first.
-    entries.append(read_board_metadata(DEFAULT_BOARD))
-    seen.add(DEFAULT_BOARD)
+    with enumerating_boards():
+        # Default board is always first.
+        entries.append(read_board_metadata(DEFAULT_BOARD))
+        seen.add(DEFAULT_BOARD)
 
-    root = boards_root()
-    if root.is_dir():
-        for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
-            if not child.is_dir():
-                continue
-            slug = child.name
-            # Keep slug normalisation soft for discovery — but skip dirs
-            # that don't parse as valid slugs so we don't surface junk.
-            try:
-                normed = _normalize_board_slug(slug)
-            except ValueError:
-                continue
-            if not normed or normed in seen:
-                continue
-            has_db = (child / "kanban.db").exists()
-            has_meta = (child / "board.json").exists()
-            if not (has_db or has_meta):
-                continue
-            # A dir holding a kanban.db but NO board.json was never created
-            # through create_board() — it is almost always a phantom: some
-            # consumer resolved a stale/typo slug and connect() initialised an
-            # empty schema beside the real board. Surfacing it as a board is a
-            # silent card-loss path (cards created against the stale slug land
-            # in the empty DB, invisible on the real one). Skip it only when it
-            # is genuinely empty; a dir with real cards is someone's data and
-            # must stay visible even if board.json was lost.
-            if has_db and not has_meta and _board_db_is_empty(child / "kanban.db"):
-                _log.warning(
-                    "kanban: ignoring phantom board dir %s (kanban.db with 0 "
-                    "tasks and no board.json). If this slug was renamed, add "
-                    "it to %s; otherwise remove the directory.",
-                    child,
-                    board_aliases_path(),
-                )
-                continue
-            meta = read_board_metadata(normed)
-            if meta.get("archived") and not include_archived:
-                continue
-            entries.append(meta)
-            seen.add(normed)
+        root = boards_root()
+        if root.is_dir():
+            for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+                if not child.is_dir():
+                    continue
+                slug = child.name
+                # Keep slug normalisation soft for discovery — but skip dirs
+                # that don't parse as valid slugs so we don't surface junk.
+                try:
+                    normed = _normalize_board_slug(slug)
+                except ValueError:
+                    continue
+                if not normed or normed in seen:
+                    continue
+                has_db = (child / "kanban.db").exists()
+                has_meta = (child / "board.json").exists()
+                if not (has_db or has_meta):
+                    continue
+                # A dir holding a kanban.db but NO board.json was never created
+                # through create_board() — it is almost always a phantom: some
+                # consumer resolved a stale/typo slug and connect() initialised an
+                # empty schema beside the real board. Surfacing it as a board is a
+                # silent card-loss path (cards created against the stale slug land
+                # in the empty DB, invisible on the real one). Skip it only when it
+                # is genuinely empty; a dir with real cards is someone's data and
+                # must stay visible even if board.json was lost.
+                if has_db and not has_meta and _board_db_is_empty(child / "kanban.db"):
+                    _log.warning(
+                        "kanban: ignoring phantom board dir %s (kanban.db with 0 "
+                        "tasks and no board.json). If this slug was renamed, add "
+                        "it to %s; otherwise remove the directory.",
+                        child,
+                        board_aliases_path(),
+                    )
+                    continue
+                meta = read_board_metadata(normed)
+                if meta.get("archived") and not include_archived:
+                    continue
+                entries.append(meta)
+                seen.add(normed)
     return entries
 
 
@@ -12073,18 +12137,17 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     for meta in boards:
         slug = meta.get("slug") or DEFAULT_BOARD
         try:
-            # Enumerating every board on disk, not addressing the named one —
-            # under a pin each non-active slug trivially disagrees with it and
-            # is skipped two lines down. See ``kanban_db_path``'s note.
-            path = kanban_db_path(
-                board=slug, warn_on_pin_contradiction=False,
-            ).expanduser()
-            resolved = str(path.resolve())
-            if current_path is not None and resolved == current_path:
-                continue
-            if not path.exists():
-                continue
-            other = connect(board=slug)
+            # Enumerating every board on disk, not addressing the named one.
+            # The extent also covers the ``connect(board=slug)`` below, which
+            # re-resolves the path internally.
+            with enumerating_boards():
+                path = kanban_db_path(board=slug).expanduser()
+                resolved = str(path.resolve())
+                if current_path is not None and resolved == current_path:
+                    continue
+                if not path.exists():
+                    continue
+                other = connect(board=slug)
             try:
                 total += count_running_tasks(other)
             finally:

@@ -1519,15 +1519,16 @@ def _board_task_counts(slug: str) -> dict[str, int]:
     """Return ``{status: count}`` for a board. Safe to call on an empty DB."""
     try:
         # Called once per board by ``boards list`` — enumeration, not
-        # addressing. Under a HERMES_KANBAN_DB pin every non-active slug
-        # trivially disagrees with it; see ``kanban_db_path``'s note.
-        path = kb.kanban_db_path(board=slug, warn_on_pin_contradiction=False)
-        if not path.exists():
-            return {}
-        with kb.connect_closing(board=slug) as conn:
-            rows = conn.execute(
-                "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
-            ).fetchall()
+        # addressing. The extent covers ``connect_closing`` too, which
+        # re-resolves the path internally.
+        with kb.enumerating_boards():
+            path = kb.kanban_db_path(board=slug)
+            if not path.exists():
+                return {}
+            with kb.connect_closing(board=slug) as conn:
+                rows = conn.execute(
+                    "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
+                ).fetchall()
         return {r["status"]: int(r["n"]) for r in rows}
     except Exception:
         return {}

@@ -12803,13 +12803,12 @@ def _collect_kanban_notifications(session: dict) -> list:
         slug = (board_meta or {}).get("slug") or _kb.DEFAULT_BOARD
         db_path = (board_meta or {}).get("db_path")
         try:
-            resolved = (
-                str(Path(db_path).expanduser().resolve())
-                if db_path
-                else str(_kb.kanban_db_path(
-                    slug, warn_on_pin_contradiction=False,
-                ).resolve())
-            )
+            with _kb.enumerating_boards():
+                resolved = (
+                    str(Path(db_path).expanduser().resolve())
+                    if db_path
+                    else str(_kb.kanban_db_path(slug).resolve())
+                )
         except Exception:
             resolved = f"slug:{slug}"
         if resolved in seen_db_paths:
