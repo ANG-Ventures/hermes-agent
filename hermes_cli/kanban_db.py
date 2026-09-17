@@ -1246,9 +1246,19 @@ def _board_db_is_empty(db_path: Path) -> bool:
     Read-only and fail-CLOSED: any error (unreadable, locked, corrupt, not
     a kanban schema) returns ``False`` so the caller keeps the board
     visible. Never hide a board we could not positively prove is empty.
+
+    ``mode=ro`` only — deliberately NOT ``immutable=1``. Every board DB is
+    ``journal_mode=wal``, and ``immutable=1`` tells SQLite the file cannot
+    change so it skips the ``-wal`` entirely: a board whose cards are
+    committed but not yet checkpointed (the normal state while a worker or
+    the dispatcher holds the connection open) reads back as zero tasks and
+    the caller HIDES a board full of real cards. Measured: with a writer
+    open on a 3-card board, ``immutable=1`` returns 0 and plain ``mode=ro``
+    returns 3. ``mode=ro`` still refuses to create a missing file, so this
+    probe cannot itself become a phantom-creator.
     """
     try:
-        uri = f"file:{db_path}?mode=ro&immutable=1"
+        uri = f"file:{db_path}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=0.5)
     except sqlite3.Error:
         return False

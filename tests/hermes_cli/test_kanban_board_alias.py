@@ -160,18 +160,32 @@ def test_list_boards_keeps_board_with_cards_but_no_board_json(kanban_home):
 
     A board that lost its board.json is a recoverable metadata problem,
     not a phantom. Hiding it would be data loss by a different route.
+
+    The writer connection is deliberately held OPEN across ``list_boards()``
+    and the WAL is deliberately NOT checkpointed. That is the live state on
+    a real host — a worker or the dispatcher holds the connection, so the
+    cards sit in the ``-wal``. Closing the connection first checkpoints the
+    WAL and makes this test pass even against a probe that skips the WAL
+    (``immutable=1``), i.e. it would assert the property without gating it.
     """
     kb.create_board("hascards", name="Has Cards")
     conn = kb.connect(board="hascards")
+    # Push the schema into the main DB file so the ONLY thing left in the
+    # -wal is the card itself; a WAL-skipping probe then opens a valid but
+    # zero-task DB rather than erroring out on a missing table.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     kb.create_task(conn, title="a real card", assignee="daedalus")
     conn.commit()
-    conn.close()
 
     kb.board_metadata_path("hascards").unlink()
     assert not (kanban_home / "kanban" / "boards" / "hascards" / "board.json").exists()
 
-    slugs = [b.get("slug") for b in kb.list_boards()]
-    assert "hascards" in slugs
+    try:
+        assert kb._board_db_is_empty(kb.kanban_db_path("hascards")) is False
+        slugs = [b.get("slug") for b in kb.list_boards()]
+        assert "hascards" in slugs
+    finally:
+        conn.close()
 
 
 def test_board_db_is_empty_fails_closed_on_unreadable_db(kanban_home, tmp_path):
