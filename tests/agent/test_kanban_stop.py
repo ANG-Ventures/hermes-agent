@@ -13,6 +13,7 @@ from agent.kanban_stop import (
     build_kanban_stop_nudge,
     kanban_stop_nudge_enabled,
     session_called_kanban_terminal,
+    session_has_kanban_terminal_tool,
 )
 from hermes_cli import kanban_db as kb
 
@@ -58,6 +59,58 @@ def test_nudge_when_no_terminal_tool(clear_kanban_env):
     assert "kanban_block" in nudge
     assert "t_46be8aa5" in nudge
     assert "protocol violation" in nudge.lower() or "protocol" in nudge.lower()
+
+
+def _tool_def(name):
+    return {"type": "function", "function": {"name": name, "parameters": {}}}
+
+
+# ── Inherited HERMES_KANBAN_TASK in a child process without kanban tools ──
+# A kanban worker that shells out to `hermes -z ... -t web` (research fan-out,
+# nested one-shots) leaks HERMES_KANBAN_TASK into the child. The child's model
+# has no kanban_* tool, so the nudge is unsatisfiable: it can only reply
+# "I cannot call that" — replacing the real answer on stdout. Verified live
+# 2026-09-17 (six research workers lost their reports this way).
+
+def test_no_nudge_when_session_exposes_no_kanban_terminal_tool(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_inherited")
+    web_only = [_tool_def("web_search"), _tool_def("web_extract")]
+    assert session_has_kanban_terminal_tool(web_only) is False
+    assert build_kanban_stop_nudge(messages=[], attempts=0, tools=web_only) is None
+
+
+@pytest.mark.parametrize("terminal", sorted([
+    "kanban_complete", "kanban_request_review", "kanban_request_changes", "kanban_block",
+]))
+def test_nudge_when_any_kanban_terminal_tool_is_exposed(clear_kanban_env, terminal):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_real_worker")
+    tools = [_tool_def("web_search"), _tool_def(terminal)]
+    assert session_has_kanban_terminal_tool(tools) is True
+    assert build_kanban_stop_nudge(messages=[], attempts=0, tools=tools) is not None
+
+
+def test_unknown_toolset_keeps_legacy_nudge(clear_kanban_env):
+    # tools=None == "caller didn't say" → guard behaves exactly as before.
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_legacy")
+    assert session_has_kanban_terminal_tool(None) is True
+    assert build_kanban_stop_nudge(messages=[], attempts=0, tools=None) is not None
+
+
+def test_empty_toolset_does_not_nudge(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_no_tools")
+    assert build_kanban_stop_nudge(messages=[], attempts=0, tools=[]) is None
+
+
+def test_conversation_loop_passes_agent_tools_to_stop_guard():
+    # The loop must thread the live toolset into the guard, otherwise the
+    # module-level fix above is inert in production.
+    import inspect
+    from agent import conversation_loop
+
+    src = inspect.getsource(conversation_loop)
+    call = src[src.index("_kanban_nudge = build_kanban_stop_nudge("):]
+    call = call[: call.index("except Exception")]
+    assert 'tools=getattr(agent, "tools", None)' in call
 
 
 def test_no_nudge_after_kanban_complete(clear_kanban_env):
@@ -261,6 +314,9 @@ def test_conversation_loop_enforces_originating_run(worker_run, monkeypatch, han
             skip_context_files=True, skip_memory=True,
         )
     agent._cached_system_prompt = "stable test prompt"
+    # A real dispatcher-spawned worker exposes the kanban terminal tools; the
+    # stop guard is (correctly) inert when they are absent from the toolset.
+    agent.tools = [_tool_def("kanban_complete")]
     agent._session_db = None
     agent._session_json_enabled = False
     agent.save_trajectories = False

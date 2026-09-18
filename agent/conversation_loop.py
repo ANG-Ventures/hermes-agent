@@ -9269,6 +9269,7 @@ def run_conversation(
                     _kanban_nudge = build_kanban_stop_nudge(
                         messages=messages,
                         attempts=getattr(agent, "_kanban_stop_nudges", 0),
+                        tools=getattr(agent, "tools", None),
                     )
                 except Exception:
                     logger.debug("kanban stop-loop check failed", exc_info=True)
