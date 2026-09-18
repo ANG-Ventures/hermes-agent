@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from contextlib import closing
 from types import SimpleNamespace
@@ -20,9 +21,125 @@ from hermes_cli import kanban_db as kb
 
 @pytest.fixture
 def clear_kanban_env(monkeypatch):
-    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_STOP_NUDGE"):
+    for var in (
+        "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_STOP_NUDGE",
+        "HERMES_KANBAN_OWNER_PID",
+    ):
         monkeypatch.delenv(var, raising=False)
     return monkeypatch
+
+
+# ── Ownership gate: the nudge may only fire where a terminal tool EXISTS ──
+# HERMES_KANBAN_* is ambient process env, inherited by every child a worker
+# spawns. The kanban TOOL gate (tools/kanban_tools.py::_check_kanban_mode)
+# withholds kanban_complete from a non-owning process, so a nudge fired there
+# demands a tool the model does not have. Measured 2026-09-17 (card
+# t_8acd8da3): 6/6 deep-research fan-out one-shots launched from a kanban
+# worker burned their nudge budget refusing, and the refusal became the last
+# assistant message — their reports (0-byte .md) never reached stdout.
+# These tests pin the two gates to the SAME predicate.
+
+
+def _owner_pid_is(monkeypatch, value):
+    monkeypatch.setenv("HERMES_KANBAN_OWNER_PID", str(value))
+
+
+def test_inheriting_child_is_not_nudged(clear_kanban_env):
+    """A child that inherited the env but not the identity must not be nudged."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_8acd8da3")
+    # Owner pid names a DIFFERENT process, so this process does not own the grant.
+    _owner_pid_is(clear_kanban_env, os.getpid() + 1)
+    assert kanban_stop_nudge_enabled() is False
+    assert build_kanban_stop_nudge(messages=[]) is None
+
+
+def test_owning_worker_is_still_nudged(clear_kanban_env):
+    """Positive control: the real dispatcher-spawned worker keeps the guard."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_8acd8da3")
+    _owner_pid_is(clear_kanban_env, os.getpid())
+    assert kanban_stop_nudge_enabled() is True
+    assert build_kanban_stop_nudge(messages=[]) is not None
+
+
+def test_unclaimed_pending_grant_is_not_nudged(clear_kanban_env):
+    """An issued-but-never-claimed grant belongs to nobody, so nudges nobody."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_8acd8da3")
+    _owner_pid_is(clear_kanban_env, "pending")
+    assert kanban_stop_nudge_enabled() is False
+    assert build_kanban_stop_nudge(messages=[]) is None
+
+
+def test_missing_owner_stamp_fails_open(clear_kanban_env):
+    """Back-compat: no stamp at all (hand-driven / pre-stamp dispatcher) still nudges."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_8acd8da3")
+    assert kanban_stop_nudge_enabled() is True
+    assert build_kanban_stop_nudge(messages=[]) is not None
+
+
+def test_nudge_gate_agrees_with_kanban_tool_gate(clear_kanban_env):
+    """The invariant behind the fix: never nudge where the tool is withheld.
+
+    Asserts the two gates against the SAME env, so a future edit that
+    re-derives ownership locally in either file fails here.
+    """
+    import tools.kanban_tools as kanban_tools
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_8acd8da3")
+    for owner in (os.getpid(), os.getpid() + 1, "pending"):
+        _owner_pid_is(clear_kanban_env, owner)
+        tool_exposed = kanban_tools._is_dispatcher_owned_worker()
+        assert kanban_stop_nudge_enabled() is tool_exposed, (
+            f"owner={owner}: nudge fires without a terminal tool exposed"
+        )
+
+
+def test_non_owner_with_kanban_tools_exposed_is_not_nudged(clear_kanban_env):
+    """The gap the TOOLSET gate alone does not close.
+
+    ``session_has_kanban_terminal_tool`` asks whether the model CAN satisfy the
+    nudge. That is necessary but not sufficient: a child of a worker can see
+    kanban tools and still not own the card. The codex
+    ``hermes_tools_mcp_server`` callback hardcodes ``kanban_complete`` into its
+    tool list, and orchestrator profiles enable the kanban toolset outright.
+    Nudging such a child pressures a NON-OWNER toward a terminal call on its
+    parent's card — the 2026-08-12 ``t_09b90233`` failure, arriving through the
+    stop-guard rather than the tool gate.
+
+    Measured: with only the toolset gate this case nudged (True); the ownership
+    gate is what makes it silent.
+    """
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_parent_card")
+    _owner_pid_is(clear_kanban_env, os.getpid() + 1)  # a DIFFERENT process owns it
+    kanban_tools_exposed = [
+        {"function": {"name": "kanban_complete"}},
+        {"function": {"name": "WebSearch"}},
+    ]
+    # The toolset gate is satisfied — the tool really is there.
+    assert session_has_kanban_terminal_tool(kanban_tools_exposed) is True
+    # ...and the nudge must STILL not fire, because this process is not the addressee.
+    assert build_kanban_stop_nudge(messages=[], tools=kanban_tools_exposed) is None
+
+
+def test_owning_worker_with_kanban_tools_is_nudged(clear_kanban_env):
+    """Positive control for the pair: both gates open ⇒ the guard still works."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_8acd8da3")
+    _owner_pid_is(clear_kanban_env, os.getpid())
+    tools = [{"function": {"name": "kanban_complete"}}]
+    assert session_has_kanban_terminal_tool(tools) is True
+    assert build_kanban_stop_nudge(messages=[], tools=tools) is not None
+
+
+def test_delegated_child_context_is_not_nudged(clear_kanban_env):
+    """A delegate_task child shares the process, so pid ownership passes — but
+    the delegated-child marker must still suppress the nudge."""
+    from agent.delegation_context import delegated_child_context
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_8acd8da3")
+    _owner_pid_is(clear_kanban_env, os.getpid())
+    assert kanban_stop_nudge_enabled() is True
+    with delegated_child_context("child-session"):
+        assert kanban_stop_nudge_enabled() is False
+        assert build_kanban_stop_nudge(messages=[]) is None
 
 
 
