@@ -89,22 +89,66 @@ def _worker_run_ended(task_id: str, run_id: str) -> bool:
         return False
 
 
+_KANBAN_TERMINAL_TOOLS = frozenset(
+    {"kanban_complete", "kanban_request_review", "kanban_request_changes", "kanban_block"}
+)
+
+
+def _tool_def_name(tool: Any) -> str:
+    """Name of an OpenAI-format tool definition (``{"function": {"name": ..}}``)."""
+    if isinstance(tool, dict):
+        fn = tool.get("function")
+        if isinstance(fn, dict):
+            return str(fn.get("name") or "")
+        return str(tool.get("name") or "")
+    fn = getattr(tool, "function", None)
+    return str(getattr(fn, "name", None) or getattr(tool, "name", None) or "")
+
+
+def session_has_kanban_terminal_tool(tools: Iterable[Any] | None) -> bool:
+    """True when at least one kanban terminal tool is exposed to the model.
+
+    ``None`` means "unknown" (caller didn't pass a tool list) and is treated
+    as True so the guard keeps its legacy behaviour. An explicit list without
+    any kanban terminal tool means the nudge is unsatisfiable: the model
+    literally cannot call what the nudge demands.
+    """
+    if tools is None:
+        return True
+    return any(_tool_def_name(t) in _KANBAN_TERMINAL_TOOLS for t in tools)
+
+
 def build_kanban_stop_nudge(
     *,
     messages: Iterable[dict] | None = None,
     attempts: int = 0,
     max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
     task_id: Optional[str] = None,
+    tools: Iterable[Any] | None = None,
 ) -> Optional[str]:
     """Return a synthetic follow-up when a kanban worker exits without a handoff.
 
     Returns ``None`` when the guard should not fire (not a kanban worker,
-    originating run already closed, or nudge budget exhausted). Only legacy
-    workers without a run pin fall back to tool-call history.
+    originating run already closed, nudge budget exhausted, or the session
+    exposes no kanban terminal tool at all). Only legacy workers without a
+    run pin fall back to tool-call history.
+
+    The ``tools`` check exists because ``HERMES_KANBAN_TASK`` is inherited by
+    every child process a worker spawns — including ``hermes -z`` one-shots
+    with a restricted toolset (e.g. ``-t web``). Nudging a model that has no
+    kanban tool just replaces its real answer with "I cannot call that"
+    (2026-09-17: six research fan-out workers lost their stdout this way).
     """
     if not kanban_stop_nudge_enabled():
         return None
     if attempts >= max_attempts:
+        return None
+    if not session_has_kanban_terminal_tool(tools):
+        _log.info(
+            "kanban stop-guard skipped: no kanban terminal tool in this session's "
+            "toolset (inherited HERMES_KANBAN_TASK=%s)",
+            os.environ.get("HERMES_KANBAN_TASK", ""),
+        )
         return None
     tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
     run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
@@ -131,6 +175,7 @@ def build_kanban_stop_nudge(
 
 
 __all__ = [
+    "session_has_kanban_terminal_tool",
     "build_kanban_stop_nudge",
     "kanban_stop_nudge_enabled",
     "session_called_kanban_terminal",
