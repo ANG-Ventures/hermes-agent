@@ -27,17 +27,64 @@ _DEFAULT_MAX_ATTEMPTS = 2
 _log = logging.getLogger(__name__)
 
 
+def _owns_dispatcher_task() -> bool:
+    """Whether THIS process is the dispatcher's granted worker.
+
+    Read through ``agent.delegation_context`` so this guard uses the SAME
+    ownership predicate as the tool gate in ``tools/kanban_tools.py``. Fails
+    open on import/None error, matching the read-side accessors there.
+    """
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        return is_dispatcher_owned_worker_context()
+    except Exception:
+        return True
+
+
 def kanban_stop_nudge_enabled() -> bool:
     """Return whether the kanban stop-guard is active for this process.
 
-    On when ``HERMES_KANBAN_TASK`` is set (dispatcher-spawned worker), unless
-    ``HERMES_KANBAN_STOP_NUDGE`` explicitly disables it.
+    On when ``HERMES_KANBAN_TASK`` is set AND this process actually owns that
+    grant, unless ``HERMES_KANBAN_STOP_NUDGE`` explicitly disables it.
+
+    The ownership half is load-bearing, and it is the SECOND of two gates.
+    ``session_has_kanban_terminal_tool`` (added 2026-09-17) asks "can the model
+    satisfy this nudge?"; this asks "is this process even the addressee?".
+    They are complementary, and neither subsumes the other:
+
+    * A dispatcher-spawned worker with a restricted toolset (``-t web``) owns
+      the grant but has no terminal tool — caught by the toolset gate.
+    * A CHILD of a worker that DOES see kanban tools — the codex
+      ``hermes_tools_mcp_server`` callback hardcodes ``kanban_complete`` into
+      its tool list, and orchestrator profiles enable the kanban toolset
+      outright — passes the toolset gate while not owning the card. Nudging it
+      pressures a non-owner toward a terminal call on its PARENT's card. That
+      is the 2026-08-12 ``t_09b90233`` hole (a nested ``hermes chat`` completed
+      its parent's card with an unrelated summary) arriving through the
+      stop-guard instead of the tool gate.
+
+    ``HERMES_KANBAN_*`` is ordinary process environment, so *every* child a
+    worker spawns inherits it — a nested ``hermes -p <profile> -z`` one-shot, a
+    research fan-out worker, a script that shells out. Reading the bare task id
+    treats that inheritance as proof of ownership, which is exactly the mistake
+    ``tools/kanban_tools.py::_owned_worker_task_id`` exists to prevent. Routing
+    through the shared predicate is what keeps this gate from drifting away
+    from the tool gate again.
+
+    Field evidence for the pair: 2026-09-17, 6/6 deep-research fan-out workers
+    launched from a kanban worker lost their entire report — the nudge demanded
+    a tool they did not have, they spent the budget refusing, and the refusal
+    became the last assistant message, so ``<out>/<name>.md`` landed 0 bytes
+    (reports recovered from ``lcm.db``). Card ``t_8acd8da3``.
     """
     env = os.environ.get("HERMES_KANBAN_STOP_NUDGE")
     if env is not None and env.strip().lower() in {"0", "false", "no", "off"}:
         return False
     task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-    return bool(task)
+    if not task:
+        return False
+    return _owns_dispatcher_task()
 
 
 def _tool_call_name(tc: Any) -> str:
