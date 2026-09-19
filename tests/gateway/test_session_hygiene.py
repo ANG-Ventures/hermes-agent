@@ -30,14 +30,6 @@ from gateway.session import SessionEntry, SessionSource
 # Helpers
 # ---------------------------------------------------------------------------
 
-# Hang-guard for test stubs that park a worker thread on the default executor
-# until the test releases it.  Generous (well above any real rendezvous) so it
-# is never a timing assertion, but FINITE so a test that fails before its
-# `release_worker.set()` cannot wedge the event loop's executor join and take
-# the entire file to the per-file SIGKILL.
-_STUB_MAX_SPIN_SECONDS = 30.0
-
-
 def _make_history(n_messages: int, content_size: int = 100) -> list:
     """Build a fake transcript with n_messages user/assistant pairs."""
     history = []
@@ -802,19 +794,7 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
             worker_started.set()
             # Stream progress continuously so the inactivity slice never
             # times out; only the turn-hold budget can abandon this wait.
-            #
-            # BOUNDED (#724/#725): this stub runs on the default executor, and
-            # the event loop joins that executor at teardown. An UNBOUNDED spin
-            # here means any assertion failing before `release_worker.set()`
-            # skips the release, the stub spins forever, teardown never
-            # completes, and the whole FILE hangs to the per-file SIGKILL
-            # (measured: 600.6s on CI slice 9 of run 35435109445 — reported as
-            # "no tests ran", which hides the real failure). The deadline is a
-            # hang-guard, not a timing assertion.
-            _spin_deadline = time.monotonic() + _STUB_MAX_SPIN_SECONDS
             while not release_worker.is_set():
-                if time.monotonic() > _spin_deadline:
-                    break
                 if commit_fence is not None:
                     commit_fence.touch_progress()
                 time.sleep(0.01)
@@ -1007,14 +987,7 @@ async def test_session_hygiene_idle_timeout_still_takes_failure_path(
             worker_started.set()
             # NEVER touch progress — the inactivity slice will fire.
             # But we must be stoppable so the test can clean up.
-            #
-            # BOUNDED for the same reason as the sibling stub above: an
-            # unbounded spin turns any early assertion failure into a
-            # file-wide teardown hang, not a test failure.
-            _spin_deadline = time.monotonic() + _STUB_MAX_SPIN_SECONDS
             while not release_worker.is_set():
-                if time.monotonic() > _spin_deadline:
-                    break
                 time.sleep(0.01)
 
     fake_run_agent = types.ModuleType("run_agent")

@@ -48,12 +48,18 @@ def _min_time(fn, *, repeat: int = 5) -> float:
 def _min_cpu_time(fn, *, repeat: int = 5) -> float:
     """Best-of-``repeat`` CPU time for ``fn()`` — immune to CFS throttling.
 
-    ``time.process_time`` counts only cycles this process was actually ON a
-    CPU, so a cgroup-quota-throttled CI runner descheduling the measured
-    thread mid-sample does not inflate the reading.  Wall clock does inflate,
-    which is precisely how the 4x/1x ratio guard below became a coin flip on
-    the self-hosted 2-3 CPU runners (observed on ace-media-*-8 and
-    ace-ai-*-6, runs 35435109445 / 35436550177).
+    ``time.thread_time`` counts only cycles the *calling thread* was actually
+    ON a CPU, so a cgroup-quota-throttled CI runner descheduling it mid-sample
+    does not inflate the reading.  Wall clock does inflate, which is precisely
+    how the 4x/1x ratio guard below became a coin flip on the self-hosted 2-3
+    CPU runners (observed on ace-media-*-8 and ace-ai-*-6, runs 35435109445 /
+    35436550177).
+
+    Thread-scoped rather than ``time.process_time`` (process-wide, all
+    threads) deliberately: an xdist worker that ran an earlier test leaving a
+    live executor thread behind would charge that thread's CPU to every
+    ``process_time`` sample taken here.  ``thread_time`` is
+    ``CLOCK_THREAD_CPUTIME_ID`` on both Linux and macOS.
 
     Only valid for a purely CPU-bound, single-threaded callable — any sleep,
     I/O or thread hand-off is invisible to this clock.  The callables measured
@@ -61,9 +67,9 @@ def _min_cpu_time(fn, *, repeat: int = 5) -> float:
     """
     best = float("inf")
     for _ in range(repeat):
-        t0 = time.process_time()
+        t0 = time.thread_time()
         fn()
-        best = min(best, time.process_time() - t0)
+        best = min(best, time.thread_time() - t0)
     return best
 
 
@@ -226,7 +232,7 @@ class TestToolCallFragmentAssemblyLinear:
 
     def test_4x_fragments_cost_about_4x_time(self):
         # CPU time, not wall clock (#724/#725): this path is pure in-process
-        # CPU work, so process_time measures exactly the property under test
+        # CPU work, so thread_time measures exactly the property under test
         # (work done) and ignores the CFS throttling that made the wall-clock
         # form a coin flip on quota-capped self-hosted runners. repeat=5 and
         # min-of-K on top, because a GC pass inside one sample still perturbs
