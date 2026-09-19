@@ -26,7 +26,7 @@ name: CI
 #   rust-tests.yml  sudo apt-get for webkit2gtk; the pool image ships none
 #   e2e-desktop.yml sudo apt-get for gtk/nss/xvfb
 #   docker-lint.yml hadolint is a Docker container action; no socket on the pool
-#   js-tests.yml    683-file vitest suite exceeds the 4-CPU/8g container
+#   js-tests.yml    mid-flight vitest death, not root-caused; see js-tests.yml
 #
 # ``installer-tests``, the ``tests-os`` matrix and ``ci-review-comment`` use a
 # literal ``runs-on`` and are hosted by design. Everything else runs on the

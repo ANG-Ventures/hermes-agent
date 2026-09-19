@@ -40,7 +40,7 @@ jobs:
     # shows is a run that stops mid-flight with no summary and no per-file result
     # line at all — a different signature from a resource kill, and one that did
     # not reproduce in 8 replays. The real standing risk is that the host is
-    # oversubscribed 100 committed vCPU / 200g across six pools on 24 cores and
+    # oversubscribed 106 committed vCPU / 232g across six pools on 24 cores and
     # 121g, so a pool container can be starved by its neighbours at any sizing.
     #
     # Stays GitHub-hosted: raising CPU_LIMIT/MEM_LIMIT for this repo would not
