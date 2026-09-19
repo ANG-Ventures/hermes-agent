@@ -153,8 +153,13 @@ jobs:
           NOUS_API_KEY: ""
           # Subprocess-per-file is import/IO-bound, not CPU-bound: workers spend
           # most of their wall time in interpreter boot + module import, not
-          # computing. cpu_count*2 (=8 on a 4-vCPU runner) leaves headroom;
-          # bump to 12 — the fork's own CI run on this PR is the measurement.
+          # computing. This is a CEILING, not an absolute — run_tests_parallel.py
+          # clamps it to max(2, effective_cpus*2) where effective_cpus comes from
+          # the cgroup CPU quota, not nproc. So a 4-vCPU hosted runner still gets
+          # 8, while a --cpus=2 self-hosted container gets 4 instead of 12.
+          # (12 on 2 CPUs was 6x oversubscription: CFS throttling blew wall-clock
+          # windows and sqlite busy-timeouts, ejecting merge-queue entries.)
+          # HERMES_TEST_WORKERS_FORCE=1 bypasses the clamp.
           HERMES_TEST_WORKERS: "12"
 
       - name: Upload per-slice durations
