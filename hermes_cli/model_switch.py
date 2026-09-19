@@ -1280,6 +1280,59 @@ def get_authenticated_provider_slugs(
         return []
 
 
+def resolve_startup_model_arg(
+    raw_model: Optional[str],
+    current_provider: str,
+    user_providers: dict | None = None,
+    custom_providers: list | None = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve a non-interactive ``-m/--model`` value the way ``/model`` would.
+
+    ``hermes chat -m <x>`` used to hand the raw string straight to the current
+    provider. That silently broke the two shorthands users reach for most:
+
+    * config aliases (``-m grok`` / ``-m fable`` from ``model.aliases``) — the
+      provider received the literal word ``grok``, 400'd, and the fallback
+      chain quietly switched to a different provider *and model* (measured
+      2026-09-18: ``-m grok`` on claude-apr → ``claude-apx-1/claude-opus-5``).
+    * inline provider qualification (``-m xai-oauth/grok-4.6`` /
+      ``-m xai-oauth:grok-4.6``) — the whole thing was sent as a model id to
+      the current provider, same silent fallback.
+
+    Returns ``(provider, model)``. ``provider`` is ``None`` when the input
+    carries no provider information (plain model id, or ``moa:`` which the
+    caller handles first). Never raises: any resolution failure returns the
+    input unchanged so the existing provider-side validation still runs.
+    Only DIRECT aliases (config-declared exact mappings) are honored here —
+    the catalog-search alias ladder needs network/credentials and belongs to
+    the interactive ``/model`` path.
+    """
+    if not isinstance(raw_model, str):
+        return None, raw_model
+    raw = raw_model.strip()
+    if not raw or raw.lower().startswith("moa:") or "://" in raw:
+        return None, raw_model
+    try:
+        inline = _parse_inline_provider_model(
+            raw, current_provider or "", user_providers, custom_providers
+        )
+        if inline is not None:
+            provider, model = inline
+            # the right-hand side may itself be a direct alias (``xai:grok``)
+            _ensure_direct_aliases()
+            da = DIRECT_ALIASES.get(model.strip().lower())
+            if da is not None and da.provider == provider:
+                model = da.model
+            return provider, model
+        _ensure_direct_aliases()
+        da = DIRECT_ALIASES.get(raw.lower())
+        if da is not None:
+            return (da.provider or None), da.model
+    except Exception:  # pragma: no cover - resolution must never block startup
+        logger.debug("startup -m alias resolution failed for %r", raw, exc_info=True)
+    return None, raw_model
+
+
 def _resolve_alias_fallback(
     raw_input: str,
     authenticated_providers: list[str] = (),
