@@ -58,6 +58,22 @@ def test_inline_provider_colon_form_is_split(monkeypatch):
     assert (provider, model) == ("xai-oauth", "grok-4.6")
 
 
+@pytest.mark.parametrize("raw", [
+    "anthropic/claude-opus-4.6",
+    "openai/gpt-5.4",
+    "meta-llama/llama-4-scout",
+    "deepseek/deepseek-v4-flash",
+])
+def test_vendor_namespace_is_not_a_provider_switch(monkeypatch, raw):
+    """`vendor/model` is a model-id prefix the TARGET provider strips, not an
+    inline provider switch. Hijacking it here routed `-m anthropic/claude-opus-4.6`
+    away from the configured provider instead of stripping to the bare id, which
+    regressed the foreign-provider-prefix incident guard
+    (tests/hermes_cli/test_codex_foreign_provider_prefix.py)."""
+    _fake_aliases(monkeypatch, {})
+    assert ms.resolve_startup_model_arg(raw, "openai-codex") == (None, raw)
+
+
 def test_plain_model_id_passes_through_unchanged(monkeypatch):
     _fake_aliases(monkeypatch, {"grok": "xai-oauth/grok-4.6"})
     assert ms.resolve_startup_model_arg("claude-opus-5", "claude-apr") == (None, "claude-opus-5")

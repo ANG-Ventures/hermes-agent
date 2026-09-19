@@ -41,6 +41,7 @@ from hermes_cli.providers import (
     resolve_provider_full,
 )
 from hermes_cli.model_normalize import (
+    is_known_vendor_namespace,
     normalize_model_for_provider,
 )
 from agent.models_dev import (
@@ -1318,6 +1319,15 @@ def resolve_startup_model_arg(
         )
         if inline is not None:
             provider, model = inline
+            # A VENDOR namespace (`anthropic/…`, `openai/…`, `deepseek/…`) is a
+            # model-id prefix, not a provider switch — the target provider strips
+            # it in _normalize_model_for_provider. Hijacking it here would route
+            # `-m anthropic/claude-opus-4.6` away from the configured provider
+            # instead of stripping to `claude-opus-4.6` (regressed the
+            # foreign-provider-prefix incident guard).
+            head = raw.split("/", 1)[0].split(":", 1)[0].strip().lower()
+            if is_known_vendor_namespace(head):
+                return None, raw_model
             # the right-hand side may itself be a direct alias (``xai:grok``)
             _ensure_direct_aliases()
             da = DIRECT_ALIASES.get(model.strip().lower())
