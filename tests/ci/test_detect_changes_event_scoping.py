@@ -12,12 +12,15 @@ paraphrase of it.
 The property under test:
 
 * ``pull_request``  → diff from ``pull_request.base.sha``/``head.sha``.
-* ``merge_group``   → diff from ``merge_group.base_sha``/``head_sha``. Safe to
-  narrow because the batched candidate's diff is the UNION of its member PRs'
-  diffs (argument in full at the action).
+* ``merge_group``   → diff from the TARGET BRANCH
+  (``merge_group.base_ref``) to ``merge_group.head_sha``. Deliberately NOT
+  ``merge_group.base_sha``: queue candidate refs are chained, so base_sha is
+  the previous candidate and its diff is only the topmost entry's delta, which
+  under-tests every other member of the batch (measured 2026-09-19; argument in
+  full at the action).
 * every other event (``push``, ``release``, ``workflow_dispatch``, ...) → no
-  SHAs, empty diff, every lane ``true``, ``test_scope=full``.
-* a malformed/absent SHA pair on a gated event → fails OPEN, same as push.
+  base resolved, empty diff, every lane ``true``, ``test_scope=full``.
+* a malformed/absent payload on a gated event → fails OPEN, same as push.
 """
 
 from __future__ import annotations
@@ -35,8 +38,11 @@ ACTION = REPO_ROOT / ".github" / "actions" / "detect-changes" / "action.yml"
 
 PR_BASE = "1" * 40
 PR_HEAD = "2" * 40
-MG_BASE = "3" * 40
+# The PREVIOUS queue candidate. A chained batch's payload carries this as
+# base_sha; the classifier must never diff from it.
+MG_PREV_CANDIDATE = "3" * 40
 MG_HEAD = "4" * 40
+MG_BASE_REF = "refs/heads/main"
 
 
 def _action_script() -> str:
@@ -71,7 +77,7 @@ def _run(tmp_path: Path, env_overrides: dict[str, str], changed: list[str]):
         "EVENT_NAME": "",
         "PR_BASE_SHA": "",
         "PR_HEAD_SHA": "",
-        "MG_BASE_SHA": "",
+        "MG_BASE_REF": "",
         "MG_HEAD_SHA": "",
         "GITHUB_OUTPUT": str(github_output),
         **env_overrides,
@@ -108,11 +114,13 @@ def _need_bash():
 def test_merge_group_tests_only_batch_narrows_lanes(tmp_path):
     outputs, gh_args, _ = _run(
         tmp_path,
-        {"EVENT_NAME": "merge_group", "MG_BASE_SHA": MG_BASE, "MG_HEAD_SHA": MG_HEAD},
+        {"EVENT_NAME": "merge_group", "MG_BASE_REF": MG_BASE_REF, "MG_HEAD_SHA": MG_HEAD},
         ["tests/gateway/test_foo.py", "tests/tools/test_bar.py"],
     )
-    # It asked about the merge_group SHAs, not the (empty) PR ones.
-    assert f"{MG_BASE}...{MG_HEAD}" in gh_args
+    # It asked about the TARGET BRANCH, not the chained previous candidate.
+    assert f"main...{MG_HEAD}" in gh_args
+    # and never about the chained previous candidate.
+    assert MG_PREV_CANDIDATE not in gh_args
     # pytest must still run (tests changed), but nothing that ships the product.
     assert outputs["python"] == "true"
     assert outputs["python_prod"] == "false"
@@ -129,7 +137,7 @@ def test_merge_group_tests_only_batch_narrows_lanes(tmp_path):
 def test_merge_group_single_plugin_batch_narrows_test_scope(tmp_path):
     outputs, _, _ = _run(
         tmp_path,
-        {"EVENT_NAME": "merge_group", "MG_BASE_SHA": MG_BASE, "MG_HEAD_SHA": MG_HEAD},
+        {"EVENT_NAME": "merge_group", "MG_BASE_REF": MG_BASE_REF, "MG_HEAD_SHA": MG_HEAD},
         ["plugins/kanban/plugin_api.py", "tests/plugins/kanban/test_api.py"],
     )
     assert outputs["test_scope"] == "plugin:kanban"
@@ -141,7 +149,7 @@ def test_merge_group_single_plugin_batch_narrows_test_scope(tmp_path):
 def test_merge_group_core_batch_runs_full_matrix(tmp_path):
     outputs, _, _ = _run(
         tmp_path,
-        {"EVENT_NAME": "merge_group", "MG_BASE_SHA": MG_BASE, "MG_HEAD_SHA": MG_HEAD},
+        {"EVENT_NAME": "merge_group", "MG_BASE_REF": MG_BASE_REF, "MG_HEAD_SHA": MG_HEAD},
         ["agent/run_agent.py", "tests/agent/test_run_agent.py"],
     )
     assert outputs["python"] == "true"
@@ -155,7 +163,7 @@ def test_merge_group_core_batch_runs_full_matrix(tmp_path):
 def test_merge_group_workflow_change_forces_every_lane(tmp_path):
     outputs, _, _ = _run(
         tmp_path,
-        {"EVENT_NAME": "merge_group", "MG_BASE_SHA": MG_BASE, "MG_HEAD_SHA": MG_HEAD},
+        {"EVENT_NAME": "merge_group", "MG_BASE_REF": MG_BASE_REF, "MG_HEAD_SHA": MG_HEAD},
         [".github/workflows/ci.yaml"],
     )
     for lane in ("python", "python_prod", "frontend", "site", "scan", "deps",
@@ -170,25 +178,41 @@ def test_merge_group_workflow_change_forces_every_lane(tmp_path):
 @pytest.mark.parametrize(
     "overrides",
     [
-        pytest.param({"EVENT_NAME": "merge_group"}, id="merge_group-absent-shas"),
+        pytest.param({"EVENT_NAME": "merge_group"}, id="merge_group-absent-payload"),
         pytest.param(
-            {"EVENT_NAME": "merge_group", "MG_BASE_SHA": MG_BASE, "MG_HEAD_SHA": ""},
+            {"EVENT_NAME": "merge_group", "MG_BASE_REF": MG_BASE_REF, "MG_HEAD_SHA": ""},
             id="merge_group-half-empty",
         ),
         pytest.param(
-            {"EVENT_NAME": "merge_group", "MG_BASE_SHA": "not-a-sha", "MG_HEAD_SHA": MG_HEAD},
-            id="merge_group-garbage-base",
+            {"EVENT_NAME": "merge_group", "MG_BASE_REF": "main", "MG_HEAD_SHA": MG_HEAD},
+            id="merge_group-base-ref-not-refs-heads",
         ),
         pytest.param(
-            {"EVENT_NAME": "merge_group", "MG_BASE_SHA": MG_BASE[:39], "MG_HEAD_SHA": MG_HEAD},
-            id="merge_group-short-sha",
+            {"EVENT_NAME": "merge_group", "MG_BASE_REF": "refs/tags/v1", "MG_HEAD_SHA": MG_HEAD},
+            id="merge_group-base-ref-is-a-tag",
+        ),
+        pytest.param(
+            {"EVENT_NAME": "merge_group", "MG_BASE_REF": "refs/heads/m ain;rm", "MG_HEAD_SHA": MG_HEAD},
+            id="merge_group-base-ref-hostile-charset",
+        ),
+        pytest.param(
+            {"EVENT_NAME": "merge_group", "MG_BASE_REF": MG_BASE_REF, "MG_HEAD_SHA": "not-a-sha"},
+            id="merge_group-garbage-head",
+        ),
+        pytest.param(
+            {"EVENT_NAME": "merge_group", "MG_BASE_REF": MG_BASE_REF, "MG_HEAD_SHA": MG_HEAD[:39]},
+            id="merge_group-short-head-sha",
         ),
         pytest.param({"EVENT_NAME": "pull_request"}, id="pull_request-absent-shas"),
+        pytest.param(
+            {"EVENT_NAME": "pull_request", "PR_BASE_SHA": PR_BASE, "PR_HEAD_SHA": "not-a-sha"},
+            id="pull_request-garbage-head",
+        ),
     ],
 )
 def test_malformed_payload_fails_open(tmp_path, overrides):
     outputs, gh_args, _ = _run(tmp_path, overrides, ["tests/gateway/test_foo.py"])
-    assert gh_args == "", "must not call the compare API without a valid SHA pair"
+    assert gh_args == "", "must not call the compare API without a valid base/head pair"
     for lane in ("python", "python_prod", "frontend", "site", "scan", "deps",
                  "uv_lock", "npm_lock", "installer", "rust", "nix"):
         assert outputs[lane] == "true", lane
@@ -204,7 +228,7 @@ def test_other_events_still_fail_open(tmp_path, event):
     outputs, gh_args, _ = _run(
         tmp_path,
         # Even if a payload happened to carry SHAs, a non-gated event ignores them.
-        {"EVENT_NAME": event, "MG_BASE_SHA": MG_BASE, "MG_HEAD_SHA": MG_HEAD,
+        {"EVENT_NAME": event, "MG_BASE_REF": MG_BASE_REF, "MG_HEAD_SHA": MG_HEAD,
          "PR_BASE_SHA": PR_BASE, "PR_HEAD_SHA": PR_HEAD},
         ["tests/gateway/test_foo.py"],
     )
@@ -218,10 +242,89 @@ def test_pull_request_still_uses_pull_request_shas(tmp_path):
     outputs, gh_args, _ = _run(
         tmp_path,
         {"EVENT_NAME": "pull_request", "PR_BASE_SHA": PR_BASE, "PR_HEAD_SHA": PR_HEAD,
-         "MG_BASE_SHA": MG_BASE, "MG_HEAD_SHA": MG_HEAD},
+         "MG_BASE_REF": MG_BASE_REF, "MG_HEAD_SHA": MG_HEAD},
         ["tests/gateway/test_foo.py"],
     )
     assert f"{PR_BASE}...{PR_HEAD}" in gh_args
-    assert MG_BASE not in gh_args
+    assert MG_HEAD not in gh_args
     assert outputs["python"] == "true"
     assert outputs["python_prod"] == "false"
+
+
+# --------------------------------------------------------------------------
+# REGRESSION GUARD — the multi-entry chained batch.
+#
+# This is the case that makes base_sha wrong and it is invisible on a
+# single-entry batch (where base_sha == the target tip, so both bases agree).
+# Measured on the live queue 2026-09-19: with 5 entries queued, each candidate
+# ref's base_sha was the PREVIOUS candidate's head, so the payload pair on the
+# candidate that fast-forwards main resolved 3 files where the true incoming
+# set was 12 — two product files (gateway/platforms/base.py,
+# plugins/platforms/discord/adapter.py) would have merged with their lanes
+# never run on the tree that lands.
+#
+# The stub gh serves the batch UNION for the target-branch compare and only
+# the topmost entry's delta for the chained-base compare, so this test goes RED
+# if the action is ever pointed back at merge_group.base_sha.
+# --------------------------------------------------------------------------
+def test_merge_group_chained_batch_uses_union_not_topmost_delta(tmp_path):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    union = ["cli.py", "gateway/platforms/base.py", "plugins/platforms/discord/adapter.py"]
+    topmost = ["cli.py"]
+    # Route on which base the script asked about.
+    (bindir / "gh").write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> {tmp_path / "gh_args.txt"}\n'
+        f'if [[ "$*" == *"{MG_PREV_CANDIDATE}"* ]]; then\n'
+        + "".join(f'  printf "%s\\n" {p!r}\n' for p in topmost)
+        + "else\n"
+        + "".join(f'  printf "%s\\n" {p!r}\n' for p in union)
+        + "fi\n",
+        encoding="utf-8",
+    )
+    (bindir / "gh").chmod(0o755)
+
+    github_output = tmp_path / "github_output"
+    github_output.touch()
+    env = {
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+        "GH_TOKEN": "stub",
+        "REPO": "ANG-Ventures/hermes-agent",
+        "EVENT_NAME": "merge_group",
+        "PR_BASE_SHA": "",
+        "PR_HEAD_SHA": "",
+        # A real chained payload carries BOTH: base_ref (target branch) and
+        # base_sha (the previous candidate). Export the wrong one too, so the
+        # test proves the action ignores it rather than merely lacking it.
+        "MG_BASE_REF": MG_BASE_REF,
+        "MG_BASE_SHA": MG_PREV_CANDIDATE,
+        "MG_HEAD_SHA": MG_HEAD,
+        "GITHUB_OUTPUT": str(github_output),
+    }
+    proc = subprocess.run(
+        ["bash", "-c", _action_script()],
+        cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=180,
+    )
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    gh_args = (tmp_path / "gh_args.txt").read_text(encoding="utf-8")
+    assert f"main...{MG_HEAD}" in gh_args, "must diff from the target branch"
+    assert MG_PREV_CANDIDATE not in gh_args, (
+        "must NOT diff from merge_group.base_sha — that is the previous chained "
+        "candidate and yields only the topmost entry's delta"
+    )
+
+    outputs: dict[str, str] = {}
+    for line in github_output.read_text(encoding="utf-8").splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            outputs[key] = value
+    # The union contains a plugin path and a gateway path. Under the topmost
+    # delta (cli.py alone) frontend/site stay false either way, but the lanes
+    # the OTHER member PRs need must be ON.
+    assert outputs["python"] == "true"
+    assert outputs["python_prod"] == "true"
+    assert outputs["scan"] == "true"
+    # A multi-tree union must never resolve to a single plugin's scope.
+    assert outputs["test_scope"] == "full"

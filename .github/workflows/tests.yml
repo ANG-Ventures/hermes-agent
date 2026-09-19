@@ -5,7 +5,8 @@ name: Tests
 # and one pinned gateway/session/config smoke slice. Any other, uncertain,
 # cross-plugin, conftest, pyproject, or workflow path fails open to the full
 # slice_count matrix. merge_group is scoped the same way, over the batch's
-# base_sha...head_sha union diff; every other non-PR event runs full.
+# three-dot diff from the target branch (base_ref...head_sha, NOT base_sha,
+# which is the previous chained candidate); every other non-PR event runs full.
 on:
   workflow_call:
     inputs:
