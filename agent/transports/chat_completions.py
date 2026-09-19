@@ -1048,7 +1048,20 @@ class ChatCompletionsTransport(ProviderTransport):
             return None
         details = getattr(usage, "prompt_tokens_details", None)
         cached = getattr(details, "cached_tokens", 0) or 0 if details else 0
-        written = getattr(details, "cache_write_tokens", 0) or 0 if details else 0
+        # OpenAI's documented field for GPT-5.6+ explicit cache writes is
+        # `cache_write_tokens`. Anthropic-backed OpenAI-compatible bridges
+        # (claude-code-bridge, Yunwu, and other Claude resellers) instead emit
+        # `cache_creation_tokens` — the OpenAI-shaped spelling of Anthropic's
+        # `cache_creation_input_tokens`. Without this fallback their writes are
+        # silently booked as UNCACHED input: measured 2026-09-19, 100% of 764
+        # claude-bpx turns reported cache_read (5.75B tokens) and 0% reported
+        # any write, which is arithmetically impossible. Mirrors the same
+        # fallback already used in usage_pricing.py (#70543).
+        written = 0
+        if details:
+            written = getattr(details, "cache_write_tokens", 0) or 0
+            if not written:
+                written = getattr(details, "cache_creation_tokens", 0) or 0
         if not cached:
             # DeepSeek native API shape (api.deepseek.com): top-level
             # prompt_cache_hit_tokens / prompt_cache_miss_tokens (#61871).
