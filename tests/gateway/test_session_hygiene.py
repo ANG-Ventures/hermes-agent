@@ -769,6 +769,7 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
     worker_started = threading.Event()
     release_worker = threading.Event()
     cleanup_done = threading.Event()
+    worker_returned = threading.Event()  # set on EVERY exit path of the worker
     fake_db = MagicMock()
     fake_db.get_compression_failure_cooldown.return_value = None
 
@@ -791,25 +792,34 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
         def _compress_context(
             self, messages, *_args, commit_fence=None, **_kwargs
         ):
-            worker_started.set()
-            # Stream progress continuously so the inactivity slice never
-            # times out; only the turn-hold budget can abandon this wait.
-            while not release_worker.is_set():
-                if commit_fence is not None:
-                    commit_fence.touch_progress()
-                time.sleep(0.01)
-            if commit_fence is not None and not commit_fence.begin_commit():
-                return (messages, None)
             try:
-                self._session_db.archive_and_compact(
-                    self.session_id,
-                    [{"role": "assistant", "content": "too late"}],
-                )
-                self._last_compaction_in_place = True
-                return ([{"role": "assistant", "content": "too late"}], None)
+                worker_started.set()
+                # Stream progress continuously so the inactivity slice never
+                # times out; only the turn-hold budget can abandon this wait.
+                # Finite, and deliberately BELOW the 15s harness wait_for on
+                # _handle_message: a regression that joins this worker must
+                # produce a NAMED assertion failure below, not a hang.
+                _deadline = time.monotonic() + 5
+                while not release_worker.is_set():
+                    if time.monotonic() > _deadline:
+                        break
+                    if commit_fence is not None:
+                        commit_fence.touch_progress()
+                    time.sleep(0.01)
+                if commit_fence is not None and not commit_fence.begin_commit():
+                    return (messages, None)
+                try:
+                    self._session_db.archive_and_compact(
+                        self.session_id,
+                        [{"role": "assistant", "content": "too late"}],
+                    )
+                    self._last_compaction_in_place = True
+                    return ([{"role": "assistant", "content": "too late"}], None)
+                finally:
+                    if commit_fence is not None:
+                        commit_fence.finish_commit()
             finally:
-                if commit_fence is not None:
-                    commit_fence.finish_commit()
+                worker_returned.set()
 
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = StreamingCompressAgent
@@ -885,21 +895,41 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
         message_id="1",
     )
 
-    started = time.monotonic()
     result = await asyncio.wait_for(runner._handle_message(event), timeout=15)
-    elapsed = time.monotonic() - started
 
     # The turn proceeded on the uncompressed transcript well under the 600s
     # ceiling — the turn-hold budget (~0.3s) abandoned the streaming wait.
+    #
+    # DETERMINISTIC ORDERING WITNESS — replaces `assert elapsed < 5.0`.
+    # Measured idle: 1.891 / 1.054 / 1.015s against a 5.0 bound — a 2.6x
+    # ratio. Worse, profiling this exact test inside a real pytest run shows
+    # 1.057s of a 1.837s window is `agent.models_dev.fetch_models_dev` ->
+    # `atomic_json_write` (provider-metadata cache, ~8.5M calls), i.e. the
+    # ceiling was mostly measuring one-time setup that has nothing to do with
+    # the 0.3s turn-hold budget under test. The instrument was the defect.
+    #
+    # The real contract is ordering: the handler must return WITHOUT waiting
+    # for the still-streaming compression worker. `worker_returned` is set on
+    # every exit path of that worker and is asserted UNSET here, so if the
+    # turn-hold budget is ever removed (and the wait runs to the 600s ceiling
+    # instead) the worker can only have been reached after the handler
+    # returned, and this fails by name. No wall-clock constant.
     assert result == "ok"
-    assert elapsed < 5.0, f"turn held for {elapsed:.1f}s despite the turn-hold budget"
-    assert worker_started.is_set()
+    assert worker_started.is_set(), "hygiene compression worker never started"
+    assert not worker_returned.is_set(), (
+        "the turn was held until the streaming compression worker finished — "
+        "the turn-hold budget did not abandon the wait"
+    )
+    # Behavior witness: the turn-hold path (not the idle-timeout path) ran.
+    assert any(
+        "deferred" in m["content"].lower() for m in adapter.sent
+    ), f"turn-hold must send the deferral notice, got: {[m['content'] for m in adapter.sent]}"
     assert runner._run_agent.await_count == 1
     # The stale commit must be fenced: the late worker never mutates the session.
     fake_db.archive_and_compact.assert_not_called()
 
     release_worker.set()
-    await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=3)
+    await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=10)
     fake_db.archive_and_compact.assert_not_called()
     StreamingCompressAgent.last_instance.close.assert_called_once()
 
@@ -962,6 +992,7 @@ async def test_session_hygiene_idle_timeout_still_takes_failure_path(
     worker_started = threading.Event()
     release_worker = threading.Event()
     cleanup_done = threading.Event()
+    worker_returned = threading.Event()  # set on EVERY exit path of the worker
     fake_db = MagicMock()
     fake_db.get_compression_failure_cooldown.return_value = None
 
@@ -984,11 +1015,16 @@ async def test_session_hygiene_idle_timeout_still_takes_failure_path(
         def _compress_context(
             self, messages, *_args, commit_fence=None, **_kwargs
         ):
-            worker_started.set()
-            # NEVER touch progress — the inactivity slice will fire.
-            # But we must be stoppable so the test can clean up.
-            while not release_worker.is_set():
-                time.sleep(0.01)
+            try:
+                worker_started.set()
+                # NEVER touch progress — the inactivity slice will fire.
+                # But we must be stoppable so the test can clean up, and the
+                # wait is finite and deliberately BELOW the 15s harness
+                # wait_for on _handle_message, so a regression that joins this
+                # worker fails by NAME below instead of hanging.
+                release_worker.wait(5)
+            finally:
+                worker_returned.set()
 
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = StalledCompressAgent
@@ -1062,15 +1098,26 @@ async def test_session_hygiene_idle_timeout_still_takes_failure_path(
         message_id="1",
     )
 
-    started = time.monotonic()
     result = await asyncio.wait_for(runner._handle_message(event), timeout=15)
-    elapsed = time.monotonic() - started
 
     # The turn proceeded on the uncompressed transcript after the idle
     # timeout fired (~0.1s).
+    #
+    # DETERMINISTIC ORDERING WITNESS — replaces `assert elapsed < 5.0`.
+    # Measured idle: 0.964 / 0.787 / 0.830s against a 5.0 bound (5.2x), and
+    # like its sibling above most of that window is provider-metadata cache
+    # setup rather than the 0.1s inactivity budget under test.
+    #
+    # The ordering fact: the handler must return while the stalled worker is
+    # STILL parked. `worker_returned` is set on every exit path of that worker
+    # and asserted UNSET here, so a regression that waits the worker out
+    # (rather than timing out on inactivity) fails by name.
     assert result == "ok"
-    assert elapsed < 5.0
-    assert worker_started.is_set()
+    assert worker_started.is_set(), "hygiene compression worker never started"
+    assert not worker_returned.is_set(), (
+        "the turn was held until the stalled compression worker finished — "
+        "the inactivity timeout did not abandon the wait"
+    )
     assert runner._run_agent.await_count == 1
 
     # Behavior witness: idle timeout MUST send the "no output" message.
