@@ -34,6 +34,12 @@ permissions:
 # cancels the poller of the run that GitHub superseded. The group keys
 # on the head repository too: fork PRs often share a branch name
 # (``main``, ``patch-1``), and two PRs must not cancel each other.
+#
+# Measured 2026-09-19: this group works as intended. The 12 pollers alive
+# at 11:31Z were 12 DISTINCT PR branches, not duplicates — poller count
+# scales with open-PR count, which the group cannot bound. The rate-limit
+# budget is therefore defended in the poller itself (conditional requests,
+# a slower interval, and a merge-queue skip), not here.
 concurrency:
   group: ci-review-comment-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
   cancel-in-progress: true
@@ -76,5 +82,5 @@ jobs:
           COMMIT_MESSAGE: ${{ github.event.workflow_run.head_commit.message }}
         run: |
           python3 -u scripts/ci/live_comment.py \
-            --interval 15 \
+            --interval 45 \
             --timeout 3000
