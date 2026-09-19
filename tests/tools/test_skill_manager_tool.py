@@ -1165,3 +1165,72 @@ class TestCuratorConsolidationDeleteGuard:
             assert allowed["success"] is True, allowed
 
         _reset_background_review_read_marks()
+
+
+class TestCreateSeesUnsubscribedSharedGroups:
+    """A create must collide with a skill in ANY shared group, subscribed or not.
+
+    ``_find_skill`` scans ``get_all_skills_dirs()`` = local skills dir + the
+    SUBSCRIBED ``skills.external_dirs`` groups — the right set for "which skill
+    do I load", the wrong set for "does this name already exist". A create into
+    an UNSUBSCRIBED group was therefore invisible to the dedupe guard and a
+    second copy of the same skill was born silently (t_2a49949a).
+    """
+
+    @contextmanager
+    def _shared_tree(self, tmp_path, subscribed_group: str):
+        """HERMES_HOME with skills-shared/{general,finance}; only one subscribed."""
+        hermes_home = tmp_path / ".hermes"
+        skills_root = hermes_home / "skills"
+        skills_root.mkdir(parents=True, exist_ok=True)
+        shared = hermes_home / "skills-shared"
+        for g in ("general", "finance"):
+            (shared / g).mkdir(parents=True, exist_ok=True)
+        with patch("tools.skill_manager_tool.SKILLS_DIR", skills_root), \
+             patch("tools.skill_manager_tool.HERMES_HOME", hermes_home), \
+             patch("agent.skill_utils.get_all_skills_dirs",
+                   return_value=[skills_root, shared / subscribed_group]):
+            yield shared
+
+    @staticmethod
+    def _plant(shared: Path, group: str, name: str) -> Path:
+        d = shared / group / name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: A planted skill.\n---\n\nbody\n",
+            encoding="utf-8",
+        )
+        return d
+
+    def test_create_refuses_name_living_in_an_unsubscribed_group(self, tmp_path):
+        with self._shared_tree(tmp_path, subscribed_group="general") as shared:
+            planted = self._plant(shared, "finance", "dup-probe")
+
+            # Precondition: the load-path finder genuinely cannot see it.
+            from tools.skill_manager_tool import _find_skill
+            assert _find_skill("dup-probe") is None
+
+            result = _create_skill("dup-probe", _skill_content("dup-probe"),
+                                   category="general")
+
+            assert result["success"] is False, result
+            assert "already exists" in result["error"]
+            assert str(planted) in result["error"]
+            # And no second copy was born.
+            assert not (shared / "general" / "dup-probe").exists()
+
+    def test_create_still_refuses_a_subscribed_group_collision(self, tmp_path):
+        with self._shared_tree(tmp_path, subscribed_group="general") as shared:
+            self._plant(shared, "general", "dup-probe")
+            result = _create_skill("dup-probe", _skill_content("dup-probe"),
+                                   category="finance")
+            assert result["success"] is False, result
+            assert "already exists" in result["error"]
+
+    def test_create_still_succeeds_for_a_genuinely_new_name(self, tmp_path):
+        with self._shared_tree(tmp_path, subscribed_group="general") as shared:
+            self._plant(shared, "finance", "dup-probe")
+            result = _create_skill("fresh-probe", _skill_content("fresh-probe"),
+                                   category="general")
+            assert result["success"] is True, result
+            assert (shared / "general" / "fresh-probe" / "SKILL.md").is_file()
