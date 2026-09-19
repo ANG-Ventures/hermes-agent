@@ -79,15 +79,75 @@ runs:
         GH_TOKEN: ${{ inputs.github-token || github.token }}
         REPO: ${{ github.repository }}
         EVENT_NAME: ${{ github.event_name }}
-        BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        MG_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
       run: |
         set -euo pipefail
 
-        # Only pull_request events are gated. Other events (push, release,
-        # dispatch) leave CHANGED empty, so the classifier fails open and every
-        # lane runs. Post-merge / on-demand validation is never weakened.
-        if [ "$EVENT_NAME" = "pull_request" ]; then
+        # Which events get a real diff, and which fail open to "run everything".
+        #
+        # pull_request — base.sha...head.sha, pinned at trigger time.
+        #
+        # merge_group  — base_sha...head_sha from the merge_group payload (the
+        #   same pair fleet-secret-scan.yml has used since 2026-07-27; confirmed
+        #   present on a real merge_group run, ANG-Ventures/hermes-agent run
+        #   35426298773: base 026ee57b, head a226966f, compare = 3 real files).
+        #
+        #   SAFETY ARGUMENT — why narrowing the batched candidate cannot
+        #   under-test any member PR. The queue builds head_sha by applying the
+        #   batch's member PRs on top of base_sha (the projected main). So
+        #   diff(base_sha, head_sha) is the UNION of the member PRs' diffs, as
+        #   projected onto that base — every path any member touches appears in
+        #   it (a path two members both touch appears once; a path one member
+        #   touches and another reverts still appears if the net differs from
+        #   base, and if the net is IDENTICAL to base then no member's change to
+        #   it survives into main, so nothing untested merges). Lane selection is
+        #   a monotone OR over that path set: lanes(A ∪ B) ⊇ lanes(A) ∪ lanes(B)
+        #   for every lane in classify_changes.py, because each lane is
+        #   `any(predicate(f) for f in files)` and the fail-open overrides (empty
+        #   diff, any `.github/` path) only ever force lanes ON. Therefore the
+        #   batch runs at least every lane each member would have run alone.
+        #
+        #   The same monotonicity does NOT hold for TEST_SCOPE: the plugin scope
+        #   is a narrowing (`plugin:<name>`), not an OR. But it is safe for the
+        #   opposite reason — _plugin_scope_from_changes() fails open to `full`
+        #   the moment the path set spans more than one plugin tree or contains
+        #   any non-plugin path, so a union of two members can only ever be
+        #   EQUAL to (single plugin, all members in it) or WIDER (`full`) than
+        #   either member's own scope. It can never resolve to a plugin scope no
+        #   member had.
+        #
+        # everything else (push to main, release, dispatch, schedule) — no SHAs
+        #   are exported, CHANGED stays empty, every lane runs and TEST_SCOPE
+        #   stays `full`. Post-merge / on-demand validation is never weakened.
+        #
+        # A malformed or absent payload fails OPEN: the 40-hex guard below
+        # rejects anything that is not a full SHA pair, which leaves BASE_SHA /
+        # HEAD_SHA empty and takes the same path as push.
+        # `CHANGED` must be declared before the gate: under `set -u` the
+        # fail-open path reaches the `-n "$CHANGED"` test below without ever
+        # entering the compare block.
+        CHANGED=""
+        BASE_SHA=""
+        HEAD_SHA=""
+        case "$EVENT_NAME" in
+          pull_request) BASE_SHA="$PR_BASE_SHA"; HEAD_SHA="$PR_HEAD_SHA" ;;
+          merge_group)  BASE_SHA="$MG_BASE_SHA"; HEAD_SHA="$MG_HEAD_SHA" ;;
+        esac
+        # 40-hex validation with a bash regex (the step declares `shell: bash`).
+        # Deliberately NOT `grep`: under `set -e` a non-matching grep aborts the
+        # step, and a malformed payload must fail OPEN, not fail the job.
+        _sha_re='^[0-9a-f]{40}$'
+        if [ -n "${BASE_SHA}${HEAD_SHA}" ] \
+          && ! { [[ "$BASE_SHA" =~ $_sha_re ]] && [[ "$HEAD_SHA" =~ $_sha_re ]]; }; then
+          echo "::warning::${EVENT_NAME}: malformed base/head SHAs (base='${BASE_SHA}' head='${HEAD_SHA}') — failing open (all lanes run)"
+          BASE_SHA=""
+          HEAD_SHA=""
+        fi
+
+        if [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ]; then
           # Use the compare endpoint with the pinned base/head SHAs from the
           # event payload instead of the "current PR files" endpoint. The SHAs
           # are frozen at trigger time, so the file list is deterministic even
@@ -129,7 +189,9 @@ runs:
         printf '%s\n' "${CHANGED:-}" | python3 scripts/ci/classify_changes.py
 
         TEST_SCOPE=full
-        if [ "$EVENT_NAME" = "pull_request" ] && [ -n "$CHANGED" ]; then
+        if [ -n "$CHANGED" ]; then
+          # Same gate as the lane classifier: CHANGED is only non-empty when a
+          # real base...head diff was resolved (pull_request or merge_group).
           TEST_SCOPE="$(printf '%s\n' "$CHANGED" | \
             python3 scripts/run_tests_parallel.py --changed-files-scope || true)"
         fi

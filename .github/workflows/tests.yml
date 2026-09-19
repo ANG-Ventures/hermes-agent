@@ -4,7 +4,8 @@ name: Tests
 # plugins/<name>/ tree (plus tests/plugins/<name>/) runs that plugin's tests
 # and one pinned gateway/session/config smoke slice. Any other, uncertain,
 # cross-plugin, conftest, pyproject, or workflow path fails open to the full
-# slice_count matrix. Non-PR events, including merge_group, always run full.
+# slice_count matrix. merge_group is scoped the same way, over the batch's
+# base_sha...head_sha union diff; every other non-PR event runs full.
 on:
   workflow_call:
     inputs:
