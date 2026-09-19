@@ -2512,6 +2512,20 @@ class MessageEvent:
     # Proactive plugin events set this to False so untrusted payload text
     # remains conversational input.
     allow_gateway_control: bool = True
+
+    # ---- Native slash-interaction echo handoff --------------------------
+    # Set True by an adapter that owns an OPEN, already-deferred platform
+    # interaction it will answer itself (Discord native slash commands).
+    # The inline command-dispatch paths in handle_message then hand the
+    # gateway's reply back through ``deferred_reply_text`` instead of
+    # publishing a public channel message, so the user gets ONE delivery
+    # (the interaction reply, carrying the gateway's real text) rather
+    # than two — the bug where /queue answered "Queued for the next turn."
+    # both ephemerally (hardcoded in the adapter) and publicly (here).
+    # Adapters that never defer an interaction leave this False and the
+    # public-echo behavior is byte-identical to before.
+    suppress_public_echo: bool = False
+    deferred_reply_text: Optional[str] = None
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -6290,6 +6304,47 @@ class BasePlatformAdapter(ABC):
             return
         self._start_session_processing(pending_event, session_key)
 
+    async def _deliver_inline_command_reply(
+        self,
+        event: MessageEvent,
+        response: Any,
+        *,
+        thread_meta: Any,
+    ) -> None:
+        """Deliver an INLINE command-dispatch reply (not an agent turn).
+
+        The inline paths (busy bypass, interrupt-then-dispatch, clarify
+        text-intercept) call ``self._message_handler(event)`` directly and
+        publish its return value as a channel message.  When the event came
+        from a native platform interaction that the adapter has already
+        DEFERRED and will answer itself (``event.suppress_public_echo``),
+        publishing here is a second delivery of the same text — the
+        duplicate-``/queue`` bug.  In that case hand the text back on the
+        event (``event.deferred_reply_text``) and send nothing; the adapter
+        renders it on the interaction instead.
+
+        For every other event this is byte-identical to the inline send it
+        replaces.
+        """
+        _text, _eph_ttl = self._unwrap_ephemeral(response)
+        if not _text:
+            return
+        if getattr(event, "suppress_public_echo", False):
+            event.deferred_reply_text = _text
+            return
+        _r = await self._send_with_retry(
+            chat_id=event.source.chat_id,
+            content=_text,
+            reply_to=_reply_anchor_for_event(event),
+            metadata=_mark_notify_metadata(thread_meta),
+        )
+        if _eph_ttl > 0 and _r.success and _r.message_id:
+            self._schedule_ephemeral_delete(
+                chat_id=event.source.chat_id,
+                message_id=_r.message_id,
+                ttl_seconds=_eph_ttl,
+            )
+
     async def _dispatch_active_session_command(
         self,
         event: MessageEvent,
@@ -6322,32 +6377,26 @@ class BasePlatformAdapter(ABC):
 
         try:
             response = await self._message_handler(event)
-            _text, _eph_ttl = self._unwrap_ephemeral(response)
             # Send the response BEFORE cancelling the old task so the send
             # cannot be affected by task-cancellation side effects (race
             # condition fix — issue #18912).  Previously the send happened
             # after cancel_session_processing, which could silently drop the
             # "/new" confirmation when an agent was actively running.
+            _text, _ = self._unwrap_ephemeral(response)
             if _text:
                 logger.info(
-                    "[%s] Sending command '/%s' response (%d chars) to %s",
+                    "[%s] Delivering command '/%s' response (%d chars) to %s%s",
                     self.name,
                     cmd,
                     len(_text),
                     event.source.chat_id,
+                    " (via deferred interaction)"
+                    if getattr(event, "suppress_public_echo", False)
+                    else "",
                 )
-                _r = await self._send_with_retry(
-                    chat_id=event.source.chat_id,
-                    content=_text,
-                    reply_to=_reply_anchor_for_event(event),
-                    metadata=_mark_notify_metadata(thread_meta),
-                )
-                if _eph_ttl > 0 and _r.success and _r.message_id:
-                    self._schedule_ephemeral_delete(
-                        chat_id=event.source.chat_id,
-                        message_id=_r.message_id,
-                        ttl_seconds=_eph_ttl,
-                    )
+            await self._deliver_inline_command_reply(
+                event, response, thread_meta=thread_meta,
+            )
             # Old adapter task (if any) is cancelled AFTER the response has
             # been sent — keeps ordering deterministic and avoids the race.
             await self.cancel_session_processing(
@@ -6469,20 +6518,9 @@ class BasePlatformAdapter(ABC):
                 try:
                     _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
                     response = await self._message_handler(event)
-                    _text, _eph_ttl = self._unwrap_ephemeral(response)
-                    if _text:
-                        _r = await self._send_with_retry(
-                            chat_id=event.source.chat_id,
-                            content=_text,
-                            reply_to=_reply_anchor_for_event(event),
-                            metadata=_mark_notify_metadata(_thread_meta),
-                        )
-                        if _eph_ttl > 0 and _r.success and _r.message_id:
-                            self._schedule_ephemeral_delete(
-                                chat_id=event.source.chat_id,
-                                message_id=_r.message_id,
-                                ttl_seconds=_eph_ttl,
-                            )
+                    await self._deliver_inline_command_reply(
+                        event, response, thread_meta=_thread_meta,
+                    )
                 except Exception as e:
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
                 return
@@ -6522,20 +6560,9 @@ class BasePlatformAdapter(ABC):
                             event.source, _reply_anchor_for_event(event)
                         )
                         response = await self._message_handler(event)
-                        _text, _eph_ttl = self._unwrap_ephemeral(response)
-                        if _text:
-                            _r = await self._send_with_retry(
-                                chat_id=event.source.chat_id,
-                                content=_text,
-                                reply_to=_reply_anchor_for_event(event),
-                                metadata=_mark_notify_metadata(_thread_meta),
-                            )
-                            if _eph_ttl > 0 and _r.success and _r.message_id:
-                                self._schedule_ephemeral_delete(
-                                    chat_id=event.source.chat_id,
-                                    message_id=_r.message_id,
-                                    ttl_seconds=_eph_ttl,
-                                )
+                        await self._deliver_inline_command_reply(
+                            event, response, thread_meta=_thread_meta,
+                        )
                     except Exception as e:
                         logger.error(
                             "[%s] Clarify text-intercept dispatch failed: %s",
