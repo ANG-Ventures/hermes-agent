@@ -99,6 +99,21 @@ def is_boot_id_alive(boot_id: str) -> bool:
     return _store.is_boot_id_alive(boot_id)
 
 
+def current_boot_id() -> str:
+    """This process's boot id, or "" when it cannot be computed.
+
+    Shutdown paths use this to scope their durable cancel to their OWN
+    records. Failing to "" preserves the pre-existing unscoped behavior rather
+    than silently skipping a cancel the caller is entitled to make.
+    """
+    try:
+        from gateway.status import get_current_boot_id
+
+        return get_current_boot_id() or ""
+    except Exception:  # pragma: no cover - shutdown must never raise
+        return ""
+
+
 def observability_counters() -> Dict[str, int]:
     return {"sync_fallback_registry_cap": _sync_fallback_registry_cap}
 
@@ -2386,15 +2401,24 @@ def interrupt_all(
     *,
     recoverable: bool = False,
     lock_timeout: float = 0.1,
+    boot_id: Optional[str] = None,
 ) -> int:
     """Signal every running async delegation to stop. Returns how many.
 
     Used on ``/stop`` and gateway shutdown so a dangling background subagent
     can't keep burning tokens with no one listening. The child still emits a
     completion event (status='interrupted') via the normal finalize path.
+
+    ``boot_id`` scopes the DURABLE cancel to the caller's own boot, matching
+    the in-memory half (which only ever signals records in this process's
+    ``_records``). It DEFAULTS to this process's boot id, so the scoping is
+    structural: no shutdown path has to remember to opt in. Pass ``""`` to
+    deliberately cancel across boots.
     """
     count = 0
     caller = _immediate_caller()
+    if boot_id is None:
+        boot_id = current_boot_id()
     with _records_lock:
         targets = [
             r for r in _records.values()
@@ -2413,7 +2437,12 @@ def interrupt_all(
     elif not recoverable:
         # /stop and other explicit parent/user cancellation are terminal,
         # including resume-disabled records without a live handle.
-        _store.cancel_matching(all_active=True, reason=reason, caller=caller)
+        _store.cancel_matching(
+            all_active=True,
+            owner_boot_id=str(boot_id or ""),
+            reason=reason,
+            caller=caller,
+        )
     for r in targets:
         fn = r.get("interrupt_fn")
         if callable(fn):
