@@ -5158,6 +5158,26 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     """
     configured_model = str(cfg.get("model") or "").strip() or None
     configured_provider = str(cfg.get("provider") or "").strip() or None
+    # `delegation.model` is a user-supplied model string like any other entry
+    # point: a config `model.aliases` key (``grok``) or a ``provider/model``
+    # pair must resolve, or the raw word is handed to the child's provider,
+    # 400s, and the fallback chain silently serves a different provider AND
+    # model (measured 2026-09-18). Resolved at READ time, not write time —
+    # delegation config IS the user's file, so pinning it would mean editing
+    # what they typed. An explicit `delegation.provider` still wins.
+    if configured_model:
+        try:
+            from hermes_cli.model_switch import resolve_model_pair_for_storage
+
+            configured_model, configured_provider = resolve_model_pair_for_storage(
+                configured_model, configured_provider
+            )
+        except Exception:  # pragma: no cover - never block a dispatch
+            logger.debug(
+                "delegation.model alias resolution failed for %r",
+                cfg.get("model"),
+                exc_info=True,
+            )
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
     configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
