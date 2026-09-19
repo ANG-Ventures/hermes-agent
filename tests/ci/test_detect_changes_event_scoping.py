@@ -531,3 +531,131 @@ def test_every_needs_outputs_reference_resolves(workflow):
         f"{dangling}. GitHub resolves these to '' — every gated job goes "
         "SKIPPED and CI stays green, so the lane is silently off."
     )
+
+
+# --------------------------------------------------------------------------
+# CONTRACT: the FOURTH hop — `steps.<id>.outputs.<key>` inside CONSUMING
+# workflow files.
+#
+# The chain is four hops, not three:
+#
+#   script $GITHUB_OUTPUT key
+#     -> action.yml `outputs:`                        (pinned above)
+#     -> `steps.<id>.outputs.<key>` in the CONSUMER   (THIS test)
+#     -> job `outputs:` / step `env:`
+#     -> `needs.<job>.outputs.<key>`                  (pinned above)
+#
+# `test_action_outputs_forward_the_same_named_classify_key` only reads
+# action.yml. The consumers carry their OWN `steps.classify.outputs.X`
+# references — ci.yaml's `detect` job forwards 15 of them, docker.yml's gate
+# step reads one in `env:`, nix.yml forwards one — and nothing read those.
+# Measured 2026-09-19 on this branch: renaming ci.yaml's
+# `steps.classify.outputs.python_prod` to `.pythonn_prod` (kills the
+# Playwright/e2e-desktop gate) and docker.yml's `.docker` to `.dockerr`
+# (kills the whole docker build lane) BOTH left the suite at 225 passed.
+#
+# Same fail-CLOSED shape as every other hop: GitHub resolves an unknown step
+# output to "", `"" == 'true'` is false, the lane is SKIPPED, the run is green.
+#
+# Scope is the CLASS, not the three files that happen to consume
+# detect-changes: every job in every workflow and every step list in every
+# local composite action. Refs to remote actions (`actions/upload-artifact@…`)
+# and to `run:` steps are skipped — their output keys are not declared in this
+# repo, so there is nothing to resolve against. Measured: 21 resolvable
+# local-composite refs, 47 run-step refs, 7 remote-action refs, 0 dangling.
+# --------------------------------------------------------------------------
+
+ACTIONS_DIR = REPO_ROOT / ".github" / "actions"
+ACTION_FILES = sorted(ACTIONS_DIR.rglob("action.y*ml"))
+
+_EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+_STEP_OUTPUT_REF = re.compile(r"steps\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)")
+
+
+def _local_composite_outputs(uses: object) -> set[str] | None:
+    """Declared `outputs:` of a local (`./…`) action, else None.
+
+    None means "not resolvable from this repo" — a `run:` step (uses is None)
+    or a pinned third-party action, neither of which declares its outputs here.
+    """
+    if not isinstance(uses, str) or not uses.startswith("./"):
+        return None
+    base = REPO_ROOT / uses[2:]
+    for candidate in (base / "action.yml", base / "action.yaml", base):
+        if candidate.is_file():
+            doc = yaml.safe_load(candidate.read_text(encoding="utf-8"))
+            return set((doc or {}).get("outputs") or {})
+    return set()  # `uses: ./…` pointing at nothing — every ref dangles.
+
+
+def _step_output_refs(node: object) -> set[tuple[str, str]]:
+    """Every `steps.<id>.outputs.<key>` inside a `${{ }}` expression."""
+    text = yaml.safe_dump(node, default_flow_style=False, sort_keys=True)
+    refs: set[tuple[str, str]] = set()
+    for expression in _EXPRESSION.findall(text):
+        refs |= set(_STEP_OUTPUT_REF.findall(expression))
+    return refs
+
+
+def _step_scopes(doc: dict):
+    """(label, steps, node) for each independent `steps.*` namespace.
+
+    A composite action has ONE namespace (`runs.steps`) but references it from
+    the whole file — its top-level `outputs:` block is where the step values
+    escape, so the scanned node is the entire doc, not just `runs:`.
+    """
+    if isinstance(doc.get("runs"), dict):  # a composite action
+        yield "action", doc["runs"].get("steps") or [], doc
+    for job_name, job in (doc.get("jobs") or {}).items():
+        if isinstance(job, dict):
+            yield f"job {job_name}", job.get("steps") or [], job
+
+
+def _dangling_step_output_refs(path: Path) -> list[str]:
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(doc, dict):
+        return []
+    dangling = []
+    for label, steps, node in _step_scopes(doc):
+        uses_by_id = {
+            step["id"]: step.get("uses")
+            for step in steps
+            if isinstance(step, dict) and step.get("id")
+        }
+        for step_id, key in sorted(_step_output_refs(node)):
+            if step_id not in uses_by_id:
+                dangling.append(
+                    f"[{label}] steps.{step_id}.outputs.{key} "
+                    f"(no step with id '{step_id}'; ids: {sorted(uses_by_id)})"
+                )
+                continue
+            declared = _local_composite_outputs(uses_by_id[step_id])
+            if declared is None:
+                continue  # run: step or remote action — not resolvable here.
+            if key not in declared:
+                dangling.append(
+                    f"[{label}] steps.{step_id}.outputs.{key} "
+                    f"({uses_by_id[step_id]} declares {sorted(declared)})"
+                )
+    return dangling
+
+
+@pytest.mark.parametrize(
+    "path",
+    WORKFLOW_FILES + ACTION_FILES,
+    ids=lambda p: str(p.relative_to(REPO_ROOT / ".github")),
+)
+def test_every_step_output_reference_resolves(path):
+    """No `steps.<id>.outputs.<key>` may name a key its action never declares.
+
+    Checked for refs the repo can resolve: a step whose `uses:` is a local
+    composite action. GitHub resolves an unknown step output to "" with no
+    warning, so the consuming `if:`/`env:` sees the empty string, the lane
+    goes OFF, and the run stays green — the fail-CLOSED direction.
+    """
+    dangling = _dangling_step_output_refs(path)
+    assert not dangling, (
+        f"{path.relative_to(REPO_ROOT)} reads step outputs that are never "
+        f"declared: {dangling}. These resolve to '' at runtime — the gated "
+        "lane is silently skipped and CI still reports green."
+    )
