@@ -38,6 +38,17 @@ jobs:
         run: gh extension install drogers0/gh-image --pin v1.2.0
 
       - name: Download and attach evidence
+        # Best-effort: this workflow is not in ``all-checks-pass.needs`` and
+        # not a required context, so it gates nothing. Every call in this step
+        # spends the shared installation rate-limit budget, and when that
+        # budget ran out on 2026-09-19 the step failed 10 times and painted a
+        # red X on PRs that had nothing wrong with them. A missing evidence
+        # attachment is not a reason to report failure.
+        #
+        # The OSV scan's SARIF upload is deliberately NOT given the same
+        # treatment: ``osv-scanner`` IS in ``all-checks-pass.needs``, so
+        # silencing it would hide a required check.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
