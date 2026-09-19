@@ -15,17 +15,38 @@ jobs:
     # One larger runner installs one time. vitest, tsc and eslint each size
     # their own worker pool from the core count.
     #
-    # fork 2026-09-16: NOT routed through CI_RUNNER_LABELS. This job is
-    # explicitly designed for a big runner (see above), and the ACE-AI pool
-    # caps each container at 4 CPU / 8g (ci-runner-pool.sh). The
-    # `apps/desktop :: check:test:ui` leg alone runs 683 vitest files and sits
-    # right on that ceiling: measured PASS at 223.2s on a PR head, then killed
-    # with no vitest summary at 238.0s and again at 271.5s on merge_group refs,
-    # where the queue runs the full matrix concurrently. A `rerun --failed`
-    # came back 34 success / 0 failure on the same commit, so this is capacity,
-    # not content — and it ejected the PR from the merge queue twice. Stays
-    # GitHub-hosted until the pool gets a bigger sizing for this repo
-    # (tracked separately).
+    # fork 2026-09-16: NOT routed through CI_RUNNER_LABELS. Pinned after the
+    # `apps/desktop :: check:test:ui` leg died twice on merge_group refs with no
+    # vitest summary (238.0s, 271.5s), while a `rerun --failed` on the same
+    # commit came back 34 success / 0 failure.
+    #
+    # fork 2026-09-18: the original "4 CPU / 8g container ceiling" reading was
+    # MEASURED AND FALSIFIED. Replayed this exact job at 5f7235803f inside the
+    # real pool container shape (`--cpus 4 --memory 8g`, node:26-bookworm) on
+    # ACE-AI:
+    #   * full run-workspace-checks.mjs, idle host:  all 10 checks pass,
+    #     check:test:ui 307.8s / 229.3s
+    #   * same, with 3 extra pool-shaped containers pinning the host at
+    #     load ~80: all 10 checks pass, check:test:ui stretches to 511.0s
+    #   * check:test:ui alone, 3x and 4x concurrently: 7/7 exit 0
+    # Peak container memory was 2.1 GiB of the 8 GiB cap and the cgroup reports
+    # `oom_kill 0` — the job is not close to the memory ceiling, so a bigger
+    # MEM_LIMIT buys nothing. Node 26 already honours the CPU quota
+    # (`availableParallelism()` = 4 under `--cpus 4`), so the worker pools are
+    # sized correctly and are not oversubscribing.
+    #
+    # Contention only makes this leg SLOWER, never red, and the 30 min timeout
+    # has 4x headroom over the worst measured run. What the failing log actually
+    # shows is a run that stops mid-flight with no summary and no per-file result
+    # line at all — a different signature from a resource kill, and one that did
+    # not reproduce in 8 replays. The real standing risk is that the host is
+    # oversubscribed 106 committed vCPU / 232g across six pools on 24 cores and
+    # 121g, so a pool container can be starved by its neighbours at any sizing.
+    #
+    # Stays GitHub-hosted: raising CPU_LIMIT/MEM_LIMIT for this repo would not
+    # have fixed the observed failure, and would have deepened that host
+    # oversubscription. Re-pointing this at the pool needs the mid-flight death
+    # root-caused first, not a bigger box.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
