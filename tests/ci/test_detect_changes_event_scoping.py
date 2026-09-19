@@ -26,6 +26,7 @@ The property under test:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -402,4 +403,131 @@ def test_classify_env_never_reads_merge_group_base_sha():
         f"via {offenders} — base_sha is the PREVIOUS queue candidate, so "
         "diffing from it yields only the topmost entry's delta and under-tests "
         "every other member of the batch."
+    )
+
+
+# --------------------------------------------------------------------------
+# CONTRACT: the action's top-level `outputs:` BLOCK, and the whole hop chain
+# from the script's $GITHUB_OUTPUT keys to every consuming `if:`.
+#
+# The env: seam above is only half of the plumbing the suite could not see.
+# The tests read $GITHUB_OUTPUT directly, so they prove the SCRIPT emits
+# `python=true` — nothing proves the action re-exports it as `outputs.python`,
+# nor that `needs.detect.outputs.python` resolves to anything at all. There
+# are three renameable hops:
+#
+#   script key  ->  action outputs:  ->  job outputs:  ->  needs.<job>.outputs
+#
+# A typo or rename at any hop makes the consuming `if:` evaluate the empty
+# string, and empty is falsey, so the lane silently goes OFF. That fails
+# CLOSED — the dangerous direction: the env: seam under-diffs loudly-wrong,
+# this one skips a required check while CI stays green.
+#
+# These assert DERIVED invariants (emitted set == declared set, and every
+# reference resolves), not a frozen 17-name list: adding a genuine new lane
+# must stay a one-line change, while a rename that breaks a hop must fail.
+# --------------------------------------------------------------------------
+
+
+def _action_doc() -> dict:
+    return yaml.safe_load(ACTION.read_text(encoding="utf-8"))
+
+
+def _emitted_output_keys(tmp_path: Path) -> set[str]:
+    """Keys the action's script actually writes to $GITHUB_OUTPUT."""
+    outputs, _, _ = _run(tmp_path, {"EVENT_NAME": "push"}, ["hermes/agent.py"])
+    return set(outputs)
+
+
+def test_action_outputs_are_exactly_what_the_script_emits(tmp_path):
+    """Declared outputs must match the script's emitted keys, both ways.
+
+    Declared-but-never-emitted -> the consuming `if:` reads "" -> lane OFF.
+    Emitted-but-undeclared     -> the value dies at the action boundary.
+    """
+    emitted = _emitted_output_keys(tmp_path)
+    declared = set(_action_doc()["outputs"])
+    assert declared == emitted, (
+        "detect-changes action.yml outputs: block is out of sync with the "
+        f"script: declared-but-not-emitted {sorted(declared - emitted)} "
+        f"(consumers read '' and the lane silently goes OFF), "
+        f"emitted-but-not-declared {sorted(emitted - declared)} "
+        "(the value never escapes the composite action)."
+    )
+
+
+def test_action_outputs_forward_the_same_named_classify_key():
+    """Each `outputs.X` must forward `steps.classify.outputs.X` — same name.
+
+    Cross-wiring (outputs.nix reading steps.classify.outputs.site) type-checks
+    fine in YAML and runs the wrong lanes.
+    """
+    mismatched = {
+        name: spec.get("value")
+        for name, spec in _action_doc()["outputs"].items()
+        if str(spec.get("value", "")).strip()
+        != "${{ steps.classify.outputs.%s }}" % name
+    }
+    assert not mismatched, (
+        f"detect-changes action.yml outputs: {mismatched} — each output must "
+        "forward the identically-named key of the classify step. A rename or "
+        "cross-wire here resolves to '' (lane OFF) or to another lane's value."
+    )
+
+
+def _workflow_job_outputs(doc: dict, job_name: str) -> set[str] | None:
+    """Outputs a job exposes to `needs.<job>.outputs.*`, or None if no job.
+
+    A `uses:` (reusable-workflow) job exposes the CALLED workflow's
+    `on.workflow_call.outputs`, not anything in the calling file.
+    """
+    job = (doc.get("jobs") or {}).get(job_name)
+    if job is None:
+        return None
+    called = job.get("uses")
+    if isinstance(called, str) and called.startswith("./"):
+        called_doc = yaml.safe_load(
+            (REPO_ROOT / called[2:]).read_text(encoding="utf-8")
+        )
+        # PyYAML parses a bare `on:` key as the boolean True.
+        triggers = called_doc.get("on", called_doc.get(True)) or {}
+        return set((triggers.get("workflow_call") or {}).get("outputs") or {})
+    return set(job.get("outputs") or {})
+
+
+WORKFLOW_FILES = sorted(
+    p
+    for p in (REPO_ROOT / ".github" / "workflows").iterdir()
+    if p.suffix in (".yml", ".yaml")
+)
+
+
+@pytest.mark.parametrize("workflow", WORKFLOW_FILES, ids=lambda p: p.name)
+def test_every_needs_outputs_reference_resolves(workflow):
+    """No `needs.<job>.outputs.<key>` may reference an undeclared key.
+
+    This is the last hop and the one with no schema behind it: GitHub silently
+    resolves an unknown output to "", every `if:` comparing it to 'true' goes
+    false, and the job is SKIPPED while the run stays green.
+    """
+    text = workflow.read_text(encoding="utf-8")
+    doc = yaml.safe_load(text)
+    if not isinstance(doc, dict) or not doc.get("jobs"):
+        pytest.skip(f"{workflow.name} declares no jobs")
+    dangling = []
+    for job_name, key in sorted(
+        set(re.findall(r"needs\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)", text))
+    ):
+        declared = _workflow_job_outputs(doc, job_name)
+        if declared is None:
+            dangling.append(f"needs.{job_name}.outputs.{key} (no job '{job_name}')")
+        elif key not in declared:
+            dangling.append(
+                f"needs.{job_name}.outputs.{key} "
+                f"(job '{job_name}' declares {sorted(declared)})"
+            )
+    assert not dangling, (
+        f"{workflow.name} reads workflow outputs that are never declared: "
+        f"{dangling}. GitHub resolves these to '' — every gated job goes "
+        "SKIPPED and CI stays green, so the lane is silently off."
     )
