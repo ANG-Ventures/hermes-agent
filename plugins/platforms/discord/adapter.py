@@ -6346,12 +6346,48 @@ class DiscordAdapter(BasePlatformAdapter):
                 command_text,
             )
         event = self._build_slash_event(interaction, command_text)
+        # This interaction is deferred and WE will answer it below. Tell the
+        # base adapter's inline command-dispatch paths (busy bypass,
+        # interrupt-then-dispatch, clarify intercept) to hand their reply
+        # back on the event instead of publishing a public channel message —
+        # otherwise the same text is delivered twice (public + ephemeral),
+        # which is the duplicate "Queued for the next turn." bug. Only set
+        # when the defer succeeded: an expired interaction has no ephemeral
+        # surface left, so the public echo is the user's ONLY delivery and
+        # must not be suppressed.
+        if deferred_response:
+            event.suppress_public_echo = True
         await self.handle_message(event)
         if not deferred_response:
             return
+        # Prefer the gateway's OWN reply over the hardcoded followup: it
+        # carries the real outcome (e.g. "Queued for the next turn. (2
+        # queued)" depth suffix, or a usage error) instead of a static
+        # string that can contradict it. Fall back to followup_msg when the
+        # gateway produced no text for this path (e.g. the idle path, where
+        # the answer arrives later as a normal channel message) — that is
+        # what followup_msg exists for.
+        gateway_text = getattr(event, "deferred_reply_text", None)
+        if gateway_text and len(gateway_text) > self.MAX_MESSAGE_LENGTH:
+            # Too long for a single interaction response (Discord rejects
+            # >2000 chars with error 50035). Publish it on the channel the
+            # way the suppressed public echo would have — send() chunks —
+            # and keep the interaction reply short.
+            try:
+                await self._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=gateway_text,
+                )
+            except Exception as e:
+                logger.error(
+                    "[%s] slash %s: oversized reply publish failed: %s",
+                    self.name, command_text, e,
+                )
+            gateway_text = None
+        reply_text = gateway_text or followup_msg
         try:
-            if followup_msg:
-                await interaction.edit_original_response(content=followup_msg)
+            if reply_text:
+                await interaction.edit_original_response(content=reply_text)
             else:
                 await interaction.delete_original_response()
         except Exception as e:
