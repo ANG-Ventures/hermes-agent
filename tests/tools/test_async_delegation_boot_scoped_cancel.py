@@ -184,3 +184,39 @@ def test_spared_record_can_still_deliver_its_terminal_result():
         event.get("type") == "async_delegation" and event.get("state") == "pending"
         for event in stored["outbox"]
     )
+
+
+def test_interrupt_all_scopes_by_default_without_an_explicit_boot_id():
+    """The PRODUCTION callers pass no boot_id at all.
+
+    ``hermes_cli/main.py:_cleanup_oneshot_runtime`` calls
+    ``interrupt_all(reason="oneshot shutdown")`` and
+    ``cli_commands_mixin.py`` calls ``interrupt_all(reason="/stop")`` — neither
+    supplies ``boot_id``. The scoping is only structural if the DEFAULT scopes;
+    every other test in this file passes ``boot_id=`` explicitly and therefore
+    cannot see a regression that makes the default unscoped.
+
+    Guard C: this fails if ``boot_id=None`` stops resolving to
+    ``current_boot_id()`` (e.g. defaulted back to ``""``), which is exactly the
+    unscoped behavior that killed 3 completed workers' results.
+    """
+    foreign = "99999:1.0"
+    assert not ad.is_boot_id_alive(foreign) or foreign != get_current_boot_id()
+    # A record owned by a DIFFERENT, LIVE boot. Use this process as the live
+    # foreign owner and drive interrupt_all the way production does: no kwarg.
+    _write(_record("deleg_default", owner_boot_id=get_current_boot_id()))
+
+    # Simulate the one-shot: its own boot id differs from the record's owner.
+    original = ad.current_boot_id
+    ad.current_boot_id = lambda: "oneshot:0.0"
+    try:
+        ad.interrupt_all(reason="oneshot shutdown")
+    finally:
+        ad.current_boot_id = original
+
+    stored = _load("deleg_default")
+    assert stored["state"] == "running", (
+        "interrupt_all() with NO boot_id kwarg must default to the caller's "
+        "own boot and spare another live boot's record"
+    )
+    assert "cancel_attribution" not in stored
