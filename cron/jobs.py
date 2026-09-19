@@ -2765,27 +2765,29 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             # Resolve a config `model.aliases` key / `provider/model` pair the
             # same way create_job does, so `cron edit --model grok` cannot
             # re-introduce a raw alias the create path just eliminated.
-            # Deliberately narrow: the stored value is rewritten ONLY when
-            # resolution actually changes the model, so every other update
-            # semantic here (notably `--model ""` clearing the pin, which is
-            # stored verbatim) is untouched. When the model resolves, the
-            # provider it implies is written alongside it — a resolved model
-            # left against the OLD provider is the exact mismatch this
-            # resolution exists to prevent.
+            #
+            # The explicit-provider slot takes a provider THIS update asserts
+            # (`--model grok --provider claude-apr`), never the one the job
+            # merely has stored: a stored value is the PREVIOUS model's
+            # provider, and letting it win means `cron edit --model grok`
+            # pins grok-4.6 to claude-apr. For the same reason the resolved
+            # provider is written unconditionally when the model changes at
+            # all — including to None — rather than only when it is truthy,
+            # so a new model never inherits the old model's backend.
+            #
+            # No "only if the model string changed" narrowing: a self-named
+            # alias (key == target model id) resolves the PROVIDER while
+            # leaving the model byte-identical, and that write must land.
+            # `--model ""` clears the pin and is deliberately untouched here.
             if "model" in updates and isinstance(updates["model"], str):
                 _raw_model = updates["model"].strip()
                 if _raw_model:
                     _m, _p = _resolve_stored_model_pair(
                         _raw_model,
-                        _normalize_job_optional_text(
-                            updates["provider"] if "provider" in updates
-                            else job.get("provider")
-                        ),
+                        _normalize_job_optional_text(updates.get("provider")),
                     )
-                    if _m != _raw_model:
-                        updates["model"] = _m
-                        if _p:
-                            updates["provider"] = _p
+                    updates["model"] = _m
+                    updates["provider"] = _p
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})

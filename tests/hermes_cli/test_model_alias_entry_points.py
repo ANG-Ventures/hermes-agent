@@ -40,6 +40,13 @@ def _direct_alias_grok(monkeypatch):
         merged["grok"] = ms.DirectAlias(
             model="grok-4.6", provider="xai-oauth", base_url=""
         )
+        # A SELF-NAMED alias: the key equals the model id it targets, so
+        # resolution changes the PROVIDER while leaving the model string
+        # byte-identical. Any "only rewrite when the model changed" narrowing
+        # drops the provider half here.
+        merged["grok-4.6"] = ms.DirectAlias(
+            model="grok-4.6", provider="xai-oauth", base_url=""
+        )
         return merged, True
 
     monkeypatch.setattr(ms, "_load_direct_aliases", _loader)
@@ -302,3 +309,156 @@ def test_delegation_config_plain_model_is_untouched():
         {"model": "claude-opus-5"}, parent_agent=None
     )
     assert creds["model"] == "claude-opus-5"
+
+
+# ---------------------------------------------------------------------------
+# CLASS SWEEP — the PROVIDER half of the pair
+#
+# Round 1 resolved the MODEL everywhere but left the provider wrong at two
+# sites. The class is: "the resolved model is written, the provider half is
+# left stale (or a STORED provider is wrongly treated as an EXPLICIT user
+# assertion)". These lock every site that writes a model+provider pair so a
+# new model can never land against the previous model's provider.
+# ---------------------------------------------------------------------------
+
+def test_kanban_set_task_model_does_not_leave_a_stale_provider(kanban_home):
+    """`kanban edit --model X` on a card already pinned to another provider.
+
+    X resolves to no provider of its own, so the OLD provider must be cleared,
+    not kept — a new model against the old backend is exactly the mismatch
+    this resolution exists to kill.
+    """
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="x", assignee="worker", model_override="grok"
+        )
+        assert kb.get_task(conn, tid).provider_override == "xai-oauth"
+        assert kb.set_task_model(conn, tid, "claude-opus-5") == 1
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert (task.model_override, task.provider_override) == ("claude-opus-5", None)
+
+
+def test_kanban_edit_then_spawn_never_emits_a_mismatched_pair(
+    kanban_home, monkeypatch
+):
+    """End of the chain for the same sequence: what actually spawns."""
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="spawn", assignee="worker", model_override="grok"
+        )
+        assert kb.set_task_model(conn, tid, "claude-opus-5") == 1
+        task = kb.get_task(conn, tid)
+
+    captured: dict = {}
+
+    class FakeProc:
+        pid = 4242
+
+    def fake_popen(cmd, *a, **kw):
+        captured["cmd"] = list(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    kb._default_spawn(task, str(kb.resolve_workspace(task)))
+    argv = captured["cmd"]
+    assert argv[argv.index("-m") + 1] == "claude-opus-5"
+    assert "xai-oauth" not in argv
+
+
+def test_kanban_set_task_model_clear_also_clears_the_provider(kanban_home):
+    """Clearing the model must not strand the provider it was pinned with."""
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="x", assignee="worker", model_override="grok"
+        )
+        assert kb.set_task_model(conn, tid, None) == 1
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert (task.model_override, task.provider_override) == (None, None)
+
+
+def test_kanban_set_task_model_selfnamed_alias_updates_the_provider(kanban_home):
+    """Self-named alias: the model string does not change, the provider does."""
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        assert kb.set_task_model(conn, tid, "grok-4.6") == 1
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert (task.model_override, task.provider_override) == ("grok-4.6", "xai-oauth")
+
+
+def test_kanban_set_model_override_does_not_leave_a_stale_provider(kanban_home):
+    """The sibling setter — same invariant, asserted rather than assumed."""
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="x", assignee="worker", model_override="grok"
+        )
+        assert kb.set_model_override(conn, tid, "claude-opus-5") is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert (task.model_override, task.provider_override) == ("claude-opus-5", None)
+
+
+def test_cron_update_model_only_does_not_keep_the_old_provider(cron_home):
+    """`cron edit --model grok` on a claude-apr-pinned job.
+
+    The job's STORED provider is not an explicit assertion by this update, so
+    it must not win over the provider the alias implies.
+    """
+    from cron import jobs as cj
+
+    job = cj.create_job(
+        prompt="ping", schedule="in 1 hour",
+        model="claude-opus-5", provider="claude-apr",
+    )
+    assert job["provider"] == "claude-apr"
+    updated = cj.update_job(job["id"], {"model": "grok"})
+    assert (updated["model"], updated["provider"]) == ("grok-4.6", "xai-oauth")
+    reloaded = [j for j in cj.load_jobs() if j["id"] == job["id"]][0]
+    assert (reloaded["model"], reloaded["provider"]) == ("grok-4.6", "xai-oauth")
+
+
+def test_cron_update_explicit_provider_in_the_same_edit_still_wins(cron_home):
+    """`cron edit --model grok --provider claude-apr` — THIS update asserts it."""
+    from cron import jobs as cj
+
+    job = cj.create_job(prompt="ping", schedule="in 1 hour")
+    updated = cj.update_job(
+        job["id"], {"model": "grok", "provider": "claude-apr"}
+    )
+    assert (updated["model"], updated["provider"]) == ("grok-4.6", "claude-apr")
+
+
+def test_cron_update_selfnamed_alias_updates_the_provider(cron_home):
+    """The `_m != _raw_model` narrowing drops the provider half here."""
+    from cron import jobs as cj
+
+    job = cj.create_job(
+        prompt="ping", schedule="in 1 hour",
+        model="claude-opus-5", provider="claude-apr",
+    )
+    updated = cj.update_job(job["id"], {"model": "grok-4.6"})
+    assert (updated["model"], updated["provider"]) == ("grok-4.6", "xai-oauth")
+
+
+def test_cron_update_unresolvable_model_clears_the_stale_provider(cron_home):
+    """A model that resolves to nothing must not inherit the old provider."""
+    from cron import jobs as cj
+
+    job = cj.create_job(
+        prompt="ping", schedule="in 1 hour", model="grok",
+    )
+    assert job["provider"] == "xai-oauth"
+    updated = cj.update_job(job["id"], {"model": "some-local-model"})
+    assert (updated["model"], updated["provider"]) == ("some-local-model", None)

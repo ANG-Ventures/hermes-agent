@@ -9452,28 +9452,27 @@ def set_task_model(
     NULL (clears the override). The DB layer does NOT interpret ``""`` —
     empty-string handling is a CLI concern.
 
-    Note this setter writes ``model_override`` only. When alias resolution
-    yields a provider, it is written to ``provider_override`` in the same
-    statement, because a resolved model without its provider is exactly the
-    mismatch this resolution exists to prevent.
+    This setter always writes BOTH columns in one statement, exactly like
+    :func:`set_model_override`. Writing ``model_override`` alone would leave
+    whatever ``provider_override`` the PREVIOUS model was pinned with, so
+    ``edit --model claude-opus-5`` on a card pinned to ``xai-oauth`` would
+    spawn that model against xAI — the exact mismatch this resolution exists
+    to prevent. It is also an illegal card state: every other writer here
+    rejects a ``provider_override`` without a ``model_override``.
 
     Returns the number of rows affected: a call against a nonexistent
     ``task_id`` returns ``0`` (never a silent success), so callers can tell
     a real write from a no-op.
     """
     resolved_model, resolved_provider = _resolve_stored_model_pair(model, None)
+    if not resolved_model:
+        resolved_provider = None
     with write_txn(conn):
-        if resolved_provider:
-            cur = conn.execute(
-                "UPDATE tasks SET model_override = ?, provider_override = ? "
-                "WHERE id = ?",
-                (resolved_model, resolved_provider, task_id),
-            )
-        else:
-            cur = conn.execute(
-                "UPDATE tasks SET model_override = ? WHERE id = ?",
-                (resolved_model, task_id),
-            )
+        cur = conn.execute(
+            "UPDATE tasks SET model_override = ?, provider_override = ? "
+            "WHERE id = ?",
+            (resolved_model, resolved_provider, task_id),
+        )
     return int(cur.rowcount or 0)
 
 
