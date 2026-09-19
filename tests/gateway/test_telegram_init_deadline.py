@@ -12,39 +12,54 @@ async def test_await_with_thread_deadline_abandons_and_runs_cleanup_on_timeout()
 
     This exercises the REAL _await_with_thread_deadline (not a monkeypatched
     stub), covering the abandonment + cleanup mechanism directly.
+
+    DETERMINISTIC ORDERING WITNESS — replaces ``assert elapsed < 0.8``.
+    Measured idle: 0.324 / 0.347 / 0.304s against a 0.8 bound — only ~2.3x of
+    headroom over a 0.2s timeout, i.e. the ceiling was mostly measuring loop
+    scheduling and would flip on a loaded runner with nothing wrong.
+
+    The fact the stopwatch stood in for is ordering: the helper must return
+    control while the cancellation-swallowing coroutine is STILL running.
+    ``wedged_returned`` is set on every exit path of that coroutine and is
+    asserted UNSET at the instant TimeoutError surfaces.
     """
     import asyncio as _asyncio
-    import time as _time
 
     cleanup_ran = _asyncio.Event()
+    wedged_returned = _asyncio.Event()  # set on EVERY exit path of the wedged coro
 
     async def _wedged():
         # Swallows cancellation for a bounded window — long enough that the
         # helper must return control BEFORE this finishes (proving it doesn't
         # await cancellation, the #58236 shielded-scope behavior), but bounded
         # so the abandoned task can't outlive the test and wedge teardown.
-        for _ in range(20):
-            try:
-                await _asyncio.sleep(0.05)
-            except _asyncio.CancelledError:
-                # Keep going despite cancellation, like the shielded scope.
-                pass
+        try:
+            for _ in range(20):
+                try:
+                    await _asyncio.sleep(0.05)
+                except _asyncio.CancelledError:
+                    # Keep going despite cancellation, like the shielded scope.
+                    pass
+        finally:
+            wedged_returned.set()
 
     async def _cleanup():
         cleanup_ran.set()
 
-    started = _time.monotonic()
     with pytest.raises(_asyncio.TimeoutError):
         await tg_adapter._await_with_thread_deadline(
             _wedged(), timeout=0.2, on_abandon=_cleanup
         )
-    elapsed = _time.monotonic() - started
 
-    # Returned control promptly — well before the wedged coroutine's ~1s span.
-    assert elapsed < 0.8
+    assert not wedged_returned.is_set(), (
+        "TimeoutError surfaced only AFTER the wedged awaitable finished — the "
+        "helper awaited cancellation instead of abandoning the task"
+    )
     # The detached cleanup was scheduled; give the loop a tick to run it.
-    await _asyncio.wait_for(cleanup_ran.wait(), timeout=2.0)
+    await _asyncio.wait_for(cleanup_ran.wait(), timeout=10.0)
     assert cleanup_ran.is_set()
+    # Let the abandoned task finish so it can't outlive the test.
+    await _asyncio.wait_for(wedged_returned.wait(), timeout=10.0)
 
 
 @pytest.mark.asyncio
