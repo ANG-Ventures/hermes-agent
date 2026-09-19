@@ -328,3 +328,78 @@ def test_merge_group_chained_batch_uses_union_not_topmost_delta(tmp_path):
     assert outputs["scan"] == "true"
     # A multi-tree union must never resolve to a single plugin's scope.
     assert outputs["test_scope"] == "full"
+
+
+# --------------------------------------------------------------------------
+# CONTRACT: the step's env: BLOCK, not just its run: script.
+#
+# `_action_script()` above extracts only `step["run"]`, so every test in this
+# file injects MG_BASE_REF/PR_BASE_SHA itself. That makes the *binding* — WHICH
+# payload field each env var reads — invisible to the suite: mutating
+# `MG_BASE_REF: ${{ github.event.merge_group.base_ref }}` to `.base_sha` on
+# action.yml left all 19 tests green (measured 2026-09-19). That one line IS
+# the defect this action exists to fix, so it gets pinned lexically here.
+#
+# A lexical equality assert is deliberate: the point is pinning the field name,
+# not the behaviour downstream of it.
+# --------------------------------------------------------------------------
+
+# Every env var of the classify step, mapped to the EXACT expression that must
+# produce it. Payload-derived entries are the load-bearing ones; the rest are
+# included so the dict is the whole block and a drift anywhere trips.
+EXPECTED_CLASSIFY_ENV = {
+    "GH_TOKEN": "${{ inputs.github-token || github.token }}",
+    "REPO": "${{ github.repository }}",
+    "EVENT_NAME": "${{ github.event_name }}",
+    "PR_BASE_SHA": "${{ github.event.pull_request.base.sha }}",
+    "PR_HEAD_SHA": "${{ github.event.pull_request.head.sha }}",
+    # base_REF (the target branch), NOT base_sha (the previous chained queue
+    # candidate) — see the SAFETY ARGUMENT in the action.
+    "MG_BASE_REF": "${{ github.event.merge_group.base_ref }}",
+    "MG_HEAD_SHA": "${{ github.event.merge_group.head_sha }}",
+}
+
+
+def _classify_step_env() -> dict[str, str]:
+    doc = yaml.safe_load(ACTION.read_text(encoding="utf-8"))
+    (step,) = [s for s in doc["runs"]["steps"] if s.get("id") == "classify"]
+    return dict(step["env"])
+
+
+@pytest.mark.parametrize("var", sorted(EXPECTED_CLASSIFY_ENV))
+def test_classify_env_binds_the_exact_payload_field(var):
+    """Each env var must read the exact expression it is pinned to."""
+    actual = _classify_step_env().get(var)
+    expected = EXPECTED_CLASSIFY_ENV[var]
+    assert actual == expected, (
+        f"detect-changes classify step: env {var} reads {actual!r}, "
+        f"must read {expected!r}. The classifier's whole correctness argument "
+        f"rests on WHICH payload field each var binds; the run: script cannot "
+        f"see this, so changing it here silently changes what CI diffs."
+    )
+
+
+def test_classify_env_block_has_no_unpinned_vars():
+    """A new env var must be pinned above, not merely added to the action."""
+    actual = set(_classify_step_env())
+    expected = set(EXPECTED_CLASSIFY_ENV)
+    assert actual == expected, (
+        "detect-changes classify step env: block drifted — "
+        f"added {sorted(actual - expected)}, removed {sorted(expected - actual)}. "
+        "Pin any new payload-derived var in EXPECTED_CLASSIFY_ENV."
+    )
+
+
+def test_classify_env_never_reads_merge_group_base_sha():
+    """The chained-candidate field must appear in NO binding, under any name."""
+    offenders = {
+        name: expr
+        for name, expr in _classify_step_env().items()
+        if "merge_group.base_sha" in expr
+    }
+    assert not offenders, (
+        f"detect-changes classify step binds github.event.merge_group.base_sha "
+        f"via {offenders} — base_sha is the PREVIOUS queue candidate, so "
+        "diffing from it yields only the topmost entry's delta and under-tests "
+        "every other member of the batch."
+    )
