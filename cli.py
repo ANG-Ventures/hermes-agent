@@ -5237,6 +5237,31 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # through MoA instead of hitting the real provider with an unknown
         # model (#56828). A ``moa:`` prefix wins over an explicit ``--provider``.
         _moa_provider_override, self.model = _normalize_moa_model(self.model)
+        # Resolve `-m <alias>` / `-m <provider>/<model>` exactly like the
+        # interactive `/model` command would (config `model.aliases` +
+        # inline provider qualification). Without this the raw string went
+        # to the current provider, 400'd, and the fallback chain silently
+        # served a different provider+model with only a one-line banner.
+        # Applies ONLY to an explicit CLI arg; config `model.default` is
+        # already a concrete id. A ``moa:`` prefix was handled above.
+        _inline_provider_override: Optional[str] = None
+        if model and not _moa_provider_override:
+            from hermes_cli.model_switch import resolve_startup_model_arg
+            _cfg_provider_for_alias = (
+                provider
+                or _nested_provider
+                or CLI_CONFIG["model"].get("provider")
+                or ""
+            )
+            _inline_provider_override, self.model = resolve_startup_model_arg(
+                self.model,
+                _cfg_provider_for_alias,
+                CLI_CONFIG.get("providers") if isinstance(CLI_CONFIG.get("providers"), dict) else None,
+                CLI_CONFIG.get("custom_providers") if isinstance(CLI_CONFIG.get("custom_providers"), list) else None,
+            )
+            if provider and _inline_provider_override and _inline_provider_override != provider:
+                # `--provider X -m Y/model`: the explicit flag wins, like /model.
+                _inline_provider_override = None
         # Read max_tokens from config (env var override: HERMES_MAX_TOKENS)
         _env_mt = os.environ.get("HERMES_MAX_TOKENS")
         if _env_mt:
@@ -5274,6 +5299,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.requested_provider = (
             _moa_provider_override
             or provider
+            or _inline_provider_override
             or _nested_provider
             or CLI_CONFIG["model"].get("provider")
             or os.getenv("HERMES_INFERENCE_PROVIDER")
