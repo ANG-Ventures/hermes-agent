@@ -17,19 +17,29 @@ class _BlockingStream:
     def __init__(self, started: threading.Event) -> None:
         self.started = started
         self.closed = threading.Event()
+        # Set on EVERY exit path of the silent transport call. The ordering
+        # witness the cancellation tests assert against: the cancelled owner
+        # must unwind while this is still UNSET.
+        self.returned = threading.Event()
 
     def __iter__(self):
         self.started.set()
-        self.closed.wait(timeout=5)
-        raise RuntimeError("transport closed")
+        try:
+            self.closed.wait(timeout=5)
+            raise RuntimeError("transport closed")
+        finally:
+            self.returned.set()
 
     def close(self) -> None:
         self.closed.set()
 
     def get_final_message(self) -> Any:
         self.started.set()
-        self.closed.wait(timeout=5)
-        raise RuntimeError("transport closed")
+        try:
+            self.closed.wait(timeout=5)
+            raise RuntimeError("transport closed")
+        finally:
+            self.returned.set()
 
 
 class _GenericCompletions:
@@ -107,20 +117,25 @@ class _BedrockRuntimeClient:
         self.started = started
         self.release = release
         self.closed = threading.Event()
+        # See _BlockingStream.returned — same ordering witness.
+        self.returned = threading.Event()
 
     def converse(self, **_kwargs: Any) -> dict[str, Any]:
         self.started.set()
-        self.release.wait(timeout=5)
-        return {
-            "output": {
-                "message": {
-                    "role": "assistant",
-                    "content": [{"text": "cancelled response"}],
-                }
-            },
-            "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
-            "stopReason": "end_turn",
-        }
+        try:
+            self.release.wait(timeout=5)
+            return {
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"text": "cancelled response"}],
+                    }
+                },
+                "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+                "stopReason": "end_turn",
+            }
+        finally:
+            self.returned.set()
 
     def close(self) -> None:
         self.closed.set()
@@ -130,7 +145,23 @@ def _cancel_silent_request(
     client: Any,
     started: threading.Event,
     invoke: Callable[[Any], Any],
-) -> tuple[BaseException, float]:
+    transport_returned: threading.Event,
+) -> BaseException:
+    """Cancel a request parked in a silent transport and witness the unwind.
+
+    DETERMINISTIC ORDERING WITNESS — replaces the ``elapsed`` this helper used
+    to return for four ``assert elapsed < 0.75`` call sites. Measured idle
+    across the four: worst 0.000 / 0.140 / 0.110 / 0.153s. The two that idle
+    at ~0.15s sat only ~5x under their bound while the poll loop that drives
+    them ticks every 20ms, so the ceiling was measuring owner-poll cadence
+    plus thread scheduling, not the behavior.
+
+    The fact the stopwatch stood in for is ordering: the cancelled owner must
+    unwind while the provider transport is STILL parked.
+    ``transport_returned`` is set on every exit path of that transport, and is
+    asserted UNSET at the instant the owner thread finishes — a fact only the
+    code under test can trip.
+    """
     cancel_event = threading.Event()
     result: dict[str, BaseException] = {}
 
@@ -143,13 +174,15 @@ def _cancel_silent_request(
 
     worker = threading.Thread(target=_worker, daemon=True)
     worker.start()
-    assert started.wait(timeout=1), "request never entered its silent transport"
-    cancelled_at = time.monotonic()
+    assert started.wait(timeout=10), "request never entered its silent transport"
     cancel_event.set()
-    worker.join(timeout=1)
-    elapsed = time.monotonic() - cancelled_at
+    worker.join(timeout=10)
     assert not worker.is_alive(), "explicit cancellation did not wake the silent request"
-    return result["exc"], elapsed
+    assert not transport_returned.is_set(), (
+        "the owner unwound only AFTER the silent provider transport returned — "
+        "cancellation waited on the in-flight request instead of abandoning it"
+    )
+    return result["exc"]
 
 
 def _invoke_generic(client: Any) -> Any:
@@ -167,13 +200,13 @@ def test_protected_silent_provider_is_isolated_and_raises_frozen_explicit_cancel
     stream = _BlockingStream(started)
     client = _GenericClient(stream)
 
-    exc, elapsed = _cancel_silent_request(client, started, _invoke_generic)
+    exc = _cancel_silent_request(client, started, _invoke_generic, stream.returned)
 
     assert isinstance(exc, aux.AuxiliaryExplicitCancellation)
     assert exc.cause == "explicit_host_cancel"
     assert not client.closed.is_set()
-    assert elapsed < 0.75
     stream.close()  # release the bounded daemon provider worker
+    assert stream.returned.wait(timeout=10)
 
 
 def test_codex_silent_stream_is_isolated_without_closing_shared_client() -> None:
@@ -182,12 +215,12 @@ def test_codex_silent_stream_is_isolated_without_closing_shared_client() -> None
     real_client = _CodexRealClient(stream)
     client = aux.CodexAuxiliaryClient(real_client, "gpt-test")
 
-    exc, elapsed = _cancel_silent_request(client, started, _invoke_generic)
+    exc = _cancel_silent_request(client, started, _invoke_generic, stream.returned)
 
     assert isinstance(exc, aux.AuxiliaryExplicitCancellation)
     assert not real_client.closed.is_set()
-    assert elapsed < 0.75
     stream.close()
+    assert stream.returned.wait(timeout=10)
 
 
 def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None:
@@ -405,12 +438,12 @@ def test_anthropic_silent_stream_is_isolated_without_closing_shared_client() -> 
         "https://api.anthropic.test",
     )
 
-    exc, elapsed = _cancel_silent_request(client, started, _invoke_generic)
+    exc = _cancel_silent_request(client, started, _invoke_generic, stream.returned)
 
     assert isinstance(exc, aux.AuxiliaryExplicitCancellation)
     assert not real_client.closed.is_set()
-    assert elapsed < 0.75
     stream.close()
+    assert stream.returned.wait(timeout=10)
 
 
 def test_cancelled_attempt_does_not_close_or_fail_concurrent_shared_client_call(
@@ -497,14 +530,16 @@ def test_bedrock_silent_nonstream_request_is_isolated_without_close_wakeup() -> 
     _bedrock_runtime_client_cache["us-test-1"] = runtime_client
     client = aux.BedrockAuxiliaryClient("us-test-1", "bedrock-test")
     try:
-        exc, elapsed = _cancel_silent_request(client, started, _invoke_generic)
+        exc = _cancel_silent_request(
+            client, started, _invoke_generic, runtime_client.returned
+        )
     finally:
         release.set()
         reset_client_cache()
 
     assert isinstance(exc, aux.AuxiliaryExplicitCancellation)
     assert not runtime_client.closed.is_set()
-    assert elapsed < 0.75
+    assert runtime_client.returned.wait(timeout=10)
 
 
 def test_unprotected_sync_completion_stays_on_calling_thread() -> None:

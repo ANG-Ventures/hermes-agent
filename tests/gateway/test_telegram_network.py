@@ -545,8 +545,20 @@ class TestDiscoverFallbackIps:
     async def test_hung_system_dns_does_not_gate_doh_results(self, monkeypatch):
         """#63309: socket.getaddrinfo has no timeout of its own — a wedged OS
         resolver must not stall discovery. DoH answers must come back promptly
-        even while the system-DNS worker thread is still hanging."""
-        import time as _time
+        even while the system-DNS worker thread is still hanging.
+
+        DETERMINISTIC ORDERING WITNESS — replaces ``assert elapsed < 1.4``.
+        Measured idle: 0.202 / 0.203 / 0.203s, i.e. the window is exactly the
+        0.2s ``_DOH_TIMEOUT``; the 1.4 ceiling was a stopwatch reading with
+        ~7x of slack that could still flip on a loaded runner (it is asserting
+        thread-pool handoff latency, not the behavior).
+
+        The fact it stood in for is ordering: discovery must return while the
+        wedged ``getaddrinfo`` worker is STILL inside the resolver.
+        ``resolver_returned`` is set on every exit path of that stub and is
+        asserted UNSET once discovery returns.
+        """
+        import threading as _threading
 
         self._patch_doh(monkeypatch, {
             "https://dns.google": (200, _doh_answer("149.154.167.220")),
@@ -554,16 +566,31 @@ class TestDiscoverFallbackIps:
         }, system_dns_ips=["149.154.166.110"])
         monkeypatch.setattr(tnet, "_DOH_TIMEOUT", 0.2)
 
+        release_resolver = _threading.Event()   # test-controlled
+        resolver_entered = _threading.Event()
+        resolver_returned = _threading.Event()  # set on EVERY exit path
+
         def _hung_getaddrinfo(*a, **kw):
-            _time.sleep(0.2)  # far beyond the discovery bound
-            raise OSError("resolver wedged")
+            resolver_entered.set()
+            try:
+                # Finite: a regression fails fast instead of hanging the suite.
+                release_resolver.wait(timeout=10)
+                raise OSError("resolver wedged")
+            finally:
+                resolver_returned.set()
 
         monkeypatch.setattr(tnet.socket, "getaddrinfo", _hung_getaddrinfo)
 
-        start = _time.monotonic()
-        ips = await tnet.discover_fallback_ips()
-        elapsed = _time.monotonic() - start
+        try:
+            ips = await tnet.discover_fallback_ips()
 
-        assert ips == ["149.154.167.220"]
-        assert elapsed < 1.4, f"discovery gated on hung system DNS ({elapsed:.2f}s)"
+            assert ips == ["149.154.167.220"]
+            assert resolver_entered.is_set(), "system-DNS leg never started"
+            assert not resolver_returned.is_set(), (
+                "discovery returned only AFTER the wedged system resolver did — "
+                "the system-DNS leg gated the DoH results instead of being bounded"
+            )
+        finally:
+            release_resolver.set()  # let the abandoned resolver thread exit
+            resolver_returned.wait(timeout=10)
 

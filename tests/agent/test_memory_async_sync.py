@@ -123,18 +123,34 @@ def test_shutdown_drains_queued_writes_and_boundary_in_fifo_order():
 
 
 def test_shutdown_timeout_abandons_queued_write_with_state_and_log(monkeypatch, caplog):
-    """A wedged active write bounds shutdown and reports queued data loss."""
+    """A wedged active write bounds shutdown and reports queued data loss.
+
+    DETERMINISTIC ORDERING WITNESS — replaces ``assert elapsed < 0.5``.
+    Measured idle: 0.164 / 0.221 / 0.152s against a 0.5 bound (only ~2.3x of
+    headroom), so the ceiling sat inside the window's own natural
+    distribution and a loaded runner could cross it with nothing wrong.
+
+    The fact the stopwatch stood in for is ordering, not duration:
+    ``shutdown_all()`` must return while the wedged write is STILL running,
+    instead of joining it. ``active_returned`` is set on every exit path of
+    that write and asserted unset once shutdown returns.
+    """
     import agent.memory_manager as memory_manager_module
 
     started = threading.Event()
     release = threading.Event()
+    active_returned = threading.Event()  # set on EVERY exit path of the wedged write
     calls = []
 
     class _WedgedProvider(_SlowProvider):
         def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None):
             if user_content == "active":
                 started.set()
-                release.wait(timeout=2)
+                try:
+                    # Finite: a regression fails fast instead of hanging.
+                    release.wait(timeout=2)
+                finally:
+                    active_returned.set()
             calls.append(user_content)
 
     monkeypatch.setattr(memory_manager_module, "_SYNC_DRAIN_TIMEOUT_S", 0.1)
@@ -145,14 +161,16 @@ def test_shutdown_timeout_abandons_queued_write_with_state_and_log(monkeypatch, 
     mgr.sync_all("queued", "response")
 
     with caplog.at_level(logging.WARNING, logger="agent.memory_manager"):
-        t0 = time.monotonic()
         mgr.shutdown_all()
-        elapsed = time.monotonic() - t0
 
     state = mgr.shutdown_drain_state
-    assert elapsed < 0.5
+    assert not active_returned.is_set(), (
+        "shutdown_all() returned only AFTER the wedged write finished — it "
+        "joined the abandoned worker instead of bounding the drain"
+    )
     assert state["status"] == "timed_out"
     assert state["abandoned_writes"] == 1
     assert "queued" not in calls
     assert "abandoning 1 queued memory write" in caplog.text
     release.set()
+    assert active_returned.wait(timeout=10)  # let the abandoned worker exit cleanly
