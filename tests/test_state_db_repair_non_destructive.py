@@ -128,7 +128,16 @@ def _leave_hot_wal_row(db_path: str) -> None:
 
 
 def _probe_repair_lock_from_child(db_path: str, result) -> None:
-    """Attempt the repair lock with a short timeout from another process."""
+    """Attempt the repair lock from another process and report the outcome.
+
+    Publishes a ``"ready"`` sentinel *before* touching the lock so the parent
+    can separate interpreter-boot cost (a ``spawn`` child re-imports
+    ``hermes_state``, which takes seconds on a CFS-throttled CI runner) from
+    the thing under test — whether the lock is refused while the parent holds
+    it.  The refusal itself is deterministic: ``flock`` fails for as long as
+    the parent's critical section is open, no matter how slow the box is.
+    """
+    result.put("ready")
     hermes_state._REPAIR_LOCK_TIMEOUT_SECONDS = 0.5
     with hermes_state._cross_process_repair_lock(Path(db_path)) as holding:
         result.put(holding)
@@ -454,12 +463,21 @@ def test_repair_outcome_is_recorded_while_cross_process_lock_is_held(
         )
         probe.start()
         try:
-            observed.append(result.get(timeout=5))
+            # Two-phase wait (#724): the first get() covers `spawn` interpreter
+            # boot + the hermes_state import, which cost SECONDS on a
+            # CFS-throttled 2-CPU CI runner and blew the old single 5s budget
+            # (measured: run 35435109445 slice 9 raised _queue.Empty while the
+            # child's refusal log was captured on the same run — it arrived, it
+            # was just late). Boot is machine-speed; the lock refusal is not.
+            # Budget them separately and generously — these are hang-guards,
+            # not timing assertions.
+            assert result.get(timeout=120) == "ready", "probe child never booted"
+            observed.append(result.get(timeout=60))
         finally:
-            probe.join(5)
+            probe.join(30)
             if probe.is_alive():
                 probe.terminate()
-                probe.join(5)
+                probe.join(30)
         assert repaired is False
 
     monkeypatch.setattr(hermes_state, "_record_repair_outcome", record_outcome)
