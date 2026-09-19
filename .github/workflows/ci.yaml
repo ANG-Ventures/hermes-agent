@@ -52,7 +52,22 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # Cancel superseded runs on BOTH pull_request and merge_group.
+  #
+  # merge_group was previously excluded, which stranded a full 44-job run every
+  # time the queue reshuffled: GitHub creates a NEW gh-readonly-queue/... branch
+  # per batch candidate, the old batch's run stays queued forever, and those
+  # orphans keep competing for the self-hosted ACE-AI pool. Measured 2026-09-19:
+  # 17 orphaned merge_group runs across PRs 711/712/715/716 (already evicted from
+  # the queue) starved a seconds-long `all-checks-pass` rollup job for 3.5 hours,
+  # blocking PR #713 behind head-of-line contention on a pool that was otherwise
+  # healthy and cycling normally.
+  #
+  # Safe because `group` is keyed on github.ref: each queue batch has its own
+  # unique gh-readonly-queue ref, so cancelling only ever kills a run whose ref
+  # is being superseded — never a live sibling batch. push-to-main keeps its
+  # no-cancel behaviour (main's history must be fully verified).
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────

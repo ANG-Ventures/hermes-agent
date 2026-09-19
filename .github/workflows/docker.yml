@@ -24,7 +24,7 @@ permissions:
 # the latest commit.
 concurrency:
   group: docker-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
 
 env:
   IMAGE_NAME: nousresearch/hermes-agent
