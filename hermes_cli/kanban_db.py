@@ -3964,6 +3964,34 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _resolve_stored_model_pair(
+    model: Optional[str], provider: Optional[str]
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve a config `model.aliases` key / `provider/model` pair at WRITE time.
+
+    Every kanban model-override write funnels through here so a card can
+    never persist a raw alias (``grok``). The dispatcher passes
+    ``model_override`` to the worker as ``-m <model>``; an unresolved alias
+    reaches the worker's configured provider, 400s, and the fallback chain
+    silently serves a different provider AND model (measured 2026-09-18).
+
+    Resolving at write time also PINS the card: retargeting
+    ``model.aliases.grok`` later cannot change what an already-created card
+    runs. Best-effort — anything unresolvable is stored verbatim, preserving
+    the previous literal-storage behaviour, and resolution failure never
+    blocks a board write.
+    """
+    if not model:
+        return model, provider
+    try:
+        from hermes_cli.model_switch import resolve_model_pair_for_storage
+
+        return resolve_model_pair_for_storage(model, provider)
+    except Exception:  # pragma: no cover - a board write must never fail here
+        _log.debug("kanban model alias resolution failed for %r", model, exc_info=True)
+        return model, provider
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -4044,6 +4072,9 @@ def create_task(
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
+    model_override, provider_override = _resolve_stored_model_pair(
+        model_override, provider_override
+    )
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -4600,6 +4631,7 @@ def set_model_override(
         raise ValueError("provider_override requires a model_override")
     if not model:
         provider = None
+    model, provider = _resolve_stored_model_pair(model, provider)
     with write_txn(conn):
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
@@ -9413,19 +9445,33 @@ def set_task_model(
 ) -> int:
     """Set (or clear) a task's per-task model override.
 
-    ``model`` is taken literally: a non-empty string pins that model, and
-    ``None`` writes SQL NULL (clears the override). The DB layer does NOT
-    interpret ``""`` — empty-string handling is a CLI concern; whatever is
-    passed is stored verbatim.
+    ``model`` is taken literally APART from alias resolution: a config
+    ``model.aliases`` key (or a ``provider/model`` pair) is resolved to its
+    concrete target first — see :func:`_resolve_stored_model_pair` — and
+    anything that does not resolve is stored verbatim. ``None`` writes SQL
+    NULL (clears the override). The DB layer does NOT interpret ``""`` —
+    empty-string handling is a CLI concern.
+
+    This setter always writes BOTH columns in one statement, exactly like
+    :func:`set_model_override`. Writing ``model_override`` alone would leave
+    whatever ``provider_override`` the PREVIOUS model was pinned with, so
+    ``edit --model claude-opus-5`` on a card pinned to ``xai-oauth`` would
+    spawn that model against xAI — the exact mismatch this resolution exists
+    to prevent. It is also an illegal card state: every other writer here
+    rejects a ``provider_override`` without a ``model_override``.
 
     Returns the number of rows affected: a call against a nonexistent
     ``task_id`` returns ``0`` (never a silent success), so callers can tell
     a real write from a no-op.
     """
+    resolved_model, resolved_provider = _resolve_stored_model_pair(model, None)
+    if not resolved_model:
+        resolved_provider = None
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE tasks SET model_override = ? WHERE id = ?",
-            (model, task_id),
+            "UPDATE tasks SET model_override = ?, provider_override = ? "
+            "WHERE id = ?",
+            (resolved_model, resolved_provider, task_id),
         )
     return int(cur.rowcount or 0)
 

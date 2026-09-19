@@ -1343,6 +1343,42 @@ def resolve_startup_model_arg(
     return None, raw_model
 
 
+def resolve_model_pair_for_storage(
+    model: Optional[str],
+    provider: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve a ``(model, provider)`` pair at WRITE time for a PERSISTED record.
+
+    Thin policy wrapper over :func:`resolve_startup_model_arg` — the single
+    resolver — for the non-interactive entry points that *store* a model
+    string for something else to run later (kanban card overrides, cron job
+    pins). Without it those records keep a raw ``model.aliases`` key such as
+    ``grok``, which the dispatched worker hands to its configured provider;
+    the provider 400s and the fallback chain silently serves a different
+    provider AND model behind a one-line banner (measured 2026-09-18).
+
+    Resolving at write time — rather than at spawn/fire time — also pins the
+    record: retargeting ``model.aliases.grok`` later cannot silently change
+    what an already-stored card or job runs.
+
+    Precedence mirrors ``/model`` and the CLI ``-m`` path: an EXPLICIT
+    ``provider`` wins over a provider implied by the model string, and it is
+    also what aggregator detection is evaluated against (so ``vendor/model``
+    stays a model id on an aggregator). Returns ``(model, provider)``
+    unchanged on anything it cannot resolve; never raises.
+    """
+    if not isinstance(model, str) or not model.strip():
+        return model, provider
+    explicit_provider = (provider or "").strip() or None
+    resolved_provider, resolved_model = resolve_startup_model_arg(
+        model, explicit_provider or ""
+    )
+    if explicit_provider:
+        # `--model X --provider Y`: the explicit flag wins, like /model.
+        return resolved_model, explicit_provider
+    return resolved_model, (resolved_provider or None)
+
+
 def _resolve_alias_fallback(
     raw_input: str,
     authenticated_providers: list[str] = (),

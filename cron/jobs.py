@@ -2228,6 +2228,32 @@ def _resolve_default_model_snapshot() -> Optional[str]:
         return None
 
 
+def _resolve_stored_model_pair(
+    model: Optional[str], provider: Optional[str]
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve a config `model.aliases` key / `provider/model` pair at WRITE time.
+
+    A cron job PINS its model for later runs, so an unresolved alias (e.g.
+    ``grok`` from ``model.aliases``) reaches the scheduler's provider at fire
+    time, 400s, and the fallback chain silently serves a different provider
+    AND model (measured 2026-09-18). Resolving here — the shared normalization
+    point for both ``create_job`` and ``update_job`` — also pins the record:
+    retargeting the alias later cannot change what an existing job runs.
+
+    Best-effort: anything unresolvable is stored verbatim (previous
+    behaviour), and a resolution failure never blocks a job write.
+    """
+    if not model:
+        return model, provider
+    try:
+        from hermes_cli.model_switch import resolve_model_pair_for_storage
+
+        return resolve_model_pair_for_storage(model, provider)
+    except Exception:  # pragma: no cover - a job write must never fail here
+        logger.debug("cron model alias resolution failed for %r", model, exc_info=True)
+        return model, provider
+
+
 def _normalize_job_optional_text(value: Any, *, strip_trailing_slash: bool = False) -> Optional[str]:
     if not isinstance(value, str):
         return None
@@ -2468,6 +2494,9 @@ def create_job(
     normalized_skills = _normalize_skill_list(skill, skills)
     normalized_model = _normalize_job_optional_text(model)
     normalized_provider = _normalize_job_optional_text(provider)
+    normalized_model, normalized_provider = _resolve_stored_model_pair(
+        normalized_model, normalized_provider
+    )
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
@@ -2732,6 +2761,33 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                         "times": normalize_repeat_value(_rp),
                         "completed": (job.get("repeat") or {}).get("completed", 0),
                     }
+
+            # Resolve a config `model.aliases` key / `provider/model` pair the
+            # same way create_job does, so `cron edit --model grok` cannot
+            # re-introduce a raw alias the create path just eliminated.
+            #
+            # The explicit-provider slot takes a provider THIS update asserts
+            # (`--model grok --provider claude-apr`), never the one the job
+            # merely has stored: a stored value is the PREVIOUS model's
+            # provider, and letting it win means `cron edit --model grok`
+            # pins grok-4.6 to claude-apr. For the same reason the resolved
+            # provider is written unconditionally when the model changes at
+            # all — including to None — rather than only when it is truthy,
+            # so a new model never inherits the old model's backend.
+            #
+            # No "only if the model string changed" narrowing: a self-named
+            # alias (key == target model id) resolves the PROVIDER while
+            # leaving the model byte-identical, and that write must land.
+            # `--model ""` clears the pin and is deliberately untouched here.
+            if "model" in updates and isinstance(updates["model"], str):
+                _raw_model = updates["model"].strip()
+                if _raw_model:
+                    _m, _p = _resolve_stored_model_pair(
+                        _raw_model,
+                        _normalize_job_optional_text(updates.get("provider")),
+                    )
+                    updates["model"] = _m
+                    updates["provider"] = _p
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
