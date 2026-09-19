@@ -42,6 +42,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
+
+# Discord's own ceiling (7 days). Ace 2026-09-18: bot threads are not reaped on a timer,
+# so every thread this tool creates is stamped at the MAXIMUM Discord allows.
+# auto_archive_duration is Discord-native and DEPRECATED as an archiver: it now only
+# controls how long the thread stays in the channel LIST, not when it archives.
+DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES = 10080
 _DISCORD_RESPONSE_BODY_MAX_BYTES = 4 * 1024 * 1024
 _DISCORD_ERROR_BODY_MAX_BYTES = 64 * 1024
 
@@ -586,7 +592,7 @@ def _delete_message(token: str, channel_id: str, message_id: str, **_kwargs: Any
 def _create_thread(
     token: str, channel_id: str, name: str,
     message_id: Optional[str] = None,
-    auto_archive_duration: int = 1440,
+    auto_archive_duration: int = DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
     **_kwargs: Any,
 ) -> str:
     """Create a thread in a channel."""
@@ -910,7 +916,10 @@ def _build_schema(
         "auto_archive_duration": {
             "type": "integer",
             "enum": [60, 1440, 4320, 10080],
-            "description": "Thread archive duration in minutes (create_thread, default 1440).",
+            "description": (
+                "Minutes the thread stays in the channel list "
+                "(create_thread, default 10080 = Discord max)."
+            ),
         },
         "emoji": {
             "type": "string",
@@ -1052,7 +1061,7 @@ def _run_discord_action(
     limit: int = 50,
     before: str = "",
     after: str = "",
-    auto_archive_duration: int = 1440,
+    auto_archive_duration: int = DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
     emoji: str = "",
 ) -> str:
     """Shared handler logic for both discord tools."""
@@ -1137,7 +1146,8 @@ def discord_admin_handler(action: str, **kwargs) -> str:
 _HANDLER_DEFAULTS = {
     "action": "", "guild_id": "", "channel_id": "", "user_id": "",
     "role_id": "", "message_id": "", "query": "", "name": "",
-    "limit": 50, "before": "", "after": "", "auto_archive_duration": 1440,
+    "limit": 50, "before": "", "after": "",
+    "auto_archive_duration": DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
     "emoji": "",
 }
 

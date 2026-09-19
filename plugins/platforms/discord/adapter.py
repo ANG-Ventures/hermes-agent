@@ -73,6 +73,12 @@ class _Snowflake:
         self.id = id
 
 VALID_THREAD_AUTO_ARCHIVE_MINUTES = {60, 1440, 4320, 10080}
+# Discord's own ceiling (7 days). Ace 2026-09-18: the fleet does NOT want bot threads
+# reaped on a timer, so every thread we create is stamped at the MAXIMUM Discord allows.
+# NOTE: auto_archive_duration is Discord-native and DEPRECATED as an archiver — per
+# Discord's docs it now only controls how long a thread stays in the channel LIST.
+# It is NOT the retired ~/.hermes/scripts/discord-thread-hygiene.py sweep.
+DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES = 10080
 _DISCORD_COMMAND_SYNC_POLICIES = {"safe", "bulk", "off"}
 _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
@@ -6505,13 +6511,13 @@ class DiscordAdapter(BasePlatformAdapter):
         @discord.app_commands.describe(
             name="Thread name",
             message="Optional first message to send to Hermes in the thread",
-            auto_archive_duration="Auto-archive in minutes (60, 1440, 4320, 10080)",
+            auto_archive_duration="Minutes a thread stays in the channel list (60, 1440, 4320, 10080; default 10080 = max)",
         )
         async def slash_thread(
             interaction: discord.Interaction,
             name: str,
             message: str = "",
-            auto_archive_duration: int = 1440,
+            auto_archive_duration: int = DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
         ):
             # defer() is performed inside the handler *after* the auth gate
             # so a rejected invoker can receive an ephemeral rejection.
@@ -6972,7 +6978,7 @@ class DiscordAdapter(BasePlatformAdapter):
         interaction: discord.Interaction,
         name: str,
         message: str = "",
-        auto_archive_duration: int = 1440,
+        auto_archive_duration: int = DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
     ) -> None:
         """Create a Discord thread from a slash command and start a session in it."""
         if not await self._check_slash_authorization(interaction, "/thread"):
@@ -8014,7 +8020,7 @@ class DiscordAdapter(BasePlatformAdapter):
         *,
         name: str,
         message: str = "",
-        auto_archive_duration: int = 1440,
+        auto_archive_duration: int = DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
     ) -> Dict[str, Any]:
         """Create a thread in the current Discord channel.
 
@@ -8123,7 +8129,10 @@ class DiscordAdapter(BasePlatformAdapter):
 
         for attempt in range(2):
             try:
-                thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
+                thread = await message.create_thread(
+                    name=thread_name,
+                    auto_archive_duration=DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
+                )
                 try:
                     setattr(thread, "_hermes_auto_thread_initial_name", thread_name)
                 except Exception:
@@ -8137,7 +8146,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     )
                     thread = await seed_msg.create_thread(
                         name=thread_name,
-                        auto_archive_duration=1440,
+                        auto_archive_duration=DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
                         reason=reason,
                     )
                     try:
@@ -8272,7 +8281,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if create is not None:
                 thread = await create(
                     name=thread_name,
-                    auto_archive_duration=1440,
+                    auto_archive_duration=DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
                     reason=reason,
                 )
                 return str(thread.id)
@@ -8290,7 +8299,7 @@ class DiscordAdapter(BasePlatformAdapter):
             seed_msg = await send(f"\U0001f9f5 Hermes handoff: **{thread_name}**")
             thread = await seed_msg.create_thread(
                 name=thread_name,
-                auto_archive_duration=1440,
+                auto_archive_duration=DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
                 reason=reason,
             )
             return str(thread.id)
