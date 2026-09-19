@@ -5635,7 +5635,11 @@ def cmd_cron(args):
     """Cron job management."""
     from hermes_cli.cron import cron_command
 
-    cron_command(args)
+    # Propagate the handler's return code: ``cron_command`` already returns 1
+    # for a missing job / failed ``cron run --wait`` / failed ``cron tick``,
+    # but dropping it here made every failure exit 0 — a false green that
+    # scripts and acceptance gates read as success.
+    return cron_command(args)
 
 
 def cmd_sync(args):
