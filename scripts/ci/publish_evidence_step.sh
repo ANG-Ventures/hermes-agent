@@ -15,8 +15,17 @@
 # artifacts, bad credentials and a broken gh extension — i.e. the workflow
 # could report success while attaching nothing, which is its whole job.
 #
-# So only the rate-limit class is tolerated. Every other failure still exits
-# non-zero and reds the step.
+# So exactly two outcomes exit 0:
+#
+#   1. The shared installation rate-limit budget is exhausted. Not our bug,
+#      and not a reason to red an innocent PR.
+#   2. No OPEN PR has this head at this SHA — a superseded run has nothing
+#      to attach to.
+#
+# Everything else, INCLUDING a missing evidence artifact, exits non-zero.
+# A missing artifact means an artifact-generation regression upstream, and
+# reporting success for it is the precise silent failure this wrapper was
+# written to prevent.
 #
 # The OSV scan's SARIF upload deliberately gets no such treatment:
 # ``osv-scanner`` IS in ``all-checks-pass.needs``, so silencing it would
@@ -30,12 +39,18 @@ set -uo pipefail
 : "${HEAD_BRANCH:?HEAD_BRANCH is required}"
 : "${HEAD_SHA:?HEAD_SHA is required}"
 
-WORK_DIR="${RUNNER_TEMP:-/tmp}"
-LOG_FILE="$WORK_DIR/publish-e2e-evidence.log"
+# A private working directory. Without this the log and the evidence dir sit
+# at predictable shared paths, so on a shared host another user can
+# pre-create the log as a symlink and have ``tee`` truncate an unrelated
+# file, or seed the evidence dir with stale content.
+WORK_DIR=$(mktemp -d "${RUNNER_TEMP:-/tmp}/publish-e2e-evidence.XXXXXX")
+trap 'rm -rf "$WORK_DIR"' EXIT
+LOG_FILE="$WORK_DIR/publish.log"
 
-# Signatures GitHub uses for primary and secondary rate limits, across both
-# the REST envelope and gh's own error rendering.
-RATE_LIMIT_PATTERN='API rate limit exceeded|secondary rate limit|rate limit exceeded for installation|HTTP 429|X-RateLimit-Remaining: 0'
+# Signatures GitHub uses for primary and secondary rate limits, across the
+# REST envelope, gh's own error rendering, and the Python publisher's
+# urllib error text.
+RATE_LIMIT_PATTERN='API rate limit exceeded|secondary rate limit|rate limit exceeded for installation|HTTP 429|HTTP Error 429|X-RateLimit-Remaining: 0|RateLimitError'
 
 publish() {
   set -euo pipefail
@@ -53,12 +68,17 @@ publish() {
     return 0
   fi
 
-  ARTIFACT_NAME=$(gh api "repos/$SOURCE_REPO/actions/runs/$SOURCE_RUN_ID/artifacts" \
+  # --paginate, not the default first page: this CI run produces well over
+  # 30 artifacts (16 test-slice artifacts alone, plus every reusable job's
+  # review-status upload), so a single page can easily exclude the evidence
+  # artifact and make a present artifact look absent.
+  ARTIFACT_NAME=$(gh api --paginate "repos/$SOURCE_REPO/actions/runs/$SOURCE_RUN_ID/artifacts?per_page=100" \
     --jq '.artifacts[] | select(.expired == false and (.name | startswith("e2e-evidence-"))) | .name' \
-    | python3 -c 'import sys; print(next(iter(sys.stdin), "").strip())')
+    | head -n1)
   if [ -z "$ARTIFACT_NAME" ]; then
-    echo "No E2E evidence artifact was produced for CI run $SOURCE_RUN_ID."
-    return 0
+    echo "No E2E evidence artifact was produced for CI run $SOURCE_RUN_ID." >&2
+    echo "Publishing evidence is this workflow's primary function, so this is a failure, not a skip." >&2
+    return 1
   fi
 
   EVIDENCE_DIR="$WORK_DIR/e2e-evidence"
@@ -71,8 +91,13 @@ publish() {
     --pr-number "$PR_NUMBER"
 }
 
-publish 2>&1 | tee "$LOG_FILE"
-rc=${PIPESTATUS[0]}
+# Run in an explicit SUBSHELL, not a pipeline. A pipeline would work too
+# (PIPESTATUS[0] is accurate), but with `publish` running in the current
+# shell its `set -e` aborts this script before the log can be classified.
+# The subshell confines errexit to the function and still yields its status.
+( publish ) >"$LOG_FILE" 2>&1
+rc=$?
+cat "$LOG_FILE"
 
 if [ "$rc" -eq 0 ]; then
   exit 0

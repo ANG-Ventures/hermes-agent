@@ -108,6 +108,12 @@ _LOW_REMAINING_INTERVAL = 60
 # against the ~2 charged calls per 45 s cycle it suppresses.
 _MERGE_QUEUE_RECHECK_INTERVAL = 300
 
+# Socket timeout for every API call. Without it a hung connection blocks on
+# the OS default (minutes, or forever), and the poller stops updating the
+# comment with no log line and no error.
+_REQUEST_TIMEOUT = 30
+
+
 
 
 class RateLimitError(Exception):
@@ -124,7 +130,10 @@ class _ApiState:
     def __init__(self) -> None:
         self.etags: dict[str, tuple[str, object, str]] = {}
         self.artifacts: dict[str, list[dict]] = {}
-        self.comment_id: int | None = None
+        # Keyed by (repo, pr_number): the PATCH URL for a comment carries only
+        # the comment id, not the PR, so a process-global id would let a
+        # second PR's poller overwrite the FIRST PR's comment.
+        self.comment_ids: dict[tuple[str, str], int] = {}
         self.remaining: int | None = None
         self.limit: int | None = None
         self.retry_after: float = 0.0
@@ -133,6 +142,17 @@ class _ApiState:
 
     def reset(self) -> None:
         self.__init__()
+
+    def comment_id_for(self, repo: str, pr_number: str) -> int | None:
+        return self.comment_ids.get((repo, str(pr_number)))
+
+    def set_comment_id(self, repo: str, pr_number: str, comment_id: int | None) -> None:
+        key = (repo, str(pr_number))
+        if comment_id:
+            self.comment_ids[key] = comment_id
+        else:
+            self.comment_ids.pop(key, None)
+
 
     def observe(self, headers) -> None:
         """Record rate-limit headers from any response (success or error).
@@ -188,6 +208,25 @@ class _ApiState:
 
 
 STATE = _ApiState()
+
+
+def _read_retry_after(headers) -> float:
+    """Retry-After from a response, without touching the REST budget state.
+
+    Used by the GraphQL path: GraphQL has its own point budget, so its
+    headers must not update the REST governor's remaining/limit — but a
+    Retry-After on it is still a real instruction to back off.
+    """
+    if headers is None:
+        return 0.0
+    raw = headers.get("Retry-After")
+    if raw is None:
+        return 0.0
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return 0.0
+    return value if value > 0 else 0.0
 
 
 def _is_rate_limited(err: urllib.error.HTTPError) -> bool:
@@ -323,7 +362,7 @@ def _conditional_get(url: str, token: str, cache_key: str):
     extra = {"If-None-Match": cached[0]} if cached else None
     req = urllib.request.Request(url, headers=_headers(token, extra))
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT) as resp:
             STATE.observe(resp.headers)
             STATE.charged += 1
             body = json.loads(resp.read())
@@ -514,9 +553,19 @@ def upsert_comment(
     """
     owner, repo_name = repo.split("/")
     if comment_id is None:
-        comment_id = STATE.comment_id
+        comment_id = STATE.comment_id_for(repo, pr_number)
     if comment_id is None:
-        comment_id = find_comment_id(token, repo, pr_number)
+        try:
+            comment_id = find_comment_id(token, repo, pr_number)
+        except RateLimitError:
+            raise
+        except Exception as e:
+            # find_comment_id sits OUTSIDE the try below; an HTTPError or a
+            # transport error here used to escape run()'s RateLimitError-only
+            # handler and kill the poller.
+            print(f"  Could not list comments ({e}) — will retry next cycle.",
+                  file=sys.stderr)
+            return None
 
     if comment_id:
         url = f"{API_BASE}/repos/{owner}/{repo_name}/issues/comments/{comment_id}"
@@ -530,13 +579,13 @@ def upsert_comment(
         "Content-Type": "application/json",
     }))
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT) as resp:
             STATE.observe(resp.headers)
             STATE.charged += 1
             result = json.loads(resp.read())
             new_id = result.get("id")
             if new_id:
-                STATE.comment_id = new_id
+                STATE.set_comment_id(repo, pr_number, new_id)
             return new_id
     except urllib.error.HTTPError as e:
         STATE.observe(e.headers)
@@ -548,7 +597,7 @@ def upsert_comment(
             # Someone deleted our comment. Re-create it NOW: deferring to the
             # next cycle silently drops the final status when this is the last
             # one. ``_allow_recreate=False`` on the retry keeps it to one POST.
-            STATE.comment_id = None
+            STATE.set_comment_id(repo, pr_number, None)
             print("  Review comment was deleted — recreating it.", file=sys.stderr)
             if _allow_recreate:
                 return upsert_comment(
@@ -557,6 +606,14 @@ def upsert_comment(
                 )
             return None
         print(f"  API error {e.code}: {e.reason}", file=sys.stderr)
+        return None
+    except Exception as e:
+        # URLError / socket.timeout / ssl.SSLError. HTTPError is a SUBCLASS of
+        # URLError, not the reverse, so the handler above does not cover these
+        # — and an escape here killed the poller and froze the comment for the
+        # rest of the run. Comment posting is best-effort; retry next cycle.
+        print(f"  Network error updating the comment ({e}) — will retry.",
+              file=sys.stderr)
         return None
 
 
@@ -570,6 +627,10 @@ def upsert_comment(
 # ``review-status.json`` file in GITHUB_OUTPUT format:
 #   review_status=<json array of {source, results: [...]} objects>
 _REVIEW_STATUS_ARTIFACT_PREFIX = "review-status-"
+
+# Where artifact zips are staged. Module-level so tests can redirect it
+# instead of writing into the real shared /tmp.
+_ARTIFACT_TEMP_BASE = Path("/tmp/review-status-artifacts")
 
 
 def _list_artifacts(token: str, repo: str, run_id: str) -> list[dict]:
@@ -673,7 +734,7 @@ def _parse_status_file(status_file: Path) -> list[dict]:
 
 def fetch_all_review_statuses(
     token: str, repo: str, run_id: str,
-) -> list[dict]:
+) -> list[dict] | None:
     """Fetch and merge all review-status artifacts from the run.
 
     Lists artifacts with the ``review-status-`` prefix on the orchestrator
@@ -688,18 +749,26 @@ def fetch_all_review_statuses(
     poll cycle re-downloaded every artifact (measured: 4 extra charged
     requests per cycle on a typical run, plus the listing).
 
-    Returns the merged list of ``{source, results: [...]}`` objects.
+    Returns the merged list of ``{source, results: [...]}`` objects, or
+    ``None`` when the artifact LISTING itself failed. ``None`` means
+    "unknown", not "none exist": returning an empty list there made the
+    caller republish the comment with every review section deleted.
     Artifacts that don't exist yet or fail to parse are silently skipped.
     """
     all_statuses: list[dict] = []
-    temp_base = Path("/tmp/review-status-artifacts")
+    temp_base = _ARTIFACT_TEMP_BASE
 
     try:
         artifacts = _list_artifacts(token, repo, run_id)
     except RateLimitError:
         raise
-    except Exception:
-        return all_statuses
+    except Exception as e:
+        # A transient listing failure must not silently republish the comment
+        # with every review section gone. Signal "unknown", not "empty", and
+        # let the caller keep the last known statuses.
+        print(f"  Could not list artifacts ({e}) — keeping the previous "
+              f"review statuses.", file=sys.stderr)
+        return None
 
     rs_artifacts = [
         a for a in artifacts
@@ -816,6 +885,8 @@ def run(
     prev_completed: dict[str, str] = {}
     prev_pending: list[str] = []
     prev_artifact_count = 0
+    prev_artifact_statuses: list[dict] = []
+
     # -inf so the first cycle always checks; then throttled to one check per
     # _MERGE_QUEUE_RECHECK_INTERVAL so the recheck does not become a new
     # per-cycle charge against the budget this whole module defends.
@@ -826,6 +897,23 @@ def run(
         """Sleep, but never past the timeout."""
         remaining_time = timeout - (time.time() - start)
         time.sleep(max(0.0, min(seconds, remaining_time)))
+
+    def _pause_for_queue(seconds: float) -> None:
+        """Sleep while merge-queued, WITHOUT spending the poll lifetime.
+
+        A queued pause is not polling work — it is waiting for the PR to
+        come back. Counting it against ``timeout`` means a PR queued for the
+        full 50-minute window exits the poller, and a later dequeue then has
+        no reporter at all: exactly the failure the pause exists to prevent
+        (merge-group runs never post a comment). So advance ``start`` by the
+        paused duration, which leaves the poller its full budget of ACTIVE
+        polling once the PR returns.
+        """
+        nonlocal start
+        before = time.time()
+        time.sleep(max(0.0, seconds))
+        start += time.time() - before
+
 
     while True:
         elapsed = time.time() - start
@@ -847,11 +935,19 @@ def run(
             time.time() - last_queue_check >= _MERGE_QUEUE_RECHECK_INTERVAL
         ):
             last_queue_check = time.time()
-            if pr_is_in_merge_queue(token, repo, pr_number):
+            try:
+                queued = pr_is_in_merge_queue(token, repo, pr_number)
+            except RateLimitError as e:
+                backoff = max(e.retry_after, float(_LOW_REMAINING_INTERVAL))
+                print(f"  Rate limited on the merge-queue check — backing off "
+                      f"{backoff:.0f}s ({STATE.budget_line()})", file=sys.stderr)
+                _nap(backoff)
+                continue
+            if queued:
                 print(f"  PR #{pr_number} is in the merge queue — pausing "
                       f"{_MERGE_QUEUE_RECHECK_INTERVAL}s "
                       f"(will resume if it is dequeued).")
-                _nap(_MERGE_QUEUE_RECHECK_INTERVAL)
+                _pause_for_queue(_MERGE_QUEUE_RECHECK_INTERVAL)
                 continue
 
         cycle_start_charged = STATE.charged
@@ -897,7 +993,13 @@ def run(
                   f"{backoff:.0f}s ({STATE.budget_line()})", file=sys.stderr)
             _nap(backoff)
             continue
+        if artifact_statuses is None:
+            # The listing failed transiently. Reuse the last known statuses so
+            # the comment is not republished with every review section gone.
+            artifact_statuses = prev_artifact_statuses
+        prev_artifact_statuses = artifact_statuses
         artifact_count_changed = len(artifact_statuses) != prev_artifact_count
+
         if artifact_count_changed:
             print(f"  Found {len(artifact_statuses)} review status entries from artifacts "
                   f"(was {prev_artifact_count} last poll)")
@@ -1059,14 +1161,32 @@ def pr_is_in_merge_queue(token: str, repo: str, pr_number: str) -> bool:
         headers=_headers(token, {"Content-Type": "application/json"}),
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            STATE.observe(resp.headers)
+        with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT) as resp:
+            # NOT STATE.observe(): GraphQL has its OWN budget (5000 points,
+            # separate from the REST installation limit). Feeding its
+            # headers into the REST governor overwrites a low REST remaining
+            # with a healthy GraphQL one and silently disarms the backoff —
+            # measured: REST 50/1000 (interval 60s) became 4900/5000
+            # (interval 45s) after one membership check.
             STATE.charged += 1
             data = json.loads(resp.read())
-    except (ValueError, OSError, urllib.error.HTTPError) as e:
+    except urllib.error.HTTPError as e:
+        # A rate-limited membership check must back the poller off, not be
+        # silently read as "not queued".
+        if _is_rate_limited(e):
+            print("  Merge-queue check was rate limited — backing off.",
+                  file=sys.stderr)
+            raise RateLimitError(
+                _read_retry_after(e.headers) or float(_LOW_REMAINING_INTERVAL)
+            ) from e
         print(f"  Could not check merge-queue membership ({e}) — polling anyway.",
               file=sys.stderr)
         return False
+    except (ValueError, OSError) as e:
+        print(f"  Could not check merge-queue membership ({e}) — polling anyway.",
+              file=sys.stderr)
+        return False
+
     try:
         return bool(data["data"]["repository"]["pullRequest"]["isInMergeQueue"])
     except (KeyError, TypeError):

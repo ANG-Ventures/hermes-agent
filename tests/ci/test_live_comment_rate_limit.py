@@ -45,6 +45,29 @@ def _fresh_state():
     _mod.STATE.reset()
 
 
+@pytest.fixture(autouse=True)
+def _no_real_network(monkeypatch):
+    """Fail any test that reaches the real GitHub API.
+
+    Moving the merge-queue check into the poll loop made every
+    ``run(dry_run=False)`` test call ``pr_is_in_merge_queue`` for real —
+    measured 3 live requests to ``api.github.com/graphql``. They passed
+    anyway because that helper fails open, so the suite was quietly
+    network-dependent AND spending the very budget it exists to defend.
+
+    Tests that want network behaviour monkeypatch ``urllib.request.urlopen``
+    themselves, which overrides this fixture for that test.
+    """
+    def _blocked(req, *a, **k):
+        url = getattr(req, "full_url", str(req))
+        raise AssertionError(
+            f"test made a REAL network request to {url}; stub it instead"
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", _blocked)
+
+
+
 class _Resp:
     """Minimal urlopen context-manager stand-in."""
 
@@ -152,8 +175,9 @@ def test_cached_pagination_replays_the_link_header(monkeypatch):
 # ─── artifact dedupe ──────────────────────────────────────────────────
 
 
-def test_artifacts_are_downloaded_once_per_id(monkeypatch):
+def test_artifacts_are_downloaded_once_per_id(monkeypatch, tmp_path):
     """Artifact content is immutable per id; re-downloading is pure waste."""
+    monkeypatch.setattr(_mod, "_ARTIFACT_TEMP_BASE", tmp_path)
     artifacts = [
         {"id": 1, "name": "review-status-lint", "archive_download_url": "u1"},
         {"id": 2, "name": "review-status-osv", "archive_download_url": "u2"},
@@ -181,8 +205,9 @@ def test_artifacts_are_downloaded_once_per_id(monkeypatch):
     assert downloads == [1, 2], "second cycle re-downloaded immutable artifacts"
 
 
-def test_failed_artifact_download_is_not_cached(monkeypatch):
+def test_failed_artifact_download_is_not_cached(monkeypatch, tmp_path):
     """An artifact that is not uploaded yet must be retried next cycle."""
+    monkeypatch.setattr(_mod, "_ARTIFACT_TEMP_BASE", tmp_path)
     artifacts = [{"id": 9, "name": "review-status-x", "archive_download_url": "u"}]
     monkeypatch.setattr(_mod, "_list_artifacts", lambda *a, **k: artifacts)
 
@@ -298,6 +323,7 @@ def test_upsert_failure_does_not_mark_the_body_as_posted(monkeypatch):
     jobs = [{"name": "Python tests", "status": "in_progress", "html_url": "u"}]
     monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: (jobs, False))
     monkeypatch.setattr(_mod, "fetch_all_review_statuses", lambda *a, **k: [])
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: False)
 
     attempts = {"n": 0}
 
@@ -390,6 +416,212 @@ def test_production_parser_is_the_one_main_uses():
         "main() builds its own parser, so build_parser() proves nothing"
 
 
+# ─── P1: the comment cache must not cross PRs ─────────────────────────
+
+
+def test_comment_id_cache_is_keyed_by_repo_and_pr(monkeypatch):
+    """A process-global id lets PR B overwrite PR A's comment.
+
+    The PATCH URL carries only the comment id, never the PR, so a second
+    run() in the same interpreter PATCHed the first PR's comment — silently
+    replacing the review shown on the wrong PR and leaving the second
+    without one.
+    """
+    posted: list[tuple[str, str]] = []
+
+    def fake_urlopen(req, *a, **k):
+        posted.append((req.get_method(), req.full_url))
+        # The POST endpoint encodes the PR; return a distinct id per PR.
+        cid = 900 if "/issues/5/" in req.full_url else 901
+        return _Resp({"id": cid}, {"X-RateLimit-Remaining": "900"})
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    _mod.upsert_comment("tok", "o/r", "5", "body-A", comment_id=0)
+    _mod.upsert_comment("tok", "o/r", "6", "body-B", comment_id=None)
+
+    assert _mod.STATE.comment_id_for("o/r", "5") == 900
+    assert _mod.STATE.comment_id_for("o/r", "6") == 901, \
+        "PR 6 reused PR 5's cached comment id and overwrote the wrong comment"
+    # PR 6 must not have PATCHed PR 5's comment URL.
+    assert not any(m == "PATCH" and "/issues/comments/900" in u
+                   for m, u in posted), \
+        f"PR 6 PATCHed PR 5's comment: {posted}"
+
+
+# ─── P1: transport errors must not kill the poller ────────────────────
+
+
+def test_network_error_during_upsert_does_not_crash(monkeypatch):
+    """HTTPError is a SUBCLASS of URLError, not the reverse.
+
+    A plain URLError / socket timeout escaped the HTTPError-only handler
+    and run()'s RateLimitError-only handler, killing the poller and
+    freezing the review comment for the rest of the CI run.
+    """
+    def boom(req, *a, **k):
+        raise urllib.error.URLError("connection reset by peer")
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    _mod.STATE.set_comment_id("o/r", "5", 111)
+    assert _mod.upsert_comment("tok", "o/r", "5", "body") is None, \
+        "a transport error must degrade to a retry, not an exception"
+
+
+def test_find_comment_id_failure_does_not_crash_upsert(monkeypatch):
+    """find_comment_id sits OUTSIDE upsert_comment's try block."""
+    def boom(req, *a, **k):
+        _raise(500, {})
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    assert _mod.upsert_comment("tok", "o/r", "5", "body") is None
+
+
+def test_rate_limit_from_find_comment_id_still_propagates(monkeypatch):
+    """Swallowing everything would hide the backoff signal."""
+    def limited(req, *a, **k):
+        _raise(403, {"X-RateLimit-Remaining": "0", "Retry-After": "77"})
+
+    monkeypatch.setattr(urllib.request, "urlopen", limited)
+    with pytest.raises(_mod.RateLimitError):
+        _mod.upsert_comment("tok", "o/r", "5", "body")
+
+
+def test_api_calls_carry_a_socket_timeout(monkeypatch):
+    """A hung connection must not stall the poller silently."""
+    seen: list[object] = []
+
+    def fake_urlopen(req, *a, **k):
+        seen.append(k.get("timeout"))
+        return _Resp({"id": 1}, {})
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    _mod._api_request("https://api.github.com/run", "tok")
+    _mod.upsert_comment("tok", "o/r", "5", "body", comment_id=0)
+    assert seen and all(t is not None for t in seen), \
+        f"an API call was made with no socket timeout: {seen}"
+
+
+def test_graphql_headers_do_not_pollute_the_rest_budget(monkeypatch):
+    """GraphQL has its OWN 5000-point budget, separate from REST's 1000.
+
+    Feeding its headers into the REST governor overwrote a low REST
+    remaining with a healthy GraphQL one and silently disarmed the
+    interval backoff.
+    """
+    _mod.STATE.observe({"X-RateLimit-Remaining": "50", "X-RateLimit-Limit": "1000"})
+    assert _mod.STATE.effective_interval(45) >= 60
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, *a, **k: _Resp(
+        {"data": {"repository": {"pullRequest": {"isInMergeQueue": False}}}},
+        {"X-RateLimit-Remaining": "4900", "X-RateLimit-Limit": "5000"}))
+    _mod.pr_is_in_merge_queue("tok", "o/r", "5")
+
+    assert _mod.STATE.remaining == 50, (
+        f"the GraphQL budget overwrote the REST one (remaining={_mod.STATE.remaining})"
+    )
+    assert _mod.STATE.effective_interval(45) >= 60, \
+        "the low-budget backoff was disarmed by a GraphQL response"
+
+
+def test_rate_limited_merge_queue_check_backs_off(monkeypatch):
+    """A 403 here must not be read as 'not queued' and charge on regardless."""
+    def limited(req, *a, **k):
+        _raise(403, {"X-RateLimit-Remaining": "0", "Retry-After": "88"})
+
+    monkeypatch.setattr(urllib.request, "urlopen", limited)
+    with pytest.raises(_mod.RateLimitError) as exc:
+        _mod.pr_is_in_merge_queue("tok", "o/r", "5")
+    assert exc.value.retry_after == 88
+
+
+def test_rate_limited_merge_queue_check_does_not_kill_the_loop(monkeypatch):
+    """run() must survive it — the poller never fails on a rate limit."""
+    calls = {"n": 0}
+
+    def fake_queued(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _mod.RateLimitError(60.0)
+        return False
+
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", fake_queued)
+    monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: (
+        [{"name": "Python tests", "status": "completed",
+          "conclusion": "success", "html_url": "u"}], True))
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", lambda *a, **k: [])
+    posted: list[str] = []
+    monkeypatch.setattr(_mod, "upsert_comment",
+                        lambda t, r, p, body, comment_id=None: posted.append(body) or 1)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_mod.time, "sleep",
+                        lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
+
+    rc = _mod.run(token="t", repo="o/r", run_id="1", pr_number="5",
+                  run_url="u", interval=45, timeout=3000, dry_run=False)
+    assert rc == 0
+    assert posted, "a rate-limited queue check stopped the poller publishing"
+
+
+def test_transient_artifact_listing_failure_keeps_the_last_statuses(monkeypatch):
+    """A listing blip must not republish the comment with sections deleted.
+
+    Returning an empty list on failure is indistinguishable from "no
+    artifacts exist", so the comment was rewritten with every review
+    section gone and then restored on the next cycle.
+    """
+    bodies: list[str] = []
+    cycle = {"n": 0}
+
+    def fake_fetch(*a, **k):
+        cycle["n"] += 1
+        if cycle["n"] == 1:
+            return [{"source": "lint", "results": [{"x": 1}]}]
+        if cycle["n"] == 2:
+            return None                         # transient listing failure
+        return [{"source": "lint", "results": [{"x": 1}]}]
+
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", fake_fetch)
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: False)
+    monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: (
+        [{"name": "Python tests", "status": "in_progress", "html_url": "u"}], False))
+    monkeypatch.setattr(_mod, "upsert_comment",
+                        lambda t, r, p, body, comment_id=None: bodies.append(body) or 1)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_mod.time, "sleep",
+                        lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
+
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5",
+             run_url="u", interval=45, timeout=150, dry_run=False)
+
+    assert cycle["n"] >= 3, "the test did not reach the post-failure cycle"
+    # Exactly one body: the failure cycle must not have produced a different
+    # (stripped) one, and therefore no re-post.
+    assert len(set(bodies)) == 1, (
+        "the comment was rewritten when the artifact listing failed — review "
+        f"sections were dropped and restored ({len(set(bodies))} distinct bodies)"
+    )
+
+
+def test_real_absence_of_artifacts_is_still_empty(monkeypatch):
+    """None means 'unknown'; an empty list must still mean 'none exist'."""
+    monkeypatch.setattr(_mod, "_list_artifacts", lambda *a, **k: [])
+    assert _mod.fetch_all_review_statuses("tok", "o/r", "77") == []
+
+
+def test_listing_failure_returns_none_not_empty(monkeypatch):
+    def boom(*a, **k):
+        raise urllib.error.URLError("nope")
+
+    monkeypatch.setattr(_mod, "_list_artifacts", boom)
+    assert _mod.fetch_all_review_statuses("tok", "o/r", "77") is None, \
+        "a listing failure is indistinguishable from 'no artifacts exist'"
+
+
 # ─── P1: merge-queue membership is not terminal ───────────────────────
 
 
@@ -434,20 +666,76 @@ def test_queued_pr_is_rechecked_not_abandoned(monkeypatch):
         "the PR left the merge queue but no comment was ever published"
 
 
+def test_queued_pause_does_not_consume_the_poll_lifetime(monkeypatch):
+    """A long queue stay must not exhaust the timeout before the dequeue.
+
+    The pause exists so a dequeued PR still gets reported. If queued time
+    counted against ``timeout``, a PR queued for the whole window would exit
+    the poller — and merge-group runs never comment, so nothing would ever
+    publish its result. That is the same bug the pause replaced.
+    """
+    # Queued far longer than the whole 1800s timeout, then released.
+    queued = {"n": 0}
+
+    def fake_queued(token, repo, pr):
+        queued["n"] += 1
+        return queued["n"] <= 20        # 20 * 300s = 6000s >> timeout
+
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", fake_queued)
+    monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: (
+        [{"name": "Python tests", "status": "completed",
+          "conclusion": "success", "html_url": "u"}], True))
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", lambda *a, **k: [])
+
+    posted: list[str] = []
+    monkeypatch.setattr(_mod, "upsert_comment",
+                        lambda t, r, p, body, comment_id=None: posted.append(body) or 7)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_mod.time, "sleep",
+                        lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
+
+    rc = _mod.run(token="t", repo="o/r", run_id="1", pr_number="5",
+                  run_url="u", interval=45, timeout=1800, dry_run=False)
+
+    assert rc == 0
+    assert clock["t"] > 1800, "the test did not actually outlast the timeout"
+    assert posted, (
+        f"the PR sat queued for {clock['t']:.0f}s (timeout 1800s), was then "
+        "dequeued, and the poller had already exited — its result is "
+        "permanently unreported"
+    )
+
+
+
 def test_queued_pr_does_not_poll_the_jobs_api(monkeypatch):
     """Pausing must be cheap: one GraphQL check per pause, no job polling."""
-    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: True)
+    # Queued for a bounded number of checks, then the run ends. (Queued time
+    # no longer consumes the timeout, so a permanently-queued PR would pause
+    # forever by design.)
+    queued = {"n": 0}
+
+    def fake_queued(*a, **k):
+        queued["n"] += 1
+        return queued["n"] <= 5
+
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", fake_queued)
 
     collects = {"n": 0}
 
     def fake_collect(*a, **k):
         collects["n"] += 1
-        return [], True
+        return [{"name": "Python tests", "status": "completed",
+                 "conclusion": "success", "html_url": "u"}], True
 
     monkeypatch.setattr(_mod, "collect_run_jobs", fake_collect)
     monkeypatch.setattr(_mod, "fetch_all_review_statuses", lambda *a, **k: [])
-    monkeypatch.setattr(_mod, "upsert_comment",
-                        lambda *a, **k: pytest.fail("a queued PR must not be commented on"))
+    comments_while_queued = {"n": 0}
+    monkeypatch.setattr(
+        _mod, "upsert_comment",
+        lambda *a, **k: comments_while_queued.__setitem__("n", comments_while_queued["n"] + 1) or 1,
+    )
 
     clock = {"t": 0.0}
     monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
@@ -458,8 +746,13 @@ def test_queued_pr_does_not_poll_the_jobs_api(monkeypatch):
                   run_url="u", interval=45, timeout=300, dry_run=False)
 
     assert rc == 0
-    assert collects["n"] == 0, \
-        "a queued PR spent job-API budget it was supposed to be conserving"
+    # 5 queued pauses happened before the PR was released; during those the
+    # poller must not have touched the jobs API at all.
+    assert queued["n"] >= 6, "the PR was never actually paused while queued"
+    assert collects["n"] <= 2, (
+        f"a queued PR spent job-API budget it was supposed to be conserving "
+        f"({collects['n']} collect calls across {queued['n']} membership checks)"
+    )
 
 
 def test_merge_queue_check_is_throttled_not_per_cycle(monkeypatch):
@@ -568,6 +861,7 @@ def test_stale_backoff_is_not_replayed_by_the_poll_loop(monkeypatch):
 
     monkeypatch.setattr(_mod, "collect_run_jobs", fake_collect)
     monkeypatch.setattr(_mod, "fetch_all_review_statuses", lambda *a, **k: [])
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: False)
     posted: list[str] = []
     monkeypatch.setattr(_mod, "upsert_comment",
                         lambda t, r, p, body, comment_id=None: posted.append(body) or 1)
@@ -616,14 +910,14 @@ def test_deleted_comment_is_recreated_in_the_same_call(monkeypatch):
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
-    _mod.STATE.comment_id = 111
+    _mod.STATE.set_comment_id("o/r", "5", 111)
     new_id = _mod.upsert_comment("tok", "o/r", "5", "body")
 
     assert new_id == 555, \
         "a deleted comment was not recreated; the final status was lost"
     assert [m for m, _ in requests] == ["PATCH", "POST"], \
         f"expected a PATCH then an immediate POST, got {requests}"
-    assert _mod.STATE.comment_id == 555
+    assert _mod.STATE.comment_id_for("o/r", "5") == 555
 
 
 def test_recreate_after_404_happens_only_once(monkeypatch):
@@ -635,7 +929,7 @@ def test_recreate_after_404_happens_only_once(monkeypatch):
         _raise(404, {}, b'{"message":"Not Found"}')
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    _mod.STATE.comment_id = 111
+    _mod.STATE.set_comment_id("o/r", "5", 111)
     assert _mod.upsert_comment("tok", "o/r", "5", "body") is None
     assert methods == ["PATCH", "POST"], f"unbounded retry: {methods}"
 
@@ -649,11 +943,11 @@ def test_non_404_patch_error_does_not_trigger_a_recreate(monkeypatch):
         _raise(500, {})
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    _mod.STATE.comment_id = 111
+    _mod.STATE.set_comment_id("o/r", "5", 111)
     assert _mod.upsert_comment("tok", "o/r", "5", "body") is None
     assert methods == ["PATCH"], \
         f"a transient 500 caused a duplicate comment to be posted: {methods}"
-    assert _mod.STATE.comment_id == 111, "a 500 must not discard the cached id"
+    assert _mod.STATE.comment_id_for("o/r", "5") == 111, "a 500 must not discard the cached id"
 
 
 # ─── P3: artifact extract paths must be keyed by immutable id ─────────
@@ -685,11 +979,6 @@ def test_two_artifact_ids_with_one_name_do_not_share_a_directory(tmp_path, monke
             (Path(dest) / "review-status.json").write_text("review_status=[]")
 
     monkeypatch.setattr(_mod.zipfile, "ZipFile", _FakeZip)
-
-    def fake_urlopen(req, *a, **k):
-        if "archive" in req.full_url:
-            _raise(302, {"Location": "https://blob/x"})
-        return _Resp({}, {})
 
     class _Blob:
         headers = {}
