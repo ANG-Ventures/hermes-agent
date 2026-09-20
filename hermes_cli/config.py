@@ -3797,44 +3797,95 @@ def apply_terminal_config_to_env(
     return target
 
 
+def _config_cache_signature(config_path: Path) -> Optional[Tuple[int, int, int, int]]:
+    """Return the (user_mtime, user_size, managed_mtime, managed_size) cache key.
+
+    Single source of truth for the cache signature, shared by the lock-free
+    fast path and the locked rebuild path in ``_load_config_impl`` so the two
+    can never drift into disagreeing about freshness.
+
+    ``None`` means "nothing to cache on": the user config is absent AND no
+    managed config file exists.
+    """
+    try:
+        st = config_path.stat()
+        user_sig: Optional[Tuple[int, int]] = (st.st_mtime_ns, st.st_size)
+    except FileNotFoundError:
+        user_sig = None
+
+    # Managed scope: fold the managed config file's (mtime, size) into the
+    # signature so editing /etc/hermes/config.yaml invalidates the cached
+    # merged result. (0, 0) means "no managed config file".
+    from hermes_cli import managed_scope
+
+    managed_dir = managed_scope.get_managed_dir()
+    managed_cfg_path = (managed_dir / "config.yaml") if managed_dir else None
+    try:
+        mst = managed_cfg_path.stat() if managed_cfg_path else None
+        managed_sig = (mst.st_mtime_ns, mst.st_size) if mst else (0, 0)
+    except OSError:
+        managed_sig = (0, 0)
+
+    if user_sig is not None:
+        return (user_sig[0], user_sig[1], managed_sig[0], managed_sig[1])
+    if managed_sig != (0, 0):
+        return (0, 0, managed_sig[0], managed_sig[1])
+    return None
+
+
 def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+    # ---- LOCK-FREE FAST PATH -------------------------------------------
+    #
+    # Measured on the live Apollo gateway 2026-09-20 (py-spy, 14 dumps 2s
+    # apart): MainThread sat in this function for >=6s across 3 consecutive
+    # samples, reached from `_handle_message` -> `invoke_hook` ->
+    # `_resolve_hook_callback_timeout` -> `load_config_readonly`, while a
+    # worker thread (`asyncio_5`) was inside this same function. A cache HIT
+    # costs ~0.025ms, so the loop was not computing -- it was WAITING ON
+    # `_CONFIG_LOCK` held by a background writer. Measured hold times on this
+    # box: cache-miss rebuild median 5.5ms, `save_config()` median 5.5ms /
+    # p95 33ms / max 55ms; under a writer loop a CACHED on-loop read measured
+    # median 22ms / max 4032ms.
+    #
+    # The lock never protected the cache dict itself -- CPython dict
+    # get/setitem are atomic under the GIL, and the cached tuple is replaced
+    # wholesale (never mutated in place), so a reader sees either the old
+    # complete tuple or the new complete tuple. The lock's real job is
+    # serializing the REBUILD (parse + merge + expand) and the writers in
+    # `save_config`. So a hit can be served without ever touching the lock.
+    #
+    # Worst case on a miss-looking-like-a-hit race is a redundant rebuild,
+    # which the lock-held path below re-checks and collapses.
+    try:
+        config_path = get_config_path()
+        path_key = str(config_path)
+        cached = _LOAD_CONFIG_CACHE.get(path_key)
+        if cached is not None:
+            fast_sig = _config_cache_signature(config_path)
+            if fast_sig is not None and cached[:4] == fast_sig:
+                env_snapshot = cached[5] if len(cached) > 5 else {}
+                if all(os.environ.get(k) == v for k, v in env_snapshot.items()):
+                    return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
+    except Exception:
+        # Any surprise in the fast path falls through to the locked path,
+        # which is the original, fully-defensive implementation.
+        pass
+
     with _CONFIG_LOCK:
         ensure_hermes_home()
         config_path = get_config_path()
         path_key = str(config_path)
 
+        cache_sig = _config_cache_signature(config_path)
+        # ``user_sig is not None`` in the original shape == "the user config
+        # file exists"; re-derive it here rather than duplicating the stat.
         try:
             st = config_path.stat()
             user_sig: Optional[Tuple[int, int]] = (st.st_mtime_ns, st.st_size)
         except FileNotFoundError:
             user_sig = None
 
-        # Managed scope: fold the managed config file's (mtime, size) into the
-        # cache signature so editing /etc/hermes/config.yaml invalidates the
-        # cached merged result. (0, 0) means "no managed config file".
         from hermes_cli import managed_scope
-
-        managed_dir = managed_scope.get_managed_dir()
-        managed_cfg_path = (managed_dir / "config.yaml") if managed_dir else None
-        try:
-            mst = managed_cfg_path.stat() if managed_cfg_path else None
-            managed_sig = (mst.st_mtime_ns, mst.st_size) if mst else (0, 0)
-        except OSError:
-            managed_sig = (0, 0)
-
-        # Combined cache signature: user file + managed file. None only when the
-        # user config is absent AND no managed file exists (nothing to cache on).
-        if user_sig is not None:
-            cache_sig: Optional[Tuple[int, int, int, int]] = (
-                user_sig[0],
-                user_sig[1],
-                managed_sig[0],
-                managed_sig[1],
-            )
-        elif managed_sig != (0, 0):
-            cache_sig = (0, 0, managed_sig[0], managed_sig[1])
-        else:
-            cache_sig = None
 
         cached = _LOAD_CONFIG_CACHE.get(path_key)
         if cached is not None and cache_sig is not None and cached[:4] == cache_sig:
