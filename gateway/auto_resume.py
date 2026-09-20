@@ -124,6 +124,17 @@ class InterruptedTurnAssessment:
 # resumable — this gate only ever SKIPS work on positive evidence.
 _COMPLETED_FINISH_REASONS = frozenset({"stop"})
 
+# Rows the gateway persists as bookkeeping, never as conversation. run.py
+# appends a ``session_meta`` row (model, platform) AFTER a new session's first
+# turn is persisted, so every single-turn transcript ends
+# ``assistant(stop) -> session_meta``; system injections (restart notes) are
+# likewise dropped before the agent sees history (``_last_transcript_timestamp``
+# in gateway/run.py skips the same set). Judging ``rows[-1]`` without skipping
+# these made every finished first-turn session look unanswered and fail closed
+# into a full resume turn (2026-09-20: four fresh sessions re-prompted on one
+# marker-less boot, one of them ``/stop``ped).
+_TRANSCRIPT_METADATA_ROLES = frozenset({"session_meta", "system"})
+
 
 def has_resumable_work(messages: Iterable[dict[str, Any]]) -> bool:
     """True when the persisted tail leaves work a boot-resume turn could continue.
@@ -144,9 +155,14 @@ def has_resumable_work(messages: Iterable[dict[str, Any]]) -> bool:
     positive proof of completion: the last row is an assistant message, with no
     unanswered tool calls, non-empty content, and an explicit ``stop``.
     """
-    rows = [row for row in messages if isinstance(row, dict)]
+    rows = [
+        row
+        for row in messages
+        if isinstance(row, dict)
+        and row.get("role") not in _TRANSCRIPT_METADATA_ROLES
+    ]
     if not rows:
-        # No persisted transcript to reason about — keep today's behaviour.
+        # No conversational transcript to reason about — keep today's behaviour.
         return True
 
     tail = rows[-1]

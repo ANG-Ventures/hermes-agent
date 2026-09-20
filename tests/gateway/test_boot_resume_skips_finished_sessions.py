@@ -210,6 +210,82 @@ async def test_finished_session_is_not_scheduled_and_marker_is_cleared(
     db.close()
 
 
+# --------------------------------------------------------------------------
+# Metadata rows in the tail (2026-09-20)
+#
+# ``gateway/run.py`` appends a ``session_meta`` bookkeeping row (model,
+# platform) AFTER a NEW session's first turn has been persisted, so every
+# single-turn session's transcript ends ``assistant(stop) -> session_meta``.
+# ``SessionDB.get_messages`` returns that row verbatim. A classifier that only
+# looks at ``rows[-1]`` therefore sees a non-assistant tail and fails closed —
+# which is exactly how four freshly-created sessions (all finished, one of them
+# ``/stop``ped) were resumed on a marker-less boot at 00:23:53 and posted
+# spurious replies. The gate must judge the last CONVERSATIONAL row.
+# --------------------------------------------------------------------------
+
+_META_ROW = {"role": "session_meta", "content": "", "model": "x", "platform": "discord"}
+_SYSTEM_NOTE = {"role": "system", "content": "[gateway restarted]"}
+
+
+@pytest.mark.parametrize("meta", [_META_ROW, _SYSTEM_NOTE], ids=["session_meta", "system"])
+def test_completed_tail_followed_by_metadata_row_has_no_resumable_work(meta):
+    assert (
+        has_resumable_work(
+            [
+                {"role": "user", "content": "status?"},
+                {"role": "assistant", "content": "All done.", "finish_reason": "stop"},
+                meta,
+            ]
+        )
+        is False
+    )
+
+
+def test_metadata_row_does_not_mask_an_unfinished_tail():
+    assert (
+        has_resumable_work(
+            [
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"id": "c1", "function": {"name": "terminal"}}],
+                    "finish_reason": "tool_calls",
+                },
+                _META_ROW,
+            ]
+        )
+        is True
+    )
+
+
+def test_metadata_only_transcript_fails_open():
+    # Nothing conversational to judge — keep today's behaviour (resume).
+    assert has_resumable_work([_META_ROW]) is True
+
+
+@pytest.mark.asyncio
+async def test_first_turn_session_whose_persisted_tail_is_session_meta_is_not_scheduled(
+    tmp_path, monkeypatch, caplog
+):
+    """The production seam: real ``SessionDB`` rows, real ``get_messages``,
+    real prepare -> schedule. A session that finished its first (and only)
+    turn must be skipped even though its last persisted row is metadata."""
+    runner, _adapter, db = _runner(tmp_path, monkeypatch)
+    entry = runner.session_store.get_or_create_session(_source())
+    _seed(db, entry, _COMPLETED_TAIL + [{"role": "session_meta", "content": ""}])
+    assert db.get_messages(entry.session_id)[-1]["role"] == "session_meta"
+    assert runner.session_store.mark_resume_pending(entry.session_key, "restart_interrupted")
+
+    assert await runner._prepare_boot_resume_work_check() == 1
+    assert runner._boot_resume_has_work[entry.session_key] is False
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        assert runner._schedule_resume_pending_sessions() == 0
+    assert any("cause=no_unfinished_work" in m for m in caplog.messages)
+    assert not any("PHASE=boot_resume_scheduled" in m for m in caplog.messages)
+
+
 @pytest.mark.asyncio
 async def test_negative_control_genuinely_interrupted_session_still_resumes(
     tmp_path, monkeypatch, caplog

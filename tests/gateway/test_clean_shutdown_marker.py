@@ -127,6 +127,73 @@ class TestCleanShutdownMarker:
             resume_count = sum(1 for e in store._entries.values() if e.resume_pending)
         assert resume_count == 1, "Session should be resume_pending after crash (no marker)"
 
+    def test_marker_written_when_only_cron_work_outlives_the_drain(self, tmp_path, monkeypatch):
+        """A cron job past its own drain deadline is terminated and recorded in
+        jobs.json — but no chat/api turn was interrupted, so the next boot has
+        nothing to recover. The marker MUST still be written. Without it the
+        boot runs ``suspend_recently_active()`` and re-marks every session that
+        was active in the last 120s (measured 2026-09-20 00:22:34:
+        ``active_at_start=0 active_now=0 cron_now=1`` -> marker skipped ->
+        "Marked 4 in-flight session(s) as resumable" -> four finished sessions
+        re-prompted). Drives the REAL ``stop()`` drain, no LLM, no adapters."""
+        import asyncio
+        import cron.scheduler as sched
+        import tools.process_registry as _pr
+        import tools.terminal_tool as _tt
+        import tools.browser_tool as _bt
+        from tests.gateway.restart_test_helpers import make_restart_runner
+
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        marker = tmp_path / ".clean_shutdown"
+        runner, adapter = make_restart_runner()
+        runner._restart_drain_timeout = 0.01
+        runner._cron_drain_timeout = 0.01  # past the cron floor too (#82161)
+        adapter.disconnect = AsyncMock()
+        sched._running_job_ids.add("job-1")
+        sched._running_fire_owners["job-1"] = {
+            object(): ("owner-1", sched._get_hermes_home().resolve())
+        }
+        monkeypatch.setattr(_pr.process_registry, "kill_all", lambda task_id=None: 0)
+        monkeypatch.setattr(_tt, "cleanup_all_environments", lambda: None)
+        monkeypatch.setattr(_bt, "cleanup_all_browsers", lambda: None)
+        try:
+            with patch("gateway.status.remove_pid_file"), \
+                 patch("gateway.status.write_runtime_status"), \
+                 patch("cron.scheduler.mark_job_run"):
+                asyncio.run(runner.stop())
+        finally:
+            sched._running_job_ids.discard("job-1")
+            sched._running_fire_owners.pop("job-1", None)
+        assert marker.exists(), (
+            ".clean_shutdown must be written when the only work that outlived "
+            "the drain was a cron job — no chat session was interrupted"
+        )
+
+    def test_marker_skipped_when_a_chat_turn_outlives_the_drain(self, tmp_path, monkeypatch):
+        """Negative control for the test above: a chat turn that is still
+        running at the deadline IS interrupted, its transcript may be half
+        finished, and the marker must stay absent so the boot recovers it."""
+        import asyncio
+        from tests.gateway.restart_test_helpers import make_restart_runner
+
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        marker = tmp_path / ".clean_shutdown"
+        runner, adapter = make_restart_runner()
+        runner._restart_drain_timeout = 0.05
+        adapter.disconnect = AsyncMock()
+        runner._running_agents = {"agent:main:telegram:dm:1": MagicMock()}  # never finishes
+        store = MagicMock()
+        store._entries = {}
+        store.mark_resume_pending = MagicMock(return_value=True)
+        store.clear_resume_pending = MagicMock(return_value=True)
+        runner.session_store = store
+        with patch("gateway.status.remove_pid_file"), \
+             patch("gateway.status.write_runtime_status"):
+            asyncio.run(runner.stop())
+        assert not marker.exists(), (
+            "a genuinely interrupted chat turn must suppress the marker"
+        )
+
 
 # ---------------------------------------------------------------------------
 # resume_pending freshness gate (#46934)
