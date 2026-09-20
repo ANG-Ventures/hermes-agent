@@ -3184,6 +3184,7 @@ from gateway.platforms.base import (
     _reply_anchor_for_event,
     build_auto_tts_output_path,
     merge_pending_message_event,
+    prime_system_proxy_cache,
     utf16_len,
 )
 from gateway.shutdown_watchdog import (
@@ -16286,6 +16287,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns True if at least one adapter connected successfully.
         """
         logger.info("Starting Hermes Gateway...")
+        # Warm the macOS system-proxy cache BEFORE any adapter connects. The
+        # probe shells out to `scutil --proxy`; doing it lazily meant the first
+        # caller was often a reconnect running ON the event loop, which froze
+        # every other platform for the length of the subprocess (see
+        # gateway/platforms/base.py). Off-loop here, once, at boot.
+        try:
+            await asyncio.to_thread(prime_system_proxy_cache)
+        except Exception:
+            logger.debug("system-proxy cache prime failed (non-fatal)", exc_info=True)
         # Persisted deferred requests can span an OS reboot, so their ordering
         # must use the same stable wall-clock epoch as request intent_ts.
         self._boot_started_at = time.time()
@@ -17173,8 +17183,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Adapters and parent-session startup restore are complete. Claim once,
         # then queue restart/terminal events before the existing watcher starts.
+        #
+        # OFF-LOOP: this does a JSON registry rewrite (sha256 per record +
+        # atomic_json_write) and a heavy lazy import chain (run_agent ->
+        # model_tools -> tool registry). Measured on a busy gateway it blocked
+        # the event loop for >20s at boot, which starves discord.py's heartbeat
+        # ACK and force-reconnects the adapter with `latency_exceeded`.
         try:
-            self._recover_async_delegations_once()
+            await asyncio.to_thread(self._recover_async_delegations_once)
         except Exception:
             logger.error(
                 "Async delegation restart recovery failed during gateway startup",
