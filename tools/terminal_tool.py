@@ -3171,16 +3171,28 @@ def terminal_tool(
                 _MAX_REFERENCED_SCRIPT_BYTES,
                 contains_gateway_lifecycle_command_or_referenced_script,
                 contains_launchctl_submit_command,
+                describe_self_gateway_identity,
+            )
+            _self_identity = describe_self_gateway_identity()
+            _identity_clause = (
+                f"{_self_identity}; stopping/restarting it from inside itself is "
+                "blocked — SIBLING gateway labels are allowed. "
+                if _self_identity
+                else (
+                    "This gateway's own service identity could not be determined, "
+                    "so every gateway lifecycle command is blocked (fail-closed). "
+                )
             )
             if contains_launchctl_submit_command(command):
                 return json.dumps({
                     "output": "",
                     "exit_code": 1,
                     "error": (
-                        "Blocked: launchctl submit/bootstrap registers a persistent "
+                        "Blocked: launchctl submit registers a persistent "
                         "KeepAlive job and is unsafe from inside the gateway process. "
                         "Use Hermes cron for one-shot delayed work, or install an "
-                        "explicit LaunchAgent from a separate shell."
+                        "explicit LaunchAgent from a separate shell. "
+                        "(launchctl bootstrap of a SIBLING gateway's plist is allowed.)"
                     ),
                     "status": "error",
                 }, ensure_ascii=False)
@@ -3259,10 +3271,11 @@ def terminal_tool(
                     "exit_code": 1,
                     "error": (
                         "Blocked: command or referenced script cannot restart, stop, or "
-                        "uninstall the gateway from inside the gateway process. The gateway would "
-                        "kill this command before it could complete (SIGTERM propagates "
-                        "to child processes). Run `hermes gateway restart` from a "
-                        "separate shell outside the running gateway."
+                        "uninstall THIS gateway from inside the gateway process. "
+                        + _identity_clause +
+                        "The gateway would kill this command before it could complete "
+                        "(SIGTERM propagates to child processes). Run `hermes gateway "
+                        "restart` from a separate shell outside the running gateway."
                     ),
                     "status": "error",
                 }, ensure_ascii=False)
