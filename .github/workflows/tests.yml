@@ -160,7 +160,8 @@ jobs:
         # re-ran LPT independently — redundant N times.
         run: |
           source .venv/bin/activate
-          scripts/run_tests.sh --files '${{ matrix.slice.files }}'
+          # Verbose pytest output lets timeout verdicts name the last test reached.
+          scripts/run_tests.sh --files '${{ matrix.slice.files }}' -- -v
         env:
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
