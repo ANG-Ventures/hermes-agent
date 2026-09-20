@@ -42,6 +42,7 @@ from agent.context_engine import (
     call_with_messages as _call_with_messages,
 )
 from agent.display import KawaiiSpinner
+from agent.confab_notice import CONFAB_NOTICE_TEXT
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
 from agent.turn_context import (
@@ -7656,6 +7657,24 @@ def run_conversation(
 
             assistant_message = normalized
             finish_reason = normalized.finish_reason
+
+            # Out-of-band confab notice: the provider caught and removed
+            # self-fabricated scaffold text from this reply. Tell the user NOW
+            # (CLI/TUI/gateway all receive _emit_status) — out of band must not
+            # mean invisible, because this signal is load-bearing for triage.
+            # Exactly one status per accepted notice: the request_id ledger
+            # stops a retry/fallback that re-normalizes the same response from
+            # emitting twice. See agent/confab_notice.py.
+            _confab_notice = getattr(normalized, "confab_notice", None)
+            if _confab_notice:
+                _seen = getattr(agent, "_confab_notices_announced", None)
+                if _seen is None:
+                    _seen = set()
+                    agent._confab_notices_announced = _seen
+                _notice_id = _confab_notice.get("request_id")
+                if _notice_id not in _seen:
+                    _seen.add(_notice_id)
+                    agent._emit_status(CONFAB_NOTICE_TEXT)
             
             # Normalize content to string — some OpenAI-compatible servers
             # (llama-server, etc.) return content as a dict or list instead

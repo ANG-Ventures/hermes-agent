@@ -13,6 +13,7 @@ import json
 from typing import Any, Dict
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
+from agent.confab_notice import CONFAB_NOTICE_KEY, extract_confab_notice
 from agent.reasoning_effort import (
     KIMI_K3_EFFORTS,
     KIMI_K3_OVERRIDES,
@@ -986,6 +987,14 @@ class ChatCompletionsTransport(ProviderTransport):
         rd = getattr(msg, "reasoning_details", None)
         if rd:
             provider_data["reasoning_details"] = rd
+
+        # Out-of-band confab notice (agent/confab_notice.py). Top-level on the
+        # completion object for non-stream responses; the streaming path
+        # forwards the same field on its synthetic completion. Validated here —
+        # an unvalidated payload is dropped, never carried forward.
+        _confab_notice = extract_confab_notice(response)
+        if _confab_notice is not None:
+            provider_data[CONFAB_NOTICE_KEY] = _confab_notice
 
         # OpenAI structured-refusal field. When a model declines, the SDK
         # populates ``message.refusal`` with the explanation and leaves

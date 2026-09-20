@@ -143,6 +143,17 @@ class NormalizedResponse:
         pd = self.provider_data or {}
         return pd.get("codex_message_items")
 
+    @property
+    def confab_notice(self):
+        """Validated out-of-band confab notice, or ``None``.
+
+        Set by the chat_completions transport when a bridge attached a valid
+        v1 ``hermes_confab_notice`` to the response envelope. Presentation
+        only — see agent/confab_notice.py.
+        """
+        pd = self.provider_data or {}
+        return pd.get("confab_notice")
+
 
 # ---------------------------------------------------------------------------
 # Factory helpers
