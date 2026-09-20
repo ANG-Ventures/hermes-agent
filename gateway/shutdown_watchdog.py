@@ -104,8 +104,8 @@ def _sample_host_load() -> tuple[Optional[float], Optional[int]]:
 
     Best-effort: this runs on a path that may be about to hard-exit, so a platform without
     ``os.getloadavg`` (Windows) reports ``None`` rather than raising and costing us the dump. An
-    unavailable load average classifies as WEDGED — absence of evidence for starvation must not
-    create a hold.
+    unavailable load average OR an unavailable CPU count classifies as WEDGED — absence of
+    evidence for starvation must not create a hold.
     """
     try:
         load1: Optional[float] = float(os.getloadavg()[0])
@@ -141,9 +141,19 @@ def evaluate_liveness_miss(
         factor = DEFAULT_LIVENESS_STARVATION_LOAD_FACTOR
 
     starved = False
-    if load1 is not None and math.isfinite(load1):
-        cores = ncpu if isinstance(ncpu, int) and ncpu > 0 else 1
-        starved = load1 > max(factor * cores, LIVENESS_STARVATION_LOAD_FLOOR)
+    # BOTH terms of the predicate must be evidence. A missing CPU count used to fall back to
+    # ``cores = 1``, which is not a conservative default but the most permissive one: on a 64-core
+    # host, ``load1=20`` then cleared ``max(2 * 1, 8)`` and held, where the real threshold is
+    # ``max(2 * 64, 8) = 128`` and the correct action is to exit. An unknown ncpu is insufficient
+    # evidence for starvation and classifies as WEDGED, exactly like an unavailable load average.
+    if (
+        load1 is not None
+        and math.isfinite(load1)
+        and isinstance(ncpu, int)
+        and not isinstance(ncpu, bool)
+        and ncpu > 0
+    ):
+        starved = load1 > max(factor * ncpu, LIVENESS_STARVATION_LOAD_FLOOR)
     if not starved:
         return _LivenessMissDecision("exit", strikes, None, None)
 
