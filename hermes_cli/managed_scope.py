@@ -26,6 +26,10 @@ from typing import Dict, Optional
 
 import yaml
 
+# Single definition of "are we under pytest" (session-wide: env markers + pytest
+# ancestry). A LEAF module by design — importing it pulls no dependency graph.
+from hermes_test_context import _in_test_context
+
 logger = logging.getLogger(__name__)
 
 # POSIX default. Other-platform locations are a deliberate v2 item; when added,
@@ -45,8 +49,19 @@ def _under_pytest() -> bool:
     managed scope on a developer/CI box can't leak policy into the suite. Tests
     that exercise managed scope set ``HERMES_MANAGED_DIR`` explicitly, which is
     still honored (the override path below runs before this guard takes effect).
+
+    "Under pytest" is a property of the SESSION, not of the currently-executing
+    test, so this delegates to the single strict definition in
+    ``hermes_test_context._in_test_context()`` rather than keeping a second
+    private copy — two copies of one predicate will drift.
+    ``PYTEST_CURRENT_TEST`` alone only answers for the in-test phase: pytest
+    unsets it at collection, in any thread that outlives its test, and at
+    interpreter shutdown, and the system scope leaked back into the suite in
+    exactly those phases. ``_in_test_context()`` adds ``PYTEST_VERSION`` (whole
+    session), ``HERMES_TEST_ISOLATION`` (our own marker, survives an env
+    rebuild) and pytest process ancestry, memoised.
     """
-    return "PYTEST_CURRENT_TEST" in os.environ
+    return _in_test_context()
 
 
 def get_managed_dir() -> Optional[Path]:
