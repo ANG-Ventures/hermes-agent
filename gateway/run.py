@@ -13848,7 +13848,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         ``_session_initiated_restart`` is popped (one-shot per turn) so it can't
         bleed into the next turn. ``resume_pending`` is always cleared (recovery
-        completed; the breaker, not the resume flag, is what trips a loop).
+        completed; the breaker, not the resume flag, is what trips a loop), and it
+        is cleared BEFORE either branch touches the replay/cap counters — see the
+        ordering note at the call site.
 
         The restart-initiator signal comes from THREE sources, OR'd:
         ``_session_initiated_restart`` (F1 ``request_restart`` + C1 progress-
@@ -13882,6 +13884,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # short-circuit, or a C1/F1-flagged turn leaks its breadcrumb (I-3).
         breadcrumb = self._consume_restart_initiated_breadcrumb(session_key)
         initiated_restart = flag or breadcrumb
+        # Clear the recovery marker FIRST, before either branch touches the
+        # replay/cap counters. Recovery is complete either way (the turn ran to
+        # a clean finish); it is the breaker and the cap, not this flag, that
+        # bound a loop. Ordering is load-bearing on the work-progress branch
+        # below, which also zeroes the per-session cap counter: a crash between
+        # the two must not leave a set marker beside a zeroed counter, which
+        # would hand the session a whole extra budget of unattended replays.
+        try:
+            self.session_store.clear_resume_pending(session_key)
+        except Exception as exc:
+            logger.debug("clear_resume_pending failed for %s: %s", session_key, exc)
         if initiated_restart:
             if breadcrumb and not flag:
                 logger.info(
@@ -13928,6 +13941,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # purpose: the restart-initiating branch above must keep its count,
             # or a session whose every resumed turn does nothing but re-restart
             # would refresh its own budget forever.
+            #
+            # ORDER MATTERS: the marker is cleared BEFORE this, hoisted above
+            # the branch. A crash between the two must not leave
+            # ``resume_pending`` set next to a freshly-zeroed counter — that is
+            # a whole extra budget of unattended replays. The reverse partial
+            # state (marker cleared, counter left) costs at most one skipped
+            # resume, the same fail-towards-fewer-replays direction
+            # ``clear_session_attempts`` already takes on error.
             try:
                 self._get_auto_resume_attempt_store().clear_session_attempts(
                     session_key
@@ -13936,10 +13957,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug(
                     "clear_session_attempts failed for %s: %s", session_key, exc
                 )
-        try:
-            self.session_store.clear_resume_pending(session_key)
-        except Exception as exc:
-            logger.debug("clear_resume_pending failed for %s: %s", session_key, exc)
 
     # ------------------------------------------------------------------
     # F2 restart-initiator breadcrumb consume / sweep (per-session, per-boot)
@@ -16015,25 +16032,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (_apply_post_turn_resume_gate), so a healthy session that is
             # simply unlucky with deploys never accumulates toward the cap.
             #
-            # At the cap the marker is CLEARED, same as the no-work skip above:
-            # the transcript is untouched and the next real user message
-            # continues the conversation normally — we only stop the gateway
-            # from replaying it unprompted, which puts a human back in the loop.
+            # At the cap the marker is LEFT SET and only the unprompted replay
+            # stops. This is the opposite of the no-work skip above, and the
+            # difference is the whole point: a no-work session has nothing to
+            # recover, whereas a capped session by construction still has
+            # unfinished work (the work check voted RESUME on every boot that
+            # spent the budget). ``resume_pending`` is not merely a "replay me"
+            # flag — it is the ONLY carrier of the user's recovery context:
+            # ``_clear_resume_pending_entry`` wipes resume_reason / resume_kind
+            # / resume_handoff / resume_request_id with it, and the inbound path
+            # gates the reason-aware resume prompt and the
+            # ``build_resume_recovery_note`` safety net on that same marker.
+            # Clearing it here would mean the user's NEXT real message lands on
+            # an interrupted session with no recovery note and no handoff.
+            #
+            # The clear would also buy nothing. Both jobs it could do are
+            # already done elsewhere: ``session_resume_verdict`` denies the
+            # unattended replay once count >= max regardless of the marker, and
+            # ``_clear_stale_resume_pending_flags`` reaps markers that outlive
+            # their usefulness. The cap counter bounds the replay; the marker
+            # stays until real forward progress or the stale reaper.
             _max_attempts = _auto_resume_max_attempts()
             if _max_attempts > 0:
-                # Two shapes of denial, and they are NOT interchangeable:
+                # Two shapes of denial. They log differently because they mean
+                # different things operationally, but NEITHER touches the
+                # marker:
                 #
                 #   attempts=<n>    this SESSION provably spent its budget.
-                #                   Retire the marker — the evidence is about
-                #                   the session.
+                #                   cause=attempt_cap.
                 #   attempts=None   the attempt store cannot record anything
                 #                   (unwritable dir, full disk). The session is
                 #                   owed a resume it cannot be accounted for,
-                #                   so we skip but LEAVE the marker set: the
-                #                   denial must evaporate the moment the disk
-                #                   is fixed. Answering "allowed" here instead
-                #                   is what reproduced the incident — 10 boots,
-                #                   10 full-transcript replays, zero cap lines.
+                #                   so the denial must evaporate the moment the
+                #                   disk is fixed. cause=cap_unaccountable.
+                #                   Answering "allowed" here instead is what
+                #                   reproduced the incident — 10 boots, 10
+                #                   full-transcript replays, zero cap lines.
                 #
                 # An unreadable store is neither: it self-repairs to an empty
                 # counter file and the session honestly reads zero attempts.
@@ -16065,16 +16099,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _attempt_count if _attempt_count is not None else "unknown",
                         _max_attempts,
                     )
-                    if _attempt_count is not None:
-                        try:
-                            self.session_store.clear_resume_pending(entry.session_key)
-                        except Exception as exc:
-                            logger.debug(
-                                "clear_resume_pending after attempt-cap skip failed "
-                                "for %s: %s",
-                                entry.session_key,
-                                exc,
-                            )
                     skipped += 1
                     continue
 

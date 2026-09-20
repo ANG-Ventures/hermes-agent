@@ -341,10 +341,12 @@ async def test_repeated_boots_stop_resuming_the_same_session_at_the_cap(
     assert not any("PHASE=boot_resume_scheduled" in m for m in messages)
     assert runner._background_tasks == set()
 
-    # The marker is retired so later boots do not re-litigate it...
+    # The marker SURVIVES the cap: it is the user's recovery context, not a
+    # "replay me" flag. The cap counter is what bounds the unattended replay.
     refreshed = runner.session_store._entries[entry.session_key]
-    assert refreshed.resume_pending is False
-    # ...but the conversation itself is untouched: a real user message still
+    assert refreshed.resume_pending is True
+    assert refreshed.resume_reason == "shutdown_timeout"
+    # ...and the conversation itself is untouched: a real user message still
     # continues it. Losing history would be a far worse bug than the replay.
     assert refreshed.session_id == entry.session_id
     assert len(db.get_messages(entry.session_id)) == len(_INTERRUPTED_TAIL)
@@ -427,9 +429,10 @@ async def test_the_cap_is_per_session_not_global(tmp_path, monkeypatch):
     assert _boot(runner) == 1
     assert quiet.session_key in runner._resumed_this_boot
     assert noisy.session_key not in runner._resumed_this_boot
-    # The capped session's marker is retired; the healthy one keeps its marker
-    # until its own resumed turn clears it post-turn.
-    assert runner.session_store._entries[noisy.session_key].resume_pending is False
+    # Both keep their markers: the capped one because the marker is recovery
+    # context (only the replay is bounded), the healthy one until its own
+    # resumed turn clears it post-turn.
+    assert runner.session_store._entries[noisy.session_key].resume_pending is True
     assert runner.session_store._entries[quiet.session_key].resume_pending is True
     db.close()
 

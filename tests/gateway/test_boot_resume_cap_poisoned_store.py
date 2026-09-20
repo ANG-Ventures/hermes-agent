@@ -5,9 +5,11 @@ through the real boot-resume scheduler:
 
 * **Round 1.** A poisoned ``auto_resume_attempts.json`` read as ``1_000_000``
   attempts, so ``count >= max`` was true for EVERY session on the host —
-  including ones that had never resumed. The cap's skip branch also clears
-  ``resume_pending``, so one corrupt file stripped restart continuity
-  host-wide and destroyed the markers on the way out.
+  including ones that had never resumed. At the time the cap's skip branch
+  also cleared ``resume_pending``, so one corrupt file stripped restart
+  continuity host-wide and destroyed the markers on the way out. That clear is
+  gone (round 3 — see ``test_boot_resume_cap_keeps_recovery_context.py``); the
+  innocent-session half below is still the contract.
 * **Round 2.** The fix flipped the polarity: a store fault answered "unknown",
   the cap never fired, and ``_invalid`` latched with no write path ever
   repairing the file. Measured with the incident's own shape
