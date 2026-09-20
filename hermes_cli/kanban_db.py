@@ -2066,6 +2066,13 @@ CREATE TABLE IF NOT EXISTS task_runs (
 -- dashboard can list/download and ``build_worker_context`` can surface
 -- the absolute path to the worker (which has full file-tool access). See
 -- #35338.
+CREATE TABLE IF NOT EXISTS task_workspace_survivors (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    bases TEXT NOT NULL DEFAULT '{}',
+    held_reason TEXT,
+    survivor TEXT
+);
+
 CREATE TABLE IF NOT EXISTS task_attachments (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id      TEXT NOT NULL,
@@ -6546,6 +6553,21 @@ def complete_task(
     else:
         verified_cards = []
 
+    # Reject stale workers before doing filesystem work or recording a hold.
+    candidate = get_task(conn, task_id)
+    if candidate is None or candidate.status not in ('running', 'ready', 'blocked', 'review'):
+        return False
+    if expected_run_id is not None and candidate.current_run_id != expected_run_id:
+        return False
+    from hermes_cli.kanban_survivor import preserve
+    survivor = preserve(conn, task_id, metadata)
+    if survivor:
+        metadata = dict(metadata or {}, survivor=survivor)
+        survivor_note = (
+            f"survivor=patch {survivor['path']} {survivor['sha256']} {survivor['bytes']} NOT PUSHED"
+            if survivor['kind'] == 'patch' else f"survivor=ref {json.dumps(survivor['refs'])}"
+        )
+        result = '\n'.join(filter(None, [result, survivor_note]))
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
@@ -6649,6 +6671,8 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
+        if survivor:
+            completed_payload["survivor"] = survivor
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -7014,6 +7038,9 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             return
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
+        from hermes_cli.kanban_survivor import allow_cleanup
+        if kind in ("scratch", "worktree") and path and not allow_cleanup(conn, task_id):
+            return
         if kind not in ("scratch", "worktree") or not path:
             # This task's own workspace isn't a removable scratch dir, but its
             # completion may still unblock a deferred parent scratch cleanup
@@ -7171,6 +7198,9 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             ).fetchone()
             if active:
                 continue  # still has active children
+            from hermes_cli.kanban_survivor import allow_cleanup
+            if not allow_cleanup(conn, parent_id):
+                continue
             # All children done — safe to clean up parent workspace
             if row["workspace_kind"] == "worktree":
                 _cleanup_worktree_workspace(
@@ -9438,6 +9468,8 @@ def set_workspace_path(
             "UPDATE tasks SET workspace_path = ? WHERE id = ?",
             (str(path), task_id),
         )
+    from hermes_cli.kanban_survivor import record_baseline
+    record_baseline(conn, task_id, path)
 
 
 def set_task_model(
