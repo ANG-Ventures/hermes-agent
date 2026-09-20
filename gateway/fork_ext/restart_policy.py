@@ -99,6 +99,7 @@ _AGENT_CONFIG_ENV_BRIDGE: dict[str, str] = {
     "restart_loop_threshold": "HERMES_RESTART_LOOP_THRESHOLD",
     "restart_loop_window_secs": "HERMES_RESTART_LOOP_WINDOW_SECS",
     "restart_initiated_ttl_secs": "HERMES_RESTART_INITIATED_TTL_SECS",
+    "gateway_stale_lease_wait": "HERMES_STALE_LEASE_WAIT",
 }
 
 

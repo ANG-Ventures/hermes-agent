@@ -49,9 +49,10 @@ Known limits (deliberate, flagged on #64934):
 """
 
 import asyncio
+import inspect
 import logging
 import time
-from typing import Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,52 @@ DEFAULT_MAX_LEASES = 512
 # inactivity. A caller that reaches this bound must reject the turn rather than
 # run it concurrently with the holder.
 DEFAULT_LEASE_WAIT = 1800.0
+
+# Wait bound (seconds) for a waiter queued behind a STALE-generation holder —
+# a turn whose run generation was already invalidated by /stop or /new but
+# whose thread is still unwinding (parked in a tool call the cooperative
+# interrupt has not reached yet). That holder is a zombie by construction: it
+# will never produce user-visible output, so making the next message wait the
+# full DEFAULT_LEASE_WAIT is pure dead time. A much shorter bound converts an
+# invisible 30-minute stall into a prompt, actionable rejection.
+DEFAULT_STALE_LEASE_WAIT = 90.0
+
+# A stale-generation holder that keeps the lease longer than this emits ONE
+# structured PHASE=stale_lease_holder line so the class is observable in
+# gateway.log instead of silently eating the user's next turn.
+STALE_HOLDER_LOG_AFTER = 60.0
+
+
+def _holder_tool_name(holder: "TurnLeaseToken") -> Optional[str]:
+    """Best-effort name of the tool the holder's turn is parked in.
+
+    The dispatch layer may attach a zero-arg callable to the token
+    (``tool_name_hint``) that reads the live agent's ``_current_tool``. Purely
+    diagnostic: any failure yields ``None`` and the detector line says
+    ``tool=unknown``.
+    """
+    hint = getattr(holder, "tool_name_hint", None)
+    if hint is None:
+        return None
+    try:
+        value = hint() if callable(hint) else hint
+    except Exception:
+        return None
+    return str(value) if value else None
+
+
+async def _invoke_stale_notice(callback: Callable[..., Any], **kwargs: Any) -> None:
+    """Fire the stale-holder notice callback, sync or async, never raising.
+
+    Delivering a user-visible notice must never be able to break lease
+    acquisition — a failed notice degrades observability, not correctness.
+    """
+    try:
+        result = callback(**kwargs)
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        logger.debug("stale-lease notice callback failed", exc_info=True)
 
 
 class TurnLeaseTimeoutError(TimeoutError):
@@ -102,7 +149,13 @@ class TurnLeaseToken:
     release idempotent.
     """
 
-    __slots__ = ("session_id", "owner_key", "generation", "released")
+    __slots__ = (
+        "session_id",
+        "owner_key",
+        "generation",
+        "released",
+        "tool_name_hint",
+    )
 
     def __init__(
         self,
@@ -112,8 +165,12 @@ class TurnLeaseToken:
     ) -> None:
         self.session_id = session_id
         self.owner_key = owner_key
-        self.generation = generation
+        self.generation = int(generation)
         self.released = False
+        # Optional zero-arg callable set by the dispatch layer so the
+        # PHASE=stale_lease_holder detector can name the tool this turn is
+        # parked in. Diagnostic only; never read on any correctness path.
+        self.tool_name_hint: Optional[Callable[[], Optional[str]]] = None
 
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         return (
@@ -130,6 +187,7 @@ class _SessionLease:
         "acquired_at",
         "last_used",
         "pending_acquires",
+        "stale_logged",
     )
 
     def __init__(self) -> None:
@@ -138,6 +196,9 @@ class _SessionLease:
         self.acquired_at = 0.0
         self.last_used = time.time()
         self.pending_acquires = 0
+        # One-shot latch for the PHASE=stale_lease_holder detector line, so a
+        # long zombie drain logs once rather than once per poll.
+        self.stale_logged = False
 
     @property
     def idle(self) -> bool:
@@ -157,9 +218,28 @@ class SessionTurnLeaseRegistry:
     gateway's event loop.
     """
 
-    def __init__(self, max_entries: int = DEFAULT_MAX_LEASES) -> None:
+    def __init__(
+        self,
+        max_entries: int = DEFAULT_MAX_LEASES,
+        *,
+        is_generation_current: Optional[Callable[[str, int], bool]] = None,
+        stale_wait: float = DEFAULT_STALE_LEASE_WAIT,
+    ) -> None:
         self._leases: Dict[str, _SessionLease] = {}
         self._max_entries = max(1, int(max_entries))
+        # Predicate supplied by the gateway runner
+        # (``GatewayRunner._is_session_run_current``) answering "is this
+        # holder's (routing key, generation) still the session's current
+        # run?". False means the holder was already /stop'd or /new'd and is
+        # merely draining — a ZOMBIE, not a live alias-key turn. Optional so
+        # the registry stays usable standalone (tests, embedders): with no
+        # predicate every holder is treated as live, i.e. the pre-fix
+        # behavior.
+        self._is_generation_current = is_generation_current
+        self._stale_wait = (
+            float(stale_wait) if stale_wait and stale_wait > 0
+            else DEFAULT_STALE_LEASE_WAIT
+        )
 
     def __len__(self) -> int:
         return len(self._leases)
@@ -188,6 +268,49 @@ class SessionTurnLeaseRegistry:
         for sid in idle_ids[:overflow]:
             self._leases.pop(sid, None)
 
+    def _holder_is_stale(self, holder: Optional[TurnLeaseToken]) -> bool:
+        """True when ``holder``'s run generation is no longer current.
+
+        A stale holder is a turn whose generation was invalidated by /stop or
+        /new while its thread was still parked in a tool call — the zombie
+        case. Fail-open: with no predicate, or if the predicate raises, treat
+        the holder as LIVE so a predicate bug can never shorten the wait for a
+        genuinely-running turn.
+        """
+        predicate = self._is_generation_current
+        if holder is None or predicate is None:
+            return False
+        try:
+            return not bool(predicate(holder.owner_key, holder.generation))
+        except Exception:
+            logger.debug("turn lease currency predicate failed", exc_info=True)
+            return False
+
+    def _log_stale_holder(
+        self,
+        session_id: str,
+        lease: _SessionLease,
+        holder: TurnLeaseToken,
+        held: float,
+    ) -> None:
+        """Emit the one-shot structured detector line for a zombie holder.
+
+        Machine-greppable by design: the class was invisible in gateway.log
+        for 16 minutes during the 2026-09-20 incident because the only signal
+        was a WARNING whose text blamed alias routing keys.
+        """
+        if lease.stale_logged or held < STALE_HOLDER_LOG_AFTER:
+            return
+        lease.stale_logged = True
+        logger.warning(
+            "PHASE=stale_lease_holder session=%s key=%s gen=%s held=%.0fs tool=%s",
+            session_id,
+            holder.owner_key,
+            holder.generation,
+            held,
+            _holder_tool_name(holder) or "unknown",
+        )
+
     async def acquire(
         self,
         session_id: str,
@@ -195,6 +318,7 @@ class SessionTurnLeaseRegistry:
         owner_key: str,
         generation: int,
         timeout: Optional[float] = None,
+        on_stale_holder: Optional[Callable[..., Any]] = None,
     ) -> Optional[TurnLeaseToken]:
         """Acquire the turn lease for ``session_id``, waiting if held.
 
@@ -202,6 +326,23 @@ class SessionTurnLeaseRegistry:
         :class:`TurnLeaseTimeoutError` when the wait budget expires; the caller
         must reject rather than enter the serialized region. Returns ``None``
         for a falsy ``session_id``.
+
+        Two kinds of contention are distinguished (#64934 / the 2026-09-20
+        zombie-lease incident):
+
+        * **Alias-key contention** — the holder's generation is still current,
+          so a genuinely-live turn on a second routing key is running. Wait the
+          full ``timeout``; this is the case the lease was built for.
+        * **Stale holder** — the holder's generation was already invalidated
+          (/stop, /new) and its thread is merely draining a tool call. The
+          holder will never emit user-visible output, so waiting the full
+          budget strands the user's next message in silence. Wait only
+          ``stale_wait``, log the HONEST reason (same routing key, stopped
+          generation, still draining — NOT two aliased keys), fire
+          ``on_stale_holder`` so the dispatch layer can send an immediate
+          user-visible "your message is queued" notice, and emit the
+          ``PHASE=stale_lease_holder`` detector line once past
+          ``STALE_HOLDER_LOG_AFTER``.
         """
         if not session_id:
             return None
@@ -211,19 +352,51 @@ class SessionTurnLeaseRegistry:
 
         if lease.lock.locked():
             holder = lease.holder
-            logger.warning(
-                "turn lease contention on session %s: routing key %s (gen %s) "
-                "waiting behind in-flight turn held by routing key %s (gen %s, "
-                "held %.0fs) — two routing keys are mapped to one session_id "
-                "(#64934); serializing this turn behind the previous turn's "
-                "flush",
-                session_id,
-                owner_key,
-                generation,
-                holder.owner_key if holder else "?",
-                holder.generation if holder else "?",
-                time.time() - lease.acquired_at if lease.acquired_at else -1.0,
-            )
+            held = time.time() - lease.acquired_at if lease.acquired_at else -1.0
+            stale = self._holder_is_stale(holder)
+            if stale and holder is not None:
+                # Bound the wait to the stale budget — never EXTEND a caller's
+                # own shorter timeout.
+                wait = min(wait, self._stale_wait)
+                logger.warning(
+                    "turn lease held by a STALE turn on session %s: routing "
+                    "key %s (gen %s) is waiting behind routing key %s "
+                    "(gen %s, held %.0fs) whose generation was already "
+                    "invalidated — that turn was stopped and is still "
+                    "draining a tool call, so this is NOT alias-key "
+                    "contention; waiting at most %.0fs before rejecting",
+                    session_id,
+                    owner_key,
+                    generation,
+                    holder.owner_key,
+                    holder.generation,
+                    held,
+                    wait,
+                )
+                self._log_stale_holder(session_id, lease, holder, held)
+                if on_stale_holder is not None:
+                    await _invoke_stale_notice(
+                        on_stale_holder,
+                        session_id=session_id,
+                        owner_key=holder.owner_key,
+                        generation=holder.generation,
+                        held_seconds=held,
+                        wait_seconds=wait,
+                    )
+            else:
+                logger.warning(
+                    "turn lease contention on session %s: routing key %s (gen %s) "
+                    "waiting behind in-flight turn held by routing key %s (gen %s, "
+                    "held %.0fs) — two routing keys are mapped to one session_id "
+                    "(#64934); serializing this turn behind the previous turn's "
+                    "flush",
+                    session_id,
+                    owner_key,
+                    generation,
+                    holder.owner_key if holder else "?",
+                    holder.generation if holder else "?",
+                    held,
+                )
 
         # Lock.release() wakes a waiter while leaving the lock momentarily
         # unlocked. Track every in-progress acquire across that handoff so
@@ -347,6 +520,8 @@ class SessionTurnLeaseRegistry:
         lease.holder = None
         lease.acquired_at = 0.0
         lease.last_used = time.time()
+        # Re-arm the detector: a LATER zombie on this session must log again.
+        lease.stale_logged = False
         if lease.lock.locked():
             lease.lock.release()
         return True
