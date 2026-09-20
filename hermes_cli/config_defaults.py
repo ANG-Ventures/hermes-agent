@@ -3006,6 +3006,18 @@ DEFAULT_CONFIG = {
         "rate_limit_cooldown_seconds": 300,
         # Optional provider -> health URL admission probes; disabled by default.
         "provider_health_probes": {},
+        # CPU scheduling priority for dispatcher-spawned worker gateways, and
+        # therefore for everything they spawn (terminal-tool children inherit
+        # niceness). "background" (default) runs each worker at nice 19 — and,
+        # on Linux, SCHED_IDLE — so batch worker load can never outbid a
+        # resident gateway on the same host for CPU. This is a floor on
+        # interactive responsiveness, not a throughput cap: an otherwise idle
+        # machine still gives workers the whole CPU. Set "normal" to opt out
+        # and leave workers at the dispatcher's inherited priority.
+        # (2026-09-20: a worker's runaway busy-loops drove the host to load
+        # 538/32 cores and starved the resident gateway's event loop into two
+        # watchdog hard-exits and a 12-minute boot.)
+        "worker_cpu_priority": "background",
         # Worker stdout/stderr logs rotate at spawn time. Defaults preserve
         # the historical 2 MiB + one-backup behavior; long-running workers can
         # raise these to keep more early failure evidence.

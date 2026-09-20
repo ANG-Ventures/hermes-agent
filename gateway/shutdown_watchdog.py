@@ -99,6 +99,30 @@ class _LoopLivenessWatchdogHandle:
         return self._thread.is_alive()
 
 
+def _host_load_suffix() -> str:
+    """Return ``load1=<x> ncpu=<n>`` for the missed-probe CRITICAL.
+
+    A wedged event loop and a starved one produce the SAME watchdog symptom,
+    and the log line alone could not tell them apart — the 2026-09-20 incident
+    (a kanban worker's runaway busy-loops at load 538 on 32 cores) read as a
+    gateway deadlock for 55 minutes. Attaching the host's 1-minute load average
+    and CPU count makes the next occurrence self-diagnosing.
+
+    Best-effort by construction: this runs on a path that is about to hard-exit,
+    so a platform without ``os.getloadavg`` (Windows) reports ``unknown`` rather
+    than raising and costing us the diagnostic dump.
+    """
+    try:
+        load1 = f"{os.getloadavg()[0]:.2f}"
+    except (OSError, AttributeError, IndexError):
+        load1 = "unknown"
+    try:
+        ncpu = str(os.cpu_count() or "unknown")
+    except Exception:
+        ncpu = "unknown"
+    return f"load1={load1} ncpu={ncpu}"
+
+
 def _arm_loop_floor_timer(
     loop: asyncio.AbstractEventLoop,
     interval: float = DEFAULT_LOOP_FLOOR_TIMER_INTERVAL_S,
@@ -178,9 +202,10 @@ def start_loop_liveness_watchdog(
             try:
                 logger.critical(
                     "Gateway event loop missed %d consecutive liveness probes; "
-                    "dumping all thread stacks and exiting with code %d so the "
-                    "service supervisor can restart it.",
+                    "host %s; dumping all thread stacks and exiting with code "
+                    "%d so the service supervisor can restart it.",
                     strikes,
+                    _host_load_suffix(),
                     exit_code,
                 )
             except Exception:
