@@ -499,8 +499,19 @@ def test_api_calls_carry_a_socket_timeout(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     _mod._api_request("https://api.github.com/run", "tok")
     _mod.upsert_comment("tok", "o/r", "5", "body", comment_id=0)
-    assert seen and all(t is not None for t in seen), \
-        f"an API call was made with no socket timeout: {seen}"
+    # `is not None` admitted a timeout of 0, which urllib treats as a
+    # non-blocking socket that fails instantly — measured: setting
+    # _REQUEST_TIMEOUT = 0 left this whole file green. The expectation is a
+    # deliberate literal, NOT derived from _REQUEST_TIMEOUT, so mutating the
+    # constant moves the code without moving the assertion.
+    assert seen, "no API call was observed"
+    for t in seen:
+        assert isinstance(t, (int, float)) and not isinstance(t, bool), \
+            f"an API call was made with a non-numeric socket timeout: {seen}"
+        assert 5 <= t <= 120, (
+            f"an API call used a {t}s socket timeout; a GitHub API call needs "
+            "a real, bounded window (0 fails instantly, huge values hang)"
+        )
 
 
 def test_graphql_headers_do_not_pollute_the_rest_budget(monkeypatch):
@@ -1361,16 +1372,33 @@ def test_wall_clock_budget_leaves_a_real_shutdown_margin():
     Active polling stops at ``budget - reserve``; the snapshot then runs
     until ``budget`` at the latest. But the artifact deadline only blocks
     STARTING new work — an in-flight redirect + blob request can each run a
-    further ``_REQUEST_TIMEOUT``, and the final PATCH costs another. So the
-    job deadline must sit at least that overrun past the FULL budget, not
+    further socket timeout, and the final PATCH costs another. So the job
+    deadline must sit at least that overrun past the FULL budget, not
     merely past the poll ceiling, or the snapshot is racing a SIGKILL.
+
+    Every expectation here is a deliberate LITERAL. Deriving them from
+    ``_SHUTDOWN_RESERVE_SECONDS`` / ``_REQUEST_TIMEOUT`` moved the assertion
+    in lockstep with the code, so zeroing either constant stayed green
+    (measured: 68 passed with ``_SHUTDOWN_RESERVE_SECONDS = 0``).
     """
     job_timeout, budget = _workflow_wall_budget()
-    reserve = min(float(_mod._SHUTDOWN_RESERVE_SECONDS), budget / 2.0)
-    poll_ceiling = budget - reserve
+
+    # A reserve that is actually a window, sized for the serial API calls
+    # the snapshot makes. 60s is the floor a single artifact fetch needs.
+    assert _mod._SHUTDOWN_RESERVE_SECONDS >= 60, (
+        f"the shutdown reserve is {_mod._SHUTDOWN_RESERVE_SECONDS}s — too "
+        "small for the snapshot's serial API calls (a single artifact fetch "
+        "is a 30s redirect plus a 30s blob request)"
+    )
+    assert _mod._SHUTDOWN_RESERVE_SECONDS <= budget / 2, (
+        "the shutdown reserve consumes more than half the poll budget"
+    )
+    poll_ceiling = budget - _mod._SHUTDOWN_RESERVE_SECONDS
     assert poll_ceiling > 0, "the reserve consumed the entire budget"
 
-    overrun = 2 * _mod._REQUEST_TIMEOUT
+    # An in-flight redirect + blob request plus the final PATCH, at the
+    # socket timeout a GitHub API call is allowed. Literal, not derived.
+    overrun = 60
     assert job_timeout - budget >= overrun, (
         f"the wall budget {budget}s ends only {job_timeout - budget}s before "
         f"the job's {job_timeout}s deadline, but an in-flight artifact "
@@ -1791,6 +1819,47 @@ def test_newest_empty_artifact_does_not_resurrect_an_older_failure(
     )
 
 
+@pytest.mark.parametrize("listing_order", ["newest-first", "oldest-first"])
+def test_newest_artifact_wins_regardless_of_listing_order(
+        monkeypatch, tmp_path, listing_order):
+    """F5 SEAM: the selection must SORT, not trust the listing's order.
+
+    The sibling test above feeds artifacts newest-first, which is the order
+    the API happens to return today — so deleting the sort entirely left it
+    green (measured: 68 passed with `group = list(group)`). Nothing pinned
+    the ordering guarantee itself. Feeding the SAME data oldest-first fails
+    the moment the sort is dropped, because then the stale failed attempt is
+    chosen first and published.
+    """
+    monkeypatch.setattr(_mod, "_ARTIFACT_TEMP_BASE", tmp_path)
+    newest = {"id": 20, "name": "review-status-lint",
+              "archive_download_url": "u20"}
+    oldest = {"id": 10, "name": "review-status-lint",
+              "archive_download_url": "u10"}
+    listing = ([newest, oldest] if listing_order == "newest-first"
+               else [oldest, newest])
+    monkeypatch.setattr(_mod, "_list_artifacts", lambda *a, **k: list(listing))
+    monkeypatch.setattr(
+        _mod, "_download_artifact",
+        lambda token, repo, artifact, dest: Path(
+            f"/nonexistent/{artifact['id']}.json"))
+
+    payloads = {
+        "20": [],
+        "10": [{"source": "lint",
+                "results": [{"name": "lint", "status": "failure"}]}],
+    }
+    monkeypatch.setattr(_mod, "_parse_status_file", lambda p: payloads[p.stem])
+
+    out = _mod.fetch_all_review_statuses("tok", "o/r", "77")
+
+    assert out == [], (
+        f"with the listing in {listing_order} order the poller published a "
+        f"stale failure from the older attempt: {out} — the selection is "
+        "relying on the listing's order instead of sorting by id"
+    )
+
+
 def test_older_artifact_is_used_when_the_newest_cannot_be_read(
         monkeypatch, tmp_path):
     """Newest-wins must not become newest-only.
@@ -1865,6 +1934,56 @@ def test_artifact_fetch_stops_downloading_past_its_deadline(
     )
 
 
+def test_final_snapshot_wires_a_real_deadline_into_the_artifact_fetch(
+        monkeypatch):
+    """F6 SEAM: the deadline must REACH the fetch, not merely be honoured.
+
+    The sibling test above calls ``fetch_all_review_statuses`` DIRECTLY with
+    an explicit deadline, so it only proves the parameter is respected once
+    supplied. Nothing proved the shutdown snapshot supplies one — measured:
+    hardcoding ``deadline=None`` at the call site left the whole file green
+    (68 passed). This drives the real ``run()`` to its wall-clock cutoff and
+    asserts on what the seam actually handed over.
+    """
+    seen: dict[str, object] = {}
+
+    def spy_fetch(token, repo, run_id, deadline=None):
+        seen["deadline"] = deadline
+        return []
+
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", spy_fetch)
+    monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: (
+        [{"name": "Python tests", "status": "in_progress", "html_url": "u"}],
+        False))
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: False)
+    monkeypatch.setattr(_mod, "upsert_comment",
+                        lambda t, r, p, body, comment_id=None: 1)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(
+        _mod.time, "sleep",
+        lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
+
+    budget = 1200
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5", run_url="u",
+             interval=45, timeout=100000, dry_run=False,
+             max_wall_seconds=budget)
+
+    deadline = seen.get("deadline")
+    assert deadline is not None, (
+        "the shutdown snapshot fetched artifacts with NO deadline — a run "
+        "with many uncached artifacts can chain 30-60s downloads past the "
+        "Actions job deadline and be SIGKILLed having published nothing"
+    )
+    assert isinstance(deadline, (int, float))
+    # An absolute time.time() instant, bounded by the budget it must fit in.
+    assert 0 < deadline <= budget, (
+        f"the snapshot's deadline ({deadline}) is not a bounded instant "
+        f"inside the {budget}s wall-clock budget"
+    )
+
+
 def test_poll_ceiling_reserves_time_for_the_shutdown_snapshot(monkeypatch):
     """F6: the cutoff must fire BEFORE the budget, not at it.
 
@@ -1891,7 +2010,12 @@ def test_poll_ceiling_reserves_time_for_the_shutdown_snapshot(monkeypatch):
                         lambda *a, **k: [])
 
     budget = 1200.0
-    reserve = min(float(_mod._SHUTDOWN_RESERVE_SECONDS), budget / 2.0)
+    # A LITERAL bound, not `min(_SHUTDOWN_RESERVE_SECONDS, budget/2)`. The
+    # derived form moved with the code: zeroing the constant slid both the
+    # cutoff and this expectation to t=budget and stayed green (measured: 68
+    # passed). The contract is "polling stops a real window before the
+    # budget", so assert a window the snapshot can actually use.
+    min_reserve = 60.0
 
     snapshot_times: list[float] = []
     clock = {"t": 0.0}
@@ -1910,8 +2034,8 @@ def test_poll_ceiling_reserves_time_for_the_shutdown_snapshot(monkeypatch):
         f"expected a pre-pause write and a cutoff write, got {snapshot_times}"
     )
     last = snapshot_times[-1]
-    assert last <= budget - reserve + 1.0, (
+    assert last <= budget - min_reserve, (
         f"the last write happened at t={last:.0f}s of a {budget:.0f}s budget; "
-        f"only {budget - last:.0f}s remained for it, against a {reserve:.0f}s "
-        "reserve — it is racing the job deadline"
+        f"only {budget - last:.0f}s remained for it, against a "
+        f"{min_reserve:.0f}s minimum reserve — it is racing the job deadline"
     )
