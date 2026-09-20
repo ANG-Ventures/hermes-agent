@@ -19,6 +19,7 @@ So a GREEN relay suite does not prove the user-visible label survived, and vice
 versa. ``test_relay_429_alone_does_not_carry_the_window`` below pins that
 asymmetry so the claim can't rot into an assumption again.
 """
+import time
 from types import SimpleNamespace
 
 import httpx
@@ -202,3 +203,64 @@ def test_relay_429_alone_does_not_carry_the_window():
     assert "rate limit" in degraded
     assert "usage exhausted" not in degraded
     assert "5h limit" not in degraded
+
+
+# ── apx parity: the SAME label via a different mechanism ─────────────────────
+
+def test_apx_header_quota_produces_the_same_label_as_a_bpx_sentence_cap():
+    """claude-apx must reach the SAME user-visible label — by a different route.
+
+    Two mechanisms, one label:
+
+      * **bpx** relays the Claude Code CLI, which has no structured quota
+        surface, so the window is recovered by parsing the cap SENTENCE
+        ("You've hit your session limit · resets 2:20pm (UTC)").
+      * **apx** talks to the real Anthropic API, which answers a spent bucket
+        with a proper 429 carrying ``anthropic-ratelimit-unified-*`` HEADERS and
+        no prose sentence at all. The window comes from
+        ``anthropic-ratelimit-unified-representative-claim`` / the per-window
+        ``-status`` fields.
+
+    Both must land on "<model> usage exhausted · 5h limit, ...". This test pins
+    the HEADER half, so a refactor of ``_extract_unified_quota_window`` cannot
+    silently break apx while every sentence-based test in this file stays green
+    — they exercise a code path apx never touches.
+
+    Why apx needs NO code fix: the bpx bug class was a cap sentence *thrown as a
+    5xx* out of the ``claude-agent-sdk`` result frame. apx carries zero
+    ``claude-agent-sdk`` dependency and has no result-frame path, so that class
+    structurally cannot occur on this lane. Only the header path can rot here,
+    and this is the test that catches it.
+    """
+    reset = time.time() + 7200
+    msg = "This request would exceed your organization's rate limit"
+    body = {"error": {"message": msg, "type": "rate_limit_error"}}
+    req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    resp = httpx.Response(
+        429,
+        request=req,
+        json=body,
+        headers={
+            "anthropic-ratelimit-unified-5h-status": "rejected",
+            "anthropic-ratelimit-unified-5h-reset": str(int(reset)),
+            "anthropic-ratelimit-unified-7d-status": "allowed",
+            "anthropic-ratelimit-unified-representative-claim": "five_hour",
+        },
+    )
+    err = openai.APIStatusError(msg, response=resp, body=body)
+
+    # Classification: a quota 429 — same failover verdict as the bpx cap.
+    r = classify_api_error(err, provider="claude-apx-1", model="claude-fable-5-1")
+    assert r.reason is FailoverReason.rate_limit, r
+
+    # The window is HEADER-derived; the sentence parser has nothing to chew on.
+    ctx = extract_api_error_context(err)
+    assert ctx["quota_window"] == "5h", ctx
+
+    # And the user-visible line is the bpx line, in shape and in wording.
+    line = _announce(FailoverReason.rate_limit, window_ctx={
+        k: ctx.get(k) for k in ("quota_window", "quota_window_reset", "quota_window_reset_text")
+    })
+    assert "usage exhausted" in line, line
+    assert "5h limit" in line, line
+    assert "connection issue" not in line, line
