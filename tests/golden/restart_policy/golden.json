@@ -50,6 +50,7 @@
         "HERMES_RESTART_LOOP_WINDOW_SECS": "300",
         "HERMES_RESUME_FLAG_STALE_CLEAR": "True",
         "HERMES_RESUME_INTERRUPTED_TURNS": "auto",
+        "HERMES_STALE_LEASE_WAIT": null,
         "HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT": "30"
       },
       "messages": [],
@@ -94,6 +95,7 @@
         "HERMES_RESTART_LOOP_WINDOW_SECS": null,
         "HERMES_RESUME_FLAG_STALE_CLEAR": null,
         "HERMES_RESUME_INTERRUPTED_TURNS": null,
+        "HERMES_STALE_LEASE_WAIT": null,
         "HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT": null
       },
       "messages": [],
@@ -421,6 +423,7 @@
         "HERMES_RESTART_LOOP_WINDOW_SECS": null,
         "HERMES_RESUME_FLAG_STALE_CLEAR": null,
         "HERMES_RESUME_INTERRUPTED_TURNS": null,
+        "HERMES_STALE_LEASE_WAIT": null,
         "HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT": null
       },
       "messages": [],
