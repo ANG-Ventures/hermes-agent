@@ -45,6 +45,34 @@ def _min_time(fn, *, repeat: int = 5) -> float:
     return best
 
 
+def _min_cpu_time(fn, *, repeat: int = 5) -> float:
+    """Best-of-``repeat`` CPU time for ``fn()`` — immune to CFS throttling.
+
+    ``time.thread_time`` counts only cycles the *calling thread* was actually
+    ON a CPU, so a cgroup-quota-throttled CI runner descheduling it mid-sample
+    does not inflate the reading.  Wall clock does inflate, which is precisely
+    how the 4x/1x ratio guard below became a coin flip on the self-hosted 2-3
+    CPU runners (observed on ace-media-*-8 and ace-ai-*-6, runs 35435109445 /
+    35436550177).
+
+    Thread-scoped rather than ``time.process_time`` (process-wide, all
+    threads) deliberately: an xdist worker that ran an earlier test leaving a
+    live executor thread behind would charge that thread's CPU to every
+    ``process_time`` sample taken here.  ``thread_time`` is
+    ``CLOCK_THREAD_CPUTIME_ID`` on both Linux and macOS.
+
+    Only valid for a purely CPU-bound, single-threaded callable — any sleep,
+    I/O or thread hand-off is invisible to this clock.  The callables measured
+    with it here are exactly that: in-process list appends and one ``join``.
+    """
+    best = float("inf")
+    for _ in range(repeat):
+        t0 = time.thread_time()
+        fn()
+        best = min(best, time.thread_time() - t0)
+    return best
+
+
 # ---------------------------------------------------------------------------
 # Guard 1 — streamed assistant text accumulation must be linear (#92166).
 # ---------------------------------------------------------------------------
@@ -203,11 +231,25 @@ class TestToolCallFragmentAssemblyLinear:
         return len("".join(entry["function"]["arguments_parts"]))
 
     def test_4x_fragments_cost_about_4x_time(self):
-        t_small = _min_time(lambda: self._assemble_dict_field(self.N_SMALL, self.FRAG), repeat=3)
-        t_large = _min_time(lambda: self._assemble_dict_field(self.N_LARGE, self.FRAG), repeat=3)
+        # CPU time, not wall clock (#724/#725): this path is pure in-process
+        # CPU work, so thread_time measures exactly the property under test
+        # (work done) and ignores the CFS throttling that made the wall-clock
+        # form a coin flip on quota-capped self-hosted runners. repeat=5 and
+        # min-of-K on top, because a GC pass inside one sample still perturbs
+        # even the CPU clock.
+        #
+        # The alternative (skip under low CPU count) was rejected: it would
+        # disarm the guard on exactly the runners CI actually uses, so the
+        # quadratic regression it exists to catch could land unnoticed.
+        t_small = _min_cpu_time(
+            lambda: self._assemble_dict_field(self.N_SMALL, self.FRAG), repeat=5
+        )
+        t_large = _min_cpu_time(
+            lambda: self._assemble_dict_field(self.N_LARGE, self.FRAG), repeat=5
+        )
         ratio = t_large / max(t_small, 1e-9)
         assert ratio < self.MAX_RATIO, (
             f"tool-call fragment assembly is superlinear: 4x fragments cost "
-            f"{ratio:.1f}x time. Fragments must be buffered in a list and "
+            f"{ratio:.1f}x CPU time. Fragments must be buffered in a list and "
             f"joined once (PR #92242 shape), never `+=` into a dict field."
         )

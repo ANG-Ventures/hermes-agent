@@ -153,22 +153,74 @@ class TestLazyMcpSdk:
 
 class TestBannerUpdateCheckNonBlocking:
     def test_banner_does_not_block_on_pending_update_check(self):
-        """When the prefetch hasn't finished, the banner path must return in
-        well under the old 500ms blocking wait."""
+        """When the prefetch hasn't finished, the banner path must hand the
+        still-pending check off instead of waiting for it.
+
+        DETERMINISTIC BUDGET + ORDERING WITNESS — replaces
+        ``assert elapsed < 0.3``. Profiled inside a real pytest run: 100% of
+        the measured window was the ``_update_check_done.wait()`` itself
+        (0.189s of a 0.189s window), i.e. a 0.05s budget that the OS
+        overslept by ~4x under nothing worse than pytest's own scheduling.
+        Measured 0.138 / 0.164 / 0.195s idle against a 0.3 bound — only 1.5x
+        of headroom, the tightest ratio in the repo-wide census, so the bound
+        sat squarely inside its own natural distribution.
+
+        The two facts the stopwatch stood in for:
+          1. the caller's own thread waits only on ITS OWN budget, rather than
+             waiting unbounded (or on the notice's 30s window); and
+          2. nothing is printed synchronously while the check is pending —
+             the notice is deferred to another thread.
+        Both are asserted directly, so the OS scheduler is no longer part of
+        the assertion.
+        """
         import hermes_cli.banner as banner
 
-        class _NullConsole:
-            def print(self, *a, **k):
-                pass
+        printed: list = []
 
-        with patch.object(banner, "_update_check_done", threading.Event()), \
+        class _RecordingConsole:
+            def print(self, *a, **k):
+                printed.append(a)
+
+        waits: list = []
+        caller_thread = threading.get_ident()
+
+        class _RecordingEvent(threading.Event):
+            """Records (thread, timeout) for every wait the production code does.
+
+            Never blocks: the budget is asserted, not slept, so a regression
+            fails by name instead of hanging the suite.
+            """
+
+            def wait(self, timeout=None):  # type: ignore[override]
+                waits.append((threading.get_ident(), timeout))
+                return False
+
+        with patch.object(banner, "_update_check_done", _RecordingEvent()), \
+             patch.object(banner, "_update_result", None), \
              patch.object(banner, "_deferred_update_notice_started", False):
-            start = time.perf_counter()
             behind = banner.get_update_result(timeout=0.05)
             if behind is None and not banner._update_check_done.is_set():
-                banner._defer_update_notice(_NullConsole())
-            elapsed = time.perf_counter() - start
-        assert elapsed < 0.3, f"banner update check blocked {elapsed:.3f}s"
+                banner._defer_update_notice(_RecordingConsole())
+            # Let the deferred notice thread reach its own wait before the
+            # patched Event is restored.
+            deadline = time.monotonic() + 10.0
+            while len(waits) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+        caller_waits = [t for ident, t in waits if ident == caller_thread]
+        other_waits = [t for ident, t in waits if ident != caller_thread]
+
+        assert behind is None, "pending check must not yield a result"
+        assert caller_waits == [0.05], (
+            f"caller thread did not bound its wait by its own budget: {caller_waits!r} "
+            "(None = waited unbounded; 30.0 = the caller ran the deferred notice inline)"
+        )
+        assert other_waits == [30.0], (
+            f"the deferred update notice did not run off the caller's thread: {other_waits!r}"
+        )
+        assert printed == [], (
+            f"update notice printed synchronously while the check was pending: {printed!r}"
+        )
 
     def test_deferred_notice_prints_when_result_lands(self):
         import hermes_cli.banner as banner

@@ -29,7 +29,12 @@ jobs:
   rerun-review-labels:
     name: Rerun review-labels job
     if: github.event.label.name == 'ci-reviewed'
-    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    # Pure API poller (`gh run watch` for up to 35 min) — it never checks out
+    # or builds the repo, so it must NOT take a self-hosted runner slot: on a
+    # small self-hosted pool it sits on one runner waiting for the very CI run
+    # that pool is trying to finish. Pin to GitHub-hosted, same as
+    # ci-review-comment.yml.
+    runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
       - name: Wait for CI run to finish, then rerun failed jobs

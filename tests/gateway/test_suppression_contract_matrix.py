@@ -156,8 +156,16 @@ async def _drive(adapter, *, interrupt: bool):
     else:
         consumer.finish()
         try:
-            await asyncio.wait_for(task, timeout=2.0)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+            # Generous ceiling: this is a hang guard, not a timing assertion.
+            # 2.0s was hit on loaded CI runners, and the cancel path below
+            # returned a half-driven consumer whose flags then failed the
+            # contract assertion for reasons unrelated to suppression.
+            await asyncio.wait_for(task, timeout=30.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+            pytest.fail("GatewayStreamConsumer.run() did not finish within 30s "
+                        "after finish() - hang, not a suppression verdict")
+        except asyncio.CancelledError:
             task.cancel()
     return consumer
 

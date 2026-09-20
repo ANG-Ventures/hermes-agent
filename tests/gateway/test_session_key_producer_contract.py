@@ -1,5 +1,6 @@
 """Discover bypasses of the canonical session-key builder, across all producers."""
 import ast
+import os
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -54,12 +55,33 @@ def _channel_literal_sites(path: Path):
     yield from walk(tree, "")
 
 
+def _python_sources(top: Path):
+    """Yield ``*.py`` under *top*, pruning ``__pycache__``.
+
+    ``Path.rglob`` descends into ``__pycache__`` and raises FileNotFoundError
+    when a sibling test clears bytecode caches mid-walk (seen ejecting merge
+    groups under load).  ``os.walk`` lets us prune the directory instead of
+    racing it.
+    """
+    for dirpath, dirnames, filenames in os.walk(top):
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        for filename in filenames:
+            if filename.endswith(".py"):
+                yield Path(dirpath) / filename
+
+
 def test_no_producer_interpolates_literal_session_namespace():
     root = Path(__file__).resolve().parents[2]
     bypasses = []
     for directory in ("gateway", "cron", "tools", "plugins", "hermes_cli"):
-        for path in (root / directory).rglob("*.py"):
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+        for path in _python_sources(root / directory):
+            try:
+                source = path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                # A sibling test may remove a file between listing and read
+                # (merge-group slices share one checkout).
+                continue
+            tree = ast.parse(source)
             for node in ast.walk(tree):
                 if not isinstance(node, ast.JoinedStr) or not node.values:
                     continue

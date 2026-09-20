@@ -31,7 +31,15 @@ Usage:
     a literal ``--`` is also passed through, and stacks with bare flags.
 
 Environment:
-    HERMES_TEST_WORKERS  Override worker count (default: os.cpu_count())
+    HERMES_TEST_WORKERS  Worker-count CEILING (default: effective_cpus*2).
+                         Clamped to max(2, effective_cpus*2), where
+                         effective_cpus is read from the cgroup CPU quota
+                         rather than the host core count — `docker run
+                         --cpus 2` on a 24-core box still reports 24 from
+                         os.cpu_count().
+    HERMES_TEST_WORKERS_FORCE
+                         Set to 1 to take HERMES_TEST_WORKERS/-j literally
+                         and skip the quota clamp.
     HERMES_TEST_PATHS    Override discovery roots (colon-sep; on Windows
                          ';' also works and drive letters are handled;
                          default: 'tests')
@@ -58,6 +66,103 @@ from typing import Dict, List, Tuple
 
 # Default test discovery roots.
 _DEFAULT_ROOTS = ["tests"]
+
+# Where the kernel exposes this process's CPU quota. Overridable so the unit
+# tests can point at a fixture tree instead of the real (unwritable) cgroupfs.
+_CGROUP_ROOT = Path("/sys/fs/cgroup")
+
+
+def effective_cpu_count(cgroup_root: Path = _CGROUP_ROOT) -> Tuple[int, str]:
+    """How many CPUs this process may actually use, and where we learned it.
+
+    ``os.cpu_count()`` reports the HOST's cores, which is a lie inside a
+    CFS-capped container: ``docker run --cpus 2`` on a 24-core box still
+    reports 24 because ``--cpus`` sets a *quota*, not a cpuset. Sizing the
+    worker pool off that number oversubscribes the quota by the ratio of the
+    two (6x on the ACE-AI CI runners), and the resulting CFS throttling blows
+    every wall-clock window and sqlite busy-timeout in the suite.
+
+    Resolution order, first hit wins:
+      1. cgroup v2 ``cpu.max``        ("<quota> <period>", or "max <period>")
+      2. cgroup v1 ``cpu.cfs_quota_us`` / ``cpu.cfs_period_us`` (-1 = no quota)
+      3. ``os.sched_getaffinity(0)``  (respects taskset/cpuset pinning)
+      4. ``os.cpu_count()``           (macOS/Windows have no affinity call)
+
+    Quotas are rounded UP: ``--cpus 1.5`` is closer to 2 usable CPUs than 1,
+    and flooring a sub-1.0 quota to zero would be nonsense. Any unreadable or
+    malformed file degrades to the next source rather than raising — a broken
+    cgroupfs must not take down the whole test run.
+    """
+    # 1. cgroup v2
+    try:
+        raw = (cgroup_root / "cpu.max").read_text(encoding="utf-8").split()
+        if len(raw) == 2 and raw[0] != "max":
+            quota, period = int(raw[0]), int(raw[1])
+            if quota > 0 and period > 0:
+                return max(1, -(-quota // period)), "cgroup-v2"
+    except Exception:
+        pass
+
+    # 2. cgroup v1
+    try:
+        quota = int(
+            (cgroup_root / "cpu" / "cpu.cfs_quota_us").read_text(encoding="utf-8")
+        )
+        period = int(
+            (cgroup_root / "cpu" / "cpu.cfs_period_us").read_text(encoding="utf-8")
+        )
+        if quota > 0 and period > 0:
+            return max(1, -(-quota // period)), "cgroup-v1"
+    except Exception:
+        pass
+
+    # 3. scheduler affinity (POSIX only)
+    getaffinity = getattr(os, "sched_getaffinity", None)
+    if getaffinity is not None:
+        try:
+            n = len(getaffinity(0))
+            if n > 0:
+                return n, "affinity"
+        except Exception:
+            pass
+
+    # 4. host core count
+    return max(1, os.cpu_count() or 4), "cpu_count"
+
+
+def resolve_worker_count(
+    requested: int | None, effective_cpus: int, force: bool = False
+) -> int:
+    """Clamp a requested worker count to what the CPU quota can actually run.
+
+    ``HERMES_TEST_WORKERS`` (and ``-j``) is a CEILING, not an absolute: it can
+    lower the worker count below the quota-derived default but never raise it
+    above, because the value that is right for a 4-vCPU hosted runner is 6x
+    oversubscribed on a 2-CPU self-hosted container. ``HERMES_TEST_WORKERS_FORCE=1``
+    bypasses the clamp for deliberate oversubscription experiments.
+    """
+    default = max(2, effective_cpus * 2)
+    if requested is None:
+        return default
+    if force:
+        return requested
+    return min(requested, default)
+
+
+def format_worker_sizing_log(
+    workers: int, effective_cpus: int, requested: int | None, source: str
+) -> str:
+    """One line naming every input to the sizing decision.
+
+    Printed at startup so a CI log answers "why N workers?" without a repro —
+    the clamp is invisible otherwise (the workflow still says 12).
+    """
+    req = "none" if requested is None else str(requested)
+    return (
+        f"workers={workers} (effective_cpus={effective_cpus}, "
+        f"requested={req}, source={source})"
+    )
+
 
 # Directories to skip during discovery — these suites require real
 # external services (a model gateway, a docker daemon with a prebuilt
@@ -924,8 +1029,13 @@ def main() -> int:
         "-j",
         "--jobs",
         type=int,
-        default=int(os.environ.get("HERMES_TEST_WORKERS") or (os.cpu_count() or 4) * 2),
-        help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count*2)",
+        default=None,
+        help=(
+            "Parallel worker count CEILING (default: $HERMES_TEST_WORKERS, "
+            "else effective_cpus*2). Clamped to max(2, effective_cpus*2) — "
+            "where effective_cpus comes from the cgroup CPU quota, not the "
+            "host core count — unless HERMES_TEST_WORKERS_FORCE=1."
+        ),
     )
     parser.add_argument(
         "--paths",
@@ -1122,6 +1232,45 @@ def main() -> int:
         i += 1
 
     args = parser.parse_args(our_args)
+
+    # ── Worker sizing: the CPU QUOTA is the ceiling, not the host core count ─
+    # An explicit -j (or $HERMES_TEST_WORKERS) is a REQUEST that can only lower
+    # the count. CI pins 12, which is right on a 4-vCPU hosted runner and 6x
+    # oversubscribed inside a --cpus=2 self-hosted container; the resulting CFS
+    # throttling was ejecting merge-queue entries on wall-clock and sqlite
+    # busy-timeout flakes. HERMES_TEST_WORKERS_FORCE=1 restores the old
+    # take-the-number-literally behaviour for deliberate experiments.
+    _requested = args.jobs
+    if _requested is None:
+        _env_workers = os.environ.get("HERMES_TEST_WORKERS")
+        if _env_workers:
+            try:
+                _requested = int(_env_workers)
+            except ValueError:
+                print(
+                    f"warning: ignoring non-integer HERMES_TEST_WORKERS={_env_workers!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+    _effective_cpus, _cpu_source = effective_cpu_count()
+    args.jobs = resolve_worker_count(
+        _requested,
+        _effective_cpus,
+        force=os.environ.get("HERMES_TEST_WORKERS_FORCE") == "1",
+    )
+    print(
+        format_worker_sizing_log(
+            workers=args.jobs,
+            effective_cpus=_effective_cpus,
+            requested=_requested,
+            source=_cpu_source,
+        ),
+        # stderr, not stdout: `--generate-slices` stdout is captured verbatim
+        # by CI (`MATRIX=$(...)` → `fromJSON`), so any extra stdout line kills
+        # the generate job. stderr still shows in the job log.
+        file=sys.stderr,
+        flush=True,
+    )
 
     # ── Node-id selectors → file + ``-k`` filter ────────────────────────────
     # This runner is FILE-granular: it spawns one ``pytest <file>`` per test
