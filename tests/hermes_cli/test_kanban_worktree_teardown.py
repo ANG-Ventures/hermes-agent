@@ -49,8 +49,10 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture
-def repo(tmp_path: Path) -> Path:
+def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A project repo with a remote whose history is fully pushed."""
+    from hermes_cli import kanban_survivor
+    monkeypatch.setattr(kanban_survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
     origin = tmp_path / "origin.git"
     _git("init", "--bare", str(origin))
     project = tmp_path / "project"

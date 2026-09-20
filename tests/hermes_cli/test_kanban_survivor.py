@@ -124,12 +124,91 @@ def test_write_failure_refuses_completion_and_holds_cleanup(board, monkeypatch):
     assert any(e.kind == "workspace_held" for e in kb.list_events(board, tid))
 
 
-def test_reaper_preserves_before_removal(board):
+def test_reaper_preserves_before_removal(board, tmp_path):
     tid, ws, repo = fixture_repo(board)
     (repo / "code.py").write_text("value = 9\n")
     kb._cleanup_workspace(board, tid)
     assert not ws.exists()
     assert b"value = 9" in Path(kb.list_attachments(board, tid)[0].stored_path).read_bytes()
+    restored = tmp_path / "reaper-restored"
+    git(tmp_path, "clone", "-b", "main", str(tmp_path / f"{tid}.git"), str(restored))
+    git(restored, "apply", kb.list_attachments(board, tid)[0].stored_path)
+    assert (restored / "code.py").read_text() == "value = 9\n"
+
+
+@pytest.mark.parametrize("write_failure", [False, True])
+def test_gc_null_path_inspects_actual_deletion_target(board, tmp_path, monkeypatch, write_failure):
+    import argparse
+    from hermes_cli import kanban, kanban_survivor as survivor
+    tid, ws, repo = fixture_repo(board)
+    (repo / "code.py").write_text("gc_recovered = True\n")
+    with kb.write_txn(board):
+        board.execute("UPDATE tasks SET workspace_path = NULL, status = 'archived' WHERE id = ?", (tid,))
+        board.execute("DELETE FROM task_workspace_survivors WHERE task_id = ?", (tid,))
+    if write_failure:
+        monkeypatch.setattr(survivor, "_write_patch", lambda *a: (_ for _ in ()).throw(OSError("disk full")))
+    assert kanban._cmd_gc(argparse.Namespace()) == 0
+    if write_failure:
+        assert ws.exists()
+        assert any(e.kind == "workspace_held" for e in kb.list_events(board, tid))
+    else:
+        assert not ws.exists()
+        patch = next(a for a in kb.list_attachments(board, tid) if a.filename == "implementation.patch")
+        restored = tmp_path / "gc-restored"
+        git(tmp_path, "clone", "-b", "main", str(tmp_path / f"{tid}.git"), str(restored))
+        git(restored, "apply", "--check", patch.stored_path)
+        git(restored, "apply", patch.stored_path)
+        assert (restored / "code.py").read_text() == "gc_recovered = True\n"
+
+
+def test_workspace_deletion_has_one_choke_point():
+    import ast
+    root = Path(kb.__file__).parent
+    removals = []
+    for path in root.glob("kanban*.py"):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call):
+                    continue
+                name = getattr(call.func, "attr", getattr(call.func, "id", ""))
+                strings = {n.value for n in ast.walk(call) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+                if name == "rmtree" or {"worktree", "remove"} <= strings or any("rm -rf" in s for s in strings):
+                    removals.append((path.name, node.name))
+    assert removals
+    assert set(removals) == {("kanban_survivor.py", "remove_workspace_dir")}
+
+
+@pytest.mark.parametrize("target", [None, "missing"])
+def test_deleter_missing_target_is_held(board, tmp_path, target):
+    from hermes_cli.kanban_survivor import remove_workspace_dir
+    tid, ws, repo = fixture_repo(board)
+    assert not remove_workspace_dir(board, tid, tmp_path / target if target else None)
+    assert ws.exists()
+    assert any(e.kind == "workspace_held" for e in kb.list_events(board, tid))
+
+
+def test_deleter_git_failure_is_held(board):
+    from hermes_cli.kanban_survivor import remove_workspace_dir
+    tid, ws, repo = fixture_repo(board)
+    (repo / ".git" / "HEAD").write_text("broken repository\n")
+    assert not remove_workspace_dir(board, tid, ws)
+    assert ws.exists()
+    assert any(e.kind == "workspace_held" for e in kb.list_events(board, tid))
+
+
+@pytest.mark.parametrize("storage", ["workspaces", "attachments"])
+def test_board_hard_delete_cannot_destroy_retained_work(board, storage):
+    kb.create_board("retained")
+    path = kb.board_dir("retained")
+    retained = path / storage / "work"
+    retained.mkdir(parents=True)
+    (retained / "sentinel").write_text("recoverable")
+    with pytest.raises(ValueError, match="archive instead"):
+        kb.remove_board("retained", archive=False)
+    assert (retained / "sentinel").read_text() == "recoverable"
 
 
 

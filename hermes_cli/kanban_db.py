@@ -1599,8 +1599,8 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         d.rename(target)
         return {"slug": normed, "action": "archived", "new_path": str(target)}
     else:
-        import shutil
-        shutil.rmtree(d)
+        from hermes_cli.kanban_survivor import remove_workspace_dir
+        remove_workspace_dir(None, None, d, board=True)
         return {"slug": normed, "action": "deleted", "new_path": ""}
 
 
@@ -7042,9 +7042,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             return
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
-        from hermes_cli.kanban_survivor import allow_cleanup
-        if kind in ("scratch", "worktree") and path and not allow_cleanup(conn, task_id):
-            return
+        from hermes_cli.kanban_survivor import remove_workspace_dir
         if kind not in ("scratch", "worktree") or not path:
             # This task's own workspace isn't a removable scratch dir, but its
             # completion may still unblock a deferred parent scratch cleanup
@@ -7073,10 +7071,9 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # worktree so a lingering worker never has its cwd deleted out
             # from under it. Both steps stay best-effort.
             _cleanup_worker_tmux(conn, task_id)
-            _cleanup_worktree_workspace(task_id, path, row["branch_name"])
+            _cleanup_worktree_workspace(task_id, path, row["branch_name"], conn=conn)
             _try_cleanup_parent_workspaces(conn, task_id)
             return
-        import shutil
         wp = Path(path)
         if wp.is_dir():
             # Containment guard (#28818): a board's ``default_workdir`` can
@@ -7085,8 +7082,8 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # completion would unconditionally ``shutil.rmtree`` that path
             # and silently delete the user's source data.
             if _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
-                _log.debug("Removed scratch workspace: %s", wp)
+                if remove_workspace_dir(conn, task_id, wp):
+                    _log.debug("Removed scratch workspace: %s", wp)
             else:
                 _log.warning(
                     "Refusing to remove out-of-scratch workspace for task %s: %s "
@@ -7106,7 +7103,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
 
 
 def _cleanup_worktree_workspace(
-    task_id: str, path: str, branch_name: Optional[str] = None
+    task_id: str, path: str, branch_name: Optional[str] = None, *, conn=None
 ) -> None:
     """Remove a finished task's linked git worktree when it holds no work.
 
@@ -7141,18 +7138,8 @@ def _cleanup_worktree_workspace(
         # git's own dirty guard re-verifies at removal time. If the tree
         # became dirty between our check and the removal (TOCTOU), removal
         # fails safe and the worktree is preserved.
-        result = subprocess.run(
-            ["git", "-C", str(repo_root), "worktree", "remove", str(wp)],
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            timeout=60,
-            check=False,
-        )
-        if result.returncode != 0:
-            _log.warning(
-                "git worktree remove failed for task %s at %s: %s",
-                task_id, wp, (result.stderr or result.stdout or "").strip(),
-            )
+        from hermes_cli.kanban_survivor import remove_workspace_dir
+        if not remove_workspace_dir(conn, task_id, wp, worktree_root=repo_root):
             return
         _log.debug("Removed worktree workspace: %s", wp)
         branch = (branch_name or "").strip() or f"wt/{task_id}"
@@ -7202,20 +7189,17 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             ).fetchone()
             if active:
                 continue  # still has active children
-            from hermes_cli.kanban_survivor import allow_cleanup
-            if not allow_cleanup(conn, parent_id):
-                continue
+            from hermes_cli.kanban_survivor import remove_workspace_dir
             # All children done — safe to clean up parent workspace
             if row["workspace_kind"] == "worktree":
                 _cleanup_worktree_workspace(
-                    parent_id, row["workspace_path"], row["branch_name"]
+                    parent_id, row["workspace_path"], row["branch_name"], conn=conn
                 )
                 continue
-            import shutil
             wp = Path(row["workspace_path"])
             if wp.is_dir() and _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
-                _log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+                if remove_workspace_dir(conn, parent_id, wp):
+                    _log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
     except Exception:
         pass  # best-effort
 

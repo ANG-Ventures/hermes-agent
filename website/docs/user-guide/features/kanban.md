@@ -96,6 +96,11 @@ If code cannot be captured (missing repository, failed Git/read/write, attachmen
 size limit, or an empty patch despite `metadata.changed_files`), completion refuses
 with `survivor_unavailable` and records a durable `workspace_held` event. Cleanup skips
 held workspaces until an explicit successful completion/capture clears the hold.
+All workspace directory removal goes through one path-bound capture-and-delete
+function, including archive GC's legacy fallback when no workspace path is stored.
+Missing targets and capture failures refuse deletion and log a HELD event.
+Board hard-delete refuses boards with retained workspaces or attachments; archive
+those boards instead so their recovery data remains available.
 Nested repositories inside another repository require separate recovery and are held
 rather than emitting a misleading gitlink patch. Sibling repositories in scratch
 are supported. Repositories created after dispatch use a reachable remote ancestor
@@ -201,7 +206,7 @@ hermes kanban boards rename atm10-server "ATM10 (Prod)"
 # Recoverable by moving the dir back.
 hermes kanban boards rm atm10-server
 
-# Hard delete — `rm -rf` the board dir. No recovery.
+# Hard delete — only without retained workspaces or attachments. No recovery.
 hermes kanban boards rm atm10-server --delete
 ```
 
