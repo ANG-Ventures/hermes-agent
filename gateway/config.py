@@ -20,6 +20,8 @@ from enum import Enum
 from hermes_cli.config import get_hermes_home
 from agent.secret_scope import current_secret_scope, get_secret as _get_secret
 from gateway.shutdown_watchdog import (
+    DEFAULT_LIVENESS_STARVATION_LOAD_FACTOR,
+    DEFAULT_LIVENESS_STARVATION_MAX_HOLD_S,
     DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
     DEFAULT_LOOP_WATCHDOG_MAX_STRIKES,
     DEFAULT_LOOP_WATCHDOG_TIMEOUT_S,
@@ -1010,6 +1012,14 @@ class GatewayConfig:
     # is fixed at the root by the off-loop write + two-witness probe, so
     # raising this fleet-wide would only delay genuine-wedge recovery.
     loop_watchdog_max_strikes: int = DEFAULT_LOOP_WATCHDOG_MAX_STRIKES
+    # Host-starvation classification for the missed-probe escalation. When the
+    # 1-minute load average exceeds max(factor * ncpu, an absolute floor), the
+    # loop is STARVED, not wedged — exiting 75 hands the replacement process
+    # the same starved host (2026-09-20 incident). The watchdog holds and pages
+    # instead, for at most liveness_starvation_max_hold_s of continuous
+    # starvation with no successful probe.
+    liveness_starvation_load_factor: float = DEFAULT_LIVENESS_STARVATION_LOAD_FACTOR
+    liveness_starvation_max_hold_s: float = DEFAULT_LIVENESS_STARVATION_MAX_HOLD_S
 
     # Unauthorized DM policy
     unauthorized_dm_behavior: str = "pair"  # "pair" or "ignore"
@@ -1153,6 +1163,8 @@ class GatewayConfig:
             "loop_watchdog_probe_interval_s": self.loop_watchdog_probe_interval_s,
             "loop_watchdog_probe_timeout_s": self.loop_watchdog_probe_timeout_s,
             "loop_watchdog_max_strikes": self.loop_watchdog_max_strikes,
+            "liveness_starvation_load_factor": self.liveness_starvation_load_factor,
+            "liveness_starvation_max_hold_s": self.liveness_starvation_max_hold_s,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
@@ -1268,6 +1280,32 @@ class GatewayConfig:
             loop_watchdog_probe_timeout_s = DEFAULT_LOOP_WATCHDOG_TIMEOUT_S
         if loop_watchdog_max_strikes < 1 or loop_watchdog_max_strikes > 1000:
             loop_watchdog_max_strikes = DEFAULT_LOOP_WATCHDOG_MAX_STRIKES
+
+        # Host-starvation classification knobs (see shutdown_watchdog.py).
+        liveness_starvation_load_factor = _coerce_float(
+            data.get("liveness_starvation_load_factor")
+            if "liveness_starvation_load_factor" in data
+            else nested_gateway.get("liveness_starvation_load_factor"),
+            DEFAULT_LIVENESS_STARVATION_LOAD_FACTOR,
+        )
+        liveness_starvation_max_hold_s = _coerce_float(
+            data.get("liveness_starvation_max_hold_s")
+            if "liveness_starvation_max_hold_s" in data
+            else nested_gateway.get("liveness_starvation_max_hold_s"),
+            DEFAULT_LIVENESS_STARVATION_MAX_HOLD_S,
+        )
+        if (
+            not math.isfinite(liveness_starvation_load_factor)
+            or liveness_starvation_load_factor <= 0
+            or liveness_starvation_load_factor > 1000.0
+        ):
+            liveness_starvation_load_factor = DEFAULT_LIVENESS_STARVATION_LOAD_FACTOR
+        if (
+            not math.isfinite(liveness_starvation_max_hold_s)
+            or liveness_starvation_max_hold_s <= 0
+            or liveness_starvation_max_hold_s > 86400.0
+        ):
+            liveness_starvation_max_hold_s = DEFAULT_LIVENESS_STARVATION_MAX_HOLD_S
         if multiplex_profiles is None and isinstance(nested_gateway, dict):
             # Also honor gateway.multiplex_profiles written by
             # ``hermes config set gateway.multiplex_profiles true``.
@@ -1333,6 +1371,8 @@ class GatewayConfig:
             loop_watchdog_probe_interval_s=loop_watchdog_probe_interval_s,
             loop_watchdog_probe_timeout_s=loop_watchdog_probe_timeout_s,
             loop_watchdog_max_strikes=loop_watchdog_max_strikes,
+            liveness_starvation_load_factor=liveness_starvation_load_factor,
+            liveness_starvation_max_hold_s=liveness_starvation_max_hold_s,
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
@@ -1545,6 +1585,8 @@ def load_gateway_config() -> GatewayConfig:
                 "loop_watchdog_probe_interval_s",
                 "loop_watchdog_probe_timeout_s",
                 "loop_watchdog_max_strikes",
+                "liveness_starvation_load_factor",
+                "liveness_starvation_max_hold_s",
             ):
                 if _wd_key in yaml_cfg:
                     gw_data[_wd_key] = yaml_cfg[_wd_key]

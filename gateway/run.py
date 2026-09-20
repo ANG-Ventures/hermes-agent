@@ -3202,6 +3202,8 @@ from gateway.platforms.base import (
 )
 from gateway.shutdown_watchdog import (
     DEFAULT_HEARTBEAT_INTERVAL_S,
+    DEFAULT_LIVENESS_STARVATION_LOAD_FACTOR,
+    DEFAULT_LIVENESS_STARVATION_MAX_HOLD_S,
     DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
     DEFAULT_LOOP_WATCHDOG_MAX_STRIKES,
     DEFAULT_LOOP_WATCHDOG_TIMEOUT_S,
@@ -16586,11 +16588,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "loop_watchdog_max_strikes",
                     DEFAULT_LOOP_WATCHDOG_MAX_STRIKES,
                 )
+                starvation_factor = getattr(
+                    config,
+                    "liveness_starvation_load_factor",
+                    DEFAULT_LIVENESS_STARVATION_LOAD_FACTOR,
+                )
+                starvation_max_hold = getattr(
+                    config,
+                    "liveness_starvation_max_hold_s",
+                    DEFAULT_LIVENESS_STARVATION_MAX_HOLD_S,
+                )
                 self._loop_liveness_watchdog = start_loop_liveness_watchdog(
                     loop,
                     probe_interval=float(interval),
                     probe_timeout=float(timeout),
                     max_strikes=int(strikes),
+                    starvation_load_factor=float(starvation_factor),
+                    starvation_max_hold_s=float(starvation_max_hold),
                 )
             except Exception:
                 logger.debug("Failed to start gateway loop liveness watchdog", exc_info=True)
