@@ -2825,6 +2825,12 @@ from hermes_cli.config_defaults import DEFAULT_CONFIG as _DEFAULT_CONFIG
 os.environ["HERMES_TURN_LEASE_TIMEOUT"] = str(
     _DEFAULT_CONFIG["agent"]["gateway_turn_lease_timeout"]
 )
+# Same rule for the stale-holder wait bound: seed from the canonical config
+# default so an ambient .env can never control how long the gateway waits
+# behind a /stop'd zombie turn.
+os.environ["HERMES_STALE_LEASE_WAIT"] = str(
+    _DEFAULT_CONFIG["agent"]["gateway_stale_lease_wait"]
+)
 
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
@@ -2979,6 +2985,11 @@ if _config_path.exists():
             if "gateway_turn_lease_timeout" in _agent_cfg:
                 os.environ["HERMES_TURN_LEASE_TIMEOUT"] = str(
                     _agent_cfg["gateway_turn_lease_timeout"]
+                )
+            # 2b) stale-holder wait bound (config-authoritative, same rule).
+            if "gateway_stale_lease_wait" in _agent_cfg:
+                os.environ["HERMES_STALE_LEASE_WAIT"] = str(
+                    _agent_cfg["gateway_stale_lease_wait"]
                 )
             if "session_stall_timeout" in _agent_cfg:
                 os.environ["HERMES_SESSION_STALL_TIMEOUT"] = str(
@@ -3162,6 +3173,7 @@ from gateway.delivery import (
 )
 from gateway.turn_lease import (
     DEFAULT_LEASE_WAIT,
+    DEFAULT_STALE_LEASE_WAIT,
     SessionTurnLeaseRegistry,
     TurnLeaseTimeoutError,
 )
@@ -7990,7 +8002,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # routing-key guards above cannot see that overlap. Acquired in
         # _handle_message_with_agent after session resolution is final,
         # released via _release_turn_lease in the same method's finally.
-        self._turn_leases = SessionTurnLeaseRegistry()
+        self._turn_leases = SessionTurnLeaseRegistry(
+            # Lets acquire() tell a genuinely-live alias-key holder apart from
+            # a /stop'd turn still draining a tool call. Without this the
+            # registry blames alias routing keys for every wait and makes the
+            # zombie case invisible (2026-09-20 incident).
+            is_generation_current=self._is_session_run_current,
+            stale_wait=_float_env(
+                "HERMES_STALE_LEASE_WAIT", DEFAULT_STALE_LEASE_WAIT
+            ),
+        )
         # Tokens for held turn leases, keyed by (routing key, run generation)
         # so release is granted per-turn and a stale unwind can never free a
         # newer turn's lease (#28686 ownership lesson).
@@ -24078,6 +24099,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # stale unwind can't release a newer turn's lease.
         _lease_registry = getattr(self, "_turn_leases", None)
         if _lease_registry is not None:
+            async def _notify_stale_lease_holder(
+                *,
+                session_id: str,
+                owner_key: str,
+                generation: int,
+                held_seconds: float,
+                wait_seconds: float,
+            ) -> None:
+                """Tell the user their message is queued behind a zombie turn.
+
+                The 2026-09-20 incident's worst symptom was SILENCE: the next
+                message blocked in acquire() with no user-visible signal at
+                all, so a /stop looked like it had worked and the follow-up
+                looked like it had been ignored. Fire-and-forget; a failed
+                notice must never block the acquire.
+                """
+                try:
+                    await self._send_goal_status_notice(
+                        source,
+                        "⏳ Previous turn is still finishing a tool call after "
+                        "/stop — your message is queued and will run as soon "
+                        "as it lets go.",
+                    )
+                except Exception:
+                    logger.debug(
+                        "stale-lease queued notice failed for %s",
+                        _quick_key,
+                        exc_info=True,
+                    )
+
             try:
                 _lease_token = await _lease_registry.acquire(
                     session_entry.session_id,
@@ -24086,6 +24137,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     timeout=_float_env(
                         "HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT
                     ),
+                    on_stale_holder=_notify_stale_lease_holder,
                 )
             except TurnLeaseTimeoutError:
                 # The broad session-context cleanup finally starts later in this
@@ -24097,6 +24149,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _lease_state = self._session_state(_quick_key).turn
                 _lease_state.lease_token = _lease_token
                 _lease_state.lease_generation = run_generation
+                # Diagnostic hint so a LATER waiter's PHASE=stale_lease_holder
+                # line can name the tool this turn is parked in.
+                try:
+                    _lease_token.tool_name_hint = lambda: getattr(
+                        self._peek_session_state(_quick_key).turn.agent,
+                        "_current_tool",
+                        None,
+                    )
+                except Exception:
+                    pass
 
         # A turn only becomes durable recovery work after it owns (or has
         # explicitly degraded past) the per-session lease.  Marking before the

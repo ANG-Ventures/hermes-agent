@@ -64,6 +64,15 @@ DEFAULT_CONFIG = {
         # rejected with a resend notice rather than run without serialization.
         # Non-positive values fall back to 1800 seconds.
         "gateway_turn_lease_timeout": 1800,
+        # Maximum time a message waits behind a STALE turn-lease holder — a
+        # turn whose run generation was already invalidated by /stop or /new
+        # but whose thread is still draining a tool call. That holder can
+        # never produce user-visible output, so the full
+        # gateway_turn_lease_timeout above would strand the next message in
+        # silence (measured 2026-09-20: 16 minutes). On expiry the same
+        # resend-notice rejection path applies. Non-positive values fall back
+        # to 90 seconds.
+        "gateway_stale_lease_wait": 90,
         # Per-session AIAgent cache in the gateway. Each cached agent keeps a
         # warm prompt prefix AND the session's full transcript, so the cache
         # trades memory for cost: too small and every turn re-pays an uncached
