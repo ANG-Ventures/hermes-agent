@@ -16021,51 +16021,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # from replaying it unprompted, which puts a human back in the loop.
             _max_attempts = _auto_resume_max_attempts()
             if _max_attempts > 0:
-                # Fails OPEN on every path: an unreadable store makes
-                # ``session_cap_reached`` answer False (unknown is not over
-                # budget), and an exception here is swallowed the same way.
-                # Both matter because the skip branch below CLEARS the marker —
-                # a store fault must never be able to retire restart continuity
-                # for a session it knows nothing about, which is what the
-                # 1_000_000-sentinel version of this check did host-wide.
+                # Two shapes of denial, and they are NOT interchangeable:
+                #
+                #   attempts=<n>    this SESSION provably spent its budget.
+                #                   Retire the marker — the evidence is about
+                #                   the session.
+                #   attempts=None   the attempt store cannot record anything
+                #                   (unwritable dir, full disk). The session is
+                #                   owed a resume it cannot be accounted for,
+                #                   so we skip but LEAVE the marker set: the
+                #                   denial must evaporate the moment the disk
+                #                   is fixed. Answering "allowed" here instead
+                #                   is what reproduced the incident — 10 boots,
+                #                   10 full-transcript replays, zero cap lines.
+                #
+                # An unreadable store is neither: it self-repairs to an empty
+                # counter file and the session honestly reads zero attempts.
+                # An exception escaping the verdict is treated as "cannot
+                # account" too, for the same reason.
+                _attempt_count: int | None = 0
                 try:
                     _attempts_store = self._get_auto_resume_attempt_store()
-                    _capped = _attempts_store.session_cap_reached(
+                    _allowed, _attempt_count = _attempts_store.session_resume_verdict(
                         entry.session_key, _max_attempts
                     )
-                    _attempt_count = (
-                        _attempts_store.session_attempt_count(entry.session_key)
-                        if _capped
-                        else 0
-                    )
-                except Exception as exc:  # noqa: BLE001 — cap must fail OPEN
+                except Exception as exc:  # noqa: BLE001 — never abort a boot on this
                     logger.debug(
-                        "Auto-resume attempt cap check skipped for %s: %s",
+                        "Auto-resume attempt cap check failed for %s: %s",
                         entry.session_key,
                         exc,
                     )
-                    _capped = False
-                    _attempt_count = 0
-                if _capped:
+                    _allowed, _attempt_count = False, None
+                if not _allowed:
+                    _cause = "attempt_cap" if _attempt_count is not None else "cap_unaccountable"
                     logger.warning(
                         "PHASE=boot_resume_skipped key=%s reason=%s platform=%s "
-                        "kind=%s cause=attempt_cap attempts=%s max=%s",
+                        "kind=%s cause=%s attempts=%s max=%s",
                         entry.session_key,
                         getattr(entry, "resume_reason", None),
                         getattr(getattr(source, "platform", None), "value", None),
                         getattr(entry, "resume_kind", None),
-                        _attempt_count,
+                        _cause,
+                        _attempt_count if _attempt_count is not None else "unknown",
                         _max_attempts,
                     )
-                    try:
-                        self.session_store.clear_resume_pending(entry.session_key)
-                    except Exception as exc:
-                        logger.debug(
-                            "clear_resume_pending after attempt-cap skip failed "
-                            "for %s: %s",
-                            entry.session_key,
-                            exc,
-                        )
+                    if _attempt_count is not None:
+                        try:
+                            self.session_store.clear_resume_pending(entry.session_key)
+                        except Exception as exc:
+                            logger.debug(
+                                "clear_resume_pending after attempt-cap skip failed "
+                                "for %s: %s",
+                                entry.session_key,
+                                exc,
+                            )
                     skipped += 1
                     continue
 

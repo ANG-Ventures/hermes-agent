@@ -371,11 +371,27 @@ def assess_interrupted_turn(
 
 
 class AutoResumeAttemptStore:
-    """Seven-day durable once-ever auto-resume credits.
+    """Seven-day durable once-ever auto-resume credits plus per-session counters.
 
-    A malformed file poisons this store instance closed: every lookup reports an
-    existing attempt and exactly one warning is emitted.  This prevents a corrupt
-    safety backstop from silently granting fresh auto-resume credits.
+    Two distinct store faults, with deliberately different handling, because
+    both directions of "just latch it off" were measured causing real harm on
+    PR #761:
+
+    * **Unreadable** (torn write, bad edit, truncation). This file is a counter
+      cache, not precious data, so it is REPAIRED: reset to an empty valid
+      store and carry on counting. Latching reads off instead left the
+      per-session cap permanently disabled, which reproduced the very replay
+      storm the cap exists to stop (10/10 uncapped boot resumes). The credits
+      recorded before the reset are genuinely lost, so ``has_attempt`` — and
+      only ``has_attempt`` — keeps failing closed for the rest of the process
+      rather than minting fresh ones off an emptied file.
+    * **Unwritable** (perms, full disk, bad chown). This cannot self-heal, and
+      an unrecordable attempt means the cap has no way to bound anything. The
+      store reports that honestly via :meth:`session_resume_verdict` so the
+      scheduler can stop replaying instead of replaying silently forever. It
+      does NOT retire ``resume_pending``: the transcript is untouched and the
+      next real user message continues the conversation, so the denial is
+      reversible the moment the disk is.
     """
 
     def __init__(
@@ -386,19 +402,76 @@ class AutoResumeAttemptStore:
     ) -> None:
         self.path = Path(path)
         self._now = now
-        self._invalid = False
-        self._warned = False
+        # Rowid credits were destroyed by a repair; has_attempt must not mint
+        # fresh ones off the emptied file for the remainder of this process.
+        self._credits_lost = False
+        # Persistence is known-broken: nothing this store is told can be
+        # recorded, so nothing it reports can bound anything.
+        self._degraded = False
+        # A successful write proves the path is persistable; probed lazily once.
+        self._persist_proven = False
+        self._warned_unreadable = False
+        self._warned_degraded = False
 
-    def _warn_invalid(self, exc: Exception | str) -> None:
-        if self._warned:
+    # ---- fault handling ---------------------------------------------------
+
+    def _warn_unreadable(self, exc: Exception | str) -> None:
+        if self._warned_unreadable:
             return
-        self._warned = True
+        self._warned_unreadable = True
         logger.warning(
-            "%s is unparseable; interrupted-turn auto-continuation fails closed "
-            "to prompt for all sessions: %s",
+            "%s was unreadable and has been reset to an empty counter store "
+            "(%s). Per-turn auto-resume credits recorded before the reset are "
+            "lost, so interrupted turns fall back to prompt mode for the rest "
+            "of this process; per-session boot-resume counting continues from "
+            "zero.",
             self.path.name,
             exc,
         )
+
+    def _warn_degraded(self, exc: Exception | str) -> None:
+        if self._warned_degraded:
+            return
+        self._warned_degraded = True
+        logger.warning(
+            "%s cannot be written (%s); the per-session boot auto-resume cap "
+            "has no durable counter, so boot resumes are SKIPPED (resume_pending "
+            "is left set and the transcript is untouched) rather than replayed "
+            "unbounded. Fix the permissions or free space at %s.",
+            self.path.name,
+            exc,
+            self.path.parent,
+        )
+
+    def _degrade(self, exc: Exception) -> None:
+        self._degraded = True
+        self._persist_proven = False
+        self._warn_degraded(exc)
+
+    def _persist(
+        self,
+        attempts: list[dict[str, Any]],
+        session_attempts: dict[str, dict[str, Any]],
+    ) -> bool:
+        """Write the store, converting a write failure into the degraded latch.
+
+        Never raises: a failed write must not be mistaken for an unreadable
+        file (which would trigger a repair that empties a perfectly good store
+        on a host whose only problem is a read-only directory).
+        """
+        try:
+            self._write(attempts, session_attempts)
+        except Exception as exc:
+            self._degrade(exc)
+            return False
+        self._persist_proven = True
+        return True
+
+    def _repair(self, exc: Exception) -> bool:
+        """Reset an unreadable store to empty. True when the reset landed."""
+        self._credits_lost = True
+        self._warn_unreadable(exc)
+        return self._persist([], {})
 
     def _validate(self, raw: Any) -> list[dict[str, Any]]:
         if not isinstance(raw, dict) or raw.get("version") != _STORE_VERSION:
@@ -460,7 +533,14 @@ class AutoResumeAttemptStore:
         return validated
 
     def _load_state(self) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]] | None:
-        if self._invalid:
+        """Return ``(credits, counters)``, repairing an unreadable file.
+
+        ``None`` means only one thing now: the store could not be made usable
+        because the *disk* is the problem (the repair write itself failed).
+        Unreadable-but-writable resolves to an empty store, so a bad file can
+        never leave the cap permanently blind.
+        """
+        if self._degraded:
             return None
         if not self.path.exists():
             return [], {}
@@ -468,20 +548,21 @@ class AutoResumeAttemptStore:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
             attempts = self._validate(raw)
             counters = self._validate_session_attempts(raw)
-            cutoff = self._now() - AUTO_RESUME_ATTEMPT_TTL_SECONDS
-            current = [item for item in attempts if item["attempted_at"] >= cutoff]
-            fresh = {
-                key: value
-                for key, value in counters.items()
-                if value["attempted_at"] >= cutoff
-            }
-            if len(current) != len(attempts) or len(fresh) != len(counters):
-                self._write(current, fresh)
-            return current, fresh
         except Exception as exc:
-            self._invalid = True
-            self._warn_invalid(exc)
-            return None
+            return ([], {}) if self._repair(exc) else None
+        cutoff = self._now() - AUTO_RESUME_ATTEMPT_TTL_SECONDS
+        current = [item for item in attempts if item["attempted_at"] >= cutoff]
+        fresh = {
+            key: value
+            for key, value in counters.items()
+            if value["attempted_at"] >= cutoff
+        }
+        if len(current) != len(attempts) or len(fresh) != len(counters):
+            # A TTL prune failing to persist is a real persistence fault; the
+            # in-memory view is still accurate, so return it and let the
+            # degraded latch govern the next call.
+            self._persist(current, fresh)
+        return current, fresh
 
     def _load(self) -> list[dict[str, Any]] | None:
         state = self._load_state()
@@ -550,8 +631,23 @@ class AutoResumeAttemptStore:
                     pass
 
     def has_attempt(self, session_key: str, assistant_rowid: int) -> bool:
+        """True when this interrupted turn already spent its once-ever credit.
+
+        Fails CLOSED, and is the ONE consumer that still does. Two faults reach
+        here and both mean the same thing for this question — the credit ledger
+        cannot be trusted — so both deny: a degraded store (``None``), and a
+        repaired one (``_credits_lost``), where the file now parses but is
+        empty precisely because the prior credits were discarded. Reporting
+        "no attempt recorded" off an emptied ledger would mint a fresh
+        unattended replay for every interrupted turn on the host.
+
+        The denial is small and reversible: the resume drops from ``auto`` to
+        ``prompt``, the transcript is untouched, the user gets a banner, and
+        the next message continues the conversation. That is why this may fail
+        closed while the cap must not — see :meth:`session_resume_verdict`.
+        """
         attempts = self._load()
-        if attempts is None:
+        if attempts is None or self._credits_lost:
             return True
         return any(
             item["session_key"] == session_key
@@ -560,7 +656,12 @@ class AutoResumeAttemptStore:
         )
 
     def consume(self, session_key: str, assistant_rowid: int) -> bool:
-        """Record a scheduled auto continuation; false means fail closed."""
+        """Record a scheduled auto continuation; false means fail closed.
+
+        Fails CLOSED alongside ``has_attempt``, and for the same reason: an
+        unrecordable credit would be re-granted on the next boot. False demotes
+        the resume to ``prompt`` mode, which is the bounded degradation.
+        """
 
         state = self._load_state()
         if state is None:
@@ -579,13 +680,7 @@ class AutoResumeAttemptStore:
                 "attempted_at": float(self._now()),
             }
         )
-        try:
-            self._write(attempts, session_attempts)
-        except Exception as exc:
-            self._invalid = True
-            self._warn_invalid(exc)
-            return False
-        return True
+        return self._persist(attempts, session_attempts)
 
     # ---- per-session boot-resume cap -------------------------------------
     #
@@ -599,42 +694,78 @@ class AutoResumeAttemptStore:
     def session_attempt_count(self, session_key: str) -> int | None:
         """Attempts recorded for ``session_key``; ``None`` when unknowable.
 
-        A poisoned store reports ``None``, NOT a large number. It deliberately
-        does not copy ``has_attempt``'s fail-closed posture, because the two
-        denials are not the same size: ``has_attempt`` failing closed degrades
-        one turn from ``auto`` to ``prompt`` — the transcript survives and the
-        next user message continues it — whereas the cap's skip branch retires
-        ``resume_pending``, which is irreversible and was measured stripping
-        restart continuity from every session on the host at once.
-
-        A store fault is evidence about the STORE. It is not evidence that some
-        session spent a budget, so it must not be reported as one.
+        ``None`` now means only "persistence is broken" — an unreadable file
+        repairs to an empty store and legitimately reports ``0``. Reporting a
+        store fault as a large number (the ``1_000_000`` sentinel this
+        replaced) capped every session on the host at once.
         """
         state = self._load_state()
         if state is None:
             return None
         return int(state[1].get(session_key, {}).get("count", 0))
 
-    def session_cap_reached(self, session_key: str, max_attempts: int) -> bool:
-        """True when ``session_key`` has provably exhausted its budget.
+    def _persistable(
+        self,
+        attempts: list[dict[str, Any]],
+        session_attempts: dict[str, dict[str, Any]],
+    ) -> bool:
+        """True when this store can durably record what it is told.
 
-        Unknown is not over budget: an unreadable store answers ``False`` so a
-        session with no recorded attempts keeps resuming and keeps its marker.
+        Probed by rewriting the state already on disk — atomic, idempotent, and
+        done at most once per instance. It has to happen at CHECK time rather
+        than at record time: ``record_session_attempt`` runs after the resume is
+        already scheduled, so discovering there that the counter cannot be
+        persisted is one full transcript replay too late, every boot, forever.
+        """
+        if self._degraded:
+            return False
+        if self._persist_proven:
+            return True
+        return self._persist(attempts, session_attempts)
+
+    def session_resume_verdict(
+        self, session_key: str, max_attempts: int
+    ) -> tuple[bool, int | None]:
+        """Decide whether ``session_key`` may be boot-resumed again.
+
+        Returns ``(allowed, attempts_or_None)``. ``attempts is None`` on a
+        denial means "this store cannot bound anything" rather than "budget
+        spent", and the caller MUST leave ``resume_pending`` set for it — the
+        session is owed a resume it simply cannot account for, so the denial has
+        to stay reversible.
+
+        Three outcomes, each learned from a measured failure on PR #761:
+
+        * under budget, or the cap disabled → allowed.
+        * provably at/over budget → denied with a count. Retiring the marker is
+          correct here: the evidence is about the SESSION.
+        * persistence broken → denied with ``None``. Answering "allowed" here
+          is what reproduced the incident — 10 boots, 10 full-transcript
+          replays, zero cap lines, because nothing could ever be counted.
         """
         if max_attempts <= 0:
-            return False
-        count = self.session_attempt_count(session_key)
-        if count is None:
-            return False
-        return count >= max_attempts
+            return True, None
+        state = self._load_state()
+        if state is None:
+            return False, None
+        attempts, session_attempts = state
+        if not self._persistable(attempts, session_attempts):
+            return False, None
+        count = int(session_attempts.get(session_key, {}).get("count", 0))
+        return count < max_attempts, count
+
+    def session_cap_reached(self, session_key: str, max_attempts: int) -> bool:
+        """True when ``session_key`` may not be boot-resumed again."""
+        allowed, _count = self.session_resume_verdict(session_key, max_attempts)
+        return not allowed
 
     def record_session_attempt(self, session_key: str) -> int | None:
         """Increment and persist ``session_key``'s counter; return the new count.
 
-        ``None`` means the attempt could NOT be recorded — an unreadable store,
-        or a write that failed. The caller treats that as lost accounting, not
-        as a spent budget: an unrecordable attempt leaves the cap reading
-        ``unknown``, which keeps resuming rather than capping on a store fault.
+        ``None`` means the attempt could NOT be recorded. The bound does not
+        depend on this call succeeding: ``session_resume_verdict`` proves the
+        store is writable BEFORE allowing the resume, so a failure here means
+        the disk broke between the two and the next boot's check will deny.
         """
         state = self._load_state()
         if state is None:
@@ -645,24 +776,22 @@ class AutoResumeAttemptStore:
             "count": count,
             "attempted_at": float(self._now()),
         }
-        try:
-            self._write(attempts, session_attempts)
-        except Exception as exc:
-            self._invalid = True
-            self._warn_invalid(exc)
+        if not self._persist(attempts, session_attempts):
             return None
         return count
 
     def clear_session_attempts(self, session_key: str) -> None:
-        """Forget ``session_key``'s counter after real forward progress."""
+        """Forget ``session_key``'s counter after real forward progress.
+
+        Fails OPEN by omission: if the counter cannot be cleared the session
+        keeps a budget it has earned back, which costs at most a skipped resume
+        that a user message undoes. The opposite — pretending it cleared — is
+        what would license an unbounded replay.
+        """
         state = self._load_state()
         if state is None:
             return
         attempts, session_attempts = state
         if session_attempts.pop(session_key, None) is None:
             return
-        try:
-            self._write(attempts, session_attempts)
-        except Exception as exc:
-            self._invalid = True
-            self._warn_invalid(exc)
+        self._persist(attempts, session_attempts)

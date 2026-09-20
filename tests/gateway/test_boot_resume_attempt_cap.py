@@ -196,29 +196,39 @@ def test_store_written_by_an_older_gateway_loads_with_zero_counters(tmp_path):
     assert store.has_attempt("s1", 7) is True
 
 
-def test_poisoned_store_reports_unknown_rather_than_a_spent_budget(tmp_path, caplog):
-    """A store fault is evidence about the STORE, not about any session's budget.
+def test_unreadable_store_repairs_itself_instead_of_latching_off(tmp_path, caplog):
+    """An unreadable counter cache must be RESET, not treated as unusable forever.
 
-    Deliberately NOT ``has_attempt``'s fail-closed posture. That one degrades a
-    single turn from ``auto`` to ``prompt`` and keeps the transcript; the cap's
-    skip branch retires ``resume_pending``, so reporting a poisoned store as
-    "over budget" stripped restart continuity from every session on the host
-    (measured in review: SCHEDULED 0 and both markers cleared, for two sessions
-    that had never resumed once). Scheduler-grain contract:
-    ``test_boot_resume_cap_poisoned_store.py``.
+    Round-1 review made a poisoned store report a huge number, which capped
+    every session on the host. Round 2 made it report ``None``, which capped
+    nobody — and measured 10/10 uncapped replays, permanently, because
+    ``_invalid`` latched and no write path ever repaired the file. Both
+    directions of "latch on the fault" are wrong for a file that holds nothing
+    but recoverable counters. Resetting it restores the bound on the same boot.
+
+    Scheduler-grain contract: ``test_boot_resume_cap_poisoned_store.py``.
     """
     path = tmp_path / "attempts.json"
     path.write_text("{not json", encoding="utf-8")
     store = AutoResumeAttemptStore(path)
 
     with caplog.at_level(logging.WARNING):
-        assert store.session_attempt_count("s1") is None
+        # A never-resumed session honestly reads zero, not "unknown".
+        assert store.session_attempt_count("s1") == 0
         assert store.session_cap_reached("s1", 3) is False
-        assert store.record_session_attempt("s1") is None
-    # Exactly one warning for a poisoned store, matching the existing contract.
-    assert sum("unparseable" in r.getMessage() for r in caplog.records) == 1
-    # ...and the rowid credit keeps failing CLOSED, which is the bounded
-    # degradation that still covers a corrupt store.
+        # ...and counting works again immediately, so the cap can still bound.
+        assert store.record_session_attempt("s1") == 1
+        assert store.record_session_attempt("s1") == 2
+        assert store.record_session_attempt("s1") == 3
+        assert store.session_cap_reached("s1", 3) is True
+
+    assert sum("was unreadable" in r.getMessage() for r in caplog.records) == 1
+    # The repair landed on disk: a fresh process sees valid state, not the
+    # corrupt bytes that used to survive every boot.
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 1
+    assert AutoResumeAttemptStore(path).session_attempt_count("s1") == 3
+    # The rowid credit still fails CLOSED for the rest of THIS process: the
+    # repair discarded real credits, so an empty ledger must not mint new ones.
     assert store.has_attempt("s1", 7) is True
 
 
@@ -231,37 +241,59 @@ def test_poisoned_store_reports_unknown_rather_than_a_spent_budget(tmp_path, cap
         pytest.param({"s1": {"count": 1, "attempted_at": "soon"}}, id="non_numeric_ts"),
     ],
 )
-def test_malformed_session_counters_report_unknown(tmp_path, counters):
+def test_malformed_session_counters_repair_to_zero(tmp_path, counters):
     path = tmp_path / "attempts.json"
     path.write_text(
         json.dumps({"version": 1, "attempts": [], "session_attempts": counters}),
         encoding="utf-8",
     )
     store = AutoResumeAttemptStore(path)
-    assert store.session_attempt_count("s1") is None
+    assert store.session_attempt_count("s1") == 0
     assert store.session_cap_reached("s1", 3) is False
+    assert store.record_session_attempt("s1") == 1
 
 
-def test_a_failed_counter_write_does_not_cap_the_session(tmp_path, caplog):
-    """Lost accounting must not read as a spent budget either.
+def test_an_unwritable_store_denies_the_resume_rather_than_replaying_forever(
+    tmp_path, caplog
+):
+    """Lost accounting must not be an unbounded licence to replay.
 
-    ``record_session_attempt`` reports ``None`` when it could not persist, and
-    the poisoned store it leaves behind answers ``unknown`` — so the session
-    keeps resuming (and keeps its marker) instead of being capped by a disk
-    fault it had nothing to do with.
+    Unlike an unreadable file, an unwritable one cannot self-heal, so nothing
+    the cap is told can ever be counted. Round 2 measured that arm at 10 boots
+    / 10 full-transcript replays / 0 cap lines — the incident, restated. The
+    verdict says so instead, and says it BEFORE the resume is scheduled
+    (``record_session_attempt`` runs too late to bound anything).
+
+    The attempts field is ``None``, which is how the scheduler knows to leave
+    ``resume_pending`` set: this denial is about the disk and must evaporate
+    when the disk is fixed.
     """
     path = tmp_path / "attempts.json"
     store = AutoResumeAttemptStore(path)
-    store.record_session_attempt("s1")
+    assert store.record_session_attempt("s1") == 1
 
     def _boom(*_args, **_kwargs):
         raise OSError("read-only file system")
 
     store._write = _boom
+    store._persist_proven = False  # a fresh process has not proven the path yet
+
     with caplog.at_level(logging.WARNING):
-        assert store.record_session_attempt("s1") is None
-    assert store.session_attempt_count("s1") is None
-    assert store.session_cap_reached("s1", 3) is False
+        assert store.session_resume_verdict("s1", 3) == (False, None)
+    assert store.session_cap_reached("s1", 3) is True
+    assert store.record_session_attempt("s1") is None
+    assert sum("cannot be written" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_a_writable_store_is_not_denied_by_the_persistability_probe(tmp_path):
+    """The probe must not deny a healthy store, and must not corrupt its counts."""
+    path = tmp_path / "nested" / "attempts.json"
+    store = AutoResumeAttemptStore(path)
+    assert store.record_session_attempt("s1") == 1
+
+    fresh = AutoResumeAttemptStore(path)
+    assert fresh.session_resume_verdict("s1", 3) == (True, 1)
+    assert fresh.session_attempt_count("s1") == 1
 
 
 def test_session_counters_expire_with_the_attempt_ttl(tmp_path):
