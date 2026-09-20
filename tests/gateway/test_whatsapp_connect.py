@@ -222,6 +222,49 @@ class TestConnectCleanup:
         mock_release.assert_called_once_with("whatsapp-session", str(adapter._session_path))
         assert adapter._platform_lock_identity is None
 
+    @pytest.mark.asyncio
+    async def test_npm_install_runs_off_the_event_loop_thread(self):
+        """`npm install` blocks for up to 300s; it must not run on the loop thread.
+
+        Records the thread that actually executes subprocess.run while a loop is
+        running: it must NOT be the loop's own thread, otherwise every other
+        platform adapter's heartbeat is frozen for the duration of the install.
+        """
+        import threading
+
+        adapter = _make_adapter()
+        loop_thread = threading.current_thread()
+        seen = {}
+
+        def _path_exists(path_obj):
+            return not str(path_obj).endswith("node_modules")
+
+        def _record(*args, **kwargs):
+            seen["thread"] = threading.current_thread()
+            seen["args"] = args
+            seen["kwargs"] = kwargs
+            return MagicMock(returncode=1, stderr="install failed")
+
+        with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
+             patch.object(Path, "exists", autospec=True, side_effect=_path_exists), \
+             patch("subprocess.run", side_effect=_record), \
+             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
+             patch("gateway.status.release_scoped_lock"):
+            result = await adapter.connect()
+
+        assert result is False
+        assert seen, "subprocess.run was never reached"
+        assert seen["thread"] is not loop_thread, (
+            "npm install executed on the event-loop thread; it must be offloaded "
+            "via asyncio.to_thread / run_in_executor"
+        )
+        assert seen["thread"] is not threading.main_thread()
+        # Args and the timeout must survive the offload unchanged.
+        assert seen["args"][0][1:] == ["install", "--silent"]
+        assert seen["kwargs"]["timeout"] == 300
+        assert seen["kwargs"]["capture_output"] is True
+        assert seen["kwargs"]["text"] is True
+
 
 class TestBridgeRuntimeFailure:
     """Verify runtime bridge death is surfaced as a fatal adapter error."""
