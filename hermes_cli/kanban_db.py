@@ -678,8 +678,8 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             suffix += 1
         d.rename(target)
         return {"slug": normed, "action": "archived", "new_path": str(target)}
-    import shutil
-    shutil.rmtree(d)
+    from hermes_cli.kanban_survivor import remove_workspace_dir
+    remove_workspace_dir(None, None, d, board=True)
     return {"slug": normed, "action": "deleted", "new_path": ""}
 
 

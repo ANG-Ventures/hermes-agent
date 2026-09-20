@@ -47,7 +47,7 @@ def _repos(workspace):
             found.append(Path(root))
         dirs[:] = sorted(d for d in dirs if d != ".git" and not (Path(root) / d).is_symlink())
     if workspace not in found and any((p / ".git").exists() for p in (workspace, *workspace.parents)):
-        tracked = _git(workspace, "ls-files", "--", ".", check=False)
+        tracked = _git(workspace, "ls-files", "--", ".")
         if tracked.returncode == 0 and tracked.stdout:
             found.insert(0, workspace)
     return found
@@ -225,7 +225,7 @@ def _hold(conn, task_id, reason):
     _log.warning("Workspace HELD for task %s: %s", task_id, reason)
 
 
-def preserve(conn, task_id, metadata=None, *, cleanup=False):
+def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None):
     """Return a verified survivor or None for non-code work; fail closed on doubt."""
     bases, held, previous = _state(conn, task_id)
     if cleanup and held:
@@ -233,18 +233,19 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False):
     try:
         task = kb.get_task(conn, task_id)
         if task is None:
-            return None
+            raise SurvivorUnavailable("survivor_unavailable: task missing")
         claimed = bool((metadata or {}).get("changed_files"))
         # Review approval often has no new changed_files: inherit the implementer's claim.
         claimed = claimed or any(
             bool(json.loads(r[0]).get("changed_files"))
             for r in conn.execute("SELECT metadata FROM task_runs WHERE task_id = ? AND metadata IS NOT NULL", (task_id,))
         )
-        workspace = Path(task.workspace_path) if task.workspace_path else None
+        workspace = Path(workspace or task.workspace_path) if workspace or task.workspace_path else None
         if workspace is None or not workspace.is_dir():
-            if bases or claimed:
+            if cleanup or bases or claimed:
                 raise SurvivorUnavailable("survivor_unavailable: workspace missing")
             return None
+        workspace = workspace.resolve(strict=True)
         repos = _repos(workspace)
         if any(a != b and a.is_relative_to(b) for a in repos for b in repos):
             # A patch cannot add a gitlink and files below the same path.
@@ -306,11 +307,58 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False):
         raise SurvivorUnavailable(reason) from exc
 
 
-def allow_cleanup(conn, task_id):
+def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False):
+    """The only Kanban directory deleter: inspect the exact target, then remove.
+
+    Board hard-delete may remove only empty workspace/attachment storage. Archive
+    a board with retained work instead: deleting its recovery artifacts would
+    defeat survivorship. Linked worktrees retain Git's no-force dirty check.
+    """
     try:
-        preserve(conn, task_id, cleanup=True)
+        if not path:
+            raise SurvivorUnavailable("survivor_unavailable: deletion target missing")
+        workspace = Path(path).expanduser().resolve(strict=True)
+        if not workspace.is_dir():
+            raise SurvivorUnavailable("survivor_unavailable: deletion target is not a directory")
+        if board:
+            if any(p.exists() and any(p.iterdir()) for p in
+                   (workspace / "workspaces", workspace / "attachments")) or _repos(workspace):
+                raise SurvivorUnavailable("survivor_unavailable: board has retained work; archive instead")
+        elif conn is None:
+            # Legacy direct worktree callers have no task connection. Never
+            # capture to an invented task: allow only independently durable refs.
+            repos = _repos(workspace)
+            if not repos or any(
+                _git(repo, "status", "--porcelain", "--untracked-files=all").stdout
+                or not _remote_survivor(repo, _git(repo, "rev-parse", "HEAD").stdout.decode().strip(),
+                                        list(_published_refs(repo, workspace)))
+                for repo in repos
+            ):
+                raise SurvivorUnavailable("survivor_unavailable: no task connection or durable ref")
+        else:
+            if _attachment_dir(conn, task_id).resolve().is_relative_to(workspace):
+                raise SurvivorUnavailable("survivor_unavailable: recovery storage inside deletion target")
+            preserve(conn, task_id, cleanup=True, workspace=workspace)
+        if worktree_root is not None:
+            # Preserve upstream's handle-release retry, still without --force.
+            result = _git(worktree_root, "worktree", "remove", str(workspace), check=False)
+            if result.returncode:
+                import time
+                time.sleep(0.1)
+                result = _git(worktree_root, "worktree", "remove", str(workspace), check=False)
+            if result.returncode:
+                raise SurvivorUnavailable("survivor_unavailable: git refused workspace removal")
+        else:
+            shutil.rmtree(workspace)
         return True
-    except SurvivorUnavailable:
+    except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as exc:
+        reason = str(exc) if isinstance(exc, SurvivorUnavailable) else "survivor_unavailable: removal failed"
+        if conn is not None and task_id is not None:
+            _hold(conn, task_id, reason)
+        else:
+            _log.warning("Workspace HELD: %s", reason)
+        if board:
+            raise SurvivorUnavailable(reason) from exc
         return False
 
 
