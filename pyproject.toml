@@ -455,6 +455,7 @@ py-modules = [
   "hermes_state_portability",
   "hermes_state_schema",
   "hermes_state_search",
+  "hermes_test_context",
   "hermes_time",
   "hermes_logging",
   "hermes_undo",
