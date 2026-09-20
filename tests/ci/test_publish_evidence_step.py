@@ -56,11 +56,28 @@ def _run_step(tmp_path: Path, gh_body: str) -> subprocess.CompletedProcess:
         tmp_path, textwrap.dedent(_EXTENSION_PRESENT_PREAMBLE) + gh_body)
 
 
-def _run_step_raw(tmp_path: Path, gh_body: str) -> subprocess.CompletedProcess:
+def _run_step_raw(tmp_path: Path, gh_body: str, *,
+                  extra_env: dict | None = None,
+                  uname_machine: str | None = None,
+                  break_hashers: bool = False,
+                  ) -> subprocess.CompletedProcess:
     """As ``_run_step`` but with NO extension-present preamble.
 
     Used by the tests that exercise the install/verify path itself, which
     must see ``ensure_extension`` actually run.
+
+    ``extra_env`` overrides the step environment; a value of ``None``
+    REMOVES the variable. Removal is the only way to un-pin: the step reads
+    its overrides with ``${VAR:-default}``, so an EMPTY value falls back to
+    the shipped architecture pin rather than clearing it.
+
+    ``uname_machine`` puts a fake ``uname`` on PATH reporting that machine,
+    so the architecture dispatch can be driven to its unsupported branch on
+    any host.
+
+    ``break_hashers`` shadows ``sha256sum``/``shasum`` with stubs that fail,
+    which is how the "could not compute a digest" refusal is reached without
+    dismantling the PATH the rest of the script needs.
     """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -68,9 +85,36 @@ def _run_step_raw(tmp_path: Path, gh_body: str) -> subprocess.CompletedProcess:
     gh.write_text("#!/usr/bin/env bash\n" + textwrap.dedent(gh_body), encoding="utf-8")
     gh.chmod(0o755)
 
+    if uname_machine is not None:
+        uname = bin_dir / "uname"
+        uname.write_text(
+            "#!/usr/bin/env bash\n"
+            f'if [ "${{1:-}}" = "-m" ]; then echo {shlex.quote(uname_machine)}; '
+            "else /usr/bin/uname \"$@\"; fi\n",
+            encoding="utf-8",
+        )
+        uname.chmod(0o755)
+
+    if break_hashers:
+        for tool in ("sha256sum", "shasum"):
+            stub = bin_dir / tool
+            stub.write_text(
+                "#!/usr/bin/env bash\n"
+                f'echo "{tool}: simulated failure" >&2\nexit 1\n',
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+
+    env = _step_env(bin_dir, tmp_path)
+    for key, value in (extra_env or {}).items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
+
     (tmp_path / "temp").mkdir(exist_ok=True)
     return subprocess.run(
-        ["bash", str(_SCRIPT)], cwd=_ROOT, env=_step_env(bin_dir, tmp_path),
+        ["bash", str(_SCRIPT)], cwd=_ROOT, env=env,
         capture_output=True, text=True, timeout=120,
     )
 
@@ -1459,3 +1503,200 @@ def test_a_second_attempt_does_not_fail_on_an_already_installed_extension(tmp_pa
         f"the retry attempt failed on the already-installed extension; "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# CLASS-SWEEP (reviewer round 3): the supply-chain guards in
+# ``ensure_extension`` were all individually disableable with the suite
+# staying green. Root cause was structural, not six oversights: ``_step_env``
+# ALWAYS supplies PUBLISH_EVIDENCE_GH_IMAGE_ASSET/_SHA256 so the
+# architecture dispatch and its "no pinned asset" refusal were unreachable,
+# and ``_extension_gh``'s ``download_rc`` parameter had no caller so the
+# download-failure path was never driven either.
+#
+# Mutants that survived before these tests (both directions, tree restored
+# after each):
+#   D2a  the missing-pin branch skipped entirely
+#   D2b  the refusal returning 0 instead of the supply-chain code
+#   D2c  only the asset checked, an empty digest ignored
+#   D2d  an unknown architecture falling back to the amd64 pin
+#   D3a  a sha256 that could not be computed treated as a match
+#   D5a  a failed release download swallowed rather than propagated
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+@pytest.mark.parametrize("unpinned", ["asset", "digest", "both"])
+def test_an_unpinned_gh_image_is_refused_rather_than_installed(tmp_path, unpinned):
+    """No pin means no install — never an unverified binary.
+
+    Closes D2a and D2c. With no pinned digest there is nothing to verify
+    against, so installing anyway would execute whatever the mutable tag
+    currently resolves to with the workflow token's permissions, which is
+    exactly the P0 this lane exists to prevent. Checking only the asset
+    (D2c) is the same hole: an empty digest still compares unequal later,
+    but the refusal must happen before the download, not by accident.
+
+    The overrides are REMOVED rather than emptied, and the architecture is
+    driven to an unsupported one, because the step resolves its pin with
+    ``${VAR:-default}`` — an empty value silently falls back to the shipped
+    pin and would test nothing.
+    """
+    overrides: dict = {
+        "asset": {"PUBLISH_EVIDENCE_GH_IMAGE_ASSET": None},
+        "digest": {"PUBLISH_EVIDENCE_GH_IMAGE_SHA256": None},
+        "both": {"PUBLISH_EVIDENCE_GH_IMAGE_ASSET": None,
+                 "PUBLISH_EVIDENCE_GH_IMAGE_SHA256": None},
+    }[unpinned]
+
+    result = _run_step_raw(
+        tmp_path, _extension_gh(tmp_path), extra_env=overrides,
+        uname_machine="s390x")
+
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0, (
+        f"an unpinned gh-image ({unpinned}) was accepted; stdout={result.stdout!r}"
+    )
+    assert "refusing to install an unverified binary" in combined, (
+        f"the refusal never fired; stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert not (tmp_path / "installed").exists(), (
+        "an unpinned binary was installed"
+    )
+    assert "::warning::" not in result.stdout, (
+        "an unpinned binary was reported as a tolerated transient"
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+def test_the_unpinned_refusal_is_not_tolerated_as_transient(tmp_path):
+    """Closes D2b: the refusal must carry the supply-chain exit code.
+
+    Returning 0 there would make an unsupported architecture publish
+    nothing and report success, and returning the transient code would
+    route it to NEUTRAL. Both are silent; a supply-chain refusal is RED.
+    """
+    result = _run_step_raw(
+        tmp_path, _extension_gh(tmp_path), uname_machine="s390x",
+        extra_env={"PUBLISH_EVIDENCE_GH_IMAGE_SHA256": None,
+                   "PUBLISH_EVIDENCE_GH_IMAGE_ASSET": None})
+
+    assert result.returncode == _supply_chain_exit_code(), (
+        "the unpinned refusal did not exit with the supply-chain code "
+        f"{_supply_chain_exit_code()}; got {result.returncode}"
+    )
+    assert "::warning::" not in result.stdout
+    assert "conclusion=neutral" not in result.stdout
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+def test_an_unsupported_architecture_has_no_pin_and_refuses(tmp_path):
+    """Closes D2d: an unknown arch must not borrow another arch's digest.
+
+    The amd64 digest cannot describe an arm64 (or s390x) asset, so falling
+    back to it either rejects every download on a valid host or, worse,
+    silently pins the wrong bytes. The shipped code empties both variables
+    for an unrecognised machine; this drives that branch with a fake
+    ``uname`` so it is exercised regardless of the host running the suite.
+    """
+    result = _run_step_raw(
+        tmp_path, _extension_gh(tmp_path), uname_machine="s390x",
+        extra_env={"PUBLISH_EVIDENCE_GH_IMAGE_ASSET": None,
+                   "PUBLISH_EVIDENCE_GH_IMAGE_SHA256": None})
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == _supply_chain_exit_code(), (
+        f"an unsupported architecture did not refuse; stdout={result.stdout!r}"
+    )
+    assert "No pinned gh-image asset for architecture" in combined
+    assert not (tmp_path / "installed").exists()
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+def test_a_supported_architecture_does_resolve_a_pin(tmp_path):
+    """The positive control for the architecture dispatch.
+
+    Without this, emptying the pin for EVERY architecture would satisfy the
+    unsupported-arch test above while disabling the extension entirely.
+    """
+    result = _run_step_raw(
+        tmp_path, _extension_gh(tmp_path, rest="""
+        case "$*" in
+          *"/pulls"*) echo 4242 ;;
+          *"/jobs"*) echo skipped ;;
+          *"/artifacts"*) ;;
+          *) exit 0 ;;
+        esac
+    """), uname_machine="x86_64",
+        extra_env={"PUBLISH_EVIDENCE_GH_IMAGE_ASSET": None})
+
+    combined = result.stdout + result.stderr
+    assert "No pinned gh-image asset for architecture" not in combined, (
+        "a supported architecture resolved no pin"
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+def test_an_uncomputable_digest_is_refused_not_assumed_to_match(tmp_path):
+    """Closes D3a: no hash tool means no install.
+
+    If ``sha256_of`` fails and the code substitutes the expected digest, the
+    comparison trivially passes and an unverified binary runs. The refusal
+    must be explicit and must not be transient-tolerated.
+    """
+    # Neither sha256sum nor shasum usable: the step's own helper then
+    # returns non-zero, which is the branch under test. Shadowing the two
+    # tools beats emptying PATH, which would also break bash's own builtins
+    # lookup and fail the step for an unrelated reason.
+    result = _run_step_raw(
+        tmp_path, _extension_gh(tmp_path), break_hashers=True)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == _supply_chain_exit_code(), (
+        f"an uncomputable digest was tolerated; stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
+    assert "Could not compute a SHA-256" in combined
+    assert not (tmp_path / "installed").exists(), (
+        "a binary whose digest could not be computed was installed"
+    )
+    assert "::warning::" not in result.stdout
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+def test_a_failed_release_download_is_propagated_not_swallowed(tmp_path):
+    """Closes D5a: a download failure must not fall through to the hash.
+
+    Swallowing it leaves no asset on disk, so the step would go on to hash
+    a missing file and report a confusing digest error — or, if that were
+    also tolerated, install nothing and claim success. The download spends
+    the rate-limit budget, so its failure is deliberately eligible for
+    ordinary transient classification; what it must never be is ignored.
+    """
+    result = _run_step_raw(tmp_path, _extension_gh(
+        tmp_path, download_rc=1,
+        download_stderr="HTTP 503: Service Unavailable"))
+
+    assert result.returncode == 0, (
+        "a transient download failure should reach the NEUTRAL path; "
+        f"got {result.returncode}"
+    )
+    assert "::warning::" in result.stdout, (
+        "a swallowed download failure produced a silent green; "
+        f"stdout={result.stdout!r}"
+    )
+    assert not (tmp_path / "installed").exists(), (
+        "the extension was installed despite the download failing"
+    )
+
+
+def _supply_chain_exit_code() -> int:
+    """Read the shipped supply-chain exit code rather than hardcoding it.
+
+    Hardcoding 78 in the tests would let a change to the constant drift
+    away from the assertions that are supposed to pin it.
+    """
+    match = re.search(r"^SUPPLY_CHAIN_EXIT_CODE=(\d+)",
+                      _SCRIPT.read_text(encoding="utf-8"), re.M)
+    assert match, "the step no longer defines SUPPLY_CHAIN_EXIT_CODE"
+    return int(match.group(1))
