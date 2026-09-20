@@ -54,6 +54,45 @@ _DOTENV_PUBLISHED: dict[str, tuple[str | None, str, int]] = {}
 _DOTENV_PASSES = itertools.count()
 _DOTENV_LOCK = threading.RLock()
 
+# Set once ``load_hermes_dotenv()`` has populated ``os.environ`` from a
+# ``.env`` file in this process.  Read by ``hermes_cli.config`` to tell a
+# genuinely-unset ``${env:VAR}`` config ref apart from one that is merely
+# being resolved too early — several entrypoints import
+# ``hermes_cli.config`` (and expand config refs as an import side effect)
+# BEFORE they call ``load_hermes_dotenv()``.
+_DOTENV_LOADED = False
+
+
+def dotenv_loaded() -> bool:
+    """True once a Hermes ``.env`` has been loaded into ``os.environ``."""
+    return _DOTENV_LOADED
+
+
+def dotenv_pending() -> bool:
+    """True when a ``.env`` exists on disk that this process has not read yet.
+
+    ``hermes_cli.config`` uses this to decide whether an unresolved
+    ``${env:VAR}`` config ref is worth warning about. Several entrypoints
+    import ``hermes_cli.config`` — which expands config refs as an import
+    side effect — strictly BEFORE they call :func:`load_hermes_dotenv`, so a
+    var that lives only in ``.env`` looks unset at that moment and produced a
+    false "is not set (check ~/.hermes/.env)" warning on every CLI
+    invocation. The value itself was always correct: ``load_config()``'s
+    env-ref snapshot re-expands once the environment changes (#58514).
+
+    Deliberately narrow: when no ``.env`` exists (or it has already been
+    loaded) this returns ``False`` and the warning fires as before, so a
+    genuinely-missing variable is still reported.
+    """
+    if _DOTENV_LOADED:
+        return False
+    try:
+        home = Path(os.getenv("HERMES_HOME") or (Path.home() / ".hermes"))
+        return (home / ".env").exists()
+    except Exception:  # noqa: BLE001 — diagnostics must never raise
+        return False
+
+
 # Per-process credentials a parent mints and injects into the child's environment (the Desktop shell /
 # a link-style launcher spawns `hermes dashboard` with a fresh HERMES_DASHBOARD_SESSION_TOKEN and keeps
 # the same token for its own /api probes). They are never .env configuration, so a persisted value in
@@ -433,6 +472,8 @@ def load_hermes_dotenv(
     if user_env.exists():
         _load_dotenv_with_fallback(user_env, override=True, load_pass=load_pass)
         loaded.append(user_env)
+        global _DOTENV_LOADED
+        _DOTENV_LOADED = True
         _clear_known_keys_missing_from_dotenv(user_env)  # mirrors reload_env(): inherited keys must not leak
 
     # .op.env AFTER .env so .env wins, but the bootstrap OP_SERVICE_ACCOUNT_TOKEN reaches
