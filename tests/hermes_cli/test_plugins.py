@@ -1016,20 +1016,30 @@ class TestForceReloadSymmetry:
 
         Regression for the #6622 approach: ThreadPoolExecutor + result(timeout)
         inside a ``with`` still waits on shutdown after TimeoutError.
-        """
-        import time
 
+        DETERMINISTIC ORDERING WITNESS — replaces ``assert elapsed < 1.0``.
+        Measured idle: 0.246 / 0.189 / 0.290s against a 1.0 bound on a 0.15s
+        hook timeout — only ~3.4x of headroom, most of it thread spawn, so the
+        ceiling would flip on a loaded runner with nothing wrong. The real
+        contract is ordering: ``invoke_hook`` must return while the blocker is
+        STILL parked. ``blocker_returned`` fires on every exit path of the hung
+        callback and is asserted UNSET the instant invoke_hook returns.
+        """
         monkeypatch.setattr(
             "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.15
         )
 
         hold = threading.Event()
         started = threading.Event()
+        blocker_returned = threading.Event()
 
         def blocker(**_kwargs):
             started.set()
-            hold.wait(timeout=10.0)
-            return "late"
+            try:
+                hold.wait(timeout=10.0)
+                return "late"
+            finally:
+                blocker_returned.set()
 
         def fast(**_kwargs):
             return {"ok": True}
@@ -1037,19 +1047,21 @@ class TestForceReloadSymmetry:
         mgr = PluginManager()
         mgr._hooks["post_tool_call"] = [blocker, fast]
 
-        t0 = time.monotonic()
         results = mgr.invoke_hook(
             "post_tool_call",
             tool_name="terminal",
             args={},
             result="{}",
         )
-        elapsed = time.monotonic() - t0
 
-        assert started.wait(timeout=1.0)
+        assert started.wait(timeout=10.0)
         assert results == [{"ok": True}]
-        assert elapsed < 1.0, f"caller blocked for {elapsed:.2f}s after timeout"
+        assert not blocker_returned.is_set(), (
+            "invoke_hook returned only AFTER the hung callback finished — the "
+            "timed-out worker was joined instead of abandoned (#6622)"
+        )
         hold.set()
+        assert blocker_returned.wait(10), "abandoned hook worker never drained"
 
     def test_hook_callback_within_timeout_returns_value(self, monkeypatch):
         monkeypatch.setattr(
@@ -1108,37 +1120,53 @@ class TestForceReloadSymmetry:
         assert seen["thread"] is caller
 
     def test_hung_callback_suppresses_repeat_fires(self, monkeypatch):
-        """A still-running timed-out callback must not spawn another worker."""
-        import time
+        """A still-running timed-out callback must not spawn another worker.
 
+        DETERMINISTIC ORDERING WITNESS — replaces ``assert elapsed < 1.0``.
+        Measured idle: 0.226 / 0.250 / 0.155s against a 1.0 bound on a 0.1s
+        timeout. ``len(starts) == 1`` was already the suppression fact; the
+        clock was standing in for "the second call did not join the first
+        worker either". ``blocker_returned`` asserts that directly.
+        """
         monkeypatch.setattr(
             "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
         )
 
         hold = threading.Event()
         starts = []
+        blocker_returned = threading.Event()
 
         def blocker(**_kwargs):
             starts.append(1)
-            hold.wait(timeout=10.0)
-            return "late"
+            try:
+                hold.wait(timeout=10.0)
+                return "late"
+            finally:
+                blocker_returned.set()
 
         mgr = PluginManager()
         mgr._hooks["post_tool_call"] = [blocker]
 
-        t0 = time.monotonic()
         assert mgr.invoke_hook("post_tool_call") == []
         assert mgr.invoke_hook("post_tool_call") == []
-        elapsed = time.monotonic() - t0
 
         assert len(starts) == 1
-        assert elapsed < 1.0
+        assert not blocker_returned.is_set(), (
+            "invoke_hook returned only AFTER the hung callback finished — a "
+            "timed-out-then-suppressed callback was joined instead of abandoned"
+        )
         hold.set()
+        assert blocker_returned.wait(10), "abandoned hook worker never drained"
 
     def test_pre_tool_call_timeout_fail_closed(self, monkeypatch):
-        """Timed-out pre_tool_call must return a block directive, not allow."""
-        import time
+        """Timed-out pre_tool_call must return a block directive, not allow.
 
+        DETERMINISTIC ORDERING WITNESS — replaces ``assert elapsed < 1.0``.
+        Measured idle: 0.313 / 0.303 / 0.301s against a 1.0 bound on a 0.1s
+        timeout — ~3.2x, i.e. the ceiling sat close enough to the window to
+        flip under load. The fail-closed message is the primary fact; the
+        clock stood in for "we blocked without joining the hung policy".
+        """
         from hermes_cli.plugins import (
             _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE,
             resolve_pre_tool_block,
@@ -1149,10 +1177,14 @@ class TestForceReloadSymmetry:
         )
 
         hold = threading.Event()
+        policy_returned = threading.Event()
 
         def hung_policy(**_kwargs):
-            hold.wait(timeout=10.0)
-            return None
+            try:
+                hold.wait(timeout=10.0)
+                return None
+            finally:
+                policy_returned.set()
 
         mgr = PluginManager()
         mgr._hooks["pre_tool_call"] = [hung_policy]
@@ -1161,17 +1193,22 @@ class TestForceReloadSymmetry:
 
         monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
 
-        t0 = time.monotonic()
         msg = resolve_pre_tool_block("web_search", {"query": "x"})
-        elapsed = time.monotonic() - t0
 
         assert msg == _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
-        assert elapsed < 1.0
+        assert not policy_returned.is_set(), (
+            "resolve_pre_tool_block returned only AFTER the hung policy "
+            "finished — the timed-out worker was joined instead of abandoned"
+        )
 
         # Still-running / suppression window must also fail closed.
         msg2 = resolve_pre_tool_block("web_search", {"query": "y"})
         assert msg2 == _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
+        assert not policy_returned.is_set(), (
+            "the suppressed second call joined the still-running policy worker"
+        )
         hold.set()
+        assert policy_returned.wait(10), "abandoned policy worker never drained"
 
     def test_pre_tool_call_timeout_does_not_reach_tool_handler(self, monkeypatch):
         """E2E: timed-out pre_tool_call blocks handle_function_call before dispatch."""

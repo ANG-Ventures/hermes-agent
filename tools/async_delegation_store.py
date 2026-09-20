@@ -857,6 +857,7 @@ def cancel_matching(
     parent_session_id: str = "",
     origin_ui_session_id: str = "",
     all_active: bool = False,
+    owner_boot_id: str = "",
     profile_home: Path | None = None,
     reason: str = "unspecified",
     caller: str = "",
@@ -866,6 +867,13 @@ def cancel_matching(
     ``reason``/``caller`` are Phase-0 cancel forensics: they are stamped into
     each cancelled record's additive ``cancel_attribution`` block (WHO/WHY/
     WHEN) and change no cancellation behavior.
+
+    ``owner_boot_id`` scopes the write to the CALLER's own boot. The registry
+    is process-shared, so an unscoped ``all_active`` cancel from a short-lived
+    process (a ``hermes -z`` one-shot's shutdown cleanup) silently killed every
+    in-flight delegation the live gateway owned. When supplied, a record owned
+    by a DIFFERENT boot that is still ALIVE is skipped; a record owned by a
+    dead boot (crash recovery) or carrying no owner (legacy) stays cancellable.
     """
     if not registry_path(profile_home).exists():
         return 0
@@ -904,6 +912,24 @@ def cancel_matching(
             )
             if not matches:
                 continue
+            if owner_boot_id:
+                record_owner = str(
+                    (record.get("attempt") or {}).get("owner_boot_id") or ""
+                )
+                if (
+                    record_owner
+                    and record_owner != owner_boot_id
+                    and is_boot_id_alive(record_owner)
+                ):
+                    logger.info(
+                        "async_delegation_cancel_skipped_foreign_boot "
+                        "delegation_id=%s owner_boot_id=%s caller_boot_id=%s caller=%s",
+                        delegation_id,
+                        record_owner,
+                        owner_boot_id,
+                        caller,
+                    )
+                    continue
             record["state"] = "cancelled"
             record["updated_at"] = now
             _stamp_cancel_attribution(

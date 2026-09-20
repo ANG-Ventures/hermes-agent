@@ -924,6 +924,49 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _find_existing_skill_anywhere(name: str) -> Optional[Dict[str, Any]]:
+    """Existence check for CREATE — scans the WHOLE shared tree, not just subscribed groups.
+
+    ``_find_skill``'s scan set (``get_all_skills_dirs()`` = local skills dir +
+    the groups listed in ``skills.external_dirs``) answers "which skill would I
+    load", and is deliberately narrow: widening it would change prompt loading
+    and precedence for every agent. It is the WRONG set for "does this name
+    already exist" — a create into an UNSUBSCRIBED shared group is invisible to
+    it, so a second create of the same name succeeds silently and the tree ends
+    up with two copies of one skill (measured: 13 of 27 shared groups / 94
+    skills were blind).
+
+    So the create path gets its own union: everything ``_find_skill`` sees, PLUS
+    every group under ``_shared_skills_root()`` regardless of subscription.
+    Returns ``{"path": Path}`` or None.
+    """
+    existing = _find_skill(name)
+    if existing:
+        return existing
+
+    shared_root = _shared_skills_root()
+    try:
+        if not shared_root.is_dir():
+            return None
+    except OSError:
+        return None
+
+    try:
+        from agent.skill_utils import is_excluded_skill_path
+    except Exception:  # pragma: no cover - import guard
+        return None
+
+    for group in _valid_shared_groups():
+        gdir = shared_root / group
+        try:
+            candidate = gdir / name / "SKILL.md"
+            if candidate.is_file() and not is_excluded_skill_path(candidate):
+                return {"path": candidate.parent}
+        except OSError:
+            continue
+    return None
+
+
 def _maybe_auto_propose_org_edit(name: str, skill_path: Path) -> Optional[str]:
     """Submit an org-skill edit upstream when `sync.org_auto_propose` is on.
 
@@ -1192,8 +1235,9 @@ def _create_skill(name: str, content: str, category: str = None, *, local: bool 
     if err:
         return {"success": False, "error": err}
 
-    # Check for name collisions across all directories
-    existing = _find_skill(name)
+    # Check for name collisions across all directories AND every shared group
+    # (subscribed or not) — see _find_existing_skill_anywhere.
+    existing = _find_existing_skill_anywhere(name)
     if existing:
         return {
             "success": False,

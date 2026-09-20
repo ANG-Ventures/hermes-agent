@@ -129,14 +129,14 @@ class TestDDGSProviderSearch:
         monkeypatch.setattr(prov, "_TERMINATE_GRACE_SECS", 0.5, raising=True)
         monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
 
-        start = time.monotonic()
         result = prov.DDGSWebSearchProvider().search("hangs forever", limit=5)
-        elapsed = time.monotonic() - start
 
         assert result["success"] is False
         assert "timed out" in result["error"].lower()
-        assert elapsed < 5.0, f"search did not return promptly ({elapsed:.1f}s)"
-        _assert_worker_reaped(prov)
+        # Replaces ``assert elapsed < 5.0`` (measured idle 0.676/0.735/0.685s
+        # against a 0.4s timeout + 0.5s grace — a ~6.8x ratio that was really
+        # measuring spawn + reap latency, not the deadline).
+        _assert_worker_signalled(prov, why="hung search")
 
     def test_fast_search_not_affected_by_timeout_wrapper(self, monkeypatch):
         """Happy-path guard: the timeout wrapper must not break a normal,
@@ -168,6 +168,35 @@ def _assert_worker_reaped(prov) -> None:
     )
 
 
+def _assert_worker_signalled(prov, *, why: str) -> None:
+    """Assert the worker was reaped BY SIGNAL, i.e. the parent never joined it.
+
+    DETERMINISTIC ORDERING WITNESS — the fact the ``elapsed < 5.0`` stopwatches
+    in this file stood in for.
+
+    The worker's ``sleep``/``gil`` test hooks run for 30s and then return a
+    ``*hook returned unexpectedly*`` envelope. So there are exactly two ways
+    this call can end:
+
+    * the parent enforced its own deadline/interrupt and ran
+      ``_terminate_and_reap`` -> the child dies on SIGTERM/SIGKILL and
+      ``returncode`` is **negative**; or
+    * the parent waited the child out -> the child exits normally and
+      ``returncode`` is **0**.
+
+    A negative returncode is therefore a direct, load-immune proof that the
+    parent abandoned the child rather than joining it — no wall-clock constant
+    involved. Measured on this box: -15 (SIGTERM) for all three bounded paths.
+    """
+    _assert_worker_reaped(prov)
+    proc = prov._last_worker_proc
+    assert proc.returncode is not None and proc.returncode < 0, (
+        f"{why}: DDGS worker exited with returncode={proc.returncode} "
+        "(>=0 means it ran to completion) — the parent waited the 30s test "
+        "hook out instead of enforcing its own deadline and killing the child"
+    )
+
+
 @pytest.mark.live_system_guard_bypass
 class TestDDGSProcessIsolation:
     def test_gil_holding_worker_times_out_and_is_reaped(self, monkeypatch):
@@ -180,14 +209,13 @@ class TestDDGSProcessIsolation:
         monkeypatch.setattr(prov, "_TERMINATE_GRACE_SECS", 0.5, raising=True)
         monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
 
-        start = time.monotonic()
         result = prov.DDGSWebSearchProvider().search("gil hold", limit=5)
-        elapsed = time.monotonic() - start
 
         assert result["success"] is False
         assert "timed out" in result["error"].lower()
-        assert elapsed < 5.0, f"GIL-hold search did not time out promptly ({elapsed:.1f}s)"
-        _assert_worker_reaped(prov)
+        # Replaces ``assert elapsed < 5.0`` (measured idle 0.690/0.833/0.830s
+        # against a 0.5s timeout + 0.5s grace — ~6.0x, dominated by spawn+reap).
+        _assert_worker_signalled(prov, why="GIL-hold search")
 
     def test_interrupt_terminates_worker_promptly(self, monkeypatch):
         """TUI/gateway interrupt must kill the DDGS child before the deadline."""
@@ -206,14 +234,16 @@ class TestDDGSProcessIsolation:
         monkeypatch.setattr(prov, "_TERMINATE_GRACE_SECS", 0.5, raising=True)
         monkeypatch.setattr("tools.interrupt.is_interrupted", _interrupt_after_poll)
 
-        start = time.monotonic()
         result = prov.DDGSWebSearchProvider().search("interrupt me", limit=5)
-        elapsed = time.monotonic() - start
 
         assert result["success"] is False
         assert "interrupted" in result["error"].lower()
-        assert elapsed < 5.0, f"interrupt did not return promptly ({elapsed:.1f}s)"
-        _assert_worker_reaped(prov)
+        # Replaces ``assert elapsed < 5.0`` (measured idle 0.326/0.451/0.438s).
+        # Strictly stronger here: the deadline is pinned at 30s, so the ONLY
+        # thing that can signal-kill this child is the interrupt poll. A
+        # non-negative returncode would mean the parent sat through the 30s
+        # sleep hook and the interrupt never preempted it.
+        _assert_worker_signalled(prov, why="interrupt")
 
 
     def test_no_orphan_after_successful_search(self, monkeypatch):

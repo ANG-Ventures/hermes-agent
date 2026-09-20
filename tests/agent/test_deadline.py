@@ -184,22 +184,42 @@ class TestRunBoundedSync:
             run_bounded_sync(lambda: (_ for _ in ()).throw(Boom("x")), 5.0, label="t")
 
     def test_timeout_abandons_worker_and_reports(self):
+        """DETERMINISTIC ORDERING WITNESS — replaces ``assert elapsed < 5.0``.
+
+        Measured idle: 0.329 / 0.336 / 0.294s against a 5.0 bound and a 0.2s
+        deadline, i.e. the ceiling was ~15x above the window and mostly
+        measuring thread spawn + scheduling.
+
+        The fact the stopwatch stood in for is ordering: ``run_bounded_sync``
+        must return while the wedged worker is STILL running. ``worker_returned``
+        is set on every exit path of the worker and asserted UNSET at the
+        instant the BoundedResult comes back — if the helper ever joined the
+        worker instead of abandoning it, the worker could only have been
+        reached after it finished and this fails by name.
+        """
         release = threading.Event()
+        worker_returned = threading.Event()
 
         def _wedged():
-            release.wait(30)
-            return "late"
+            try:
+                # Finite: a regression must fail fast, never hang the suite.
+                release.wait(30)
+                return "late"
+            finally:
+                worker_returned.set()
 
-        start = time.monotonic()
         result = run_bounded_sync(_wedged, 0.2, label="wedged")
-        elapsed = time.monotonic() - start
         assert result.timed_out is True
         assert result.value is None
-        assert elapsed < 5.0  # returned near the deadline, not after 30s
+        assert not worker_returned.is_set(), (
+            "run_bounded_sync returned only AFTER the wedged worker finished — "
+            "it joined the abandoned thread instead of bounding the wait"
+        )
         with pytest.raises(DeadlineExpired) as exc_info:
             result.raise_if_timed_out()
         assert "wedged" in str(exc_info.value)
         release.set()
+        assert worker_returned.wait(10), "abandoned worker never drained"
 
     def test_on_timeout_callback_runs(self):
         release = threading.Event()
@@ -270,42 +290,69 @@ class TestRunBoundedAsync:
             asyncio.run(scenario())
 
     def test_timeout_returns_promptly(self):
+        """DETERMINISTIC ORDERING WITNESS — replaces ``assert elapsed < 5.0``.
+
+        Measured idle: 0.299 / 0.243 / 0.350s against a 5.0 bound on a 0.2s
+        deadline. The contract is that the helper returns while the 30s
+        operation is still pending, not that a clock reading came in low.
+        """
+
         async def scenario():
+            op_returned = asyncio.Event()
+
             async def op():
-                await asyncio.sleep(30)
+                try:
+                    await asyncio.sleep(30)
+                finally:
+                    op_returned.set()
 
-            start = time.monotonic()
             result = await run_bounded_async(op(), 0.2, label="slow")
-            return result, time.monotonic() - start
+            return result, op_returned.is_set()
 
-        result, elapsed = asyncio.run(scenario())
+        result, op_had_returned = asyncio.run(scenario())
         assert result.timed_out is True
-        assert elapsed < 5.0
+        assert not op_had_returned, (
+            "run_bounded_async returned only AFTER the 30s operation finished — "
+            "it awaited the cancelled task instead of abandoning it"
+        )
 
     def test_timeout_abandons_cancellation_shielded_task(self):
         """The family-A killer case: asyncio.wait_for cannot expire a shielded
-        scope; the thread-timer deadline must return anyway."""
+        scope; the thread-timer deadline must return anyway.
+
+        DETERMINISTIC ORDERING WITNESS — replaces ``assert elapsed < 5.0``.
+        Measured idle: 0.310 / 0.319 / 0.320s against a 5.0 bound on a 0.2s
+        deadline. ``shielded_returned`` is set on every exit path of the
+        cancellation-swallowing coroutine and asserted UNSET when the helper
+        returns, which is exactly the abandonment fact the clock stood in for.
+        """
 
         async def scenario():
             hung = asyncio.Event()
+            shielded_returned = asyncio.Event()
 
             async def inner():
                 await hung.wait()
 
             async def shielded():
-                # Shield swallows the cancellation run_bounded_async issues.
-                await asyncio.shield(asyncio.ensure_future(inner()))
+                try:
+                    # Shield swallows the cancellation run_bounded_async issues.
+                    await asyncio.shield(asyncio.ensure_future(inner()))
+                finally:
+                    shielded_returned.set()
 
-            start = time.monotonic()
             result = await run_bounded_async(shielded(), 0.2, label="shielded")
-            elapsed = time.monotonic() - start
+            returned_before = shielded_returned.is_set()
             hung.set()  # release the orphan so the loop can drain
             await asyncio.sleep(0)
-            return result, elapsed
+            return result, returned_before
 
-        result, elapsed = asyncio.run(scenario())
+        result, shielded_had_returned = asyncio.run(scenario())
         assert result.timed_out is True
-        assert elapsed < 5.0
+        assert not shielded_had_returned, (
+            "run_bounded_async returned only AFTER the shielded scope finished — "
+            "it awaited cancellation completion instead of abandoning the task"
+        )
 
     def test_on_abandon_cleanup_runs_detached(self):
         async def scenario():
