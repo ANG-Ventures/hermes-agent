@@ -780,6 +780,118 @@ def test_the_workflow_grants_the_permission_the_neutral_status_needs():
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# The hopeless-wait short-circuit (``transient_wait_is_hopeless``).
+#
+# Every stub above answers the ``rate_limit`` probe from its catch-all
+# ``*) exit 0``, i.e. with EMPTY output — so the function's non-numeric
+# guard short-circuits and the three predicates behind it are never
+# reached. Measured: inverting the probe's fail-open, the ``remaining``
+# guard or the 60s reset window each left the suite 35/35 green.
+#
+# The predicates decide whether a retry that WOULD have succeeded is
+# abandoned, so each one gets a case that distinguishes it. The stubs
+# below are the only ones in this file that serve a well-formed probe.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+_HOPELESS_MESSAGE = "not retrying"
+
+
+def _probing_gh(counter: Path, reset: str, remaining: str) -> str:
+    """A gh stub with a persistent rate limit AND a readable budget probe.
+
+    ``reset``/``remaining`` are shell expressions evaluated per call, so a
+    test can place the reset window relative to *now*. Either may be
+    ``FAIL`` to make that half of the probe unreadable.
+    """
+    def _arm(expr: str) -> str:
+        return "exit 1" if expr == "FAIL" else f'echo "{expr}"'
+
+    return f"""
+        case "$*" in
+          *"core.reset"*)     {_arm(reset)} ;;
+          *"core.remaining"*) {_arm(remaining)} ;;
+          *"/pulls"*)
+             n=$(cat {counter} 2>/dev/null || echo 0)
+             n=$((n + 1)); echo "$n" > {counter}
+             echo "gh: API rate limit exceeded for installation" >&2
+             exit 1 ;;
+          *"/jobs"*) echo skipped ;;
+          *"/artifacts"*) ;;
+          *) exit 0 ;;
+        esac
+    """
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+@pytest.mark.parametrize("label,reset,remaining", [
+    # The probe is itself an API call and the API is by hypothesis unwell.
+    # Failing it CLOSED would let a broken probe abandon a viable retry.
+    ("reset unreadable", "FAIL", "0"),
+    ("remaining unreadable", "$(( $(date +%s) + 3600 ))", "FAIL"),
+    # Budget is NOT exhausted, so this is a secondary limit that clears in
+    # seconds — the reset of the primary budget is irrelevant to it.
+    ("budget still has room", "$(( $(date +%s) + 3600 ))", "500"),
+    # Exhausted, but the reset lands inside the window the retry budget
+    # can actually cover, so waiting is viable.
+    ("reset inside the retry window", "$(( $(date +%s) + 30 ))", "0"),
+])
+def test_a_viable_retry_is_never_skipped_by_the_hopeless_check(
+    tmp_path, label, reset, remaining,
+):
+    """The short-circuit must fire ONLY when the wait is truly hopeless.
+
+    Each case is a condition under which the retry could still succeed.
+    Short-circuiting any of them converts the bounded-retry tolerance into
+    zero retries — a publish that would have worked is abandoned, and the
+    only visible difference is a neutral status arriving sooner.
+    """
+    counter = tmp_path / "calls"
+    result = _run_step(tmp_path, _probing_gh(counter, reset, remaining))
+
+    assert int(counter.read_text()) == 3, (
+        f"{label}: the retry loop ran {counter.read_text().strip()} attempt(s) "
+        "instead of the full 3 — the hopeless-wait check abandoned a retry "
+        f"that could still have succeeded; stdout={result.stdout!r}"
+    )
+    assert _HOPELESS_MESSAGE not in result.stdout, (
+        f"{label}: the step declared the wait hopeless when it was not"
+    )
+    # Still a tolerated transient, and still visibly non-green.
+    assert result.returncode == 0
+    assert "::warning::" in result.stdout
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+def test_a_genuinely_hopeless_wait_short_circuits_to_neutral(tmp_path):
+    """The positive control: exhausted budget, reset far beyond the window.
+
+    Retrying then spends more of the exhausted quota and more of the job
+    timeout to reach the same neutral outcome. Without this case the
+    window could be widened to infinity — the check never firing at all —
+    and every other test here would still pass.
+    """
+    counter = tmp_path / "calls"
+    result = _run_step(
+        tmp_path,
+        _probing_gh(counter,
+                    reset="$(( $(date +%s) + 3600 ))", remaining="0"),
+    )
+
+    assert int(counter.read_text()) == 1, (
+        "the primary budget is exhausted for an hour, yet the step kept "
+        f"retrying; stdout={result.stdout!r}"
+    )
+    assert _HOPELESS_MESSAGE in result.stdout, (
+        "the short-circuit fired without saying why, leaving the single "
+        "attempt looking like the retry loop was simply broken"
+    )
+    # Short-circuiting is an optimisation, not a different verdict.
+    assert result.returncode == 0
+    assert "::warning::" in result.stdout
+
+
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
 def test_a_second_attempt_does_not_fail_on_an_already_installed_extension(tmp_path):
     """``gh extension install`` FAILS when the extension already exists.
