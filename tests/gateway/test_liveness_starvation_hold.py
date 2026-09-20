@@ -123,10 +123,18 @@ def test_starved_hold_decrements_the_strike_counter_to_one_below_the_limit():
 
 def test_wedged_miss_under_low_load_still_exits_75_unchanged():
     exit_codes: list[int] = []
+    handle_ref: dict = {}
+
+    def record_and_disarm(code: int) -> None:
+        # os._exit is mocked, so the watchdog thread would otherwise loop on and
+        # call the REAL os._exit once this patch lifts, killing the test process.
+        exit_codes.append(code)
+        handle_ref["handle"].stop()
+
     with (
         patch("gateway.shutdown_watchdog.logger.critical") as critical,
         patch("gateway.shutdown_watchdog.faulthandler.dump_traceback") as dump,
-        patch("gateway.shutdown_watchdog.os._exit", side_effect=exit_codes.append),
+        patch("gateway.shutdown_watchdog.os._exit", side_effect=record_and_disarm),
         patch("gateway.shutdown_watchdog.os.getloadavg", return_value=(1.5, 1.2, 1.0)),
         patch("gateway.shutdown_watchdog.os.cpu_count", return_value=32),
     ):
@@ -134,7 +142,8 @@ def test_wedged_miss_under_low_load_still_exits_75_unchanged():
             _dead_loop(), probe_interval=0.01, probe_timeout=0.01, max_strikes=1
         )
         assert handle is not None
-        time.sleep(0.3)
+        handle_ref["handle"] = handle
+        handle.join(timeout=2.0)
         handle.stop()
         handle.join(timeout=2.0)
 
@@ -217,10 +226,16 @@ def test_starvation_within_max_hold_keeps_holding():
 
 def test_watchdog_gives_up_and_exits_75_after_the_hold_ceiling():
     exit_codes: list[int] = []
+    handle_ref: dict = {}
+
+    def record_and_disarm(code: int) -> None:
+        exit_codes.append(code)
+        handle_ref["handle"].stop()
+
     with (
         patch("gateway.shutdown_watchdog.logger.critical") as critical,
         patch("gateway.shutdown_watchdog.faulthandler.dump_traceback"),
-        patch("gateway.shutdown_watchdog.os._exit", side_effect=exit_codes.append),
+        patch("gateway.shutdown_watchdog.os._exit", side_effect=record_and_disarm),
         patch("gateway.shutdown_watchdog.os.getloadavg", return_value=(538.0, 400.0, 200.0)),
         patch("gateway.shutdown_watchdog.os.cpu_count", return_value=32),
     ):
@@ -232,7 +247,8 @@ def test_watchdog_gives_up_and_exits_75_after_the_hold_ceiling():
             starvation_max_hold_s=0.0,  # ceiling already exceeded on arrival
         )
         assert handle is not None
-        time.sleep(0.3)
+        handle_ref["handle"] = handle
+        handle.join(timeout=2.0)
         handle.stop()
         handle.join(timeout=2.0)
 
