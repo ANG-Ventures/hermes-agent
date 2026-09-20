@@ -16,10 +16,24 @@ extension instead:
                               "grammar": "inbound"}}
 
 This module owns the *only* gate between that untrusted provider-supplied
-payload and anything user-visible or persisted. It fails closed: an unknown
-version, a wrong ``kind``, a bad ``scope``, a non-string ``request_id``, or a
-duplicate notice in one response yields ``None`` and a debug log. Callers must
-never display or persist a payload this function rejected.
+payload and anything user-visible or persisted. ``validate_confab_notice``
+fails closed: an unknown version, a wrong ``kind``, a bad ``scope``, or a
+non-string ``request_id`` yields ``None`` and a debug log. Callers must never
+display or persist a payload this function rejected.
+
+The one-notice-per-response half of the contract is enforced by the *callers*,
+because only they can see a whole response: the streaming aggregator in
+``agent/chat_completion_helpers.py`` marks its accumulator invalid and
+forwards NO notice once a second valid notice appears in one stream.
+
+Two reader-side helpers complete the contract:
+
+* ``notice_from_display_row`` re-validates a persisted row before any surface
+  presents the confirmed-catch claim, and requires an ``assistant`` role —
+  ``display_kind`` alone is an open string any writer can set;
+* ``should_announce_notice`` scopes the announce-once ledger to the current
+  turn, so a colliding or restarted provider ``request_id`` can never silently
+  suppress a genuine later warning.
 
 The returned object is a fresh dict containing only the validated keys — a
 provider cannot smuggle extra fields into ``display_metadata`` by attaching
@@ -28,6 +42,7 @@ them to the extension.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Dict, Optional
 
@@ -145,3 +160,84 @@ def extract_confab_notice(obj: Any) -> Optional[Dict[str, Any]]:
     if raw is None:
         return None
     return validate_confab_notice(raw)
+
+
+#: Attribute holding the per-turn announce ledger on the agent.
+_ANNOUNCE_LEDGER_ATTR = "_confab_notices_announced"
+
+
+def notice_from_display_row(
+    role: Any, display_kind: Any, display_metadata: Any
+) -> Optional[Dict[str, Any]]:
+    """Return the validated notice a persisted row genuinely carries, else ``None``.
+
+    ``display_kind`` is an open-ended string column that any writer — a
+    history importer, a migration, a malformed or hand-edited record — can
+    populate. Claiming "confabulation caught" on the strength of that string
+    alone asserts a CONFIRMED provider catch that may never have happened, on
+    a row that may not even be a model reply.
+
+    So a reader must clear two gates before presenting the claim:
+
+    1. the row is an ``assistant`` turn — only a model reply can carry a
+       catch; a user or system row tagged this way is malformed input, and
+    2. ``display_metadata[CONFAB_NOTICE_KEY]`` re-validates against the same
+       fail-closed v1 schema the wire payload had to pass.
+
+    Returns the re-validated notice (so callers can key off ``kind`` /
+    ``request_id``) or ``None`` when the row does not qualify.
+    """
+    if role != "assistant":
+        return None
+    if display_kind != CONFAB_NOTICE_DISPLAY_KIND:
+        return None
+
+    metadata = display_metadata
+    # A row round-tripped through a store that serializes the column arrives
+    # as JSON text; a reader must not credit it or reject it on shape alone.
+    if isinstance(metadata, (str, bytes)):
+        try:
+            metadata = json.loads(metadata)
+        except (ValueError, TypeError):
+            return None
+    if not isinstance(metadata, dict):
+        return None
+
+    return validate_confab_notice(metadata.get(CONFAB_NOTICE_KEY))
+
+
+def should_announce_notice(agent: Any, notice: Any, turn_id: Any) -> bool:
+    """Return ``True`` the FIRST time *notice* is seen within *turn_id*.
+
+    The user-facing warning must fire exactly once per accepted notice even
+    when a retry or a provider failover re-normalizes the same response
+    object. That is the only job of this ledger — and its scope is therefore
+    the logical turn, never the agent's lifetime.
+
+    A lifetime-scoped ledger keyed only on the provider-supplied
+    ``request_id`` silently SUPPRESSES a genuine later warning whenever a
+    bridge restarts its ID sequence, two providers issue the same ID, or an ID
+    simply collides. Suppressing the signal this whole feature exists to
+    deliver is strictly worse than announcing twice, so:
+
+    * the key carries the turn identity as well as the request id, and
+    * the ledger is evicted the moment the turn changes, so it cannot grow
+      without bound or leak a key into a later turn.
+    """
+    if not isinstance(notice, dict):
+        return False
+    request_id = notice.get("request_id")
+
+    ledger = getattr(agent, _ANNOUNCE_LEDGER_ATTR, None)
+    # Evict on turn change: a previous turn's keys can never suppress this
+    # turn's warning. Also repairs a ledger left behind in the pre-scoping
+    # (bare set) shape by an older build.
+    if not isinstance(ledger, dict) or ledger.get("turn_id") != turn_id:
+        ledger = {"turn_id": turn_id, "keys": set()}
+        setattr(agent, _ANNOUNCE_LEDGER_ATTR, ledger)
+
+    key = (turn_id, request_id)
+    if key in ledger["keys"]:
+        return False
+    ledger["keys"].add(key)
+    return True

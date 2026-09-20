@@ -42,7 +42,7 @@ from agent.context_engine import (
     call_with_messages as _call_with_messages,
 )
 from agent.display import KawaiiSpinner
-from agent.confab_notice import CONFAB_NOTICE_TEXT
+from agent.confab_notice import CONFAB_NOTICE_TEXT, should_announce_notice
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
 from agent.turn_context import (
@@ -7662,19 +7662,16 @@ def run_conversation(
             # self-fabricated scaffold text from this reply. Tell the user NOW
             # (CLI/TUI/gateway all receive _emit_status) — out of band must not
             # mean invisible, because this signal is load-bearing for triage.
-            # Exactly one status per accepted notice: the request_id ledger
-            # stops a retry/fallback that re-normalizes the same response from
-            # emitting twice. See agent/confab_notice.py.
+            # Exactly one status per accepted notice PER TURN: the ledger stops
+            # a retry/fallback that re-normalizes the same response from
+            # emitting twice, and is evicted on turn change so a colliding or
+            # restarted provider request_id can never suppress a later turn's
+            # genuine warning. See agent/confab_notice.py.
             _confab_notice = getattr(normalized, "confab_notice", None)
-            if _confab_notice:
-                _seen = getattr(agent, "_confab_notices_announced", None)
-                if _seen is None:
-                    _seen = set()
-                    agent._confab_notices_announced = _seen
-                _notice_id = _confab_notice.get("request_id")
-                if _notice_id not in _seen:
-                    _seen.add(_notice_id)
-                    agent._emit_status(CONFAB_NOTICE_TEXT)
+            if _confab_notice and should_announce_notice(
+                agent, _confab_notice, turn_id
+            ):
+                agent._emit_status(CONFAB_NOTICE_TEXT)
             
             # Normalize content to string — some OpenAI-compatible servers
             # (llama-server, etc.) return content as a dict or list instead
