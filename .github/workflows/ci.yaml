@@ -29,8 +29,8 @@ name: CI
 #   js-tests.yml    mid-flight vitest death, not root-caused; see js-tests.yml
 #
 # ``installer-tests``, the ``tests-os`` matrix and ``ci-review-comment`` use a
-# literal ``runs-on`` and are hosted by design. Everything else runs on the
-# pool. Any PR touching ``.github/workflows/**`` also needs the ``ci-reviewed``
+# literal ``runs-on`` and are hosted by design. Further hosted pins are listed
+# below. Any PR touching ``.github/workflows/**`` also needs the ``ci-reviewed``
 # label or the Review label gate hard-blocks it.
 #
 # OVERFLOW (2026-09-20). The pool has 17 slots (ace-ai 8 + ace-media 8 +
@@ -46,6 +46,10 @@ name: CI
 #   * the short non-test jobs that gate nothing on the LAN — lint (x3),
 #     uv-lockfile-check, contributor-check, docs-site-checks — moved to a
 #     literal ``ubuntu-latest``, freeing 6 pool slots per run for test slices.
+#   * gate/plumbing jobs (detect, generate, all-checks-pass, ci-timings,
+#     save-durations, OSV emit-status) are also pinned hosted. The required
+#     aggregator queued 17+ minutes behind test slices after they finished;
+#     these GitHub API/artifact and local Python jobs need no LAN resources.
 #
 # ``CI_RUNNER_LABELS`` rollback is unchanged: point it at ubuntu-latest and
 # every job, matrix slices included, goes hosted.
@@ -101,7 +105,8 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   detect:
     name: Detect affected areas
-    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    # Unblock all lanes without waiting for a self-hosted test slot.
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       python: ${{ steps.classify.outputs.python }}
@@ -323,7 +328,8 @@ jobs:
       # to block a merge. A separate run also stops it from holding this
       # run open. That is what blocked ``gh run rerun``.
     if: always()
-    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    # A completed matrix must not wait for the pool to report its verdict.
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       needs-json: ${{ steps.evaluate.outputs.needs-json }}
@@ -350,7 +356,8 @@ jobs:
     name: CI timing report
     needs: [all-checks-pass]
     if: always()
-    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    # GitHub API/cache/artifacts only; reserve pool slots for tests.
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout code
