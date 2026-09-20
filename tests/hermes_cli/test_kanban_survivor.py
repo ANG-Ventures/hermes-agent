@@ -1,5 +1,6 @@
 """Real Git/SQLite regressions for code surviving task completion and GC."""
 import hashlib
+import json
 import subprocess
 from pathlib import Path
 
@@ -17,6 +18,9 @@ def git(repo, *args):
 
 @pytest.fixture
 def board(tmp_path, monkeypatch):
+    import hermes_cli.kanban_survivor as survivor
+    # Model separate durable and temporary roots within the disposable test home.
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     with kb.connect_closing() as conn:
@@ -35,6 +39,10 @@ def fixture_repo(conn, nested=False):
     (repo / ".gitignore").write_text("ignored.txt\n")
     git(repo, "add", ".")
     git(repo, "commit", "-m", "base")
+    remote = Path.home() / f"{tid}.git"
+    git(repo, "init", "--bare", str(remote))
+    git(repo, "remote", "add", "origin", str(remote))
+    git(repo, "push", "origin", "HEAD:main")
     kb.set_workspace_path(conn, tid, ws)
     return tid, ws, repo
 
@@ -50,7 +58,7 @@ def test_completion_captures_patch_before_deleting(board, tmp_path, nested):
     (repo / "ignored.txt").write_text("must not be captured")
     assert kb.complete_task(board, tid, metadata={"changed_files": ["code.py"]})
     attachments = kb.list_attachments(board, tid)
-    assert len(attachments) == 1
+    assert len(attachments) == 2  # patch and restoration manifest
     patch = Path(attachments[0].stored_path)
     assert patch.name == "implementation.patch"
     data = patch.read_bytes()
@@ -59,15 +67,12 @@ def test_completion_captures_patch_before_deleting(board, tmp_path, nested):
     survivor = kb.latest_run(board, tid).metadata["survivor"]
     assert survivor["sha256"] == hashlib.sha256(data).hexdigest()
     assert survivor["bytes"] == len(data)
-    # Recreate the exact base, then APPLY the stored artifact, not just grep it.
+    # Restore only from surviving remote + artifact, never hand-recreate a base.
     restored = tmp_path / "restored"
     restored.mkdir()
-    git(restored, "init")
     prefix = restored / "repo" if nested else restored
-    prefix.mkdir(exist_ok=True)
-    (prefix / "code.py").write_text("value = 1\n")
-    (prefix / ".gitignore").write_text("ignored.txt\n")
-    git(restored, "apply", str(patch))
+    git(tmp_path, "clone", "-b", "main", str(tmp_path / f"{tid}.git"), str(prefix))
+    git(prefix, "apply", "-p2" if nested else "-p1", str(patch))
     assert (prefix / "code.py").read_text() == "value = 2\n"
     assert (prefix / "new.bin").read_bytes() == b"\x00\xff\x01"
     assert base
@@ -77,7 +82,7 @@ def test_completion_with_pushed_clean_head_records_remote(board, tmp_path):
     tid, ws, repo = fixture_repo(board)
     remote = tmp_path / "remote.git"
     git(tmp_path, "init", "--bare", str(remote))
-    git(repo, "remote", "add", "origin", str(remote))
+    git(repo, "remote", "set-url", "origin", str(remote))
     (repo / "code.py").write_text("value = 3\n")
     git(repo, "add", ".")
     git(repo, "commit", "-m", "implementation")
@@ -88,13 +93,17 @@ def test_completion_with_pushed_clean_head_records_remote(board, tmp_path):
     assert survivor["kind"] == "ref"
     assert survivor["refs"][0]["sha"] == sha
     assert not kb.list_attachments(board, tid)
+    assert not ws.exists()
+    restored = tmp_path / "restored"
+    git(tmp_path, "clone", "-b", "feature", str(remote), str(restored))
+    assert (restored / "code.py").read_text() == "value = 3\n"
 
 
 def test_pushed_head_does_not_cover_dirty_files(board, tmp_path):
     tid, ws, repo = fixture_repo(board)
     remote = tmp_path / "remote.git"
     git(tmp_path, "init", "--bare", str(remote))
-    git(repo, "remote", "add", "origin", str(remote))
+    git(repo, "remote", "set-url", "origin", str(remote))
     git(repo, "push", "origin", "HEAD:main")
     (repo / "code.py").write_text("dirty = True\n")
     assert kb.complete_task(board, tid)
@@ -203,7 +212,7 @@ def test_capture_is_idempotent_and_never_changes_real_index(board):
     first = preserve(board, tid)
     second = preserve(board, tid)
     assert first == second
-    assert len(kb.list_attachments(board, tid)) == 1
+    assert len(kb.list_attachments(board, tid)) == 2
     assert (repo / ".git" / "index").read_bytes() == before
 
 
@@ -222,7 +231,9 @@ def test_reaper_write_failure_holds_workspace_even_after_disk_recovers(board, mo
 
 
 def test_empty_code_claim_refuses(board):
-    tid, ws, repo = fixture_repo(board)
+    tid = kb.create_task(board, title="empty workspace")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    kb.set_workspace_path(board, tid, ws)
     with pytest.raises(ValueError, match="empty patch"):
         kb.complete_task(board, tid, metadata={"changed_files": ["code.py"]})
     assert ws.exists()
@@ -232,7 +243,8 @@ def test_stale_remote_tracking_ref_is_not_a_survivor(board, tmp_path):
     tid, ws, repo = fixture_repo(board)
     remote = tmp_path / "remote.git"
     git(tmp_path, "init", "--bare", str(remote))
-    git(repo, "remote", "add", "origin", str(remote))
+    git(repo, "remote", "set-url", "origin", str(remote))
+    git(repo, "push", "origin", "HEAD:main")
     (repo / "code.py").write_text("unpublished_again = True\n")
     git(repo, "add", ".")
     git(repo, "commit", "-m", "implementation")
@@ -272,7 +284,7 @@ def test_deferred_parent_capture_includes_later_edits(board):
     assert kb.complete_task(board, child)
     assert not ws.exists()
     attachments = kb.list_attachments(board, tid)
-    assert len(attachments) == 2
+    assert len(attachments) == 4  # two patch/manifest versions
     assert any(b"second = True" in Path(a.stored_path).read_bytes() for a in attachments)
 
 
@@ -280,7 +292,7 @@ def test_remote_timeout_falls_back_to_patch(board, monkeypatch):
     import importlib
     survivor = importlib.import_module("hermes_cli.kanban_survivor")
     tid, ws, repo = fixture_repo(board)
-    git(repo, "remote", "add", "origin", "https://example.invalid/repo.git")
+    git(repo, "remote", "set-url", "origin", "https://example.invalid/repo.git")
     (repo / "code.py").write_text("changed = True\n")
     git(repo, "add", ".")
     git(repo, "commit", "-m", "implementation")
@@ -291,7 +303,7 @@ def test_remote_timeout_falls_back_to_patch(board, monkeypatch):
         return real(repo, *args, **kwargs)
     monkeypatch.setattr(survivor, "_git", offline)
     assert kb.complete_task(board, tid)
-    assert kb.latest_run(board, tid).metadata["survivor"]["kind"] == "patch"
+    assert kb.latest_run(board, tid).metadata["survivor"]["kind"] == "bundle"
 
 
 def test_embedded_repository_is_held_instead_of_invalid_gitlink_patch(board):
@@ -302,4 +314,121 @@ def test_embedded_repository_is_held_instead_of_invalid_gitlink_patch(board):
     (child / "new.py").write_text("nested = True\n")
     with pytest.raises(ValueError, match="nested repository"):
         kb.complete_task(board, tid)
+    assert ws.exists()
+
+
+@pytest.mark.parametrize("url_kind", ["path", "file", "symlink"])
+def test_scratch_remote_restores_after_cleanup(board, tmp_path, url_kind):
+    tid, ws, repo = fixture_repo(board, nested=True)
+    remote = ws / "remote.git"
+    git(ws, "init", "--bare", str(remote))
+    url = str(remote)
+    if url_kind == "file":
+        url = remote.as_uri()
+    elif url_kind == "symlink":
+        alias = tmp_path / "alias.git"
+        alias.symlink_to(remote, target_is_directory=True)
+        url = str(alias)
+    git(repo, "remote", "set-url", "origin", url)
+    (repo / "code.py").write_text("value = 17\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "implementation")
+    git(repo, "push", "origin", "HEAD:main")
+    assert kb.complete_task(board, tid)
+    assert not ws.exists() and not remote.exists()
+    survivor = kb.latest_run(board, tid).metadata["survivor"]
+    assert survivor["kind"] == "bundle"
+    restored = tmp_path / "restored"
+    git(tmp_path, "clone", survivor["bundles"][0]["path"], str(restored))
+    assert (restored / "code.py").read_text() == "value = 17\n"
+
+
+def test_unpublished_dispatch_base_restores_from_published_ancestor(board, tmp_path):
+    tid, ws, repo = fixture_repo(board)
+    remote = tmp_path / "remote.git"
+    git(tmp_path, "init", "--bare", str(remote))
+    git(repo, "remote", "set-url", "origin", str(remote))
+    git(repo, "push", "origin", "HEAD:main")
+    published = git(repo, "rev-parse", "HEAD")
+    (repo / "code.py").write_text("unpublished baseline\n")
+    (repo / "baseline.txt").write_text("must survive\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "unpublished baseline")
+    with kb.write_txn(board):
+        board.execute("DELETE FROM task_workspace_survivors WHERE task_id = ?", (tid,))
+    kb.set_workspace_path(board, tid, ws)
+    (repo / "code.py").write_text("final implementation\n")
+    assert kb.complete_task(board, tid)
+    assert not ws.exists()
+    survivor = kb.latest_run(board, tid).metadata["survivor"]
+    restored = tmp_path / "restored"
+    git(tmp_path, "clone", "-b", "main", str(remote), str(restored))
+    git(restored, "apply", "--check", survivor["path"])
+    git(restored, "apply", survivor["path"])
+    assert (restored / "code.py").read_text() == "final implementation\n"
+    assert (restored / "baseline.txt").read_text() == "must survive\n"
+    manifest = json.loads(Path(survivor["sidecar"]).read_text())
+    assert manifest["repositories"][0]["base_sha"] == published
+
+
+@pytest.mark.parametrize("reap", [False, True])
+def test_unpublished_bundle_restores_dirty_binary_and_history(board, tmp_path, reap):
+    from hermes_cli.kanban_survivor import preserve
+    tid, ws, repo = fixture_repo(board)
+    git(repo, "remote", "remove", "origin")
+    original = git(repo, "rev-parse", "HEAD")
+    (repo / "code.py").unlink()
+    (repo / "new.bin").write_bytes(b"\x00\xffrecovery")
+    script = repo / "run.sh"
+    script.write_text("#!/bin/sh\nexit 0\n")
+    script.chmod(0o755)
+    (repo / "ignored.txt").write_text("excluded")
+    first = preserve(board, tid)
+    assert preserve(board, tid) == first
+    assert len(kb.list_attachments(board, tid)) == 2
+    if reap:
+        kb._cleanup_workspace(board, tid)
+    else:
+        assert kb.complete_task(board, tid)
+        assert "survivor=bundle" in kb.get_task(board, tid).result
+        assert "NOT PUSHED" in kb.get_task(board, tid).result
+    assert not ws.exists()
+    restored = tmp_path / "restored"
+    git(tmp_path, "clone", first["bundles"][0]["path"], str(restored))
+    git(restored, "merge-base", "--is-ancestor", original, "HEAD")
+    assert not (restored / "code.py").exists()
+    assert not (restored / "ignored.txt").exists()
+    assert (restored / "new.bin").read_bytes() == b"\x00\xffrecovery"
+    assert (restored / "run.sh").stat().st_mode & 0o111
+
+
+@pytest.mark.parametrize("location", ["temporary", "sibling_workspace"])
+def test_other_reclaimed_remote_cannot_supply_ref_or_patch_base(board, tmp_path, location):
+    tid, ws, repo = fixture_repo(board)
+    root = tmp_path / "temporary" if location == "temporary" else ws.parent / "other_task"
+    root.mkdir(exist_ok=True)
+    remote = root / "remote.git"
+    git(repo, "init", "--bare", str(remote))
+    # URL rewrite and file URL must not obscure the reclaimed filesystem path.
+    git(repo, "config", f"url.{remote.as_uri()}.insteadOf", "recovery-alias:")
+    git(repo, "remote", "set-url", "origin", "recovery-alias:")
+    git(repo, "push", "origin", "HEAD:main")
+    (repo / "code.py").write_text("value = 50\n")
+    assert kb.complete_task(board, tid)
+    assert kb.latest_run(board, tid).metadata["survivor"]["kind"] == "bundle"
+
+
+def test_bundle_write_failure_holds_workspace(board, monkeypatch):
+    import hermes_cli.kanban_survivor as survivor
+    tid, ws, repo = fixture_repo(board)
+    git(repo, "remote", "remove", "origin")
+    real = survivor._write_patch
+    def fail_bundle(path, data):
+        if path.suffix == ".bundle":
+            raise OSError("full")
+        return real(path, data)
+    monkeypatch.setattr(survivor, "_write_patch", fail_bundle)
+    with pytest.raises(ValueError, match="survivor_unavailable"):
+        kb.complete_task(board, tid)
+    kb._cleanup_workspace(board, tid)
     assert ws.exists()
