@@ -196,6 +196,18 @@ def collect_memory_status(
         status["last_boot_suspected_oom"] = bool(
             sentinel.get("prior_suspected_oom")
         )
+        # Who killed the previous life, when the boot-time attribution probe
+        # could name it ("SIGKILL" / "Python[35502]" /
+        # "ai.hermes.gateway-watchdog") — so status/doctor can answer "what
+        # killed the gateway?" without re-running the forensics by hand.
+        if sentinel.get("prior_killer"):
+            status["last_boot_killer"] = sentinel.get("prior_killer")
+        if sentinel.get("prior_kill_sender"):
+            status["last_boot_kill_sender"] = sentinel.get("prior_kill_sender")
+        if sentinel.get("prior_kill_sender_label"):
+            status["last_boot_kill_sender_label"] = sentinel.get(
+                "prior_kill_sender_label"
+            )
         started_at = sentinel.get("started_at")
         if isinstance(started_at, str) and started_at:
             status["boot_id"] = started_at

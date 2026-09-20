@@ -37748,8 +37748,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # only the authoritative gateway for this HERMES_HOME touches the
     # sentinel — a --replace loser exiting above must not clobber it.
     try:
-        from gateway.lifecycle_ledger import record_startup as _lifecycle_record_startup
-        _lifecycle_record_startup()
+        from gateway.lifecycle_ledger import (
+            record_startup_async as _lifecycle_record_startup_async,
+        )
+        # Async variant: the kill-attribution probe shells out to
+        # `log show` / `journalctl` and must never run on the loop thread.
+        await _lifecycle_record_startup_async()
     except Exception as _lc_exc:
         logger.debug("Lifecycle ledger startup record failed: %s", _lc_exc)
 
