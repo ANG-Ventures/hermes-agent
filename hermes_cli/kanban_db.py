@@ -2758,7 +2758,9 @@ def complete_task(
         metadata = dict(metadata or {}, survivor=survivor)
         survivor_note = (
             f"survivor=patch {survivor['path']} {survivor['sha256']} {survivor['bytes']} NOT PUSHED"
-            if survivor['kind'] == 'patch' else "survivor=ref " + " ".join(
+            if survivor['kind'] == 'patch' else
+            f"survivor=bundle {survivor['sidecar']} NOT PUSHED"
+            if survivor['kind'] == 'bundle' else "survivor=ref " + " ".join(
                 f"{ref['remote']}/{ref['branch']}@{ref['sha']}" for ref in survivor["refs"]
             )
         )

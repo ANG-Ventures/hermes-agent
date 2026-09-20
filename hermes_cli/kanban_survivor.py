@@ -1,7 +1,7 @@
 """Durable Git survivors shared by completion and workspace reclamation.
 
 A remote HEAD only protects a CLEAN tree. Otherwise save a binary Git patch
-against the dispatch baseline, using a temporary index (never stage user work).
+against a published ancestor, or a self-contained bundle when none survives.
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+from urllib.parse import unquote, urlsplit
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import write_txn
@@ -94,7 +95,7 @@ def _write_patch(path, data):
         if path.read_bytes() == data:
             return path
         digest = hashlib.sha256(data).hexdigest()
-        path = path.with_name(f"implementation-{digest}.patch")
+        path = path.with_name(f"{path.stem}-{digest}{path.suffix}")
         if path.exists() and path.read_bytes() == data:
             return path
     with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as f:
@@ -125,10 +126,31 @@ def _write_patch(path, data):
         temp.unlink(missing_ok=True)
 
 
-def _remote_survivor(repo, head):
-    # Never trust stale refs/remotes: query the actual remote. A local object
-    # for its advertised tip permits ancestry proof; otherwise fall back to patch.
+def _temporary_roots():
+    return [Path(tempfile.gettempdir()), Path("/tmp"), Path("/var/tmp")]
+
+
+def _durable_remote(repo, remote, workspace):
+    # Expand insteadOf aliases, then resolve symlinks before checking scope.
+    url = _git(repo, "remote", "get-url", remote).stdout.decode().strip()
+    parsed = urlsplit(url)
+    if parsed.scheme in {"https", "http", "ssh", "git"}:
+        return True
+    if not parsed.scheme and ":" in url and not url.startswith(("/", ".")):
+        return True  # scp-style SSH
+    if parsed.scheme not in {"", "file"} or parsed.netloc not in {"", "localhost"}:
+        return False
+    path = Path(unquote(parsed.path) if parsed.scheme else url).expanduser()
+    path = (repo / path).resolve()
+    roots = [workspace, kb.workspaces_root(), kb.kanban_home() / "kanban" / "workspaces",
+             kb.kanban_home() / "kanban" / "boards", *_temporary_roots()]
+    return remote == "origin" and not any(path.is_relative_to(root.resolve()) for root in roots)
+
+
+def _published_refs(repo, workspace):
     for remote in _git(repo, "remote").stdout.decode().splitlines():
+        if not _durable_remote(repo, remote, workspace):
+            continue
         try:
             advertised = _git(repo, "ls-remote", "--heads", remote, check=False)
         except subprocess.TimeoutExpired:
@@ -137,29 +159,25 @@ def _remote_survivor(repo, head):
             continue
         for line in advertised.stdout.decode().splitlines():
             sha, ref = line.split("\t", 1)
-            if sha == head or _git(repo, "merge-base", "--is-ancestor", head, sha, check=False).returncode == 0:
-                return {"remote": remote, "branch": ref.removeprefix("refs/heads/"), "sha": sha, "head": head}
+            yield {"remote": remote, "branch": ref.removeprefix("refs/heads/"), "sha": sha}
+
+
+def _remote_survivor(repo, head, published):
+    for ref in published:
+        if ref["sha"] == head or _git(repo, "merge-base", "--is-ancestor", head, ref["sha"], check=False).returncode == 0:
+            return dict(ref, head=head)
     return None
 
 
-def _base(repo, bases, key):
-    if key in bases and bases[key]:
-        return bases[key]
-    # Repos created after dispatch have no recorded baseline. Preserve their
-    # unpublished history from a reachable remote ancestor, or their whole tree.
-    for remote in _git(repo, "remote").stdout.decode().splitlines():
-        try:
-            advertised = _git(repo, "ls-remote", "--heads", remote, check=False)
-        except subprocess.TimeoutExpired:
-            continue
-        if advertised.returncode:
-            continue
-        for line in advertised.stdout.decode().splitlines():
-            sha = line.split("\t", 1)[0]
-            base = _git(repo, "merge-base", "HEAD", sha, check=False)
-            if base.returncode == 0:
-                return base.stdout.decode().strip()
-    return _git(repo, "hash-object", "-t", "tree", os.devnull).stdout.decode().strip()
+def _base(repo, published):
+    candidates = []
+    for ref in published:
+        base = _git(repo, "merge-base", "HEAD", ref["sha"], check=False)
+        if base.returncode == 0:
+            sha = base.stdout.decode().strip()
+            distance = int(_git(repo, "rev-list", "--count", f"{sha}..HEAD").stdout)
+            candidates.append((distance, sha))
+    return min(candidates)[1] if candidates else None
 
 
 def _snapshot(repo, base, prefix):
@@ -172,6 +190,23 @@ def _snapshot(repo, base, prefix):
         else:
             _git(repo, "read-tree", "--empty", env=env)
         _git(repo, "add", "-A", "--", ".", env=env)
+        if base is None:
+            tree = _git(repo, "write-tree", env=env).stdout.decode().strip()
+            head = _git(repo, "rev-parse", "--verify", "HEAD", check=False)
+            parents = ["-p", head.stdout.decode().strip()] if head.returncode == 0 else []
+            identity = dict(env, GIT_AUTHOR_NAME="Kanban recovery", GIT_COMMITTER_NAME="Kanban recovery",
+                            GIT_AUTHOR_EMAIL="kanban@localhost", GIT_COMMITTER_EMAIL="kanban@localhost",
+                            GIT_AUTHOR_DATE="2000-01-01T00:00:00Z", GIT_COMMITTER_DATE="2000-01-01T00:00:00Z")
+            commit = _git(repo, "commit-tree", tree, *parents, "-m", "Kanban workspace recovery", env=identity).stdout.decode().strip()
+            recovery = Path(tmp) / "recovery.git"
+            _git(repo, "init", "--bare", str(recovery))
+            objects = _git(repo, "rev-parse", "--path-format=absolute", "--git-path", "objects").stdout.decode().strip()
+            bundle_env = dict(os.environ, GIT_ALTERNATE_OBJECT_DIRECTORIES=objects)
+            _git(recovery, "update-ref", "refs/heads/implementation", commit, env=bundle_env)
+            _git(recovery, "symbolic-ref", "HEAD", "refs/heads/implementation", env=bundle_env)
+            bundle = Path(tmp) / "implementation.bundle"
+            _git(recovery, "bundle", "create", str(bundle), "--all", env=bundle_env)
+            return bundle.read_bytes()
         return _git(
             repo, "diff", "--cached", "--relative", "--binary", "--full-index", "--no-ext-diff",
             "--no-textconv", "--no-renames", f"--src-prefix=a/{prefix}",
@@ -217,34 +252,41 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False):
         keys = {str(r.relative_to(workspace)) for r in repos}
         if set(bases) - keys:
             raise SurvivorUnavailable("survivor_unavailable: recorded repository missing")
-        patches, refs = [], []
+        patches, refs, bundles, repositories = [], [], [], []
         for repo in repos:
             key = str(repo.relative_to(workspace))
-            base = _base(repo, bases, key)
-            prefix = "" if key == "." else key + "/"
-            patch = _snapshot(repo, base, prefix)
-            if patch:
-                header = f"# kanban repository={json.dumps(key)} base={base}\n".encode()
-                patches.append(header + patch)
+            published = list(_published_refs(repo, workspace))
             head = _git(repo, "rev-parse", "--verify", "HEAD", check=False)
             dirty = _git(repo, "status", "--porcelain", "--untracked-files=all").stdout
             ref = None
             if not dirty and head.returncode == 0:
-                ref = _remote_survivor(repo, head.stdout.decode().strip())
+                ref = _remote_survivor(repo, head.stdout.decode().strip(), published)
             if ref:
                 refs.append(dict(ref, repository=key))
+                continue
+            base = _base(repo, published)
+            prefix = "" if key == "." else key + "/"
+            data = _snapshot(repo, base, prefix)
+            if base is None:
+                name = f"implementation-{len(bundles)}.bundle"
+                bundle = _store(conn, task_id, name, data, "application/x-git-bundle")
+                bundles.append(dict(bundle, repository=key))
+            elif data:
+                header = f"# kanban repository={json.dumps(key)} base={base}\n".encode()
+                patches.append(header + data)
+            repositories.append({"repository": key, "base_sha": base})
         if repos and len(refs) == len(repos):
             survivor = {"kind": "ref", "refs": refs}
-        elif patches:
+        elif patches or bundles:
             data = b"".join(patches)
-            if len(data) > kb.KANBAN_ATTACHMENT_MAX_BYTES:
-                raise SurvivorUnavailable("survivor_unavailable: implementation patch exceeds attachment limit")
-            path = _write_patch(_attachment_dir(conn, task_id) / "implementation.patch", data)
-            if not any(a.stored_path == str(path) for a in kb.list_attachments(conn, task_id)):
-                kb.add_attachment(conn, task_id, filename=path.name, stored_path=str(path),
-                                  content_type="text/x-patch", size=len(data), uploaded_by="harness")
-            survivor = {"kind": "patch", "path": str(path), "sha256": hashlib.sha256(data).hexdigest(),
-                        "bytes": len(data), "notice": "NOT PUSHED"}
+            survivor = {"kind": "bundle" if bundles else "patch", "notice": "NOT PUSHED",
+                        "bundles": bundles, "refs": refs}
+            if patches:
+                survivor.update(_store(conn, task_id, "implementation.patch", data, "text/x-patch"))
+            manifest = dict(survivor, repositories=repositories)
+            sidecar = _store(conn, task_id, "implementation.json",
+                             json.dumps(manifest, sort_keys=True).encode(), "application/json")
+            survivor["sidecar"] = sidecar["path"]
         elif claimed:
             raise SurvivorUnavailable("survivor_unavailable: empty patch despite claimed code changes")
         else:
@@ -270,3 +312,13 @@ def allow_cleanup(conn, task_id):
         return True
     except SurvivorUnavailable:
         return False
+
+
+def _store(conn, task_id, name, data, content_type):
+    if len(data) > kb.KANBAN_ATTACHMENT_MAX_BYTES:
+        raise SurvivorUnavailable("survivor_unavailable: implementation artifact exceeds attachment limit")
+    path = _write_patch(_attachment_dir(conn, task_id) / name, data)
+    if not any(a.stored_path == str(path) for a in kb.list_attachments(conn, task_id)):
+        kb.add_attachment(conn, task_id, filename=path.name, stored_path=str(path),
+                          content_type=content_type, size=len(data), uploaded_by="harness")
+    return {"path": str(path), "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}

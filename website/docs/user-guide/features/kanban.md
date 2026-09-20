@@ -129,17 +129,24 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
 ### Code survivors on completion
 
 Pushing a reviewed branch is preferred. Completion also accepts a harness-written
-`implementation.patch` attachment: it contains the binary Git diff from the recorded
-dispatch baseline to the current files, including non-ignored untracked files. The
-real Git index is not staged or modified. A clean HEAD is accepted as a ref survivor
-only after querying a remote branch that contains it; stale remote-tracking refs
-and a pushed HEAD with dirty files do not qualify.
+`implementation.patch` attachment: it contains the binary Git diff from a published
+ancestor to the current files, including non-ignored untracked files. An unpublished
+dispatch baseline is not a recoverable base. If no published ancestor survives,
+the harness saves a self-contained Git bundle containing the HEAD history plus a
+snapshot commit of the current files. The real Git index and branch are not changed.
+A clean HEAD is accepted as a ref survivor only after querying a durable remote
+branch that contains it. Local origins inside workspace or temporary directories
+(including symlinks and URL aliases), stale tracking refs, and dirty trees do not qualify.
 
-The completion result and event record the survivor. Patch-only completion says
-`NOT PUSHED` and records the attachment path, SHA-256, and byte count. Apply the patch
-from the workspace root with `git apply /path/to/implementation.patch`, using the
-original base checkout(s). Repeated capture of unchanged content reuses the attachment;
-changed captures preserve earlier versions under distinct names.
+The completion result and event record the survivor. Attachment-only completion says
+`NOT PUSHED`; the `implementation.json` sidecar records repository paths, published
+`base_sha` values, artifact paths, SHA-256 digests, and byte counts. Clone each durable
+remote and check out its recorded base before applying the patch from the workspace
+root with `git apply /path/to/implementation.patch`. For a bundle, clone the listed
+bundle into its repository path instead (`git clone /path/to/implementation-0.bundle repo`).
+Mixed workspaces can require both bundles and a patch; follow the sidecar's repository
+mapping. Repeated capture of unchanged content reuses attachments; changed captures
+preserve earlier versions under distinct names.
 
 If code cannot be captured (missing repository, failed Git/read/write, attachment
 size limit, or an empty patch despite `metadata.changed_files`), completion refuses
