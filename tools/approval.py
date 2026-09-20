@@ -3798,10 +3798,10 @@ def _run_approval_gate(
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
         ``check_dangerous_command`` so all callers handle it uniformly.
     """
-    # --yolo bypasses all approval prompts (session- or process-scoped).
-    # Hardline blocks are handled by the caller BEFORE this gate, so yolo
-    # here only skips the recoverable approval layer.
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    # --yolo / approvals.mode=off bypass all approval prompts (session- or
+    # process-scoped). Hardline blocks are handled by the caller BEFORE this
+    # gate, so bypass here only skips the recoverable approval layer.
+    if is_approval_bypass_active():
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
@@ -4099,9 +4099,9 @@ def check_dangerous_command(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
-    # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
-    # CLI --yolo remains process-scoped via the env var for local use.
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    # --yolo / approvals.mode=off: bypass all approval prompts. Gateway /yolo
+    # is session-scoped; CLI --yolo is process-scoped; mode=off is config.
+    if is_approval_bypass_active():
         return {"approved": True, "message": None}
 
     if _command_matches_permanent_allowlist(command):
@@ -4751,7 +4751,7 @@ def check_all_command_guards(command: str, env_type: str,
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    if is_approval_bypass_active():
         return {"approved": True, "message": None}
 
     if _command_matches_permanent_allowlist(command):
@@ -5387,7 +5387,7 @@ def check_execute_code_guard(code: str, env_type: str,
 
     # --yolo or approvals.mode=off: bypass (session- or process-scoped).
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    if is_approval_bypass_active():
         return {"approved": True, "message": None}
 
     is_gateway = _is_gateway_approval_context()

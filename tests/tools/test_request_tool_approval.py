@@ -21,9 +21,12 @@ def _isolate_approval_state(monkeypatch):
     )
     # Empty session + permanent approval stores so nothing pre-approves.
     monkeypatch.setattr(approval, "is_approved", lambda sk, pk: False)
-    # Not a yolo session (the shared gate checks this first).
+    # Not a yolo session. The shared gate reads is_approval_bypass_active(),
+    # which consults is_session_yolo_enabled + mode=off — pin both sources off.
     monkeypatch.setattr(approval, "is_current_session_yolo_enabled", lambda: False)
+    monkeypatch.setattr(approval, "is_session_yolo_enabled", lambda _k: False)
     monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False, raising=False)
+    monkeypatch.setattr(approval, "_get_approval_mode", lambda: "manual")
     # No thread-registered CLI callback by default.
     monkeypatch.setattr(
         "tools.terminal_tool._get_approval_callback", lambda: None, raising=False
@@ -145,6 +148,7 @@ class TestRequestToolApproval:
         """A --yolo session skips the plugin approval gate (parity with the
         dangerous-command path, via the shared _run_approval_gate)."""
         monkeypatch.setattr(approval, "is_current_session_yolo_enabled", lambda: True)
+        monkeypatch.setattr(approval, "is_session_yolo_enabled", lambda _k: True)
         monkeypatch.setattr(
             approval, "prompt_dangerous_approval",
             lambda *a, **k: pytest.fail("yolo must not prompt"),
