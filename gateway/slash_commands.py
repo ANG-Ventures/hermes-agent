@@ -2297,6 +2297,33 @@ class GatewaySlashCommandsMixin:
             current_base_url = override.get("base_url", current_base_url)
             current_api_key = override.get("api_key", current_api_key)
 
+        # The LIVE agent is the ground truth for what we are switching FROM.
+        # config.yaml + the session override describe the route that was
+        # *requested*; a failover / model fallback can move the cached agent off
+        # both without touching either. Measured 2026-09-19: a Telegram session
+        # running claude-opus-5 on claude-apx-1 (visible in every API-call log
+        # line) got the note "switched from claude-fable-5-1 to claude-fable-5-1
+        # via Claude BPX-8" because the stale override still said fable-5-1 —
+        # while the in-place switch log, which reads the agent, correctly said
+        # "claude-opus-5 (claude-apx-1) -> claude-fable-5-1 (claude-bpx-8)".
+        # Reading the agent here fixes the note, the picker's captured
+        # "current", the announce fallback and the bare-model resolution
+        # provider in one place. Best-effort: a cache hiccup must not break
+        # the switch.
+        try:
+            _live_lock = getattr(self, "_agent_cache_lock", None)
+            _live_cache = getattr(self, "_agent_cache", None)
+            _live_entry = None
+            if _live_lock and _live_cache is not None:
+                with _live_lock:
+                    _live_entry = _live_cache.get(session_key)
+            _live_agent = _live_entry[0] if _live_entry else None
+            if _live_agent is not None:
+                current_model = getattr(_live_agent, "model", None) or current_model
+                current_provider = getattr(_live_agent, "provider", None) or current_provider
+        except Exception:
+            logger.debug("live-agent route read skipped (non-fatal)", exc_info=True)
+
         # Explicit preference clear is authoritative. It clears both the
         # identity field and the legacy sanitized mirror so a later /new or
         # restart cannot resurrect the prior pin.
@@ -2545,9 +2572,15 @@ class GatewaySlashCommandsMixin:
                         _display_new = format_model_for_display(result.new_model)
                         if not hasattr(_self, "_pending_model_notes"):
                             _self._pending_model_notes = {}
+                        # Route (provider) is named explicitly: a sub-to-sub move
+                        # keeps the model slug, so "fable-5-1 to fable-5-1" alone
+                        # reads as a no-op when the provider actually changed.
+                        # `_cur_provider` is the LIVE agent's provider (read at the
+                        # top of the handler), not the config/override value.
                         _self._pending_model_notes[_session_key] = (
                             f"[Note: model was just switched from {_display_cur} to {_display_new} "
-                            f"via {result.provider_label or result.target_provider}. "
+                            f"via {result.provider_label or result.target_provider} "
+                            f"(route {_cur_provider} -> {result.target_provider}). "
                             f"Adjust your self-identification accordingly.]"
                         )
                         _self._set_session_model_override(_session_key, {
@@ -2948,9 +2981,14 @@ class GatewaySlashCommandsMixin:
             from hermes_cli.model_switch import format_model_for_display
             if not hasattr(self, "_pending_model_notes"):
                 self._pending_model_notes = {}
+            # `current_model`/`current_provider` are the LIVE agent's route (read
+            # near the top of the handler), so the note names what the session
+            # was actually running, and the provider is spelled out because a
+            # sub-to-sub move keeps the model slug.
             self._pending_model_notes[session_key] = (
                 f"[Note: model was just switched from {format_model_for_display(current_model)} to {format_model_for_display(result.new_model)} "
-                f"via {result.provider_label or result.target_provider}. "
+                f"via {result.provider_label or result.target_provider} "
+                f"(route {current_provider} -> {result.target_provider}). "
                 f"{'This override applies to the next turn only. ' if one_turn else ''}"
                 f"Adjust your self-identification accordingly.]"
             )
