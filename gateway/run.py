@@ -4842,6 +4842,8 @@ async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None
 # secondary-profile reconnects share this policy — tune in one place).
 _RECONNECT_BACKOFF_CAP = 300
 _DISCORD_RECONNECT_BACKOFF_CAP = 120
+# Max concurrent Discord get_chat_info lookups during boot session-key migration.
+_DISCORD_MIGRATION_LOOKUP_CONCURRENCY = 8
 
 # Seconds a platform may sit continuously in the reconnect queue before the
 # watcher flags it NEEDS_ATTENTION in runtime status. Retrying never stops
@@ -8905,21 +8907,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if adapter is None:
             return
         entries = await asyncio.to_thread(self.session_store.snapshot_entries)
-        chat_types = {}
+        # Dedupe BEFORE issuing lookups, then resolve concurrently under a
+        # bounded semaphore. This runs before
+        # _restore_resume_pending_sessions_at_startup, so serial lookups
+        # directly delay boot resume: measured across 7 boots with 311 distinct
+        # Discord chat_ids (35 of them 404 'Unknown Channel' every boot), the
+        # first boot-resume decision landed 68-75s after "Starting Hermes
+        # Gateway" and the startup-restore 30s watchdog fired every time.
+        chat_ids = []
+        seen = set()
         for entry in entries:
             source = entry.origin
             parts = entry.session_key.split(":")
             if len(parts) < 5 or parts[2] != "discord":
                 continue
             chat_id = source.chat_id if source is not None else parts[4]
-            if chat_id in chat_types:
+            if chat_id in seen:
                 continue
-            try:
-                info = await asyncio.wait_for(adapter.get_chat_info(chat_id), 10)
-                if not info.get("error"):
-                    chat_types[chat_id] = info.get("type")
-            except Exception:
-                logger.warning("Discord session migration lookup failed", exc_info=True)
+            seen.add(chat_id)
+            chat_ids.append(chat_id)
+
+        chat_types = {}
+        semaphore = asyncio.Semaphore(_DISCORD_MIGRATION_LOOKUP_CONCURRENCY)
+
+        async def _resolve(chat_id: str) -> None:
+            async with semaphore:
+                try:
+                    info = await asyncio.wait_for(adapter.get_chat_info(chat_id), 10)
+                    if not info.get("error"):
+                        chat_types[chat_id] = info.get("type")
+                except Exception:
+                    logger.warning(
+                        "Discord session migration lookup failed", exc_info=True
+                    )
+
+        if chat_ids:
+            await asyncio.gather(*(_resolve(chat_id) for chat_id in chat_ids))
         await asyncio.to_thread(self.session_store.migrate_discord_session_keys, chat_types)
 
     def _canonicalize_session_source(self, source: SessionSource) -> None:
