@@ -19,6 +19,7 @@ and a real warning for a genuinely-missing one.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import textwrap
@@ -34,8 +35,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 @pytest.fixture(autouse=True)
 def _reset_dotenv_flag(monkeypatch):
-    """Each test owns the process-global "have we loaded .env yet" flag."""
-    monkeypatch.setattr(env_loader, "_DOTENV_LOADED", False, raising=False)
+    """Each test owns the process-global "which homes have we loaded" set."""
+    # raising=True on purpose: a rename must fail loudly rather than silently
+    # stop isolating the global.
+    monkeypatch.setattr(env_loader, "_DOTENV_LOADED_HOMES", set(), raising=True)
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +62,7 @@ def test_dotenv_pending_false_when_no_env_file(monkeypatch, tmp_path):
 def test_dotenv_pending_false_once_loaded(monkeypatch, tmp_path):
     (tmp_path / ".env").write_text("FOO=bar\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setattr(env_loader, "_DOTENV_LOADED", True, raising=False)
+    env_loader._mark_dotenv_loaded(tmp_path)
     assert env_loader.dotenv_pending() is False
 
 
@@ -72,6 +75,102 @@ def test_load_hermes_dotenv_sets_the_loaded_flag(monkeypatch, tmp_path):
     )
     assert env_loader.dotenv_loaded() is True
     assert env_loader.dotenv_pending() is False
+
+
+# ---------------------------------------------------------------------------
+# The predicate and the loader must agree on WHICH home
+# (@kyssta-exe, review of #117476)
+# ---------------------------------------------------------------------------
+
+
+def test_predicate_and_loader_resolve_the_same_home(monkeypatch, tmp_path):
+    """Both sides must route through the one shared resolver.
+
+    ``dotenv_pending()`` originally spelled the home resolution out for
+    itself. Two independent spellings of "which .env do we mean" drift, and
+    when they do the predicate reports on a different file than the loader
+    reads — the gate then misfires or goes silent for the wrong home. This
+    pins that they share ``_resolve_dotenv_home``.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    assert env_loader._resolve_dotenv_home() == tmp_path
+    # An explicit argument wins, exactly as load_hermes_dotenv() treats it.
+    other = tmp_path / "explicit"
+    assert env_loader._resolve_dotenv_home(other) == other
+
+
+def test_loading_one_home_does_not_silence_another(monkeypatch, tmp_path):
+    """``load_hermes_dotenv(hermes_home=...)`` takes an explicit home.
+
+    Loading home B must not make the predicate report "already loaded" for
+    home A, whose ``.env`` this process has never read — that would suppress
+    the warning for A while A's vars are genuinely absent from ``os.environ``.
+    Multiplex gateways and ``hermes -p <profile>`` both take that path.
+    """
+    home_a = tmp_path / "a"
+    home_a.mkdir()
+    (home_a / ".env").write_text("A_ONLY=1\n", encoding="utf-8")
+    home_b = tmp_path / "b"
+    home_b.mkdir()
+    (home_b / ".env").write_text("B_ONLY=1\n", encoding="utf-8")
+
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    monkeypatch.delenv("A_ONLY", raising=False)
+    assert env_loader.dotenv_pending() is True
+
+    env_loader.load_hermes_dotenv(
+        hermes_home=home_b, load_external_secrets=False
+    )
+
+    # B is loaded; A is still unread, so A is still pending.
+    assert env_loader.dotenv_loaded() is True
+    assert env_loader.dotenv_pending() is True
+    assert os.environ.get("A_ONLY") is None
+
+    # Now load A for real — the predicate closes.
+    env_loader.load_hermes_dotenv(
+        hermes_home=home_a, load_external_secrets=False
+    )
+    assert env_loader.dotenv_pending() is False
+
+
+def test_unresolved_ref_still_warns_after_a_DIFFERENT_home_loaded(
+    monkeypatch, tmp_path, caplog
+):
+    """The end-to-end consequence of the cross-home bug.
+
+    A single process-global "loaded" bool let home B's load silence the
+    warning for home A — whose ``.env`` was never read — so a genuinely
+    missing var under A went unreported. Only B is loaded here on purpose:
+    loading A too would set the old bool for the right reason and the test
+    would pass against the bug.
+    """
+    home_a = tmp_path / "a"
+    home_a.mkdir()
+    (home_a / ".env").write_text("A_ONLY=1\n", encoding="utf-8")
+    home_b = tmp_path / "b"
+    home_b.mkdir()
+    (home_b / ".env").write_text("B_ONLY=1\n", encoding="utf-8")
+
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    env_loader.load_hermes_dotenv(
+        hermes_home=home_b, load_external_secrets=False
+    )
+    monkeypatch.delenv("TRULY_MISSING_UNDER_A", raising=False)
+
+    with caplog.at_level("WARNING"):
+        _expand_env_vars("${env:TRULY_MISSING_UNDER_A}")
+
+    # A's .env is still unread, so A is still pending -> correctly silent.
+    assert "TRULY_MISSING_UNDER_A is not set" not in caplog.text
+
+    # Once A is genuinely loaded, the missing var IS reported.
+    env_loader.load_hermes_dotenv(
+        hermes_home=home_a, load_external_secrets=False
+    )
+    with caplog.at_level("WARNING"):
+        _expand_env_vars("${env:TRULY_MISSING_UNDER_A}")
+    assert "TRULY_MISSING_UNDER_A is not set" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +199,7 @@ def test_unresolved_ref_still_warns_once_dotenv_is_loaded(
     """The real signal survives: after .env load, a missing var warns."""
     (tmp_path / ".env").write_text("SOMETHING_ELSE=x\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setattr(env_loader, "_DOTENV_LOADED", True, raising=False)
+    env_loader._mark_dotenv_loaded(tmp_path)
     monkeypatch.delenv("TRULY_MISSING_REF", raising=False)
 
     with caplog.at_level("WARNING"):
