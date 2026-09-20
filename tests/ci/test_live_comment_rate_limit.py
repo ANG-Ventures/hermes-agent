@@ -1785,6 +1785,76 @@ def test_final_snapshot_keeps_prev_statuses_when_listing_fails(monkeypatch):
     )
 
 
+def test_queue_pause_snapshot_records_what_it_published(monkeypatch):
+    """SEAM: `_publish_final_snapshot` must RECORD `prev_artifact_statuses`.
+
+    The snapshot is not only a shutdown path — a poller that starts while
+    the PR is already merge-queued calls it mid-run to create the comment,
+    and polling then RESUMES after the dequeue. If it fetches statuses but
+    does not record them, the next cycle's transient listing failure falls
+    back to the stale `prev_artifact_statuses` (`[]`) and republishes the
+    comment with every review section deleted — the exact F1 defect one
+    seam over.
+
+    The F1 test above proves the snapshot READS `prev_artifact_statuses`;
+    nothing proved it WRITES it. Measured: deleting
+    `prev_artifact_statuses = statuses` from the snapshot left the whole
+    file green (71 passed) while the poller published a body with the
+    section gone.
+    """
+    queue_checks = {"n": 0}
+    listings = {"n": 0}
+
+    def queued(token, repo, pr):
+        queue_checks["n"] += 1
+        return queue_checks["n"] == 1      # queued on cycle 1, released after
+
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", queued)
+    monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: (
+        [{"name": "Python tests", "status": "in_progress", "html_url": "u"}],
+        False))
+
+    good = [{"source": "FleetReview", "results": [{"name": "r", "status": "ok"}]}]
+
+    def statuses(token, repo, run_id, deadline=None):
+        listings["n"] += 1
+        # The queue-pause snapshot fetches successfully; every later cycle
+        # hits a transient listing failure.
+        return good if listings["n"] <= 1 else None
+
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", statuses)
+
+    bodies: list[str] = []
+
+    def spy_body(asm, completed, pending, run_url, job_urls,
+                 review_statuses_json, commit_info="", waiting=False):
+        bodies.append(review_statuses_json)
+        return f"body:{review_statuses_json}:{pending}"
+
+    monkeypatch.setattr(_mod, "build_comment_body", spy_body)
+    monkeypatch.setattr(_mod, "upsert_comment",
+                        lambda t, r, p, body, comment_id=None: 1)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_mod.time, "sleep",
+                        lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
+
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5", run_url="u",
+             interval=45, timeout=100000, dry_run=False, max_wall_seconds=1200)
+
+    assert queue_checks["n"] >= 2, "the PR was never rechecked after the pause"
+    assert listings["n"] >= 2, "no cycle ran after the queue-pause snapshot"
+    assert bodies, "nothing was ever rendered"
+    assert "FleetReview" in bodies[0], (
+        "the queue-pause snapshot never carried the section")
+    assert "FleetReview" in bodies[-1], (
+        "the queue-pause snapshot did not record what it published, so a "
+        "later transient listing failure republished the comment with the "
+        "review section deleted"
+    )
+
+
 def test_newest_empty_artifact_does_not_resurrect_an_older_failure(
         monkeypatch, tmp_path):
     """F5: an older attempt's failure must not survive a green rerun.
