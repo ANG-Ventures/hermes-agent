@@ -505,5 +505,23 @@
     "upstream_ref": null,
     "absorbed_date": null,
     "surfaces": ["gateway", "discord", "telegram", "cli"]
+  },
+  {
+    "feature": "Claude Code CLI subscription usage caps classify as a quota, not a transport fault",
+    "tests": [
+      "tests/agent/test_claude_cli_usage_cap_classification.py"
+    ],
+    "paths": [
+      "agent/error_classifier.py",
+      "agent/agent_runtime_helpers.py",
+      "agent/chat_completion_helpers.py",
+      "agent/conversation_loop.py",
+      "tests/agent/test_claude_cli_usage_cap_classification.py"
+    ],
+    "why": "Reported live 2026-09-19: a spent 5h Fable bucket on claude-bpx-12 announced 'Model fallback (connection issue)'. Any relay driving the genuine claude binary (claude-bpx-N, claude-cpx, claude-cpr) surfaces a cap as the CLI's own sentence \"You've hit your session limit - resets 2:20pm (UTC)\"; when the SDK THROWS that instead of yielding a result frame, the relay wraps it in a 5xx, so status-code classification returned server_error and the announce fell to the generic 'connection issue' floor. Three coupled behaviours: (1) classify_api_error matches the cap sentence BEFORE status-code classification (same position as account_blocked, for the same two-surface reason) and returns rate_limit; (2) extract_api_error_context derives the quota WINDOW and reset from the sentence, because these relays send no anthropic-ratelimit-unified-* headers - a named-UTC clock resolves to an epoch, an unzoned one is deliberately NOT guessed and falls back to literal text; (3) the announce rider reads '<model> usage exhausted' rather than 'rate limit', which describes a request-rate throttle. Scoped on purpose: only a BOUND quota window earns the exhaustion wording. A parity merge resolving error_classifier.py toward upstream silently restores the original symptom with no import error and no red test outside the canary file. RED-PROVEN 5/5 against merge-shaped mutations (2026-09-19): (a) agent/error_classifier.py ~L1262 disable the `if _CLAUDE_CLI_USAGE_CAP_RE.search(error_msg):` branch -> 4 fail; (b) ~L398 narrow _CLAUDE_CLI_USAGE_CAP_RE to a bare 'hit your usage limit' substring -> 4 fail; (c) agent/agent_runtime_helpers.py ~L5194 disable the sentence-derived `if \"quota_window\" not in context:` block -> 2 fail; (d) agent/chat_completion_helpers.py ~L2960 revert `_reason_label = f\"{_who} usage exhausted\"` to the flat label -> 1 fail; (e) ~L2750 drop the `quota_window_reset_text` fallback -> 1 fail. Relay-side half: Kyzcreig/claude-bpx#174.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": ["gateway", "discord", "telegram", "cli", "cron"]
   }
 ]
