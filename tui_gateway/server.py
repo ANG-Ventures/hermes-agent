@@ -10170,6 +10170,16 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         has_reasoning = role == "assistant" and any(
             m.get(key) for key in reasoning_keys
         )
+        if m.get("display_kind") == "confab_notice" and role == "system":
+            from agent.confab_notice import confab_notice_status
+            _notice_meta = m.get("display_metadata") or {}
+            if isinstance(_notice_meta, str):
+                try:
+                    _notice_meta = json.loads(_notice_meta)
+                except (ValueError, TypeError):
+                    _notice_meta = {}
+            _notice = _notice_meta.get("confab_notice", {}) if isinstance(_notice_meta, dict) else {}
+            content_text = confab_notice_status(_notice.get("kind") if isinstance(_notice, dict) else None)
         if not content_text.strip() and not has_reasoning:
             continue
         msg = {"role": role, "text": content_text}

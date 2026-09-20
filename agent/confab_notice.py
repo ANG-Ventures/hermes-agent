@@ -49,9 +49,8 @@ CONFAB_NOTICE_VERSION = 1
 #: Original scaffold kind; retained for callers that distinguish status-only notices.
 CONFAB_NOTICE_KIND = "scaffold_confab_removed"
 
-# Tool guards may be the entire visible turn. Unlike the scaffold status,
-# these local instructions become assistant content and may be replayed so
-# the model can recover. Never interpolate provider-supplied labels here.
+# Ephemeral retry instructions only: never persisted as assistant prose.
+# Never interpolate provider-supplied labels here.
 TOOL_CALL_NOTICE_TEXT = {
     "tool_call_unparseable": (
         "Tool call not executed: the tool-call JSON could not be parsed. "
@@ -73,6 +72,18 @@ CONFAB_NOTICE_TEXT = (
     "⚠️ Confabulation caught: the provider detected and removed "
     "self-fabricated scaffold text from this reply."
 )
+
+
+def confab_notice_status(kind: str) -> str:
+    """Fixed user-facing label, separate from the model retry instruction."""
+    if not isinstance(kind, str):
+        return "⚠️ Provider notice."
+    return {
+        CONFAB_NOTICE_KIND: CONFAB_NOTICE_TEXT,
+        "tool_call_unparseable": "⚠️ Tool call not executed: tool-call JSON could not be parsed.",
+        "tool_call_as_text": "⚠️ Tool call not executed: text was sent instead of a native tool call.",
+    }.get(kind, "⚠️ Provider notice.")
+
 
 # Defensive bound — ``request_id`` and ``grammar`` are short opaque labels.
 _MAX_LABEL_LEN = 256

@@ -56,9 +56,12 @@ class _NoticeHandler(BaseHTTPRequestHandler):
         # The model context-length probe also POSTs here; only a real
         # chat-completions payload may consume a queued scripted response.
         if "messages" in req and type(self).response_queue:
-            text, notice = type(self).response_queue.pop(0)
+            scripted = type(self).response_queue.pop(0)
+            text, notice = scripted[:2]
+            finish = scripted[2] if len(scripted) > 2 else "stop"
         else:
             text, notice = "DONE", None
+            finish = "stop"
 
         if is_stream:
             self.send_response(200)
@@ -67,7 +70,7 @@ class _NoticeHandler(BaseHTTPRequestHandler):
             chunks = [
                 {"id": "m", "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]},
                 {"id": "m", "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]},
-                {"id": "m", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+                {"id": "m", "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]},
             ]
             # Per the contract the extension rides the FINAL usage chunk
             # (choices: []), never a content delta.
@@ -90,7 +93,7 @@ class _NoticeHandler(BaseHTTPRequestHandler):
                     {
                         "index": 0,
                         "message": {"role": "assistant", "content": text},
-                        "finish_reason": "stop",
+                        "finish_reason": finish,
                     }
                 ],
                 "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
@@ -200,34 +203,36 @@ class TestConfabNoticeEndToEnd:
 
     @pytest.mark.parametrize("kind", ["tool_call_unparseable", "tool_call_as_text"])
     @pytest.mark.parametrize("prose", ["", "Work is incomplete."])
-    def test_tool_notice_renders_before_empty_retry_and_replays_without_metadata(
+    def test_tool_notice_recovers_ephemerally_before_empty_retry(
         self, notice_env, stream, kind, prose,
     ):
         make_agent, handler, db, sid, statuses = notice_env
         notice = {**VALID_NOTICE, "kind": kind, "grammar": "opaque-reason-label"}
-        handler.response_queue.append((prose, notice))
+        handler.response_queue.extend([(prose, notice), ("Recovered model answer.", None)])
         agent = make_agent(stream=stream)
         result = agent.run_conversation("hello", conversation_history=[], task_id="t1")
 
         # Real conversation_loop empty-response handling must never retry/fallback.
-        assert len(_chat_requests(handler)) == 1
+        assert len(_chat_requests(handler)) == 2
         assert not getattr(agent, "_empty_content_retries", 0)
+        correction = _chat_requests(handler)[1]["messages"][-1]["content"]
+        assert "re-issue" in correction.lower()
+        assert ("JSON" in correction) == (kind == "tool_call_unparseable")
+        assert ("native" in correction.lower()) == (kind == "tool_call_as_text")
         row = [r for r in db.get_messages(sid) if r["role"] == "assistant"][-1]
         text = row["content"]
-        assert text.strip()
-        if prose:
-            assert text.startswith(prose + "\n\n")
-        assert "re-issue" in text.lower()
-        assert ("JSON" in text) == (kind == "tool_call_unparseable")
-        assert ("native" in text.lower()) == (kind == "tool_call_as_text")
+        assert text == "Recovered model answer."
+        assert all(correction not in (r["content"] or "") for r in db.get_messages(sid))
         assert notice["grammar"] not in text
         assert result["final_response"] == text
-        assert row["display_kind"] == CONFAB_NOTICE_DISPLAY_KIND
-        meta = row["display_metadata"]
+        notices = [r for r in db.get_messages(sid) if r["display_kind"] == CONFAB_NOTICE_DISPLAY_KIND]
+        assert len(notices) == 1
+        meta = notices[0]["display_metadata"]
         if isinstance(meta, str):
             meta = json.loads(meta)
         assert meta[CONFAB_NOTICE_KEY] == notice
         assert not _confab_statuses(statuses)  # Not a scaffold catch.
+        assert any("Tool call not executed" in s for s in _lifecycle_texts(statuses))
 
         history = db.get_messages_as_conversation(sid)
         handler.captured_requests = []
@@ -239,7 +244,40 @@ class TestConfabNoticeEndToEnd:
         assert "display_kind" not in blob
         assert "display_metadata" not in blob
         assert notice["grammar"] not in blob
+        assert correction not in blob
         assert any(m.get("content") == text for m in requests[0]["messages"])
+
+    @pytest.mark.parametrize("kind", ["tool_call_unparseable", "tool_call_as_text"])
+    def test_tool_notice_retry_budget_is_bounded(self, notice_env, stream, kind):
+        make_agent, handler, db, sid, statuses = notice_env
+        handler.response_queue.extend([
+            ("", {**VALID_NOTICE, "kind": kind, "request_id": f"attempt-{i}"})
+            for i in range(6)
+        ])
+        agent = make_agent(stream=stream)
+        result = agent.run_conversation("hello", conversation_history=[], task_id="t1")
+        assert len(_chat_requests(handler)) == 4
+        assert result["failed"] is True
+        assert not getattr(agent, "_empty_content_retries", 0)
+        assert not [r for r in db.get_messages(sid) if r["role"] == "assistant"]
+        assert len([r for r in db.get_messages(sid) if r["display_kind"] == CONFAB_NOTICE_DISPLAY_KIND]) == 4
+        assert not any(m.get("_dropped_toolcall_nudge") for m in result["messages"])
+
+    def test_notices_share_budget_with_dropped_calls(self, notice_env, stream):
+        make_agent, handler, db, sid, statuses = notice_env
+        handler.response_queue.extend([
+            ("Trying.", None, "tool_calls"),
+            ("", {**VALID_NOTICE, "kind": "tool_call_unparseable"}),
+            ("Trying again.", None, "tool_calls"),
+            ("", {**VALID_NOTICE, "kind": "tool_call_as_text", "request_id": "last"}),
+        ])
+        agent = make_agent(stream=stream)
+        result = agent.run_conversation("hello", conversation_history=[], task_id="t1")
+        assert len(_chat_requests(handler)) == 4
+        assert result["failed"] is True
+        assert not getattr(agent, "_empty_content_retries", 0)
+        assert not any(m.get("_dropped_toolcall_nudge") for m in result["messages"])
+        assert not [r for r in db.get_messages(sid) if r["role"] == "assistant"]
 
     def test_status_shown_once_and_row_persisted(self, notice_env, stream):
         make_agent, handler, db, sid, statuses = notice_env

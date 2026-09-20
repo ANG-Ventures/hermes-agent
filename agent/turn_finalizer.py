@@ -300,6 +300,16 @@ def finalize_turn(
     # killing the turn.
     _cleanup_errors = []
 
+    # Dropped-call recovery pairs can be interleaved with durable OOB events
+    # or successful tool rounds. Tail-only cleanup misses those pairs and
+    # replays the correction next turn. They are in-turn context only.
+    _flushed = getattr(agent, "_last_flushed_db_idx", 0)
+    if isinstance(_flushed, int):
+        agent._last_flushed_db_idx = sum(
+            not m.get("_dropped_toolcall_nudge") for m in messages[:_flushed]
+        )
+    messages[:] = [m for m in messages if not m.get("_dropped_toolcall_nudge")]
+
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
     try:

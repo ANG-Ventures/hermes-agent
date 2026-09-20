@@ -2482,7 +2482,7 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     # tell a confirmed self-confabulation catch from content that needs real
     # provenance work. Both keys are stripped from every outgoing provider
     # copy in conversation_loop's api_msg builder — they must never reach a
-    # model. Tool-call recovery content is synthesized separately by the loop;
+    # model. Tool-call recovery uses ephemeral scaffolding in the loop;
     # the raw notice is never appended. See agent/confab_notice.py.
     _confab_notice = getattr(assistant_message, "confab_notice", None)
     if _confab_notice:

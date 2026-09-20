@@ -799,10 +799,21 @@ class CLIAgentSetupMixin:
                 entries.append(("event", "resumed interrupted turn"))
                 continue
             if display_kind == "confab_notice":
+                import json
                 # Presentation-only tag on an assistant row that still has
                 # real content — surface the catch as an event line AND fall
                 # through so the reply itself is still recapped.
-                entries.append(("event", "confabulation caught — scaffold text removed"))
+                from agent.confab_notice import confab_notice_status
+                _notice_meta = msg.get("display_metadata") or {}
+                if isinstance(_notice_meta, str):
+                    try:
+                        _notice_meta = json.loads(_notice_meta)
+                    except (ValueError, TypeError):
+                        _notice_meta = {}
+                _notice = _notice_meta.get("confab_notice", {}) if isinstance(_notice_meta, dict) else {}
+                entries.append(("event", confab_notice_status(
+                    _notice.get("kind") if isinstance(_notice, dict) else None
+                )))
 
             if role == "system":
                 continue
