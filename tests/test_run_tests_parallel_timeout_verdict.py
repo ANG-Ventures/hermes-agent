@@ -281,6 +281,52 @@ def test_e2e_import_error_still_reported_as_no_tests_ran(tmp_path: Path) -> None
     assert "TIMED OUT" not in proc.stdout, proc.stdout
 
 
+def test_e2e_absent_summary_without_zero_collect_evidence_is_not_no_tests_ran(
+    tmp_path: Path,
+) -> None:
+    """Ask #2, at its CALL SITE — an absent summary alone is never a no-op.
+
+    Review round 1 found the predicate was unit-tested but its *call* was not:
+    deleting ``and _looks_like_no_collection(_o, s)`` from the classifier
+    survived the whole suite while restoring the false sentence verbatim. This
+    drives the runner end-to-end over a file that collects fine, runs a test,
+    then hard-exits (``os._exit``) — no counts line, no timeout, and no
+    zero-collection evidence anywhere in the output. The only thing standing
+    between it and "where no tests ran" is that predicate call.
+    """
+    probe = tmp_path / "test_hard_exits_midrun.py"
+    probe.write_text(
+        textwrap.dedent(
+            """
+            import os
+
+            def test_a():
+                assert True
+
+            def test_b_hard_exits():
+                os._exit(3)
+
+            def test_c():
+                assert True
+            """
+        ).lstrip()
+    )
+    proc = _run_runner("--file-timeout", "60", "--file-retries", "0", str(probe))
+    out = proc.stdout
+    assert proc.returncode != 0, out
+    # Non-vacuity: this case must actually be the one under test — collection
+    # SUCCEEDED, pytest printed no counts line, and nothing was killed.
+    assert "collected 3 items" in out, f"probe did not collect — test is vacuous:\n{out}"
+    assert "=== Summary:" in out and " passed" in out, out
+    assert "no tests ran" not in out.replace(
+        "where no tests ran", ""
+    ), f"output carries real zero-collect evidence — wrong fixture:\n{out}"
+    assert "TIMED OUT" not in out, out
+    # The contract: reported as undetermined, never asserted as a no-op.
+    assert "cause not determinable from output" in out, out
+    assert "where no tests ran" not in out, out
+
+
 def test_e2e_normal_passing_run_names_no_timeout(tmp_path: Path) -> None:
     """Sanity: an ordinary green run is untouched by any of this."""
     probe = tmp_path / "test_real.py"
