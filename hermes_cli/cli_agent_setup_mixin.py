@@ -798,6 +798,11 @@ class CLIAgentSetupMixin:
             if display_kind == "auto_continue":
                 entries.append(("event", "resumed interrupted turn"))
                 continue
+            if display_kind == "confab_notice":
+                # Presentation-only tag on an assistant row that still has
+                # real content — surface the catch as an event line AND fall
+                # through so the reply itself is still recapped.
+                entries.append(("event", "confabulation caught — scaffold text removed"))
 
             if role == "system":
                 continue

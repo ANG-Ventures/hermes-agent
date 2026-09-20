@@ -35,6 +35,12 @@ from agent.error_classifier import (
 )
 from agent.errors import EmptyStreamError, ProviderStreamParseError
 from agent.turn_context import substitute_api_content
+from agent.confab_notice import (
+    CONFAB_NOTICE_DISPLAY_KIND,
+    CONFAB_NOTICE_FIELD,
+    CONFAB_NOTICE_KEY,
+    extract_confab_notice,
+)
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint, _ceil_chars_to_tokens
 from agent.message_content import flatten_message_text
@@ -2470,6 +2476,21 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     codex_message_items = getattr(assistant_message, "codex_message_items", None)
     if codex_message_items:
         msg["codex_message_items"] = codex_message_items
+
+    # Out-of-band confab notice → presentation-only fields on the assistant
+    # row. This is the DURABLE triage record: an operator reading history can
+    # tell a confirmed self-confabulation catch from content that needs real
+    # provenance work. Both keys are stripped from every outgoing provider
+    # copy in conversation_loop's api_msg builder — they must never reach a
+    # model. Never appended to content. See agent/confab_notice.py.
+    _confab_notice = getattr(assistant_message, "confab_notice", None)
+    if _confab_notice:
+        msg["display_kind"] = CONFAB_NOTICE_DISPLAY_KIND
+        _display_metadata = msg.get("display_metadata")
+        if not isinstance(_display_metadata, dict):
+            _display_metadata = {}
+        _display_metadata[CONFAB_NOTICE_KEY] = _confab_notice
+        msg["display_metadata"] = _display_metadata
 
     if assistant_tool_calls:
         tool_calls = []
@@ -4999,6 +5020,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         role = "assistant"
         reasoning_parts: list = []
         usage_obj = None
+        # Out-of-band confab notice (see agent/confab_notice.py). Rides the
+        # final usage chunk; at most one is accepted per provider response.
+        confab_notice_acc: dict = {"value": None, "seen": 0}
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
         _writer_token = {"value": None}
@@ -5192,6 +5216,23 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             if not _stream_attempt_is_active(stream_attempt_id):
                 _discard_stale_stream_chunk(stream_attempt_id, chunk)
                 continue
+
+            # Out-of-band confab notice. The contract puts it on the final
+            # usage chunk (choices: []), but scan every chunk so a producer
+            # that attaches it slightly earlier is still consumed — at most
+            # ONE notice per response is accepted; a second is dropped and
+            # logged rather than overwriting the first.
+            _notice = extract_confab_notice(chunk)
+            if _notice is not None:
+                confab_notice_acc["seen"] += 1
+                if confab_notice_acc["value"] is None:
+                    confab_notice_acc["value"] = _notice
+                else:
+                    logger.debug(
+                        "Ignoring duplicate %s in stream (seen=%d)",
+                        CONFAB_NOTICE_FIELD,
+                        confab_notice_acc["seen"],
+                    )
 
             if not chunk.choices:
                 if hasattr(chunk, "model") and chunk.model:
@@ -5607,12 +5648,19 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             message=mock_message,
             finish_reason=effective_finish_reason,
         )
-        return SimpleNamespace(
+        _mock_response = SimpleNamespace(
             id="stream-" + str(uuid.uuid4()),
             model=model_name,
             choices=[mock_choice],
             usage=usage_obj,
         )
+        # Forward the validated out-of-band notice on the synthetic completion
+        # so the transport's normalize_response sees the same top-level shape
+        # the non-streaming path gets. Only set when one was accepted, so a
+        # clean turn's response object is byte-identical to before.
+        if confab_notice_acc["value"] is not None:
+            setattr(_mock_response, CONFAB_NOTICE_FIELD, confab_notice_acc["value"])
+        return _mock_response
 
     def _call_anthropic(request_client):
         """Stream an Anthropic Messages API response.
