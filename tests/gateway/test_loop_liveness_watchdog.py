@@ -24,6 +24,24 @@ def _immediate_loop() -> MagicMock:
     return loop
 
 
+@pytest.fixture(autouse=True)
+def _pin_host_as_unstarved():
+    """Force the WEDGED classification for every test in this file.
+
+    These tests predate host-starvation classification and all assert the
+    wedge path (dump + exit 75). Left unpinned they read the REAL load
+    average, so on a busy CI runner (measured: load1=69.69 on 24 cores) the
+    watchdog correctly takes the starvation HOLD path and they fail —
+    a genuine environment coupling, not a flake. Starvation behavior has its
+    own coverage in tests/gateway/test_liveness_starvation_hold.py.
+    """
+    with (
+        patch("gateway.shutdown_watchdog.os.getloadavg", return_value=(0.5, 0.5, 0.5)),
+        patch("gateway.shutdown_watchdog.os.cpu_count", return_value=8),
+    ):
+        yield
+
+
 def test_loop_liveness_watchdog_stop_during_dump_disarms_hard_exit():
     loop = MagicMock(spec=asyncio.AbstractEventLoop)
     handle_ready = threading.Event()
