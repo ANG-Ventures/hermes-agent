@@ -612,6 +612,7 @@ def _run_one_file_once(
         cmd.append(f"--basetemp={private_basetemp}")
 
     subproc_start = time.monotonic()
+    timed_out = False
     # launch the pytest process
     try:
         proc = subprocess.Popen(
@@ -648,6 +649,7 @@ def _run_one_file_once(
         output, _ = proc.communicate(timeout=file_timeout)
         rc = proc.returncode
     except subprocess.TimeoutExpired:
+        timed_out = True
         _kill_tree(proc, pgid=pgid)
         try:
             output, _ = proc.communicate(timeout=10)
@@ -677,6 +679,15 @@ def _run_one_file_once(
             shutil.rmtree(private_basetemp, ignore_errors=True)
 
     summary = _parse_pytest_summary(output)
+    if timed_out:
+        # The per-file wall ceiling fired and we SIGKILL'd pytest. A killed
+        # pytest never prints its `=== N passed ... ===` summary, so the
+        # parsed counts are empty — which used to be indistinguishable from
+        # "collected nothing" and got reported as a no-op. Record the real
+        # event instead: how far the run got before it was killed.
+        summary.update(_parse_timeout_progress(output))
+        summary["timed_out"] = 1
+        summary["timeout_secs"] = int(file_timeout)
     if rc == 5:
         # No tests collected — every test in the file was filtered out.
         # Treat as a pass (a correctly marker-filtered file SHOULD be a
@@ -719,6 +730,96 @@ def _run_one_file_once(
                 pass
     subproc_wall = time.monotonic() - subproc_start
     return file, rc, output, summary, subproc_wall
+
+
+def _looks_like_no_collection(output: str, summary: dict) -> bool:
+    """True only with POSITIVE evidence that the file collected no tests.
+
+    An absent counts line is NOT such evidence (a pytest killed mid-run also
+    has none — that was the misdiagnosis this predicate exists to stop).
+    Accepts: pytest's own zero-collect phrasing, the exit-5 no-op tags this
+    runner sets, or a collection/import error.
+    """
+    if summary.get("noop_exit5") or summary.get("noop_skip") or summary.get("noop_testless"):
+        return True
+    low = output.lower()
+    return (
+        "no tests ran" in low
+        or "collected 0 items" in low
+        or "error collecting" in low
+        or "errors during collection" in low
+        or "importerror" in low
+        or "modulenotfounderror" in low
+        or "no tests collected" in low
+    )
+
+
+def _format_timeout_verdict(output: str, summary: dict) -> str:
+    """Human verdict for a file killed at the per-file wall ceiling.
+
+    e.g. ``TIMED OUT after 402s at ~39% (81 collected), last test reached:
+    tests/x.py::test_foo``. Each clause is emitted only when the evidence for
+    it is actually present in the captured output — no invented numbers.
+    """
+    parts = [f"TIMED OUT after {summary.get('timeout_secs', 0)}s"]
+    pct = summary.get("progress_pct")
+    if pct is not None:
+        parts.append(f"at ~{pct}%")
+    collected = summary.get("collected")
+    if collected is not None:
+        parts.append(f"({collected} collected)")
+    verdict = " ".join(parts)
+    last = _last_test_reached(output)
+    if last:
+        verdict += f", last test reached: {last}"
+    return verdict
+
+
+def _parse_timeout_progress(output: str) -> dict[str, int]:
+    """Extract how far a KILLED pytest got, from its partial output.
+
+    A pytest killed at the per-file wall ceiling never prints its counts
+    line, so ``_parse_pytest_summary`` returns ``{}`` — indistinguishable
+    from "collected nothing" unless we read the progress it DID print.
+
+    Returns (only keys that were found):
+      ``collected``  — N from ``collected N items`` / ``collected N item``
+                       (also ``N items / M deselected`` and ``collecting N``)
+      ``progress_pct`` — the last ``[ NN%]`` progress marker pytest printed.
+
+    Both are evidence that collection SUCCEEDED and tests were running, which
+    is what routes the file to the "timed out mid-run" verdict instead of the
+    no-op gate.
+    """
+    result: dict[str, int] = {}
+    m_collected = None
+    for m in re.finditer(r"collected\s+(\d+)\s+items?", output):
+        m_collected = m
+    if m_collected is not None:
+        result["collected"] = int(m_collected.group(1))
+    # Last progress marker pytest emitted, e.g. "........ [ 39%]".
+    last_pct = None
+    for m in re.finditer(r"\[\s*(\d{1,3})%\]", output):
+        last_pct = m
+    if last_pct is not None:
+        result["progress_pct"] = int(last_pct.group(1))
+    return result
+
+
+def _last_test_reached(output: str) -> str | None:
+    """Best-effort name of the last test pytest STARTED before being killed.
+
+    Only available when the run was verbose (``-v``): pytest then prints the
+    ``path::test_name`` line when it STARTS a test, before its status. So the
+    final such line names the test that was in flight when the kill landed —
+    i.e. the hang itself. (Verified live: a deliberate 300 s sleep in
+    ``test_c_hangs`` produced exactly that name.) Returns None on non-verbose
+    output rather than guessing.
+    """
+    last: str | None = None
+    for m in re.finditer(r"^(\S+::\S+)\s", output, re.MULTILINE):
+        last = m.group(1)
+    return last
 
 
 def _parse_pytest_summary(output: str) -> dict[str, int]:
@@ -820,6 +921,17 @@ def _print_progress(
     else:
         n_tests = test_counts.get(file, 0)
         test_str = f"{n_tests} tests, " if n_tests else ""
+    if file_summary and file_summary.get("timed_out"):
+        # A killed pytest parses to no counts, so the line would otherwise
+        # read like an ordinary slow file. Name the kill.
+        _c = file_summary.get("collected")
+        _p = file_summary.get("progress_pct")
+        test_str = "TIMED OUT"
+        if _p is not None:
+            test_str += f" at ~{_p}%"
+        if _c is not None:
+            test_str += f", {_c} collected"
+        test_str += ", "
     # Show subprocess time when available; fall back to queue-inclusive dur.
     if subproc_wall is not None:
         time_str = f"{subproc_wall:.1f}s"
@@ -1530,7 +1642,15 @@ def main() -> int:
     print()
     pct = min(100, (tests_done / approx_total_tests * 100)) if approx_total_tests else 0
     skipped_note = f", {tests_skipped} skipped" if tests_skipped else ""
-    print(f"=== Summary: {len(files)} files, {tests_passed} tests passed, {tests_failed} failed{skipped_note} ({pct:.0f}% complete) in {elapsed:.1f}s ({args.jobs} workers) ===")
+    # A file killed at the per-file wall ceiling contributes 0 passed / 0
+    # failed (a SIGKILL'd pytest prints no counts line), so a run whose ONLY
+    # problem is a hang used to read "0 failed" on a red job. Name it here.
+    n_timed_out = sum(1 for _f, s in all_summaries if s.get("timed_out"))
+    timeout_note = (
+        f", {n_timed_out} timed-out file{'s' if n_timed_out != 1 else ''}"
+        if n_timed_out else ""
+    )
+    print(f"=== Summary: {len(files)} files, {tests_passed} tests passed, {tests_failed} failed{skipped_note}{timeout_note} ({pct:.0f}% complete) in {elapsed:.1f}s ({args.jobs} workers) ===")
 
     # Host-OS gating note: tests marked for another OS were skipped by the
     # conftest hook, not run. Say so explicitly — a green local run on Linux
@@ -1554,7 +1674,17 @@ def main() -> int:
     # complete"), which has been misread as a successful verification, so say
     # it plainly AND fail the exit code.
     no_tests_ran_at_all = bool(files) and tests_collected == 0
-    if no_tests_ran_at_all:
+    if no_tests_ran_at_all and n_timed_out:
+        # A file killed at the per-file ceiling contributes no counts, so
+        # "0 collected" is an artifact of the kill, not a measurement. Say
+        # that instead of claiming the invocation collected nothing.
+        print()
+        print(
+            f"=== ✗ NO TEST COUNTS — {n_timed_out} file(s) were KILLED at the "
+            "per-file timeout before printing a summary. Collection counts are "
+            "UNKNOWN, not zero. See the TIMED OUT verdict below. ==="
+        )
+    elif no_tests_ran_at_all:
         print()
         print(
             "=== ✗ NO TESTS RAN — 0 collected across "
@@ -1623,8 +1753,28 @@ def main() -> int:
         test_fail_files = [(f, s) for f, _o, s in failures if s.get("failed", 0) > 0]
         all_passed_but_nonzero = [(f, s) for f, _o, s in failures
                                   if s.get("failed", 0) == 0 and s.get("passed", 0) > 0]
+        # A file KILLED at the per-file wall ceiling prints no counts line, so
+        # its parsed summary is empty — which used to fall through to
+        # `no_tests_ran` and get reported as "collected 0 tests (no-op)". That
+        # diagnosis is false whenever collection succeeded (the captured output
+        # carries `collected N items` and/or a progress marker) and it hides the
+        # real event: a hang. Classify these first and never let them reach the
+        # no-op bucket.
+        timed_out_files = [(f, o, s) for f, o, s in failures if s.get("timed_out")]
+        _timed_out_paths = {f for f, _o, _s in timed_out_files}
         no_tests_ran = [(f, s) for f, _o, s in failures
-                        if s.get("failed", 0) == 0 and s.get("passed", 0) == 0]
+                        if f not in _timed_out_paths
+                        and s.get("failed", 0) == 0 and s.get("passed", 0) == 0
+                        # Ask #2: an ABSENT summary is not evidence of no
+                        # collection. Require a positive signal that nothing
+                        # was collected — pytest's own "no tests ran" /
+                        # "collected 0 items", the exit-5 no-op tag, or a
+                        # collection/import error.
+                        and _looks_like_no_collection(_o, s)]
+        if timed_out_files:
+            print(f"=== {len(timed_out_files)} file{'s' if len(timed_out_files) != 1 else ''} TIMED OUT (killed at the per-file wall ceiling — a hang, NOT a no-op) ===")
+            for file, output, s in timed_out_files:
+                print(f"  {_format_file(file, repo_root)}  {_format_timeout_verdict(output, s)}")
         if test_fail_files:
             total_tf = sum(s.get("failed", 0) for _, s in test_fail_files)
             print(f"=== {len(test_fail_files)} file{'s' if len(test_fail_files) != 1 else ''} with test failures ({total_tf} test{'s' if total_tf != 1 else ''} failed) ===")
@@ -1638,6 +1788,21 @@ def main() -> int:
         if no_tests_ran:
             print(f"=== {len(no_tests_ran)} file{'s' if len(no_tests_ran) != 1 else ''} where no tests ran (collection/import error, timeout before collection, etc.) ===")
             for file, s in no_tests_ran:
+                print(f"  {_format_file(file, repo_root)}")
+        # Residual: a non-zero exit with no counts line and no positive
+        # evidence of zero-collection. Previously these were swept into
+        # `no_tests_ran` and mislabelled; report them honestly as unknown
+        # rather than asserting a cause we cannot see.
+        _classified = (
+            {f for f, _s in test_fail_files}
+            | {f for f, _s in all_passed_but_nonzero}
+            | _timed_out_paths
+            | {f for f, _s in no_tests_ran}
+        )
+        unclassified = [f for f, _o, _s in failures if f not in _classified]
+        if unclassified:
+            print(f"=== {len(unclassified)} file{'s' if len(unclassified) != 1 else ''} exited non-zero with no pytest summary (cause not determinable from output — read the captured output above) ===")
+            for file in unclassified:
                 print(f"  {_format_file(file, repo_root)}")
         had_failures = True
 
@@ -1724,8 +1889,16 @@ def _noop_guard(
     # ── Gate 1: whole-suite-zero (hard RED, always) ───────────────────────
     if total_executed == 0:
         print()
-        print("=== NO TESTS EXECUTED — suite is a no-op (missing dep? bad selector? all filtered?) ===")
-        print("    A run that executed 0 tests is RED, not green (test-gate-honesty §5).")
+        any_timed_out = any(s.get("timed_out") for _f, s in all_summaries)
+        if any_timed_out:
+            # Still RED (the caller already reds on the non-zero exit), but do
+            # not assert "no-op": a killed pytest executed an unknown number of
+            # tests and simply never printed its counts line.
+            print("=== 0 tests counted, but at least one file was KILLED at the per-file "
+                  "timeout — counts are unknown, NOT zero. See the TIMED OUT verdict above. ===")
+        else:
+            print("=== NO TESTS EXECUTED — suite is a no-op (missing dep? bad selector? all filtered?) ===")
+            print("    A run that executed 0 tests is RED, not green (test-gate-honesty §5).")
         red = True
 
     # ── Gate 2: explicitly-requested paths that collected 0 tests ─────────
@@ -1740,12 +1913,13 @@ def _noop_guard(
             rp = f.resolve()
             agg = by_path.setdefault(rp, {"f": f, "executed": 0, "skipped": 0,
                                           "noop_skip": False, "noop_testless": False,
-                                          "noop_exit5": False})
+                                          "noop_exit5": False, "timed_out": False})
             agg["executed"] += _executed(s)
             agg["skipped"] += s.get("skipped", 0)
             agg["noop_skip"] = agg["noop_skip"] or bool(s.get("noop_skip"))
             agg["noop_testless"] = agg["noop_testless"] or bool(s.get("noop_testless"))
             agg["noop_exit5"] = agg["noop_exit5"] or bool(s.get("noop_exit5"))
+            agg["timed_out"] = agg["timed_out"] or bool(s.get("timed_out"))
         noop_explicit = [
             (agg["f"], agg) for rp, agg in by_path.items()
             # An explicit file that executed 0 tests is a caller-intent no-op —
@@ -1754,11 +1928,15 @@ def _noop_guard(
             #   (b) noop_testless: an empty tombstone / __main__ script with no tests;
             #   (c) skipped>0: every test skipped (module skipif / empty-parametrize /
             #       per-test pytest.skip()) — pytest ran the file, the tests opted out.
+            #   (d) timed_out: killed at the per-file wall ceiling. It executed an
+            #       unknown number of tests and printed no counts line; that is a
+            #       HANG, reported by its own verdict above, never a no-op.
             # None is a broken request; all surface as ⚠ above, never a RED gate. A
             # file that DOES define tests, skipped none, and collected zero still REDs
             # (the real silent no-op the guard exists to catch).
             if rp in explicit_files and agg["executed"] == 0
             and not agg["noop_skip"] and not agg["noop_testless"]
+            and not agg["timed_out"]
             and agg["skipped"] == 0
         ]
         if noop_explicit:
