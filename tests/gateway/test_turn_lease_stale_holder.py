@@ -24,6 +24,7 @@ from gateway.turn_lease import (
     STALE_HOLDER_LOG_AFTER,
     SessionTurnLeaseRegistry,
     TurnLeaseTimeoutError,
+    TurnLeaseToken,
 )
 
 SESSION = "sess-stale"
@@ -186,17 +187,37 @@ def test_raising_predicate_fails_open_to_live(caplog):
 
 
 def test_runner_wires_the_predicate_into_its_registry():
-    """The gateway must actually supply _is_session_run_current."""
+    """The gateway must actually supply _is_session_run_current.
+
+    Drives the REAL initialiser on a bare instance so deleting the
+    ``is_generation_current=`` argument at ``gateway/run.py`` fails here.
+    Constructing a registry in the test and handing it the bound method by hand
+    exercises the registry, not the wiring: it stays green with the production
+    argument deleted (verified by mutation).
+    """
     from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
-    registry = SessionTurnLeaseRegistry(
-        is_generation_current=GatewayRunner._is_session_run_current.__get__(
-            runner, GatewayRunner
-        )
-    )
+    GatewayRunner._init_lifecycle_state(runner)
+
+    registry = runner._turn_leases
     assert registry._is_generation_current is not None
-    # An empty routing key is "current" by the runner's own contract → never stale.
-    assert registry._holder_is_stale(
-        type("T", (), {"owner_key": "", "generation": 1})()
-    ) is False
+    # The predicate must be the runner's own bound method, not an arbitrary callable.
+    assert getattr(registry._is_generation_current, "__self__", None) is runner
+
+    # And it must actually CLASSIFY: a holder whose generation is no longer current
+    # is stale. Assert through the runner's registry, using its real session state.
+    from gateway.session_state import SessionState
+
+    session_key = "agent:main:discord:thread:12345:12345"
+    state = SessionState()
+    state.persistent.run_generation = 7
+    runner._sessions = {session_key: state}
+
+    from gateway.turn_lease import _SessionLease
+
+    lease = _SessionLease()
+    holder = TurnLeaseToken(SESSION, session_key, 3, lease=lease)
+    live = TurnLeaseToken(SESSION, session_key, 7, lease=lease)
+    assert registry._holder_is_stale(holder) is True
+    assert registry._holder_is_stale(live) is False
