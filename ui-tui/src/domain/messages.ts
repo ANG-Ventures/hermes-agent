@@ -97,9 +97,14 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
     // Gated on role + re-validated metadata: display_kind is an open string
     // column, so a malformed or imported non-assistant row carrying it must
     // not be presented as a confirmed catch.
+    //
+    // Unlike the branches above, this one must NOT clear `pending`: they each
+    // `continue` and replace the row, while this one falls through to the
+    // assistant push below, which reads `pending` for the reply's tool trail.
+    // Clearing it here would silently erase the tool evidence on exactly the
+    // turns an operator reloads history to audit.
     if (display_kind === 'confab_notice' && confabNoticeFromRow(row as TranscriptRow)) {
       out.push({ kind: 'event', role: 'system', text: CONFAB_NOTICE_EVENT_TEXT })
-      pending = []
     }
 
     if (role === 'assistant') {
