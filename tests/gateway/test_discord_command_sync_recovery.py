@@ -336,7 +336,7 @@ async def test_reconnect_inside_backoff_window_skips_the_sync(adapter, monkeypat
     with caplog.at_level("INFO"):
         await adapter._run_post_connect_initialization()
 
-    sync.assert_not_awaited(), "a reconnect inside the backoff window must not sync"
+    sync.assert_not_awaited()
     assert any(
         "backoff" in record.getMessage().lower() for record in caplog.records
     ), f"the skip must log WHY; got {[r.getMessage() for r in caplog.records]}"
@@ -434,3 +434,156 @@ async def test_successful_sync_runs_the_drift_check(adapter, monkeypatch):
     await adapter._run_post_connect_initialization()
 
     drift_check.assert_awaited()
+
+
+# ---------------------------------------------------------------------------
+# (e) Review follow-ups (#117299): the retry arithmetic must honour the backoff.
+# ---------------------------------------------------------------------------
+
+
+def _write_state(adapter, fingerprint, **fields):
+    state_path = adapter._command_sync_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {"fingerprint": fingerprint}
+    entry.update(fields)
+    state_path.write_text(json.dumps({"999": entry}), encoding="utf-8")
+
+
+def _stub_client(adapter, name="stop"):
+    adapter._client = SimpleNamespace(
+        tree=SimpleNamespace(get_commands=lambda: [_DesiredCommand(_payload(name))]),
+        application_id=999,
+        user=SimpleNamespace(id=999),
+    )
+    return adapter._desired_command_sync_fingerprint()
+
+
+def test_retry_delay_waits_out_the_escalating_backoff(adapter):
+    """The in-process retry must not spend the budget inside one backoff window.
+
+    Deriving the delay from ``retry_after_until`` alone burns all 5 attempts
+    within ~25s of the first 429 (5s retry_after) while the first backoff
+    window is 300s -- the same bucket-burning this change exists to stop, and
+    contradicting the documented "exponential backoff".
+    """
+    import time as _time
+
+    fingerprint = _stub_client(adapter)
+    now = _time.time()
+    _write_state(
+        adapter,
+        fingerprint,
+        retry_after_until=now + 5,      # Discord's short retry-after
+        backoff_until=now + 300,        # the escalating window
+        retry_attempts=1,
+    )
+
+    delay = adapter._command_sync_retry_delay(999)
+    assert delay is not None
+    # Jitter is additive and bounded; the floor is the backoff, not retry_after.
+    assert delay >= 290, f"retry fired inside the backoff window: {delay}s"
+
+
+def test_changed_command_set_is_not_held_by_a_stale_backoff(adapter, monkeypatch):
+    """A CHANGED fingerprint is fresh intent, not continued refusal.
+
+    ``_record_command_sync_rate_limit`` already resets ``retry_attempts`` on a
+    changed fingerprint. The backoff gate did not, so a newly registered
+    command could stay missing from the picker for up to an hour after the
+    restart that introduced it.
+    """
+    import time as _time
+
+    fingerprint = _stub_client(adapter)
+    now = _time.time()
+    # State was written for a DIFFERENT desired command set.
+    _write_state(
+        adapter,
+        "a-different-fingerprint",
+        last_attempt_at=now - 10,
+        retry_after_until=now - 5,   # elapsed
+        backoff_until=now + 3000,    # a long stale window
+        retry_attempts=5,
+    )
+
+    reason = adapter._command_sync_skip_reason(999, fingerprint)
+    assert reason is None, f"a changed command set must not be gated: {reason}"
+
+    # ...and the SAME fingerprint is still gated.
+    _write_state(
+        adapter,
+        fingerprint,
+        last_attempt_at=now - 10,
+        retry_after_until=now - 5,
+        backoff_until=now + 3000,
+        retry_attempts=5,
+    )
+    assert "backoff" in (adapter._command_sync_skip_reason(999, fingerprint) or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_failing_drift_check_is_throttled_like_a_successful_one(adapter):
+    """A FAILING check must stamp the attempt, or it re-fires every tick.
+
+    The caller is the liveness probe (default 15s). Stamping only on success
+    turns a persistently failing check -- the incident's own state -- into a
+    GET every 15s instead of once an hour.
+    """
+    failing_tree = SimpleNamespace(
+        get_commands=lambda: [_DesiredCommand(_payload("stop"))],
+        fetch_commands=AsyncMock(side_effect=_RateLimited(30.0)),
+    )
+    adapter._client = SimpleNamespace(tree=failing_tree, application_id=999,
+                                      user=SimpleNamespace(id=999))
+
+    await adapter._maybe_check_command_registry_drift()
+    assert failing_tree.fetch_commands.await_count == 1
+
+    # A second tick inside the interval must be throttled despite the failure.
+    await adapter._maybe_check_command_registry_drift()
+    assert failing_tree.fetch_commands.await_count == 1, (
+        "a failing drift check re-fired instead of being throttled"
+    )
+
+
+@pytest.mark.asyncio
+async def test_drift_check_respects_a_disabled_sync_policy(adapter, monkeypatch):
+    """policy=off means the operator does not want us policing the registry."""
+    tree = SimpleNamespace(
+        get_commands=lambda: [_DesiredCommand(_payload("stop"))],
+        fetch_commands=AsyncMock(return_value=[]),
+    )
+    adapter._client = SimpleNamespace(tree=tree, application_id=999,
+                                      user=SimpleNamespace(id=999))
+    monkeypatch.setattr(adapter, "_get_discord_command_sync_policy", lambda: "off")
+
+    await adapter._maybe_check_command_registry_drift()
+    tree.fetch_commands.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_post_connect_inits_are_serialized(adapter, monkeypatch):
+    """A retry firing AT backoff_until can race a reconnect; only one may sync."""
+    _stub_client(adapter)
+    monkeypatch.setattr(adapter, "_command_sync_skip_reason", lambda *a, **k: None)
+    monkeypatch.setattr(adapter, "_maybe_check_command_registry_drift", AsyncMock())
+
+    inflight = 0
+    peak = 0
+
+    async def _slow_sync():
+        nonlocal inflight, peak
+        inflight += 1
+        peak = max(peak, inflight)
+        await asyncio.sleep(0.05)
+        inflight -= 1
+        return {"created": [], "updated": [], "deleted": []}
+
+    monkeypatch.setattr(adapter, "_safe_sync_slash_commands", _slow_sync)
+
+    await asyncio.gather(
+        adapter._run_post_connect_initialization(),
+        adapter._run_post_connect_initialization(is_rate_limit_retry=True),
+    )
+
+    assert peak == 1, f"two syncs overlapped (peak concurrency {peak})"

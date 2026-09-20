@@ -2008,7 +2008,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             # 429. The scheduled in-process retry owns recovery; this reconnect
             # stands down.
             backoff_until = float(entry.get("backoff_until") or 0)
-            if backoff_until > now:
+            # Scoped to the fingerprint for the same reason
+            # _record_command_sync_rate_limit resets retry_attempts on a changed
+            # one: a different desired command set is fresh intent, not continued
+            # refusal. Without this, a job that exhausted its budget leaves a
+            # newly-registered command missing from the picker for up to
+            # _DISCORD_COMMAND_SYNC_RETRY_MAX_BACKOFF_SECONDS after the restart
+            # that introduced it.
+            if backoff_until > now and entry.get("fingerprint") == fingerprint:
                 remaining = max(1, int(backoff_until - now))
                 attempts = int(entry.get("retry_attempts") or 0)
                 return (
@@ -2078,7 +2085,15 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if attempts >= _DISCORD_COMMAND_SYNC_RETRY_MAX_ATTEMPTS:
             return None
         retry_after_until = float(entry.get("retry_after_until") or 0)
-        delay = max(0.0, retry_after_until - time.time())
+        # The escalating backoff must gate the in-process retry too, not just
+        # reconnects. Deriving the delay from retry_after alone burns the whole
+        # 5-attempt budget inside the FIRST backoff window (measured: 5 attempts
+        # in 25s against a 300s window with a 5s retry_after), which is the same
+        # bucket-burning this change exists to stop, and contradicts the
+        # "bounded retries with exponential backoff" contract in
+        # website/docs/user-guide/messaging/discord.md.
+        backoff_until = float(entry.get("backoff_until") or 0)
+        delay = max(0.0, max(retry_after_until, backoff_until) - time.time())
         # Jitter so a fleet of adapters recovering from the same outage does
         # not stampede Discord's bucket at the identical instant.
         return delay + random.uniform(0.0, _DISCORD_COMMAND_SYNC_RETRY_JITTER_SECONDS)
@@ -2152,6 +2167,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 for command in await tree.fetch_commands()
             }
         except Exception:
+            # Stamp the ATTEMPT, not just the success: the caller is the liveness
+            # probe (default 15s) and returning unstamped makes a persistently
+            # failing check — HTTPException / RateLimited while the app's command
+            # bucket is saturated, i.e. exactly the incident's state — issue a GET
+            # every tick instead of once per interval.
+            self._last_command_drift_check_at = time.time()
             logger.debug("[%s] Command registry drift check failed", self.name, exc_info=True)
             return None
 
@@ -2171,6 +2192,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
     async def _maybe_check_command_registry_drift(self) -> None:
         """Run the drift check at most once per interval (fail-soft)."""
+        # An operator who turned syncing off (or delegated it to a bulk sync) did
+        # not ask us to police Discord's registry: skip the GET and the drift
+        # WARNINGs rather than reporting drift nobody intends to close.
+        if self._get_discord_command_sync_policy() != "safe":
+            return
         last = getattr(self, "_last_command_drift_check_at", 0.0) or 0.0
         if time.time() - last < _DISCORD_COMMAND_DRIFT_CHECK_INTERVAL_SECONDS:
             return
@@ -2259,6 +2285,23 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
     async def _run_post_connect_initialization(self, *, is_rate_limit_retry: bool = False) -> None:
         """Finish non-critical startup work after Discord is connected."""
+        if not self._client:
+            return
+        # A scheduled retry and a reconnect can arrive together — the retry fires
+        # AT backoff_until, the instant the backoff gate stops skipping
+        # reconnects — and two concurrent syncs would double-burn the very
+        # command-management bucket this path exists to protect. Serialize them;
+        # the loser re-evaluates the skip reasons and normally stands down.
+        lock = getattr(self, "_post_connect_sync_lock", None)
+        if lock is None:
+            lock = self._post_connect_sync_lock = asyncio.Lock()
+        async with lock:
+            await self._run_post_connect_initialization_locked(
+                is_rate_limit_retry=is_rate_limit_retry
+            )
+
+    async def _run_post_connect_initialization_locked(self, *, is_rate_limit_retry: bool = False) -> None:
+        # Re-checked under the lock: the client can be torn down while waiting.
         if not self._client:
             return
         try:
