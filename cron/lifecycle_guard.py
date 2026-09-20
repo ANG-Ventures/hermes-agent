@@ -45,6 +45,7 @@ import os
 import re
 import shlex
 import stat
+import threading
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
@@ -53,6 +54,16 @@ logger = logging.getLogger(__name__)
 
 class GatewayLifecycleBlocked(ValueError):
     """Raised when a cron job spec contains a gateway-lifecycle command."""
+
+
+# Stable marker attached to every terminal-tool result that was refused by
+# THIS guard. It exists so a consumer can distinguish "the guard refused"
+# from "the command ran and failed" WITHOUT string-matching prose that is
+# free to change. The execute_code sandbox stub keys on it to raise instead
+# of handing the caller a result that looks like an ordinary non-zero exit
+# (a script that does not inspect the returned dict otherwise completes
+# silently with rc 0, which reads as success — measured 2026-09-20).
+GATEWAY_LIFECYCLE_BLOCK_MARKER = "gateway_lifecycle_guard"
 
 
 # Shell-level command shapes that target the gateway lifecycle. Each branch
@@ -1100,15 +1111,20 @@ def contains_launchctl_submit_command(command: str) -> bool:
         if _executable_name(segment[index]) == "launchctl":
             arguments = segment[index + 1 :]
             if arguments and arguments[0].lower() in {"submit", "bootstrap"}:
-                if arguments[0].lower() == "bootstrap" and _bootstrap_targets_sibling_plist(
-                    arguments[1:]
+                if arguments[0].lower() == "bootstrap" and (
+                    _bootstrap_targets_sibling_plist(arguments[1:])
+                    or _bootstrap_targets_readable_non_gateway_plist(arguments[1:])
                 ):
                     # `launchctl bootstrap gui/<uid> <sibling>.plist` loads a
                     # DIFFERENT gateway's job. It cannot restart-loop this
                     # process, and it is exactly how a break-glass profile
-                    # brings a wedged sibling back up. `submit` stays blocked
-                    # unconditionally (its label is attacker-chosen, so the
-                    # text proves nothing about the job it creates).
+                    # brings a wedged sibling back up. The second predicate
+                    # covers the much more common case: bootstrapping a plist
+                    # that is ALREADY on disk and is not a gateway job at all
+                    # (reloading a fleet daemon after editing it). `submit`
+                    # stays blocked unconditionally (its label is
+                    # attacker-chosen, so the text proves nothing about the
+                    # job it creates).
                     continue
                 return True
     return False
@@ -1135,6 +1151,200 @@ def _bootstrap_targets_sibling_plist(arguments: list[str]) -> bool:
         if not _LAUNCHD_GATEWAY_LABEL_RE.fullmatch(name):
             return False
         if name in self_names:
+            return False
+    return True
+
+
+# A launchd plist is a small configuration file; the real ones on this fleet
+# are well under 8 KiB. Bound the read so a hostile/oversized file can never
+# be streamed into the guard, mirroring `_MAX_REFERENCED_SCRIPT_BYTES`.
+_MAX_PLIST_BYTES = 256 * 1024
+
+# Tokens that mean "this job IS a hermes gateway" when they appear in a
+# plist's Program / ProgramArguments. The label check alone is not enough: a
+# plist can carry a neutral Label (`ai.hermes.svc-reload-tmp`) while its argv
+# runs `python -m hermes_cli.main gateway run`, which is the #62891 laundering
+# shape with a file instead of a `submit` line.
+_PLIST_GATEWAY_ARGV_MARKERS = ("hermes_cli.main", "hermes-gateway", "hermes_gateway")
+
+# `_plist_argv_runs_gateway_lifecycle` scans a plist's argv with the same
+# scanner that resolves `launchctl bootstrap <plist>` — so a plist whose argv
+# bootstraps another plist re-enters it. Bound the nesting per thread (the
+# guard runs on the gateway's request threads) and fail CLOSED at the bound.
+_MAX_PLIST_ARGV_SCAN_DEPTH = 2
+_PLIST_ARGV_SCAN_STATE = threading.local()
+
+
+def _plist_program_tokens(payload: dict) -> list[str]:
+    """Flatten a plist's Program / ProgramArguments into scannable strings."""
+    tokens: list[str] = []
+    program = payload.get("Program")
+    if isinstance(program, str):
+        tokens.append(program)
+    arguments = payload.get("ProgramArguments")
+    if isinstance(arguments, (list, tuple)):
+        tokens.extend(item for item in arguments if isinstance(item, str))
+    return tokens
+
+
+def _plist_argv_runs_gateway_lifecycle(payload: dict) -> bool:
+    """True when loading this plist would EXECUTE a gateway-lifecycle command.
+
+    ``_plist_declares_gateway_job`` asks whether the plist *is* a gateway job.
+    That is not the question the guard exists to answer: a plist with a wholly
+    neutral ``Label`` and a non-entrypoint argv can still run
+
+        /bin/sh -c 'launchctl kickstart -k system/ai.hermes.gateway-daedalus'
+
+    — the #62891 laundering shape with a file instead of a ``submit`` line, and
+    it needs no root (``launchctl bootstrap gui/<uid> $TMPDIR/x.plist``). Run
+    the flattened argv through the lifecycle scanner that already handles both
+    inline commands and commands hidden in a referenced script.
+
+    Each token is scanned on its own (a ``sh -c <payload>`` string is its own
+    command text, and a bare script path is a referenced script) AND joined (a
+    lifecycle command spelled across separate argv words). ``or`` of the two:
+    every extra match is a REFUSAL, which is the safe direction.
+    """
+    tokens = _plist_program_tokens(payload)
+    if not tokens:
+        return False
+    depth = getattr(_PLIST_ARGV_SCAN_STATE, "depth", 0)
+    if depth >= _MAX_PLIST_ARGV_SCAN_DEPTH:
+        # A plist whose argv bootstraps another plist re-enters this scan.
+        # Two plists can reference each other, so bound it and fail CLOSED:
+        # a plist that bootstraps a plist is not the routine maintenance
+        # shape this allow-path exists for.
+        return True
+    _PLIST_ARGV_SCAN_STATE.depth = depth + 1
+    try:
+        if any(
+            contains_gateway_lifecycle_command_or_referenced_script(token)
+            for token in tokens
+        ):
+            return True
+        return contains_gateway_lifecycle_command_or_referenced_script(" ".join(tokens))
+    finally:
+        _PLIST_ARGV_SCAN_STATE.depth = depth
+
+
+def _plist_declares_gateway_job(payload: dict) -> bool:
+    """True when *payload* describes, or drives, a hermes GATEWAY job.
+
+    Three independent tells, any one is enough:
+
+    * ``Label`` is a full hermes gateway label; or
+    * ``Program``/``ProgramArguments`` reference a hermes gateway entrypoint
+      (``hermes_cli.main ... gateway``, a ``hermes-gateway`` launcher, ...); or
+    * that same argv EXECUTES a gateway-lifecycle command, inline or via a
+      referenced script (see ``_plist_argv_runs_gateway_lifecycle``).
+    """
+    label = payload.get("Label")
+    if not isinstance(label, str) or not label.strip():
+        # No Label at all: launchd would reject it, and we cannot reason
+        # about what it registers. Treat as gateway-ish (fail closed).
+        return True
+    if _LAUNCHD_GATEWAY_LABEL_RE.fullmatch(_normalize_service_name(label)):
+        return True
+    tokens = [token.lower() for token in _plist_program_tokens(payload)]
+    if any(marker in token for token in tokens for marker in _PLIST_GATEWAY_ARGV_MARKERS):
+        return True
+    # `... -m hermes_cli.main gateway run` spelled across separate argv words.
+    if "gateway" in tokens and any("hermes" in token for token in tokens):
+        return True
+    return _plist_argv_runs_gateway_lifecycle(payload)
+
+
+def _read_plist_label_payload(path: Path) -> Optional[dict]:
+    """Bounded, regular-file-only plist read. ``None`` means "cannot read".
+
+    Fails closed on every ambiguity the caller must not paper over: cloud
+    placeholders (an evicted FileProvider read can hang the guard, #88052),
+    non-regular files, directories, oversized files, and anything ``plistlib``
+    cannot parse into a mapping.
+    """
+    import plistlib
+
+    if _is_cloud_placeholder_path(path):
+        return None
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, ValueError):
+        resolved = path
+    if _is_cloud_placeholder_path(resolved):
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except (OSError, ValueError):
+        return None
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            # Directories (`launchctl bootstrap <domain> <dir>` loads EVERY
+            # plist inside), FIFOs, devices: nothing we can read once and
+            # reason about.
+            return None
+        if metadata.st_size > _MAX_PLIST_BYTES:
+            return None
+        data = b""
+        while len(data) <= _MAX_PLIST_BYTES:
+            chunk = os.read(descriptor, _MAX_PLIST_BYTES + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+    if len(data) > _MAX_PLIST_BYTES:
+        return None
+    try:
+        payload = plistlib.loads(data)
+    except Exception:
+        # Malformed / not a plist at all. plistlib raises several unrelated
+        # exception types depending on format; none of them mean "safe".
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _bootstrap_targets_readable_non_gateway_plist(arguments: list[str]) -> bool:
+    """True when every plist argument is an EXISTING, non-gateway plist.
+
+    ``submit`` and ``bootstrap`` are otherwise handled label-independently
+    because a NEW job's label is chosen by whoever writes the command
+    (#62891). That reasoning holds for ``submit`` (pure text) and for
+    bootstrapping a path that does not exist yet — but NOT for a plist already
+    on disk: launchd reads ``Label`` out of that file, so the label is a
+    readable fact, not an attacker's claim. Refusing those blocked routine
+    fleet maintenance (reloading ``ai.hermes.fleetreview-router`` after a
+    ``plutil -replace`` edit) and pushed operators onto the deprecated,
+    label-gated ``launchctl load -w``.
+
+    Deliberately strict — every condition must hold:
+
+    1. at least one argument looks like a plist path;
+    2. no argument carries an unexpanded shell value (the path we read would
+       not be the path launchd loads);
+    3. every plist argument resolves to a readable regular file within the
+       size bound; and
+    4. none of those files declares a hermes gateway job (by ``Label`` or by
+       entrypoint).
+    """
+    plists = [argument for argument in arguments if argument.lower().endswith(".plist")]
+    if not plists:
+        return False
+    for argument in arguments:
+        if _UNEXPANDED_SHELL_VALUE_RE.search(argument):
+            return False
+    for plist in plists:
+        candidate = _expand_candidate_path(plist)
+        if candidate is None:
+            return False
+        payload = _read_plist_label_payload(candidate)
+        if payload is None:
+            return False
+        if _plist_declares_gateway_job(payload):
             return False
     return True
 

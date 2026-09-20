@@ -573,7 +573,9 @@ def generate_hermes_tools_module(enabled_tools: List[str],
         stub_functions.append(
             f"def {func_name}({sig}):\n"
             f"    {doc}\n"
-            f"    return _call({func_name!r}, {args_expr})\n"
+            f"    return _raise_if_blocked(\n"
+            f"        {func_name!r}, _call({func_name!r}, {args_expr})\n"
+            f"    )\n"
         )
         export_names.append(func_name)
 
@@ -625,6 +627,36 @@ def retry(fn, max_attempts=3, delay=2):
             if attempt < max_attempts - 1:
                 time.sleep(delay * (2 ** attempt))
     raise last_err
+
+
+class ToolCallBlocked(RuntimeError):
+    """A tool call was REFUSED by a Hermes guard; it never ran."""
+
+
+# Marker key set by tools/terminal_tool.py on a gateway-lifecycle refusal.
+# Kept in sync with cron.lifecycle_guard.GATEWAY_LIFECYCLE_BLOCK_MARKER by
+# tests/tools/test_execute_code_surfaces_blocks.py.
+_BLOCKED_MARKER_KEY = "blocked_by"
+
+
+def _raise_if_blocked(tool_name, result):
+    """Turn a guard REFUSAL into an exception instead of a return value.
+
+    A refused call comes back as an ordinary dict. A script that does not
+    inspect it (the common shape: ``r = terminal(cmd)`` with no check) then
+    runs to completion, and execute_code reports status=success /
+    exit_code=0 with empty output — a silent block, strictly worse than the
+    direct terminal tool, which at least prints why. Raising puts the
+    refusal in the cell's traceback so the caller always sees it.
+    """
+    if not isinstance(result, dict):
+        return result
+    if not result.get(_BLOCKED_MARKER_KEY):
+        return result
+    message = result.get("error") or "blocked by a Hermes guard"
+    raise ToolCallBlocked(
+        tool_name + "() was blocked and did not run: " + str(message)
+    )
 
 '''
 
