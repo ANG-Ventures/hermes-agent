@@ -60,7 +60,9 @@ concurrency:
 jobs:
   check:
     name: uv lock --check
-    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    # Hosted by design: `uv lock --check` is a network round-trip to PyPI,
+    # not a LAN-bound job. Keeps a 17-slot pool slot free for a test slice.
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       review_status: ${{ steps.verify.outputs.review_status }}

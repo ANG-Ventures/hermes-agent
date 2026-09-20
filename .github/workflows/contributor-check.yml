@@ -12,7 +12,9 @@ permissions:
 
 jobs:
   check-attribution:
-    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    # Hosted by design: short, no LAN dependency, and its checkout is
+    # already treeless. Keeps a 17-slot pool slot free for a test slice.
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       review_status: ${{ steps.check-emails.outputs.review_status }}

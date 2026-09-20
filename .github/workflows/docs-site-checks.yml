@@ -8,7 +8,9 @@ permissions:
 
 jobs:
   docs-site-checks:
-    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    # Hosted by design: npm/node docs build, no LAN dependency.
+    # Keeps a 17-slot pool slot free for a test slice.
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
