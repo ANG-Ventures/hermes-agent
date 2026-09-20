@@ -46,6 +46,24 @@ def resume_kind_for_reason(reason: str | None) -> str:
 AUTO_RESUME_ATTEMPT_TTL_SECONDS = 7 * 24 * 60 * 60
 _STORE_VERSION = 1
 
+# How many consecutive boot auto-resumes of the SAME session may be scheduled
+# before the gateway stops resuming it. The once-ever credit above is keyed on
+# ``(session_key, assistant_rowid)``, which is the wrong grain for a session
+# that is re-amputated every boot: each restart interrupts a NEW assistant row,
+# so the credit is fresh every time, and a ``kind=self`` resume skips the credit
+# entirely. Both were live on 2026-09-20, when one dead Discord session replayed
+# its whole ~450k-char history across ten overnight boots. The counter here is
+# per-SESSION and boot-independent; forward progress on a resumed turn clears it
+# (see ``GatewayRunner._apply_post_turn_resume_gate``), so only resumes that
+# achieved nothing accumulate. ``<= 0`` disables the cap.
+DEFAULT_AUTO_RESUME_MAX_ATTEMPTS = 3
+
+# Sentinel count returned when the attempt store is unreadable or a counter
+# write failed. Sits above the clamp ceiling on ``max_attempts`` so every
+# ``count >= cap`` test blocks — a broken backstop denies resume credit rather
+# than minting it (same fail-closed posture as ``has_attempt``).
+_POISONED_ATTEMPT_COUNT = 1_000_000
+
 # Auto-resume is allowlist-based.  Unknown tools fail closed because plugins and
 # MCP servers can expose arbitrary side effects under names core cannot classify.
 _READ_ONLY_TOOLS = frozenset(
@@ -416,27 +434,77 @@ class AutoResumeAttemptStore:
             )
         return validated
 
-    def _load(self) -> list[dict[str, Any]] | None:
+    def _validate_session_attempts(self, raw: Any) -> dict[str, dict[str, Any]]:
+        """Validate the per-session boot-resume counters.
+
+        Absent is valid and means zero: the key was added after the rowid
+        credits, so a file written by an older gateway has no counters and must
+        keep loading (and vice versa — an older gateway ignores this key, which
+        is why adding it needs no ``_STORE_VERSION`` bump).
+        """
+        counters = raw.get("session_attempts") if isinstance(raw, dict) else None
+        if counters is None:
+            return {}
+        if not isinstance(counters, dict):
+            raise ValueError("session_attempts must be an object")
+        validated: dict[str, dict[str, Any]] = {}
+        for session_key, item in counters.items():
+            if not isinstance(session_key, str) or not session_key:
+                raise ValueError("session_attempts key must be a non-empty string")
+            if not isinstance(item, dict):
+                raise ValueError("session_attempts entry must be an object")
+            count = item.get("count")
+            attempted_at = item.get("attempted_at")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise ValueError("session_attempts count must be a non-negative integer")
+            if isinstance(attempted_at, bool) or not isinstance(attempted_at, (int, float)):
+                raise ValueError("session_attempts attempted_at must be numeric")
+            validated[session_key] = {
+                "count": count,
+                "attempted_at": float(attempted_at),
+            }
+        return validated
+
+    def _load_state(self) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]] | None:
         if self._invalid:
             return None
         if not self.path.exists():
-            return []
+            return [], {}
         try:
-            attempts = self._validate(json.loads(self.path.read_text(encoding="utf-8")))
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            attempts = self._validate(raw)
+            counters = self._validate_session_attempts(raw)
             cutoff = self._now() - AUTO_RESUME_ATTEMPT_TTL_SECONDS
             current = [item for item in attempts if item["attempted_at"] >= cutoff]
-            if len(current) != len(attempts):
-                self._write(current)
-            return current
+            fresh = {
+                key: value
+                for key, value in counters.items()
+                if value["attempted_at"] >= cutoff
+            }
+            if len(current) != len(attempts) or len(fresh) != len(counters):
+                self._write(current, fresh)
+            return current, fresh
         except Exception as exc:
             self._invalid = True
             self._warn_invalid(exc)
             return None
 
-    def _write(self, attempts: list[dict[str, Any]]) -> None:
+    def _load(self) -> list[dict[str, Any]] | None:
+        state = self._load_state()
+        return None if state is None else state[0]
+
+    def _write(
+        self,
+        attempts: list[dict[str, Any]],
+        session_attempts: dict[str, dict[str, Any]],
+    ) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(
-            {"version": _STORE_VERSION, "attempts": attempts},
+            {
+                "version": _STORE_VERSION,
+                "attempts": attempts,
+                "session_attempts": session_attempts,
+            },
             ensure_ascii=False,
             indent=2,
             sort_keys=True,
@@ -500,9 +568,10 @@ class AutoResumeAttemptStore:
     def consume(self, session_key: str, assistant_rowid: int) -> bool:
         """Record a scheduled auto continuation; false means fail closed."""
 
-        attempts = self._load()
-        if attempts is None:
+        state = self._load_state()
+        if state is None:
             return False
+        attempts, session_attempts = state
         if any(
             item["session_key"] == session_key
             and item["assistant_rowid"] == assistant_rowid
@@ -517,9 +586,75 @@ class AutoResumeAttemptStore:
             }
         )
         try:
-            self._write(attempts)
+            self._write(attempts, session_attempts)
         except Exception as exc:
             self._invalid = True
             self._warn_invalid(exc)
             return False
         return True
+
+    # ---- per-session boot-resume cap -------------------------------------
+    #
+    # Distinct grain from the (session_key, assistant_rowid) credits above and
+    # deliberately NOT folded into them: the rowid credit answers "was THIS
+    # interrupted turn already continued once", which resets whenever a restart
+    # amputates a new turn. These counters answer "how many boots in a row have
+    # we resumed this session without it getting anywhere", which is the
+    # question the 2026-09-20 replay storm needed answered.
+
+    def session_attempt_count(self, session_key: str) -> int:
+        """Attempts recorded for ``session_key``; a poisoned store reads high.
+
+        Fail-closed matches ``has_attempt``: a corrupt backstop must deny
+        resume credit, never mint it. Returned as a sentinel above any sane cap
+        so every caller's ``>= cap`` comparison blocks.
+        """
+        state = self._load_state()
+        if state is None:
+            return _POISONED_ATTEMPT_COUNT
+        return int(state[1].get(session_key, {}).get("count", 0))
+
+    def session_cap_reached(self, session_key: str, max_attempts: int) -> bool:
+        """True when ``session_key`` has exhausted its boot-resume budget."""
+        if max_attempts <= 0:
+            return False
+        return self.session_attempt_count(session_key) >= max_attempts
+
+    def record_session_attempt(self, session_key: str) -> int:
+        """Increment and persist ``session_key``'s counter; return the new count.
+
+        A write failure poisons the store, which makes every later
+        ``session_attempt_count`` read high — so a session whose increment could
+        not be persisted is denied further resumes rather than granted unbounded
+        ones.
+        """
+        state = self._load_state()
+        if state is None:
+            return _POISONED_ATTEMPT_COUNT
+        attempts, session_attempts = state
+        count = int(session_attempts.get(session_key, {}).get("count", 0)) + 1
+        session_attempts[session_key] = {
+            "count": count,
+            "attempted_at": float(self._now()),
+        }
+        try:
+            self._write(attempts, session_attempts)
+        except Exception as exc:
+            self._invalid = True
+            self._warn_invalid(exc)
+            return _POISONED_ATTEMPT_COUNT
+        return count
+
+    def clear_session_attempts(self, session_key: str) -> None:
+        """Forget ``session_key``'s counter after real forward progress."""
+        state = self._load_state()
+        if state is None:
+            return
+        attempts, session_attempts = state
+        if session_attempts.pop(session_key, None) is None:
+            return
+        try:
+            self._write(attempts, session_attempts)
+        except Exception as exc:
+            self._invalid = True
+            self._warn_invalid(exc)
