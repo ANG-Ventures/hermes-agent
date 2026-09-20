@@ -1923,18 +1923,30 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         in-process pool that has not touched the store since the rotation
         still sees the newest pair. Nothing is marked exhausted; the caller's
         unmatched-rotation streak bounds repeat visits.
+
+        The entry must also be AVAILABLE. ``_rotate_unmatched`` only ever
+        passes one (it comes from ``_select_unlocked()``), but
+        ``try_refresh_matching`` looks the entry up by a caller-supplied id,
+        which can name an entry the pool has benched (STATUS_EXHAUSTED inside
+        its cooldown, or STATUS_DEAD). Handing that back costs a retry on a
+        credential the pool already refuses to lease. The availability check
+        runs AFTER the store resync, which clears the status when it adopts a
+        newer pair — a rotation on disk legitimately un-benches the entry.
         """
         if not api_key_hint:
             return None
-        candidate = entry
-        try:
-            synced = self._sync_entry_from_auth_store(entry)
-        except Exception:  # pragma: no cover - defensive; sync is best-effort
-            synced = entry
-        if synced is not entry:
-            candidate = synced
+        candidate = self._sync_entry_from_auth_store(entry)
         runtime_key = candidate.runtime_api_key
         if not runtime_key or runtime_key == api_key_hint:
+            return None
+        if candidate.id not in {e.id for e in self._available_entries()[0]}:
+            logger.info(
+                "credential pool: %s entry %s holds a different token than the "
+                "failed key but is benched (status=%s) — not adopting it",
+                self.provider,
+                (candidate.label or candidate.id[:8]),
+                candidate.last_status,
+            )
             return None
         if self._entry_needs_refresh(candidate):
             # The lone entry's token is itself expiring; handing it back would

@@ -99,7 +99,7 @@ class TestSingleEntryPoolAdoptsRotatedToken:
         )
         # A real match on the key marks the entry exhausted and, with one
         # entry, has nothing to rotate to.
-        assert nxt is None or nxt.runtime_api_key != "T1"
+        assert nxt is None
 
     def test_unmatched_hint_with_no_hint_key_does_not_adopt(
         self, tmp_path, monkeypatch
@@ -182,9 +182,74 @@ class TestTryRefreshMatchingAdoptsInsteadOfBurningRefreshToken:
         # credential_id points at cred-0 but the failing key is cred-1's.
         got = pool.try_refresh_matching(api_key_hint="T-b", credential_id="cred-0")
         assert got is not None
-        # Existing behaviour: id wins when both are supplied; we only assert
-        # that adoption did not short-circuit the refresh.
-        assert calls, "refresh path was skipped for a key that IS in the pool"
+        # #79156 "id wins" when both identities are supplied AND the hint
+        # matches a real entry: the id-bound entry is refreshed, and adoption
+        # must not short-circuit it.
+        assert calls == ["cred-0"]
+        assert got.id == "cred-0"
+
+
+class TestBenchedEntryIsNotAdopted:
+    """A caller-supplied ``credential_id`` can name an entry the pool has
+    benched. ``_rotate_unmatched`` cannot hit this (its entry comes from
+    ``_select_unlocked()``), but ``try_refresh_matching`` resolves the id
+    directly — adopting a benched entry spends a retry on a credential the
+    pool refuses to lease. Reported by @Enough1122 on #116052.
+    """
+
+    def _bench(self, pool, idx, **fields):
+        from dataclasses import replace
+
+        with pool._lock:
+            pool._entries[idx] = replace(pool._entries[idx], **fields)
+
+    def test_exhausted_entry_in_cooldown_is_not_adopted(self, tmp_path, monkeypatch):
+        import time
+
+        pool = _seed_pool(
+            tmp_path, monkeypatch, [_entry(0, "T2"), _entry(1, "T-other")]
+        )
+        assert pool.select() is not None
+        self._bench(
+            pool,
+            0,
+            last_status="exhausted",
+            last_status_at=time.time(),
+            last_error_reset_at="2099-01-01T00:00:00Z",
+        )
+        assert "cred-0" not in {e.id for e in pool._available_entries()[0]}
+
+        got = pool.try_refresh_matching(api_key_hint="T1", credential_id="cred-0")
+        assert got is None
+
+    def test_dead_entry_is_not_adopted(self, tmp_path, monkeypatch):
+        pool = _seed_pool(tmp_path, monkeypatch, [_entry(0, "T2")])
+        assert pool.select() is not None
+        self._bench(pool, 0, last_status="dead")
+
+        got = pool.try_refresh_matching(api_key_hint="T1", credential_id="cred-0")
+        assert got is None
+
+    def test_elapsed_cooldown_is_still_adopted(self, tmp_path, monkeypatch):
+        """The gate keys on availability, not on ``last_status`` — an entry
+        whose cooldown has already elapsed is available and still adopted."""
+        import time
+
+        pool = _seed_pool(tmp_path, monkeypatch, [_entry(0, "T2")])
+        assert pool.select() is not None
+        self._bench(
+            pool,
+            0,
+            last_status="exhausted",
+            last_status_at=time.time() - 86_400,
+            last_error_reset_at="2000-01-01T00:00:00Z",
+        )
+        assert "cred-0" in {e.id for e in pool._available_entries()[0]}
+
+        got = pool.try_refresh_matching(api_key_hint="T1", credential_id="cred-0")
+        assert got is not None
+        assert got.id == "cred-0"
+        assert got.runtime_api_key == "T2"
 
 
 class TestXaiSingletonResyncBeforeAdopt:
