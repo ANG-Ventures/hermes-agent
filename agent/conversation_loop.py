@@ -5317,6 +5317,7 @@ def run_conversation(
                     agent._pending_quota_window = {
                         "quota_window": error_context.get("quota_window"),
                         "quota_window_reset": error_context.get("quota_window_reset"),
+                        "quota_window_reset_text": error_context.get("quota_window_reset_text"),
                     }
                 # Stamp pool-exhaustion SCOPE the same way. The pool tells us
                 # whether only THIS MODEL is capped or the whole pool is out;

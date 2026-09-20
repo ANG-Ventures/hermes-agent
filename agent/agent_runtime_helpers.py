@@ -5074,6 +5074,61 @@ def cleanup_dead_connections(agent) -> bool:
 
 
 
+# Claude Code CLI's subscription-cap sentence. Captures WHICH window
+# ("session"/"5-hour" → 5h; "weekly"/"monthly" → 7d) and the reset clause the
+# CLI renders after the middle dot: "resets 2:20pm (UTC)", "resets Sep 23,
+# 2pm (UTC)", "resets 7pm". Kept in lock-step with error_classifier's
+# _CLAUDE_CLI_USAGE_CAP_RE (which only needs to detect, not parse).
+_CLAUDE_CLI_CAP_SENTENCE_RE = re.compile(
+    r"hit your (?P<kind>weekly|monthly|session|5-hour|five-hour)? ?(?:usage )?limit"
+    r"(?:\s*[·\-–—]\s*resets?\s+(?P<reset>[^\n]+?))?\s*$",
+    re.IGNORECASE,
+)
+
+_CLI_RESET_CLOCK_RE = re.compile(
+    r"^(?:(?P<mon>[A-Za-z]{3,9})\s+(?P<day>\d{1,2}),?\s+)?"
+    r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm)"
+    r"(?:\s*\((?P<tz>UTC|GMT)\))?$",
+    re.IGNORECASE,
+)
+
+
+def _parse_cli_reset_clock(text: str, *, now: Optional[float] = None) -> Optional[float]:
+    """Best-effort epoch for a Claude Code "resets 2:20pm (UTC)" clause.
+
+    The CLI prints a wall clock, not a duration. When it names UTC we can
+    resolve it exactly (next occurrence of that clock; a date, if present,
+    pins the day). Without a named zone we don't guess — the sub's box, the
+    user, and the CLI's locale can all disagree — and return None so the
+    announce falls back to the literal reset text.
+    """
+    if not isinstance(text, str):
+        return None
+    m = _CLI_RESET_CLOCK_RE.match(text.strip())
+    if not m or not m.group("tz"):
+        return None
+    try:
+        from datetime import timezone, timedelta
+        hour = int(m.group("hour")) % 12
+        if m.group("ampm").lower() == "pm":
+            hour += 12
+        minute = int(m.group("minute") or 0)
+        base = datetime.fromtimestamp(now if now is not None else time.time(), tz=timezone.utc)
+        if m.group("mon"):
+            month = datetime.strptime(m.group("mon")[:3], "%b").month
+            candidate = base.replace(month=month, day=int(m.group("day")),
+                                     hour=hour, minute=minute, second=0, microsecond=0)
+            if candidate < base - timedelta(days=1):
+                candidate = candidate.replace(year=candidate.year + 1)
+        else:
+            candidate = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if candidate <= base:
+                candidate += timedelta(days=1)
+        return candidate.timestamp()
+    except (ValueError, OverflowError):
+        return None
+
+
 def _extract_unified_quota_window(headers, context: Dict[str, Any]) -> None:
     """Record WHICH Anthropic quota window is exhausted, and when it resets.
 
@@ -5190,6 +5245,26 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
         raw_message = str(error).strip()
         if raw_message:
             context["message"] = raw_message[:500]
+
+    # Claude Code CLI subscription-cap sentence ("You've hit your session
+    # limit · resets 2:20pm (UTC)" / "...weekly limit · resets Sep 23, 2pm
+    # (UTC)"). Relays driving the genuine binary carry no unified-quota
+    # headers, so this is the ONLY place the window + reset are recoverable.
+    # session/5-hour → 5h, weekly → 7d. Header-derived values win.
+    if "quota_window" not in context:
+        _cli_msg = context.get("message") or ""
+        if isinstance(_cli_msg, str):
+            _m = _CLAUDE_CLI_CAP_SENTENCE_RE.search(_cli_msg)
+            if _m:
+                _kind = (_m.group("kind") or "").lower()
+                context["quota_window"] = "7d" if _kind in {"weekly", "monthly"} else "5h"
+                _reset_text = (_m.group("reset") or "").strip().rstrip(".")
+                if _reset_text:
+                    context["quota_window_reset_text"] = _reset_text
+                    _epoch = _parse_cli_reset_clock(_reset_text)
+                    if _epoch:
+                        context["quota_window_reset"] = _epoch
+                        context.setdefault("reset_at", _epoch)
 
     if "reset_at" not in context:
         message = context.get("message") or ""
