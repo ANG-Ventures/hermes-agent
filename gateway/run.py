@@ -14641,11 +14641,125 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         }
     )
 
+    def _prior_life_verdict(self):
+        """Classify how the PREVIOUS gateway life ended. Cached per boot.
+
+        Reads the lifecycle sentinel (already claimed for this life at startup
+        by ``gateway.lifecycle_ledger.record_startup_async``, carrying the
+        previous life's verdict forward) plus, when cheaply available, the last
+        ``PHASE=event_loop_blocked ... site=`` line. Never raises.
+        """
+        cached = getattr(self, "_prior_life_verdict_cache", None)
+        if cached is not None:
+            return cached
+        from gateway.fork_ext.unclean_restart_notice import (
+            PriorLifeVerdict,
+            classify_prior_life,
+            read_last_event_loop_blocked_site,
+        )
+
+        home = getattr(self, "_unclean_restart_home", None)
+        try:
+            sentinel = getattr(self, "_unclean_restart_sentinel", None)
+            if sentinel is None:
+                from gateway.lifecycle_ledger import (
+                    _read_json,
+                    get_lifecycle_sentinel_path,
+                )
+
+                sentinel = _read_json(get_lifecycle_sentinel_path(home))
+            site = getattr(self, "_unclean_restart_site", None)
+            if site is None:
+                site = read_last_event_loop_blocked_site(home)
+            verdict = classify_prior_life(sentinel, site=site)
+        except Exception:
+            logger.debug("Prior-life verdict unavailable", exc_info=True)
+            verdict = PriorLifeVerdict(unclean=False)
+        self._prior_life_verdict_cache = verdict
+        return verdict
+
+    async def _maybe_notify_unclean_restart(
+        self,
+        adapter: BasePlatformAdapter,
+        event: MessageEvent,
+        session_key: str,
+        resume_reason: Optional[str],
+    ) -> None:
+        """Post ONE short notice explaining an UNCLEAN restart, pre-resume.
+
+        The graceful drain path already tells live sessions
+        ``_INTERRUPT_REASON_GATEWAY_RESTART`` on the way down. An ``os._exit``
+        from the loop-liveness watchdog (exit 75), a SIGKILL, or a host death
+        runs no drain, so the FIRST moment anything can speak is here — on the
+        next boot, before the resumed turn produces a reply that would
+        otherwise arrive minutes late with no explanation (incident
+        2026-09-20 16:01).
+
+        Strictly best-effort: every failure is logged and swallowed so the
+        resumed turn always runs.
+        """
+        try:
+            from gateway.fork_ext.unclean_restart_notice import (
+                UNCLEAN_NOTICE_RESUME_REASONS,
+                claim_restart_notice,
+                format_restart_notice,
+            )
+
+            if resume_reason not in UNCLEAN_NOTICE_RESUME_REASONS:
+                return
+            verdict = self._prior_life_verdict()
+            message = format_restart_notice(verdict)
+            if not message:
+                return
+            # Idempotent per (boot, session): a re-scheduled resume or a crash
+            # loop must not spam the channel.
+            if not claim_restart_notice(
+                verdict.boot_id,
+                session_key,
+                home=getattr(self, "_unclean_restart_home", None),
+            ):
+                return
+        except Exception:
+            logger.debug(
+                "Unclean-restart notice classification failed for %s",
+                session_key,
+                exc_info=True,
+            )
+            return
+
+        try:
+            source = getattr(event, "source", None)
+            metadata = None
+            if source is not None:
+                metadata = self._thread_metadata_for_target(
+                    source.platform,
+                    source.chat_id,
+                    getattr(source, "thread_id", None),
+                    chat_type=getattr(source, "chat_type", None),
+                    adapter=adapter,
+                )
+                await adapter.send(
+                    str(source.chat_id), message, metadata=metadata
+                )
+                logger.warning(
+                    "PHASE=unclean_restart_notice key=%s reason=%s",
+                    session_key,
+                    verdict.exit_reason or verdict.killer or "unclean",
+                )
+        except Exception as exc:
+            # Never let a transport failure eat the resumed turn.
+            logger.warning(
+                "Failed to deliver unclean-restart notice to %s: %s",
+                session_key,
+                exc,
+            )
+
     async def _run_startup_resume_event(
         self,
         adapter: BasePlatformAdapter,
         event: MessageEvent,
         session_key: str,
+        resume_reason: Optional[str] = None,
     ) -> None:
         """Dispatch one synthetic startup resume and wait for its agent turn.
 
@@ -14672,6 +14786,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         active.add(session_key)
         dispatched_ok = False
         turn_task = None
+        # Explain an UNCLEAN prior death BEFORE the resumed turn runs. This is
+        # the only surface left when no drain ran (watchdog os._exit / SIGKILL);
+        # best-effort and never raises.
+        await self._maybe_notify_unclean_restart(
+            adapter, event, session_key, resume_reason
+        )
         try:
             await adapter.handle_message(event)
             dispatched_ok = True
@@ -16405,7 +16525,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 internal=True,
             )
             task = asyncio.create_task(
-                self._run_startup_resume_event(adapter, event, entry.session_key)
+                self._run_startup_resume_event(
+                    adapter,
+                    event,
+                    entry.session_key,
+                    getattr(entry, "resume_reason", None),
+                )
             )
             # Track this scheduled resume so shutdown can tell a resume whose
             # turn NEVER STARTED (cancel + re-mark) from one that is genuinely

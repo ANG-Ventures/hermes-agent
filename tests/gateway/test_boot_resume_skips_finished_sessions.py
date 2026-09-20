@@ -139,7 +139,7 @@ def _runner(tmp_path: Path, monkeypatch):
     runner._session_db = AsyncSessionDB(db)
     runner.adapters = {Platform.TELEGRAM: adapter}
 
-    async def _scheduled_resume_stub(_adapter, _event, _session_key):
+    async def _scheduled_resume_stub(_adapter, _event, _session_key, *_rest):
         return None
 
     monkeypatch.setattr(runner, "_run_startup_resume_event", _scheduled_resume_stub)

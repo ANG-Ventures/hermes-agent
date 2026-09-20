@@ -73,7 +73,7 @@ def _runner(tmp_path: Path, monkeypatch, *, platform: Platform = Platform.TELEGR
     runner._session_db = AsyncSessionDB(db)
     runner.adapters = {platform: adapter}
 
-    async def _scheduled_resume_stub(_adapter, _event, _session_key):
+    async def _scheduled_resume_stub(_adapter, _event, _session_key, *_rest):
         return None
 
     # These contracts exercise scheduler disposition, not BasePlatformAdapter's
