@@ -31,12 +31,6 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
-      # v1.2.0 resolves to 44f4b93ecbbe22de6c45fa2f62f519aee564ca8c.
-      - name: Install gh-image
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh extension install drogers0/gh-image --pin v1.2.0
-
       - name: Download and attach evidence
         # Deliberately NO ``continue-on-error``. Every call in this step
         # spends the shared installation rate-limit budget, and when that

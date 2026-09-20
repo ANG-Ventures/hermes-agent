@@ -680,7 +680,11 @@ def test_queue_pause_is_bounded_by_the_wall_clock_budget(monkeypatch):
                   max_wall_seconds=budget)
 
     assert rc == 0
-    assert clock["t"] <= budget + 60, (
+    # No overrun tolerance: _pause_for_queue and _nap both clamp to the
+    # remaining wall-clock room, so the poller must stop at or before the
+    # budget. Allowing a 60s overrun here (as an earlier version did) let
+    # the poller exceed the Actions deadline while the test stayed green.
+    assert clock["t"] <= budget, (
         f"a permanently-queued PR ran {clock['t']:.0f}s past its "
         f"{budget}s wall-clock budget — the job would be SIGKILLed mid-pause"
     )
@@ -1113,3 +1117,174 @@ def test_conditional_get_has_no_dead_list_key_parameter():
     assert "list_key" not in params, \
         "list_key is dead on _conditional_get — it misleads every caller"
 
+
+
+# ─── round 4 ──────────────────────────────────────────────────────────
+
+
+def test_backoff_sleeps_respect_the_wall_clock_budget(monkeypatch):
+    """_nap clamped only against the ACTIVE timeout.
+
+    Queued time is added back to ``start``, so the active timeout can have
+    thousands of seconds left while the job has seconds. A long rate-limit
+    backoff would then run into the Actions deadline and be SIGKILLed.
+    """
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: False)
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", lambda *a, **k: [])
+    monkeypatch.setattr(_mod, "upsert_comment", lambda *a, **k: 1)
+
+    def always_limited(*a, **k):
+        raise _mod.RateLimitError(2000.0)
+
+    monkeypatch.setattr(_mod, "collect_run_jobs", always_limited)
+
+    slept: list[float] = []
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_mod.time, "sleep", lambda s: (
+        slept.append(s), clock.__setitem__("t", clock["t"] + max(s, 1.0))))
+
+    budget = 300
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5", run_url="u",
+             interval=45, timeout=100000, dry_run=False, max_wall_seconds=budget)
+
+    assert clock["t"] <= budget + 5, (
+        f"a {slept[0]:.0f}s backoff ran to {clock['t']:.0f}s against a "
+        f"{budget}s wall-clock budget — the job would be SIGKILLed"
+    )
+
+
+def test_final_upsert_failure_is_retried_before_exit(monkeypatch):
+    """"will retry" is a lie on the final cycle: the loop breaks right after.
+
+    The body must CHANGE on the last cycle (so an upsert is attempted then)
+    and that attempt must fail. Earlier failures are covered by the ordinary
+    next-cycle retry and prove nothing about the exit path.
+    """
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: False)
+
+    cycles = {"n": 0}
+
+    def jobs(*a, **k):
+        cycles["n"] += 1
+        # Pending -> (grace) -> a NEW job appears on the final cycle, so its
+        # body genuinely differs and an upsert is attempted there. Without
+        # that, the final cycle posts nothing and the exit path is untested.
+        if cycles["n"] <= 1:
+            return [{"name": "Python tests", "status": "in_progress",
+                     "html_url": "u"}], False
+        if cycles["n"] == 2:
+            return [{"name": "Python tests", "status": "completed",
+                     "conclusion": "success", "html_url": "u"}], True
+        return [{"name": "Python tests", "status": "completed",
+                 "conclusion": "success", "html_url": "u"},
+                {"name": "Lint", "status": "completed",
+                 "conclusion": "failure", "html_url": "u2"}], True
+
+    monkeypatch.setattr(_mod, "collect_run_jobs", jobs)
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", lambda *a, **k: [])
+
+    attempts = {"n": 0}
+    posted: list[int] = []
+
+    def flaky(token, repo, pr, body, comment_id=None):
+        attempts["n"] += 1
+        # The run is: cycle 1 (pending, posts), cycle 2 (all_done -> grace,
+        # posts the completed body), cycle 3 = the TRUE final cycle, after
+        # which the loop breaks. Fail that one.
+        if attempts["n"] == 3:
+            return None
+        posted.append(attempts["n"])
+        return 4242
+
+    monkeypatch.setattr(_mod, "upsert_comment", flaky)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_mod.time, "sleep",
+                        lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
+
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5", run_url="u",
+             interval=45, timeout=3000, dry_run=False)
+
+    assert attempts["n"] >= 4, (
+        "the FINAL comment write failed and the poller exited without "
+        f"retrying (attempts={attempts['n']}) — the comment is left stale"
+    )
+    assert len(posted) >= 2, "the final status was never successfully written"
+
+
+def test_artifact_slug_is_bounded(monkeypatch, tmp_path):
+    """A long caller-chosen artifact name can exceed NAME_MAX.
+
+    The resulting OSError reads as a transient download failure, silently
+    omitting or staling the section.
+    """
+    long_name = "review-status-" + "x" * 300
+    captured: list[str] = []
+
+    monkeypatch.setattr(
+        urllib.request, "build_opener",
+        lambda *a, **k: type("O", (), {"open": staticmethod(
+            lambda req, *a, **k: _raise(302, {"Location": "https://blob/x"}))})(),
+    )
+
+    class _Blob:
+        headers = {}
+
+        def read(self):
+            return b"zip"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Blob())
+
+    class _FakeZip:
+        def __init__(self, path):
+            captured.append(Path(path).name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def namelist(self):
+            return ["review-status.json"]
+
+        def extractall(self, dest):
+            Path(dest).mkdir(parents=True, exist_ok=True)
+            (Path(dest) / "review-status.json").write_text("review_status=[]")
+
+    monkeypatch.setattr(_mod.zipfile, "ZipFile", _FakeZip)
+
+    out = _mod._download_artifact(
+        "tok", "o/r",
+        {"id": 7, "name": long_name, "archive_download_url": "https://api/a"},
+        tmp_path,
+    )
+    assert out is not None, "a long artifact name broke the download path"
+    for component in (captured + [out.parts[-2]]):
+        assert len(component.encode()) <= 255, (
+            f"path component exceeds NAME_MAX ({len(component)} bytes): "
+            f"{component[:60]}..."
+        )
+    assert "7" in out.parts[-2], "the immutable id is no longer in the path"
+
+
+def test_wall_clock_budget_leaves_a_real_shutdown_margin():
+    """One second below the job timeout is not a margin."""
+    root = Path(__file__).resolve().parents[2]
+    text = (root / ".github/workflows/ci-review-comment.yml").read_text(encoding="utf-8")
+    job_timeout = int(
+        re.search(r"^\s*timeout-minutes:\s*(\d+)", text, re.M).group(1)) * 60
+    budget = int(re.search(r"--max-wall-seconds (\d+)", text).group(1))
+    margin = job_timeout - budget
+    assert margin >= 120, (
+        f"--max-wall-seconds {budget} leaves only {margin}s before the job's "
+        f"{job_timeout}s deadline — not enough to publish a final status"
+    )

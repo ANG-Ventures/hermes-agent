@@ -13,8 +13,10 @@ stubbed ``gh`` on ``PATH`` and assert the exit code per failure class.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
+import sys
 import textwrap
 from pathlib import Path
 
@@ -151,21 +153,50 @@ def test_missing_evidence_artifact_is_fatal(tmp_path):
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
-@pytest.mark.parametrize("producer", ["skipped", "cancelled", ""])
-def test_missing_artifact_is_a_clean_skip_when_the_producer_did_not_run(tmp_path, producer):
+def test_missing_artifact_is_a_clean_skip_only_when_the_producer_was_skipped(tmp_path):
     """`Desktop E2E` is hard-disabled in ci.yaml (`if: ${{ false && ... }}`).
 
     No CI run therefore produces an `e2e-evidence-*` artifact, so treating a
     missing artifact as fatal unconditionally would red the publish workflow
-    on 100% of PRs. Fatal only when the producer actually ran and succeeded.
+    on 100% of PRs. `skipped` — and ONLY `skipped` — is a clean skip.
+    """
+    result = _run_step(tmp_path, _gh_stub(artifacts="", producer="skipped"))
+    assert result.returncode == 0, (
+        "the producer was skipped, yet a missing artifact was treated as a "
+        f"regression; stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "Desktop E2E was skipped" in result.stdout
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+@pytest.mark.parametrize("producer", ["failure", "cancelled", "timed_out"])
+def test_producer_ran_and_delivered_nothing_is_fatal(tmp_path, producer):
+    """A producer that RAN and delivered no evidence is a real failure.
+
+    Treating every non-success conclusion as "never ran" would let a
+    genuinely broken Desktop E2E report success while attaching nothing.
     """
     result = _run_step(tmp_path, _gh_stub(artifacts="", producer=producer))
-    assert result.returncode == 0, (
-        f"the producer did not run (conclusion={producer!r}) yet a missing "
-        f"artifact was treated as a regression; stdout={result.stdout!r} "
-        f"stderr={result.stderr!r}"
+    assert result.returncode != 0, (
+        f"Desktop E2E concluded {producer!r} and produced no evidence, yet "
+        f"the step reported success; stdout={result.stdout!r}"
     )
-    assert "producer did not run" in result.stdout
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+def test_absent_producer_job_is_fatal_not_a_skip(tmp_path):
+    """An empty conclusion is not evidence of a deliberate skip.
+
+    It also occurs when the job is renamed, removed, or no longer matches
+    the wrapper's name filter — in which case reporting success while
+    attaching nothing silently fails the workflow's primary function.
+    """
+    result = _run_step(tmp_path, _gh_stub(artifacts="", producer=""))
+    assert result.returncode != 0, (
+        "no Desktop E2E job matched the filter (renamed? removed?) and the "
+        f"step still reported success; stdout={result.stdout!r}"
+    )
+    assert "renamed or removed" in result.stdout + result.stderr
 
 
 def test_the_evidence_producer_is_currently_disabled_in_ci():
@@ -352,3 +383,80 @@ def test_workflow_does_not_blanket_suppress_the_publish_step():
             "continue-on-error on the publish step masks every failure class, "
             "not just the rate-limit one it was added for"
         )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+def test_publisher_rate_limit_exit_code_is_tolerated(tmp_path):
+    """The publisher makes its OWN API calls; the budget can die there.
+
+    It signals that class with a dedicated exit code rather than log text,
+    because its stdout echoes untrusted artifact filenames.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "gh").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$*" in\n'
+        '  *"/pulls"*) echo 4242 ;;\n'
+        '  *"/jobs"*) echo success ;;\n'
+        '  *"/artifacts"*) echo e2e-evidence-desktop ;;\n'
+        "  *) exit 0 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    (bin_dir / "gh").chmod(0o755)
+    (bin_dir / "python3").write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        "  *publish_e2e_evidence.py*) exit 75 ;;\n"
+        f"  *) exec {shutil.which('python3')} \"$@\" ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    (bin_dir / "python3").chmod(0o755)
+
+    (tmp_path / "temp").mkdir(exist_ok=True)
+    result = subprocess.run(
+        ["bash", str(_SCRIPT)], cwd=_ROOT, env=_step_env(bin_dir, tmp_path),
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, (
+        "a publisher-side rate limit still reddened the step; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "::warning::" in result.stdout
+
+
+def test_publisher_rate_limit_exit_code_matches_the_wrapper():
+    """A drifting code silently disables the tolerance."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "pub_e2e", _ROOT / "scripts" / "ci" / "publish_e2e_evidence.py")
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["pub_e2e"] = mod
+    spec.loader.exec_module(mod)
+
+    wrapper = _SCRIPT.read_text(encoding="utf-8")
+    declared = int(re.search(r"PUBLISHER_RATE_LIMITED_RC=(\d+)", wrapper).group(1))
+    assert declared == mod.RATE_LIMITED_EXIT_CODE, (
+        f"the wrapper tolerates exit {declared} but the publisher signals "
+        f"{mod.RATE_LIMITED_EXIT_CODE}"
+    )
+
+
+def test_extension_install_is_inside_the_classifier():
+    """`gh extension install` spends the same budget it must be tolerant of.
+
+    Run as a separate workflow step it sat OUTSIDE the classifier, so a
+    budget exhaustion there reddened the PR before tolerance applied.
+    """
+    spec = yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))
+    steps = spec["jobs"]["publish"]["steps"]
+    install_steps = [s for s in steps if "extension install" in str(s.get("run", ""))]
+    assert not install_steps, (
+        "gh extension install still runs as its own workflow step, outside "
+        "the rate-limit classifier"
+    )
+    assert "gh extension install" in _SCRIPT.read_text(encoding="utf-8")

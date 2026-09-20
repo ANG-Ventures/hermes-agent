@@ -695,7 +695,12 @@ def _download_artifact(
     # name: an ``overwrite: true`` upload (every ``review-status-*``) mints a
     # NEW id under the SAME name, so name-keyed paths let a stale extract from
     # the previous id be served for the newer one.
-    slug = f"{artifact['name']}-{artifact.get('id', 'noid')}"
+    # Keyed by the immutable id, and BOUNDED: an artifact name is
+    # caller-chosen and can be long enough that name+id+".zip" exceeds the
+    # filesystem's per-component limit, whose OSError reads as a transient
+    # download failure and silently drops the section.
+    artifact_id = artifact.get("id", "noid")
+    slug = f"{str(artifact['name'])[:80]}-{artifact_id}"
     zip_path = dest_dir / f"{slug}.zip"
     try:
         # No auth headers here; further redirects are safe to follow.
@@ -909,8 +914,19 @@ def run(
 
 
     def _nap(seconds: float) -> None:
-        """Sleep, but never past the timeout."""
+        """Sleep, but never past the timeout OR the wall-clock budget.
+
+        Queued time is added back to ``start``, so the ACTIVE timeout can
+        have thousands of seconds left while the workflow job has seconds.
+        Clamping only against ``timeout`` would let an ordinary sleep or a
+        rate-limit backoff run into the Actions deadline and be SIGKILLed.
+        """
         remaining_time = timeout - (time.time() - start)
+        if max_wall_seconds is not None:
+            remaining_time = min(
+                remaining_time,
+                max_wall_seconds - (time.time() - wall_start),
+            )
         time.sleep(max(0.0, min(seconds, remaining_time)))
 
     def _pause_for_queue(seconds: float) -> None:
@@ -1084,7 +1100,27 @@ def run(
                 else:
                     # Leave last_body unchanged so the next cycle retries the
                     # same body instead of treating the failure as posted.
-                    print(f"  Failed to update comment ({reason}, will retry)", file=sys.stderr)
+                    #
+                    # On the FINAL cycle there is no next cycle: all_done is
+                    # true and the quiet grace is spent, so the loop breaks
+                    # below. Retry here or the comment is left stale.
+                    if all_done and quiet_grace_used:
+                        print("  Final upsert failed — retrying once before exit.",
+                              file=sys.stderr)
+                        _nap(min(5.0, float(interval)))
+                        try:
+                            cid = upsert_comment(token, repo, pr_number, body)
+                        except RateLimitError:
+                            cid = None
+                        if cid:
+                            print(f"  Updated comment {cid} on the final retry")
+                            last_body = body
+                        else:
+                            print("  Final comment update failed after a retry.",
+                                  file=sys.stderr)
+                    else:
+                        print(f"  Failed to update comment ({reason}, will retry)",
+                              file=sys.stderr)
         else:
             if pending:
                 print(f"  No change since last poll. Still waiting on: {', '.join(pending)}")

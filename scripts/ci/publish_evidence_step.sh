@@ -55,6 +55,10 @@ if [ -z "$WORK_DIR" ] || [ ! -d "$WORK_DIR" ]; then
 fi
 trap 'rm -rf "$WORK_DIR"' EXIT
 LOG_FILE="$WORK_DIR/publish.log"
+# The publisher's own output is kept OUT of LOG_FILE: it echoes filenames
+# from the untrusted PR artifact, and LOG_FILE is what the rate-limit grep
+# reads. It is printed for humans but never classified.
+PUBLISHER_LOG="$WORK_DIR/publisher.log"
 
 # Signatures GitHub uses for primary and secondary rate limits.
 #
@@ -66,13 +70,21 @@ LOG_FILE="$WORK_DIR/publish.log"
 # is never eligible for rate-limit tolerance.
 RATE_LIMIT_PATTERN='API rate limit exceeded|secondary rate limit|rate limit exceeded for installation|HTTP 429|HTTP Error 429|X-RateLimit-Remaining: 0'
 
-# Marker printed immediately before the publisher runs. Everything after it
-# is untrusted-influenced output and is excluded from the rate-limit grep.
-PUBLISHER_MARKER='=== invoking publish_e2e_evidence.py ==='
+# Exit code the Python publisher uses for "rate limited". Kept in sync with
+# RATE_LIMITED_EXIT_CODE in scripts/ci/publish_e2e_evidence.py; a test pins
+# the two together.
+PUBLISHER_RATE_LIMITED_RC=75
 
 
 publish() {
   set -euo pipefail
+
+  # The gh-image extension install also spends the shared installation
+  # budget. It used to run as a separate workflow step OUTSIDE this
+  # classifier, so a budget exhaustion there reddened the PR before the
+  # tolerance could ever apply. v1.2.0 resolves to
+  # 44f4b93ecbbe22de6c45fa2f62f519aee564ca8c.
+  gh extension install drogers0/gh-image --pin v1.2.0
 
   # The run's own ``pull_requests`` payload is always empty for a fork PR,
   # so resolve the PR from its head reference instead. The head-SHA match
@@ -107,11 +119,24 @@ publish() {
     --jq '.artifacts[] | select(.expired == false and (.name | startswith("e2e-evidence-"))) | .name' \
     | head -n1)
   if [ -z "$ARTIFACT_NAME" ]; then
-    if [ "$PRODUCER_CONCLUSION" != "success" ]; then
-      echo "No E2E evidence artifact for CI run $SOURCE_RUN_ID, and its producer did not run (Desktop E2E: ${PRODUCER_CONCLUSION:-absent}). Nothing to publish."
-      return 0
-    fi
-    echo "Desktop E2E succeeded but produced no evidence artifact for CI run $SOURCE_RUN_ID." >&2
+    case "$PRODUCER_CONCLUSION" in
+      skipped)
+        # The producer is deliberately disabled (ci.yaml `if: ${{ false && ... }}`).
+        echo "No E2E evidence artifact for CI run $SOURCE_RUN_ID: Desktop E2E was skipped. Nothing to publish."
+        return 0
+        ;;
+      "")
+        # No job matched the name filter. That is NOT evidence of a
+        # deliberate skip — the job may have been renamed or removed, or
+        # the filter may have drifted. Fail loudly rather than reporting
+        # success while attaching nothing.
+        echo "No Desktop E2E job found in CI run $SOURCE_RUN_ID; the producer may have been renamed or removed." >&2
+        echo "Refusing to report success with no evidence attached." >&2
+        return 1
+        ;;
+    esac
+    # failure / cancelled / timed_out: the producer RAN and did not deliver.
+    echo "Desktop E2E concluded '$PRODUCER_CONCLUSION' and produced no evidence artifact for CI run $SOURCE_RUN_ID." >&2
     echo "Publishing evidence is this workflow's primary function, so this is a failure, not a skip." >&2
     return 1
   fi
@@ -120,11 +145,20 @@ publish() {
   mkdir -p "$EVIDENCE_DIR"
   gh run download "$SOURCE_RUN_ID" --repo "$SOURCE_REPO" --name "$ARTIFACT_NAME" --dir "$EVIDENCE_DIR"
 
-  echo "$PUBLISHER_MARKER"
+  # The publisher signals a rate limit with a DEDICATED EXIT CODE rather
+  # than log text: its stdout echoes filenames taken from the untrusted PR
+  # artifact, so classifying it by grep would let a manifest spoof the
+  # rate-limit tolerance.
+  # Its output goes to a SEPARATE file so it never reaches the transport
+  # log that the rate-limit grep reads.
+  set +e
   python3 scripts/ci/publish_e2e_evidence.py \
     --evidence-dir "$EVIDENCE_DIR" \
     --source-repo "$SOURCE_REPO" \
-    --pr-number "$PR_NUMBER"
+    --pr-number "$PR_NUMBER" >"$PUBLISHER_LOG" 2>&1
+  publisher_rc=$?
+  set -e
+  return "$publisher_rc"
 }
 
 # Run in an explicit SUBSHELL, not a pipeline. A pipeline would work too
@@ -134,16 +168,22 @@ publish() {
 ( publish ) >"$LOG_FILE" 2>&1
 rc=$?
 cat "$LOG_FILE"
+# Printed for humans, deliberately NOT part of the classified transport log.
+[ -s "$PUBLISHER_LOG" ] && cat "$PUBLISHER_LOG"
 
 if [ "$rc" -eq 0 ]; then
   exit 0
 fi
 
-# Classify ONLY the transport portion of the log: everything from the
-# publisher marker onward can echo attacker-chosen filenames.
-sed "/$PUBLISHER_MARKER/,\$d" "$LOG_FILE" > "$WORK_DIR/transport.log"
+if [ "$rc" -eq "$PUBLISHER_RATE_LIMITED_RC" ]; then
+  echo "::warning::E2E evidence not published: the publisher hit the installation rate limit. Not failing the step."
+  exit 0
+fi
 
-if grep -qiE "$RATE_LIMIT_PATTERN" "$WORK_DIR/transport.log"; then
+# gh/transport output is trusted (it is not attacker-influenced), so a
+# rate-limit signature there is a safe tolerance signal. The publisher's own
+# output is deliberately NOT consulted — see PUBLISHER_RATE_LIMITED_RC.
+if grep -qiE "$RATE_LIMIT_PATTERN" "$LOG_FILE"; then
   echo "::warning::E2E evidence not published: the shared installation rate-limit budget is exhausted (exit $rc). Not failing the step."
   exit 0
 fi
