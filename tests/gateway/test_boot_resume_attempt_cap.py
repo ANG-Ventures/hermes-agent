@@ -196,17 +196,30 @@ def test_store_written_by_an_older_gateway_loads_with_zero_counters(tmp_path):
     assert store.has_attempt("s1", 7) is True
 
 
-def test_poisoned_store_denies_resume_credit_rather_than_minting_it(tmp_path, caplog):
-    """Fail CLOSED, matching ``has_attempt``: a broken backstop must not grant credit."""
+def test_poisoned_store_reports_unknown_rather_than_a_spent_budget(tmp_path, caplog):
+    """A store fault is evidence about the STORE, not about any session's budget.
+
+    Deliberately NOT ``has_attempt``'s fail-closed posture. That one degrades a
+    single turn from ``auto`` to ``prompt`` and keeps the transcript; the cap's
+    skip branch retires ``resume_pending``, so reporting a poisoned store as
+    "over budget" stripped restart continuity from every session on the host
+    (measured in review: SCHEDULED 0 and both markers cleared, for two sessions
+    that had never resumed once). Scheduler-grain contract:
+    ``test_boot_resume_cap_poisoned_store.py``.
+    """
     path = tmp_path / "attempts.json"
     path.write_text("{not json", encoding="utf-8")
     store = AutoResumeAttemptStore(path)
 
     with caplog.at_level(logging.WARNING):
-        assert store.session_cap_reached("s1", 3) is True
-        assert store.record_session_attempt("s1") > 3
+        assert store.session_attempt_count("s1") is None
+        assert store.session_cap_reached("s1", 3) is False
+        assert store.record_session_attempt("s1") is None
     # Exactly one warning for a poisoned store, matching the existing contract.
     assert sum("unparseable" in r.getMessage() for r in caplog.records) == 1
+    # ...and the rowid credit keeps failing CLOSED, which is the bounded
+    # degradation that still covers a corrupt store.
+    assert store.has_attempt("s1", 7) is True
 
 
 @pytest.mark.parametrize(
@@ -218,13 +231,37 @@ def test_poisoned_store_denies_resume_credit_rather_than_minting_it(tmp_path, ca
         pytest.param({"s1": {"count": 1, "attempted_at": "soon"}}, id="non_numeric_ts"),
     ],
 )
-def test_malformed_session_counters_fail_closed(tmp_path, counters):
+def test_malformed_session_counters_report_unknown(tmp_path, counters):
     path = tmp_path / "attempts.json"
     path.write_text(
         json.dumps({"version": 1, "attempts": [], "session_attempts": counters}),
         encoding="utf-8",
     )
-    assert AutoResumeAttemptStore(path).session_cap_reached("s1", 3) is True
+    store = AutoResumeAttemptStore(path)
+    assert store.session_attempt_count("s1") is None
+    assert store.session_cap_reached("s1", 3) is False
+
+
+def test_a_failed_counter_write_does_not_cap_the_session(tmp_path, caplog):
+    """Lost accounting must not read as a spent budget either.
+
+    ``record_session_attempt`` reports ``None`` when it could not persist, and
+    the poisoned store it leaves behind answers ``unknown`` — so the session
+    keeps resuming (and keeps its marker) instead of being capped by a disk
+    fault it had nothing to do with.
+    """
+    path = tmp_path / "attempts.json"
+    store = AutoResumeAttemptStore(path)
+    store.record_session_attempt("s1")
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("read-only file system")
+
+    store._write = _boom
+    with caplog.at_level(logging.WARNING):
+        assert store.record_session_attempt("s1") is None
+    assert store.session_attempt_count("s1") is None
+    assert store.session_cap_reached("s1", 3) is False
 
 
 def test_session_counters_expire_with_the_attempt_ttl(tmp_path):

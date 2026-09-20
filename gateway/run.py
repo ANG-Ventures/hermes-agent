@@ -16021,6 +16021,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # from replaying it unprompted, which puts a human back in the loop.
             _max_attempts = _auto_resume_max_attempts()
             if _max_attempts > 0:
+                # Fails OPEN on every path: an unreadable store makes
+                # ``session_cap_reached`` answer False (unknown is not over
+                # budget), and an exception here is swallowed the same way.
+                # Both matter because the skip branch below CLEARS the marker —
+                # a store fault must never be able to retire restart continuity
+                # for a session it knows nothing about, which is what the
+                # 1_000_000-sentinel version of this check did host-wide.
                 try:
                     _attempts_store = self._get_auto_resume_attempt_store()
                     _capped = _attempts_store.session_cap_reached(

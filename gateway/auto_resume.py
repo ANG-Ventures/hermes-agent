@@ -58,12 +58,6 @@ _STORE_VERSION = 1
 # achieved nothing accumulate. ``<= 0`` disables the cap.
 DEFAULT_AUTO_RESUME_MAX_ATTEMPTS = 3
 
-# Sentinel count returned when the attempt store is unreadable or a counter
-# write failed. Sits above the clamp ceiling on ``max_attempts`` so every
-# ``count >= cap`` test blocks — a broken backstop denies resume credit rather
-# than minting it (same fail-closed posture as ``has_attempt``).
-_POISONED_ATTEMPT_COUNT = 1_000_000
-
 # Auto-resume is allowlist-based.  Unknown tools fail closed because plugins and
 # MCP servers can expose arbitrary side effects under names core cannot classify.
 _READ_ONLY_TOOLS = frozenset(
@@ -602,35 +596,49 @@ class AutoResumeAttemptStore:
     # we resumed this session without it getting anywhere", which is the
     # question the 2026-09-20 replay storm needed answered.
 
-    def session_attempt_count(self, session_key: str) -> int:
-        """Attempts recorded for ``session_key``; a poisoned store reads high.
+    def session_attempt_count(self, session_key: str) -> int | None:
+        """Attempts recorded for ``session_key``; ``None`` when unknowable.
 
-        Fail-closed matches ``has_attempt``: a corrupt backstop must deny
-        resume credit, never mint it. Returned as a sentinel above any sane cap
-        so every caller's ``>= cap`` comparison blocks.
+        A poisoned store reports ``None``, NOT a large number. It deliberately
+        does not copy ``has_attempt``'s fail-closed posture, because the two
+        denials are not the same size: ``has_attempt`` failing closed degrades
+        one turn from ``auto`` to ``prompt`` — the transcript survives and the
+        next user message continues it — whereas the cap's skip branch retires
+        ``resume_pending``, which is irreversible and was measured stripping
+        restart continuity from every session on the host at once.
+
+        A store fault is evidence about the STORE. It is not evidence that some
+        session spent a budget, so it must not be reported as one.
         """
         state = self._load_state()
         if state is None:
-            return _POISONED_ATTEMPT_COUNT
+            return None
         return int(state[1].get(session_key, {}).get("count", 0))
 
     def session_cap_reached(self, session_key: str, max_attempts: int) -> bool:
-        """True when ``session_key`` has exhausted its boot-resume budget."""
+        """True when ``session_key`` has provably exhausted its budget.
+
+        Unknown is not over budget: an unreadable store answers ``False`` so a
+        session with no recorded attempts keeps resuming and keeps its marker.
+        """
         if max_attempts <= 0:
             return False
-        return self.session_attempt_count(session_key) >= max_attempts
+        count = self.session_attempt_count(session_key)
+        if count is None:
+            return False
+        return count >= max_attempts
 
-    def record_session_attempt(self, session_key: str) -> int:
+    def record_session_attempt(self, session_key: str) -> int | None:
         """Increment and persist ``session_key``'s counter; return the new count.
 
-        A write failure poisons the store, which makes every later
-        ``session_attempt_count`` read high — so a session whose increment could
-        not be persisted is denied further resumes rather than granted unbounded
-        ones.
+        ``None`` means the attempt could NOT be recorded — an unreadable store,
+        or a write that failed. The caller treats that as lost accounting, not
+        as a spent budget: an unrecordable attempt leaves the cap reading
+        ``unknown``, which keeps resuming rather than capping on a store fault.
         """
         state = self._load_state()
         if state is None:
-            return _POISONED_ATTEMPT_COUNT
+            return None
         attempts, session_attempts = state
         count = int(session_attempts.get(session_key, {}).get("count", 0)) + 1
         session_attempts[session_key] = {
@@ -642,7 +650,7 @@ class AutoResumeAttemptStore:
         except Exception as exc:
             self._invalid = True
             self._warn_invalid(exc)
-            return _POISONED_ATTEMPT_COUNT
+            return None
         return count
 
     def clear_session_attempts(self, session_key: str) -> None:
