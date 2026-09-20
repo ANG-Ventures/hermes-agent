@@ -18,38 +18,12 @@ import re
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 API_BASE = "https://api.github.com"
-
-# Distinct exit code meaning "the shared installation rate-limit budget is
-# exhausted". publish_evidence_step.sh tolerates ONLY this code, because the
-# stdout of this script echoes filenames taken from the untrusted PR
-# artifact and therefore cannot be trusted to classify the failure.
-RATE_LIMITED_EXIT_CODE = 75
-
-
-def _is_rate_limited(err: urllib.error.HTTPError) -> bool:
-    """True when an HTTP error is a rate-limit response, not a real failure."""
-    if err.code == 429:
-        return True
-    if err.code != 403:
-        return False
-    headers = err.headers
-    if headers is None:
-        return False
-    if str(headers.get("X-RateLimit-Remaining", "")).strip() == "0":
-        return True
-    if headers.get("Retry-After"):
-        return True
-    try:
-        return "rate limit" in err.read().decode("utf-8", "replace").lower()
-    except Exception:
-        return False
 EVIDENCE_START = "<!-- hermes-e2e-evidence:start -->"
 EVIDENCE_END = "<!-- hermes-e2e-evidence:end -->"
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -355,20 +329,7 @@ def main() -> int:
     session_token = os.environ.get("GH_SESSION_TOKEN", "")
     if not session_token:
         parser.error("GH_SESSION_TOKEN is required")
-    try:
-        publish(token, args.source_repo, args.evidence_dir, args.pr_number, session_token)
-    except urllib.error.HTTPError as e:
-        # The publisher makes its own installation-token API calls (comment
-        # GET/PATCH), so the shared budget can run out HERE, after the
-        # artifact download. The wrapper cannot classify that from the log:
-        # this script's output echoes filenames from the untrusted PR
-        # artifact, so log-grepping it is a spoofing seam. Signal the class
-        # out-of-band with a dedicated exit code instead.
-        if _is_rate_limited(e):
-            print(f"Rate limited by the GitHub API ({e.code}); evidence not published.",
-                  file=sys.stderr)
-            return RATE_LIMITED_EXIT_CODE
-        raise
+    publish(token, args.source_repo, args.evidence_dir, args.pr_number, session_token)
     return 0
 
 
