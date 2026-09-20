@@ -34,6 +34,12 @@ class TurnRecord:
     tools: List[str] = field(default_factory=list)  # ["exec","exec","read"]
     input_tokens: int = 0
     output_tokens: int = 0
+    # UNKNOWN != 0. True when the provider explicitly declined to measure this
+    # turn's output (null count + discriminator flag — see
+    # agent.usage_pricing.CanonicalUsage.output_tokens_unknown). ``output_tokens``
+    # stays an int for arithmetic; renderers MUST consult this flag and show
+    # "unknown" rather than presenting the 0 as a measurement.
+    output_tokens_unknown: bool = False
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
     reasoning_tokens: int = 0

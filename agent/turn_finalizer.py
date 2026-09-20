@@ -897,6 +897,14 @@ def finalize_turn(
                     "api_calls": len(_turn_calls),
                     "input_tokens": sum(c["input_tokens"] for c in _turn_calls),
                     "output_tokens": sum(c["output_tokens"] for c in _turn_calls),
+                    # UNKNOWN != 0 — absorbing across the turn's calls. If ANY
+                    # call's output was unmeasured the summed output above is
+                    # missing a term, so it is not a measurement and must not be
+                    # priced or rendered as one (see
+                    # CanonicalUsage.output_tokens_unknown).
+                    "output_tokens_unknown": any(
+                        bool(c.get("output_tokens_unknown")) for c in _turn_calls
+                    ),
                     "cache_read_tokens": sum(c["cache_read_tokens"] for c in _turn_calls),
                     "cache_write_tokens": sum(c["cache_write_tokens"] for c in _turn_calls),
                     "reasoning_tokens": sum(c["reasoning_tokens"] for c in _turn_calls),

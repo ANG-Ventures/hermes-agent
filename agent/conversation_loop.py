@@ -4679,6 +4679,12 @@ def run_conversation(
                     prompt_tokens = canonical_usage.prompt_tokens
                     completion_tokens = canonical_usage.output_tokens
                     total_tokens = canonical_usage.total_tokens
+                    # UNKNOWN != 0: the provider explicitly declined to measure
+                    # this turn's output (see CanonicalUsage.output_tokens_unknown).
+                    # The int fields above stay 0 so arithmetic consumers keep
+                    # working; this flag rides alongside so every persistence and
+                    # display site can refuse to present the 0 as a measurement.
+                    output_unknown = bool(canonical_usage.output_tokens_unknown)
                     # Forward canonical token + cache buckets so context engines
                     # can make decisions on cache hit ratios / reasoning costs,
                     # not just legacy aggregate tokens. Legacy keys stay for
@@ -4811,6 +4817,7 @@ def run_conversation(
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
                         "total_tokens": total_tokens,
+                        "output_tokens_unknown": output_unknown,
                     }
                     # Blackbox per-TURN accumulator (separate from the per-CALL
                     # snapshot above). INVARIANT: this append lives INSIDE the
@@ -4832,6 +4839,7 @@ def run_conversation(
                             "prompt_tokens": prompt_tokens,
                             "completion_tokens": completion_tokens,
                             "total_tokens": total_tokens,
+                            "output_tokens_unknown": output_unknown,
                             "latency_s": api_duration,
                             "composition": _call_composition,
                         })
@@ -4854,9 +4862,13 @@ def run_conversation(
                     if canonical_usage.cache_read_tokens and prompt_tokens:
                         _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100*canonical_usage.cache_read_tokens/prompt_tokens:.0f}%)"
                     logger.info(
-                        "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s",
+                        "API call #%d: model=%s provider=%s in=%d out=%s total=%s latency=%.1fs%s",
                         agent.session_api_calls, agent.model, agent.provider or "unknown",
-                        prompt_tokens, completion_tokens, total_tokens,
+                        prompt_tokens,
+                        # UNKNOWN != 0: an unmeasured output logged as `out=0`
+                        # reads as a dead round-trip. Say `out=unknown` instead.
+                        "unknown" if output_unknown else completion_tokens,
+                        "unknown" if output_unknown else total_tokens,
                         api_duration, _cache_pct,
                     )
 

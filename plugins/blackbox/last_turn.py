@@ -34,7 +34,17 @@ _LOG = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 # Formatting helpers (verbatim from blackbox-inspect)
 # --------------------------------------------------------------------------- #
-def _humanize_tok(n) -> str:
+def _humanize_tok(n, *, unknown: bool = False) -> str:
+    """Token magnitude for the last-turn card; unknown spelling is shared.
+
+    The UNKNOWN rule is single-sourced in agent.usage_pricing.format_token_count
+    so this renderer, the alert card and usage.ace cannot drift on how an
+    unmeasured turn reads. The k/M magnitude formatting below is unchanged.
+    """
+    if unknown:
+        from agent.usage_pricing import format_token_count
+
+        return format_token_count(n, unknown=True)
     try:
         n = int(n or 0)
     except (TypeError, ValueError):
@@ -275,7 +285,12 @@ def render_last_turn_record(rec: Dict[str, Any], compressions: "int | None" = No
     # broken out (Ace 2026-06-14: /context reports finished/unfinished only, not
     # final/reasoning). When the per-call split is unknown (old/NULL/blackbox-off
     # blob) show the bare billed total — NEVER fall back to final/reasoning.
-    if out_tok > 0:
+    if bool(rec.get("output_tokens_unknown")):
+        # UNKNOWN != 0: the provider never measured this turn's output, so the
+        # stored 0 is absence of data. Show it as unknown rather than omitting
+        # the row (omission reads as "nothing generated") or splitting a 0.
+        lines.append(f"• Tokens out: {_humanize_tok(0, unknown=True)}")
+    elif out_tok > 0:
         finished_output, unfinished_output = turn_output_split(
             _comp_calls_from_json(rec.get("comp_calls_json")),
             out_tok,
