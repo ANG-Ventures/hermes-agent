@@ -19093,8 +19093,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _interrupted_keys: set = set()
             _drained_clean_keys: set = set()
 
-            if not timed_out:
-                # Drain completed gracefully — all running sessions finished.
+            # Chat/api turns are the only work whose transcript the interrupt
+            # below can leave half-finished. A cron job that outlives its own
+            # deadline (#82161 split the budgets) is terminated and recorded
+            # in jobs.json — it never leaves a session tail to recover. But
+            # ``timed_out`` still ORs the two together, and gating the
+            # hedge-clear pass and the .clean_shutdown marker on it meant a
+            # cron-only overrun skipped both: the next boot then ran
+            # suspend_recently_active() and re-prompted every session active
+            # in the last 120s (measured 2026-09-20 00:22:34: active_at_start=0,
+            # active_now=0, cron_now=1 -> marker skipped -> "Marked 4 in-flight
+            # session(s) as resumable" -> four finished sessions resumed).
+            # Pending sentinels have no agent to interrupt, exactly as the
+            # ``_interrupted_keys`` capture below treats them.
+            agents_timed_out = bool(timed_out) and bool(
+                any(
+                    _agent is not _AGENT_PENDING_SENTINEL
+                    for _agent in self._running_agents.values()
+                )
+                or self._active_api_run_count()
+            )
+
+            if not agents_timed_out:
+                # No chat/api turn outlived the drain — every running session
+                # finished (a cron-only overrun is handled in the block below).
                 # Clear the pre-drain resume_pending markers so sessions that
                 # completed during the drain window don't carry a stale flag.
                 for _sk in _pre_drain_keys:
@@ -19455,7 +19477,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # message).  Skip the marker in that case so the next startup
             # suspends those sessions — giving users a clean slate instead
             # of resuming a half-finished tool loop.
-            if not timed_out:
+            if not agents_timed_out:
+                if timed_out:
+                    logger.info(
+                        "Drain timed out on cron/background work only — no chat "
+                        "or api turn was interrupted; writing .clean_shutdown "
+                        "marker so the next startup does not suspend and "
+                        "re-prompt sessions that finished cleanly."
+                    )
                 try:
                     (_hermes_home / ".clean_shutdown").touch()
                 except Exception:
@@ -19482,7 +19511,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # point either — the interrupt path above has drained it, so a
             # fresh read would be empty and a real stuck loop would never
             # accumulate.
-            if timed_out:
+            if agents_timed_out:
                 if _interrupted_keys:
                     self._increment_restart_failure_counts(_interrupted_keys)
                 # Sessions that finished during the drain window proved they
