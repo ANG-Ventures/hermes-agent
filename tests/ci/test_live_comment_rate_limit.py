@@ -187,7 +187,7 @@ def test_artifacts_are_downloaded_once_per_id(monkeypatch, tmp_path):
 
     downloads = []
 
-    def fake_download(token, repo, artifact, dest):
+    def fake_download(token, repo, artifact, dest, deadline=None):
         downloads.append(artifact["id"])
         return Path(f"/nonexistent/{artifact['id']}.json")
 
@@ -214,7 +214,7 @@ def test_failed_artifact_download_is_not_cached(monkeypatch, tmp_path):
 
     attempts = {"n": 0}
 
-    def fake_download(token, repo, artifact, dest):
+    def fake_download(token, repo, artifact, dest, deadline=None):
         attempts["n"] += 1
         if attempts["n"] == 1:
             return None
@@ -499,8 +499,19 @@ def test_api_calls_carry_a_socket_timeout(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     _mod._api_request("https://api.github.com/run", "tok")
     _mod.upsert_comment("tok", "o/r", "5", "body", comment_id=0)
-    assert seen and all(t is not None for t in seen), \
-        f"an API call was made with no socket timeout: {seen}"
+    # `is not None` admitted a timeout of 0, which urllib treats as a
+    # non-blocking socket that fails instantly — measured: setting
+    # _REQUEST_TIMEOUT = 0 left this whole file green. The expectation is a
+    # deliberate literal, NOT derived from _REQUEST_TIMEOUT, so mutating the
+    # constant moves the code without moving the assertion.
+    assert seen, "no API call was observed"
+    for t in seen:
+        assert isinstance(t, (int, float)) and not isinstance(t, bool), \
+            f"an API call was made with a non-numeric socket timeout: {seen}"
+        assert 5 <= t <= 120, (
+            f"an API call used a {t}s socket timeout; a GitHub API call needs "
+            "a real, bounded window (0 fails instantly, huge values hang)"
+        )
 
 
 def test_graphql_headers_do_not_pollute_the_rest_budget(monkeypatch):
@@ -638,7 +649,8 @@ def test_failed_download_of_a_new_id_keeps_the_published_section(monkeypatch, tm
          "archive_download_url": "u"}])
     monkeypatch.setattr(
         _mod, "_download_artifact",
-        lambda t, r, artifact, dest: None if state["fail"] else Path("/x.json"))
+        lambda t, r, artifact, dest, deadline=None: (
+            None if state["fail"] else Path("/x.json")))
     monkeypatch.setattr(_mod, "_parse_status_file",
                         lambda p: [{"source": "lint", "results": [{"ok": 1}]}])
 
@@ -697,17 +709,101 @@ def test_queue_pause_is_bounded_by_the_wall_clock_budget(monkeypatch):
     )
 
 
-def test_workflow_sets_a_wall_clock_budget_below_the_job_timeout():
-    """A budget at or above timeout-minutes would never fire."""
+def _workflow_wall_budget():
+    """The budget the workflow ACTUALLY runs with: override or default.
+
+    An absent `--max-wall-seconds` means the script's default applies. A
+    PRESENT one must be read in whatever form argparse accepts — argparse
+    takes `--max-wall-seconds=1799` as readily as the space form, and a
+    regex matching only the space form would silently substitute the safe
+    default and let these guards pass while the poller ran with 1799s.
+    A present-but-unparseable value is a hard failure, not a default.
+    """
     root = Path(__file__).resolve().parents[2]
-    text = (root / ".github/workflows/ci-review-comment.yml").read_text(encoding="utf-8")
+    text = (root / ".github/workflows/ci-review-comment.yml").read_text(
+        encoding="utf-8")
     job_timeout_min = int(
         re.search(r"^\s*timeout-minutes:\s*(\d+)", text, re.M).group(1))
-    budget = int(re.search(r"--max-wall-seconds (\d+)", text).group(1))
-    assert budget < job_timeout_min * 60, (
-        f"--max-wall-seconds {budget} is not below the job's "
-        f"timeout-minutes ({job_timeout_min} = {job_timeout_min * 60}s), so "
+    # Only the invocation matters — the file's comments discuss the flag.
+    invocation = text[text.index("live_comment.py"):]
+    present = re.search(r"--max-wall-seconds(?:[=\s]+)(\S+)", invocation)
+    if present is None:
+        budget = _mod._DEFAULT_MAX_WALL_SECONDS
+    else:
+        raw = present.group(1).strip().strip("\\").strip()
+        assert raw.isdigit(), (
+            f"the workflow passes --max-wall-seconds {raw!r}, which this "
+            "guard cannot evaluate — the poller would run with an unchecked "
+            "wall-clock budget"
+        )
+        budget = int(raw)
+    return job_timeout_min * 60, budget
+
+
+def _workflow_poll_ceiling():
+    """When the workflow's poller actually STOPS polling."""
+    _, budget = _workflow_wall_budget()
+    return budget - _mod._SHUTDOWN_RESERVE_SECONDS
+
+
+def test_workflow_sets_a_wall_clock_budget_below_the_job_timeout():
+    """A budget at or above timeout-minutes would never fire."""
+    job_timeout, budget = _workflow_wall_budget()
+    assert budget < job_timeout, (
+        f"the poller's effective wall budget {budget} is not below the job's "
+        f"timeout-minutes ({job_timeout}s), so "
         "the poller is still killed before it can stop cleanly"
+    )
+
+
+def test_workflow_keeps_the_supported_50_minute_monitoring_window():
+    """F1: the monitoring window is a DECISION, not a side-effect.
+
+    Active polling must still reach 3000s — the window the poller had
+    before the shutdown reserve was carved out of the budget. Letting the
+    reserve shorten it (budget 2700 => ceiling 2400) is a user-visible
+    regression: a CI or merge-queue run finishing between 40 and 50 minutes
+    has its final snapshot taken while still in progress and is never
+    updated.
+
+    A LITERAL, not derived from the constants — deriving it would move the
+    expectation in lockstep with any future budget cut and gate nothing.
+    """
+    assert _workflow_poll_ceiling() >= 3000, (
+        f"active polling now stops at {_workflow_poll_ceiling()}s; the "
+        "supported monitoring window is 50 minutes (3000s), so a run "
+        "finishing after that is reported as still running"
+    )
+
+
+def test_the_workflow_states_its_budget_explicitly():
+    """F1: the window must not be INHERITED from the script's default.
+
+    ``_workflow_poll_ceiling`` above is satisfied either by the flag or by
+    the default, so each alone gates nothing. The workflow is where an
+    operator reads the monitoring window, and a silent change to the
+    script's default must not move it.
+    """
+    root = Path(__file__).resolve().parents[2]
+    text = (root / ".github/workflows/ci-review-comment.yml").read_text(
+        encoding="utf-8")
+    invocation = text[text.index("live_comment.py"):]
+    assert re.search(r"--max-wall-seconds[=\s]", invocation), (
+        "the workflow passes no --max-wall-seconds, so its monitoring "
+        "window is whatever the script's default happens to be"
+    )
+
+
+def test_the_script_default_also_holds_the_supported_window():
+    """F1: the other half — the default is the fallback, not a shortcut.
+
+    A poller invoked without the flag (a manual run, a future workflow)
+    must still get the supported window rather than a silently shorter one.
+    """
+    ceiling = _mod._DEFAULT_MAX_WALL_SECONDS - _mod._SHUTDOWN_RESERVE_SECONDS
+    assert ceiling >= 3000, (
+        f"the script's own default stops polling at {ceiling}s, below the "
+        "supported 3000s monitoring window"
     )
 
 
@@ -723,21 +819,33 @@ def test_queued_pr_is_rechecked_not_abandoned(monkeypatch):
     publish the result. The poller must PAUSE and recheck, not exit.
     """
     memberships = [True, True, False]
-    checks = {"n": 0}
+    checks = {"n": 0, "released_at": None}
 
     def fake_queued(token, repo, pr):
         checks["n"] += 1
-        return memberships[min(checks["n"] - 1, len(memberships) - 1)]
+        still = memberships[min(checks["n"] - 1, len(memberships) - 1)]
+        if not still and checks["released_at"] is None:
+            checks["released_at"] = clock["t"]
+        return still
 
     monkeypatch.setattr(_mod, "pr_is_in_merge_queue", fake_queued)
+    # CI must PROGRESS across the queue period, or the post-dequeue body is
+    # byte-identical to the pre-pause snapshot and is correctly deduped —
+    # and then "a write happened after the dequeue" is unprovable for a
+    # correct implementation as well as a broken one.
     monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: (
-        [{"name": "Python tests", "status": "completed",
-          "conclusion": "success", "html_url": "u"}], True))
+        [{"name": "Python tests",
+          "status": "completed" if checks["released_at"] is not None
+          else "in_progress",
+          "conclusion": "failure" if checks["released_at"] is not None else None,
+          "html_url": "u"}],
+        checks["released_at"] is not None))
     monkeypatch.setattr(_mod, "fetch_all_review_statuses", lambda *a, **k: [])
 
-    posted: list[str] = []
-    monkeypatch.setattr(_mod, "upsert_comment",
-                        lambda t, r, p, body, comment_id=None: posted.append(body) or 7)
+    posted: list[tuple[float, str]] = []
+    monkeypatch.setattr(
+        _mod, "upsert_comment",
+        lambda t, r, p, body, comment_id=None: posted.append((clock["t"], body)) or 7)
 
     slept: list[float] = []
     clock = {"t": 0.0}
@@ -751,8 +859,17 @@ def test_queued_pr_is_rechecked_not_abandoned(monkeypatch):
     assert rc == 0
     assert checks["n"] >= 2, \
         "membership was checked once and the poller gave up; a dequeue is unreported"
+    assert checks["released_at"] is not None, \
+        "the poller exited before the PR was ever seen to leave the queue"
     assert posted, \
         "the PR left the merge queue but no comment was ever published"
+    # The pre-pause snapshot also writes, so "posted is non-empty" alone
+    # does not prove the DEQUEUE was reported. Require a write at or after
+    # the moment membership went false.
+    assert any(t >= checks["released_at"] for t, _ in posted), (
+        f"every write landed before the dequeue at t={checks['released_at']:.0f}s "
+        f"(writes at {[round(t) for t, _ in posted]})"
+    )
 
 
 def test_queued_pause_does_not_consume_the_poll_lifetime(monkeypatch):
@@ -764,36 +881,63 @@ def test_queued_pause_does_not_consume_the_poll_lifetime(monkeypatch):
     publish its result. That is the same bug the pause replaced.
     """
     # Queued far longer than the whole 1800s timeout, then released.
-    queued = {"n": 0}
+    queued = {"n": 0, "released_at": None}
 
     def fake_queued(token, repo, pr):
         queued["n"] += 1
-        return queued["n"] <= 20        # 20 * 300s = 6000s >> timeout
+        still = queued["n"] <= 20        # 20 * 300s = 6000s >> timeout
+        if not still and queued["released_at"] is None:
+            queued["released_at"] = clock["t"]
+        return still
 
     monkeypatch.setattr(_mod, "pr_is_in_merge_queue", fake_queued)
+    # CI progresses across the queue period so the post-dequeue body really
+    # differs from the pre-pause snapshot; an identical body is correctly
+    # deduped and would make the post-dequeue assertion unprovable.
     monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: (
-        [{"name": "Python tests", "status": "completed",
-          "conclusion": "success", "html_url": "u"}], True))
+        [{"name": "Python tests",
+          "status": "completed" if queued["released_at"] is not None
+          else "in_progress",
+          "conclusion": "success" if queued["released_at"] is not None else None,
+          "html_url": "u"}],
+        queued["released_at"] is not None))
     monkeypatch.setattr(_mod, "fetch_all_review_statuses", lambda *a, **k: [])
 
-    posted: list[str] = []
-    monkeypatch.setattr(_mod, "upsert_comment",
-                        lambda t, r, p, body, comment_id=None: posted.append(body) or 7)
+    posted: list[tuple[float, str]] = []
+    monkeypatch.setattr(
+        _mod, "upsert_comment",
+        lambda t, r, p, body, comment_id=None: posted.append((clock["t"], body)) or 7)
 
     clock = {"t": 0.0}
     monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
     monkeypatch.setattr(_mod.time, "sleep",
                         lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
 
+    # The wall budget must exceed the 6000s queued period, or the poller
+    # stops at its ceiling while STILL queued and the test proves nothing:
+    # `posted` would be satisfied by the pre-pause snapshot alone.
     rc = _mod.run(token="t", repo="o/r", run_id="1", pr_number="5",
-                  run_url="u", interval=45, timeout=1800, dry_run=False)
+                  run_url="u", interval=45, timeout=1800, dry_run=False,
+                  max_wall_seconds=20000)
 
     assert rc == 0
     assert clock["t"] > 1800, "the test did not actually outlast the timeout"
+    assert queued["released_at"] is not None, (
+        "the poller never saw the PR leave the queue — it stopped early, so "
+        "this test never exercised the dequeue path at all"
+    )
     assert posted, (
         f"the PR sat queued for {clock['t']:.0f}s (timeout 1800s), was then "
         "dequeued, and the poller had already exited — its result is "
         "permanently unreported"
+    )
+    # The load-bearing claim: a write happened AFTER the dequeue, not just
+    # the pre-pause snapshot taken while it was still queued.
+    assert any(t >= queued["released_at"] for t, _ in posted), (
+        f"every write happened before the dequeue at t="
+        f"{queued['released_at']:.0f}s "
+        f"(writes at {[round(t) for t, _ in posted]}) — the PR was abandoned "
+        "with only its stale initial snapshot"
     )
 
 
@@ -1295,16 +1439,45 @@ def test_artifact_slug_is_bounded(monkeypatch, tmp_path):
 
 
 def test_wall_clock_budget_leaves_a_real_shutdown_margin():
-    """One second below the job timeout is not a margin."""
-    root = Path(__file__).resolve().parents[2]
-    text = (root / ".github/workflows/ci-review-comment.yml").read_text(encoding="utf-8")
-    job_timeout = int(
-        re.search(r"^\s*timeout-minutes:\s*(\d+)", text, re.M).group(1)) * 60
-    budget = int(re.search(r"--max-wall-seconds (\d+)", text).group(1))
-    margin = job_timeout - budget
-    assert margin >= 120, (
-        f"--max-wall-seconds {budget} leaves only {margin}s before the job's "
-        f"{job_timeout}s deadline — not enough to publish a final status"
+    """The shutdown snapshot must have real slack past the whole budget.
+
+    Active polling stops at ``budget - reserve``; the snapshot then runs
+    until ``budget`` at the latest. But the artifact deadline only blocks
+    STARTING new work — an in-flight redirect + blob request can each run a
+    further socket timeout, and the final PATCH costs another. So the job
+    deadline must sit at least that overrun past the FULL budget, not
+    merely past the poll ceiling, or the snapshot is racing a SIGKILL.
+
+    Every expectation here is a deliberate LITERAL. Deriving them from
+    ``_SHUTDOWN_RESERVE_SECONDS`` / ``_REQUEST_TIMEOUT`` moved the assertion
+    in lockstep with the code, so zeroing either constant stayed green
+    (measured: 68 passed with ``_SHUTDOWN_RESERVE_SECONDS = 0``).
+    """
+    job_timeout, budget = _workflow_wall_budget()
+
+    # A reserve that is actually a window, sized for the serial API calls
+    # the snapshot makes. 60s is the floor a single artifact fetch needs.
+    assert _mod._SHUTDOWN_RESERVE_SECONDS >= 60, (
+        f"the shutdown reserve is {_mod._SHUTDOWN_RESERVE_SECONDS}s — too "
+        "small for the snapshot's serial API calls (a single artifact fetch "
+        "is a 30s redirect plus a 30s blob request)"
+    )
+    assert _mod._SHUTDOWN_RESERVE_SECONDS <= budget / 2, (
+        "the shutdown reserve consumes more than half the poll budget"
+    )
+    poll_ceiling = budget - _mod._SHUTDOWN_RESERVE_SECONDS
+    assert poll_ceiling > 0, "the reserve consumed the entire budget"
+
+    # An in-flight redirect + blob request plus the final PATCH, at the
+    # socket timeouts a GitHub API call and an artifact blob are allowed:
+    # 30 + 30 + 30. Literal, not derived. 60 undercounted the very path
+    # this docstring describes and would have admitted a 60-89s margin that
+    # is still SIGKILLed before publishing.
+    overrun = 90
+    assert job_timeout - budget >= overrun, (
+        f"the wall budget {budget}s ends only {job_timeout - budget}s before "
+        f"the job's {job_timeout}s deadline, but an in-flight artifact "
+        f"request plus the final PATCH can overrun it by {overrun}s"
     )
 
 
@@ -1343,27 +1516,32 @@ def test_wall_clock_cutoff_publishes_before_exiting(monkeypatch):
     monkeypatch.setattr(_mod.time, "sleep",
                         lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
 
-    # dry_run=False + a PR that never leaves the queue means the ONLY
-    # write opportunities are the pre-pause snapshot and the wall-clock
-    # break. Suppress the pre-pause one so this test isolates the break.
-    first = {"done": False}
-    real_snapshot_guard = {"n": 0}
-
-    def count_posts(t_, r_, p_, body, comment_id=None):
-        real_snapshot_guard["n"] += 1
-        posted.append(body)
-        return 1
-
-    monkeypatch.setattr(_mod, "upsert_comment", count_posts)
+    monkeypatch.setattr(
+        _mod, "upsert_comment",
+        lambda t_, r_, p_, body, comment_id=None: posted.append(body) or 1)
 
     _mod.run(token="t", repo="o/r", run_id="1", pr_number="5", run_url="u",
              interval=45, timeout=100000, dry_run=False, max_wall_seconds=600)
 
+    # Counting writes is not enough: an implementation that republishes the
+    # PRE-PAUSE body at shutdown would satisfy `len(posted) >= 2` while
+    # leaving users a stale "still running" status forever.
     assert len(posted) >= 2, (
         "the poller hit its wall-clock budget and broke out without a final "
         f"publish — only the pre-pause snapshot was written ({len(posted)})"
     )
-    del first
+    assert calls["n"] >= 2, (
+        "the cutoff republished without re-collecting job state, so the "
+        "final comment can only ever repeat the pre-pause snapshot"
+    )
+    assert posted[-1] != posted[0], (
+        "CI completed during the queue pause but the final write is "
+        "byte-identical to the pre-pause snapshot — it is stale"
+    )
+    assert "failure" in posted[-1].lower(), (
+        "the job finished as a FAILURE during the pause and the final "
+        f"comment does not report it: {posted[-1][:200]}"
+    )
 
 
 def test_pr_queued_from_the_start_still_gets_a_comment(monkeypatch):
@@ -1472,7 +1650,7 @@ def test_parse_failure_is_not_cached_as_an_empty_result(monkeypatch, tmp_path):
         {"id": state["id"], "name": "review-status-lint",
          "archive_download_url": "u"}])
     monkeypatch.setattr(_mod, "_download_artifact",
-                        lambda t, r, artifact, dest: Path("/x.json"))
+                        lambda t, r, artifact, dest, deadline=None: Path("/x.json"))
     monkeypatch.setattr(
         _mod, "_parse_status_file",
         lambda p: None if state["broken"] else [{"source": "lint", "results": [{"ok": 1}]}])
@@ -1513,8 +1691,9 @@ def test_older_same_named_artifact_does_not_clobber_the_newer_one(monkeypatch, t
         {"id": 20, "name": "review-status-lint", "archive_download_url": "new"},
         {"id": 10, "name": "review-status-lint", "archive_download_url": "old"},
     ])
-    monkeypatch.setattr(_mod, "_download_artifact",
-                        lambda t, r, artifact, dest: Path(f"/{artifact['id']}.json"))
+    monkeypatch.setattr(
+        _mod, "_download_artifact",
+        lambda t, r, artifact, dest, deadline=None: Path(f"/{artifact['id']}.json"))
     monkeypatch.setattr(
         _mod, "_parse_status_file",
         lambda p: [{"source": "lint", "results": [{"id": p.stem}]}])
@@ -1615,3 +1794,970 @@ def test_wall_clock_ceiling_is_finite_by_default():
         f"the default ceiling ({_mod._DEFAULT_MAX_WALL_SECONDS}s) is not "
         f"below the job deadline ({job_timeout}s)"
     )
+
+
+# ─── round 6 ──────────────────────────────────────────────────────────
+
+
+def test_final_snapshot_keeps_prev_statuses_when_listing_fails(monkeypatch):
+    """F1: `None` from the listing must not erase published sections.
+
+    The normal polling path already preserves the last known statuses when
+    the artifact listing fails transiently. The final-snapshot path coerced
+    that `None` to `[]`, so a listing blip coinciding with the cutoff
+    republished the comment with every review section deleted — and there
+    is no later cycle to repair it.
+    """
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: False)
+
+    cycles = {"n": 0}
+
+    def jobs(*a, **k):
+        cycles["n"] += 1
+        return [{"name": "Python tests", "status": "in_progress",
+                 "html_url": "u"}], False
+
+    monkeypatch.setattr(_mod, "collect_run_jobs", jobs)
+
+    good = [{"source": "FleetReview", "results": [{"name": "r", "status": "ok"}]}]
+
+    def statuses(token, repo, run_id, deadline=None):
+        # Healthy on the first cycle, then the listing starts failing —
+        # including on the final snapshot.
+        return good if cycles["n"] <= 1 else None
+
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", statuses)
+
+    # Assert on the review-status JSON the poller actually hands to the
+    # assembler — the rendered markdown depends on the assembler's own
+    # formatting rules, which is not what this finding is about.
+    bodies: list[str] = []
+
+    def spy_body(asm, completed, pending, run_url, job_urls,
+                 review_statuses_json, commit_info="", waiting=False):
+        bodies.append(review_statuses_json)
+        return f"body:{review_statuses_json}:{sorted(completed.items())}:{pending}"
+
+    monkeypatch.setattr(_mod, "build_comment_body", spy_body)
+
+    posted: list[str] = []
+    monkeypatch.setattr(
+        _mod, "upsert_comment",
+        lambda t, r, p, body, comment_id=None: posted.append(body) or 1)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_mod.time, "sleep",
+                        lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
+
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5", run_url="u",
+             interval=45, timeout=100000, dry_run=False, max_wall_seconds=600)
+
+    assert posted, "nothing was ever published"
+    assert "FleetReview" in bodies[0], "the first body never carried the section"
+    assert "FleetReview" in bodies[-1], (
+        "the final snapshot hit a transient listing failure and republished "
+        "the comment with the review section deleted"
+    )
+
+
+def test_queue_pause_snapshot_records_what_it_published(monkeypatch):
+    """SEAM: `_publish_final_snapshot` must RECORD `prev_artifact_statuses`.
+
+    The snapshot is not only a shutdown path — a poller that starts while
+    the PR is already merge-queued calls it mid-run to create the comment,
+    and polling then RESUMES after the dequeue. If it fetches statuses but
+    does not record them, the next cycle's transient listing failure falls
+    back to the stale `prev_artifact_statuses` (`[]`) and republishes the
+    comment with every review section deleted — the exact F1 defect one
+    seam over.
+
+    The F1 test above proves the snapshot READS `prev_artifact_statuses`;
+    nothing proved it WRITES it. Measured: deleting
+    `prev_artifact_statuses = statuses` from the snapshot left the whole
+    file green (71 passed) while the poller published a body with the
+    section gone.
+    """
+    queue_checks = {"n": 0}
+    listings = {"n": 0}
+
+    def queued(token, repo, pr):
+        queue_checks["n"] += 1
+        return queue_checks["n"] == 1      # queued on cycle 1, released after
+
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", queued)
+    monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: (
+        [{"name": "Python tests", "status": "in_progress", "html_url": "u"}],
+        False))
+
+    good = [{"source": "FleetReview", "results": [{"name": "r", "status": "ok"}]}]
+
+    def statuses(token, repo, run_id, deadline=None):
+        listings["n"] += 1
+        # The queue-pause snapshot fetches successfully; every later cycle
+        # hits a transient listing failure.
+        return good if listings["n"] <= 1 else None
+
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", statuses)
+
+    bodies: list[str] = []
+
+    def spy_body(asm, completed, pending, run_url, job_urls,
+                 review_statuses_json, commit_info="", waiting=False):
+        bodies.append(review_statuses_json)
+        return f"body:{review_statuses_json}:{pending}"
+
+    monkeypatch.setattr(_mod, "build_comment_body", spy_body)
+    monkeypatch.setattr(_mod, "upsert_comment",
+                        lambda t, r, p, body, comment_id=None: 1)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_mod.time, "sleep",
+                        lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
+
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5", run_url="u",
+             interval=45, timeout=100000, dry_run=False, max_wall_seconds=1200)
+
+    assert queue_checks["n"] >= 2, "the PR was never rechecked after the pause"
+    assert listings["n"] >= 2, "no cycle ran after the queue-pause snapshot"
+    assert bodies, "nothing was ever rendered"
+    assert "FleetReview" in bodies[0], (
+        "the queue-pause snapshot never carried the section")
+    assert "FleetReview" in bodies[-1], (
+        "the queue-pause snapshot did not record what it published, so a "
+        "later transient listing failure republished the comment with the "
+        "review section deleted"
+    )
+
+
+def test_newest_empty_artifact_does_not_resurrect_an_older_failure(
+        monkeypatch, tmp_path):
+    """F5: an older attempt's failure must not survive a green rerun.
+
+    A rerun leaves two non-expired artifacts with the SAME name. If the
+    newest validly contains `[]` (producers emit that on success) it
+    contributes no `source`, so appending every artifact and deduping by
+    source afterwards let the OLDER failed attempt through.
+    """
+    monkeypatch.setattr(_mod, "_ARTIFACT_TEMP_BASE", tmp_path)
+    monkeypatch.setattr(_mod, "_list_artifacts", lambda *a, **k: [
+        # GitHub lists newest-first; id 20 is the rerun, id 10 the failure.
+        {"id": 20, "name": "review-status-lint", "archive_download_url": "u20"},
+        {"id": 10, "name": "review-status-lint", "archive_download_url": "u10"},
+    ])
+    monkeypatch.setattr(
+        _mod, "_download_artifact",
+        lambda token, repo, artifact, dest, deadline=None: Path(
+            f"/nonexistent/{artifact['id']}.json"))
+
+    payloads = {
+        "20": [],
+        "10": [{"source": "lint", "results": [{"name": "lint", "status": "failure"}]}],
+    }
+    monkeypatch.setattr(_mod, "_parse_status_file",
+                        lambda p: payloads[p.stem])
+
+    out = _mod.fetch_all_review_statuses("tok", "o/r", "77")
+
+    assert out == [], (
+        "the rerun's artifact is empty (the job passed), but an older failed "
+        f"attempt's result was resurrected into the comment: {out}"
+    )
+
+
+@pytest.mark.parametrize("listing_order", ["newest-first", "oldest-first"])
+def test_newest_artifact_wins_regardless_of_listing_order(
+        monkeypatch, tmp_path, listing_order):
+    """F5 SEAM: the selection must SORT, not trust the listing's order.
+
+    The sibling test above feeds artifacts newest-first, which is the order
+    the API happens to return today — so deleting the sort entirely left it
+    green (measured: 68 passed with `group = list(group)`). Nothing pinned
+    the ordering guarantee itself. Feeding the SAME data oldest-first fails
+    the moment the sort is dropped, because then the stale failed attempt is
+    chosen first and published.
+    """
+    monkeypatch.setattr(_mod, "_ARTIFACT_TEMP_BASE", tmp_path)
+    newest = {"id": 20, "name": "review-status-lint",
+              "archive_download_url": "u20"}
+    oldest = {"id": 10, "name": "review-status-lint",
+              "archive_download_url": "u10"}
+    listing = ([newest, oldest] if listing_order == "newest-first"
+               else [oldest, newest])
+    monkeypatch.setattr(_mod, "_list_artifacts", lambda *a, **k: list(listing))
+    monkeypatch.setattr(
+        _mod, "_download_artifact",
+        lambda token, repo, artifact, dest, deadline=None: Path(
+            f"/nonexistent/{artifact['id']}.json"))
+
+    payloads = {
+        "20": [],
+        "10": [{"source": "lint",
+                "results": [{"name": "lint", "status": "failure"}]}],
+    }
+    monkeypatch.setattr(_mod, "_parse_status_file", lambda p: payloads[p.stem])
+
+    out = _mod.fetch_all_review_statuses("tok", "o/r", "77")
+
+    assert out == [], (
+        f"with the listing in {listing_order} order the poller published a "
+        f"stale failure from the older attempt: {out} — the selection is "
+        "relying on the listing's order instead of sorting by id"
+    )
+
+
+def test_unreadable_newest_artifact_is_unknown_not_the_older_attempt(
+        monkeypatch, tmp_path):
+    """F10: unknown beats stale — an older same-named artifact is NOT used.
+
+    Ruled 2026-09-20: when the NEWEST artifact for a name cannot be read,
+    the group is unknown. Substituting the older same-named artifact
+    publishes a SUPERSEDED attempt's result as if it were the current one —
+    on a rerun a cold poller would show the previous attempt's failure until
+    the new archive becomes readable, or permanently if this is the final
+    snapshot. It also contradicts the newest-wins tests above.
+
+    A value this PROCESS already published under the name is a different
+    case and is still carried (covered by
+    ``test_failed_download_of_a_new_id_keeps_the_published_section``): that
+    section is already on screen, and deleting it over one blip is the
+    regression the carry exists to prevent.
+    """
+    monkeypatch.setattr(_mod, "_ARTIFACT_TEMP_BASE", tmp_path)
+    monkeypatch.setattr(_mod, "_list_artifacts", lambda *a, **k: [
+        {"id": 20, "name": "review-status-lint", "archive_download_url": "u20"},
+        {"id": 10, "name": "review-status-lint", "archive_download_url": "u10"},
+    ])
+
+    attempted: list[int] = []
+
+    def download(token, repo, artifact, dest, deadline=None):
+        attempted.append(artifact["id"])
+        if artifact["id"] == 20:
+            return None            # not uploaded yet / transient blip
+        return Path("/nonexistent/10.json")
+
+    monkeypatch.setattr(_mod, "_download_artifact", download)
+    monkeypatch.setattr(
+        _mod, "_parse_status_file",
+        lambda p: [{"source": "lint",
+                    "results": [{"name": "lint", "status": "failure"}]}])
+
+    out = _mod.fetch_all_review_statuses("tok", "o/r", "77")
+    assert out == [], (
+        f"the superseded attempt's artifact (id 10) was published as the "
+        f"current result: {out}"
+    )
+    assert attempted == [20], (
+        f"the older same-named artifact was downloaded anyway: {attempted}"
+    )
+
+
+def test_artifact_fetch_stops_downloading_past_its_deadline(
+        monkeypatch, tmp_path):
+    """F6: the shutdown snapshot must not chain unbounded downloads.
+
+    Each uncached artifact costs a redirect request plus a blob request,
+    each up to _REQUEST_TIMEOUT. Started with no deadline after the budget
+    was already spent, enough uncached artifacts push the process past the
+    Actions job deadline and it is SIGKILLed having published nothing.
+    """
+    monkeypatch.setattr(_mod, "_ARTIFACT_TEMP_BASE", tmp_path)
+    monkeypatch.setattr(_mod, "_list_artifacts", lambda *a, **k: [
+        {"id": i, "name": f"review-status-{i}", "archive_download_url": f"u{i}"}
+        for i in range(1, 6)
+    ])
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+
+    downloads: list[int] = []
+
+    def slow_download(token, repo, artifact, dest, deadline=None):
+        downloads.append(artifact["id"])
+        clock["t"] += 60.0          # a realistic worst-case artifact fetch
+        return Path(f"/nonexistent/{artifact['id']}.json")
+
+    monkeypatch.setattr(_mod, "_download_artifact", slow_download)
+    monkeypatch.setattr(
+        _mod, "_parse_status_file",
+        lambda p: [{"source": f"s{p.stem}", "results": []}])
+
+    out = _mod.fetch_all_review_statuses(
+        "tok", "o/r", "77", deadline=150.0)
+
+    assert out is not None
+    assert len(downloads) <= 3, (
+        f"the fetch kept downloading past its 150s deadline: {len(downloads)} "
+        f"downloads ending at t={clock['t']:.0f}s"
+    )
+    assert downloads, "the deadline blocked even the first download"
+    assert clock["t"] <= 210.0, (
+        f"the fetch ran to t={clock['t']:.0f}s despite a 150s deadline"
+    )
+
+
+def test_final_snapshot_wires_a_real_deadline_into_the_artifact_fetch(
+        monkeypatch):
+    """F6 SEAM: the deadline must REACH the fetch, not merely be honoured.
+
+    The sibling test above calls ``fetch_all_review_statuses`` DIRECTLY with
+    an explicit deadline, so it only proves the parameter is respected once
+    supplied. Nothing proved the shutdown snapshot supplies one — measured:
+    hardcoding ``deadline=None`` at the call site left the whole file green
+    (68 passed). This drives the real ``run()`` to its wall-clock cutoff and
+    asserts on what the seam actually handed over.
+    """
+    seen: dict[str, object] = {}
+
+    def spy_fetch(token, repo, run_id, deadline=None):
+        seen["deadline"] = deadline
+        seen["at"] = clock["t"]
+        return []
+
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", spy_fetch)
+    monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: (
+        [{"name": "Python tests", "status": "in_progress", "html_url": "u"}],
+        False))
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: False)
+    monkeypatch.setattr(_mod, "upsert_comment",
+                        lambda t, r, p, body, comment_id=None: 1)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(
+        _mod.time, "sleep",
+        lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
+
+    budget = 1200
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5", run_url="u",
+             interval=45, timeout=100000, dry_run=False,
+             max_wall_seconds=budget)
+
+    deadline = seen.get("deadline")
+    assert deadline is not None, (
+        "the shutdown snapshot fetched artifacts with NO deadline — a run "
+        "with many uncached artifacts can chain 30-60s downloads past the "
+        "Actions job deadline and be SIGKILLed having published nothing"
+    )
+    assert isinstance(deadline, (int, float))
+    # An absolute time.time() instant, bounded by the budget it must fit
+    # in — AND still in the future when the fetch is invoked, with a usable
+    # window. `0 < deadline <= budget` admitted `deadline=1`, an instant
+    # already long gone by the time the snapshot runs near t=budget: the
+    # real fetch would then skip every uncached artifact and publish an
+    # incomplete result while this assertion stayed green.
+    at = float(seen["at"])  # type: ignore[arg-type]
+    assert deadline <= budget, (
+        f"the snapshot's deadline ({deadline}) is outside the {budget}s "
+        f"wall-clock budget"
+    )
+    assert deadline - at >= _mod._REQUEST_TIMEOUT, (
+        f"the snapshot invoked the fetch at t={at} with a deadline of "
+        f"{deadline} — only {deadline - at}s of usable window, less than a "
+        f"single {_mod._REQUEST_TIMEOUT}s request, so every uncached "
+        "artifact is skipped"
+    )
+
+
+def test_poll_ceiling_reserves_time_for_the_shutdown_snapshot(monkeypatch):
+    """F6: the cutoff must fire BEFORE the budget, not at it.
+
+    Starting the snapshot at t=budget leaves it racing the Actions job
+    deadline. Active polling must stop a reserve early so the snapshot's
+    serial API calls fit inside the remaining wall clock.
+    """
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: True)
+    # The job state must CHANGE during the run, or the cutoff's body equals
+    # the pre-pause snapshot, is deduped, and the "last write" is the t=0
+    # one — which passes no matter where the ceiling is.
+    cycles = {"n": 0}
+
+    def progressing(*a, **k):
+        cycles["n"] += 1
+        if cycles["n"] <= 1:
+            return [{"name": "Python tests", "status": "in_progress",
+                     "html_url": "u"}], False
+        return [{"name": "Python tests", "status": "completed",
+                 "conclusion": "failure", "html_url": "u"}], True
+
+    monkeypatch.setattr(_mod, "collect_run_jobs", progressing)
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses",
+                        lambda *a, **k: [])
+
+    budget = 1200.0
+    # A LITERAL bound, not `min(_SHUTDOWN_RESERVE_SECONDS, budget/2)`. The
+    # derived form moved with the code: zeroing the constant slid both the
+    # cutoff and this expectation to t=budget and stayed green (measured: 68
+    # passed). The contract is "polling stops a real window before the
+    # budget", so assert a window the snapshot can actually use.
+    min_reserve = 60.0
+
+    snapshot_times: list[float] = []
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_mod.time, "sleep",
+                        lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
+    monkeypatch.setattr(
+        _mod, "upsert_comment",
+        lambda t, r, p, body, comment_id=None: snapshot_times.append(clock["t"]) or 1)
+
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5", run_url="u",
+             interval=45, timeout=100000, dry_run=False,
+             max_wall_seconds=int(budget))
+
+    assert len(snapshot_times) >= 2, (
+        f"expected a pre-pause write and a cutoff write, got {snapshot_times}"
+    )
+    last = snapshot_times[-1]
+    assert last <= budget - min_reserve, (
+        f"the last write happened at t={last:.0f}s of a {budget:.0f}s budget; "
+        f"only {budget - last:.0f}s remained for it, against a "
+        f"{min_reserve:.0f}s minimum reserve — it is racing the job deadline"
+    )
+
+
+# ─── round 11: the deadline/reserve model ─────────────────────────────
+
+
+def test_an_unknown_group_is_never_published_as_an_empty_result(
+        monkeypatch, tmp_path):
+    """F2: a deadline skip with no carried value is UNKNOWN, not empty.
+
+    Converting it to ``[]`` returned an apparently-successful partial
+    result; the final snapshot then treated it as authoritative and
+    republished the comment with that group's review section deleted.
+    """
+    monkeypatch.setattr(_mod, "_ARTIFACT_TEMP_BASE", tmp_path)
+    monkeypatch.setattr(_mod, "_list_artifacts", lambda *a, **k: [
+        {"id": 1, "name": "review-status-lint", "archive_download_url": "u1"},
+        {"id": 2, "name": "review-status-osv", "archive_download_url": "u2"},
+    ])
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+
+    def download(token, repo, artifact, dest, deadline=None):
+        clock["t"] += 60.0
+        return Path(f"/nonexistent/{artifact['id']}.json")
+
+    monkeypatch.setattr(_mod, "_download_artifact", download)
+    monkeypatch.setattr(
+        _mod, "_parse_status_file",
+        lambda p: [{"source": f"s{p.stem}", "results": []}])
+
+    # Room for exactly one download; the second group is never read.
+    out = _mod.fetch_all_review_statuses("tok", "o/r", "77", deadline=30.0)
+
+    assert [s["source"] for s in out] == ["s1"], (
+        f"expected only the group that was actually read, got {out}"
+    )
+    assert _mod.STATE.fetch_incomplete is True, (
+        "a group skipped by the deadline with no carried value was reported "
+        "as a complete result — the caller will publish it as authoritative "
+        "and delete that section from the comment"
+    )
+
+
+def test_final_snapshot_keeps_known_statuses_when_the_fetch_is_partial(
+        monkeypatch):
+    """F2 SEAM: the snapshot must ACT on fetch_incomplete.
+
+    A partial fetch returns a real list, so only the flag distinguishes it
+    from a complete one. Without reading it, the snapshot republishes the
+    partial view as the last word.
+    """
+    bodies: list[str] = []
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: False)
+    monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: (
+        [{"name": "Python tests", "status": "in_progress", "html_url": "u"}],
+        False))
+    monkeypatch.setattr(
+        _mod, "upsert_comment",
+        lambda t, r, p, body, comment_id=None: bodies.append(body) or 1)
+
+    calls = {"n": 0}
+
+    def fetch(token, repo, run_id, deadline=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            _mod.STATE.fetch_incomplete = False
+            return [{"source": "lint", "results": [
+                {"kind": "warning", "title": "lint",
+                 "summary": "a rendered review section"}]}]
+        # Every later fetch, including the shutdown snapshot's, is partial.
+        _mod.STATE.fetch_incomplete = True
+        return []
+
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", fetch)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(
+        _mod.time, "sleep",
+        lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
+
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5", run_url="u",
+             interval=45, timeout=100000, dry_run=False, max_wall_seconds=1200)
+
+    assert bodies, "the poller never published anything"
+    assert "a rendered review section" in bodies[-1], (
+        "the final snapshot republished a PARTIAL artifact fetch as "
+        "authoritative and deleted the known review section"
+    )
+
+
+def test_artifact_requests_are_bounded_by_the_remaining_deadline(monkeypatch):
+    """F5: a download must not START a full-length request near the cutoff.
+
+    Checking the deadline only before a download lets a hop begin one
+    second early and run a further 30-60s, eating the window the final
+    PATCH needs.
+    """
+    timeouts: list[float] = []
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            timeouts.append(timeout)
+            raise _http_error(302, {"Location": "https://blob/x"})
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *a: _Opener())
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda req, *a, **k: timeouts.append(k.get("timeout")) or _Resp({}, {}))
+
+    artifact = {"id": 1, "name": "review-status-lint",
+                "archive_download_url": "https://api/x"}
+    # 10s of room against a 30s API timeout and a 60s blob timeout.
+    _mod._download_artifact("tok", "o/r", artifact, Path("/tmp"), deadline=10.0)
+
+    assert timeouts, "no request was attempted"
+    for t in timeouts:
+        assert t is not None and t <= 10.0, (
+            f"a request was given a {t}s socket timeout with only 10s left "
+            f"before the deadline: {timeouts}"
+        )
+
+
+def test_an_expired_deadline_starts_no_artifact_request(monkeypatch):
+    """F5: past the cutoff, do not open a connection at all."""
+    clock = {"t": 100.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+
+    def boom(*a, **k):
+        raise AssertionError("a request was started past the deadline")
+
+    monkeypatch.setattr(urllib.request, "build_opener", boom)
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+
+    artifact = {"id": 1, "name": "review-status-lint",
+                "archive_download_url": "https://api/x"}
+    assert _mod._download_artifact(
+        "tok", "o/r", artifact, Path("/tmp"), deadline=50.0) is None
+
+
+def test_download_timeouts_come_from_named_constants(monkeypatch):
+    """F9: the artifact path's timeouts must be gated, not hardcoded.
+
+    ``_download_artifact`` used literal 30/60. Zeroing the module's timeout
+    constants left it untouched, so the socket-timeout guard covered only
+    ``_api_request``/``upsert_comment``.
+    """
+    monkeypatch.setattr(_mod, "_REQUEST_TIMEOUT", 7)
+    monkeypatch.setattr(_mod, "_ARTIFACT_BLOB_TIMEOUT", 11)
+    timeouts: list[float] = []
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            timeouts.append(timeout)
+            raise _http_error(302, {"Location": "https://blob/x"})
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *a: _Opener())
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda req, *a, **k: timeouts.append(k.get("timeout")) or _Resp({}, {}))
+
+    artifact = {"id": 1, "name": "review-status-lint",
+                "archive_download_url": "https://api/x"}
+    _mod._download_artifact("tok", "o/r", artifact, Path("/tmp"))
+
+    assert timeouts == [7, 11], (
+        f"the artifact download ignored the timeout constants: {timeouts}"
+    )
+
+
+def test_a_failed_final_snapshot_is_retried_inside_the_reserve(monkeypatch):
+    """F6: a transient failure on the last write must not end the run.
+
+    The break followed the snapshot unconditionally, so a single failed
+    PATCH discarded the whole remaining shutdown reserve and left the
+    comment stale.
+    """
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: True)
+    cycles = {"n": 0}
+
+    def progressing(*a, **k):
+        cycles["n"] += 1
+        if cycles["n"] <= 1:
+            return [{"name": "Python tests", "status": "in_progress",
+                     "html_url": "u"}], False
+        return [{"name": "Python tests", "status": "completed",
+                 "conclusion": "failure", "html_url": "u"}], True
+
+    monkeypatch.setattr(_mod, "collect_run_jobs", progressing)
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", lambda *a, **k: [])
+
+    attempts = {"n": 0}
+    published: list[float] = []
+
+    def flaky_upsert(t, r, p, body, comment_id=None):
+        attempts["n"] += 1
+        if attempts["n"] == 2:      # the first shutdown-snapshot write
+            return 0                # transient failure
+        published.append(clock["t"])
+        return 1
+
+    monkeypatch.setattr(_mod, "upsert_comment", flaky_upsert)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(
+        _mod.time, "sleep",
+        lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
+
+    budget = 1200
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5", run_url="u",
+             interval=45, timeout=100000, dry_run=False,
+             max_wall_seconds=budget)
+
+    assert len(published) >= 2, (
+        f"the failed final snapshot was never retried (writes at {published}); "
+        "the shutdown reserve was discarded and the comment left stale"
+    )
+    assert published[-1] <= budget, (
+        f"a retry ran to t={published[-1]}s, past the {budget}s budget"
+    )
+
+
+def test_active_polling_passes_the_poll_ceiling_to_the_artifact_fetch(
+        monkeypatch):
+    """F8: the last active cycle must not eat the shutdown reserve.
+
+    Only the snapshot passed a deadline. A cycle starting just before the
+    ceiling could serially try every uncached artifact at 30-60s each,
+    spend the whole reserve, and be SIGKILLed before the final write.
+    """
+    seen: list[object] = []
+
+    def spy_fetch(token, repo, run_id, deadline=None):
+        seen.append(deadline)
+        return []
+
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", spy_fetch)
+    monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: (
+        [{"name": "Python tests", "status": "in_progress", "html_url": "u"}],
+        False))
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: False)
+    monkeypatch.setattr(_mod, "upsert_comment",
+                        lambda t, r, p, body, comment_id=None: 1)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(
+        _mod.time, "sleep",
+        lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
+
+    budget = 1200
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5", run_url="u",
+             interval=45, timeout=100000, dry_run=False,
+             max_wall_seconds=budget)
+
+    # seen[0] is the FIRST active poll cycle, long before the snapshot.
+    assert seen, "the poller never fetched artifacts"
+    first = seen[0]
+    assert first is not None, (
+        "ordinary polling fetched artifacts with NO deadline — one cycle "
+        "starting near the ceiling can consume the entire shutdown reserve"
+    )
+    expected_ceiling = budget - _mod._SHUTDOWN_RESERVE_SECONDS
+    assert first == expected_ceiling, (
+        f"the active cycle's deadline is {first}, not the poll ceiling "
+        f"({expected_ceiling}) — it does not stop work at the cutoff"
+    )
+
+
+# ─── round-11: gates for the seams round 10 introduced ────────────────
+
+
+def test_the_snapshot_fetch_cutoff_reserves_a_window_for_the_patch(monkeypatch):
+    """F5 SEAM: the fetch cutoff must sit BEFORE the budget end.
+
+    A fetch deadline equal to the budget end only bounds when a download
+    may start; the PATCH that follows then inherits whatever a last hop
+    left behind. Measured: `_PATCH_RESERVE_SECONDS = 0` and hardcoding the
+    cutoff to the budget end BOTH left the whole file green — the sibling
+    deadline test only requires one `_REQUEST_TIMEOUT` of window, which a
+    zero reserve still satisfies.
+    """
+    seen: dict[str, object] = {}
+
+    def spy_fetch(token, repo, run_id, deadline=None):
+        seen["deadline"] = deadline
+        return []
+
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", spy_fetch)
+    monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: (
+        [{"name": "Python tests", "status": "in_progress", "html_url": "u"}],
+        False))
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: False)
+    monkeypatch.setattr(_mod, "upsert_comment",
+                        lambda t, r, p, body, comment_id=None: 1)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(
+        _mod.time, "sleep",
+        lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
+
+    budget = 1200
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5", run_url="u",
+             interval=45, timeout=100000, dry_run=False,
+             max_wall_seconds=budget)
+
+    deadline = seen.get("deadline")
+    assert deadline is not None, "the snapshot fetched with no deadline"
+    # A deliberate literal, NOT read back from _PATCH_RESERVE_SECONDS: the
+    # point is that SOME real window is held back for the write, so moving
+    # the constant moves the code without moving this assertion.
+    slack = budget - float(deadline)  # type: ignore[arg-type]
+    assert slack >= 30, (
+        f"the snapshot's artifact fetch may run until t={deadline} of a "
+        f"{budget}s budget, leaving only {slack}s for the final PATCH; a "
+        "download that starts just before the cutoff can consume it and the "
+        "comment is never written"
+    )
+
+
+def test_the_final_snapshot_retry_window_stops_before_the_budget_ends(
+        monkeypatch):
+    """F6 SEAM: retries must not spend the PATCH reserve itself.
+
+    Measured: widening `retry_until` to the budget end left the file green
+    — the existing retry test only proves that A retry happens, not that
+    the retry loop stops early enough for the attempt it launches to land.
+    """
+    attempts: list[float] = []
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(
+        _mod.time, "sleep",
+        lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
+
+    monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: (
+        [{"name": "Python tests", "status": "in_progress", "html_url": "u"}],
+        False))
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses",
+                        lambda *a, **k: [])
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: False)
+
+    def always_failing_upsert(t, r, p, body, comment_id=None):
+        attempts.append(clock["t"])
+        raise _mod.RateLimitError(0.0)
+
+    monkeypatch.setattr(_mod, "upsert_comment", always_failing_upsert)
+
+    budget = 1200
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5", run_url="u",
+             interval=45, timeout=100000, dry_run=False,
+             max_wall_seconds=budget)
+
+    assert len(attempts) >= 2, (
+        f"the failed final snapshot was not retried: {attempts}")
+    # The LAST attempt must still have a full request's worth of room before
+    # the budget ends, or it is launched only to be SIGKILLed mid-flight.
+    last = attempts[-1]
+    assert budget - last >= 30, (
+        f"the final retry was launched at t={last} of a {budget}s budget, "
+        f"{budget - last}s before the deadline — the PATCH it issues cannot "
+        "complete, so the retry loop spent the reserve it was meant to use"
+    )
+
+
+def test_artifact_download_hops_carry_bounded_socket_timeouts(monkeypatch):
+    """F9: the socket-timeout guard must cover the DOWNLOAD path too.
+
+    `test_api_calls_carry_a_socket_timeout` only observes `_api_request`
+    and `upsert_comment`. Measured: `_ARTIFACT_BLOB_TIMEOUT = 0` left the
+    whole file green, and urllib treats `timeout=0` as a non-blocking
+    socket that fails instantly — every artifact download would silently
+    drop its section.
+    """
+    timeouts: list[object] = []
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            timeouts.append(timeout)
+            raise _http_error(302, {"Location": "https://blob/x"})
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *a: _Opener())
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda req, *a, **k: timeouts.append(k.get("timeout")) or _Resp({}, {}))
+
+    artifact = {"id": 1, "name": "review-status-lint",
+                "archive_download_url": "https://api/x"}
+    # No deadline: the UNCLAMPED, shipped values must themselves be sane.
+    _mod._download_artifact("tok", "o/r", artifact, Path("/tmp"))
+
+    assert len(timeouts) >= 2, (
+        f"expected a redirect hop and a blob hop, saw {timeouts}")
+    for t in timeouts:
+        assert isinstance(t, (int, float)) and not isinstance(t, bool), (
+            f"an artifact download hop used a non-numeric timeout: {timeouts}")
+        assert 5 <= t <= 300, (
+            f"an artifact download hop used a {t}s socket timeout; 0 is a "
+            f"non-blocking socket that fails instantly and huge values hang: "
+            f"{timeouts}"
+        )
+
+
+def test_bounded_timeout_never_returns_an_unusable_socket_timeout():
+    """`_bounded_timeout`'s floor is the guard, not an optimisation.
+
+    The clamp exists so a request cannot outlive the deadline, but the
+    clamped value is still handed to `socket.settimeout`. Without the
+    floor a deadline 0.2s away yields a 0.2s socket timeout — in practice
+    an instant failure, which reads as "the artifact is unavailable" and
+    silently drops the section. Measured: dropping `max(1.0, ...)` left
+    the whole file green.
+
+    The expectations are deliberate literals, not read back from the
+    module's constants.
+    """
+    import time as _time
+
+    now = _time.time()
+
+    # Deadline comfortably far away: the caller's own base wins, unclamped.
+    assert _mod._bounded_timeout(30.0, now + 600) == 30.0
+
+    # Deadline nearer than the base: clamped DOWN, but still usable.
+    tight = _mod._bounded_timeout(30.0, now + 0.2)
+    assert tight is not None, (
+        "a deadline 0.2s away returned None; there is still room to try")
+    assert tight >= 1.0, (
+        f"_bounded_timeout handed a {tight}s socket timeout to a real "
+        "request; anything under a second fails effectively instantly and "
+        "reads as an unavailable artifact rather than a timeout")
+
+    # Deadline already gone: refuse to start at all.
+    assert _mod._bounded_timeout(30.0, now - 1) is None, (
+        "a spent deadline must return None so the hop is not started")
+
+    # No deadline at all: unchanged.
+    assert _mod._bounded_timeout(30.0, None) == 30.0
+
+
+def test_a_spent_deadline_stops_the_blob_hop_not_just_the_first_hop(
+        monkeypatch, tmp_path):
+    """Both download hops must refuse to start once the deadline is gone.
+
+    The redirect hop's `None` check was gated; the blob hop's was not.
+    Measured: replacing the blob hop's `if blob_timeout is None: return
+    None` with a fall-back to the unclamped constant left the whole file
+    green — a 60s bulk transfer could then start AFTER the shutdown cutoff
+    and eat the window the final PATCH needs.
+    """
+    import time as _time
+
+    blob_opens: list[object] = []
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            # Hop 1 succeeds (302) but consumes the entire window, so the
+            # blob hop is reached with the deadline already spent.
+            clock["t"] = deadline + 5
+            raise _http_error(302, {"Location": "https://blob/x"})
+
+    clock = {"t": _time.time()}
+    deadline = clock["t"] + 10
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *a: _Opener())
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda req, *a, **k: blob_opens.append(k.get("timeout")))
+
+    artifact = {"id": 1, "name": "review-status-lint",
+                "archive_download_url": "https://api/x"}
+    result = _mod._download_artifact(
+        "tok", "o/r", artifact, tmp_path, deadline=deadline)
+
+    assert result is None
+    assert blob_opens == [], (
+        f"the blob hop started {len(blob_opens)}s past a spent deadline "
+        f"with timeout(s) {blob_opens}; it must not begin at all")
+
+
+def test_the_final_retry_backoff_is_a_real_pause(monkeypatch):
+    """The retry pause must actually pause.
+
+    `_FINAL_RETRY_BACKOFF` bounds how hard the shutdown reserve is spun.
+    Measured: setting it to 0 left the whole file green, which is a busy
+    loop hammering the very API that just rate-limited us — for the whole
+    reserve. It must also stay clamped to the room left, so the last
+    sleep cannot overshoot the retry window.
+    """
+    sleeps: list[float] = []
+    attempts: list[float] = []
+    clock = {"t": 0.0}
+    phase = {"final": False}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+
+    def fake_sleep(s):
+        # Only the pauses INSIDE the shutdown-retry loop are the subject;
+        # the poll loop's own interval sleeps sit in the same range and
+        # would mask a zero retry backoff entirely.
+        if phase["final"]:
+            sleeps.append(s)
+        clock["t"] += max(s, 1.0)
+
+    monkeypatch.setattr(_mod.time, "sleep", fake_sleep)
+    monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: (
+        [{"name": "Python tests", "status": "in_progress", "html_url": "u"}],
+        False))
+
+    def fetch(*a, **k):
+        # The snapshot path is the only caller that passes a deadline; use
+        # that as the phase marker rather than any budget constant.
+        if k.get("deadline") is not None:
+            phase["final"] = True
+        return []
+
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", fetch)
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: False)
+
+    def always_failing_upsert(t, r, p, body, comment_id=None):
+        attempts.append(clock["t"])
+        raise _mod.RateLimitError(0.0)
+
+    monkeypatch.setattr(_mod, "upsert_comment", always_failing_upsert)
+
+    budget = 1200
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5", run_url="u",
+             interval=45, timeout=100000, dry_run=False,
+             max_wall_seconds=budget)
+
+    retry_sleeps = sleeps
+    assert retry_sleeps, (
+        "the shutdown-reserve retry loop never paused between attempts")
+    # Deliberate literals: a pause short enough to be a busy loop is the
+    # defect, and one long enough to swallow the reserve is the other.
+    assert max(retry_sleeps) <= 60, (
+        f"a retry pause of {max(retry_sleeps)}s can swallow the whole "
+        f"shutdown reserve: {retry_sleeps}")
+    assert min(retry_sleeps) >= 1, (
+        f"a retry paused {min(retry_sleeps)}s between attempts — that is a "
+        f"busy loop against an API that just rate-limited us: {retry_sleeps}")
+    assert len(attempts) >= 2, f"no retry was attempted: {attempts}"

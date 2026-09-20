@@ -113,14 +113,53 @@ _MERGE_QUEUE_RECHECK_INTERVAL = 300
 # comment with no log line and no error.
 _REQUEST_TIMEOUT = 30
 
+# Socket timeout for the artifact BLOB hop (hop 2 of a download). It is a
+# separate constant from _REQUEST_TIMEOUT because it is a bulk transfer, not
+# an API call — but it must be a named constant, not a literal, so the
+# timeout the download path actually uses is visible to the budget
+# arithmetic below and gated by a test.
+_ARTIFACT_BLOB_TIMEOUT = 60
+
 # Default hard wall-clock ceiling, INCLUDING merge-queue pauses.
 #
 # It must be finite by DEFAULT, not only when the workflow passes a flag:
 # queue pauses are excluded from the active timeout, so with no ceiling a
 # permanently-queued PR pauses forever and is eventually SIGKILLed by the
-# Actions job deadline — publishing nothing. 45 minutes sits below the
-# workflow's 60-minute timeout-minutes with room to write a final status.
-_DEFAULT_MAX_WALL_SECONDS = 2700
+# Actions job deadline — publishing nothing.
+#
+# 3300s is the SUPPORTED MONITORING WINDOW, chosen deliberately rather than
+# inherited: with _SHUTDOWN_RESERVE_SECONDS active polling runs to 3000s,
+# which is exactly the window the poller had before the reserve existed
+# (``--timeout 3000``). A 2700 default silently cut it to 2400s — a
+# ten-minute observability regression for any run finishing between 40 and
+# 50 minutes. The workflow's 60-minute timeout-minutes leaves 300s past this
+# budget, more than the ~90s an in-flight request plus the final PATCH can
+# overrun by.
+_DEFAULT_MAX_WALL_SECONDS = 3300
+
+# How much of the wall-clock budget is RESERVED for the shutdown snapshot.
+#
+# The cutoff must fire BEFORE the budget is spent, not when it is already
+# gone: the snapshot itself is a sequence of synchronous API calls (a
+# paginated jobs read, an artifact listing, up to _REQUEST_TIMEOUT-bounded
+# downloads, a PATCH). Starting it at t=budget left it racing the Actions
+# job deadline with nothing but luck between it and a SIGKILL. So active
+# polling stops at ``budget - reserve`` and the snapshot gets the reserve
+# to itself, additionally bounded by a hard ``deadline`` passed into the
+# artifact fetch so uncached downloads cannot overrun it either.
+_SHUTDOWN_RESERVE_SECONDS = 300
+
+# How much of the shutdown reserve is held back for the final PATCH itself.
+#
+# A fetch deadline equal to the end of the budget only bounds when a
+# download may START; the write that follows still needs a window of its
+# own. So artifact fetching stops this long before the budget ends, and the
+# PATCH (plus one retry) runs inside what is left.
+_PATCH_RESERVE_SECONDS = 60
+
+# Pause between shutdown-snapshot retries. Short: the reserve is finite and
+# the usual failure is a single transient API error, not a sustained outage.
+_FINAL_RETRY_BACKOFF = 5
 
 
 
@@ -149,6 +188,10 @@ class _ApiState:
         # the comment id, not the PR, so a process-global id would let a
         # second PR's poller overwrite the FIRST PR's comment.
         self.comment_ids: dict[tuple[str, str], int] = {}
+        # True when the last fetch could not READ some artifact group because
+        # its deadline was spent. The result is then partial, and the final
+        # snapshot must not treat it as authoritative.
+        self.fetch_incomplete = False
         self.remaining: int | None = None
         self.limit: int | None = None
         self.retry_after: float = 0.0
@@ -664,17 +707,42 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _bounded_timeout(base: float, deadline: float | None) -> float | None:
+    """Clamp a socket timeout to the time left before ``deadline``.
+
+    Returns ``None`` when the deadline has already passed, meaning "do not
+    start this request at all". A request bounded only by its own socket
+    timeout can begin just before the cutoff and still run a further
+    30-60s, eating the window the final PATCH needs.
+    """
+    if deadline is None:
+        return base
+    room = deadline - time.time()
+    if room <= 0:
+        return None
+    return max(1.0, min(base, room))
+
+
 def _download_artifact(
     token: str, repo: str, artifact: dict, dest_dir: Path,
+    deadline: float | None = None,
 ) -> Path | None:
     """Download a single artifact zip via the API and extract it.
 
     Returns the path to ``review-status.json`` inside the extracted dir,
     or ``None`` if the download or extraction failed.
+
+    ``deadline`` is an absolute ``time.time()`` instant past which no hop
+    may still be running: each request's socket timeout is clamped to the
+    time remaining, and a hop whose window is already gone is not started.
     """
     owner, repo_name = repo.split("/")
     archive_download_url = artifact.get("archive_download_url", "")
     if not archive_download_url:
+        return None
+
+    redirect_timeout = _bounded_timeout(_REQUEST_TIMEOUT, deadline)
+    if redirect_timeout is None:
         return None
 
     # The archive_download_url is an API URL that 302s to a signed blob
@@ -686,7 +754,7 @@ def _download_artifact(
     try:
         resp = opener.open(urllib.request.Request(
             archive_download_url, headers=_headers(token),
-        ), timeout=30)
+        ), timeout=redirect_timeout)
         STATE.observe(resp.headers)
         STATE.charged += 1
     except urllib.error.HTTPError as e:
@@ -720,11 +788,14 @@ def _download_artifact(
     safe_name = name_bytes.decode("utf-8", "ignore")
     slug = f"{safe_name}-{artifact_id}"
     zip_path = dest_dir / f"{slug}.zip"
+    blob_timeout = _bounded_timeout(_ARTIFACT_BLOB_TIMEOUT, deadline)
+    if blob_timeout is None:
+        return None
     try:
         # No auth headers here; further redirects are safe to follow.
         with urllib.request.urlopen(
             urllib.request.Request(location, headers={"User-Agent": "ci-live-comment"}),
-            timeout=60,
+            timeout=blob_timeout,
         ) as resp:
             zip_path.write_bytes(resp.read())
     except Exception:
@@ -773,7 +844,7 @@ def _parse_status_file(status_file: Path) -> list[dict] | None:
 
 
 def fetch_all_review_statuses(
-    token: str, repo: str, run_id: str,
+    token: str, repo: str, run_id: str, deadline: float | None = None,
 ) -> list[dict] | None:
     """Fetch and merge all review-status artifacts from the run.
 
@@ -794,8 +865,21 @@ def fetch_all_review_statuses(
     "unknown", not "none exist": returning an empty list there made the
     caller republish the comment with every review section deleted.
     Artifacts that don't exist yet or fail to parse are silently skipped.
+
+    ``deadline`` is an absolute ``time.time()`` value past which no further
+    UNCACHED artifact is downloaded, and which bounds each in-flight request
+    so a hop cannot start just before the cutoff and run a further 30-60s.
+    Both the shutdown snapshot and ordinary polling pass one, so a run with
+    many uncached artifacts cannot spend an unbounded number of downloads
+    against the wall-clock budget and be SIGKILLed with nothing published.
+    Cached/carried values are still merged — they cost no request.
+
+    A group whose newest artifact could not be read contributes NOTHING and
+    sets ``STATE.fetch_incomplete``; only a value this process already
+    published for that same newest id is carried. An OLDER same-named
+    artifact is never substituted: on a rerun that would present a
+    superseded attempt's failure as the current result. Unknown beats stale.
     """
-    all_statuses: list[dict] = []
     temp_base = _ARTIFACT_TEMP_BASE
 
     try:
@@ -808,6 +892,7 @@ def fetch_all_review_statuses(
         # let the caller keep the last known statuses.
         print(f"  Could not list artifacts ({e}) — keeping the previous "
               f"review statuses.", file=sys.stderr)
+        STATE.fetch_incomplete = True
         return None
 
     rs_artifacts = [
@@ -815,53 +900,92 @@ def fetch_all_review_statuses(
         if a.get("name", "").startswith(_REVIEW_STATUS_ARTIFACT_PREFIX)
     ]
     if not rs_artifacts:
-        return all_statuses
+        STATE.fetch_incomplete = False
+        return []
 
     run_dl_dir = temp_base / str(run_id)
     run_dl_dir.mkdir(parents=True, exist_ok=True)
 
+    # Group by artifact NAME and use only the newest artifact that actually
+    # parses. A rerun leaves several non-expired artifacts with the same
+    # name; appending all of them and deduping by `source` afterwards only
+    # worked while the newest one carried every source. A newest artifact
+    # that validly contains `[]` (several producers emit that on success)
+    # contributes no source, so an older artifact from a FAILED attempt was
+    # appended later and survived the dedupe — the comment kept showing an
+    # obsolete failure after the rerun passed.
+    by_name: dict[str, list[dict]] = {}
     for artifact in rs_artifacts:
-        key = str(artifact.get("id", artifact.get("name", "")))
-        cached = STATE.artifacts.get(key)
-        if cached is not None:
-            all_statuses.extend(cached)
-            continue
-        status_file = _download_artifact(token, repo, artifact, run_dl_dir)
-        if status_file is None:
-            # Not yet available, or a transient download failure. Leave it
-            # uncached so a later poll retries — but if a PREVIOUS cycle
-            # already parsed an artifact with this same source name, keep
-            # that result rather than silently dropping the section from
-            # the comment (an `overwrite: true` upload mints a new id, so a
-            # blip on the new zip would otherwise delete a published
-            # section, permanently if it lands on the final cycle).
-            carried = STATE.artifacts_by_name.get(artifact.get("name", ""))
-            if carried:
-                all_statuses.extend(carried)
-            continue
-        statuses = _parse_status_file(status_file)
-        if statuses is None:
-            # A transient read/parse failure, NOT a valid empty payload.
-            # Caching it would replace the last known-good section with
-            # nothing; fall back like a failed download instead.
-            carried = STATE.artifacts_by_name.get(artifact.get("name", ""))
-            if carried:
-                all_statuses.extend(carried)
-            continue
-        STATE.artifacts[key] = statuses
-        # Newest-wins: GitHub lists artifacts newest-first, so an OLDER
-        # same-named artifact appearing later must not clobber the newer
-        # parsed result and resurrect an obsolete section.
-        name = artifact.get("name", "")
-        this_id = _artifact_sort_key(artifact.get("id"))
-        prev_id = STATE.artifact_name_ids.get(name)
-        if prev_id is None or this_id >= prev_id:
-            STATE.artifacts_by_name[name] = statuses
-            STATE.artifact_name_ids[name] = this_id
-        all_statuses.extend(statuses)
+        by_name.setdefault(artifact.get("name", ""), []).append(artifact)
 
-    # A re-run can leave several non-expired artifacts with the same name,
-    # each carrying the same source — dedupe by source so the comment
+    all_statuses: list[dict] = []
+    incomplete = False
+    for name, group in by_name.items():
+        # Explicit newest-first: do not rely on the listing's order.
+        group = sorted(
+            group, key=lambda a: _artifact_sort_key(a.get("id")), reverse=True)
+        newest = group[0]
+        newest_id = _artifact_sort_key(newest.get("id"))
+        key = str(newest.get("id", newest.get("name", "")))
+        chosen: list[dict] | None = STATE.artifacts.get(key)
+        skipped = False
+        if chosen is None:
+            if deadline is not None and time.time() >= deadline:
+                # Out of shutdown margin — do not start another 30-60s
+                # download. Fall through to the carried value below.
+                skipped = True
+                print(f"  Shutdown margin spent — skipping the uncached "
+                      f"artifact {name}.", file=sys.stderr)
+            else:
+                status_file = _download_artifact(
+                    token, repo, newest, run_dl_dir, deadline=deadline)
+                if status_file is None and deadline is not None and \
+                        time.time() >= deadline:
+                    # The download was cut short by the deadline rather than
+                    # by the artifact being unavailable.
+                    skipped = True
+                if status_file is not None:
+                    statuses = _parse_status_file(status_file)
+                    # `None` is a transient read/parse failure, NOT a valid
+                    # empty payload; caching it would replace the last
+                    # known-good section with nothing.
+                    if statuses is not None:
+                        STATE.artifacts[key] = statuses
+                        chosen = statuses
+                        prev_id = STATE.artifact_name_ids.get(name)
+                        if prev_id is None or newest_id >= prev_id:
+                            STATE.artifacts_by_name[name] = statuses
+                            STATE.artifact_name_ids[name] = newest_id
+        if chosen is None:
+            # Only the NEWEST artifact of a name is eligible to be READ.
+            # Walking down to an older same-named artifact in the listing
+            # resurrected a SUPERSEDED attempt's failure: on a rerun, a cold
+            # poller that cannot read the new archive would publish the
+            # previous attempt's result as if it were the rerun's. Unknown
+            # beats stale.
+            #
+            # A value this process already PUBLISHED under this name is a
+            # different case — it is on screen right now, and deleting the
+            # section over one blip on a re-uploaded zip is the regression
+            # the carry exists to prevent.
+            chosen = STATE.artifacts_by_name.get(name)
+            if chosen is None:
+                # Nothing readable and nothing published: the group's state
+                # is UNKNOWN. Contribute nothing, and when the deadline is
+                # what stopped us from looking, say the result is partial so
+                # the caller does not treat it as authoritative.
+                if skipped:
+                    incomplete = True
+                print(f"  Review status for {name} is not readable yet — "
+                      f"leaving the section unknown this cycle.",
+                      file=sys.stderr)
+                continue
+        all_statuses.extend(chosen)
+
+    STATE.fetch_incomplete = incomplete
+
+    # Distinct artifact NAMES can still carry the same source (e.g. a
+    # renamed producer across a rerun) — dedupe by source so the comment
     # doesn't render duplicate sections.
     seen: set[str] = set()
     deduped: list[dict] = []
@@ -948,6 +1072,14 @@ def run(
     asm = _import_assembler()
     start = time.time()
     wall_start = start
+    # Active polling stops here, leaving the reserve for the shutdown
+    # snapshot; the snapshot itself is bounded by the full budget.
+    reserve = None
+    poll_ceiling = None
+    if max_wall_seconds is not None:
+        reserve = min(float(_SHUTDOWN_RESERVE_SECONDS),
+                      max_wall_seconds / 2.0)
+        poll_ceiling = max_wall_seconds - reserve
     last_body = ""
     quiet_grace_used = False
     prev_completed: dict[str, str] = {}
@@ -970,10 +1102,10 @@ def run(
         rate-limit backoff run into the Actions deadline and be SIGKILLed.
         """
         remaining_time = timeout - (time.time() - start)
-        if max_wall_seconds is not None:
+        if poll_ceiling is not None:
             remaining_time = min(
                 remaining_time,
-                max_wall_seconds - (time.time() - wall_start),
+                poll_ceiling - (time.time() - wall_start),
             )
         time.sleep(max(0.0, min(seconds, remaining_time)))
 
@@ -995,32 +1127,58 @@ def run(
         """
         nonlocal start
         before = time.time()
-        if max_wall_seconds is not None:
-            room = max_wall_seconds - (before - wall_start)
+        if poll_ceiling is not None:
+            room = poll_ceiling - (before - wall_start)
             seconds = min(seconds, max(0.0, room))
         time.sleep(max(0.0, seconds))
         start += time.time() - before
 
 
 
-    def _publish_final_snapshot() -> None:
+    def _publish_final_snapshot() -> bool:
         """Best-effort last write before an early, non-completion exit.
 
         Both the wall-clock cutoff and a poller that spends its whole life
         with the PR merge-queued would otherwise exit having published
         nothing at all — and merge-group runs never post a comment, so no
         other process would.
+
+        It runs with ``_SHUTDOWN_RESERVE_SECONDS`` of the wall-clock budget
+        deliberately left unspent. Artifact fetching gets a cutoff of
+        ``budget - _PATCH_RESERVE_SECONDS`` — earlier than the budget
+        itself, so the PATCH that follows has a window of its own rather
+        than inheriting whatever a last download left behind.
+
+        Returns True when a write landed (or none was needed because the
+        body is unchanged), False when the snapshot failed and is worth
+        retrying inside the remaining reserve.
         """
-        nonlocal last_body
+        nonlocal last_body, prev_artifact_statuses
         if dry_run:
-            return
+            return True
+        fetch_deadline = None
+        if max_wall_seconds is not None:
+            fetch_deadline = (
+                wall_start + max_wall_seconds - _PATCH_RESERVE_SECONDS)
         try:
             jobs, runs_completed = collect_run_jobs(
                 token, repo, run_id, watch_workflows)
-            statuses = fetch_all_review_statuses(token, repo, run_id) or []
+            fetched = fetch_all_review_statuses(
+                token, repo, run_id, deadline=fetch_deadline)
         except Exception as e:
             print(f"  Could not collect a final snapshot ({e}).", file=sys.stderr)
-            return
+            return False
+        if fetched is None or STATE.fetch_incomplete:
+            # `None` is a failed LISTING; `fetch_incomplete` is a listing
+            # that succeeded but whose groups could not all be read. Either
+            # way the result is not authoritative — republishing it would
+            # delete review sections from the comment, permanently, since
+            # this is the last write. Keep the last known statuses, exactly
+            # as the normal polling path does.
+            statuses = prev_artifact_statuses
+        else:
+            statuses = fetched
+        prev_artifact_statuses = statuses
         completed, pending, job_urls = classify_jobs(jobs)
         body = build_comment_body(
             asm, completed, pending, run_url, job_urls,
@@ -1029,22 +1187,53 @@ def run(
             waiting=not runs_completed,
         )
         if body == last_body:
-            return
+            return True
         try:
             if upsert_comment(token, repo, pr_number, body):
                 last_body = body
                 print("  Published a final status snapshot before exiting.")
+                return True
         except RateLimitError:
             print("  Rate limited while publishing the final snapshot.",
                   file=sys.stderr)
+        return False
+
+    def _publish_final_snapshot_with_retry() -> bool:
+        """Publish the shutdown snapshot, retrying inside the reserve.
+
+        A transient failure on the last write used to be terminal: the
+        caller broke out of the loop immediately after, discarding the
+        whole remaining shutdown reserve and leaving the comment stale.
+        The reserve exists precisely so this write can be attempted more
+        than once — spend it.
+        """
+        if _publish_final_snapshot():
+            return True
+        if max_wall_seconds is None:
+            return False
+        # Leave the PATCH reserve itself untouched: retry only while a whole
+        # further attempt still fits before the budget ends.
+        retry_until = wall_start + max_wall_seconds - _PATCH_RESERVE_SECONDS
+        while time.time() < retry_until:
+            room = retry_until - time.time()
+            time.sleep(max(0.0, min(float(_FINAL_RETRY_BACKOFF), room)))
+            if time.time() >= retry_until:
+                break
+            print("  Retrying the final snapshot inside the shutdown reserve.",
+                  file=sys.stderr)
+            if _publish_final_snapshot():
+                return True
+        print("  Could not publish a final snapshot within the reserve.",
+              file=sys.stderr)
+        return False
 
     while True:
         elapsed = time.time() - start
         if elapsed > timeout:
             print(f"Timeout ({timeout}s) reached — stopping poll.", file=sys.stderr)
-            _publish_final_snapshot()
+            _publish_final_snapshot_with_retry()
             break
-        if max_wall_seconds is not None and (time.time() - wall_start) >= max_wall_seconds:
+        if poll_ceiling is not None and (time.time() - wall_start) >= poll_ceiling:
             # The Actions job's own timeout-minutes is about to SIGKILL us.
             # Exit cleanly instead: a killed process publishes nothing.
             #
@@ -1052,10 +1241,15 @@ def run(
             # out mid-pause: the comment would be missing or stale for a PR
             # whose CI finished during the final minutes. So take ONE last
             # pass first and write whatever is known.
-            print(f"Wall-clock budget ({max_wall_seconds}s) reached — "
-                  f"publishing a final status before stopping.",
+            #
+            # This fires at budget MINUS the shutdown reserve, so the
+            # snapshot's own API calls have room before the job deadline —
+            # including a retry if the first attempt fails transiently.
+            print(f"Wall-clock poll ceiling ({poll_ceiling:.0f}s of a "
+                  f"{max_wall_seconds}s budget) reached — publishing a final "
+                  f"status before stopping.",
                   file=sys.stderr)
-            _publish_final_snapshot()
+            _publish_final_snapshot_with_retry()
             break
 
         # A PR that has entered the merge queue is already approved and
@@ -1126,17 +1320,31 @@ def run(
             print(f"  → {len(gone_pending)} job(s) disappeared from pending: {', '.join(gone_pending)}")
 
         # Dynamically fetch all review-status artifacts from the run.
+        #
+        # The active cycle gets the poll-ceiling as an absolute deadline
+        # too, not only the shutdown snapshot: a cycle that starts just
+        # before the ceiling can otherwise serially try every uncached
+        # artifact at 30-60s each, spend the whole shutdown reserve, and be
+        # SIGKILLed before the final snapshot is written — the exact
+        # failure the reserve exists to prevent. Past the ceiling the fetch
+        # falls back to cached/carried values, which cost no request.
+        poll_deadline = None
+        if poll_ceiling is not None:
+            poll_deadline = wall_start + poll_ceiling
         try:
-            artifact_statuses = fetch_all_review_statuses(token, repo, run_id)
+            artifact_statuses = fetch_all_review_statuses(
+                token, repo, run_id, deadline=poll_deadline)
         except RateLimitError as e:
             backoff = max(e.retry_after, float(_LOW_REMAINING_INTERVAL))
             print(f"  Rate limited while fetching artifacts — backing off "
                   f"{backoff:.0f}s ({STATE.budget_line()})", file=sys.stderr)
             _nap(backoff)
             continue
-        if artifact_statuses is None:
-            # The listing failed transiently. Reuse the last known statuses so
-            # the comment is not republished with every review section gone.
+        if artifact_statuses is None or STATE.fetch_incomplete:
+            # The listing failed, or the deadline stopped us from reading
+            # some group. Either way this cycle's view is not authoritative:
+            # reuse the last known statuses so the comment is not
+            # republished with review sections gone.
             artifact_statuses = prev_artifact_statuses
         prev_artifact_statuses = artifact_statuses
         artifact_count_changed = len(artifact_statuses) != prev_artifact_count
