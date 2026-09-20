@@ -14853,7 +14853,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _marked = False
                 try:
                     _marked = bool(
-                        self.session_store.mark_resume_pending(session_key, _reason)
+                        await self.async_session_store.mark_resume_pending(
+                            session_key, _reason
+                        )
                     )
                 except Exception:
                     logger.warning(

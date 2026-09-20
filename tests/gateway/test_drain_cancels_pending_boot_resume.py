@@ -118,10 +118,15 @@ def _runner_with_registry(monkeypatch):
     runner, adapter = make_restart_runner()
     marks: list[tuple[str, str]] = []
 
-    def _mark(session_key, reason):
+    def _mark(session_key, reason="restart_timeout"):
         marks.append((session_key, reason))
         return True
 
+    # Patch the SYNC store the real AsyncSessionStore facade delegates to, so the
+    # production async path (``await self.async_session_store.mark_resume_pending``)
+    # is genuinely exercised rather than stubbed out. gateway/run.py's async methods
+    # must go through the facade -- tests/gateway/test_async_session_store.py is an
+    # AST contract that fails any raw session_store.<method>() call in an async def.
     runner.session_store.mark_resume_pending = _mark
     runner._pending_boot_resumes = {}
     runner._startup_resume_active = set()
