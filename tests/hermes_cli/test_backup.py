@@ -1268,6 +1268,212 @@ class TestSafeCopyDb:
         assert connect_calls[0][1]["timeout"] == 0.0
         assert not dst.exists()
 
+    def test_slow_but_advancing_copy_is_not_aborted(self, tmp_path, monkeypatch):
+        """A big healthy DB must finish even past the old flat 60s cap.
+
+        Regression: the guard used to be a FIXED 60s wall-clock deadline that
+        did not scale with the database, so a 3 GB live state.db (~39s of
+        healthy copying, more under load) was aborted purely for being big and
+        `hermes backup --quick` then shipped a snapshot with no state.db.
+        """
+        from hermes_cli import backup as backup_mod
+
+        src = tmp_path / "big.db"
+        dst = tmp_path / "copy.db"
+        # 3 GB, the real state.db size — sparse so the test stays cheap.
+        with open(src, "wb") as fh:
+            fh.truncate(3 * 1024 ** 3)
+
+        budget = backup_mod._safe_copy_budget_s(src)
+        old_flat_cap = 60.0
+        assert budget > old_flat_cap, "budget must scale past the old flat cap"
+
+        # Advances every step; total runtime is well past the OLD cap but
+        # inside this DB's budget.
+        steps = 20
+        per_step = (budget * 0.9) / steps
+        assert per_step * steps > old_flat_cap
+        clock = iter([0.0] + [per_step * (i + 1) for i in range(steps + 2)])
+
+        class FakeSourceConnection:
+            def backup(self, _destination, *, pages, progress, sleep):
+                remaining = steps
+                for _ in range(steps):
+                    remaining -= 1
+                    progress(sqlite3.SQLITE_OK, remaining, steps)
+
+            def close(self):
+                pass
+
+        class FakeDestinationConnection:
+            def close(self):
+                pass
+
+        connections = iter((FakeSourceConnection(), FakeDestinationConnection()))
+        monkeypatch.setattr(
+            backup_mod.sqlite3, "connect", lambda *a, **k: next(connections)
+        )
+        monkeypatch.setattr(backup_mod.time, "monotonic", lambda: next(clock))
+
+        assert backup_mod._safe_copy_db(src, dst) is True
+
+    def test_budget_scales_with_database_size(self, tmp_path):
+        """The absolute cap is sized by the DB, not flat."""
+        from hermes_cli import backup as backup_mod
+
+        small = tmp_path / "small.db"
+        small.write_bytes(b"x" * 1024)
+        big = tmp_path / "big.db"
+        with open(big, "wb") as fh:
+            fh.truncate(3 * 1024 ** 3)
+
+        small_budget = backup_mod._safe_copy_budget_s(small)
+        big_budget = backup_mod._safe_copy_budget_s(big)
+
+        assert small_budget == pytest.approx(backup_mod._SAFE_COPY_BASE_BUDGET_S, abs=1)
+        assert big_budget > small_budget
+        # 3 GB must get materially more than the old flat 60s.
+        assert big_budget > 300
+
+    def test_aborts_when_copy_makes_no_progress(self, tmp_path, monkeypatch):
+        """The anti-hang property survives: a copy that copies no pages fails."""
+        from hermes_cli import backup as backup_mod
+
+        src = tmp_path / "stuck.db"
+        dst = tmp_path / "copy.db"
+        src.touch()
+
+        stall = backup_mod._SAFE_COPY_STALL_DEADLINE_S
+        calls = 200
+        clock = iter([0.0] + [stall * (i + 1) for i in range(calls + 2)])
+        steps_taken = []
+
+        class FakeSourceConnection:
+            def backup(self, _destination, *, pages, progress, sleep):
+                # Locked source: not one page ever copies.
+                for _ in range(calls):
+                    steps_taken.append(1)
+                    progress(sqlite3.SQLITE_OK, 500, 500)
+                # Return normally rather than raising: _safe_copy_db turns any
+                # exception into False, which would pass this test vacuously.
+
+            def close(self):
+                pass
+
+        class FakeDestinationConnection:
+            def close(self):
+                pass
+
+        connections = iter((FakeSourceConnection(), FakeDestinationConnection()))
+        monkeypatch.setattr(
+            backup_mod.sqlite3, "connect", lambda *a, **k: next(connections)
+        )
+        monkeypatch.setattr(backup_mod.time, "monotonic", lambda: next(clock))
+
+        assert backup_mod._safe_copy_db(src, dst) is False
+        assert not dst.exists()
+        assert len(steps_taken) < calls
+
+    def test_restart_thrash_is_bounded_by_the_budget(self, tmp_path, monkeypatch):
+        """A never-converging copy must still terminate.
+
+        sqlite3's backup API RESTARTS the copy whenever the source is written
+        mid-backup. On a hot multi-GB DB that can thrash forever: pages keep
+        copying (so the stall guard never fires) while ``remaining`` keeps
+        resetting. Measured on the live 3 GB state.db — destination pinned at
+        65 MB for 6+ minutes, no stall detected. The budget is what stops it.
+        """
+        from hermes_cli import backup as backup_mod
+
+        src = tmp_path / "hot.db"
+        dst = tmp_path / "copy.db"
+        src.write_bytes(b"x" * 1024)
+
+        budget = backup_mod._safe_copy_budget_s(src)
+        total = 1000
+        # Endless restart cycle: always copying, never converging.
+        cycle = [900, 800, 700, total] * 200
+        step = backup_mod._SAFE_COPY_STALL_DEADLINE_S / 4  # never a stall
+        clock = iter([0.0] + [step * (i + 1) for i in range(len(cycle) + 2)])
+        assert step * len(cycle) > budget
+
+        steps_taken = []
+
+        class FakeSourceConnection:
+            def backup(self, _destination, *, pages, progress, sleep):
+                for remaining in cycle:
+                    steps_taken.append(remaining)
+                    progress(sqlite3.SQLITE_OK, remaining, total)
+                # Reaching here means nothing bounded the copy. Do NOT raise:
+                # _safe_copy_db swallows exceptions into a False return, which
+                # would make this test pass vacuously. Return normally so the
+                # unbounded case reports success and fails the assertion below.
+
+            def close(self):
+                pass
+
+        class FakeDestinationConnection:
+            def close(self):
+                pass
+
+        connections = iter((FakeSourceConnection(), FakeDestinationConnection()))
+        monkeypatch.setattr(
+            backup_mod.sqlite3, "connect", lambda *a, **k: next(connections)
+        )
+        monkeypatch.setattr(backup_mod.time, "monotonic", lambda: next(clock))
+
+        assert backup_mod._safe_copy_db(src, dst) is False
+        assert not dst.exists()
+        # Aborted partway, not merely at the end of the scripted cycle.
+        assert len(steps_taken) < len(cycle)
+
+    def test_backup_restart_counts_as_progress_not_stall(
+        self, tmp_path, monkeypatch
+    ):
+        """A sqlite backup RESTART must not be mistaken for a stall.
+
+        sqlite3's backup API restarts the copy whenever the source is written
+        mid-backup, so on a live DB ``remaining`` jumps back UP (measured on
+        the 3 GB live state.db: repeated resets to the full page count). Work
+        is still happening, so a copy that restarts a few times and then
+        finishes must succeed.
+        """
+        from hermes_cli import backup as backup_mod
+
+        src = tmp_path / "churning.db"
+        dst = tmp_path / "copy.db"
+        with open(src, "wb") as fh:
+            fh.truncate(3 * 1024 ** 3)
+
+        budget = backup_mod._safe_copy_budget_s(src)
+        total = 1000
+        # Copy some pages, get restarted, copy again, restart, then finish.
+        remainings = [900, 800, 700, total, 900, 800, total, 900, 500, 0]
+        per_step = (budget * 0.9) / len(remainings)
+        clock = iter(
+            [0.0] + [per_step * (i + 1) for i in range(len(remainings) + 2)]
+        )
+
+        class FakeSourceConnection:
+            def backup(self, _destination, *, pages, progress, sleep):
+                for remaining in remainings:
+                    progress(sqlite3.SQLITE_OK, remaining, total)
+
+            def close(self):
+                pass
+
+        class FakeDestinationConnection:
+            def close(self):
+                pass
+
+        connections = iter((FakeSourceConnection(), FakeDestinationConnection()))
+        monkeypatch.setattr(
+            backup_mod.sqlite3, "connect", lambda *a, **k: next(connections)
+        )
+        monkeypatch.setattr(backup_mod.time, "monotonic", lambda: next(clock))
+
+        assert backup_mod._safe_copy_db(src, dst) is True
+
 
     def test_locked_source_fails_fast_not_hang(self, tmp_path):
         import subprocess
