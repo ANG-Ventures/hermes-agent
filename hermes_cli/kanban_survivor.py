@@ -44,7 +44,7 @@ def _repos(workspace):
         if ".git" in dirs or ".git" in files:
             found.append(Path(root))
         dirs[:] = sorted(d for d in dirs if d != ".git" and not (Path(root) / d).is_symlink())
-    if workspace not in found:
+    if workspace not in found and any((p / ".git").exists() for p in (workspace, *workspace.parents)):
         tracked = _git(workspace, "ls-files", "--", ".", check=False)
         if tracked.returncode == 0 and tracked.stdout:
             found.insert(0, workspace)
