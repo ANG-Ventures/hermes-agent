@@ -91,6 +91,11 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
         kb.link_tasks(conn, parent_id=parent, child_id=child)
         kb.block_task(conn, child, reason="wait", kind="dependency")
         assert kb.get_task(conn, child).status == "todo"
+        assert kb.get_task(conn, child).block_recurrences == 0
+        for _ in range(5):
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, child).status == "todo"
+        assert not any(e.kind == "blocked" for e in kb.list_events(conn, child))
         # Finish the parent, then let recompute_ready run.
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
@@ -98,6 +103,56 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
         kb.complete_task(conn, parent, result="done")
         kb.recompute_ready(conn)
         assert kb.get_task(conn, child).status == "ready"
+        assert kb.get_task(conn, child).block_recurrences == 0
+
+
+@pytest.mark.parametrize("parent_state", ["done", "archived", "absent", "derived-from"])
+def test_dependency_without_open_blocking_parent_stays_blocked(
+    kanban_home: Path, parent_state: str,
+) -> None:
+    """An external wait must not re-spawn on every dispatcher tick."""
+    with kb.connect_closing() as conn:
+        child = _running_task(conn, title="waiting on external PR")
+        if parent_state != "absent":
+            parent = _running_task(conn, title="parent")
+            kb.link_tasks(
+                conn, parent_id=parent, child_id=child,
+                kind="derived-from" if parent_state == "derived-from" else "blocks",
+            )
+            if parent_state != "derived-from":
+                assert kb.complete_task(conn, parent, result="done")
+                if parent_state == "archived":
+                    assert kb.archive_task(conn, parent)
+        before = [e.kind for e in kb.list_events(conn, child)]
+        for _ in range(10):
+            kb.block_task(conn, child, reason="PR not merged", kind="dependency")
+            kb.recompute_ready(conn)
+            # Exercise the real claim gate, without launching a worker process.
+            assert kb.claim_task(conn, child, claimer="worker") is None
+        task = kb.get_task(conn, child)
+        assert task.status == "blocked"
+        assert task.block_kind == "dependency"
+        assert task.block_recurrences == 1
+        after = [e.kind for e in kb.list_events(conn, child)]
+        assert after.count("promoted") == before.count("promoted")
+        assert after.count("claimed") == before.count("claimed")
+        assert after.count("blocked") == 1
+
+
+def test_dependency_without_parent_escalates_after_manual_unblocks(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        child = _running_task(conn)
+        for attempt in range(1, kb.BLOCK_RECURRENCE_LIMIT + 1):
+            assert kb.block_task(conn, child, reason="external wait", kind="dependency")
+            task = kb.get_task(conn, child)
+            assert task.block_recurrences == attempt
+            if attempt < kb.BLOCK_RECURRENCE_LIMIT:
+                assert task.status == "blocked"
+                assert kb.unblock_task(conn, child)
+                _make_running_again(conn, child)
+        assert task.status == "triage"
+        kb.recompute_ready(conn)
+        assert kb.claim_task(conn, child, claimer="worker") is None
 
 
 # ---------------------------------------------------------------------------
