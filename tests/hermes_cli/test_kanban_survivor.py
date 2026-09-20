@@ -123,6 +123,26 @@ def test_reaper_preserves_before_removal(board):
     assert b"value = 9" in Path(kb.list_attachments(board, tid)[0].stored_path).read_bytes()
 
 
+
+
+def test_temporary_index_preserves_git_racy_clean_detection(board):
+    import os
+    from hermes_cli.kanban_survivor import _snapshot
+    tid, ws, repo = fixture_repo(board)
+    git(repo, "config", "core.trustctime", "false")
+    source = repo / "code.py"
+    stamp = source.stat()
+    os.utime(source, ns=(stamp.st_atime_ns, stamp.st_mtime_ns - 60_000_000_000))
+    git(repo, "add", "code.py")
+    stamp = source.stat()
+    source.write_text("value = 9\n")
+    os.utime(source, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+    # Git must rehash an entry as old as its index, even when stat appears clean.
+    os.utime(repo / ".git" / "index", ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+    data = _snapshot(repo, git(repo, "rev-parse", "HEAD"), "")
+    assert b"value = 9" in data
+
+
 def test_missing_workspace_with_code_claim_refuses(board):
     tid = kb.create_task(board, title="missing candidate")
     with pytest.raises(ValueError, match="survivor_unavailable"):

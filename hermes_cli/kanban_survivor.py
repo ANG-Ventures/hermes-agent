@@ -166,7 +166,8 @@ def _snapshot(repo, base, prefix):
         env = dict(os.environ, GIT_INDEX_FILE=str(Path(tmp) / "index"))
         index = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index").stdout.decode().strip())
         if index.exists():
-            shutil.copyfile(index, env["GIT_INDEX_FILE"])
+            # Preserve the index timestamp: Git uses it to detect racy-clean entries.
+            shutil.copy2(index, env["GIT_INDEX_FILE"])
         else:
             _git(repo, "read-tree", "--empty", env=env)
         _git(repo, "add", "-A", "--", ".", env=env)

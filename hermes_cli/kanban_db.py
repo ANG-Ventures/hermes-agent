@@ -6565,7 +6565,9 @@ def complete_task(
         metadata = dict(metadata or {}, survivor=survivor)
         survivor_note = (
             f"survivor=patch {survivor['path']} {survivor['sha256']} {survivor['bytes']} NOT PUSHED"
-            if survivor['kind'] == 'patch' else f"survivor=ref {json.dumps(survivor['refs'])}"
+            if survivor['kind'] == 'patch' else "survivor=ref " + " ".join(
+                f"{ref['remote']}/{ref['branch']}@{ref['sha']}" for ref in survivor["refs"]
+            )
         )
         result = '\n'.join(filter(None, [result, survivor_note]))
     metadata = _merge_completion_prose_artifacts(
