@@ -386,8 +386,12 @@ DEFAULT_CONFIG = {
         # What a messaging-gateway boot does with a restart-interrupted turn.
         # "prompt" preserves the transcript and asks before continuing (safe
         # default). "auto" continues once when the persisted tail is mechanically
-        # safe; ambiguous/mutating tails still fail closed to prompt. Read once at
-        # gateway startup, so changing it takes effect after a gateway restart.
+        # safe; ambiguous/mutating tails still fail closed to prompt. "always"
+        # continues once even past an incomplete/unclassified tool call at the
+        # tail (operator policy: an interrupted sibling turn resumes unattended);
+        # the structural guards (messaging surfaces only, stable rowid, once-ever
+        # per turn, finished-work skip) still apply. Read once at gateway
+        # startup, so changing it takes effect after a gateway restart.
         "resume_interrupted_turns": "prompt",
 
         # Per-provider opt-in to preserve assistant ``reasoning_content``

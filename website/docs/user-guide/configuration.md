@@ -1095,7 +1095,7 @@ agent:
 
 `agent.api_max_retries` controls how many times Hermes retries a provider API call on transient errors (rate limits, connection drops, 5xx) **before** fallback-provider switching engages. The default is `3` — four attempts total. If you have [fallback providers](/user-guide/features/fallback-providers) configured and want to fail over faster, drop this to `0` so the first transient error on your primary immediately hands off to the fallback instead of churning retries against the flaky endpoint.
 
-`agent.resume_interrupted_turns` controls gateway restart recovery for interrupted turns. Valid values are `off`, `prompt`, and `auto`; the default is `prompt`.
+`agent.resume_interrupted_turns` controls gateway restart recovery for interrupted turns. Valid values are `off`, `prompt`, `auto`, and `always`; the default is `prompt`. `auto` continues an interrupted turn once, unattended, when its persisted tail is mechanically safe — a turn cut in the middle of a mutating tool call (`terminal`, `write_file`, …) still falls back to `prompt`. `always` continues once even past an incomplete or unclassified tool call at the tail (for operators who want every interrupted sibling turn to resume without being asked); the structural guards — messaging surfaces only, a stable assistant rowid, once-ever per interrupted turn, and the finished-work skip — still apply in every mode.
 
 ## Wall-Clock Run Budget
 
