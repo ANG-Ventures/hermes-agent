@@ -80,16 +80,65 @@ UNTRUSTED_LOG="$WORK_DIR/untrusted.log"
 # exit 0. The publisher's exit code is therefore classified separately and
 # is never eligible for transient tolerance.
 RATE_LIMIT_PATTERN='API rate limit exceeded|secondary rate limit|rate limit exceeded for installation|HTTP 429|HTTP Error 429|X-RateLimit-Remaining: 0'
-# 5xx only. NOT a bare "HTTP 5" prefix match: that would also swallow a
-# hypothetical 5-prefixed 4xx string and, more importantly, keep matching if
-# GitHub ever prints a different 5-leading code that is not a server error.
-SERVER_ERROR_PATTERN='HTTP 50[0-4]|HTTP Error 50[0-4]|Bad gateway|Service Unavailable|Gateway Timeout'
+# 5xx server errors only: the whole 500-599 range EXCEPT 501.
+#
+# 501 (Not Implemented) is excluded deliberately and must stay excluded: it
+# means the request itself is wrong, which retrying cannot fix. The former
+# `50[0-4]` class was wrong in both directions — it matched 501 (so a
+# malformed request was retried and then exited 0 as a tolerated transient,
+# publishing nothing), and it missed 505/507/etc (so a genuine server-side
+# fault reddened an innocent PR).
+#
+# `50[02-9]|5[1-9][0-9]` is exactly 500-599 minus 501, the same set as
+# TRANSIENT_SERVER_ERROR_CODES in scripts/ci/publish_e2e_evidence.py; a
+# test pins the two against each other across all 100 codes.
+#
+# Boundary-anchored so a longer status string cannot prefix-match: without
+# `[^0-9]`, `HTTP 500` would also match a hypothetical `HTTP 5001`.
+SERVER_ERROR_PATTERN='HTTP (Error )?(50[02-9]|5[1-9][0-9])([^0-9]|$)|Bad gateway|Service Unavailable|Gateway Timeout'
 TRANSIENT_PATTERN="$RATE_LIMIT_PATTERN|$SERVER_ERROR_PATTERN"
 
 # Exit code the Python publisher uses for "transient GitHub API condition"
 # (rate limit or 5xx). Kept in sync with TRANSIENT_EXIT_CODE in
 # scripts/ci/publish_e2e_evidence.py; a test pins the two together.
 PUBLISHER_TRANSIENT_RC=75
+
+# Exit code for "a third-party binary did not match its pinned digest".
+# Distinct so it can never be confused with a transport failure, and
+# deliberately outside the transient class: a mismatched binary is a
+# supply-chain event, not an API hiccup, and must always go RED.
+SUPPLY_CHAIN_EXIT_CODE=78
+
+# gh-image release pin. The TAG is mutable, so the digest below — not the
+# tag — is what actually constrains which bytes get executed.
+#
+# Refresh procedure when bumping the tag:
+#   gh api repos/drogers0/gh-image/releases/tags/<tag> \
+#     --jq '.assets[] | select(.name|startswith("linux-")) | .name+" "+.digest'
+GH_IMAGE_REPO='drogers0/gh-image'
+GH_IMAGE_TAG='v1.2.0'
+# Digests read from the release API on 2026-09-20 (tag v1.2.0, which then
+# resolved to commit 44f4b93ecbbe22de6c45fa2f62f519aee564ca8c).
+GH_IMAGE_SHA256_linux_amd64='0505f8c46d63bd603a445fdbfdd6be45e75a80778d97f1edf3580697fa6b7919'
+GH_IMAGE_SHA256_linux_arm64='f36fd26e1920e217eb2bd1d5f7e0378c00f64214f3b011f5697d883943f0d1ee'
+# The publish job runs on `CI_RUNNER_LABELS` (the ACE-AI self-hosted Linux
+# pool) or ubuntu-latest, so only the Linux assets are pinned. Any other
+# architecture fails loudly rather than installing an unpinned binary.
+case "$(uname -m 2>/dev/null)" in
+  x86_64|amd64)
+    GH_IMAGE_ASSET='linux-amd64'
+    GH_IMAGE_SHA256="$GH_IMAGE_SHA256_linux_amd64" ;;
+  aarch64|arm64)
+    GH_IMAGE_ASSET='linux-arm64'
+    GH_IMAGE_SHA256="$GH_IMAGE_SHA256_linux_arm64" ;;
+  *)
+    GH_IMAGE_ASSET=''
+    GH_IMAGE_SHA256='' ;;
+esac
+# Tests pin a known asset+digest pair so the verification path is exercised
+# regardless of the host architecture the suite happens to run on.
+GH_IMAGE_ASSET="${PUBLISH_EVIDENCE_GH_IMAGE_ASSET:-$GH_IMAGE_ASSET}"
+GH_IMAGE_SHA256="${PUBLISH_EVIDENCE_GH_IMAGE_SHA256:-$GH_IMAGE_SHA256}"
 
 # Bounded retry. A secondary rate limit and a 5xx both clear in seconds, so
 # a short retry recovers the common case for ~20s of wall clock against the
@@ -115,17 +164,91 @@ ensure_extension() {
   # The gh-image extension install also spends the shared installation
   # budget. It used to run as a separate workflow step OUTSIDE this
   # classifier, so a budget exhaustion there reddened the PR before the
-  # tolerance could ever apply. v1.2.0 resolves to
-  # 44f4b93ecbbe22de6c45fa2f62f519aee564ca8c.
+  # tolerance could ever apply.
   #
-  # Guarded by a presence check because `gh extension install` FAILS when
-  # the extension is already installed. Without the guard the second retry
-  # attempt would hard-fail on a successful first install — turning the
-  # retry loop itself into a new red.
-  if gh extension list 2>/dev/null | grep -q 'gh-image'; then
+  # SUPPLY CHAIN — why this is not `gh extension install --pin v1.2.0`:
+  #
+  # A git tag is mutable. `--pin v1.2.0` re-resolves the tag at install
+  # time, so whoever controls that upstream repository can retarget it (or
+  # replace the release asset) and this step would execute the new binary
+  # with the workflow token's permissions. Documenting the expected commit
+  # in a comment does not constrain anything at runtime.
+  #
+  # `--pin` cannot fix this: MEASURED 2026-09-20, `gh extension install
+  # drogers0/gh-image --pin 44f4b93ecbbe22de6c45fa2f62f519aee564ca8c` exits
+  # 1 with "Could not find a release of drogers0/gh-image for 44f4b9…".
+  # gh-image ships release binaries, and for a BINARY extension gh's
+  # `--pin` accepts a release tag only — a commit is accepted for script
+  # extensions. So a commit pin is simply unavailable here.
+  #
+  # What IS immutable is the content. So: download the release asset,
+  # verify its SHA-256 against the digest pinned below, and only then
+  # install it from a local directory (which gh installs verbatim — the
+  # bytes on disk after a local install are byte-identical to the asset,
+  # verified 2026-09-20). A retargeted tag or a swapped asset fails the
+  # digest check and the step goes RED. It is never tolerated as transient:
+  # a binary that does not match its pin is a supply-chain event, not a
+  # GitHub API hiccup.
+  if extension_present; then
     return 0
   fi
-  gh extension install drogers0/gh-image --pin v1.2.0
+
+  local asset_dir ext_dir asset actual
+  if [ -z "$GH_IMAGE_ASSET" ] || [ -z "$GH_IMAGE_SHA256" ]; then
+    echo "No pinned gh-image asset for architecture $(uname -m 2>/dev/null); refusing to install an unverified binary." >&2
+    return "$SUPPLY_CHAIN_EXIT_CODE"
+  fi
+  asset_dir="$WORK_DIR/gh-image-download"
+  ext_dir="$asset_dir/gh-image"
+  rm -rf "$asset_dir"
+  mkdir -p "$ext_dir"
+  asset="$ext_dir/gh-image"
+
+  # The download itself spends the budget, so a failure here stays inside
+  # the classifier and is eligible for ordinary transient tolerance.
+  gh release download "$GH_IMAGE_TAG" --repo "$GH_IMAGE_REPO" \
+    --pattern "$GH_IMAGE_ASSET" --output "$asset" --clobber || return $?
+
+  actual=$(sha256_of "$asset") || {
+    echo "Could not compute a SHA-256 for the downloaded gh-image asset; refusing to install it." >&2
+    return "$SUPPLY_CHAIN_EXIT_CODE"
+  }
+  if [ "$actual" != "$GH_IMAGE_SHA256" ]; then
+    # Deliberately loud and deliberately NOT transient.
+    echo "gh-image $GH_IMAGE_TAG ($GH_IMAGE_ASSET) does not match its pinned digest." >&2
+    echo "  expected sha256: $GH_IMAGE_SHA256" >&2
+    echo "  actual   sha256: $actual" >&2
+    echo "Refusing to execute an unverified third-party binary with the workflow token." >&2
+    return "$SUPPLY_CHAIN_EXIT_CODE"
+  fi
+
+  chmod +x "$asset"
+  gh extension install "$ext_dir"
+}
+
+
+extension_present() {
+  # `gh extension list` renders an extension installed from a local
+  # directory WITHOUT its owner/repo column — measured 2026-09-20, a local
+  # install prints `gh image\t\t` where a remote one prints
+  # `gh image\tdrogers0/gh-image\tv1.2.0`. Matching on the repo slug
+  # therefore misses our own install and the retry loop would reinstall on
+  # every attempt. Match the COMMAND gh reports, which is stable across
+  # both install kinds.
+  gh extension list 2>/dev/null | grep -qE '(^|[[:space:]])gh[[:space:]]+image([[:space:]]|$)'
+}
+
+
+sha256_of() {
+  # Runners have sha256sum (Linux) or shasum (macOS); neither is
+  # guaranteed, so require one rather than silently skipping the check.
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | cut -d' ' -f1
+  else
+    return 1
+  fi
 }
 
 
@@ -167,10 +290,18 @@ publish() {
   PRODUCER_COUNT=$(printf '%s' "$PRODUCER_CONCLUSIONS" | grep -c . || true)
   NON_SKIPPED=$(printf '%s\n' "$PRODUCER_CONCLUSIONS" | grep -vx 'skipped' | grep -c . || true)
 
-  ARTIFACT_NAME=$(gh api --paginate "repos/$SOURCE_REPO/actions/runs/$SOURCE_RUN_ID/artifacts?per_page=100" \
-    --jq '.artifacts[] | select(.expired == false and (.name | startswith("e2e-evidence-"))) | .name' \
-    | head -n1)
-  if [ -z "$ARTIFACT_NAME" ]; then
+  # EVERY unexpired evidence artifact, not just the first.
+  #
+  # `head -n1` published one artifact and reported success. Today the
+  # producer uploads exactly one (`e2e-evidence-${{ github.sha }}`, a
+  # single non-matrix job in e2e-desktop.yml), so that is currently
+  # equivalent — but a matrix dimension or a renamed sibling silently turns
+  # it into a partial publish: some evidence attached, the rest dropped,
+  # and a green step. Enumerate them all and publish each.
+  ARTIFACT_NAMES=$(gh api --paginate "repos/$SOURCE_REPO/actions/runs/$SOURCE_RUN_ID/artifacts?per_page=100" \
+    --jq '.artifacts[] | select(.expired == false and (.name | startswith("e2e-evidence-"))) | .name')
+  ARTIFACT_COUNT=$(printf '%s' "$ARTIFACT_NAMES" | grep -c . || true)
+  if [ "$ARTIFACT_COUNT" -eq 0 ]; then
     if [ "$PRODUCER_COUNT" -eq 0 ]; then
       # No job matched the name filter. That is NOT evidence of a deliberate
       # skip — the job may have been renamed or removed, or the filter may
@@ -192,6 +323,35 @@ publish() {
     return 1
   fi
 
+  # Each producer that RAN must have delivered. Fewer artifacts than
+  # non-skipped producers means at least one ran and uploaded nothing —
+  # publishing the others and exiting 0 would be the partial-success
+  # silence this wrapper exists to prevent.
+  if [ "$NON_SKIPPED" -gt 0 ] && [ "$ARTIFACT_COUNT" -lt "$NON_SKIPPED" ]; then
+    echo "$NON_SKIPPED Desktop E2E job(s) ran but only $ARTIFACT_COUNT evidence artifact(s) exist for CI run $SOURCE_RUN_ID." >&2
+    echo "Publishing a partial result as success would hide the missing evidence." >&2
+    return 1
+  fi
+
+  # Iterate over a here-doc rather than a pipeline: a `while read` on the
+  # right of a pipe runs in a subshell, so a `return` inside it would not
+  # propagate out of `publish`.
+  while IFS= read -r ARTIFACT_NAME; do
+    [ -n "$ARTIFACT_NAME" ] || continue
+    publish_one_artifact "$ARTIFACT_NAME" "$PR_NUMBER" || return $?
+  done <<EOF
+$ARTIFACT_NAMES
+EOF
+  return 0
+}
+
+
+publish_one_artifact() {
+  # Download and publish ONE evidence artifact. Split out of `publish` so
+  # the multi-artifact loop above cannot accidentally share mutable state
+  # between iterations.
+  local ARTIFACT_NAME="$1" PR_NUMBER="$2"
+  local EVIDENCE_DIR download_rc publisher_rc PROBE_LOG
   EVIDENCE_DIR="$WORK_DIR/e2e-evidence"
   rm -rf "$EVIDENCE_DIR"
   mkdir -p "$EVIDENCE_DIR"
@@ -208,9 +368,24 @@ publish() {
   if [ "$download_rc" -ne 0 ]; then
     # Distinguish a transient API condition from a real download failure
     # with a TRUSTED probe rather than by grepping attacker-influenced
-    # output. The probe's own failure is the transient signal.
-    if ! gh api "repos/$SOURCE_REPO" --jq '.full_name' >/dev/null 2>&1; then
-      echo "API rate limit exceeded: the artifact download failed and a control API call also failed." >&2
+    # output.
+    #
+    # The probe's FAILURE is not the signal — its OUTPUT is. Any probe
+    # failure used to be rewritten into a hard-coded "API rate limit
+    # exceeded" line, which `is_transient` then matched downstream. A
+    # revoked or expired credential fails the download AND the probe, so
+    # it was retried and finally exited 0 having published nothing: the
+    # masked failure this wrapper exists to prevent, one layer down.
+    #
+    # Emitting the probe's real output instead lets the ordinary
+    # classifier decide. That output is trusted — it names only
+    # $SOURCE_REPO, never anything from the artifact — so a rate limit
+    # still reaches NEUTRAL while a 401 carries no transient signature and
+    # stays RED. No fabricated line, and no second classifier to drift.
+    PROBE_LOG="$WORK_DIR/probe.log"
+    if ! gh api "repos/$SOURCE_REPO" --jq '.full_name' >"$PROBE_LOG" 2>&1; then
+      echo "The artifact download failed (exit $download_rc) and the control API call also failed:" >&2
+      cat "$PROBE_LOG" >&2
       return "$download_rc"
     fi
     echo "Artifact download failed (exit $download_rc); see the untrusted log above." >&2
@@ -306,6 +481,24 @@ emit_neutral_status() {
 }
 
 
+print_untrusted() {
+  # Both of these files contain artifact-controlled filenames and paths.
+  # Emitted raw into the job log, a crafted filename containing a newline
+  # followed by `::error::` or `::add-mask::` is parsed by the Actions
+  # command processor — forging annotations or masking later output.
+  #
+  # `stop-commands` turns that processing off for the span. The token must
+  # be unguessable, otherwise the untrusted content could simply emit the
+  # matching resume command and re-enable parsing mid-span.
+  local token
+  token=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n') || token="publish-evidence-$$-$RANDOM"
+  echo "::stop-commands::$token"
+  [ -s "$UNTRUSTED_LOG" ] && cat "$UNTRUSTED_LOG"
+  [ -s "$PUBLISHER_LOG" ] && cat "$PUBLISHER_LOG"
+  echo "::$token::"
+}
+
+
 attempt=1
 while : ; do
   # Run in an explicit SUBSHELL, not a pipeline. A pipeline would work too
@@ -315,9 +508,10 @@ while : ; do
   ( publish ) >"$LOG_FILE" 2>&1
   rc=$?
   cat "$LOG_FILE"
-  # Printed for humans, deliberately NOT part of the classified transport log.
-  [ -s "$UNTRUSTED_LOG" ] && cat "$UNTRUSTED_LOG"
-  [ -s "$PUBLISHER_LOG" ] && cat "$PUBLISHER_LOG"
+  # Printed for humans, deliberately NOT part of the classified transport
+  # log — and with workflow-command parsing disabled, since the content is
+  # attacker-influenced.
+  print_untrusted
 
   [ "$rc" -eq 0 ] && exit 0
   is_transient "$rc" || break

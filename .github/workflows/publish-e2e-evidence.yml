@@ -50,6 +50,11 @@ jobs:
         #
         # ``checks: write`` above exists solely for that neutral check run.
         #
+        # The gh-image extension is installed INSIDE that classifier and is
+        # verified against a pinned SHA-256 rather than a mutable tag, so a
+        # retargeted tag or a swapped release asset fails the step RED
+        # instead of executing with this job's token.
+        #
         # The OSV scan's SARIF upload is deliberately NOT given any such
         # treatment: ``osv-scanner`` IS in ``all-checks-pass.needs``, so
         # silencing it would hide a required check. This workflow is not in

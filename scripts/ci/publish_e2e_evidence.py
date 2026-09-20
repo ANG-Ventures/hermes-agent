@@ -69,14 +69,27 @@ def _is_rate_limited(err: urllib.error.HTTPError) -> bool:
         return False
 
 
+#: Server-side status codes treated as transient.
+#:
+#: The whole 5xx range EXCEPT 501. A 501 (Not Implemented) means the
+#: request itself is wrong, which retrying cannot fix and which must stay
+#: red. Everything else in the range is a server-side fault: 505, 507 and
+#: friends are no more this repository's defect than a 503 is, and
+#: re-raising them made CI report a repository failure for a transient API
+#: condition.
+#:
+#: ``scripts/ci/publish_evidence_step.sh``'s ``SERVER_ERROR_PATTERN``
+#: enumerates the same set for the shell side; a test pins the two together.
+TRANSIENT_SERVER_ERROR_CODES = frozenset(range(500, 600)) - {501}
+
+
 def _is_transient(err: urllib.error.HTTPError) -> bool:
     """True for the API conditions that are not this repository's defect.
 
-    Two classes, and no others: a rate limit, and a server-side 5xx. A 501
-    (Not Implemented) is deliberately excluded - it means the request itself
-    is wrong, which retrying cannot fix and which must stay red.
+    Two classes, and no others: a rate limit, and a server-side 5xx other
+    than 501.
     """
-    if err.code in (500, 502, 503, 504):
+    if err.code in TRANSIENT_SERVER_ERROR_CODES:
         return True
     return _is_rate_limited(err)
 

@@ -235,9 +235,16 @@ def _http_error(code: int, headers: dict | None = None, body: bytes = b"") -> Ex
     )
 
 
-@pytest.mark.parametrize("code", [500, 502, 503, 504])
+@pytest.mark.parametrize("code", [500, 502, 503, 504, 505, 507, 508, 510, 511, 599])
 def test_server_errors_are_transient(code):
-    """A 5xx is GitHub's fault, not a defect in this repository."""
+    """A 5xx is GitHub's fault, not a defect in this repository.
+
+    FleetReview F1 (P2): the class was a four-entry tuple `(500, 502, 503,
+    504)`, so a 505 or 507 was re-raised and CI reported a REPOSITORY
+    failure for a transient server-side condition. The contract is the
+    whole 5xx range except 501, and this covers codes beyond the original
+    four.
+    """
     assert _mod._is_transient(_http_error(code)) is True
 
 

@@ -12,8 +12,10 @@ stubbed ``gh`` on ``PATH`` and assert the exit code per failure class.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -29,8 +31,37 @@ _SCRIPT = _ROOT / "scripts" / "ci" / "publish_evidence_step.sh"
 _WORKFLOW = _ROOT / ".github" / "workflows" / "publish-e2e-evidence.yml"
 
 
+# The gh-image binary the stubs "download". Tests pin the step's expected
+# digest to this content via PUBLISH_EVIDENCE_GH_IMAGE_SHA256, so the real
+# verification path runs against a known-good pair on any architecture.
+_FAKE_GH_IMAGE_ASSET = "linux-amd64"
+_FAKE_GH_IMAGE_BYTES = "#!/bin/sh\necho stub-gh-image\n"
+_FAKE_GH_IMAGE_SHA256 = hashlib.sha256(
+    _FAKE_GH_IMAGE_BYTES.encode("utf-8")
+).hexdigest()
+
+# Prepended to every stub built by ``_run_step``: report the extension as
+# already installed so ``ensure_extension`` short-circuits. Tests about the
+# install/verify path itself build their own ``gh`` and do not get this.
+_EXTENSION_PRESENT_PREAMBLE = """
+        case "$*" in
+          *"extension list"*) echo "gh image"; exit 0 ;;
+        esac
+"""
+
+
 def _run_step(tmp_path: Path, gh_body: str) -> subprocess.CompletedProcess:
     """Run the step script with a fake ``gh`` that behaves like ``gh_body``."""
+    return _run_step_raw(
+        tmp_path, textwrap.dedent(_EXTENSION_PRESENT_PREAMBLE) + gh_body)
+
+
+def _run_step_raw(tmp_path: Path, gh_body: str) -> subprocess.CompletedProcess:
+    """As ``_run_step`` but with NO extension-present preamble.
+
+    Used by the tests that exercise the install/verify path itself, which
+    must see ``ensure_extension`` actually run.
+    """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     gh = bin_dir / "gh"
@@ -57,6 +88,13 @@ def _step_env(bin_dir: Path, tmp_path: Path) -> dict:
     for var in ("GITHUB_TOKEN", "GH_TOKEN", "GH_SESSION_TOKEN",
                 "GH_IMAGE_SESSION_TOKEN", "GITHUB_API_TOKEN"):
         env.pop(var, None)
+    # And the ambient job summary. Inherited on GitHub Actions, the
+    # persistent-transient tests would hand the script the LIVE summary
+    # file of the test job and it would dutifully append "evidence not
+    # published" to it — false publication warnings in the user-visible
+    # summary of an unrelated job. The two tests that assert on summary
+    # content opt back in with a temporary file of their own.
+    env.pop("GITHUB_STEP_SUMMARY", None)
     env.update({
         "PATH": f"{bin_dir}:{env['PATH']}",
         "RUNNER_TEMP": str(tmp_path / "temp"),
@@ -68,6 +106,12 @@ def _step_env(bin_dir: Path, tmp_path: Path) -> dict:
         # Keep the retry path fast. The shipped default is pinned separately
         # by test_the_shipped_retry_backoff_is_not_the_test_value.
         "PUBLISH_EVIDENCE_RETRY_BACKOFF": "0 0",
+        # Pin the gh-image asset + digest the stubs serve, so the
+        # verification path is exercised regardless of the host
+        # architecture the suite runs on. The shipped defaults are pinned
+        # separately by test_the_shipped_gh_image_digests_are_not_the_test_value.
+        "PUBLISH_EVIDENCE_GH_IMAGE_ASSET": _FAKE_GH_IMAGE_ASSET,
+        "PUBLISH_EVIDENCE_GH_IMAGE_SHA256": _FAKE_GH_IMAGE_SHA256,
     })
     return env
 
@@ -231,6 +275,7 @@ def test_untrusted_publisher_output_cannot_fake_a_rate_limit(tmp_path):
     (bin_dir / "gh").write_text(
         "#!/usr/bin/env bash\n"
         'case "$*" in\n'
+        '  *"extension list"*) echo "gh image"; exit 0 ;;\n'
         '  *"/pulls"*) echo 4242 ;;\n'
         '  *"/jobs"*) echo success ;;\n'
         '  *"/artifacts"*) echo e2e-evidence-desktop ;;\n'
@@ -327,6 +372,7 @@ def test_artifact_lookup_paginates(tmp_path):
     gh.write_text(
         "#!/usr/bin/env bash\n"
         'case "$*" in\n'
+        '  *"extension list"*) echo "gh image"; exit 0 ;;\n'
         '  *"/pulls"*) echo 736 ;;\n'
         '  *"/artifacts"*)\n'
         '     if [[ "$*" != *"--paginate"* ]]; then exit 0; fi\n'
@@ -400,6 +446,7 @@ def test_publisher_transient_exit_code_is_tolerated(tmp_path):
     (bin_dir / "gh").write_text(
         "#!/usr/bin/env bash\n"
         'case "$*" in\n'
+        '  *"extension list"*) echo "gh image"; exit 0 ;;\n'
         '  *"/pulls"*) echo 4242 ;;\n'
         '  *"/jobs"*) echo success ;;\n'
         '  *"/artifacts"*) echo e2e-evidence-desktop ;;\n'
@@ -528,10 +575,362 @@ def test_untrusted_download_output_cannot_fake_a_rate_limit(tmp_path):
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Transient tolerance: bounded retry, and a VISIBLE neutral — never a
-# silent green. (FleetReview round-1 "Masked Failures" P1.)
-# ─────────────────────────────────────────────────────────────────────────
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+def test_a_revoked_credential_is_not_rewritten_into_a_rate_limit(tmp_path):
+    """FleetReview F2 (P1): the probe's FAILURE is not the transient signal.
+
+    Every probe failure used to be rewritten into a hard-coded "API rate
+    limit exceeded" line, which ``is_transient`` then matched. A revoked or
+    expired credential fails the download AND the probe, so it was retried
+    and then exited 0 having published nothing — the masked failure this
+    wrapper exists to prevent, reintroduced one layer down.
+    """
+    result = _run_step(tmp_path, """
+        case "$*" in
+          *"/pulls"*) echo 4242 ;;
+          *"/jobs"*)  echo success ;;
+          *"/artifacts"*) echo e2e-evidence-desktop ;;
+          *"run download"*) echo "gh: HTTP 401: Bad credentials" >&2; exit 1 ;;
+          *"repos/"*)
+             # The control probe fails too, with a CREDENTIAL error and no
+             # transient signature anywhere in its output.
+             echo "gh: HTTP 401: Bad credentials" >&2; exit 1 ;;
+          *) exit 0 ;;
+        esac
+    """)
+    assert result.returncode != 0, (
+        "a revoked credential was tolerated as a rate limit and the step "
+        f"exited 0 with nothing published; stdout={result.stdout!r}"
+    )
+    assert "::warning::" not in result.stdout, (
+        "a credential failure was reported as a tolerated transient"
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+def test_a_genuinely_rate_limited_probe_is_still_tolerated(tmp_path):
+    """The positive control for F2's fix.
+
+    Classifying the probe's output must not become "never transient" — a
+    download that fails while the API really is rate limited still has to
+    reach the tolerated NEUTRAL, or the fix trades a masked failure for an
+    innocent PR reddened by a rate limit.
+    """
+    result = _run_step(tmp_path, """
+        case "$*" in
+          *"/pulls"*) echo 4242 ;;
+          *"/jobs"*)  echo success ;;
+          *"/artifacts"*) echo e2e-evidence-desktop ;;
+          *"run download"*) echo "gh: could not download" >&2; exit 1 ;;
+          *"repos/"*)
+             echo "gh: API rate limit exceeded for installation" >&2; exit 1 ;;
+          *) exit 0 ;;
+        esac
+    """)
+    assert result.returncode == 0, (
+        "a real rate limit during download reddened an innocent PR; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "::warning::" in result.stdout, "the tolerated transient was invisible"
+
+
+@pytest.mark.parametrize("code,transient", [
+    ("500", True),
+    ("501", False),   # Not Implemented: the request is wrong, retry cannot fix it.
+    ("502", True),
+    ("503", True),
+    ("504", True),
+    ("505", True),    # FleetReview F1/F3: `50[0-4]` matched 501 and missed these.
+    ("507", True),
+    ("511", True),
+    ("400", False),
+    ("404", False),
+])
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+def test_the_shell_server_error_class_is_5xx_except_501(tmp_path, code, transient):
+    """FleetReview F1+F3: one 5xx class, and 501 excluded from it.
+
+    The old `50[0-4]` pattern was wrong in BOTH directions: it matched 501
+    (so a malformed request was retried and then tolerated as a transient,
+    publishing nothing) and missed 505/507/etc (so a genuine server-side
+    fault reddened an innocent PR).
+    """
+    result = _run_step(tmp_path, f"""
+        case "$*" in
+          *"/pulls"*) echo "gh: HTTP {code}: server said no" >&2; exit 1 ;;
+          *) exit 0 ;;
+        esac
+    """)
+    if transient:
+        assert result.returncode == 0, (
+            f"HTTP {code} is a server-side fault but reddened the PR; "
+            f"stdout={result.stdout!r}"
+        )
+        assert "::warning::" in result.stdout
+    else:
+        assert result.returncode != 0, (
+            f"HTTP {code} was tolerated as transient; it must stay red. "
+            f"stdout={result.stdout!r}"
+        )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+def test_a_longer_status_code_cannot_prefix_match_the_5xx_class(tmp_path):
+    """Boundary anchoring: `HTTP 500` must not match `HTTP 5001`."""
+    result = _run_step(tmp_path, """
+        case "$*" in
+          *"/pulls"*) echo "gh: HTTP 5001: not a real status" >&2; exit 1 ;;
+          *) exit 0 ;;
+        esac
+    """)
+    assert result.returncode != 0, (
+        "a non-5xx status prefix-matched the server-error class and was "
+        f"tolerated; stdout={result.stdout!r}"
+    )
+
+
+def test_the_two_transient_5xx_enumerations_agree():
+    """The shell and Python classifiers must not drift apart.
+
+    Each maintains its own copy of "which 5xx codes are transient". A
+    second hand-maintained copy of a vocabulary silently drifts, so pin
+    them against each other across the whole range rather than trusting a
+    comment.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "pub_e2e", _ROOT / "scripts" / "ci" / "publish_e2e_evidence.py")
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["pub_e2e"] = mod
+    spec.loader.exec_module(mod)
+
+    wrapper = _SCRIPT.read_text(encoding="utf-8")
+    match = re.search(r"^SERVER_ERROR_PATTERN='([^']+)'", wrapper, re.M)
+    assert match is not None, "the shell 5xx pattern could not be located"
+    pattern = match.group(1)
+
+    for code in range(500, 600):
+        shell_says = bool(re.search(pattern, f"gh: HTTP {code}: x"))
+        python_says = code in mod.TRANSIENT_SERVER_ERROR_CODES
+        assert shell_says == python_says, (
+            f"HTTP {code}: the shell classifier says transient={shell_says} "
+            f"but the Python publisher says transient={python_says}"
+        )
+    assert 501 not in mod.TRANSIENT_SERVER_ERROR_CODES, (
+        "501 Not Implemented must stay red: the request is wrong, and "
+        "retrying cannot fix it"
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+def test_every_evidence_artifact_is_published_not_just_the_first(tmp_path):
+    """FleetReview F5 (P1): a partial publish must not report success.
+
+    ``head -n1`` selected one artifact and published it. With a matrix
+    producer (or a renamed sibling) the rest are silently dropped and the
+    step is green — reviewers never see the evidence they were promised.
+    """
+    downloads = tmp_path / "downloads.log"
+    q_downloads = shlex.quote(str(downloads))
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$*" in\n'
+        '  *"extension list"*) echo "gh image"; exit 0 ;;\n'
+        '  *"/pulls"*) echo 4242 ;;\n'
+        "  *\"/jobs\"*)  printf 'success\\nsuccess\\n' ;;\n"
+        "  *\"/artifacts\"*) printf 'e2e-evidence-a\\ne2e-evidence-b\\n' ;;\n"
+        '  *"run download"*)\n'
+        '     for a in "$@"; do\n'
+        f'       case "$a" in e2e-evidence-*) echo "$a" >> {q_downloads} ;; esac\n'
+        "     done\n"
+        "     exit 0 ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    gh.chmod(0o755)
+    # The publisher itself needs credentials we deliberately do not have;
+    # stub it as succeeding so the assertion is about WHICH artifacts the
+    # loop reached, not about publishing.
+    (bin_dir / "python3").write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        "  *publish_e2e_evidence.py*) exit 0 ;;\n"
+        f"  *) exec {shutil.which('python3')} \"$@\" ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    (bin_dir / "python3").chmod(0o755)
+
+    (tmp_path / "temp").mkdir(exist_ok=True)
+    result = subprocess.run(
+        ["bash", str(_SCRIPT)], cwd=_ROOT, env=_step_env(bin_dir, tmp_path),
+        capture_output=True, text=True, timeout=120,
+    )
+    assert downloads.exists(), (
+        f"no artifact was downloaded at all; stdout={result.stdout!r}"
+    )
+    names = downloads.read_text().split()
+    assert names == ["e2e-evidence-a", "e2e-evidence-b"], (
+        "not every evidence artifact was published — a partial result "
+        f"would have been reported as success; downloaded {names!r}"
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+def test_fewer_artifacts_than_producers_that_ran_is_fatal(tmp_path):
+    """One producer ran and delivered nothing; the other did.
+
+    Publishing the one that exists and exiting 0 hides the missing half.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$*" in\n'
+        '  *"extension list"*) echo "gh image"; exit 0 ;;\n'
+        '  *"/pulls"*) echo 4242 ;;\n'
+        "  *\"/jobs\"*)  printf 'success\\nsuccess\\n' ;;\n"
+        '  *"/artifacts"*) echo e2e-evidence-a ;;\n'
+        "  *) exit 0 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    gh.chmod(0o755)
+    # The publisher must SUCCEED here. Otherwise the step exits non-zero
+    # because publishing failed for want of credentials, and the test would
+    # pass even with the cardinality guard removed — proving nothing.
+    (bin_dir / "python3").write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        "  *publish_e2e_evidence.py*) exit 0 ;;\n"
+        f"  *) exec {shutil.which('python3')} \"$@\" ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    (bin_dir / "python3").chmod(0o755)
+
+    (tmp_path / "temp").mkdir(exist_ok=True)
+    result = subprocess.run(
+        ["bash", str(_SCRIPT)], cwd=_ROOT, env=_step_env(bin_dir, tmp_path),
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode != 0, (
+        "two producers ran but only one artifact existed, and the step "
+        f"reported success anyway; stdout={result.stdout!r}"
+    )
+    assert "would hide the missing evidence" in (result.stdout + result.stderr), (
+        "the step failed for an incidental reason rather than because the "
+        f"artifact count did not cover the producers; stdout={result.stdout!r}"
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+def test_untrusted_output_cannot_forge_a_workflow_command(tmp_path):
+    """FleetReview F6 (P2): artifact filenames reach the Actions parser.
+
+    A crafted filename carrying a newline plus ``::error::`` or
+    ``::add-mask::`` would otherwise forge annotations or mask later
+    output. ``stop-commands`` with an unguessable token disables parsing
+    for the span the untrusted content occupies.
+    """
+    result = _run_step(tmp_path, """
+        case "$*" in
+          *"/pulls"*) echo 4242 ;;
+          *"/jobs"*)  echo success ;;
+          *"/artifacts"*) echo e2e-evidence-desktop ;;
+          *"run download"*)
+             printf 'failed on file\\n::error::forged annotation\\n' >&2
+             exit 1 ;;
+          *) exit 0 ;;
+        esac
+    """)
+    out = result.stdout
+    start = re.search(r"::stop-commands::([0-9a-f]{16,})", out)
+    assert start, (
+        f"untrusted output was printed with command parsing live; stdout={out!r}"
+    )
+    token = start.group(1)
+    assert f"::{token}::" in out, "command parsing was never resumed"
+    forged = out.index("::error::forged annotation")
+    assert out.index(f"::stop-commands::{token}") < forged < out.index(f"::{token}::"), (
+        "the forged workflow command fell outside the stop-commands span"
+    )
+
+
+def test_the_stop_commands_token_is_unguessable():
+    """A fixed token lets the untrusted content resume parsing itself.
+
+    If the resume token were a constant, a crafted filename could simply
+    emit it and re-enable command processing mid-span.
+    """
+    wrapper = _SCRIPT.read_text(encoding="utf-8")
+    body_match = re.search(r"^print_untrusted\(\) \{.*?^\}", wrapper, re.M | re.S)
+    assert body_match is not None, "print_untrusted could not be located"
+    body = body_match.group(0)
+    assert "/dev/urandom" in body, (
+        "the stop-commands token is not drawn from an unguessable source, "
+        "so untrusted output can resume workflow-command parsing itself"
+    )
+
+
+
+
+def test_the_step_env_does_not_inherit_the_ambient_job_summary(tmp_path):
+    """FleetReview F7 (P1): tests must not write to the LIVE job summary.
+
+    ``GITHUB_STEP_SUMMARY`` is set on every GitHub Actions job. Inherited
+    into the step's environment, the persistent-transient tests hand the
+    script the summary file of the TEST job, and it appends "evidence not
+    published" to it — false publication warnings in the user-visible
+    summary of an unrelated job. The two tests that assert on summary
+    content set their own temporary file instead.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    os.environ["GITHUB_STEP_SUMMARY"] = str(tmp_path / "ambient-summary.md")
+    try:
+        env = _step_env(bin_dir, tmp_path)
+    finally:
+        os.environ.pop("GITHUB_STEP_SUMMARY", None)
+    assert "GITHUB_STEP_SUMMARY" not in env, (
+        "the step environment inherits the ambient job summary, so a test run on "
+        "GitHub Actions would append to the live summary of the test job"
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+def test_a_tolerated_transient_writes_no_summary_when_none_is_configured(tmp_path):
+    """The end-to-end half of F7: nothing ambient gets written.
+
+    Even reaching the NEUTRAL path — the one that writes a summary line —
+    the step must not touch a summary file the test did not give it.
+    """
+    ambient = tmp_path / "ambient-summary.md"
+    ambient.write_text("", encoding="utf-8")
+    os.environ["GITHUB_STEP_SUMMARY"] = str(ambient)
+    try:
+        result = _run_step(tmp_path, """
+            case "$*" in
+              *"/pulls"*) echo "gh: API rate limit exceeded" >&2; exit 1 ;;
+              *) exit 0 ;;
+            esac
+        """)
+    finally:
+        os.environ.pop("GITHUB_STEP_SUMMARY", None)
+
+    assert "::warning::" in result.stdout, "the NEUTRAL path was never reached"
+    assert ambient.read_text() == "", (
+        "the step appended to the ambient job summary it inherited from the "
+        f"test process; contents={ambient.read_text()!r}"
+    )
+
 
 
 def _counting_gh(counter: Path, fail_times: int, failure: str) -> str:
@@ -540,11 +939,12 @@ def _counting_gh(counter: Path, fail_times: int, failure: str) -> str:
     Counts its own invocations of the PR lookup so a test can assert the
     wrapper actually RETRIED rather than merely tolerating.
     """
+    q_counter = shlex.quote(str(counter))
     return f"""
         case "$*" in
           *"/pulls"*)
-             n=$(cat {counter} 2>/dev/null || echo 0)
-             n=$((n + 1)); echo "$n" > {counter}
+             n=$(cat {q_counter} 2>/dev/null || echo 0)
+             n=$((n + 1)); echo "$n" > {q_counter}
              if [ "$n" -le {fail_times} ]; then
                echo "{failure}" >&2
                exit 1
@@ -634,8 +1034,9 @@ def test_a_tolerated_transient_is_never_a_silent_green(tmp_path):
     gh = bin_dir / "gh"
     gh.write_text(
         "#!/usr/bin/env bash\n"
-        f'echo "$*" >> {calls}\n'
+        f'echo "$*" >> {shlex.quote(str(calls))}\n'
         'case "$*" in\n'
+        '  *"extension list"*) echo "gh image"; exit 0 ;;\n'
         '  *"/pulls"*) echo "gh: API rate limit exceeded" >&2; exit 1 ;;\n'
         '  *) exit 0 ;;\n'
         "esac\n",
@@ -683,6 +1084,7 @@ def test_the_neutral_status_still_warns_when_the_check_run_cannot_be_created(tmp
     gh.write_text(
         "#!/usr/bin/env bash\n"
         'case "$*" in\n'
+        '  *"extension list"*) echo "gh image"; exit 0 ;;\n'
         '  *"check-runs"*) echo "gh: API rate limit exceeded" >&2; exit 1 ;;\n'
         '  *"/pulls"*) echo "gh: API rate limit exceeded" >&2; exit 1 ;;\n'
         '  *) exit 0 ;;\n'
@@ -805,6 +1207,7 @@ def _probing_gh(counter: Path, reset: str, remaining: str) -> str:
     test can place the reset window relative to *now*. Either may be
     ``FAIL`` to make that half of the probe unreadable.
     """
+    q_counter = shlex.quote(str(counter))
     def _arm(expr: str) -> str:
         return "exit 1" if expr == "FAIL" else f'echo "{expr}"'
 
@@ -813,8 +1216,8 @@ def _probing_gh(counter: Path, reset: str, remaining: str) -> str:
           *"core.reset"*)     {_arm(reset)} ;;
           *"core.remaining"*) {_arm(remaining)} ;;
           *"/pulls"*)
-             n=$(cat {counter} 2>/dev/null || echo 0)
-             n=$((n + 1)); echo "$n" > {counter}
+             n=$(cat {q_counter} 2>/dev/null || echo 0)
+             n=$((n + 1)); echo "$n" > {q_counter}
              echo "gh: API rate limit exceeded for installation" >&2
              exit 1 ;;
           *"/jobs"*) echo skipped ;;
@@ -892,6 +1295,125 @@ def test_a_genuinely_hopeless_wait_short_circuits_to_neutral(tmp_path):
     assert "::warning::" in result.stdout
 
 
+def _extension_gh(tmp_path: Path, *, served_bytes: str | None = None,
+                  download_rc: int = 0, download_stderr: str = "",
+                  rest: str = "") -> str:
+    """A gh stub that models the real install path: download, then install.
+
+    ``served_bytes`` is what ``gh release download`` writes to ``--output``;
+    the step hashes exactly that and compares it to its pinned digest. Pass
+    content other than ``_FAKE_GH_IMAGE_BYTES`` to simulate a retargeted tag
+    or a swapped release asset.
+    """
+    if served_bytes is None:
+        served_bytes = _FAKE_GH_IMAGE_BYTES
+    payload = tmp_path / "served-gh-image"
+    payload.write_text(served_bytes, encoding="utf-8")
+    installed = tmp_path / "installed"
+    q_payload = shlex.quote(str(payload))
+    q_installed = shlex.quote(str(installed))
+    return f"""
+        case "$*" in
+          *"extension list"*)
+             if [ -f {q_installed} ]; then echo "gh image"; fi
+             exit 0 ;;
+          *"release download"*)
+             if [ {download_rc} -ne 0 ]; then
+               echo "{download_stderr}" >&2; exit {download_rc}
+             fi
+             out=""
+             prev=""
+             for a in "$@"; do
+               if [ "$prev" = "--output" ]; then out="$a"; fi
+               prev="$a"
+             done
+             cp {q_payload} "$out"
+             exit 0 ;;
+          *"extension install"*)
+             touch {q_installed}; exit 0 ;;
+        esac
+        {textwrap.dedent(rest)}
+    """
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+def test_a_gh_image_binary_that_does_not_match_its_pin_is_fatal(tmp_path):
+    """FleetReview F4 (P0): a mutable tag must not decide which bytes run.
+
+    ``gh extension install --pin v1.2.0`` re-resolves a MUTABLE tag at
+    install time, so whoever controls the upstream repository can retarget
+    it and this step would execute the replacement with the workflow
+    token's permissions.
+
+    A commit pin is not available: measured 2026-09-20, ``--pin <commit>``
+    exits 1 with "Could not find a release of drogers0/gh-image for
+    44f4b9..." because gh accepts a release tag only for a BINARY
+    extension. So the digest is what constrains the bytes, and a mismatch
+    must be RED — never installed, never tolerated as transient.
+    """
+    result = _run_step_raw(tmp_path, _extension_gh(
+        tmp_path, served_bytes="#!/bin/sh\necho totally-different-binary\n"))
+
+    assert result.returncode != 0, (
+        "a gh-image binary that did not match its pinned digest was accepted; "
+        f"stdout={result.stdout!r}"
+    )
+    assert "does not match its pinned digest" in (result.stdout + result.stderr)
+    assert "::warning::" not in result.stdout, (
+        "a supply-chain mismatch was reported as a tolerated transient"
+    )
+    assert not (tmp_path / "installed").exists(), (
+        "the unverified binary was installed anyway"
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+def test_a_matching_gh_image_binary_is_installed(tmp_path):
+    """The positive control: verification must not reject the real asset.
+
+    Without this, widening the check to always-fail would still pass the
+    mismatch test above, and the step would simply never install anything.
+    """
+    result = _run_step_raw(tmp_path, _extension_gh(tmp_path, rest="""
+        case "$*" in
+          *"/pulls"*) echo 4242 ;;
+          *"/jobs"*) echo skipped ;;
+          *"/artifacts"*) ;;
+          *) exit 0 ;;
+        esac
+    """))
+
+    assert result.returncode == 0, (
+        f"the correctly-pinned binary was rejected; stderr={result.stderr!r}"
+    )
+    assert (tmp_path / "installed").exists(), (
+        "the verified binary was never installed"
+    )
+
+
+def test_the_shipped_gh_image_pin_is_a_digest_not_just_a_tag():
+    """The shipped default must pin CONTENT, not a mutable tag.
+
+    ``_step_env`` overrides the digest so tests can run on any
+    architecture; that override must not become the real pin, and the
+    shipped script must carry a real 64-hex SHA-256 for each supported
+    architecture.
+    """
+    wrapper = _SCRIPT.read_text(encoding="utf-8")
+    digests = re.findall(r"GH_IMAGE_SHA256_\w+='([0-9a-f]{64})'", wrapper)
+    assert len(digests) >= 2, (
+        "the shipped script does not pin a SHA-256 per supported "
+        f"architecture; found {digests!r}"
+    )
+    assert _FAKE_GH_IMAGE_SHA256 not in digests, (
+        "the test digest leaked into the shipped pin"
+    )
+    assert not re.search(r"^\s*gh extension install .*--pin", wrapper, re.M), (
+        "the install still pins a mutable tag via --pin instead of "
+        "verifying the downloaded asset's digest"
+    )
+
+
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
 def test_a_second_attempt_does_not_fail_on_an_already_installed_extension(tmp_path):
     """``gh extension install`` FAILS when the extension already exists.
@@ -899,43 +1421,36 @@ def test_a_second_attempt_does_not_fail_on_an_already_installed_extension(tmp_pa
     Unguarded, the first attempt installs it and the SECOND attempt dies on
     the install — so the retry loop would manufacture a failure of its own
     and never reach the publish it was retrying for.
+
+    The presence guard must also RECOGNISE our own install: gh renders a
+    locally-installed extension as ``gh image`` with no owner/repo column
+    (measured 2026-09-20), so a guard matching the ``gh-image`` slug misses
+    it and reinstalls on every attempt.
     """
     counter = tmp_path / "calls"
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    gh = bin_dir / "gh"
+    q_counter = shlex.quote(str(counter))
     installed = tmp_path / "installed"
-    gh.write_text(
-        "#!/usr/bin/env bash\n"
-        'case "$*" in\n'
-        '  *"extension list"*)\n'
-        f'     if [ -f {installed} ]; then echo "drogers0/gh-image  gh-image"; fi\n'
-        "     exit 0 ;;\n"
-        '  *"extension install"*)\n'
-        f'     if [ -f {installed} ]; then\n'
-        '       echo "gh: extension already installed" >&2; exit 1\n'
-        "     fi\n"
-        f"     touch {installed}; exit 0 ;;\n"
-        '  *"/pulls"*)\n'
-        f"     n=$(cat {counter} 2>/dev/null || echo 0)\n"
-        f'     n=$((n + 1)); echo "$n" > {counter}\n'
-        '     if [ "$n" -le 1 ]; then\n'
-        '       echo "gh: You have exceeded a secondary rate limit" >&2; exit 1\n'
-        "     fi\n"
-        "     echo 4242 ;;\n"
-        '  *"/jobs"*) echo skipped ;;\n'
-        '  *"/artifacts"*) ;;\n'
-        "  *) exit 0 ;;\n"
-        "esac\n",
-        encoding="utf-8",
-    )
-    gh.chmod(0o755)
+    q_installed = shlex.quote(str(installed))
+    result = _run_step_raw(tmp_path, _extension_gh(tmp_path, rest=f"""
+        case "$*" in
+          *"extension install"*)
+             if [ -f {q_installed} ]; then
+               echo "gh: extension already installed" >&2; exit 1
+             fi
+             touch {q_installed}; exit 0 ;;
+          *"/pulls"*)
+             n=$(cat {q_counter} 2>/dev/null || echo 0)
+             n=$((n + 1)); echo "$n" > {q_counter}
+             if [ "$n" -le 1 ]; then
+               echo "gh: You have exceeded a secondary rate limit" >&2; exit 1
+             fi
+             echo 4242 ;;
+          *"/jobs"*) echo skipped ;;
+          *"/artifacts"*) ;;
+          *) exit 0 ;;
+        esac
+    """))
 
-    (tmp_path / "temp").mkdir(exist_ok=True)
-    result = subprocess.run(
-        ["bash", str(_SCRIPT)], cwd=_ROOT, env=_step_env(bin_dir, tmp_path),
-        capture_output=True, text=True, timeout=120,
-    )
     assert int(counter.read_text()) >= 2, (
         "the retry never reached the PR lookup — the extension install on "
         f"attempt two aborted it; stdout={result.stdout!r}"
