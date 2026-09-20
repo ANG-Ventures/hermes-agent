@@ -39,9 +39,16 @@ on:
     branches: [main]
   # merge_group: the merge queue creates a temporary batched branch and fires
   # this event; the required checks must run on it or the queue wedges forever.
-  # On merge_group the detect-changes classifier fails open (EVENT_NAME !=
-  # pull_request -> empty diff -> every lane true), so the FULL matrix runs on
-  # the batched candidate — the queue never merges narrowed/untested code.
+  # The detect-changes classifier resolves a REAL diff here, three-dot from the
+  # TARGET BRANCH (github.event.merge_group.base_ref) to the candidate head —
+  # deliberately NOT merge_group.base_sha, which is the previous chained queue
+  # candidate and yields only the topmost entry's delta. The three-dot diff is
+  # the union of the batch's member PRs, so lane selection over it cannot
+  # under-test any member (the full argument, with the measurement, lives in
+  # .github/actions/detect-changes/action.yml).
+  # A malformed/absent payload still fails open to the full matrix, and every
+  # other non-PR event (push to main, release, dispatch) is untouched: no base
+  # resolved, empty diff, every lane true.
   merge_group:
 
 permissions:
