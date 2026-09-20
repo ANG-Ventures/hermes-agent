@@ -86,3 +86,63 @@ def test_suffix_falls_back_to_literal_reset_text_when_no_epoch():
     })
     assert _quota_window_suffix(agent) == "5h limit, resets 2:20pm (UTC)"
     assert agent._pending_quota_window is None  # consume-once preserved
+
+
+# ── The announce WORDING contract ────────────────────────────────────────────
+# The three tests below assert the user-visible rider, which is the whole point
+# of the fix: "connection issue" and "rate limit" both describe a spent
+# subscription bucket wrongly. Without these, a parity merge can revert
+# agent/chat_completion_helpers.py's `_reason_label = f"{_who} usage exhausted"`
+# line (~2960) to the flat label and every other test in this file stays green.
+# RED-proof: replace that line with `_reason_label = _reason_label`.
+
+def _announce(reason, *, window_ctx, old_model="claude-fable-5-1"):
+    """Render one real fallback announce through the shipping emitter."""
+    from agent.chat_completion_helpers import _emit_fallback_announce
+
+    emitted = []
+    agent = SimpleNamespace(
+        _pending_quota_window=window_ctx,
+        _pending_pool_scope=None,
+        _pending_stream_error_reason=None,
+        _emit_status=emitted.append,
+        provider="claude-bpx-12",
+        model=old_model,
+    )
+    _emit_fallback_announce(
+        agent, old_model, "claude-opus-5", "claude-apx-1",
+        old_provider="claude-bpx-12", record_event=False, reason=reason,
+    )
+    return emitted[0] if emitted else ""
+
+
+def test_announce_names_usage_exhaustion_not_a_transport_fault():
+    """The reported symptom: a spent bucket must not read as a connection fault."""
+    ctx = extract_api_error_context(_status_error(SESSION, 500, "internal_error"))
+    line = _announce(FailoverReason.rate_limit, window_ctx={
+        k: ctx.get(k) for k in ("quota_window", "quota_window_reset", "quota_window_reset_text")
+    })
+    assert "usage exhausted" in line
+    assert "claude-fable-5-1 usage exhausted" in line  # names WHOSE budget ran out
+    assert "5h limit" in line                          # and WHICH window bound
+    assert "connection issue" not in line
+    assert "rate limit" not in line
+
+
+def test_announce_distinguishes_the_weekly_window():
+    ctx = extract_api_error_context(_status_error(WEEKLY, 500, "internal_error"))
+    line = _announce(FailoverReason.rate_limit, window_ctx={
+        k: ctx.get(k) for k in ("quota_window", "quota_window_reset", "quota_window_reset_text")
+    })
+    assert "usage exhausted" in line and "7d limit" in line
+
+
+def test_announce_without_a_known_window_keeps_the_plain_rate_limit_label():
+    """Scoping guard: only a BOUND quota window earns the exhaustion wording.
+
+    A real request-rate throttle (no window resolved) must keep saying
+    "rate limit" — widening the new wording to every 429 would be its own lie.
+    """
+    line = _announce(FailoverReason.rate_limit, window_ctx=None)
+    assert "rate limit" in line
+    assert "usage exhausted" not in line
