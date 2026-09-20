@@ -94,6 +94,21 @@ API_BASE = "https://api.github.com"
 _LOW_REMAINING_THRESHOLD = 200
 _LOW_REMAINING_INTERVAL = 60
 
+# How long the poller pauses between merge-queue membership rechecks.
+#
+# Merge-queue membership is NOT terminal: required checks can fail or time
+# out, and a human can remove a PR from the queue. Merge-group runs never
+# post a comment (the workflow's ``if`` requires ``event == 'pull_request'``),
+# so if this poller exited on a queued PR, a later dequeue would leave no
+# process to publish the review result at all.
+#
+# So a queued PR pauses instead of exiting. The pause must be much longer
+# than the poll interval or the recheck costs more budget than skipping the
+# poll saves: one GraphQL call per 5 minutes is ~12 req/hr per poller,
+# against the ~2 charged calls per 45 s cycle it suppresses.
+_MERGE_QUEUE_RECHECK_INTERVAL = 300
+
+
 
 class RateLimitError(Exception):
     """A 403/429 that the rate limiter produced, not a real failure."""
@@ -120,7 +135,15 @@ class _ApiState:
         self.__init__()
 
     def observe(self, headers) -> None:
-        """Record rate-limit headers from any response (success or error)."""
+        """Record rate-limit headers from any response (success or error).
+
+        ``retry_after`` reflects ONLY the response being observed. It used to
+        be accumulated with ``max()`` and never cleared, so the largest delay
+        ever seen outlived its response: after recovering from a 20-minute
+        primary limit, a later 5-second secondary limit still backed off 20
+        minutes, which ``_nap`` clamps to the remaining timeout — the poller
+        then ran out the clock without publishing a final status.
+        """
         def _int(name: str) -> int | None:
             raw = headers.get(name) if headers is not None else None
             if raw is None:
@@ -139,13 +162,17 @@ class _ApiState:
 
         retry_after = _int("Retry-After")
         if retry_after is not None and retry_after > 0:
-            self.retry_after = max(self.retry_after, float(retry_after))
+            self.retry_after = float(retry_after)
             return
         # Secondary/primary limits without Retry-After carry a reset epoch.
         if remaining == 0:
             reset_at = _int("X-RateLimit-Reset")
             if reset_at is not None:
-                self.retry_after = max(self.retry_after, max(0.0, reset_at - time.time()))
+                self.retry_after = max(0.0, reset_at - time.time())
+                return
+        # This response imposes no delay — a stored one has been served out.
+        self.retry_after = 0.0
+
 
     def effective_interval(self, base: int) -> int:
         """Stretch the poll interval when the installation budget is low."""
@@ -279,7 +306,7 @@ def _headers(token: str, extra: dict[str, str] | None = None) -> dict[str, str]:
     return base
 
 
-def _conditional_get(url: str, token: str, cache_key: str, list_key: str | None = None):
+def _conditional_get(url: str, token: str, cache_key: str):
     """GET ``url``, reusing the cached body when GitHub answers 304.
 
     A 304 Not Modified is free: it does not decrement the installation's
@@ -288,8 +315,9 @@ def _conditional_get(url: str, token: str, cache_key: str, list_key: str | None 
     an entire cycle costs zero rate-limit budget.
 
     Returns ``(payload, link_header)``. ``payload`` is whatever the endpoint
-    returns — a dict, or a list once ``list_key`` has been applied by the
-    caller. On 304 the cached payload and Link header are replayed.
+    returns — a dict or a list; callers unwrap it (``_api_get_paginated``
+    applies its own ``list_key``). On 304 the cached payload and Link header
+    are replayed.
     """
     cached = STATE.etags.get(cache_key)
     extra = {"If-None-Match": cached[0]} if cached else None
@@ -468,7 +496,8 @@ def find_comment_id(token: str, repo: str, pr_number: str) -> int | None:
 
 
 def upsert_comment(
-    token: str, repo: str, pr_number: str, body: str, comment_id: int | None = None
+    token: str, repo: str, pr_number: str, body: str, comment_id: int | None = None,
+    _allow_recreate: bool = True,
 ) -> int | None:
     """Create or update the review comment. Returns the comment ID.
 
@@ -476,6 +505,12 @@ def upsert_comment(
     knows which comment is its own, every later cycle PATCHes it directly
     instead of re-listing the PR's comments (one fewer charged request per
     update, and the listing grows with PR chatter).
+
+    If the cached comment was deleted, the PATCH answers 404. Clearing the
+    cached id and deferring re-creation to "the next cycle" loses the comment
+    entirely when the 404 lands on the final cycle (the quiet grace is already
+    spent and the loop is about to break), so the re-create is issued
+    immediately, once. ``_allow_recreate`` bounds that to a single retry.
     """
     owner, repo_name = repo.split("/")
     if comment_id is None:
@@ -504,16 +539,26 @@ def upsert_comment(
                 STATE.comment_id = new_id
             return new_id
     except urllib.error.HTTPError as e:
-        if e.code == 404 and comment_id:
-            # Someone deleted our comment — forget it and re-create next cycle.
-            STATE.comment_id = None
         STATE.observe(e.headers)
         if _is_rate_limited(e):
             raise RateLimitError(
                 STATE.retry_after or float(_LOW_REMAINING_INTERVAL)
             ) from e
+        if e.code == 404 and method == "PATCH":
+            # Someone deleted our comment. Re-create it NOW: deferring to the
+            # next cycle silently drops the final status when this is the last
+            # one. ``_allow_recreate=False`` on the retry keeps it to one POST.
+            STATE.comment_id = None
+            print("  Review comment was deleted — recreating it.", file=sys.stderr)
+            if _allow_recreate:
+                return upsert_comment(
+                    token, repo, pr_number, body,
+                    comment_id=0, _allow_recreate=False,
+                )
+            return None
         print(f"  API error {e.code}: {e.reason}", file=sys.stderr)
         return None
+
 
 
 # ---------------------------------------------------------------------------
@@ -582,7 +627,12 @@ def _download_artifact(
     if not location:
         return None
 
-    zip_path = dest_dir / f"{artifact['name']}.zip"
+    # Download/extract paths are keyed by the immutable artifact ID, never by
+    # name: an ``overwrite: true`` upload (every ``review-status-*``) mints a
+    # NEW id under the SAME name, so name-keyed paths let a stale extract from
+    # the previous id be served for the newer one.
+    slug = f"{artifact['name']}-{artifact.get('id', 'noid')}"
+    zip_path = dest_dir / f"{slug}.zip"
     try:
         # No auth headers here; further redirects are safe to follow.
         with urllib.request.urlopen(
@@ -593,7 +643,7 @@ def _download_artifact(
     except Exception:
         return None
 
-    extract_dir = dest_dir / artifact["name"]
+    extract_dir = dest_dir / slug
     extract_dir.mkdir(parents=True, exist_ok=True)
     try:
         with zipfile.ZipFile(zip_path) as zf:
@@ -766,6 +816,11 @@ def run(
     prev_completed: dict[str, str] = {}
     prev_pending: list[str] = []
     prev_artifact_count = 0
+    # -inf so the first cycle always checks; then throttled to one check per
+    # _MERGE_QUEUE_RECHECK_INTERVAL so the recheck does not become a new
+    # per-cycle charge against the budget this whole module defends.
+    last_queue_check = float("-inf")
+
 
     def _nap(seconds: float) -> None:
         """Sleep, but never past the timeout."""
@@ -777,6 +832,27 @@ def run(
         if elapsed > timeout:
             print(f"Timeout ({timeout}s) reached — stopping poll.", file=sys.stderr)
             break
+
+        # A PR that has entered the merge queue is already approved and
+        # merging; its live comment is read by nobody, while its poller keeps
+        # spending the shared installation budget the merge-queue CI runs
+        # need. But queue membership is NOT terminal — a required check can
+        # fail, or a human can remove the PR — and merge-group runs never post
+        # a comment, so exiting here would leave a dequeued PR with no
+        # reporter at all. Pause and recheck instead.
+        #
+        # Throttled: one GraphQL call per _MERGE_QUEUE_RECHECK_INTERVAL, not
+        # one per cycle, or the check itself becomes the cost it avoids.
+        if pr_number and not dry_run and (
+            time.time() - last_queue_check >= _MERGE_QUEUE_RECHECK_INTERVAL
+        ):
+            last_queue_check = time.time()
+            if pr_is_in_merge_queue(token, repo, pr_number):
+                print(f"  PR #{pr_number} is in the merge queue — pausing "
+                      f"{_MERGE_QUEUE_RECHECK_INTERVAL}s "
+                      f"(will resume if it is dequeued).")
+                _nap(_MERGE_QUEUE_RECHECK_INTERVAL)
+                continue
 
         cycle_start_charged = STATE.charged
 
@@ -997,7 +1073,13 @@ def pr_is_in_merge_queue(token: str, repo: str, pr_number: str) -> bool:
         return False
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The poller's CLI parser.
+
+    Factored out of :func:`main` so tests can assert against the REAL
+    defaults. A test that rebuilds a look-alike parser with the expected
+    default hardcoded asserts only that argparse works.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--interval", type=int, default=45,
                         help="Seconds between polls (default: 45). The poller "
@@ -1008,7 +1090,12 @@ def main() -> int:
                         help="Max seconds to poll before giving up (default: 1800).")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print comment body instead of posting to PR.")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+
 
     token = os.environ.get("GITHUB_TOKEN", "")
     repo = os.environ.get("GITHUB_REPOSITORY", "")
@@ -1042,12 +1129,9 @@ def main() -> int:
             return 0
         print(f"Resolved PR #{pr_number} from commit {commit_sha[:7]}")
 
-    # A PR that has entered the merge queue is already approved and merging.
-    # Its comment is read by nobody, while its poller keeps spending the
-    # shared installation rate-limit budget that the merge-queue CI runs need.
-    if pr_number and not args.dry_run and pr_is_in_merge_queue(token, repo, pr_number):
-        print(f"PR #{pr_number} is in the merge queue — not polling.")
-        return 0
+    # Merge-queue membership is handled INSIDE run(): it is not terminal, so
+    # a queued PR pauses and rechecks rather than exiting (exiting would leave
+    # a later dequeue with no reporter — merge-group runs never comment).
 
     commit_url = os.environ.get("COMMIT_URL", "")
     if not commit_url and commit_sha and pr_number:

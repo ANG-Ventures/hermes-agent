@@ -369,11 +369,373 @@ def test_workflow_passes_the_slower_interval():
 
 
 def test_default_interval_matches_the_workflow():
-    """A drifting default silently restores the storm for any other caller."""
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--interval", type=int, default=45)
+    """A drifting default silently restores the storm for any other caller.
+
+    Asserted against the PRODUCTION parser, not a look-alike built here: a
+    test-local ``add_argument(default=45)`` proves only that argparse works
+    (FleetReview P2, tautological test).
+    """
+    parser = _mod.build_parser()
     assert parser.parse_args([]).interval == 45
     import inspect
     sig = inspect.signature(_mod.run)
     assert sig.parameters["interval"].default == 45
+
+
+def test_production_parser_is_the_one_main_uses():
+    """build_parser() must be main()'s parser, or the assertion above drifts."""
+    import inspect
+    src = inspect.getsource(_mod.main)
+    assert "build_parser()" in src, \
+        "main() builds its own parser, so build_parser() proves nothing"
+
+
+# ─── P1: merge-queue membership is not terminal ───────────────────────
+
+
+def test_queued_pr_is_rechecked_not_abandoned(monkeypatch):
+    """A queued PR can be ejected; exiting loses reporting forever.
+
+    Merge-group runs deliberately never post a comment, so if this poller
+    exits while the PR sits in the queue and the PR is then dequeued (a
+    required check fails, or a human removes it), no process remains to
+    publish the result. The poller must PAUSE and recheck, not exit.
+    """
+    memberships = [True, True, False]
+    checks = {"n": 0}
+
+    def fake_queued(token, repo, pr):
+        checks["n"] += 1
+        return memberships[min(checks["n"] - 1, len(memberships) - 1)]
+
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", fake_queued)
+    monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: (
+        [{"name": "Python tests", "status": "completed",
+          "conclusion": "success", "html_url": "u"}], True))
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", lambda *a, **k: [])
+
+    posted: list[str] = []
+    monkeypatch.setattr(_mod, "upsert_comment",
+                        lambda t, r, p, body, comment_id=None: posted.append(body) or 7)
+
+    slept: list[float] = []
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_mod.time, "sleep", lambda s: (
+        slept.append(s), clock.__setitem__("t", clock["t"] + max(s, 1.0))))
+
+    rc = _mod.run(token="t", repo="o/r", run_id="1", pr_number="5",
+                  run_url="u", interval=45, timeout=3000, dry_run=False)
+
+    assert rc == 0
+    assert checks["n"] >= 2, \
+        "membership was checked once and the poller gave up; a dequeue is unreported"
+    assert posted, \
+        "the PR left the merge queue but no comment was ever published"
+
+
+def test_queued_pr_does_not_poll_the_jobs_api(monkeypatch):
+    """Pausing must be cheap: one GraphQL check per pause, no job polling."""
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: True)
+
+    collects = {"n": 0}
+
+    def fake_collect(*a, **k):
+        collects["n"] += 1
+        return [], True
+
+    monkeypatch.setattr(_mod, "collect_run_jobs", fake_collect)
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", lambda *a, **k: [])
+    monkeypatch.setattr(_mod, "upsert_comment",
+                        lambda *a, **k: pytest.fail("a queued PR must not be commented on"))
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_mod.time, "sleep",
+                        lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
+
+    rc = _mod.run(token="t", repo="o/r", run_id="1", pr_number="5",
+                  run_url="u", interval=45, timeout=300, dry_run=False)
+
+    assert rc == 0
+    assert collects["n"] == 0, \
+        "a queued PR spent job-API budget it was supposed to be conserving"
+
+
+def test_merge_queue_check_is_throttled_not_per_cycle(monkeypatch):
+    """The recheck must not become a new per-cycle charge.
+
+    Moving the membership check from startup into the loop is only correct
+    if it is throttled: an unthrottled GraphQL call every 45 s cycle is
+    ~80 req/hr per poller added to the very budget this work defends.
+    """
+    checks = {"n": 0}
+
+    def fake_queued(token, repo, pr):
+        checks["n"] += 1
+        return False
+
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", fake_queued)
+    monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: (
+        [{"name": "Python tests", "status": "in_progress", "html_url": "u"}], False))
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", lambda *a, **k: [])
+    monkeypatch.setattr(_mod, "upsert_comment", lambda *a, **k: 1)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    # Floor the advance at 1s: _nap clamps its sleep to the remaining timeout,
+    # which is exactly 0 at the deadline, and the loop guard is ``>``. A real
+    # clock always advances; a fake one that does not would spin.
+    monkeypatch.setattr(_mod.time, "sleep",
+                        lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
+
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5",
+             run_url="u", interval=45, timeout=600, dry_run=False)
+
+    cycles = 600 // 45
+    expected_max = 600 // _mod._MERGE_QUEUE_RECHECK_INTERVAL + 1
+    assert checks["n"] <= expected_max, (
+        f"membership was checked {checks['n']} times over ~{cycles} cycles; "
+        f"the throttle allows at most {expected_max}. An unthrottled check "
+        "adds a charged GraphQL call to every cycle."
+    )
+    assert checks["n"] >= 1, "membership was never checked at all"
+
+
+def test_merge_queue_recheck_interval_is_not_the_poll_interval():
+    """Rechecking every 45s would cost more budget than it saves."""
+    assert _mod._MERGE_QUEUE_RECHECK_INTERVAL >= 120
+
+
+# ─── P1: stale backoff must not outlive its response ──────────────────
+
+
+def test_retry_after_does_not_retain_the_previous_maximum():
+    """A long limit followed by a short one must use the SHORT delay.
+
+    ``max(self.retry_after, new)`` kept the largest delay ever seen and
+    never cleared it, so after recovering from a 20-minute limit a later
+    5-second limit still slept 20 minutes — long enough for _nap to consume
+    the whole remaining timeout and exit without the final status.
+    """
+    _mod.STATE.observe({"Retry-After": "1200"})
+    assert _mod.STATE.retry_after == pytest.approx(1200.0)
+
+    # Recovery: a normal response carries no Retry-After.
+    _mod.STATE.observe({"X-RateLimit-Remaining": "900", "X-RateLimit-Limit": "1000"})
+    assert _mod.STATE.retry_after == 0.0, \
+        "a successful response must clear the stored backoff"
+
+    _mod.STATE.observe({"Retry-After": "5"})
+    assert _mod.STATE.retry_after == pytest.approx(5.0), \
+        "the stale 1200s delay resurfaced on an unrelated short rate limit"
+
+
+def test_reset_epoch_backoff_is_also_replaced_not_maximised(monkeypatch):
+    monkeypatch.setattr(_mod.time, "time", lambda: 1000.0)
+    _mod.STATE.observe({"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "2000"})
+    assert _mod.STATE.retry_after == pytest.approx(1000.0)
+    _mod.STATE.observe({"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1030"})
+    assert _mod.STATE.retry_after == pytest.approx(30.0), \
+        "an earlier, longer reset epoch overrode the current response"
+
+
+def test_stale_backoff_is_not_replayed_by_the_poll_loop(monkeypatch):
+    """End-to-end: a SHORT late limit must sleep short, not replay the long one.
+
+    Under ``max(self.retry_after, ...)`` the stored 900s delay outlived its
+    response, so a later 5s limit still slept 900s. ``_nap`` clamps that to
+    the remaining timeout, which is how the poller ran out the clock without
+    ever publishing a final status.
+    """
+    calls = {"n": 0}
+
+    def fake_collect(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            _mod.STATE.observe({"Retry-After": "900"})       # long limit
+            raise _mod.RateLimitError(_mod.STATE.retry_after)
+        if calls["n"] == 2:
+            _mod.STATE.observe({"X-RateLimit-Remaining": "900",
+                                "X-RateLimit-Limit": "1000"})  # recovered
+            return [{"name": "Python tests", "status": "in_progress",
+                     "html_url": "u"}], False
+        if calls["n"] == 3:
+            _mod.STATE.observe({"Retry-After": "5"})          # brief limit
+            raise _mod.RateLimitError(_mod.STATE.retry_after)
+        return [{"name": "Python tests", "status": "completed",
+                 "conclusion": "success", "html_url": "u"}], True
+
+    monkeypatch.setattr(_mod, "collect_run_jobs", fake_collect)
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", lambda *a, **k: [])
+    posted: list[str] = []
+    monkeypatch.setattr(_mod, "upsert_comment",
+                        lambda t, r, p, body, comment_id=None: posted.append(body) or 1)
+
+    slept: list[float] = []
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_mod.time, "sleep",
+                        lambda s: (slept.append(s), clock.__setitem__("t", clock["t"] + s)))
+
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5",
+             run_url="u", interval=45, timeout=100000, dry_run=False)
+
+    assert len(posted) >= 2, "the final completed status was never published"
+    # slept[0] is the long limit's own backoff and is legitimate. Every sleep
+    # AFTER it must reflect the current response — the 5s limit's backoff is
+    # floored at _LOW_REMAINING_INTERVAL, never the stale 900s.
+    assert slept[0] == pytest.approx(900.0)
+    later = slept[1:]
+    assert later, "the poller never slept again after the long limit"
+    assert max(later) <= float(_mod._LOW_REMAINING_INTERVAL), (
+        "the stale 900s delay was replayed after recovery "
+        f"(sleeps after the long limit: {later})"
+    )
+
+
+
+# ─── P1: a deleted comment must be recreated immediately ──────────────
+
+
+def test_deleted_comment_is_recreated_in_the_same_call(monkeypatch):
+    """A 404 on the final cycle previously lost the comment permanently.
+
+    Clearing the cached id and deferring to "next cycle" is a no-op when
+    the quiet grace has already been consumed and the loop is about to
+    break.
+    """
+    requests: list[tuple[str, str]] = []
+
+    def fake_urlopen(req, *a, **k):
+        requests.append((req.get_method(), req.full_url))
+        if req.get_method() == "PATCH":
+            _raise(404, {"X-RateLimit-Remaining": "900"},
+                   b'{"message":"Not Found"}')
+        return _Resp({"id": 555}, {"X-RateLimit-Remaining": "899"})
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    _mod.STATE.comment_id = 111
+    new_id = _mod.upsert_comment("tok", "o/r", "5", "body")
+
+    assert new_id == 555, \
+        "a deleted comment was not recreated; the final status was lost"
+    assert [m for m, _ in requests] == ["PATCH", "POST"], \
+        f"expected a PATCH then an immediate POST, got {requests}"
+    assert _mod.STATE.comment_id == 555
+
+
+def test_recreate_after_404_happens_only_once(monkeypatch):
+    """A POST that also 404s must not recurse."""
+    methods: list[str] = []
+
+    def fake_urlopen(req, *a, **k):
+        methods.append(req.get_method())
+        _raise(404, {}, b'{"message":"Not Found"}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    _mod.STATE.comment_id = 111
+    assert _mod.upsert_comment("tok", "o/r", "5", "body") is None
+    assert methods == ["PATCH", "POST"], f"unbounded retry: {methods}"
+
+
+def test_non_404_patch_error_does_not_trigger_a_recreate(monkeypatch):
+    """A 500 is transient — recreating would post a duplicate comment."""
+    methods: list[str] = []
+
+    def fake_urlopen(req, *a, **k):
+        methods.append(req.get_method())
+        _raise(500, {})
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    _mod.STATE.comment_id = 111
+    assert _mod.upsert_comment("tok", "o/r", "5", "body") is None
+    assert methods == ["PATCH"], \
+        f"a transient 500 caused a duplicate comment to be posted: {methods}"
+    assert _mod.STATE.comment_id == 111, "a 500 must not discard the cached id"
+
+
+# ─── P3: artifact extract paths must be keyed by immutable id ─────────
+
+
+def test_two_artifact_ids_with_one_name_do_not_share_a_directory(tmp_path, monkeypatch):
+    """``overwrite: true`` mints a new id under the SAME name.
+
+    Download/extract paths keyed by name alone let a stale extract from the
+    previous id be served for the new one.
+    """
+    seen: list[Path] = []
+
+    class _FakeZip:
+        def __init__(self, path):
+            self._path = path
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def namelist(self):
+            return ["review-status.json"]
+
+        def extractall(self, dest):
+            Path(dest).mkdir(parents=True, exist_ok=True)
+            (Path(dest) / "review-status.json").write_text("review_status=[]")
+
+    monkeypatch.setattr(_mod.zipfile, "ZipFile", _FakeZip)
+
+    def fake_urlopen(req, *a, **k):
+        if "archive" in req.full_url:
+            _raise(302, {"Location": "https://blob/x"})
+        return _Resp({}, {})
+
+    class _Blob:
+        headers = {}
+
+        def read(self):
+            return b"zip"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def opener_open(req, *a, **k):
+        _raise(302, {"Location": "https://blob/x"})
+
+    monkeypatch.setattr(
+        urllib.request, "build_opener",
+        lambda *a, **k: type("O", (), {"open": staticmethod(opener_open)})(),
+    )
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Blob())
+
+    for artifact_id in (1, 2):
+        out = _mod._download_artifact(
+            "tok", "o/r",
+            {"id": artifact_id, "name": "review-status-lint",
+             "archive_download_url": "https://api/archive"},
+            tmp_path,
+        )
+        assert out is not None
+        seen.append(out)
+
+    assert seen[0] != seen[1], (
+        "two distinct artifact ids extracted to the same directory; a stale "
+        f"extract can be served for the newer id ({seen[0]})"
+    )
+    assert "1" in seen[0].parts[-2] and "2" in seen[1].parts[-2]
+
+
+# ─── P3: dead parameter ───────────────────────────────────────────────
+
+
+def test_conditional_get_has_no_dead_list_key_parameter():
+    """``_api_get_paginated`` applies list_key itself; the param was unused."""
+    import inspect
+    params = inspect.signature(_mod._conditional_get).parameters
+    assert "list_key" not in params, \
+        "list_key is dead on _conditional_get — it misleads every caller"
+
