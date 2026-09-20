@@ -1575,6 +1575,27 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if get_current_board() == normed:
         clear_current_board()
 
+    if not archive:
+        # A board directory CONTAINS that board's workspaces/ -- deleting it
+        # destroys every card's scratch dir at once, the same blast radius as
+        # the 2026-09-20 incident, and the bare rmtree below did it with no
+        # containment, liveness or audit (card t_63fb42f9, review round 3).
+        # Checked BEFORE the cache invalidation: it opens the board DB (which
+        # would re-populate _INITIALIZED_PATHS) and it can abort, so no state
+        # may be torn down ahead of it.
+        live = _board_has_live_cards(normed)
+        if live:
+            _audit_workspace_deletion(
+                d, task_id=live[0], reason="remove_board", allowed=False,
+                detail=f"board-has-live-cards:{','.join(live[:5])}",
+            )
+            raise ValueError(
+                f"board {normed!r} has {len(live)} card(s) running or holding "
+                f"a live claim lock ({', '.join(live[:5])}); refusing to "
+                "delete its directory, which contains their workspaces. "
+                "Archive it instead, or wait for the cards to finish."
+            )
+
     # A concurrent connect(board=normed) after the rename/delete recreates
     # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
     # dropped first so the schema init pass re-runs on that fresh file.
@@ -1600,8 +1621,40 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         return {"slug": normed, "action": "archived", "new_path": str(target)}
     else:
         import shutil
+        _audit_workspace_deletion(
+            d, task_id=None, reason="remove_board", allowed=True,
+            detail=f"board={normed}",
+        )
         shutil.rmtree(d)
         return {"slug": normed, "action": "deleted", "new_path": ""}
+
+
+def _board_has_live_cards(slug: str) -> list:
+    """Return the ids of cards on *slug* that are running or claim-locked.
+
+    Fail-closed: if the board's DB cannot be read, return a sentinel so the
+    caller refuses rather than deleting a board whose state is unknown.
+    """
+    try:
+        with connect_closing(board=slug) as conn:
+            rows = conn.execute(
+                "SELECT id, status, claim_expires FROM tasks "
+                "WHERE status = 'running' OR claim_expires IS NOT NULL"
+            ).fetchall()
+    except Exception:
+        return ["<unreadable-board-db>"]
+    now = int(time.time())
+    live = []
+    for row in rows:
+        if row["status"] == "running":
+            live.append(row["id"])
+            continue
+        try:
+            if row["claim_expires"] and int(row["claim_expires"]) > now:
+                live.append(row["id"])
+        except (TypeError, ValueError):
+            live.append(row["id"])  # fail closed on an unparseable lock
+    return live
 
 
 # ---------------------------------------------------------------------------
@@ -7213,7 +7266,10 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # worktree so a lingering worker never has its cwd deleted out
             # from under it. Both steps stay best-effort.
             _cleanup_worker_tmux(conn, task_id)
-            _cleanup_worktree_workspace(task_id, path, row["branch_name"])
+            _cleanup_worktree_workspace(
+                task_id, path, row["branch_name"],
+                conn=conn, reason="complete_task",
+            )
             _try_cleanup_parent_workspaces(conn, task_id)
             return
         wp = Path(path)
@@ -7238,7 +7294,12 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
 
 
 def _cleanup_worktree_workspace(
-    task_id: str, path: str, branch_name: Optional[str] = None
+    task_id: str,
+    path: str,
+    branch_name: Optional[str] = None,
+    *,
+    conn: Optional[sqlite3.Connection] = None,
+    reason: str = "worktree_cleanup",
 ) -> None:
     """Remove a finished task's linked git worktree when it holds no work.
 
@@ -7248,6 +7309,15 @@ def _cleanup_worktree_workspace(
     files, unpushed commits, unresolvable repo, failing git — preserves the
     worktree. The task's auto-generated ``wt/<task-id>`` branch is deleted
     with it; custom branches are kept. Best-effort like the scratch path.
+
+    Carries the same LIVENESS gate and AUDIT trail as
+    :func:`safe_remove_workspace_dir`. Before this (card t_63fb42f9, review
+    round 3) the worktree lane returned before ever reaching the choke point:
+    it gated only on dirty/unpushed, so a ``running`` card with a clean,
+    pushed worktree — run 1880's exact situation, which held a
+    ``git worktree add --force --lock`` — was removed out from under the live
+    process, and nothing was logged. Measured on a temp ``HERMES_HOME``:
+    ``WT_STILL_EXISTS False / AUDIT_EXISTS False``.
     """
     try:
         from cli import _worktree_has_unpushed_commits, _worktree_is_dirty
@@ -7257,13 +7327,38 @@ def _cleanup_worktree_workspace(
         wp = Path(path).expanduser()
         if not wp.is_dir():
             return
+        # Liveness FIRST: a card mid-run owns its checkout regardless of how
+        # clean git thinks it is. Fail-closed on any DB error.
+        if _task_has_live_run(conn, task_id):
+            _audit_workspace_deletion(
+                wp, task_id=task_id, reason=reason, allowed=False,
+                detail="task-has-live-run",
+            )
+            _log.warning(
+                "Refusing to remove worktree %s: task %s is running or holds "
+                "a live claim lock (reason %s)",
+                wp, task_id, reason,
+            )
+            return
         common = _git_common_dir(wp)
         if common is None or common.name != ".git":
+            _audit_workspace_deletion(
+                wp, task_id=task_id, reason=reason, allowed=False,
+                detail="not-a-linked-worktree",
+            )
             return  # not a linked worktree of a normal repo — never guess
         repo_root = common.parent
         if wp.resolve(strict=False) == repo_root.resolve(strict=False):
+            _audit_workspace_deletion(
+                wp, task_id=task_id, reason=reason, allowed=False,
+                detail="is-the-main-checkout",
+            )
             return  # never remove the main checkout
         if _worktree_is_dirty(str(wp)) or _worktree_has_unpushed_commits(str(wp)):
+            _audit_workspace_deletion(
+                wp, task_id=task_id, reason=reason, allowed=False,
+                detail="dirty-or-unpushed",
+            )
             _log.info(
                 "Preserving worktree for task %s: dirty or unpushed work at %s",
                 task_id, wp,
@@ -7281,11 +7376,19 @@ def _cleanup_worktree_workspace(
             check=False,
         )
         if result.returncode != 0:
+            _audit_workspace_deletion(
+                wp, task_id=task_id, reason=reason, allowed=False,
+                detail="git-worktree-remove-failed",
+            )
             _log.warning(
                 "git worktree remove failed for task %s at %s: %s",
                 task_id, wp, (result.stderr or result.stdout or "").strip(),
             )
             return
+        _audit_workspace_deletion(
+            wp, task_id=task_id, reason=reason, allowed=True,
+            detail="git-worktree-remove",
+        )
         _log.debug("Removed worktree workspace: %s", wp)
         branch = (branch_name or "").strip() or f"wt/{task_id}"
         if branch.startswith("wt/"):
@@ -7337,7 +7440,8 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             # All children done — safe to clean up parent workspace
             if row["workspace_kind"] == "worktree":
                 _cleanup_worktree_workspace(
-                    parent_id, row["workspace_path"], row["branch_name"]
+                    parent_id, row["workspace_path"], row["branch_name"],
+                    conn=conn, reason="deferred_parent_cleanup",
                 )
                 continue
             wp = Path(row["workspace_path"])

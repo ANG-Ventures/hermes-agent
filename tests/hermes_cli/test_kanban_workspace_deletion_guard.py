@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -269,3 +271,211 @@ def test_gc_skips_an_archived_row_that_still_holds_a_live_claim(kanban_home):
 
     assert kanban_cli._cmd_gc(argparse.Namespace()) == 0
     assert (ws / "work.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# 5. The WORKTREE lane -- same liveness + audit contract as the scratch lane
+# ---------------------------------------------------------------------------
+#
+# ``_cleanup_workspace`` routes ``kind == 'worktree'`` to
+# ``_cleanup_worktree_workspace`` and returns before ever reaching
+# ``safe_remove_workspace_dir``. Before this fix that lane gated ONLY on
+# dirty/unpushed: a ``running`` card with a clean, pushed worktree -- run
+# 1880's exact situation, which held a ``git worktree add --force --lock`` --
+# was removed under the live process, with no audit line. Measured on a real
+# temp HERMES_HOME: ``WT_STILL_EXISTS False / AUDIT_EXISTS False``.
+
+
+def _git(*args, cwd):
+    return subprocess.run(
+        ["git", *args], cwd=str(cwd), capture_output=True, text=True,
+        check=False, timeout=60,
+    )
+
+
+@pytest.fixture
+def linked_worktree(tmp_path):
+    """A real repo with a real linked worktree that is clean and fully pushed.
+
+    Returns ``(repo_root, worktree_path)``. Skips if git is unavailable.
+    """
+    if shutil.which("git") is None:  # pragma: no cover - env dependent
+        pytest.skip("git not available")
+    remote = tmp_path / "remote.git"
+    _git("init", "--bare", "-b", "main", str(remote), cwd=tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-b", "main", cwd=repo)
+    _git("config", "user.email", "t@example.com", cwd=repo)
+    _git("config", "user.name", "T", cwd=repo)
+    _git("remote", "add", "origin", str(remote), cwd=repo)
+    (repo / "README.md").write_text("hi\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-m", "init", cwd=repo)
+    _git("push", "-u", "origin", "main", cwd=repo)
+
+    wt = tmp_path / "wt-card"
+    # `main` is checked out in the primary worktree, so a linked worktree
+    # must be detached at the same commit (still clean, still fully pushed).
+    res = _git("worktree", "add", "--detach", str(wt), "main", cwd=repo)
+    if res.returncode != 0 or not wt.is_dir():  # pragma: no cover
+        pytest.skip("git worktree add unavailable: %s" % res.stderr)
+    return repo, wt
+
+
+def test_worktree_removal_writes_an_audit_line(kanban_home, linked_worktree):
+    """DELIVERABLE 2b: *every* workspace deletion is logged, worktrees too."""
+    _repo, wt = linked_worktree
+    task_id = _mktask("worktree card")
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status='done', workspace_kind='worktree', "
+            "workspace_path=? WHERE id=?",
+            (str(wt), task_id),
+        )
+        conn.commit()
+
+    with kb.connect_closing() as conn:
+        kb._cleanup_worktree_workspace(
+            task_id, str(wt), None, conn=conn, reason="complete_task"
+        )
+
+    lines = _audit_lines()
+    assert lines, "worktree removal left no audit trail at all"
+    mine = [ln for ln in lines if "task=%s" % task_id in ln]
+    assert mine, lines
+    assert "\tDELETE\t" in mine[-1], mine
+    assert "reason=complete_task" in mine[-1]
+    assert str(wt) in mine[-1]
+    assert not wt.is_dir(), "a clean, pushed, non-live worktree should go"
+
+
+def test_worktree_removal_refuses_a_running_card_and_audits_it(
+    kanban_home, linked_worktree
+):
+    """A running card's worktree survives even when git says it is clean.
+
+    This is run 1880: clean tree, everything pushed, card mid-run. The old
+    lane removed it because dirty/unpushed were its only gates.
+    """
+    _repo, wt = linked_worktree
+    task_id = _mktask("live worktree card")
+    (wt / "scratch-note.txt").write_text("in flight\n", encoding="utf-8")
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status='running', workspace_kind='worktree', "
+            "workspace_path=? WHERE id=?",
+            (str(wt), task_id),
+        )
+        conn.commit()
+        kb._cleanup_worktree_workspace(
+            task_id, str(wt), None, conn=conn, reason="complete_task"
+        )
+
+    assert wt.is_dir(), "removed a RUNNING card's worktree"
+    refused = [
+        ln for ln in _audit_lines()
+        if "\tREFUSED\t" in ln and "task=%s" % task_id in ln
+    ]
+    assert refused, _audit_lines()
+    assert "detail=task-has-live-run" in refused[-1]
+
+
+def test_worktree_removal_refuses_an_unexpired_claim_lock(
+    kanban_home, linked_worktree
+):
+    _repo, wt = linked_worktree
+    task_id = _mktask("claimed worktree card")
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status='todo', workspace_kind='worktree', "
+            "workspace_path=?, claim_lock='host:3', claim_expires=? WHERE id=?",
+            (str(wt), int(time.time()) + 900, task_id),
+        )
+        conn.commit()
+        kb._cleanup_worktree_workspace(
+            task_id, str(wt), None, conn=conn, reason="complete_task"
+        )
+
+    assert wt.is_dir()
+    assert any(
+        "\tREFUSED\t" in ln and "task=%s" % task_id in ln
+        for ln in _audit_lines()
+    )
+
+
+def test_complete_task_worktree_lane_reaches_the_audit(
+    kanban_home, linked_worktree
+):
+    """The wiring, not just the helper: _cleanup_workspace -> audit line."""
+    _repo, wt = linked_worktree
+    task_id = _mktask("worktree via complete")
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status='done', workspace_kind='worktree', "
+            "workspace_path=? WHERE id=?",
+            (str(wt), task_id),
+        )
+        conn.commit()
+        kb._cleanup_workspace(conn, task_id)
+
+    assert any(
+        "task=%s" % task_id in ln for ln in _audit_lines()
+    ), "the complete_task worktree lane still bypasses the audit"
+
+
+# ---------------------------------------------------------------------------
+# 6. remove_board(archive=False) -- a board dir CONTAINS that board's
+#    workspaces/, so the same liveness + audit contract applies.
+# ---------------------------------------------------------------------------
+
+
+def test_remove_board_delete_refuses_while_a_card_is_running(kanban_home):
+    kb.create_board("doomed", name="Doomed")
+    with kb.connect_closing(board="doomed") as conn:
+        task_id = kb.create_task(conn, title="live", assignee="daedalus")
+        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
+        conn.commit()
+
+    bdir = kb.board_dir("doomed")
+    ws = bdir / "workspaces" / task_id
+    ws.mkdir(parents=True)
+    (ws / "work.txt").write_text("hours\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="running or holding"):
+        kb.remove_board("doomed", archive=False)
+
+    assert (ws / "work.txt").exists(), "board delete took a live card's work"
+    assert any("reason=remove_board" in ln for ln in _audit_lines())
+
+
+def test_remove_board_delete_allowed_when_idle_and_audited(kanban_home):
+    kb.create_board("spent", name="Spent")
+    with kb.connect_closing(board="spent") as conn:
+        task_id = kb.create_task(conn, title="done one", assignee="daedalus")
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (task_id,))
+        conn.commit()
+
+    bdir = kb.board_dir("spent")
+    assert bdir.is_dir()
+    res = kb.remove_board("spent", archive=False)
+
+    assert res["action"] == "deleted"
+    assert not bdir.exists()
+    assert any(
+        "reason=remove_board" in ln and "\tDELETE\t" in ln
+        for ln in _audit_lines()
+    ), _audit_lines()
+
+
+def test_remove_board_archive_is_unaffected(kanban_home):
+    """Archiving is a rename, not a deletion -- the guard must not block it."""
+    kb.create_board("kept", name="Kept")
+    with kb.connect_closing(board="kept") as conn:
+        task_id = kb.create_task(conn, title="live", assignee="daedalus")
+        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
+        conn.commit()
+
+    res = kb.remove_board("kept", archive=True)
+    assert res["action"] == "archived"
+    assert Path(res["new_path"]).is_dir()

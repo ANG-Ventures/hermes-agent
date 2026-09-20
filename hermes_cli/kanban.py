@@ -4275,7 +4275,13 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             # predicate: only clean, fully-pushed worktrees are removed.
             wt_path = row["workspace_path"]
             if wt_path and Path(wt_path).is_dir():
-                kb._cleanup_worktree_workspace(row["id"], wt_path, row["branch_name"])
+                # Liveness + audit now live inside the worktree lane too
+                # (card t_63fb42f9): passing no conn makes _task_has_live_run
+                # open its own, which fail-closes on any DB error.
+                kb._cleanup_worktree_workspace(
+                    row["id"], wt_path, row["branch_name"],
+                    reason="gc_archived",
+                )
                 if not Path(wt_path).is_dir():
                     removed_ws += 1
             continue
