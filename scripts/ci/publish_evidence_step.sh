@@ -43,14 +43,33 @@ set -uo pipefail
 # at predictable shared paths, so on a shared host another user can
 # pre-create the log as a symlink and have ``tee`` truncate an unrelated
 # file, or seed the evidence dir with stale content.
-WORK_DIR=$(mktemp -d "${RUNNER_TEMP:-/tmp}/publish-e2e-evidence.XXXXXX")
+WORK_DIR=$(mktemp -d "${RUNNER_TEMP:-/tmp}/publish-e2e-evidence.XXXXXX") || {
+  echo "mktemp -d failed under ${RUNNER_TEMP:-/tmp}; refusing to run with an unset working directory." >&2
+  exit 1
+}
+if [ -z "$WORK_DIR" ] || [ ! -d "$WORK_DIR" ]; then
+  # An empty WORK_DIR would redirect the log to /publish.log and download
+  # into /e2e-evidence — on a privileged runner that can clobber root data.
+  echo "mktemp -d produced no usable directory; refusing to run." >&2
+  exit 1
+fi
 trap 'rm -rf "$WORK_DIR"' EXIT
 LOG_FILE="$WORK_DIR/publish.log"
 
-# Signatures GitHub uses for primary and secondary rate limits, across the
-# REST envelope, gh's own error rendering, and the Python publisher's
-# urllib error text.
-RATE_LIMIT_PATTERN='API rate limit exceeded|secondary rate limit|rate limit exceeded for installation|HTTP 429|HTTP Error 429|X-RateLimit-Remaining: 0|RateLimitError'
+# Signatures GitHub uses for primary and secondary rate limits.
+#
+# Matched ONLY against gh/API transport output, never against the Python
+# publisher's own messages: that publisher echoes filenames taken from the
+# untrusted PR artifact, so a manifest naming a file `RateLimitError.png`
+# would otherwise let a validation failure masquerade as a rate limit and
+# exit 0. The publisher's exit code is therefore classified separately and
+# is never eligible for rate-limit tolerance.
+RATE_LIMIT_PATTERN='API rate limit exceeded|secondary rate limit|rate limit exceeded for installation|HTTP 429|HTTP Error 429|X-RateLimit-Remaining: 0'
+
+# Marker printed immediately before the publisher runs. Everything after it
+# is untrusted-influenced output and is excluded from the rate-limit grep.
+PUBLISHER_MARKER='=== invoking publish_e2e_evidence.py ==='
+
 
 publish() {
   set -euo pipefail
@@ -68,15 +87,31 @@ publish() {
     return 0
   fi
 
-  # --paginate, not the default first page: this CI run produces well over
-  # 30 artifacts (16 test-slice artifacts alone, plus every reusable job's
-  # review-status upload), so a single page can easily exclude the evidence
-  # artifact and make a present artifact look absent.
+  # A missing artifact is only a REGRESSION if the job that produces it
+  # actually ran. `Desktop E2E` is currently hard-disabled in ci.yaml
+  # (`if: ${{ false && ... }}`, pending upstream's #76627), so it reports
+  # `conclusion: skipped` and no run produces an `e2e-evidence-*` artifact
+  # at all. Treating "no artifact" as fatal unconditionally would therefore
+  # red the publish workflow on 100% of PRs.
+  #
+  # So ask the producer. Skipped/absent => nothing was supposed to be
+  # produced => clean skip. Producer ran and succeeded but produced no
+  # evidence => a real regression => fail.
+  # shellcheck disable=SC2016  # jq syntax, not shell expansion.
+  PRODUCER_CONCLUSION=$(gh api --paginate \
+    "repos/$SOURCE_REPO/actions/runs/$SOURCE_RUN_ID/jobs?per_page=100" \
+    --jq '.jobs[] | select(.name | test("Desktop E2E")) | .conclusion' \
+    | head -n1)
+
   ARTIFACT_NAME=$(gh api --paginate "repos/$SOURCE_REPO/actions/runs/$SOURCE_RUN_ID/artifacts?per_page=100" \
     --jq '.artifacts[] | select(.expired == false and (.name | startswith("e2e-evidence-"))) | .name' \
     | head -n1)
   if [ -z "$ARTIFACT_NAME" ]; then
-    echo "No E2E evidence artifact was produced for CI run $SOURCE_RUN_ID." >&2
+    if [ "$PRODUCER_CONCLUSION" != "success" ]; then
+      echo "No E2E evidence artifact for CI run $SOURCE_RUN_ID, and its producer did not run (Desktop E2E: ${PRODUCER_CONCLUSION:-absent}). Nothing to publish."
+      return 0
+    fi
+    echo "Desktop E2E succeeded but produced no evidence artifact for CI run $SOURCE_RUN_ID." >&2
     echo "Publishing evidence is this workflow's primary function, so this is a failure, not a skip." >&2
     return 1
   fi
@@ -85,6 +120,7 @@ publish() {
   mkdir -p "$EVIDENCE_DIR"
   gh run download "$SOURCE_RUN_ID" --repo "$SOURCE_REPO" --name "$ARTIFACT_NAME" --dir "$EVIDENCE_DIR"
 
+  echo "$PUBLISHER_MARKER"
   python3 scripts/ci/publish_e2e_evidence.py \
     --evidence-dir "$EVIDENCE_DIR" \
     --source-repo "$SOURCE_REPO" \
@@ -103,7 +139,11 @@ if [ "$rc" -eq 0 ]; then
   exit 0
 fi
 
-if grep -qiE "$RATE_LIMIT_PATTERN" "$LOG_FILE"; then
+# Classify ONLY the transport portion of the log: everything from the
+# publisher marker onward can echo attacker-chosen filenames.
+sed "/$PUBLISHER_MARKER/,\$d" "$LOG_FILE" > "$WORK_DIR/transport.log"
+
+if grep -qiE "$RATE_LIMIT_PATTERN" "$WORK_DIR/transport.log"; then
   echo "::warning::E2E evidence not published: the shared installation rate-limit budget is exhausted (exit $rc). Not failing the step."
   exit 0
 fi

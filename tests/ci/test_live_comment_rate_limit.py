@@ -22,6 +22,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -620,6 +621,90 @@ def test_listing_failure_returns_none_not_empty(monkeypatch):
     monkeypatch.setattr(_mod, "_list_artifacts", boom)
     assert _mod.fetch_all_review_statuses("tok", "o/r", "77") is None, \
         "a listing failure is indistinguishable from 'no artifacts exist'"
+
+
+def test_failed_download_of_a_new_id_keeps_the_published_section(monkeypatch, tmp_path):
+    """`overwrite: true` mints a new id under the same NAME.
+
+    A transient download failure on the new zip must not delete the section
+    the old id already published — permanently, if it lands on the final
+    cycle.
+    """
+    monkeypatch.setattr(_mod, "_ARTIFACT_TEMP_BASE", tmp_path)
+    state = {"id": 1, "fail": False}
+
+    monkeypatch.setattr(_mod, "_list_artifacts", lambda *a, **k: [
+        {"id": state["id"], "name": "review-status-lint",
+         "archive_download_url": "u"}])
+    monkeypatch.setattr(
+        _mod, "_download_artifact",
+        lambda t, r, artifact, dest: None if state["fail"] else Path("/x.json"))
+    monkeypatch.setattr(_mod, "_parse_status_file",
+                        lambda p: [{"source": "lint", "results": [{"ok": 1}]}])
+
+    first = _mod.fetch_all_review_statuses("tok", "o/r", "77")
+    assert len(first) == 1
+
+    # An overwrite mints a new id; its download blips.
+    state["id"] = 2
+    state["fail"] = True
+    second = _mod.fetch_all_review_statuses("tok", "o/r", "77")
+    assert second == first, (
+        "a transient download failure on a re-uploaded artifact deleted the "
+        f"already-published review section ({second})"
+    )
+
+
+def test_queue_pause_is_bounded_by_the_wall_clock_budget(monkeypatch):
+    """The Actions job has its own timeout-minutes; a SIGKILL publishes nothing.
+
+    Excluding queued time from ``timeout`` is right, but an unbounded pause
+    lets the job be killed mid-pause. _pause_for_queue must clamp to the
+    remaining wall-clock room, not just rely on the loop guard catching it
+    one pause later.
+    """
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: True)
+    monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: ([], False))
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", lambda *a, **k: [])
+    monkeypatch.setattr(_mod, "upsert_comment", lambda *a, **k: 1)
+
+    slept: list[float] = []
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_mod.time, "sleep", lambda s: (
+        slept.append(s), clock.__setitem__("t", clock["t"] + max(s, 1.0))))
+
+    budget = 700          # not a multiple of the 300s recheck interval
+    rc = _mod.run(token="t", repo="o/r", run_id="1", pr_number="5",
+                  run_url="u", interval=45, timeout=3000, dry_run=False,
+                  max_wall_seconds=budget)
+
+    assert rc == 0
+    assert clock["t"] <= budget + 60, (
+        f"a permanently-queued PR ran {clock['t']:.0f}s past its "
+        f"{budget}s wall-clock budget — the job would be SIGKILLed mid-pause"
+    )
+    # The LAST pause must have been clamped to the leftover room (100s),
+    # not taken as a full 300s interval that overshoots the budget.
+    assert slept, "the poller never paused"
+    assert slept[-1] < _mod._MERGE_QUEUE_RECHECK_INTERVAL, (
+        f"the final pause was not clamped to the remaining wall-clock room "
+        f"(slept {slept[-1]}s of a {budget}s budget; pauses={slept})"
+    )
+
+
+def test_workflow_sets_a_wall_clock_budget_below_the_job_timeout():
+    """A budget at or above timeout-minutes would never fire."""
+    root = Path(__file__).resolve().parents[2]
+    text = (root / ".github/workflows/ci-review-comment.yml").read_text(encoding="utf-8")
+    job_timeout_min = int(
+        re.search(r"^\s*timeout-minutes:\s*(\d+)", text, re.M).group(1))
+    budget = int(re.search(r"--max-wall-seconds (\d+)", text).group(1))
+    assert budget < job_timeout_min * 60, (
+        f"--max-wall-seconds {budget} is not below the job's "
+        f"timeout-minutes ({job_timeout_min} = {job_timeout_min * 60}s), so "
+        "the poller is still killed before it can stop cleanly"
+    )
 
 
 # ─── P1: merge-queue membership is not terminal ───────────────────────

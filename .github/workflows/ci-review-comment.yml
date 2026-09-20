@@ -81,6 +81,10 @@ jobs:
           COMMIT_SHA: ${{ github.event.workflow_run.head_sha }}
           COMMIT_MESSAGE: ${{ github.event.workflow_run.head_commit.message }}
         run: |
+          # --max-wall-seconds is below the job's timeout-minutes (60) so a
+          # long merge-queue pause ends with a clean exit and a published
+          # final status, rather than a SIGKILL that publishes nothing.
           python3 -u scripts/ci/live_comment.py \
             --interval 45 \
-            --timeout 3000
+            --timeout 3000 \
+            --max-wall-seconds 3300

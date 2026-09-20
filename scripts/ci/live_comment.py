@@ -130,6 +130,9 @@ class _ApiState:
     def __init__(self) -> None:
         self.etags: dict[str, tuple[str, object, str]] = {}
         self.artifacts: dict[str, list[dict]] = {}
+        # Last successfully parsed statuses per artifact NAME, used to carry
+        # a section across a transient download failure of a newer id.
+        self.artifacts_by_name: dict[str, list[dict]] = {}
         # Keyed by (repo, pr_number): the PATCH URL for a comment carries only
         # the comment id, not the PR, so a process-global id would let a
         # second PR's poller overwrite the FIRST PR's comment.
@@ -788,10 +791,20 @@ def fetch_all_review_statuses(
             continue
         status_file = _download_artifact(token, repo, artifact, run_dl_dir)
         if status_file is None:
-            # Not yet available — leave uncached so a later poll retries.
+            # Not yet available, or a transient download failure. Leave it
+            # uncached so a later poll retries — but if a PREVIOUS cycle
+            # already parsed an artifact with this same source name, keep
+            # that result rather than silently dropping the section from
+            # the comment (an `overwrite: true` upload mints a new id, so a
+            # blip on the new zip would otherwise delete a published
+            # section, permanently if it lands on the final cycle).
+            carried = STATE.artifacts_by_name.get(artifact.get("name", ""))
+            if carried:
+                all_statuses.extend(carried)
             continue
         statuses = _parse_status_file(status_file)
         STATE.artifacts[key] = statuses
+        STATE.artifacts_by_name[artifact.get("name", "")] = statuses
         all_statuses.extend(statuses)
 
     # A re-run can leave several non-expired artifacts with the same name,
@@ -869,6 +882,7 @@ def run(
     timeout: int = 1800,
     dry_run: bool = False,
     watch_workflows: list[str] | None = None,
+    max_wall_seconds: int | None = None,
 ) -> int:
     """Poll for job statuses and update the PR comment until all done.
 
@@ -880,6 +894,7 @@ def run(
     """
     asm = _import_assembler()
     start = time.time()
+    wall_start = start
     last_body = ""
     quiet_grace_used = False
     prev_completed: dict[str, str] = {}
@@ -908,17 +923,32 @@ def run(
         (merge-group runs never post a comment). So advance ``start`` by the
         paused duration, which leaves the poller its full budget of ACTIVE
         polling once the PR returns.
+
+        It is bounded by ``max_wall_seconds`` regardless: the Actions job has
+        its own hard ``timeout-minutes``, and being SIGKILLed mid-pause
+        publishes nothing at all. Stopping cleanly before that lets the
+        final status be written.
         """
         nonlocal start
         before = time.time()
+        if max_wall_seconds is not None:
+            room = max_wall_seconds - (before - wall_start)
+            seconds = min(seconds, max(0.0, room))
         time.sleep(max(0.0, seconds))
         start += time.time() - before
+
 
 
     while True:
         elapsed = time.time() - start
         if elapsed > timeout:
             print(f"Timeout ({timeout}s) reached — stopping poll.", file=sys.stderr)
+            break
+        if max_wall_seconds is not None and (time.time() - wall_start) >= max_wall_seconds:
+            # The Actions job's own timeout-minutes is about to SIGKILL us.
+            # Exit cleanly instead: a killed process publishes nothing.
+            print(f"Wall-clock budget ({max_wall_seconds}s) reached — stopping "
+                  f"poll before the job is killed.", file=sys.stderr)
             break
 
         # A PR that has entered the merge queue is already approved and
@@ -1210,6 +1240,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Max seconds to poll before giving up (default: 1800).")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print comment body instead of posting to PR.")
+    parser.add_argument("--max-wall-seconds", type=int, default=None,
+                        help="Hard wall-clock ceiling, INCLUDING merge-queue "
+                             "pauses. Set it below the workflow job's "
+                             "timeout-minutes so the poller stops cleanly "
+                             "instead of being SIGKILLed mid-pause (a killed "
+                             "process publishes nothing).")
     return parser
 
 
@@ -1284,6 +1320,7 @@ def main() -> int:
         timeout=args.timeout,
         dry_run=args.dry_run,
         watch_workflows=watch_workflows,
+        max_wall_seconds=args.max_wall_seconds,
     )
 
 
