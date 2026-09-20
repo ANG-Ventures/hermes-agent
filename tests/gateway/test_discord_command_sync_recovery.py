@@ -336,7 +336,7 @@ async def test_reconnect_inside_backoff_window_skips_the_sync(adapter, monkeypat
     with caplog.at_level("INFO"):
         await adapter._run_post_connect_initialization()
 
-    sync.assert_not_awaited(), "a reconnect inside the backoff window must not sync"
+    sync.assert_not_awaited()
     assert any(
         "backoff" in record.getMessage().lower() for record in caplog.records
     ), f"the skip must log WHY; got {[r.getMessage() for r in caplog.records]}"
@@ -434,3 +434,86 @@ async def test_successful_sync_runs_the_drift_check(adapter, monkeypatch):
     await adapter._run_post_connect_initialization()
 
     drift_check.assert_awaited()
+
+
+def _seed_retry_state(adapter, **fields):
+    adapter._client = SimpleNamespace(
+        tree=SimpleNamespace(get_commands=lambda: [_DesiredCommand(_payload("stop"))]),
+        application_id=999,
+        user=SimpleNamespace(id=999),
+    )
+    fingerprint = adapter._desired_command_sync_fingerprint()
+    adapter._write_command_sync_state({"999": {"fingerprint": fingerprint, **fields}})
+    return fingerprint
+
+
+@pytest.mark.parametrize("retry_after,backoff,expected", [(1005, 1300, 300), (1500, 1300, 500), (995, 990, 0)])
+def test_retry_delay_honours_both_deadlines(adapter, monkeypatch, retry_after, backoff, expected):
+    monkeypatch.setattr(discord_platform.time, "time", lambda: 1000)
+    monkeypatch.setattr(discord_platform.random, "uniform", lambda *args: 0)
+    _seed_retry_state(adapter, retry_after_until=retry_after, backoff_until=backoff, retry_attempts=1)
+    assert adapter._command_sync_retry_delay(999) == expected
+
+
+def test_changed_fingerprint_ignores_only_stale_backoff(adapter, monkeypatch):
+    monkeypatch.setattr(discord_platform.time, "time", lambda: 1000)
+    fingerprint = _seed_retry_state(adapter, retry_after_until=995, backoff_until=4000, retry_attempts=5)
+    assert "backoff" in adapter._command_sync_skip_reason(999, fingerprint)
+    assert adapter._command_sync_skip_reason(999, "new-fingerprint") is None
+    _seed_retry_state(adapter, retry_after_until=1005, backoff_until=4000, retry_attempts=5)
+    assert "Discord asked us to wait" in adapter._command_sync_skip_reason(999, "new-fingerprint")
+
+
+@pytest.mark.asyncio
+async def test_failed_drift_attempt_is_throttled(adapter, monkeypatch):
+    now = 10000
+    monkeypatch.setattr(discord_platform.time, "time", lambda: now)
+    _seed_retry_state(adapter)
+    fetch = adapter._client.tree.fetch_commands = AsyncMock(side_effect=_RateLimited(30))
+    await adapter._maybe_check_command_registry_drift()
+    fetch.assert_awaited_once()
+    now += 15
+    await adapter._maybe_check_command_registry_drift()
+    fetch.assert_awaited_once()
+    now += discord_platform._DISCORD_COMMAND_DRIFT_CHECK_INTERVAL_SECONDS
+    await adapter._maybe_check_command_registry_drift()
+    assert fetch.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["off", "bulk"])
+async def test_drift_check_respects_sync_policy(adapter, monkeypatch, policy):
+    _seed_retry_state(adapter)
+    fetch = adapter._client.tree.fetch_commands = AsyncMock(return_value=[])
+    monkeypatch.setattr(adapter, "_get_discord_command_sync_policy", lambda: policy)
+    await adapter._maybe_check_command_registry_drift()
+    fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_initializations_sync_once(adapter, monkeypatch):
+    _seed_retry_state(adapter)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def sync():
+        entered.set()
+        await release.wait()
+        return {"total": 1, "unchanged": 1, "updated": 0, "recreated": 0, "created": 0, "deleted": 0}
+
+    sync_mock = AsyncMock(side_effect=sync)
+    monkeypatch.setattr(adapter, "_safe_sync_slash_commands", sync_mock)
+    monkeypatch.setattr(adapter, "_check_command_registry_drift", AsyncMock())
+    first = asyncio.create_task(adapter._run_post_connect_initialization())
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    second = asyncio.create_task(adapter._run_post_connect_initialization(is_rate_limit_retry=True))
+    # Let the second initialization reach its first suspension (lock or sync).
+    await asyncio.sleep(0)
+    release.set()
+    try:
+        await asyncio.wait_for(asyncio.gather(first, second), timeout=2)
+        sync_mock.assert_awaited_once()
+    finally:
+        for task in (first, second):
+            task.cancel()
+        await asyncio.gather(first, second, return_exceptions=True)
