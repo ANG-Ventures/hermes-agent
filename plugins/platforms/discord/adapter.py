@@ -257,6 +257,141 @@ def _abort_discord_websocket_transport(websocket: Any) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# discord.py's own event-loop-block detector -> gateway.log
+#
+# discord.py's keep-alive thread already detects a blocked event loop and logs
+# ``Shard ID %s heartbeat blocked for more than %s seconds.`` (plus the loop
+# thread's traceback when it can grab one) on the ``discord.gateway`` logger at
+# WARNING. That logger name is outside gateway.log's component allowlist, so the
+# records only ever land in errors.log and nobody reading the main gateway log
+# ever connects them to the ``latency_exceeded`` forced reconnects they cause.
+#
+# Mirror the detection through this module's own logger (which IS in the
+# gateway component namespace) as one structured, greppable line.
+# ---------------------------------------------------------------------------
+
+_HEARTBEAT_BLOCKED_MARKER = "heartbeat blocked for more than"
+
+_HEARTBEAT_BLOCKED_SECONDS_RE = re.compile(
+    r"blocked for more than\s+([0-9]+(?:\.[0-9]+)?)\s+seconds",
+    re.IGNORECASE,
+)
+
+_TRACEBACK_FRAME_RE = re.compile(
+    r'^\s*File "(?P<path>.+?)", line (?P<line>\d+), in (?P<func>.+?)\s*$'
+)
+
+# Path fragments that mark a frame as third-party/stdlib rather than repo code.
+_NON_REPO_PATH_MARKERS = (
+    "/site-packages/",
+    "/dist-packages/",
+    "/venv/",
+    "/.venv/",
+    "<frozen",
+)
+
+# Set once the mirror handler is attached to the ``discord.gateway`` logger.
+_HEARTBEAT_BLOCKED_MIRROR_INSTALLED = False
+
+
+def _discord_repo_root() -> str:
+    """Return the repo root this adapter was loaded from."""
+    return os.path.abspath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..")
+    )
+
+
+def _is_repo_frame_path(path: str, repo_root: str) -> bool:
+    """True when *path* is repo source rather than venv/stdlib/frozen code."""
+    if not path:
+        return False
+    if path.startswith("<"):
+        return False
+    normalized = path.replace(os.sep, "/")
+    lowered = normalized.lower()
+    for marker in _NON_REPO_PATH_MARKERS:
+        if marker in lowered:
+            return False
+    # Stdlib lives under .../python3.11/... — exclude it even when a venv-style
+    # path fragment is absent (system interpreters, Homebrew layouts).
+    if re.search(r"/python3(?:\.[0-9]+)?/", lowered):
+        return False
+    root = repo_root.replace(os.sep, "/").rstrip("/")
+    return normalized == root or normalized.startswith(root + "/")
+
+
+def _innermost_repo_frame(text: str) -> str:
+    """Return ``path:line function`` for the deepest repo frame in *text*.
+
+    ``unknown`` when the message carries no traceback, or when every frame in it
+    belongs to third-party/stdlib code.
+    """
+    repo_root = _discord_repo_root()
+    site = "unknown"
+    for raw_line in (text or "").splitlines():
+        match = _TRACEBACK_FRAME_RE.match(raw_line)
+        if not match:
+            continue
+        path = match.group("path")
+        if not _is_repo_frame_path(path, repo_root):
+            continue
+        # Keep overwriting: traceback frames run outermost -> innermost, so the
+        # last repo frame seen is the deepest one.
+        site = f"{path}:{match.group('line')} {match.group('func')}"
+    return site
+
+
+class _DiscordHeartbeatBlockedMirror(logging.Handler):
+    """Re-emit discord.py heartbeat-blocked warnings as a structured line."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return
+        if _HEARTBEAT_BLOCKED_MARKER not in message:
+            return
+        try:
+            seconds_match = _HEARTBEAT_BLOCKED_SECONDS_RE.search(message)
+            seconds = seconds_match.group(1) if seconds_match else "unknown"
+            site = _innermost_repo_frame(message)
+            logger.error(
+                "PHASE=event_loop_blocked platform=discord seconds=%s site=%s",
+                seconds,
+                site,
+            )
+            # The traceback is the actionable half: it names the synchronous
+            # call that stalled the loop. Emit it as its own record so the
+            # structured line above stays single-line and greppable.
+            marker = "Loop thread traceback"
+            index = message.find(marker)
+            if index != -1:
+                logger.error(
+                    "PHASE=event_loop_blocked platform=discord traceback:\n%s",
+                    message[index:],
+                )
+        except Exception:
+            # A diagnostic mirror must never break the keep-alive thread.
+            pass
+
+
+def _install_discord_heartbeat_blocked_mirror() -> bool:
+    """Attach the mirror handler to ``discord.gateway`` once per process.
+
+    Returns True when this call installed the handler, False when it was
+    already present (so repeated adapter connects don't stack handlers).
+    """
+    global _HEARTBEAT_BLOCKED_MIRROR_INSTALLED
+    if _HEARTBEAT_BLOCKED_MIRROR_INSTALLED:
+        return False
+    handler = _DiscordHeartbeatBlockedMirror()
+    handler.setLevel(logging.WARNING)
+    logging.getLogger("discord.gateway").addHandler(handler)
+    _HEARTBEAT_BLOCKED_MIRROR_INSTALLED = True
+    return True
+
+
 async def _wait_for_ready_or_bot_exit(
     ready_event: asyncio.Event,
     bot_task: asyncio.Task,
@@ -1449,6 +1584,10 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Discord and start receiving events."""
+        # discord.py already detects a blocked event loop; route its warning
+        # into gateway.log as a structured PHASE=event_loop_blocked line.
+        _install_discord_heartbeat_blocked_mirror()
+
         if not DISCORD_AVAILABLE:
             logger.error("[%s] discord.py not installed. Run: pip install discord.py", self.name)
             self._set_fatal_error("missing_dependency", "discord.py not installed", retryable=False)
@@ -2237,6 +2376,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 "[%s] Discord Gateway WebSocket remained unhealthy (%s); forcing reconnect",
                 self.name,
                 reason,
+            )
+            # A stalled event loop is the common cause of latency_exceeded /
+            # ack_stale here — grep this log for PHASE=event_loop_blocked to see
+            # whether discord.py's keep-alive thread named a blocking call site.
+            logger.error(
+                "[%s] If this repeats, grep gateway.log for PHASE=event_loop_blocked "
+                "— it names the synchronous call blocking the event loop",
+                self.name,
             )
             self._set_fatal_error(
                 "discord_websocket_health_stale",
