@@ -266,6 +266,15 @@ class CanonicalUsage:
     reasoning_tokens: int = 0
     request_count: int = 1
     raw_usage: Optional[dict[str, Any]] = None
+    # UNKNOWN != 0. Some providers report an explicit "I could not measure the
+    # output of this turn" (a null count plus a discriminator flag) rather than
+    # a number — e.g. the claude-bpx bridge's parallel-batch path, which emits
+    # ``completion_tokens: null`` + ``output_tokens_unavailable: true`` on ~40%
+    # of parallel-batch turns. ``output_tokens`` stays an int so every arithmetic
+    # consumer keeps working, but this flag is the discriminator every PRICING,
+    # PERSISTENCE and DISPLAY site must branch on so an unmeasured turn is never
+    # recorded or rendered as a measured zero.
+    output_tokens_unknown: bool = False
 
     @property
     def prompt_tokens(self) -> int:
@@ -275,12 +284,20 @@ class CanonicalUsage:
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.output_tokens
 
+    @property
+    def total_tokens_unknown(self) -> bool:
+        """A total that is missing its output term is not a measurement."""
+        return self.output_tokens_unknown
+
     def __add__(self, other: "CanonicalUsage") -> "CanonicalUsage":
         """Sum two usage buckets (e.g. MoA advisor fan-out + aggregator).
 
         ``raw_usage`` is dropped on the sum — it describes a single API
         response and cannot be meaningfully merged. ``request_count`` adds so
         callers can see how many underlying API calls a combined figure covers.
+
+        Unknown is ABSORBING: a sum that is missing one side's output term is
+        itself unmeasured, and saying so is the whole point of the flag.
         """
         if not isinstance(other, CanonicalUsage):
             return NotImplemented
@@ -292,6 +309,9 @@ class CanonicalUsage:
             reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
             request_count=self.request_count + other.request_count,
             raw_usage=None,
+            output_tokens_unknown=(
+                self.output_tokens_unknown or other.output_tokens_unknown
+            ),
         )
 
 
@@ -1477,6 +1497,95 @@ def _usage_count(value: Any) -> int:
     return max(0, _to_int(value))
 
 
+# Discriminator key a provider sets alongside a null output count to say "this
+# turn's output was never measured" rather than "it was measured at 0". This is
+# the claude-bpx bridge's egress spelling (bridge/src/server.js usagePayload,
+# emitted on the unknown path only).
+_OUTPUT_UNKNOWN_FLAGS = ("output_tokens_unavailable",)
+
+# Output counters, in the order the shapes are tried. A provider that sends an
+# EXPLICIT null for the field it actually uses is declaring an unknown; a
+# provider that simply omits the field is not (see ``_output_is_unknown``).
+_OUTPUT_COUNT_KEYS = ("completion_tokens", "output_tokens")
+
+# The one spelling of "we don't know" every usage renderer must use. Single-
+# sourced so usage.ace, the MacBar and the chat cards cannot drift.
+UNKNOWN_TOKENS_LABEL = "unknown"
+
+
+def _usage_has(obj: Any, name: str) -> bool:
+    """True when a usage object carries ``name`` at all (even as None)."""
+    if isinstance(obj, dict):
+        return name in obj
+    return hasattr(obj, name)
+
+
+def _output_is_unknown(response_usage: Any) -> bool:
+    """Does this usage object declare its output count UNMEASURED?
+
+    Two independent tells, either of which is sufficient:
+
+    1. An explicit discriminator flag (``output_tokens_unavailable`` /
+       ``unavailable``) set truthy. This is the contract the claude-bpx bridge
+       egresses, and it survives the OpenAI client as ``model_extra``.
+    2. A PRESENT output counter whose value is ``None``. A null the provider
+       deliberately wrote is an unknown even without the flag.
+
+    An ABSENT key is NOT an unknown — providers that never speak this dialect
+    (every pre-existing one) must keep normalizing to integers, and a usage
+    object that simply omits ``completion_tokens`` has always meant 0 here.
+    """
+    if response_usage is None:
+        return False
+    for flag in _OUTPUT_UNKNOWN_FLAGS:
+        if _usage_get(response_usage, flag, None):
+            return True
+    # The OpenAI python client parks unrecognised wire keys in ``model_extra``
+    # rather than on the model itself, so the bridge's discriminator arrives
+    # there on a typed response. Read it too, or the flag is invisible.
+    extra = _usage_get(response_usage, "model_extra", None)
+    if isinstance(extra, dict):
+        for flag in _OUTPUT_UNKNOWN_FLAGS:
+            if extra.get(flag):
+                return True
+    for key in _OUTPUT_COUNT_KEYS:
+        if _usage_has(response_usage, key) and _usage_get(response_usage, key, 0) is None:
+            return True
+    return False
+
+
+def format_token_count(
+    value: Any,
+    *,
+    unknown: bool = False,
+    formatter: Any = None,
+) -> str:
+    """Render a token count for a human, honouring the UNKNOWN state.
+
+    THE UNKNOWN DISPLAY RULE LIVES HERE, not in each renderer. usage.ace, the
+    MacBar and the chat cards are three renderers over one usage record; an
+    unmeasured turn must read the same in all three. An unknown renders
+    ``UNKNOWN_TOKENS_LABEL`` — never ``0``, which is indistinguishable from a
+    measured dead call.
+
+    ``formatter`` lets a caller keep its own magnitude formatting (renderers
+    differ on k/M suffixes) while still routing the unknown case through here.
+    """
+    if unknown:
+        return UNKNOWN_TOKENS_LABEL
+    if formatter is not None:
+        return formatter(value)
+    try:
+        n = int(value or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if abs(n) >= 1_000_000:
+        return f"{n // 1_000_000}M" if n % 1_000_000 == 0 else f"{n / 1_000_000:.1f}M"
+    if abs(n) >= 1_000:
+        return f"{n // 1_000}k" if n % 1_000 == 0 else f"{n / 1_000:.1f}k"
+    return str(n)
+
+
 
 def resolve_billing_route(
     model_name: str,
@@ -2117,6 +2226,10 @@ def normalize_usage(
 
     provider_name = (provider or "").strip().lower()
     mode = (api_mode or "").strip().lower()
+    # UNKNOWN != 0 (see CanonicalUsage.output_tokens_unknown). Computed once,
+    # before the per-shape branches, because the discriminator is shape-agnostic:
+    # it is a property of the usage object, not of which dialect it speaks.
+    output_unknown = _output_is_unknown(response_usage)
 
     if mode == "anthropic_messages" or provider_name == "anthropic":
         input_tokens = _usage_count(_usage_get(response_usage, "input_tokens", 0))
@@ -2247,6 +2360,7 @@ def normalize_usage(
         cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens,
         reasoning_tokens=reasoning_tokens,
+        output_tokens_unknown=output_unknown,
     )
 
 
@@ -2296,6 +2410,17 @@ def estimate_usage_cost(
 
     if usage.input_tokens and input_rate is None:
         return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a")
+    if usage.output_tokens_unknown:
+        # UNKNOWN != 0. Pricing an unmeasured output term as zero produces a
+        # dollar figure that is short by the whole output while LOOKING priced
+        # — strictly worse than declining. Refuse the whole turn.
+        return CostResult(
+            amount_usd=None,
+            status="unknown",
+            source=entry.source,
+            label="n/a",
+            notes=("output tokens unavailable from provider; turn is unpriceable",),
+        )
     if usage.output_tokens and output_rate is None:
         return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a")
     if usage.cache_read_tokens:

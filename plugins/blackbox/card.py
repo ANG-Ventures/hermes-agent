@@ -11,7 +11,7 @@ from plugins.blackbox.record import TurnRecord, tools_summary, turn_output_split
 _PT = ZoneInfo("America/Los_Angeles")
 
 
-def humanize_tokens(value: int | float | None) -> str:
+def _humanize_magnitude(value: int | float | None) -> str:
     try:
         n = int(value or 0)
     except (TypeError, ValueError):
@@ -19,6 +19,19 @@ def humanize_tokens(value: int | float | None) -> str:
     if abs(n) >= 1_000:
         return f"{n // 1_000}k" if n % 1_000 == 0 else f"{n / 1_000:.1f}k"
     return str(n)
+
+
+def humanize_tokens(value: int | float | None, *, unknown: bool = False) -> str:
+    """Render a token count. Delegates the UNKNOWN rule to the shared lib.
+
+    The unknown spelling lives in agent.usage_pricing.format_token_count so
+    usage.ace, the MacBar and the chat cards — three renderers over one usage
+    record — can never disagree about how an unmeasured turn reads. This
+    renderer's own k-suffix magnitude formatting is unchanged.
+    """
+    from agent.usage_pricing import format_token_count
+
+    return format_token_count(value, unknown=unknown, formatter=_humanize_magnitude)
 
 
 def _money(value: float | None) -> str:
@@ -104,6 +117,11 @@ def _tokens_out_line(record: TurnRecord) -> str:
     per-call split is unknown (old/NULL/blackbox-off blob).
     """
     import json as _json
+    # UNKNOWN != 0: the provider never measured this turn's output. The stored
+    # 0 is absence of data, so neither the total nor a finished/unfinished split
+    # derived from it may be shown as a measurement.
+    if getattr(record, "output_tokens_unknown", False):
+        return f"{humanize_tokens(0, unknown=True)} out"
     out = int(record.output_tokens or 0)
     raw = getattr(record, "comp_calls_json", None)
     calls = None

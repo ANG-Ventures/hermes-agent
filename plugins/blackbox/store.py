@@ -74,6 +74,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             tools TEXT,
             input_tokens INT,
             output_tokens INT,
+            output_tokens_unknown INT DEFAULT 0,
             cache_read INT,
             cache_write INT,
             reasoning INT,
@@ -209,6 +210,17 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError as e:
             if "duplicate column" not in str(e).lower():
                 raise
+    # UNKNOWN != 0 discriminator column. INT 0/1, defaulted 0 so every
+    # pre-existing row reads back as "measured" — correct, since no provider
+    # could declare an unknown before this column existed. Same guarded pattern.
+    if "output_tokens_unknown" not in _existing:
+        try:
+            conn.execute(
+                "ALTER TABLE turns ADD COLUMN output_tokens_unknown INT DEFAULT 0"
+            )
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
     conn.commit()
 
 
@@ -289,8 +301,8 @@ def insert_turn(record: TurnRecord) -> None:
                     cost_uncached_usd, cost_cache_read_usd,
                     cost_cache_write_usd, cost_output_usd,
                     interrupted, alerted, user_text,
-                    final_text, cli_invocation_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    final_text, cli_invocation_id, output_tokens_unknown
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.turn_id,
@@ -339,6 +351,7 @@ def insert_turn(record: TurnRecord) -> None:
                     scrub_and_truncate(record.user_text),
                     scrub_and_truncate(record.final_text),
                     record.cli_invocation_id,
+                    _bool_int(record.output_tokens_unknown),
                 ),
             )
             conn.execute("DELETE FROM turn_tool_calls WHERE turn_id = ?", (record.turn_id,))
@@ -484,7 +497,11 @@ def reprice_unpriced(pricing_fn, *, apply: bool = False, limit: int | None = Non
             "COALESCE(cache_read,0) AS cr, COALESCE(cache_write,0) AS cw "
             "FROM turns WHERE cost_usd IS NULL "
             "AND cost_uncached_usd IS NULL AND cost_cache_read_usd IS NULL "
-            "AND cost_cache_write_usd IS NULL AND cost_output_usd IS NULL"
+            "AND cost_cache_write_usd IS NULL AND cost_output_usd IS NULL "
+            # UNKNOWN != 0: a row whose output the provider never measured has
+            # no output term to price. Repricing it from its stored 0 would
+            # manufacture a measured-looking figure short by the whole output.
+            "AND COALESCE(output_tokens_unknown,0) = 0"
         )
         if limit:
             sel += f" LIMIT {int(limit)}"

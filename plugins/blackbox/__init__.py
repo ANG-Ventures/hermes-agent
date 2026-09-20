@@ -339,6 +339,7 @@ def _build_record(
         tools=list(state.get("tools") or []),
         input_tokens=_int_value(usage.get("input_tokens")),
         output_tokens=_int_value(usage.get("output_tokens")),
+        output_tokens_unknown=bool(usage.get("output_tokens_unknown")),
         cache_read_tokens=_int_value(usage.get("cache_read_tokens")),
         cache_write_tokens=_int_value(usage.get("cache_write_tokens")),
         reasoning_tokens=_int_value(usage.get("reasoning_tokens")),
