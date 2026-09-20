@@ -303,6 +303,10 @@ def test_gateway_runner_liveness_guards_start_and_stop():
         probe_interval=30.0,
         probe_timeout=10.0,
         max_strikes=3,
+        # The host-starvation classification knobs must reach the watchdog, or
+        # a starved gateway silently falls back to the exit-75 wedge path.
+        starvation_load_factor=2.0,
+        starvation_max_hold_s=900.0,
     )
     assert runner._loop_floor_timer_handle is floor_timer
     assert runner._loop_liveness_watchdog is watchdog
