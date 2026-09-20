@@ -11,10 +11,47 @@ the terminal physically repainted.
 
 from unittest.mock import MagicMock
 
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 
 import cli as cli_mod
 from cli import HermesCLI
+
+
+def _fake_size(columns: int, lines: int = 40):
+    return os.terminal_size((columns, lines))
+
+
+class _ShutilProxy:
+    """``shutil`` stand-in that overrides ONLY ``get_terminal_size``.
+
+    Every other attribute delegates to the real module, so the proxy is a
+    drop-in for ``cli``'s module-global ``shutil`` reference.
+    """
+
+    def __init__(self, get_terminal_size):
+        self.get_terminal_size = get_terminal_size
+
+    def __getattr__(self, name):
+        return getattr(shutil, name)
+
+
+def _patch_cli_terminal_size(monkeypatch, stub):
+    """Point ``cli``'s width probe at ``stub`` WITHOUT touching global shutil.
+
+    ``monkeypatch.setattr(shutil, "get_terminal_size", ...)`` is global: it
+    also replaces the function pytest's own terminal reporter calls between
+    tests under ``-v``, which crashes the session with an INTERNALERROR when
+    the stub's signature differs (the reporter passes ``fallback=``).  We
+    swap the *name binding* inside the module under test instead, which is
+    the only binding ``_install_resize_recovery`` resolves.
+    """
+    monkeypatch.setattr(cli_mod, "shutil", _ShutilProxy(stub))
 
 
 @pytest.fixture
@@ -365,10 +402,8 @@ class TestFirstSigwinchBaseline:
 
         app = MagicMock()
         app.output.get_size.side_effect = RuntimeError("not attached")
-        monkeypatch.setattr(
-            cli_mod.shutil,
-            "get_terminal_size",
-            lambda _default: os_mod.terminal_size((97, 40)),
+        _patch_cli_terminal_size(
+            monkeypatch, lambda _default: os_mod.terminal_size((97, 40))
         )
 
         bare_cli._install_resize_recovery(app)
@@ -384,11 +419,61 @@ class TestFirstSigwinchBaseline:
         def _boom(_default):
             raise RuntimeError("no tty")
 
-        monkeypatch.setattr(cli_mod.shutil, "get_terminal_size", _boom)
+        _patch_cli_terminal_size(monkeypatch, _boom)
 
         bare_cli._install_resize_recovery(app)  # must not raise
 
         assert getattr(bare_cli, "_last_resize_width", None) is None
+
+    def test_width_probe_patch_leaves_global_shutil_intact(
+        self, bare_cli, monkeypatch
+    ):
+        """Regression (#753 CI INTERNALERROR): the width-probe fixtures must
+        not replace the *global* ``shutil.get_terminal_size``.
+
+        Under ``-v`` pytest's own terminal reporter asks for the terminal
+        width between tests — ``shutil.get_terminal_size(fallback=(80, 24))``
+        — while a function-scoped monkeypatch is still installed.  A stub
+        that only accepts the positional ``_default`` (or that raises)
+        therefore crashed pytest itself with an INTERNALERROR and killed the
+        whole session, reported as ``0 failed`` + exit 1.
+        """
+        real = shutil.get_terminal_size
+
+        app = MagicMock()
+        app.output.get_size.side_effect = RuntimeError("not attached")
+        _patch_cli_terminal_size(monkeypatch, lambda _default: _fake_size(97))
+        bare_cli._install_resize_recovery(app)
+
+        assert bare_cli._last_resize_width == 97
+        # The stdlib function pytest's reporter calls is untouched...
+        assert shutil.get_terminal_size is real
+        # ...and the exact call it makes still works while the patch is live.
+        assert shutil.get_terminal_size(fallback=(80, 24)).columns > 0
+
+    def test_file_passes_under_verbose_pytest(self):
+        """End-to-end gate for the class above: run the two width-probe tests
+        in a real ``pytest -v`` subprocess.
+
+        A signature-incompatible global patch does not surface as a failing
+        test — it aborts the session with an INTERNALERROR — so only an
+        actual verbose run can gate it.  ``-k`` keeps this from recursing
+        into itself.
+        """
+        proc = subprocess.run(
+            [
+                sys.executable, "-m", "pytest", str(Path(__file__).resolve()),
+                "-v", "-p", "no:randomly", "-p", "no:cacheprovider",
+                "-k", "falls_back_to_shutil or survives_width_probe_failure",
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True,
+            text=True,
+        )
+        combined = proc.stdout + proc.stderr
+        assert "INTERNALERROR" not in combined, combined[-3000:]
+        assert proc.returncode == 0, combined[-3000:]
+        assert "2 passed" in combined, combined[-3000:]
 
 
 class TestFocusRegainRedraw:
