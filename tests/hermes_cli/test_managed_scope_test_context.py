@@ -61,8 +61,20 @@ def test_explicit_override_still_wins_when_current_test_is_absent(tmp_path, monk
         managed_scope.invalidate_managed_cache()
 
 
-def test_predicate_is_not_a_second_private_copy():
-    """One definition: managed_scope delegates to the guard's, it does not re-implement it."""
+def test_predicate_delegates_and_is_not_a_second_private_copy(monkeypatch):
+    """One definition, proven at RUNTIME: swapping the guard's predicate swaps this one.
+
+    An identity/source-text assertion would only grade the wiring's appearance. Patching the
+    single definition and observing managed_scope's answer change proves the delegation is
+    live — a private copy would be unaffected by the patch.
+    """
     import hermes_state_guard
 
+    monkeypatch.setattr(managed_scope, "_in_test_context", lambda: False)
+    assert managed_scope._under_pytest() is False
+    monkeypatch.setattr(managed_scope, "_in_test_context", lambda: True)
+    assert managed_scope._under_pytest() is True
+
+    # ...and the name it binds is the guard's, not a re-implementation.
+    monkeypatch.undo()
     assert managed_scope._in_test_context is hermes_state_guard._in_test_context
