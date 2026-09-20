@@ -6967,6 +6967,177 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
     return False, None
 
 
+def workspace_deletion_log_path(board: Optional[str] = None) -> Path:
+    """Return the append-only audit log for workspace deletions.
+
+    Lives beside the worker logs (``<root>/kanban/logs/`` for the default
+    board, ``<root>/kanban/boards/<slug>/logs/`` otherwise) so a board's
+    deletion history is scoped the same way everything else about that
+    board is.
+    """
+    return worker_logs_dir(board=board) / "workspace-deletions.log"
+
+
+def _audit_workspace_deletion(
+    path: Path,
+    *,
+    task_id: Optional[str],
+    reason: str,
+    allowed: bool,
+    detail: str = "",
+) -> None:
+    """Append one line to the workspace-deletion audit log. Best effort.
+
+    The 2026-09-20 incident was invisible after the fact: an entire
+    default-board scratch root vanished under a running worker and no log
+    named a deleter. Every attempted removal -- permitted or refused --
+    now leaves a record naming pid, ppid, task, path and outcome.
+    """
+    try:
+        board = None
+        is_managed, matched_board = _managed_scratch_path_info(path)
+        if is_managed:
+            board = matched_board
+        log_path = workspace_deletion_log_path(board=board)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        verdict = "DELETE" if allowed else "REFUSED"
+        try:
+            argv = " ".join(sys.argv)[:300]
+        except Exception:
+            argv = "?"
+        line = (
+            f"{stamp}\t{verdict}\ttask={task_id or '-'}\tpid={os.getpid()}"
+            f"\tppid={os.getppid()}\treason={reason}\tpath={path}"
+            f"\tdetail={detail}\targv={argv}\n"
+        )
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:
+        pass  # auditing must never block or break cleanup
+
+
+def _task_has_live_run(
+    conn: Optional[sqlite3.Connection], task_id: Optional[str]
+) -> bool:
+    """Return True when *task_id* looks like it is being actively worked.
+
+    "Live" means the card is in a non-terminal working state (``running``)
+    **or** it still holds an unexpired dispatch claim lock. Either is
+    sufficient: a worker mid-run owns its workspace, and deleting it out
+    from under the process destroys unretained work (incident 2026-09-20,
+    run 1880 -- the worker recreated its dir plus a locked git worktree and
+    both vanished again within seconds).
+
+    Errors resolve to ``True`` (fail-closed): if we cannot prove the card
+    is idle, we do not delete its workspace.
+    """
+    if not task_id:
+        return False
+    if conn is None:
+        try:
+            with connect_closing() as own:
+                return _task_has_live_run(own, task_id)
+        except Exception:
+            return True
+    try:
+        row = conn.execute(
+            "SELECT status, claim_expires FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+    except Exception:
+        return True  # fail closed
+    if row is None:
+        return False
+    if row["status"] == "running":
+        return True
+    claim_expires = row["claim_expires"]
+    try:
+        if claim_expires and int(claim_expires) > int(time.time()):
+            return True
+    except (TypeError, ValueError):
+        return True
+    return False
+
+
+def safe_remove_workspace_dir(
+    path: Path,
+    *,
+    task_id: Optional[str] = None,
+    reason: str,
+    conn: Optional[sqlite3.Connection] = None,
+) -> bool:
+    """THE choke point for removing a kanban-managed scratch workspace.
+
+    Every workspace deletion in Hermes goes through here. Three gates, in
+    order, each of which independently refuses:
+
+    1. **Containment.** :func:`_is_managed_scratch_path` requires a
+       *strict* descendant of a ``workspaces/`` root. The root itself, the
+       kanban home, board roots and ``logs/`` are all refused -- deleting
+       the root wipes every card's scratch dir at once, which is exactly
+       what happened on 2026-09-20.
+    2. **Liveness.** A card that is ``running`` or holds an unexpired
+       claim lock owns its directory; refuse regardless of what the caller
+       believes. Fail-closed on any DB error.
+    3. **Audit.** Both outcomes are appended to the per-board deletion log
+       so the next incident names its deleter.
+
+    Returns True iff the directory was removed.
+    """
+    import shutil
+
+    try:
+        resolved = Path(path).resolve(strict=False)
+    except OSError:
+        _audit_workspace_deletion(
+            Path(path), task_id=task_id, reason=reason, allowed=False,
+            detail="unresolvable-path",
+        )
+        return False
+
+    if not _is_managed_scratch_path(resolved):
+        _audit_workspace_deletion(
+            resolved, task_id=task_id, reason=reason, allowed=False,
+            detail="not-a-managed-scratch-descendant",
+        )
+        _log.warning(
+            "Refusing to remove workspace %s (task %s, reason %s): not a "
+            "strict descendant of a kanban-managed workspaces root",
+            resolved, task_id, reason,
+        )
+        return False
+
+    if _task_has_live_run(conn, task_id):
+        _audit_workspace_deletion(
+            resolved, task_id=task_id, reason=reason, allowed=False,
+            detail="task-has-live-run",
+        )
+        _log.warning(
+            "Refusing to remove workspace %s: task %s is running or holds a "
+            "live claim lock (reason %s)",
+            resolved, task_id, reason,
+        )
+        return False
+
+    if not resolved.is_dir():
+        _audit_workspace_deletion(
+            resolved, task_id=task_id, reason=reason, allowed=False,
+            detail="not-a-directory",
+        )
+        return False
+
+    _audit_workspace_deletion(
+        resolved, task_id=task_id, reason=reason, allowed=True,
+    )
+    shutil.rmtree(resolved, ignore_errors=True)
+    _log.debug(
+        "Removed scratch workspace %s (task %s, reason %s)",
+        resolved, task_id, reason,
+    )
+    return True
+
+
 def _is_managed_scratch_path(p: Path) -> bool:
     """Return True iff *p* is a strict descendant of a kanban-managed scratch root.
 
@@ -7045,24 +7216,16 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             _cleanup_worktree_workspace(task_id, path, row["branch_name"])
             _try_cleanup_parent_workspaces(conn, task_id)
             return
-        import shutil
         wp = Path(path)
         if wp.is_dir():
-            # Containment guard (#28818): a board's ``default_workdir`` can
-            # pair ``workspace_kind='scratch'`` with a user-supplied path
-            # pointing at a real source tree. Without this check, task
-            # completion would unconditionally ``shutil.rmtree`` that path
-            # and silently delete the user's source data.
-            if _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
-                _log.debug("Removed scratch workspace: %s", wp)
-            else:
-                _log.warning(
-                    "Refusing to remove out-of-scratch workspace for task %s: %s "
-                    "(workspace_kind='scratch' but path is outside any "
-                    "kanban-managed workspaces root)",
-                    task_id, wp,
-                )
+            # Containment + liveness + audit all live in the choke point
+            # (#28818 for containment; incident 2026-09-20 for liveness and
+            # the audit trail). A board's ``default_workdir`` can pair
+            # ``workspace_kind='scratch'`` with a user-supplied path pointing
+            # at a real source tree, and a still-running card owns its dir.
+            safe_remove_workspace_dir(
+                wp, task_id=task_id, reason="complete_task", conn=conn,
+            )
         # Also kill the tmux session for the worker that owned this task,
         # if the tmux session is now dead (worker process exited).
         _cleanup_worker_tmux(conn, task_id)
@@ -7177,11 +7340,14 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                     parent_id, row["workspace_path"], row["branch_name"]
                 )
                 continue
-            import shutil
             wp = Path(row["workspace_path"])
-            if wp.is_dir() and _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
-                _log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+            if wp.is_dir():
+                safe_remove_workspace_dir(
+                    wp,
+                    task_id=parent_id,
+                    reason="deferred_parent_cleanup",
+                    conn=conn,
+                )
     except Exception:
         pass  # best-effort
 

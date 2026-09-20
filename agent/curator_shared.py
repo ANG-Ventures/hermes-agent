@@ -450,6 +450,9 @@ def attempt_crash_recovery(
                 if fp.exists() and not fp.is_dir():
                     # Re-validate containment before unlink
                     fp_resolved = fp.resolve()
+                    # noqa: root-equality  target is a FILE (guarded by the
+                    # `not fp.is_dir()` above) and unlink() cannot remove a
+                    # directory, so the path == root case is unreachable.
                     fp_resolved.relative_to(root_resolved)
                     fp.unlink()
                     removed.append(p)
@@ -469,6 +472,9 @@ def attempt_crash_recovery(
                     if fp.exists() and not fp.is_dir():
                         # Re-validate containment before unlink
                         fp_resolved = fp.resolve()
+                        # noqa: root-equality  target is a FILE (guarded by the
+                        # `not fp.is_dir()` above) and unlink() cannot remove a
+                        # directory, so the path == root case is unreachable.
                         fp_resolved.relative_to(root_resolved)
                         fp.unlink()
                 except (OSError, ValueError):

@@ -490,10 +490,26 @@ def _venv_python(venv_dir: Path) -> Path:
 
 
 def _remove_tree(path: Path, *, boundary: Path) -> None:
-    """Best-effort removal constrained to a known runtime boundary."""
+    """Best-effort removal constrained to a known runtime boundary.
+
+    Containment requires STRICT descendancy. ``Path.relative_to`` succeeds
+    on an equal path (it returns ``.``), so a caller that passed the
+    boundary itself -- a generation dir that collapsed to its root, a
+    ``candidate`` that resolved to ``runtime_root`` -- would have had the
+    entire managed runtime tree removed by a guard that looked like it
+    prevented exactly that. Same defect class as the kanban scratch-root
+    wipe (2026-09-20).
+    """
     try:
-        path.resolve().relative_to(boundary.resolve())
-    except (OSError, ValueError):
+        resolved = path.resolve()
+        boundary_resolved = boundary.resolve()
+    except OSError:
+        return
+    if resolved == boundary_resolved:
+        return
+    try:
+        resolved.relative_to(boundary_resolved)
+    except ValueError:
         return
     shutil.rmtree(path, ignore_errors=True)
 

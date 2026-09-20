@@ -4261,7 +4261,6 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 def _cmd_gc(args: argparse.Namespace) -> int:
     """Remove scratch workspaces of archived tasks, prune old events, and
     delete old worker logs."""
-    import shutil
     scratch_root = kb.workspaces_root()
     removed_ws = 0
     with kb.connect_closing() as conn:
@@ -4283,17 +4282,15 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         if row["workspace_kind"] != "scratch":
             continue
         path = Path(row["workspace_path"] or (scratch_root / row["id"]))
-        try:
-            path = path.resolve()
-        except OSError:
-            continue
-        try:
-            path.relative_to(scratch_root.resolve())
-        except ValueError:
-            # Safety: never delete outside the scratch root.
-            continue
-        if path.exists() and path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
+        # The old guard here was a bare ``path.relative_to(scratch_root)``.
+        # ``Path.relative_to`` SUCCEEDS on an equal path (it returns '.'), so an
+        # archived row whose workspace_path was the workspaces ROOT itself would
+        # pass the containment check and rmtree every live card's scratch dir in
+        # one call. safe_remove_workspace_dir requires STRICT descendancy, also
+        # refuses any card with a live run, and audits both outcomes.
+        if kb.safe_remove_workspace_dir(
+            path, task_id=row["id"], reason="gc_archived",
+        ):
             removed_ws += 1
 
     event_days = getattr(args, "event_retention_days", 30)
