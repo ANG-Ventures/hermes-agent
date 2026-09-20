@@ -211,6 +211,138 @@ class TestBootstrapStillBlocked:
         text = f"launchctl bootstrap gui/501 {path}"
         assert contains_launchctl_submit_command(text)
 
+    def test_argv_runs_gateway_lifecycle_inline_blocked(
+        self, tmp_path, launchd_identity
+    ):
+        """Neutral Label, non-entrypoint argv — but it KICKSTARTS us.
+
+        Review round 1's finding: "is this plist a gateway job?" is not the
+        question the guard exists to answer. This plist is not a gateway job
+        by any tell (Label is neutral, argv is ``/bin/sh``), yet loading it
+        restarts THIS gateway — the #62891 laundering shape with a file
+        instead of a ``submit`` line. Needs no root: a user-writable
+        ``$TMPDIR`` path bootstrapped into ``gui/<uid>`` is enough.
+        """
+        path = _write_plist(
+            tmp_path / "ai.hermes.helper.plist",
+            {
+                "Label": "ai.hermes.helper",
+                "ProgramArguments": [
+                    "/bin/sh",
+                    "-c",
+                    f"launchctl kickstart -k system/{SELF_LAUNCHD}",
+                ],
+            },
+        )
+        text = f"launchctl bootstrap gui/501 {path}"
+        assert contains_launchctl_submit_command(text)
+        assert contains_gateway_lifecycle_command_or_referenced_script(text)
+
+    def test_argv_runs_gateway_lifecycle_via_script_blocked(
+        self, tmp_path, launchd_identity
+    ):
+        """Same laundering, one indirection deeper: argv names a SCRIPT.
+
+        The inline-string witness alone would pass a fix that only scanned
+        ``sh -c`` payloads; the lifecycle scanner's referenced-script walk is
+        what closes this one.
+        """
+        script = tmp_path / "boot.sh"
+        script.write_text(
+            f"#!/bin/sh\nlaunchctl bootout system/{SELF_LAUNCHD}\n", encoding="utf-8"
+        )
+        script.chmod(0o755)
+        path = _write_plist(
+            tmp_path / "ai.hermes.helper2.plist",
+            {
+                "Label": "ai.hermes.helper2",
+                "ProgramArguments": ["/bin/sh", str(script)],
+            },
+        )
+        text = f"launchctl bootstrap gui/501 {path}"
+        assert contains_launchctl_submit_command(text)
+        assert contains_gateway_lifecycle_command_or_referenced_script(text)
+
+    def test_argv_runs_gateway_lifecycle_direct_argv_blocked(
+        self, tmp_path, launchd_identity
+    ):
+        """The lifecycle command IS the argv — no ``sh -c``, no script.
+
+        ``ProgramArguments`` is already a split command line, so no single
+        token contains a lifecycle command; only scanning the JOINED argv
+        sees it. Without this witness a fix that scans tokens individually
+        passes every other negative here.
+        """
+        path = _write_plist(
+            tmp_path / "ai.hermes.direct.plist",
+            {
+                "Label": "ai.hermes.direct",
+                "ProgramArguments": [
+                    "/bin/launchctl",
+                    "kickstart",
+                    "-k",
+                    f"system/{SELF_LAUNCHD}",
+                ],
+            },
+        )
+        text = f"launchctl bootstrap gui/501 {path}"
+        assert contains_launchctl_submit_command(text)
+        assert contains_gateway_lifecycle_command_or_referenced_script(text)
+
+    def test_argv_bootstraps_another_plist_blocked(self, tmp_path, monkeypatch, launchd_identity):
+        """A plist whose argv bootstraps a plist re-enters the argv scan.
+
+        Two plists can reference each other; the scan is depth-bounded and
+        fails CLOSED at the bound, so the cycle terminates as a refusal.
+
+        The verdict alone does NOT gate the bound — measured: with the bound
+        removed the cycle blows the Python stack, and the guard's own
+        ``except Exception`` fallback still returns the same ``True``. So
+        assert the WORK done: a bounded scan reads a handful of plists, an
+        unbounded one read 116 before the interpreter gave out.
+        """
+        first = tmp_path / "ai.hermes.chain-a.plist"
+        second = tmp_path / "ai.hermes.chain-b.plist"
+        _write_plist(
+            first,
+            {
+                "Label": "ai.hermes.chain-a",
+                "ProgramArguments": [
+                    "/bin/sh",
+                    "-c",
+                    f"launchctl bootstrap gui/501 {second}",
+                ],
+            },
+        )
+        _write_plist(
+            second,
+            {
+                "Label": "ai.hermes.chain-b",
+                "ProgramArguments": [
+                    "/bin/sh",
+                    "-c",
+                    f"launchctl bootstrap gui/501 {first}",
+                ],
+            },
+        )
+        real_read = lifecycle_guard._read_plist_label_payload
+        reads = []
+
+        def counting_read(path):
+            reads.append(path)
+            return real_read(path)
+
+        monkeypatch.setattr(
+            lifecycle_guard, "_read_plist_label_payload", counting_read
+        )
+        assert contains_launchctl_submit_command(
+            f"launchctl bootstrap gui/501 {first}"
+        )
+        assert len(reads) <= 8, f"unbounded plist recursion: {len(reads)} reads"
+        # The per-thread depth counter must unwind to 0, or the NEXT scan in
+        # this process starts pre-charged and fails closed on a benign plist.
+        assert getattr(lifecycle_guard._PLIST_ARGV_SCAN_STATE, "depth", 0) == 0
+
     def test_nonexistent_path_blocked(self, tmp_path, launchd_identity):
         """Nothing to read → the label is still attacker-chosen (#62891)."""
         text = f"launchctl bootstrap gui/501 {tmp_path / 'not-written-yet.plist'}"

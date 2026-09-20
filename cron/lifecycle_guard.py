@@ -45,6 +45,7 @@ import os
 import re
 import shlex
 import stat
+import threading
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
@@ -1166,6 +1167,13 @@ _MAX_PLIST_BYTES = 256 * 1024
 # shape with a file instead of a `submit` line.
 _PLIST_GATEWAY_ARGV_MARKERS = ("hermes_cli.main", "hermes-gateway", "hermes_gateway")
 
+# `_plist_argv_runs_gateway_lifecycle` scans a plist's argv with the same
+# scanner that resolves `launchctl bootstrap <plist>` — so a plist whose argv
+# bootstraps another plist re-enters it. Bound the nesting per thread (the
+# guard runs on the gateway's request threads) and fail CLOSED at the bound.
+_MAX_PLIST_ARGV_SCAN_DEPTH = 2
+_PLIST_ARGV_SCAN_STATE = threading.local()
+
 
 def _plist_program_tokens(payload: dict) -> list[str]:
     """Flatten a plist's Program / ProgramArguments into scannable strings."""
@@ -1179,14 +1187,57 @@ def _plist_program_tokens(payload: dict) -> list[str]:
     return tokens
 
 
-def _plist_declares_gateway_job(payload: dict) -> bool:
-    """True when *payload* describes a hermes GATEWAY job.
+def _plist_argv_runs_gateway_lifecycle(payload: dict) -> bool:
+    """True when loading this plist would EXECUTE a gateway-lifecycle command.
 
-    Two independent tells, either one is enough:
+    ``_plist_declares_gateway_job`` asks whether the plist *is* a gateway job.
+    That is not the question the guard exists to answer: a plist with a wholly
+    neutral ``Label`` and a non-entrypoint argv can still run
+
+        /bin/sh -c 'launchctl kickstart -k system/ai.hermes.gateway-daedalus'
+
+    — the #62891 laundering shape with a file instead of a ``submit`` line, and
+    it needs no root (``launchctl bootstrap gui/<uid> $TMPDIR/x.plist``). Run
+    the flattened argv through the lifecycle scanner that already handles both
+    inline commands and commands hidden in a referenced script.
+
+    Each token is scanned on its own (a ``sh -c <payload>`` string is its own
+    command text, and a bare script path is a referenced script) AND joined (a
+    lifecycle command spelled across separate argv words). ``or`` of the two:
+    every extra match is a REFUSAL, which is the safe direction.
+    """
+    tokens = _plist_program_tokens(payload)
+    if not tokens:
+        return False
+    depth = getattr(_PLIST_ARGV_SCAN_STATE, "depth", 0)
+    if depth >= _MAX_PLIST_ARGV_SCAN_DEPTH:
+        # A plist whose argv bootstraps another plist re-enters this scan.
+        # Two plists can reference each other, so bound it and fail CLOSED:
+        # a plist that bootstraps a plist is not the routine maintenance
+        # shape this allow-path exists for.
+        return True
+    _PLIST_ARGV_SCAN_STATE.depth = depth + 1
+    try:
+        if any(
+            contains_gateway_lifecycle_command_or_referenced_script(token)
+            for token in tokens
+        ):
+            return True
+        return contains_gateway_lifecycle_command_or_referenced_script(" ".join(tokens))
+    finally:
+        _PLIST_ARGV_SCAN_STATE.depth = depth
+
+
+def _plist_declares_gateway_job(payload: dict) -> bool:
+    """True when *payload* describes, or drives, a hermes GATEWAY job.
+
+    Three independent tells, any one is enough:
 
     * ``Label`` is a full hermes gateway label; or
     * ``Program``/``ProgramArguments`` reference a hermes gateway entrypoint
-      (``hermes_cli.main ... gateway``, a ``hermes-gateway`` launcher, ...).
+      (``hermes_cli.main ... gateway``, a ``hermes-gateway`` launcher, ...); or
+    * that same argv EXECUTES a gateway-lifecycle command, inline or via a
+      referenced script (see ``_plist_argv_runs_gateway_lifecycle``).
     """
     label = payload.get("Label")
     if not isinstance(label, str) or not label.strip():
@@ -1199,7 +1250,9 @@ def _plist_declares_gateway_job(payload: dict) -> bool:
     if any(marker in token for token in tokens for marker in _PLIST_GATEWAY_ARGV_MARKERS):
         return True
     # `... -m hermes_cli.main gateway run` spelled across separate argv words.
-    return "gateway" in tokens and any("hermes" in token for token in tokens)
+    if "gateway" in tokens and any("hermes" in token for token in tokens):
+        return True
+    return _plist_argv_runs_gateway_lifecycle(payload)
 
 
 def _read_plist_label_payload(path: Path) -> Optional[dict]:
