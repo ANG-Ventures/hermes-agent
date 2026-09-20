@@ -4638,6 +4638,34 @@ def test_startup_runtime_does_not_call_network_detector(monkeypatch):
     assert provider in {None, "anthropic"}
 
 
+# The WS-orphan reap tests hand work to a background Timer thread and then wait
+# on a threading.Event for the signal. The budget must cover the reap thread's
+# whole claim path, which is not pure in-memory work: it can lazily open
+# SessionDB. Tests below pre-warm that (``_warm_tui_session_db``) so the wait
+# measures the ordering under test, but the budget stays generous because the
+# assertion's job is to catch a DEADLOCK / never-signals bug, not to time the
+# host. A too-tight budget here turns a correctness assertion into a load
+# sensor -- it flaked CI at 1.0s on an 8-way runner.
+WS_ORPHAN_REAP_SIGNAL_BUDGET_S = 15.0
+
+
+def _warm_tui_session_db(monkeypatch):
+    """Open the TUI server's lazy SessionDB global on the CALLING thread.
+
+    ``server._get_db()`` memoizes into the module global ``server._db`` on
+    first use, and that first use pays schema creation + migrations. Sibling
+    tests reset the global to ``None``, so whether any given test inherits a
+    warm handle is test-ORDER dependent. Tests that budget a background
+    thread's latency must not also be paying for that open inside the budget.
+
+    Registers a monkeypatch teardown that restores the prior value, so this
+    never leaks a handle into a test that deliberately wants a cold global.
+    """
+    prior = server._db
+    monkeypatch.setattr(server, "_db", prior, raising=False)
+    server._get_db()
+
+
 def _session(agent=None, **extra):
     return {
         "agent": agent if agent is not None else types.SimpleNamespace(),
@@ -5097,7 +5125,7 @@ def test_ws_orphan_reap_releases_resume_lock_before_slow_teardown(monkeypatch):
     def _slow_teardown(_session, *, end_reason="tui_close"):
         assert end_reason == "ws_orphan_reap"
         teardown_started.set()
-        assert release_teardown.wait(timeout=2.0)
+        assert release_teardown.wait(timeout=WS_ORPHAN_REAP_SIGNAL_BUDGET_S)
 
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
     monkeypatch.setattr(server.threading, "Timer", _Timer)
@@ -5106,13 +5134,27 @@ def test_ws_orphan_reap_releases_resume_lock_before_slow_teardown(monkeypatch):
         transport=server._detached_ws_transport,
         running=False,
     )
+    # The reap thread's claim path runs _session_has_active_delegations ->
+    # _session_owns_durable_lifecycle -> _get_db() BEFORE it calls
+    # _teardown_session. _get_db() lazily opens SessionDB (schema creation +
+    # migrations) on first use, and whether it is cold here is TEST-ORDER
+    # dependent -- a sibling test resets the module global to None in its
+    # finally. Opening it on the reap thread put 0.06-0.5s of unrelated
+    # filesystem work (far more on a contended 8-way CI runner) inside the
+    # window this test budgets, which is what made it flake. Warm it on the
+    # MAIN thread so the budget below measures the lock-release ordering this
+    # test is actually about.
+    _warm_tui_session_db(monkeypatch)
 
     server._schedule_ws_orphan_reap("slow-orphan")
     thread = threading.Thread(target=scheduled["callback"])
     thread.start()
     acquired = False
     try:
-        assert teardown_started.wait(timeout=1.0)
+        assert teardown_started.wait(timeout=WS_ORPHAN_REAP_SIGNAL_BUDGET_S), (
+            "the reap thread never reached _teardown_session within "
+            f"{WS_ORPHAN_REAP_SIGNAL_BUDGET_S}s"
+        )
         assert "slow-orphan" not in server._sessions
         acquired = server._session_resume_lock.acquire(timeout=0.2)
         assert acquired, "orphan teardown kept the global resume lock held"
