@@ -215,3 +215,105 @@ def test_find_review_comment_requires_the_evidence_marker():
 def test_replace_evidence_marker_requires_exactly_one_marker():
     with pytest.raises(ValueError, match="does not contain one"):
         _mod.replace_evidence_marker("no marker", "evidence")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Transient classification. The publisher makes its OWN API calls (comment
+# GET/PATCH), so a transient condition can arise HERE, after the artifact
+# download. It signals that class with a dedicated exit code because its
+# stdout echoes filenames from the untrusted PR artifact and can therefore
+# never be trusted to classify anything.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _http_error(code: int, headers: dict | None = None, body: bytes = b"") -> Exception:
+    import io
+    import urllib.error
+
+    return urllib.error.HTTPError(
+        "https://api.github.com/x", code, "err", headers or {}, io.BytesIO(body)
+    )
+
+
+@pytest.mark.parametrize("code", [500, 502, 503, 504, 505, 507, 508, 510, 511, 599])
+def test_server_errors_are_transient(code):
+    """A 5xx is GitHub's fault, not a defect in this repository.
+
+    FleetReview F1 (P2): the class was a four-entry tuple `(500, 502, 503,
+    504)`, so a 505 or 507 was re-raised and CI reported a REPOSITORY
+    failure for a transient server-side condition. The contract is the
+    whole 5xx range except 501, and this covers codes beyond the original
+    four.
+    """
+    assert _mod._is_transient(_http_error(code)) is True
+
+
+@pytest.mark.parametrize("code", [400, 401, 404, 409, 422, 501])
+def test_client_errors_and_501_are_not_transient(code):
+    """Only 5xx-server and rate limits retry.
+
+    501 is deliberately excluded: it means the request itself is wrong, so
+    retrying cannot help and tolerating it would hide a real defect.
+    """
+    assert _mod._is_transient(_http_error(code)) is False
+
+
+def test_429_is_transient():
+    assert _mod._is_transient(_http_error(429)) is True
+
+
+def test_403_is_transient_only_with_a_rate_limit_shape():
+    """A bare 403 is a permissions failure and must stay red."""
+    assert _mod._is_transient(_http_error(403)) is False
+    assert _mod._is_transient(
+        _http_error(403, {"X-RateLimit-Remaining": "0"})) is True
+    assert _mod._is_transient(_http_error(403, {"Retry-After": "60"})) is True
+    assert _mod._is_transient(
+        _http_error(403, body=b"You have exceeded a rate limit")) is True
+
+
+def test_transient_exit_code_is_distinct_from_ordinary_failure():
+    """0 or 1 would be indistinguishable from success / a real failure."""
+    assert _mod.TRANSIENT_EXIT_CODE not in (0, 1, 2)
+
+
+def _run_main(monkeypatch, tmp_path, raises: Exception | None):
+    """Drive the real main() with publish() stubbed to raise ``raises``."""
+    def fake_publish(*_a, **_k):
+        if raises is not None:
+            raise raises
+
+    monkeypatch.setattr(_mod, "publish", fake_publish)
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    monkeypatch.setenv("GH_SESSION_TOKEN", "s")
+    monkeypatch.setattr(sys, "argv", [
+        "publish_e2e_evidence.py", "--evidence-dir", str(tmp_path),
+        "--source-repo", "example-org/example-repo", "--pr-number", "1",
+    ])
+    return _mod.main()
+
+
+def test_main_exits_with_the_transient_code_on_a_transient_error(monkeypatch, tmp_path):
+    """Classification is useless unless main() actually routes through it.
+
+    Without this the wrapper's tolerance is unreachable: the publisher
+    would propagate the HTTPError and exit 1, which the wrapper correctly
+    reds — a transient condition reported as a defect.
+    """
+    rc = _run_main(monkeypatch, tmp_path, _http_error(503))
+    assert rc == _mod.TRANSIENT_EXIT_CODE, (
+        f"a 503 from the publisher exited {rc}, so the wrapper cannot "
+        "distinguish it from a real failure"
+    )
+
+
+def test_main_propagates_a_real_error(monkeypatch, tmp_path):
+    """A genuine failure must still crash loudly, never exit 75."""
+    import urllib.error
+
+    with pytest.raises(urllib.error.HTTPError):
+        _run_main(monkeypatch, tmp_path, _http_error(404))
+
+
+def test_main_returns_zero_on_success(monkeypatch, tmp_path):
+    assert _run_main(monkeypatch, tmp_path, None) == 0

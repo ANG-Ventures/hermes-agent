@@ -18,6 +18,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,62 @@ COMMENT_LOOKUP_ATTEMPTS = 6
 COMMENT_LOOKUP_DELAY_SECONDS = 2
 _SAFE_FILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.png$")
 _ATTACHMENT_URL = re.compile(r"^!\[[^\]\r\n]*\]\((https://github\.com/user-attachments/assets/[0-9a-fA-F-]+)\)$")
+
+# Distinct exit code meaning "a transient GitHub API condition" - the shared
+# installation rate-limit budget is exhausted, or the API returned a 5xx.
+# publish_evidence_step.sh tolerates ONLY this code, because the stdout of
+# this script echoes filenames taken from the untrusted PR artifact and
+# therefore cannot be trusted to classify the failure.
+TRANSIENT_EXIT_CODE = 75
+
+
+def _is_rate_limited(err: urllib.error.HTTPError) -> bool:
+    """True when an HTTP error is a rate-limit response, not a real failure.
+
+    A 403 is ambiguous: GitHub uses it both for a rate limit and for a
+    genuine permissions failure. Only the rate-limit shape is tolerated, so
+    a missing scope or a revoked token still reds the step.
+    """
+    if err.code == 429:
+        return True
+    if err.code != 403:
+        return False
+    headers = err.headers
+    if headers is None:
+        return False
+    if str(headers.get("X-RateLimit-Remaining", "")).strip() == "0":
+        return True
+    if headers.get("Retry-After"):
+        return True
+    try:
+        return "rate limit" in err.read().decode("utf-8", "replace").lower()
+    except Exception:
+        return False
+
+
+#: Server-side status codes treated as transient.
+#:
+#: The whole 5xx range EXCEPT 501. A 501 (Not Implemented) means the
+#: request itself is wrong, which retrying cannot fix and which must stay
+#: red. Everything else in the range is a server-side fault: 505, 507 and
+#: friends are no more this repository's defect than a 503 is, and
+#: re-raising them made CI report a repository failure for a transient API
+#: condition.
+#:
+#: ``scripts/ci/publish_evidence_step.sh``'s ``SERVER_ERROR_PATTERN``
+#: enumerates the same set for the shell side; a test pins the two together.
+TRANSIENT_SERVER_ERROR_CODES = frozenset(range(500, 600)) - {501}
+
+
+def _is_transient(err: urllib.error.HTTPError) -> bool:
+    """True for the API conditions that are not this repository's defect.
+
+    Two classes, and no others: a rate limit, and a server-side 5xx other
+    than 501.
+    """
+    if err.code in TRANSIENT_SERVER_ERROR_CODES:
+        return True
+    return _is_rate_limited(err)
 
 
 @dataclass(frozen=True)
@@ -329,7 +386,20 @@ def main() -> int:
     session_token = os.environ.get("GH_SESSION_TOKEN", "")
     if not session_token:
         parser.error("GH_SESSION_TOKEN is required")
-    publish(token, args.source_repo, args.evidence_dir, args.pr_number, session_token)
+    try:
+        publish(token, args.source_repo, args.evidence_dir, args.pr_number, session_token)
+    except urllib.error.HTTPError as e:
+        # The publisher makes its own installation-token API calls (comment
+        # GET/PATCH), so the shared budget can run out HERE, after the
+        # artifact download. The wrapper cannot classify that from the log:
+        # this script's output echoes filenames from the untrusted PR
+        # artifact, so log-grepping it is a spoofing seam. Signal the class
+        # out-of-band with a dedicated exit code instead.
+        if _is_transient(e):
+            print(f"Transient GitHub API condition ({e.code}); evidence not published.",
+                  file=sys.stderr)
+            return TRANSIENT_EXIT_CODE
+        raise
     return 0
 
 
