@@ -165,7 +165,7 @@ def test_missing_artifact_is_a_clean_skip_only_when_the_producer_was_skipped(tmp
         "the producer was skipped, yet a missing artifact was treated as a "
         f"regression; stdout={result.stdout!r} stderr={result.stderr!r}"
     )
-    assert "Desktop E2E was skipped" in result.stdout
+    assert "were skipped" in result.stdout
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
@@ -460,3 +460,66 @@ def test_extension_install_is_inside_the_classifier():
         "the rate-limit classifier"
     )
     assert "gh extension install" in _SCRIPT.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+def test_all_matching_producers_are_considered_not_just_the_first(tmp_path):
+    """A matrix or renamed sibling can yield several matching jobs.
+
+    If the FIRST is `skipped` while another actually ran and delivered
+    nothing, skipping on the first publishes silence.
+    """
+    result = _run_step(tmp_path, """
+        case "$*" in
+          *"/pulls"*) echo 4242 ;;
+          *"/jobs"*)  printf 'skipped\\nfailure\\n' ;;
+          *"/artifacts"*) ;;
+          *) exit 0 ;;
+        esac
+    """)
+    assert result.returncode != 0, (
+        "the first producer was skipped but another RAN and delivered "
+        f"nothing, yet the step reported success; stdout={result.stdout!r}"
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+def test_every_producer_skipped_is_still_a_clean_skip(tmp_path):
+    """Several skipped jobs must not be mistaken for one that ran."""
+    result = _run_step(tmp_path, """
+        case "$*" in
+          *"/pulls"*) echo 4242 ;;
+          *"/jobs"*)  printf 'skipped\\nskipped\\n' ;;
+          *"/artifacts"*) ;;
+          *) exit 0 ;;
+        esac
+    """)
+    assert result.returncode == 0, (
+        f"all producers were skipped yet the step failed; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+def test_untrusted_download_output_cannot_fake_a_rate_limit(tmp_path):
+    """`gh run download` echoes PR-controlled artifact names and paths.
+
+    A crafted path carrying a rate-limit signature must not classify a real
+    download failure as a tolerated rate limit. The control API call is the
+    trusted signal instead.
+    """
+    result = _run_step(tmp_path, """
+        case "$*" in
+          *"/pulls"*) echo 4242 ;;
+          *"/jobs"*)  echo skipped ;;
+          *"/artifacts"*) echo e2e-evidence-desktop ;;
+          *"run download"*)
+             echo "failed to extract 'API rate limit exceeded/evil.png'" >&2
+             exit 1 ;;
+          *) exit 0 ;;   # the control API call succeeds => NOT rate limited
+        esac
+    """)
+    assert result.returncode != 0, (
+        "a crafted artifact path spoofed the rate-limit tolerance and the "
+        f"step reported success with nothing attached; stdout={result.stdout!r}"
+    )

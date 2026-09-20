@@ -59,6 +59,9 @@ LOG_FILE="$WORK_DIR/publish.log"
 # from the untrusted PR artifact, and LOG_FILE is what the rate-limit grep
 # reads. It is printed for humans but never classified.
 PUBLISHER_LOG="$WORK_DIR/publisher.log"
+# Same treatment for `gh run download`, which echoes PR-controlled artifact
+# names and paths on failure.
+UNTRUSTED_LOG="$WORK_DIR/untrusted.log"
 
 # Signatures GitHub uses for primary and secondary rate limits.
 #
@@ -109,41 +112,63 @@ publish() {
   # So ask the producer. Skipped/absent => nothing was supposed to be
   # produced => clean skip. Producer ran and succeeded but produced no
   # evidence => a real regression => fail.
+  # ALL matching jobs, not just the first: a matrix or a renamed sibling can
+  # produce several, and if the first is `skipped` while another actually ran
+  # and delivered nothing, skipping on the first would publish silence.
   # shellcheck disable=SC2016  # jq syntax, not shell expansion.
-  PRODUCER_CONCLUSION=$(gh api --paginate \
+  PRODUCER_CONCLUSIONS=$(gh api --paginate \
     "repos/$SOURCE_REPO/actions/runs/$SOURCE_RUN_ID/jobs?per_page=100" \
-    --jq '.jobs[] | select(.name | test("Desktop E2E")) | .conclusion' \
-    | head -n1)
+    --jq '.jobs[] | select(.name | test("Desktop E2E")) | .conclusion')
+  PRODUCER_COUNT=$(printf '%s' "$PRODUCER_CONCLUSIONS" | grep -c . || true)
+  NON_SKIPPED=$(printf '%s\n' "$PRODUCER_CONCLUSIONS" | grep -vx 'skipped' | grep -c . || true)
 
   ARTIFACT_NAME=$(gh api --paginate "repos/$SOURCE_REPO/actions/runs/$SOURCE_RUN_ID/artifacts?per_page=100" \
     --jq '.artifacts[] | select(.expired == false and (.name | startswith("e2e-evidence-"))) | .name' \
     | head -n1)
   if [ -z "$ARTIFACT_NAME" ]; then
-    case "$PRODUCER_CONCLUSION" in
-      skipped)
-        # The producer is deliberately disabled (ci.yaml `if: ${{ false && ... }}`).
-        echo "No E2E evidence artifact for CI run $SOURCE_RUN_ID: Desktop E2E was skipped. Nothing to publish."
-        return 0
-        ;;
-      "")
-        # No job matched the name filter. That is NOT evidence of a
-        # deliberate skip — the job may have been renamed or removed, or
-        # the filter may have drifted. Fail loudly rather than reporting
-        # success while attaching nothing.
-        echo "No Desktop E2E job found in CI run $SOURCE_RUN_ID; the producer may have been renamed or removed." >&2
-        echo "Refusing to report success with no evidence attached." >&2
-        return 1
-        ;;
-    esac
-    # failure / cancelled / timed_out: the producer RAN and did not deliver.
-    echo "Desktop E2E concluded '$PRODUCER_CONCLUSION' and produced no evidence artifact for CI run $SOURCE_RUN_ID." >&2
+    if [ "$PRODUCER_COUNT" -eq 0 ]; then
+      # No job matched the name filter. That is NOT evidence of a deliberate
+      # skip — the job may have been renamed or removed, or the filter may
+      # have drifted. Fail loudly rather than reporting success while
+      # attaching nothing.
+      echo "No Desktop E2E job found in CI run $SOURCE_RUN_ID; the producer may have been renamed or removed." >&2
+      echo "Refusing to report success with no evidence attached." >&2
+      return 1
+    fi
+    if [ "$NON_SKIPPED" -eq 0 ]; then
+      # EVERY matching producer was skipped — deliberately disabled in
+      # ci.yaml (`if: ${{ false && ... }}`). Nothing was meant to exist.
+      echo "No E2E evidence artifact for CI run $SOURCE_RUN_ID: all $PRODUCER_COUNT Desktop E2E job(s) were skipped. Nothing to publish."
+      return 0
+    fi
+    # At least one producer RAN and did not deliver.
+    echo "Desktop E2E ran ($NON_SKIPPED of $PRODUCER_COUNT job(s) not skipped) and produced no evidence artifact for CI run $SOURCE_RUN_ID." >&2
     echo "Publishing evidence is this workflow's primary function, so this is a failure, not a skip." >&2
     return 1
   fi
 
   EVIDENCE_DIR="$WORK_DIR/e2e-evidence"
   mkdir -p "$EVIDENCE_DIR"
-  gh run download "$SOURCE_RUN_ID" --repo "$SOURCE_REPO" --name "$ARTIFACT_NAME" --dir "$EVIDENCE_DIR"
+  # `gh run download` echoes PR-CONTROLLED artifact names and file paths on
+  # failure, so its output must not reach the classified transport log
+  # either — a crafted path could otherwise spoof a rate-limit signature.
+  # Its exit code is the trusted signal; a real rate limit there is caught
+  # by the dedicated probe below.
+  set +e
+  gh run download "$SOURCE_RUN_ID" --repo "$SOURCE_REPO" \
+    --name "$ARTIFACT_NAME" --dir "$EVIDENCE_DIR" >"$UNTRUSTED_LOG" 2>&1
+  download_rc=$?
+  set -e
+  if [ "$download_rc" -ne 0 ]; then
+    # Distinguish "budget exhausted" from a real download failure with a
+    # TRUSTED probe rather than by grepping attacker-influenced output.
+    if ! gh api "repos/$SOURCE_REPO" --jq '.full_name' >/dev/null 2>&1; then
+      echo "API rate limit exceeded: the artifact download failed and a control API call also failed." >&2
+      return "$download_rc"
+    fi
+    echo "Artifact download failed (exit $download_rc); see the untrusted log above." >&2
+    return "$download_rc"
+  fi
 
   # The publisher signals a rate limit with a DEDICATED EXIT CODE rather
   # than log text: its stdout echoes filenames taken from the untrusted PR
@@ -169,6 +194,7 @@ publish() {
 rc=$?
 cat "$LOG_FILE"
 # Printed for humans, deliberately NOT part of the classified transport log.
+[ -s "$UNTRUSTED_LOG" ] && cat "$UNTRUSTED_LOG"
 [ -s "$PUBLISHER_LOG" ] && cat "$PUBLISHER_LOG"
 
 if [ "$rc" -eq 0 ]; then

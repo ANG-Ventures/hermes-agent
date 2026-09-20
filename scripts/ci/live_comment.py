@@ -113,6 +113,15 @@ _MERGE_QUEUE_RECHECK_INTERVAL = 300
 # comment with no log line and no error.
 _REQUEST_TIMEOUT = 30
 
+# Default hard wall-clock ceiling, INCLUDING merge-queue pauses.
+#
+# It must be finite by DEFAULT, not only when the workflow passes a flag:
+# queue pauses are excluded from the active timeout, so with no ceiling a
+# permanently-queued PR pauses forever and is eventually SIGKILLed by the
+# Actions job deadline — publishing nothing. 45 minutes sits below the
+# workflow's 60-minute timeout-minutes with room to write a final status.
+_DEFAULT_MAX_WALL_SECONDS = 2700
+
 
 
 
@@ -133,6 +142,9 @@ class _ApiState:
         # Last successfully parsed statuses per artifact NAME, used to carry
         # a section across a transient download failure of a newer id.
         self.artifacts_by_name: dict[str, list[dict]] = {}
+        # Which artifact id produced each artifacts_by_name entry, so an
+        # older same-named artifact cannot overwrite a newer one.
+        self.artifact_name_ids: dict[str, int] = {}
         # Keyed by (repo, pr_number): the PATCH URL for a comment carries only
         # the comment id, not the PR, so a process-global id would let a
         # second PR's poller overwrite the FIRST PR's comment.
@@ -700,7 +712,13 @@ def _download_artifact(
     # filesystem's per-component limit, whose OSError reads as a transient
     # download failure and silently drops the section.
     artifact_id = artifact.get("id", "noid")
-    slug = f"{str(artifact['name'])[:80]}-{artifact_id}"
+    # NAME_MAX is a BYTE limit, so truncating by CHARACTERS is not enough:
+    # 80 four-byte characters plus the id and ".zip" blows past 255 bytes,
+    # and the resulting OSError reads as a transient download failure that
+    # silently drops the section. Truncate the encoded bytes instead.
+    name_bytes = str(artifact["name"]).encode("utf-8")[:80]
+    safe_name = name_bytes.decode("utf-8", "ignore")
+    slug = f"{safe_name}-{artifact_id}"
     zip_path = dest_dir / f"{slug}.zip"
     try:
         # No auth headers here; further redirects are safe to follow.
@@ -726,18 +744,32 @@ def _download_artifact(
     return status_file if status_file.exists() else None
 
 
-def _parse_status_file(status_file: Path) -> list[dict]:
-    """Parse a review-status.json file in GITHUB_OUTPUT format."""
+def _artifact_sort_key(artifact_id) -> int:
+    """Numeric ordering for artifact ids; non-numeric sort lowest."""
+    try:
+        return int(artifact_id)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _parse_status_file(status_file: Path) -> list[dict] | None:
+    """Parse a review-status.json file in GITHUB_OUTPUT format.
+
+    Returns ``None`` when the file could not be READ or PARSED — distinct
+    from ``[]``, which is a valid empty payload. Conflating them let a
+    transient read failure cache "no statuses" for an immutable artifact id
+    and erase an already-published review section.
+    """
     try:
         content = status_file.read_text(encoding="utf-8").strip()
         if content.startswith("review_status="):
             content = content[len("review_status="):]
         statuses = json.loads(content)
-        if isinstance(statuses, list):
-            return statuses
     except (json.JSONDecodeError, OSError):
-        pass
-    return []
+        return None
+    if isinstance(statuses, list):
+        return statuses
+    return None
 
 
 def fetch_all_review_statuses(
@@ -808,8 +840,24 @@ def fetch_all_review_statuses(
                 all_statuses.extend(carried)
             continue
         statuses = _parse_status_file(status_file)
+        if statuses is None:
+            # A transient read/parse failure, NOT a valid empty payload.
+            # Caching it would replace the last known-good section with
+            # nothing; fall back like a failed download instead.
+            carried = STATE.artifacts_by_name.get(artifact.get("name", ""))
+            if carried:
+                all_statuses.extend(carried)
+            continue
         STATE.artifacts[key] = statuses
-        STATE.artifacts_by_name[artifact.get("name", "")] = statuses
+        # Newest-wins: GitHub lists artifacts newest-first, so an OLDER
+        # same-named artifact appearing later must not clobber the newer
+        # parsed result and resurrect an obsolete section.
+        name = artifact.get("name", "")
+        this_id = _artifact_sort_key(artifact.get("id"))
+        prev_id = STATE.artifact_name_ids.get(name)
+        if prev_id is None or this_id >= prev_id:
+            STATE.artifacts_by_name[name] = statuses
+            STATE.artifact_name_ids[name] = this_id
         all_statuses.extend(statuses)
 
     # A re-run can leave several non-expired artifacts with the same name,
@@ -887,7 +935,7 @@ def run(
     timeout: int = 1800,
     dry_run: bool = False,
     watch_workflows: list[str] | None = None,
-    max_wall_seconds: int | None = None,
+    max_wall_seconds: int | None = _DEFAULT_MAX_WALL_SECONDS,
 ) -> int:
     """Poll for job statuses and update the PR comment until all done.
 
@@ -955,16 +1003,59 @@ def run(
 
 
 
+    def _publish_final_snapshot() -> None:
+        """Best-effort last write before an early, non-completion exit.
+
+        Both the wall-clock cutoff and a poller that spends its whole life
+        with the PR merge-queued would otherwise exit having published
+        nothing at all — and merge-group runs never post a comment, so no
+        other process would.
+        """
+        nonlocal last_body
+        if dry_run:
+            return
+        try:
+            jobs, runs_completed = collect_run_jobs(
+                token, repo, run_id, watch_workflows)
+            statuses = fetch_all_review_statuses(token, repo, run_id) or []
+        except Exception as e:
+            print(f"  Could not collect a final snapshot ({e}).", file=sys.stderr)
+            return
+        completed, pending, job_urls = classify_jobs(jobs)
+        body = build_comment_body(
+            asm, completed, pending, run_url, job_urls,
+            json.dumps(statuses) if statuses else "",
+            _commit_info_for_state(commit_info, pending=bool(pending)),
+            waiting=not runs_completed,
+        )
+        if body == last_body:
+            return
+        try:
+            if upsert_comment(token, repo, pr_number, body):
+                last_body = body
+                print("  Published a final status snapshot before exiting.")
+        except RateLimitError:
+            print("  Rate limited while publishing the final snapshot.",
+                  file=sys.stderr)
+
     while True:
         elapsed = time.time() - start
         if elapsed > timeout:
             print(f"Timeout ({timeout}s) reached — stopping poll.", file=sys.stderr)
+            _publish_final_snapshot()
             break
         if max_wall_seconds is not None and (time.time() - wall_start) >= max_wall_seconds:
             # The Actions job's own timeout-minutes is about to SIGKILL us.
             # Exit cleanly instead: a killed process publishes nothing.
-            print(f"Wall-clock budget ({max_wall_seconds}s) reached — stopping "
-                  f"poll before the job is killed.", file=sys.stderr)
+            #
+            # But a bare break also publishes nothing when the budget runs
+            # out mid-pause: the comment would be missing or stale for a PR
+            # whose CI finished during the final minutes. So take ONE last
+            # pass first and write whatever is known.
+            print(f"Wall-clock budget ({max_wall_seconds}s) reached — "
+                  f"publishing a final status before stopping.",
+                  file=sys.stderr)
+            _publish_final_snapshot()
             break
 
         # A PR that has entered the merge queue is already approved and
@@ -990,6 +1081,10 @@ def run(
                 _nap(backoff)
                 continue
             if queued:
+                if not last_body:
+                    # A poller that starts while the PR is already queued
+                    # would otherwise never create the comment at all.
+                    _publish_final_snapshot()
                 print(f"  PR #{pr_number} is in the merge queue — pausing "
                       f"{_MERGE_QUEUE_RECHECK_INTERVAL}s "
                       f"(will resume if it is dequeued).")
@@ -1110,8 +1205,18 @@ def run(
                         _nap(min(5.0, float(interval)))
                         try:
                             cid = upsert_comment(token, repo, pr_number, body)
-                        except RateLimitError:
-                            cid = None
+                        except RateLimitError as e:
+                            # Do NOT give up: budget usually remains, so back
+                            # off for real and let the loop try again rather
+                            # than exiting with a stale comment.
+                            backoff = max(e.retry_after,
+                                          float(_LOW_REMAINING_INTERVAL))
+                            print(f"  Rate limited on the final retry — "
+                                  f"backing off {backoff:.0f}s and continuing.",
+                                  file=sys.stderr)
+                            _nap(backoff)
+                            quiet_grace_used = False
+                            continue
                         if cid:
                             print(f"  Updated comment {cid} on the final retry")
                             last_body = body
@@ -1276,7 +1381,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Max seconds to poll before giving up (default: 1800).")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print comment body instead of posting to PR.")
-    parser.add_argument("--max-wall-seconds", type=int, default=None,
+    parser.add_argument("--max-wall-seconds", type=int,
+                        default=_DEFAULT_MAX_WALL_SECONDS,
                         help="Hard wall-clock ceiling, INCLUDING merge-queue "
                              "pauses. Set it below the workflow job's "
                              "timeout-minutes so the poller stops cleanly "

@@ -835,10 +835,12 @@ def test_queued_pr_does_not_poll_the_jobs_api(monkeypatch):
                   run_url="u", interval=45, timeout=300, dry_run=False)
 
     assert rc == 0
-    # 5 queued pauses happened before the PR was released; during those the
-    # poller must not have touched the jobs API at all.
+    # 5 queued pauses happened before the PR was released. The poller is
+    # allowed ONE collect to publish an initial comment before the first
+    # pause (a PR queued from the start would otherwise never get one) —
+    # but it must not keep polling for the rest of the queued stay.
     assert queued["n"] >= 6, "the PR was never actually paused while queued"
-    assert collects["n"] <= 2, (
+    assert collects["n"] <= 3, (
         f"a queued PR spent job-API budget it was supposed to be conserving "
         f"({collects['n']} collect calls across {queued['n']} membership checks)"
     )
@@ -1186,6 +1188,8 @@ def test_final_upsert_failure_is_retried_before_exit(monkeypatch):
 
     attempts = {"n": 0}
     posted: list[int] = []
+    bodies: list[str] = []
+    failed_body = {"value": None}
 
     def flaky(token, repo, pr, body, comment_id=None):
         attempts["n"] += 1
@@ -1193,8 +1197,10 @@ def test_final_upsert_failure_is_retried_before_exit(monkeypatch):
         # posts the completed body), cycle 3 = the TRUE final cycle, after
         # which the loop breaks. Fail that one.
         if attempts["n"] == 3:
+            failed_body["value"] = body
             return None
         posted.append(attempts["n"])
+        bodies.append(body)
         return 4242
 
     monkeypatch.setattr(_mod, "upsert_comment", flaky)
@@ -1212,6 +1218,15 @@ def test_final_upsert_failure_is_retried_before_exit(monkeypatch):
         f"retrying (attempts={attempts['n']}) — the comment is left stale"
     )
     assert len(posted) >= 2, "the final status was never successfully written"
+    # Counting attempts is not enough: retrying the PREVIOUS body would
+    # satisfy that while leaving the user-facing comment stale. The retry
+    # must carry the body that failed, including the new Lint result.
+    assert failed_body["value"] is not None, "no body actually failed"
+    assert "Lint" in failed_body["value"], "the failed body was not the final one"
+    assert bodies[-1] == failed_body["value"], (
+        "the retry posted a DIFFERENT body than the one that failed — the "
+        "published comment is stale even though the retry 'succeeded'"
+    )
 
 
 def test_artifact_slug_is_bounded(monkeypatch, tmp_path):
@@ -1220,7 +1235,10 @@ def test_artifact_slug_is_bounded(monkeypatch, tmp_path):
     The resulting OSError reads as a transient download failure, silently
     omitting or staling the section.
     """
-    long_name = "review-status-" + "x" * 300
+    # MULTIBYTE on purpose: NAME_MAX is a byte limit, so an ASCII-only
+    # fixture passes against a character-based truncation that still
+    # overflows in the real world.
+    long_name = "review-status-" + "é中😀" * 120
     captured: list[str] = []
 
     monkeypatch.setattr(
@@ -1287,4 +1305,313 @@ def test_wall_clock_budget_leaves_a_real_shutdown_margin():
     assert margin >= 120, (
         f"--max-wall-seconds {budget} leaves only {margin}s before the job's "
         f"{job_timeout}s deadline — not enough to publish a final status"
+    )
+
+
+# ─── round 5 ──────────────────────────────────────────────────────────
+
+
+def test_wall_clock_cutoff_publishes_before_exiting(monkeypatch):
+    """A bare break at the wall-clock budget publishes nothing.
+
+    If CI completes (or the PR is dequeued) during the final minutes, the
+    poller would exit having written no final status at all.
+    """
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: True)
+
+    # CI progresses while the PR sits queued, so the state at the
+    # wall-clock break genuinely differs from the pre-pause snapshot. A
+    # constant state would be deduped by `body == last_body` and hide
+    # whether the break path publishes at all.
+    calls = {"n": 0}
+
+    def progressing(*a, **k):
+        calls["n"] += 1
+        if calls["n"] <= 1:
+            return [{"name": "Python tests", "status": "in_progress",
+                     "html_url": "u"}], False
+        return [{"name": "Python tests", "status": "completed",
+                 "conclusion": "failure", "html_url": "u"}], True
+
+    monkeypatch.setattr(_mod, "collect_run_jobs", progressing)
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", lambda *a, **k: [])
+
+    posted: list[str] = []
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_mod.time, "sleep",
+                        lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
+
+    # dry_run=False + a PR that never leaves the queue means the ONLY
+    # write opportunities are the pre-pause snapshot and the wall-clock
+    # break. Suppress the pre-pause one so this test isolates the break.
+    first = {"done": False}
+    real_snapshot_guard = {"n": 0}
+
+    def count_posts(t_, r_, p_, body, comment_id=None):
+        real_snapshot_guard["n"] += 1
+        posted.append(body)
+        return 1
+
+    monkeypatch.setattr(_mod, "upsert_comment", count_posts)
+
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5", run_url="u",
+             interval=45, timeout=100000, dry_run=False, max_wall_seconds=600)
+
+    assert len(posted) >= 2, (
+        "the poller hit its wall-clock budget and broke out without a final "
+        f"publish — only the pre-pause snapshot was written ({len(posted)})"
+    )
+    del first
+
+
+def test_pr_queued_from_the_start_still_gets_a_comment(monkeypatch):
+    """The queue branch `continue`s before ever creating the comment."""
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: True)
+    monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: (
+        [{"name": "Python tests", "status": "completed",
+          "conclusion": "failure", "html_url": "u"}], True))
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", lambda *a, **k: [])
+
+    posted: list[str] = []
+    first_write_time = {"t": None}
+    clock = {"t": 0.0}
+
+    def record(t_, r_, p_, body, comment_id=None):
+        if first_write_time["t"] is None:
+            first_write_time["t"] = clock["t"]
+        posted.append(body)
+        return 1
+
+    monkeypatch.setattr(_mod, "upsert_comment", record)
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_mod.time, "sleep",
+                        lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
+
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5", run_url="u",
+             interval=45, timeout=900, dry_run=False, max_wall_seconds=900)
+
+    assert posted, (
+        "a PR that was already queued when the poller started never had a "
+        "comment created at all"
+    )
+    # The FIRST write must land before any pause completes, not only at the
+    # wall-clock break 15 minutes later: the queue branch `continue`s before
+    # reaching the normal publish path.
+    assert first_write_time["t"] is not None
+    assert first_write_time["t"] < _mod._MERGE_QUEUE_RECHECK_INTERVAL, (
+        f"the comment was first written at t={first_write_time['t']:.0f}s — "
+        "after a full queue pause, not before it"
+    )
+
+
+def test_rate_limit_on_the_final_retry_backs_off_instead_of_giving_up(monkeypatch):
+    """Converting the RateLimitError to None exits with a stale comment.
+
+    Budget usually remains; the poller must back off and try again.
+    """
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: False)
+
+    cycles = {"n": 0}
+
+    def jobs(*a, **k):
+        cycles["n"] += 1
+        if cycles["n"] <= 1:
+            return [{"name": "Python tests", "status": "in_progress",
+                     "html_url": "u"}], False
+        if cycles["n"] == 2:
+            return [{"name": "Python tests", "status": "completed",
+                     "conclusion": "success", "html_url": "u"}], True
+        return [{"name": "Python tests", "status": "completed",
+                 "conclusion": "success", "html_url": "u"},
+                {"name": "Lint", "status": "completed",
+                 "conclusion": "failure", "html_url": "u2"}], True
+
+    monkeypatch.setattr(_mod, "collect_run_jobs", jobs)
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", lambda *a, **k: [])
+
+    attempts = {"n": 0}
+    posted: list[str] = []
+
+    def flaky(token, repo, pr, body, comment_id=None):
+        attempts["n"] += 1
+        if attempts["n"] == 3:          # the final cycle's write
+            return None
+        if attempts["n"] == 4:          # its immediate retry
+            raise _mod.RateLimitError(30.0)
+        posted.append(body)
+        return 4242
+
+    monkeypatch.setattr(_mod, "upsert_comment", flaky)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(_mod.time, "sleep",
+                        lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
+
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5", run_url="u",
+             interval=45, timeout=3000, dry_run=False)
+
+    assert any("Lint" in b for b in posted), (
+        "a rate limit on the final retry made the poller give up; the "
+        f"completed result was never published (posted={len(posted)})"
+    )
+
+
+def test_parse_failure_is_not_cached_as_an_empty_result(monkeypatch, tmp_path):
+    """`[]` is a valid payload; a read/parse failure is not the same thing.
+
+    Caching the failure against the immutable id erases an already-published
+    section permanently.
+    """
+    monkeypatch.setattr(_mod, "_ARTIFACT_TEMP_BASE", tmp_path)
+    state = {"id": 1, "broken": False}
+
+    monkeypatch.setattr(_mod, "_list_artifacts", lambda *a, **k: [
+        {"id": state["id"], "name": "review-status-lint",
+         "archive_download_url": "u"}])
+    monkeypatch.setattr(_mod, "_download_artifact",
+                        lambda t, r, artifact, dest: Path("/x.json"))
+    monkeypatch.setattr(
+        _mod, "_parse_status_file",
+        lambda p: None if state["broken"] else [{"source": "lint", "results": [{"ok": 1}]}])
+
+    first = _mod.fetch_all_review_statuses("tok", "o/r", "77")
+    assert len(first) == 1
+
+    state["id"] = 2          # overwrite: true mints a new id
+    state["broken"] = True   # its local file fails to parse
+    second = _mod.fetch_all_review_statuses("tok", "o/r", "77")
+    assert second == first, (
+        "a transient parse failure erased the already-published review "
+        f"section ({second})"
+    )
+
+
+def test_parse_returns_none_on_failure_but_empty_list_on_empty_payload(tmp_path):
+    good = tmp_path / "good.json"
+    good.write_text("review_status=[]", encoding="utf-8")
+    assert _mod._parse_status_file(good) == []
+
+    bad = tmp_path / "bad.json"
+    bad.write_text("review_status={not json", encoding="utf-8")
+    assert _mod._parse_status_file(bad) is None, \
+        "a parse failure is indistinguishable from a valid empty payload"
+
+    assert _mod._parse_status_file(tmp_path / "missing.json") is None
+
+
+def test_older_same_named_artifact_does_not_clobber_the_newer_one(monkeypatch, tmp_path):
+    """GitHub lists artifacts newest-first, but the loop walks them all.
+
+    An OLDER same-named artifact appearing later must not replace the
+    newer parsed result and resurrect an obsolete section.
+    """
+    monkeypatch.setattr(_mod, "_ARTIFACT_TEMP_BASE", tmp_path)
+    monkeypatch.setattr(_mod, "_list_artifacts", lambda *a, **k: [
+        {"id": 20, "name": "review-status-lint", "archive_download_url": "new"},
+        {"id": 10, "name": "review-status-lint", "archive_download_url": "old"},
+    ])
+    monkeypatch.setattr(_mod, "_download_artifact",
+                        lambda t, r, artifact, dest: Path(f"/{artifact['id']}.json"))
+    monkeypatch.setattr(
+        _mod, "_parse_status_file",
+        lambda p: [{"source": "lint", "results": [{"id": p.stem}]}])
+
+    _mod.fetch_all_review_statuses("tok", "o/r", "77")
+    carried = _mod.STATE.artifacts_by_name["review-status-lint"]
+    assert carried[0]["results"][0]["id"] == "20", (
+        "the OLDER artifact (id 10) overwrote the newer one (id 20) as the "
+        f"fallback, so a later blip would republish stale results ({carried})"
+    )
+
+
+def test_artifact_slug_is_bounded_in_bytes_not_characters(monkeypatch, tmp_path):
+    """NAME_MAX is a BYTE limit.
+
+    80 four-byte characters plus the id and ".zip" exceeds 255 bytes, and
+    the resulting OSError reads as a transient download failure.
+    """
+    captured: list[str] = []
+
+    monkeypatch.setattr(
+        urllib.request, "build_opener",
+        lambda *a, **k: type("O", (), {"open": staticmethod(
+            lambda req, *a, **k: _raise(302, {"Location": "https://blob/x"}))})(),
+    )
+
+    class _Blob:
+        headers = {}
+
+        def read(self):
+            return b"zip"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Blob())
+
+    class _FakeZip:
+        def __init__(self, path):
+            captured.append(Path(path).name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def namelist(self):
+            return ["review-status.json"]
+
+        def extractall(self, dest):
+            Path(dest).mkdir(parents=True, exist_ok=True)
+            (Path(dest) / "review-status.json").write_text("review_status=[]")
+
+    monkeypatch.setattr(_mod.zipfile, "ZipFile", _FakeZip)
+
+    out = _mod._download_artifact(
+        "tok", "o/r",
+        {"id": 123456, "name": "review-status-" + "\U0001f600" * 200,
+         "archive_download_url": "https://api/a"},
+        tmp_path,
+    )
+    assert out is not None
+    for component in captured + [out.parts[-2]]:
+        encoded = len(component.encode("utf-8"))
+        assert encoded <= 255, (
+            f"path component is {encoded} BYTES (NAME_MAX is 255): "
+            f"{component[:40]}..."
+        )
+
+
+def test_wall_clock_ceiling_is_finite_by_default():
+    """An unset ceiling lets a queued PR pause until the job is SIGKILLed.
+
+    Queue pauses are excluded from the active timeout, so without a finite
+    default the only thing that stops the poller is the Actions deadline —
+    which publishes nothing.
+    """
+    import inspect
+
+    assert _mod._DEFAULT_MAX_WALL_SECONDS is not None
+    assert _mod._DEFAULT_MAX_WALL_SECONDS > 0
+    assert _mod.build_parser().parse_args([]).max_wall_seconds == \
+        _mod._DEFAULT_MAX_WALL_SECONDS, \
+        "the CLI default leaves the wall-clock ceiling unset"
+    assert inspect.signature(_mod.run).parameters["max_wall_seconds"].default == \
+        _mod._DEFAULT_MAX_WALL_SECONDS, \
+        "run()'s default leaves the wall-clock ceiling unset"
+
+    root = Path(__file__).resolve().parents[2]
+    text = (root / ".github/workflows/ci-review-comment.yml").read_text(encoding="utf-8")
+    job_timeout = int(
+        re.search(r"^\s*timeout-minutes:\s*(\d+)", text, re.M).group(1)) * 60
+    assert _mod._DEFAULT_MAX_WALL_SECONDS < job_timeout, (
+        f"the default ceiling ({_mod._DEFAULT_MAX_WALL_SECONDS}s) is not "
+        f"below the job deadline ({job_timeout}s)"
     )
