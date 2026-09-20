@@ -6,6 +6,18 @@ Live incident 2026-09-19 (#connection-issue): sub-vps-12's bridge egressed
 ``type=internal_error code=500`` with message "Claude Code returned an error
 result: You've hit your session limit · resets 2:20pm (UTC)". Hermes read the
 500 → server_error → "🔄 Model fallback (connection issue)" for a spent 5h bucket.
+
+🔗 SIBLING HALF — claude-bpx ``bridge/test/unit-sdk-thrown-error-result-classification.test.js``
+The fix spans TWO repos and the halves are NOT redundant. Measured 2026-09-19 by
+neutralizing each in turn against the live announce emitter:
+
+    both present ...... "claude-fable-5-1 usage exhausted · 5h limit, resets in 11h"
+    harness half gone .. "rate limit"                  <- relay tests still pass
+    relay half gone .... "usage exhausted · 5h limit"  <- harness recovers it
+
+So a GREEN relay suite does not prove the user-visible label survived, and vice
+versa. ``test_relay_429_alone_does_not_carry_the_window`` below pins that
+asymmetry so the claim can't rot into an assumption again.
 """
 from types import SimpleNamespace
 
@@ -146,3 +158,47 @@ def test_announce_without_a_known_window_keeps_the_plain_rate_limit_label():
     line = _announce(FailoverReason.rate_limit, window_ctx=None)
     assert "rate limit" in line
     assert "usage exhausted" not in line
+
+
+# ── Cross-repo non-redundancy (the claim that must not rot) ──────────────────
+
+def test_relay_429_alone_does_not_carry_the_window():
+    """The relay half and this harness half are NOT redundant.
+
+    A tempting-but-false simplification during a parity merge: "claude-bpx
+    already maps the cap to 429, so the harness-side sentence parsing is
+    belt-and-braces and can go." It cannot. The 429 body carries the cap
+    sentence but NO ``anthropic-ratelimit-unified-*`` headers, so WITHOUT the
+    sentence-derived window the announce degrades to a bare "rate limit" —
+    losing the model name, the 5h/7d window, and the reset time, which are the
+    entire point of the fix.
+
+    Measured 2026-09-19 by neutralizing each half in turn:
+        both present ...... "claude-fable-5-1 usage exhausted · 5h limit, resets in 11h"
+        harness half gone .. "rate limit"
+        relay half gone .... "usage exhausted · 5h limit"
+
+    This test pins the SECOND row. If it ever fails because a bare relay 429
+    now carries the window on its own, the premise changed — re-measure before
+    deleting anything.
+    """
+    # A relay that already did its job: 429 rate_limit_error, cap sentence in
+    # the body, no unified-quota headers (what claude-bpx actually sends).
+    err = _status_error(SESSION, 429, "rate_limit_error")
+    assert not getattr(err.response, "headers", {}).get("anthropic-ratelimit-unified-5h-status")
+
+    ctx = extract_api_error_context(err)
+    # The window is recoverable ONLY because this harness parses the sentence.
+    assert ctx.get("quota_window") == "5h", (
+        "the harness sentence-parser is what recovers the window; "
+        "the relay's 429 does not supply it"
+    )
+
+    # Strip what the harness contributed → exactly what a relay-only world has.
+    relay_only = {k: v for k, v in ctx.items()
+                  if k not in ("quota_window", "quota_window_reset", "quota_window_reset_text")}
+    degraded = _announce(FailoverReason.rate_limit,
+                         window_ctx=relay_only.get("quota_window"))
+    assert "rate limit" in degraded
+    assert "usage exhausted" not in degraded
+    assert "5h limit" not in degraded
