@@ -21,7 +21,6 @@ the caller-reason resolution turns this file red.
 """
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -40,27 +39,60 @@ def _wire_store(runner, release_after_mark=()):
     ``session_store`` (AsyncSessionStore delegates to the sync methods), so one
     sync mock records BOTH the pre-drain marks and the drain-end clears.
 
-    ``release_after_mark``: session keys whose running slot is released shortly
-    AFTER the pre-drain hedge marks them — modelling a turn that finishes (or a
-    user ``/stop``) during the drain window. Triggered BY the mark, not by a wall
-    clock: a timer-based release lost the race to the hedge on a slow CI runner
-    (merge-group run 2026-09-20: the caller was released before stop() reached
-    the hedge loop, so it was never marked at all)."""
+    ``release_after_mark``: session keys whose running slot is released during
+    the drain window — modelling a turn that finishes (or a user ``/stop``)
+    after the pre-drain hedge marked it.
+
+    The release is driven by TWO ORDERING EVENTS, never a wall clock:
+
+    1. the hedge ``mark_resume_pending(key, ...)`` for that key must have
+       happened (``_queued``), and
+    2. ``stop()`` must have reached the drain — witnessed by the drain's own
+       forced ``_update_runtime_status("draining")``, which
+       ``_drain_active_agents`` emits after the hedge loop and before it waits.
+
+    Both halves are load-bearing. A ``loop.call_later(0.05, ...)`` release (and
+    before it an ``asyncio.sleep(0.05)`` task) is a stopwatch racing the 0.5s
+    drain deadline from the other side: on a CFS-capped merge-queue runner the
+    release landed BEFORE stop() reached the hedge loop, so the caller was never
+    marked at all and the test died on ``KeyError: ...:CALLER`` (3 of 3
+    merge_group runs for #746, slice 15/16, 2026-09-20). Keying on the two
+    events makes the interleaving the contract needs independent of scheduling.
+
+    ``store.release_order`` records the marks and releases in the order they
+    actually happened, so a regression back to release-before-mark is an
+    assertable fact rather than an intermittent KeyError.
+    """
     store = MagicMock()
     store._entries = {}
-    released = set()
+    queued: set[str] = set()
+    released: set[str] = set()
+    store.release_order = []
+
+    def _release_queued() -> None:
+        """Drop every queued-and-marked slot. Called from the drain's own tick."""
+        for key in sorted(queued - released):
+            released.add(key)
+            if key in runner._running_agents:
+                del runner._running_agents[key]
+                store.release_order.append(f"release:{key}")
 
     def _mark(key, reason, *a, **k):
-        if key in release_after_mark and key not in released:
-            released.add(key)
-            loop = asyncio.get_running_loop()
-            loop.call_later(0.05, lambda: runner._running_agents.__delitem__(key)
-                            if key in runner._running_agents else None)
+        store.release_order.append(f"mark:{key}")
+        if key in release_after_mark:
+            queued.add(key)
         return True
+
+    def _status(state=None, *a, **k):
+        # The drain emits this once (force=True) after the hedge loop and before
+        # it starts waiting — the exact window a mid-drain completion lands in.
+        if state == "draining":
+            _release_queued()
 
     store.mark_resume_pending = MagicMock(side_effect=_mark)
     store.clear_resume_pending = MagicMock(return_value=True)
     runner.session_store = store
+    runner._update_runtime_status = MagicMock(side_effect=_status)
     return store, None
 
 
@@ -100,6 +132,19 @@ async def test_four_cases_through_the_real_drain():
 
     marks = _marks(store)
     cleared = _clears(store, astore)
+
+    # (0) NON-VACUITY / ordering witness: the interleaving every assertion below
+    #     depends on actually happened — both mid-drain slots were hedged BEFORE
+    #     they were released. The load flake this replaces was exactly the
+    #     opposite order (release landed first, the key was never marked), which
+    #     surfaced as an opaque KeyError instead of a named failure.
+    for _key in (CALLER, STOPPED_DURING):
+        assert f"mark:{_key}" in store.release_order, store.release_order
+        assert f"release:{_key}" in store.release_order, store.release_order
+        assert store.release_order.index(f"mark:{_key}") < store.release_order.index(
+            f"release:{_key}"
+        ), f"{_key} released before it was hedged: {store.release_order}"
+    assert f"release:{BUSY}" not in store.release_order, store.release_order
 
     # (1) CALLER: hedged with the CALLER reason (never a sibling reason), and since
     #     its turn finished cleanly during the drain the hedge is cleared — the
