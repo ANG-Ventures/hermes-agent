@@ -81,21 +81,29 @@ jobs:
           COMMIT_SHA: ${{ github.event.workflow_run.head_sha }}
           COMMIT_MESSAGE: ${{ github.event.workflow_run.head_commit.message }}
         run: |
-          # No --max-wall-seconds override: the script's own 2700s default
-          # already stops active polling with a reserved shutdown window and
-          # leaves 900s before the job's timeout-minutes (60). The previous
-          # 3300 override left under 5 minutes for the final snapshot's
-          # serial API calls, which a slow or artifact-heavy run can exceed.
+          # The monitoring window is a DELIBERATE number, not an inherited
+          # one: --max-wall-seconds 3300 with the script's 300s shutdown
+          # reserve puts the poll ceiling at 3000s — the same 50-minute
+          # window the poller had before the reserve existed. Letting the
+          # script's own 2700 default apply instead would cut active polling
+          # to 2400s, so a CI or merge-queue run finishing between 40 and 50
+          # minutes would have its final snapshot taken while still running
+          # and never be updated.
           #
-          # --timeout 3000 is deliberately INERT at these values, and kept
-          # that way: the wall-clock ceiling (2700 budget - 300 reserve =
-          # 2400s) always fires first, because `start` only ever advances
+          # timeout-minutes (60 => 3600s) leaves 300s past the budget, which
+          # covers the ~90s an in-flight artifact request plus the final
+          # PATCH can overrun by.
+          #
+          # --timeout 3300 is deliberately INERT at these values, and kept
+          # that way: the wall-clock ceiling (3300 budget - 300 reserve =
+          # 3000s) always fires first, because `start` only ever advances
           # past `wall_start` when a merge-queue pause credits time back,
-          # so `elapsed <= wall_elapsed` holds and 2400 < 3000. Do NOT drop
+          # so `elapsed <= wall_elapsed` holds and 3000 < 3300. Do NOT drop
           # the flag to "clean it up" — the script's own --timeout default
           # is 1800, which WOULD bind at 1800s and silently shorten polling
-          # by 10 minutes. It stays as an explicit, above-the-ceiling
+          # by 20 minutes. It stays as an explicit, above-the-ceiling
           # backstop for the case where --max-wall-seconds is raised.
           python3 -u scripts/ci/live_comment.py \
             --interval 45 \
-            --timeout 3000
+            --max-wall-seconds 3300 \
+            --timeout 3300
