@@ -35285,6 +35285,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return
             self._session_state(session_key).turn.agent = agent_holder[0]
+            # Turn boundary: the slot just went sentinel -> real agent, and
+            # _snapshot_running_agents() (the source of active_agent_keys)
+            # EXCLUDES sentinels. Without a persist here gateway_state.json
+            # keeps the claim-time snapshot for the whole turn — measured
+            # live 2026-09-19 21:11: `active_agents=1, active_agent_keys=[]`
+            # on a busy gateway — so the safe-restart watcher's per-session
+            # gate cannot see the running session and the boot auto-resume
+            # E2E has no key to check. Preserves gateway_state (read-merge).
+            self._persist_active_agents()
             if self._draining:
                 self._update_runtime_status("draining")
 
