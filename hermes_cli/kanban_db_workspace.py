@@ -139,6 +139,9 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             return
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
+        from hermes_cli.kanban_survivor import allow_cleanup
+        if kind in _REMOVABLE_KINDS and path and not allow_cleanup(conn, task_id):
+            return
         if kind not in _REMOVABLE_KINDS or not path:
             # Not removable itself, but completing may still unblock a deferred
             # parent scratch cleanup (e.g. a 'dir' child of a scratch parent).
@@ -281,6 +284,9 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 or not row["workspace_path"]
                 or _has_active_children(conn, parent_id)
             ):
+                continue
+            from hermes_cli.kanban_survivor import allow_cleanup
+            if not allow_cleanup(conn, parent_id):
                 continue
             if row["workspace_kind"] == "worktree":
                 _cleanup_worktree_workspace(parent_id, row["workspace_path"], row["branch_name"])
@@ -584,6 +590,8 @@ def _set_task_column(conn: sqlite3.Connection, task_id: str, column: str, value:
 
 def set_workspace_path(conn: sqlite3.Connection, task_id: str, path: Path | str) -> None:
     _set_task_column(conn, task_id, "workspace_path", str(path))
+    from hermes_cli.kanban_survivor import record_baseline
+    record_baseline(conn, task_id, path)
 
 
 def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str) -> None:

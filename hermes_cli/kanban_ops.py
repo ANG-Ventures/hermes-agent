@@ -313,6 +313,10 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             "WHERE status = 'archived'"
         ).fetchall()
     for row in rows:
+        from hermes_cli.kanban_survivor import allow_cleanup
+        with kbc.connect_closing() as conn:
+            if not allow_cleanup(conn, row["id"]):
+                continue
         if row["workspace_kind"] == "worktree":
             # Backstop for worktrees that escaped the completion/archive hook.
             # Same safety predicate: only clean, fully-pushed worktrees go.

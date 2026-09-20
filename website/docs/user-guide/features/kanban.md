@@ -126,6 +126,34 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
 - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), reaps workers that outlived their finished run (a worker still alive after its own `kanban_complete`/`kanban_block` is terminated once its run has been closed for two minutes, leaving it time to finish its final turn — matched by PID *and* spawn-time fingerprint, so a recycled PID is never signalled; recorded as a `terminal_worker_reaped` event), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
 
+### Code survivors on completion
+
+Pushing a reviewed branch is preferred. Completion also accepts a harness-written
+`implementation.patch` attachment: it contains the binary Git diff from the recorded
+dispatch baseline to the current files, including non-ignored untracked files. The
+real Git index is not staged or modified. A clean HEAD is accepted as a ref survivor
+only after querying a remote branch that contains it; stale remote-tracking refs
+and a pushed HEAD with dirty files do not qualify.
+
+The completion result and event record the survivor. Patch-only completion says
+`NOT PUSHED` and records the attachment path, SHA-256, and byte count. Apply the patch
+from the workspace root with `git apply /path/to/implementation.patch`, using the
+original base checkout(s). Repeated capture of unchanged content reuses the attachment;
+changed captures preserve earlier versions under distinct names.
+
+If code cannot be captured (missing repository, failed Git/read/write, attachment
+size limit, or an empty patch despite `metadata.changed_files`), completion refuses
+with `survivor_unavailable` and records a durable `workspace_held` event. Cleanup skips
+held workspaces until an explicit successful completion/capture clears the hold.
+Nested repositories inside another repository require separate recovery and are held
+rather than emitting a misleading gitlink patch. Sibling repositories in scratch
+are supported. Repositories created after dispatch use a reachable remote ancestor
+as their base, or a complete initial-tree patch when none is available.
+
+Completion cleanup, deferred-parent cleanup, and archive GC all use the same capture
+guard before removing a workspace. This does not turn arbitrary non-Git scratch files
+into deliverables: continue declaring those in `artifacts`.
+
 ## Boards (multi-project)
 
 Boards let you separate unrelated streams of work — one per project, repo,
