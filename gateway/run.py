@@ -1561,10 +1561,24 @@ async def _clear_stale_resume_pending_flags(async_session_store: Any) -> int:
 
 
 def _resume_interrupted_turns_mode() -> str:
-    """Resolve the startup-captured enum, failing closed to prompt."""
+    """Resolve the startup-captured enum, failing closed to prompt.
+
+    ``prompt`` — preserve + ask.  ``auto`` — continue once when the persisted
+    tail is mechanically safe (an INCOMPLETE mutating call falls back to
+    prompt).  ``always`` — continue once even past an incomplete/unclassified
+    tool call at the tail: the operator has ruled that an interrupted sibling
+    turn resumes unattended.  ``always`` keeps every structural guard
+    (messaging surfaces only, stable assistant rowid, once-ever per turn,
+    finished-work skip) — it only drops the tail-CLASSIFICATION veto.
+    """
     raw = os.environ.get("HERMES_RESUME_INTERRUPTED_TURNS", "prompt")
     mode = str(raw or "prompt").strip().lower()
-    return mode if mode in {"prompt", "auto"} else "prompt"
+    return mode if mode in _RESUME_INTERRUPTED_TURNS_MODES else "prompt"
+
+
+_RESUME_INTERRUPTED_TURNS_MODES = frozenset({"prompt", "auto", "always"})
+# The modes that schedule an unattended continuation (vs. prompt-and-wait).
+_RESUME_UNATTENDED_MODES = frozenset({"auto", "always"})
 
 
 _AUTO_RESUME_MESSAGING_PLATFORM_VALUES = frozenset(
@@ -14801,7 +14815,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # must run before the auto-only early return below.
         self._sweep_resume_requests()
         await self._prepare_boot_resume_work_check(platform=platform)
-        if _resume_interrupted_turns_mode() != "auto":
+        if _resume_interrupted_turns_mode() not in _RESUME_UNATTENDED_MODES:
             return 0
 
         try:
@@ -15923,17 +15937,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             resume_mode = "prompt"
             fallback_reason = None
             pending_attempt = None
-            if requested_mode == "auto" and getattr(entry, "resume_kind", None) == "self":
+            tail_override_reason = None
+            if requested_mode in _RESUME_UNATTENDED_MODES and getattr(entry, "resume_kind", None) == "self":
                 # SELF is a fresh synthesized handoff, not replay of an
                 # interrupted assistant row. It never consumes the SIBLING
                 # once-ever attempt credit or tail-classification gate.
                 resume_mode = "auto"
-            elif requested_mode == "auto":
+            elif requested_mode in _RESUME_UNATTENDED_MODES:
                 assessment = prepared.get(entry.session_key)
                 if assessment is None:
                     fallback_reason = "the persisted tail was not classified at schedule time"
-                elif not assessment.auto_eligible:
+                elif not assessment.auto_eligible and not (
+                    requested_mode == "always" and assessment.turn_rowid is not None
+                ):
                     fallback_reason = assessment.reason or "the persisted tail was ambiguous"
+                elif not assessment.auto_eligible:
+                    # ``always``: the tail-classification veto (an incomplete or
+                    # unclassified tool call) is overridden by operator policy —
+                    # a SIBLING turn cut mid-tool-call continues unattended. The
+                    # structural guards below (stable rowid, once-ever credit)
+                    # still apply, so a genuinely looping turn stays bounded.
+                    tail_override_reason = assessment.reason or "the persisted tail was ambiguous"
+                    attempts = self._get_auto_resume_attempt_store()
+                    if attempts.has_attempt(entry.session_key, assessment.turn_rowid):
+                        fallback_reason = "this interrupted turn was already auto-continued once"
+                    else:
+                        resume_mode = "auto"
+                        pending_attempt = (attempts, assessment.turn_rowid)
                 elif assessment.turn_rowid is None:
                     fallback_reason = "the interrupted turn had no stable assistant rowid"
                 else:
@@ -16002,13 +16032,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 if resume_mode == "auto":
                     logger.warning(
-                        "PHASE=boot_resume_scheduled key=%s reason=%s platform=%s kind=%s mode=auto",
+                        "PHASE=boot_resume_scheduled key=%s reason=%s platform=%s kind=%s mode=auto%s",
                         entry.session_key,
                         getattr(entry, "resume_reason", None),
                         getattr(getattr(source, "platform", None), "value", None),
                         _resume_kind,
+                        # ``always`` overrode a tail veto: name it, so an operator
+                        # reading the audit line knows the turn was continued past
+                        # an incomplete/unclassified tool call BY POLICY.
+                        (f" tail_override={tail_override_reason}" if tail_override_reason else ""),
                     )
-                elif requested_mode == "auto":
+                elif requested_mode in _RESUME_UNATTENDED_MODES:
                     logger.warning(
                         "PHASE=boot_resume_scheduled key=%s reason=%s platform=%s "
                         "kind=%s mode=prompt fallback_reason=%s",
