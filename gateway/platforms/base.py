@@ -349,13 +349,36 @@ def is_network_accessible(host: str) -> bool:
         return True
 
 
-def _detect_macos_system_proxy() -> str | None:
-    """Read the macOS system HTTP(S) proxy via ``scutil --proxy``.
+# macOS system-proxy probe cache. `scutil --proxy` is a SUBPROCESS: on the event
+# loop it blocks every platform adapter in the process for as long as it takes.
+# Measured on a busy gateway: a Telegram reconnect built its transport inside
+# connect() -> resolve_proxy_url() -> _detect_macos_system_proxy() ON THE LOOP,
+# discord.py's keep-alive thread logged "heartbeat blocked for more than 10
+# seconds" with exactly that traceback, its heartbeat ACK went unprocessed, and
+# the Discord adapter force-reconnected with `latency_exceeded`. One platform's
+# reconnect took another platform down.
+#
+# Policy: system proxy settings change on the order of minutes, not milliseconds,
+# so the value is cached with a TTL and served stale-while-revalidate. Off-loop
+# callers may probe synchronously. A caller on a running event loop NEVER waits:
+# it gets the cached value (possibly stale, possibly None on a cold cache) and a
+# daemon thread refreshes the cache for the next call.
+_SYSTEM_PROXY_CACHE_TTL_S = 300.0
+_system_proxy_cache: tuple[float, str | None] | None = None
+_system_proxy_lock = threading.Lock()
+_system_proxy_refreshing = False
 
-    Returns an ``http://host:port`` URL string if an HTTP or HTTPS proxy is
-    enabled, otherwise *None*.  Falls back silently on non-macOS or on any
-    subprocess error.
-    """
+
+def _reset_system_proxy_cache() -> None:
+    """Drop the cached system-proxy value (tests; and after a network change)."""
+    global _system_proxy_cache, _system_proxy_refreshing
+    with _system_proxy_lock:
+        _system_proxy_cache = None
+        _system_proxy_refreshing = False
+
+
+def _probe_macos_system_proxy() -> str | None:
+    """Run the actual ``scutil --proxy`` probe. BLOCKING — never call on the loop."""
     if sys.platform != "darwin":
         return None
     try:
@@ -364,6 +387,79 @@ def _detect_macos_system_proxy() -> str | None:
         )
     except Exception:
         return None
+    return _parse_scutil_proxy(out)
+
+
+def _store_system_proxy(value: str | None) -> str | None:
+    global _system_proxy_cache
+    with _system_proxy_lock:
+        _system_proxy_cache = (time.monotonic(), value)
+    return value
+
+
+def _refresh_system_proxy_in_background() -> None:
+    """Warm the cache off-loop. At most one refresh in flight."""
+    global _system_proxy_refreshing
+    with _system_proxy_lock:
+        if _system_proxy_refreshing:
+            return
+        _system_proxy_refreshing = True
+
+    def _worker() -> None:
+        global _system_proxy_refreshing
+        try:
+            _store_system_proxy(_probe_macos_system_proxy())
+        finally:
+            with _system_proxy_lock:
+                _system_proxy_refreshing = False
+
+    threading.Thread(
+        target=_worker, name="system-proxy-probe", daemon=True
+    ).start()
+
+
+def prime_system_proxy_cache() -> str | None:
+    """Probe once BEFORE the event loop starts so the first on-loop read is a hit.
+
+    Called from gateway startup. Safe anywhere off-loop; returns the value.
+    """
+    if sys.platform != "darwin":
+        return None
+    return _store_system_proxy(_probe_macos_system_proxy())
+
+
+def _detect_macos_system_proxy() -> str | None:
+    """Read the macOS system HTTP(S) proxy via ``scutil --proxy`` (cached).
+
+    Returns an ``http://host:port`` URL string if an HTTP or HTTPS proxy is
+    enabled, otherwise *None*.  Falls back silently on non-macOS or on any
+    subprocess error.  **Never blocks a running event loop** — see the cache
+    policy note above.
+    """
+    if sys.platform != "darwin":
+        return None
+
+    with _system_proxy_lock:
+        cached = _system_proxy_cache
+    cached_value = cached[1] if cached is not None else None
+    fresh = cached is not None and (time.monotonic() - cached[0]) < _SYSTEM_PROXY_CACHE_TTL_S
+    if fresh:
+        return cached_value
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # Off-loop: blocking here harms nobody.
+        return _store_system_proxy(_probe_macos_system_proxy())
+
+    # On the loop: answer immediately from the stale value (or None when cold)
+    # and refresh in a thread. A momentarily-stale proxy URL is vastly cheaper
+    # than freezing every adapter in the process for the length of a subprocess.
+    _refresh_system_proxy_in_background()
+    return cached_value
+
+
+def _parse_scutil_proxy(out: str) -> str | None:
 
     props: dict[str, str] = {}
     for line in out.splitlines():
