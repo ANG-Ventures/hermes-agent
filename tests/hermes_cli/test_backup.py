@@ -1,6 +1,7 @@
 """Tests for hermes backup and import commands."""
 
 import json
+import logging
 import os
 import sqlite3
 import stat
@@ -1335,15 +1336,29 @@ class TestSafeCopyDb:
         # 3 GB must get materially more than the old flat 60s.
         assert big_budget > 300
 
-    def test_aborts_when_copy_makes_no_progress(self, tmp_path, monkeypatch):
-        """The anti-hang property survives: a copy that copies no pages fails."""
+    def test_aborts_when_copy_makes_no_progress(self, tmp_path, monkeypatch, caplog):
+        """The anti-hang property survives: a copy that copies no pages fails.
+
+        The source is sized so its BUDGET is far past its STALL deadline.  A 0-byte
+        source gives ``budget == base == stall``, and the budget check runs first —
+        the test would then pass on the budget message and leave the stall guard
+        with no coverage at all (deleting it keeps the suite green).  ``_safe_copy_db``
+        collapses every failure to ``False``, so the return value cannot tell the two
+        guards apart; assert on the logged reason instead.
+        """
         from hermes_cli import backup as backup_mod
 
         src = tmp_path / "stuck.db"
         dst = tmp_path / "copy.db"
-        src.touch()
+        # 3 GB (sparse) — budget 417s vs a 60s stall deadline, so only the stall
+        # guard can fire within this test's clock.
+        with open(src, "wb") as fh:
+            fh.truncate(3 * 1024 ** 3)
 
         stall = backup_mod._SAFE_COPY_STALL_DEADLINE_S
+        budget = backup_mod._safe_copy_budget_s(src)
+        assert budget > stall * 3, "source must be big enough that only the stall can fire"
+
         calls = 200
         clock = iter([0.0] + [stall * (i + 1) for i in range(calls + 2)])
         steps_taken = []
@@ -1370,9 +1385,13 @@ class TestSafeCopyDb:
         )
         monkeypatch.setattr(backup_mod.time, "monotonic", lambda: next(clock))
 
-        assert backup_mod._safe_copy_db(src, dst) is False
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.backup"):
+            assert backup_mod._safe_copy_db(src, dst) is False
         assert not dst.exists()
         assert len(steps_taken) < calls
+        # The STALL guard specifically — not the budget, which is 417s here.
+        assert "copied no pages" in caplog.text, caplog.text
+        assert "budget" not in caplog.text, caplog.text
 
     def test_restart_thrash_is_bounded_by_the_budget(self, tmp_path, monkeypatch):
         """A never-converging copy must still terminate.
