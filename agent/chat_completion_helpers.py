@@ -2729,20 +2729,28 @@ def _quota_window_suffix(agent) -> str:
 
     detail = f"{window} limit"
     reset_at = ctx.get("quota_window_reset")
+    remaining = 0
     if reset_at:
         try:
             remaining = float(reset_at) - time.time()
         except (TypeError, ValueError):
             remaining = 0
-        if remaining > 0:
-            # Relative is what the reader actually needs ("do I wait, or give
-            # up on this sub?"). Hours for anything under a day, else days.
-            if remaining < 3600:
-                detail += f", resets in {int(remaining // 60)}m"
-            elif remaining < 86400:
-                detail += f", resets in {remaining / 3600:.0f}h"
-            else:
-                detail += f", resets in {remaining / 86400:.1f}d"
+    if remaining > 0:
+        # Relative is what the reader actually needs ("do I wait, or give
+        # up on this sub?"). Hours for anything under a day, else days.
+        if remaining < 3600:
+            detail += f", resets in {int(remaining // 60)}m"
+        elif remaining < 86400:
+            detail += f", resets in {remaining / 3600:.0f}h"
+        else:
+            detail += f", resets in {remaining / 86400:.1f}d"
+    else:
+        # No resolvable epoch (the Claude Code CLI prints a wall clock with
+        # no zone we can trust) — show the provider's literal reset clause
+        # rather than dropping the one thing the reader wants to know.
+        reset_text = ctx.get("quota_window_reset_text")
+        if isinstance(reset_text, str) and reset_text.strip():
+            detail += f", resets {reset_text.strip()}"
     return detail
 
 
@@ -2946,6 +2954,14 @@ def _emit_fallback_announce(
                       FailoverReason.pool_exhausted}:
             _window = _quota_window_suffix(agent)
             if _window:
+                # A bound quota WINDOW means this is subscription usage
+                # exhaustion, not a request-rate throttle — say so, and name
+                # the model whose budget ran out (Ace, 2026-09-19: "rate
+                # limit"/"connection issue" for a spent fable bucket was
+                # "really confusing"). Pool-scoped labels already name it.
+                if reason in {FailoverReason.rate_limit, FailoverReason.upstream_rate_limit}:
+                    _who = (old_model or "").strip()
+                    _reason_label = f"{_who} usage exhausted" if _who else "usage exhausted"
                 _reason_label = f"{_reason_label} · {_window}"
         _reason_suffix = f" ({_reason_label})" if _reason_label else ""
     msg = f"{icon} {verb}{_reason_suffix}: {old_label} → {new_label}"

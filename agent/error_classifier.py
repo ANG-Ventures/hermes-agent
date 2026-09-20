@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -391,6 +392,15 @@ _ACCOUNT_BLOCKED_PATTERNS = [
     "oauth_not_allowed_for_organization",
     "oauth authentication is currently not allowed for this organization",
 ]
+
+# Claude Code CLI's own subscription-cap sentence, as surfaced by every relay
+# that drives the genuine binary (claude-bpx/cpx/cpr). Matched on the lowercased
+# combined message. Mirrors claude-bpx's RATE_LIMIT_RESULT_RE so both sides of
+# the wire agree this is a periodic quota. Keep anchored on "hit your ... limit"
+# — a bare "limit" would collide with context-length and billing phrases.
+_CLAUDE_CLI_USAGE_CAP_RE = re.compile(
+    r"\bhit your (?:weekly|monthly|session|5-hour|five-hour)? ?(?:usage )?limit\b"
+)
 
 # Usage-limit patterns that need disambiguation (could be billing OR rate_limit)
 _USAGE_LIMIT_PATTERNS = [
@@ -1246,6 +1256,24 @@ def classify_api_error(
             FailoverReason.account_blocked,
             retryable=False,
             should_rotate_credential=False,
+            should_fallback=True,
+        )
+
+    # Claude Code CLI subscription usage cap ("You've hit your session limit ·
+    # resets 2:20pm (UTC)", "...weekly limit...", "...5-hour limit..."). Any
+    # relay that drives the genuine `claude` binary (claude-bpx-N, claude-cpx,
+    # claude-cpr) surfaces this as the CLI's own result-error sentence, and
+    # the SDK sometimes hands it up as a THROWN error rather than a result
+    # frame — in which case the relay may wrap it in a 5xx, not a 429. Checked
+    # HERE, before status-code classification, so a quota wall never
+    # classifies as ``server_error`` and announces as "connection issue"
+    # (2026-09-19). It is a periodic quota, not billing: the sentence always
+    # names a reset. Rotate + fall back, same as a 429 rate_limit.
+    if _CLAUDE_CLI_USAGE_CAP_RE.search(error_msg):
+        return _result(
+            FailoverReason.rate_limit,
+            retryable=True,
+            should_rotate_credential=True,
             should_fallback=True,
         )
 
