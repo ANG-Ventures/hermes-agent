@@ -10,6 +10,7 @@ on:
 
 permissions:
   actions: read
+  checks: write
   contents: read
   pull-requests: write
 
@@ -31,13 +32,28 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
-      # v1.2.0 resolves to 44f4b93ecbbe22de6c45fa2f62f519aee564ca8c.
-      - name: Install gh-image
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh extension install drogers0/gh-image --pin v1.2.0
-
       - name: Download and attach evidence
+        # Deliberately NO ``continue-on-error``. Every call in this step
+        # spends the shared installation rate-limit budget, and when that
+        # budget ran out on 2026-09-19 the step failed 10 times and painted
+        # a red X on PRs that had nothing wrong with them - but suppressing
+        # the whole step also swallowed missing artifacts, bad credentials
+        # and a broken gh extension, letting the workflow report success
+        # while attaching nothing, which is its entire job.
+        #
+        # ``publish_evidence_step.sh`` therefore implements a three-valued
+        # policy instead: RED on any real publish defect, GREEN on success
+        # or a deliberate skip, and - only for a transient GitHub API
+        # condition (rate limit or 5xx) that survives a bounded retry - a
+        # visible NEUTRAL: a ``neutral`` check run on the head SHA plus a
+        # warning annotation and a job-summary line. Never a silent green.
+        #
+        # ``checks: write`` above exists solely for that neutral check run.
+        #
+        # The OSV scan's SARIF upload is deliberately NOT given any such
+        # treatment: ``osv-scanner`` IS in ``all-checks-pass.needs``, so
+        # silencing it would hide a required check. This workflow is not in
+        # that list, which is what makes a neutral result safe here.
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
@@ -48,33 +64,4 @@ jobs:
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          set -euo pipefail
-
-          # The run's own ``pull_requests`` payload is always empty for a
-          # fork PR, so resolve the PR from its head reference instead.
-          # The head-SHA match skips runs that a newer push superseded.
-          PR_NUMBER=$(gh api -X GET "repos/$SOURCE_REPO/pulls" \
-            -f head="$HEAD_OWNER:$HEAD_BRANCH" -f state=open \
-            --jq '.[] | select(.head.sha == $ENV.HEAD_SHA) | .number' \
-            | head -n1)
-          if [ -z "$PR_NUMBER" ]; then
-            echo "No open pull request has head $HEAD_OWNER:$HEAD_BRANCH at $HEAD_SHA (CI run $SOURCE_RUN_ID)."
-            exit 0
-          fi
-
-          ARTIFACT_NAME=$(gh api "repos/$SOURCE_REPO/actions/runs/$SOURCE_RUN_ID/artifacts" \
-            --jq '.artifacts[] | select(.expired == false and (.name | startswith("e2e-evidence-"))) | .name' \
-            | python3 -c 'import sys; print(next(iter(sys.stdin), "").strip())')
-          if [ -z "$ARTIFACT_NAME" ]; then
-            echo "No E2E evidence artifact was produced for CI run $SOURCE_RUN_ID."
-            exit 0
-          fi
-
-          EVIDENCE_DIR="$RUNNER_TEMP/e2e-evidence"
-          mkdir -p "$EVIDENCE_DIR"
-          gh run download "$SOURCE_RUN_ID" --repo "$SOURCE_REPO" --name "$ARTIFACT_NAME" --dir "$EVIDENCE_DIR"
-
-          python3 scripts/ci/publish_e2e_evidence.py \
-            --evidence-dir "$EVIDENCE_DIR" \
-            --source-repo "$SOURCE_REPO" \
-            --pr-number "$PR_NUMBER"
+          bash scripts/ci/publish_evidence_step.sh
