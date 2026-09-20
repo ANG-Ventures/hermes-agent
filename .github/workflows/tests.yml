@@ -52,16 +52,45 @@ jobs:
 
       - name: Generate test slices
         id: matrix
+        env:
+          # Per-slice runner routing. Slices 1..CI_SELF_HOSTED_SLOTS are
+          # stamped with CI_RUNNER_LABELS; the rest spill to ubuntu-latest.
+          # GitHub will not overflow a full self-hosted pool onto hosted
+          # runners by itself, and one `runs-on` for the whole matrix cannot
+          # express the split.
+          #
+          # Measured on merge_group run 35517572423 (2026-09-20, 30 real jobs):
+          # 26 of them wanted the 17-slot self-hosted pool — 16 test slices
+          # plus 10 non-test jobs — so mean job queue-wait was 4.6 min and max
+          # 14.4 min against a mean job RUN of 3.3 min. Jobs waited longer than
+          # they ran: the limiter was SLOT COUNT, not slice speed. Hosted
+          # minutes are free on this public repo (20 concurrent jobs), so the
+          # overflow tail costs nothing and the matrix starts in one wave.
+          #
+          # Both vars are optional and fail SAFE: unset CI_SELF_HOSTED_SLOTS
+          # means no cap (every slice self-hosted, i.e. today's behaviour),
+          # and unset/garbage CI_RUNNER_LABELS falls back to ubuntu-latest —
+          # so the existing rollback (point CI_RUNNER_LABELS at ubuntu-latest
+          # to route everything hosted) still works unchanged.
+          CI_SELF_HOSTED_SLOTS: ${{ vars.CI_SELF_HOSTED_SLOTS }}
+          CI_RUNNER_LABELS: ${{ vars.CI_RUNNER_LABELS }}
         run: |
           MATRIX=$(python3 scripts/run_tests_parallel.py \
             --generate-slices ${{ inputs.slice_count }} \
-            --test-scope '${{ inputs.test_scope }}')
+            --test-scope '${{ inputs.test_scope }}' \
+            --self-hosted-slots "$CI_SELF_HOSTED_SLOTS" \
+            --self-hosted-labels "$CI_RUNNER_LABELS")
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
 
   test:
     name: Run tests ${{ matrix.slice.name }}
     needs: generate
-    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    # Per-slice runner class, stamped by the generate job (see its
+    # `Generate test slices` step for the measurement and the fail-safe
+    # semantics). Not `vars.CI_RUNNER_LABELS` directly: one label set for the
+    # whole matrix cannot spill, and GitHub will not overflow a full
+    # self-hosted pool onto hosted runners by itself.
+    runs-on: ${{ fromJSON(matrix.slice.runs_on) }}
     timeout-minutes: 30
     strategy:
       fail-fast: false

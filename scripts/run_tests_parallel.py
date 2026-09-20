@@ -398,9 +398,98 @@ def _plugin_scope_from_changes(changed_paths: List[str]) -> str:
     return f"plugin:{plugin_name}" if plugin_name else "full"
 
 
+# Default runner labels when no self-hosted pool is configured. Mirrors the
+# ``vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'`` fallback in the workflows.
+_HOSTED_RUNNER_LABELS = '["ubuntu-latest"]'
+
+
+def _runs_on_for(
+    index: int,
+    self_hosted_slots: int | None,
+    self_hosted_labels: str,
+) -> str:
+    """Return the ``runs-on`` label JSON for 1-based slice *index*.
+
+    Slices ``1..self_hosted_slots`` get the self-hosted pool's labels; the
+    overflow tail spills onto GitHub-hosted runners, which are unmetered on a
+    public repo and let one wave of jobs start at once instead of queueing
+    behind a fixed pool. ``self_hosted_slots is None`` means "no cap" — every
+    slice stays self-hosted, so an unset ``CI_SELF_HOSTED_SLOTS`` repo variable
+    is a no-op and the prior behaviour is exactly preserved.
+
+    Rollback is unchanged: pointing ``CI_RUNNER_LABELS`` at ``ubuntu-latest``
+    makes *self_hosted_labels* equal the hosted labels, so every slice is
+    hosted regardless of the slot count.
+    """
+    if self_hosted_slots is None or index <= self_hosted_slots:
+        return self_hosted_labels
+    return _HOSTED_RUNNER_LABELS
+
+
+def _resolve_self_hosted_labels(raw: str | None) -> str:
+    """Normalize ``--self-hosted-labels`` into schedulable ``runs-on`` JSON.
+
+    Empty/unset mirrors the workflows' ``vars.CI_RUNNER_LABELS || '[...]'``
+    fallback. Anything that is not a JSON array of non-empty strings falls
+    back to the hosted default and says so on stderr: a malformed value
+    emitted into ``runs-on`` makes every matrix job unschedulable, whereas
+    the hosted default always runs.
+    """
+    if raw is None or not raw.strip():
+        return _HOSTED_RUNNER_LABELS
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = None
+    if (
+        not isinstance(parsed, list)
+        or not parsed
+        or not all(isinstance(x, str) and x.strip() for x in parsed)
+    ):
+        print(
+            f"warning: --self-hosted-labels {raw!r} is not a JSON array of "
+            f"labels; using {_HOSTED_RUNNER_LABELS}",
+            file=sys.stderr,
+        )
+        return _HOSTED_RUNNER_LABELS
+    return json.dumps(parsed, separators=(",", ":"))
+
+
+def _resolve_self_hosted_slots(raw: str | None) -> int | None:
+    """Normalize ``--self-hosted-slots`` into a cap, or ``None`` for no cap.
+
+    Empty/unset/non-numeric/negative all mean "no cap", i.e. every slice stays
+    self-hosted exactly as before this flag existed — a missing or fat-fingered
+    ``CI_SELF_HOSTED_SLOTS`` repo variable can never move jobs off the pool.
+    ``0`` is meaningful and honoured: it spills the entire matrix to hosted
+    runners, which is how you drain the pool without touching the workflows.
+    """
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        print(
+            f"warning: --self-hosted-slots {raw!r} is not an integer; "
+            "leaving every slice self-hosted",
+            file=sys.stderr,
+        )
+        return None
+    if value < 0:
+        print(
+            f"warning: --self-hosted-slots {value} is negative; "
+            "leaving every slice self-hosted",
+            file=sys.stderr,
+        )
+        return None
+    return value
+
+
 def _scoped_plugin_matrix(
     scope: str,
     repo_root: Path,
+    self_hosted_slots: int | None = None,
+    self_hosted_labels: str = _HOSTED_RUNNER_LABELS,
 ) -> dict[str, list[dict[str, object]]] | None:
     """Build one plugin slice plus one pinned core-smoke slice.
 
@@ -429,11 +518,16 @@ def _scoped_plugin_matrix(
                 "index": 1,
                 "name": f"plugin {plugin_name}",
                 "files": ":".join(_format_file(path, repo_root) for path in plugin_files),
+                "runs_on": _runs_on_for(1, self_hosted_slots, self_hosted_labels),
             },
             {
                 "index": 2,
                 "name": "core smoke",
                 "files": ":".join(_format_file(path, repo_root) for path in smoke_files),
+                # The pinned smoke slice never spills: it is the one slice that
+                # gates every plugin-scoped run, so it keeps the fastest
+                # runner class unconditionally.
+                "runs_on": self_hosted_labels,
             },
         ]
     }
@@ -1222,6 +1316,28 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--self-hosted-slots",
+        metavar="K",
+        default=None,
+        help=(
+            "Number of matrix slices to stamp with --self-hosted-labels; "
+            "slices past K spill onto GitHub-hosted runners. Empty or "
+            "unset means no cap (every slice self-hosted). "
+            "Env/CI source: vars.CI_SELF_HOSTED_SLOTS."
+        ),
+    )
+    parser.add_argument(
+        "--self-hosted-labels",
+        metavar="JSON",
+        default=_HOSTED_RUNNER_LABELS,
+        help=(
+            "JSON array of runner labels for the self-hosted slices, e.g. "
+            '\'["self-hosted","hermes-ci"]\'. Empty or unset falls back to '
+            f"{_HOSTED_RUNNER_LABELS} so every slice is GitHub-hosted. "
+            "Env/CI source: vars.CI_RUNNER_LABELS."
+        ),
+    )
+    parser.add_argument(
         "--changed-files-scope",
         action="store_true",
         help=(
@@ -1302,6 +1418,7 @@ def main() -> int:
         "-j", "--jobs", "--paths", "--include-integration",
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
         "--changed-files-scope", "--test-scope",
+        "--self-hosted-slots", "--self-hosted-labels",
         "--min-tests", "--strict-noop", "--no-strict-noop",
     }
     # pytest short flags that consume the NEXT token as their value.
@@ -1447,8 +1564,13 @@ def main() -> int:
         print(_plugin_scope_from_changes(sys.stdin.read().splitlines()))
         return 0
 
+    self_hosted_labels = _resolve_self_hosted_labels(args.self_hosted_labels)
+    self_hosted_slots = _resolve_self_hosted_slots(args.self_hosted_slots)
+
     if args.generate_slices is not None and args.test_scope != "full":
-        scoped_matrix = _scoped_plugin_matrix(args.test_scope, repo_root)
+        scoped_matrix = _scoped_plugin_matrix(
+            args.test_scope, repo_root, self_hosted_slots, self_hosted_labels
+        )
         if scoped_matrix is not None:
             print(
                 f"Test scope: {args.test_scope} + core smoke (2 slices)",
@@ -1511,6 +1633,14 @@ def main() -> int:
                     "index": i + 1,
                     "name": f"slice {i + 1}/{args.generate_slices}",
                     "files": ":".join(_format_file(f, repo_root) for f in bucket),
+                    # Head of the matrix stays on the self-hosted pool, the
+                    # tail spills to GitHub-hosted. LPT seeds buckets with the
+                    # longest files first, so the low indices carry the
+                    # heaviest individual files — the ones that benefit most
+                    # from the faster pool and from LAN git-mirror alternates.
+                    "runs_on": _runs_on_for(
+                        i + 1, self_hosted_slots, self_hosted_labels
+                    ),
                 }
                 for i, bucket in enumerate(slices)
             ]

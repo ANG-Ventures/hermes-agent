@@ -34,7 +34,13 @@ jobs:
     # wedges on a pending required context. The advisory diff is exit-zero
     # always; the base-ref else-branch (HEAD~1) below covers the merge_group case.
     if: inputs.event_name == 'pull_request' || inputs.event_name == 'merge_group'
-    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    # Hosted by design: short, and gates nothing on the LAN. The 17-slot
+    # self-hosted pool is the scarce resource — a PR/merge_group run wants 26
+    # self-hosted jobs (16 test slices + 10 non-test), so every non-test job
+    # left on the pool displaces a test slice. This job's checkout is already
+    # blobless, which is what made it viable on the pool; it is equally viable
+    # hosted, where it never competes with the matrix.
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout code
@@ -131,7 +137,8 @@ jobs:
     # ``lint-diff`` job above runs independently so reviewers still get
     # the diff comment even when enforcement fails.
     name: ruff enforcement (blocking)
-    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    # Hosted by design — short, no LAN dependency. See `lint-diff` above.
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Checkout code
@@ -162,7 +169,8 @@ jobs:
     # shebang scripts via subprocess, bare open() without encoding=, etc.
     # See scripts/check-windows-footguns.py for the full rule list.
     name: Windows footguns (blocking)
-    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    # Hosted by design — short, no LAN dependency. See `lint-diff` above.
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Checkout code

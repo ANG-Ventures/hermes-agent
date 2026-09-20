@@ -32,6 +32,23 @@ name: CI
 # literal ``runs-on`` and are hosted by design. Everything else runs on the
 # pool. Any PR touching ``.github/workflows/**`` also needs the ``ci-reviewed``
 # label or the Review label gate hard-blocks it.
+#
+# OVERFLOW (2026-09-20). The pool has 17 slots (ace-ai 8 + ace-media 8 +
+# studio 1) and a PR/merge_group run wanted 26 of them — 16 test slices plus
+# 10 non-test jobs — so jobs queued 4.6 min on average (max 14.4) to run for
+# 3.3. GitHub cannot spill a full self-hosted pool onto hosted runners by
+# itself, so two things changed:
+#
+#   * tests.yml stamps a PER-SLICE ``runs_on`` in its ``generate`` job:
+#     slices 1..``vars.CI_SELF_HOSTED_SLOTS`` take ``CI_RUNNER_LABELS``, the
+#     rest take ``ubuntu-latest``. Unset slot count = no cap = every slice
+#     self-hosted, so the variable is a no-op until it is set.
+#   * the short non-test jobs that gate nothing on the LAN — lint (x3),
+#     uv-lockfile-check, contributor-check, docs-site-checks — moved to a
+#     literal ``ubuntu-latest``, freeing 6 pool slots per run for test slices.
+#
+# ``CI_RUNNER_LABELS`` rollback is unchanged: point it at ubuntu-latest and
+# every job, matrix slices included, goes hosted.
 
 on:
   pull_request:
