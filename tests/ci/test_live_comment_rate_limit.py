@@ -2486,3 +2486,278 @@ def test_active_polling_passes_the_poll_ceiling_to_the_artifact_fetch(
         f"the active cycle's deadline is {first}, not the poll ceiling "
         f"({expected_ceiling}) — it does not stop work at the cutoff"
     )
+
+
+# ─── round-11: gates for the seams round 10 introduced ────────────────
+
+
+def test_the_snapshot_fetch_cutoff_reserves_a_window_for_the_patch(monkeypatch):
+    """F5 SEAM: the fetch cutoff must sit BEFORE the budget end.
+
+    A fetch deadline equal to the budget end only bounds when a download
+    may start; the PATCH that follows then inherits whatever a last hop
+    left behind. Measured: `_PATCH_RESERVE_SECONDS = 0` and hardcoding the
+    cutoff to the budget end BOTH left the whole file green — the sibling
+    deadline test only requires one `_REQUEST_TIMEOUT` of window, which a
+    zero reserve still satisfies.
+    """
+    seen: dict[str, object] = {}
+
+    def spy_fetch(token, repo, run_id, deadline=None):
+        seen["deadline"] = deadline
+        return []
+
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", spy_fetch)
+    monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: (
+        [{"name": "Python tests", "status": "in_progress", "html_url": "u"}],
+        False))
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: False)
+    monkeypatch.setattr(_mod, "upsert_comment",
+                        lambda t, r, p, body, comment_id=None: 1)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(
+        _mod.time, "sleep",
+        lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
+
+    budget = 1200
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5", run_url="u",
+             interval=45, timeout=100000, dry_run=False,
+             max_wall_seconds=budget)
+
+    deadline = seen.get("deadline")
+    assert deadline is not None, "the snapshot fetched with no deadline"
+    # A deliberate literal, NOT read back from _PATCH_RESERVE_SECONDS: the
+    # point is that SOME real window is held back for the write, so moving
+    # the constant moves the code without moving this assertion.
+    slack = budget - float(deadline)  # type: ignore[arg-type]
+    assert slack >= 30, (
+        f"the snapshot's artifact fetch may run until t={deadline} of a "
+        f"{budget}s budget, leaving only {slack}s for the final PATCH; a "
+        "download that starts just before the cutoff can consume it and the "
+        "comment is never written"
+    )
+
+
+def test_the_final_snapshot_retry_window_stops_before_the_budget_ends(
+        monkeypatch):
+    """F6 SEAM: retries must not spend the PATCH reserve itself.
+
+    Measured: widening `retry_until` to the budget end left the file green
+    — the existing retry test only proves that A retry happens, not that
+    the retry loop stops early enough for the attempt it launches to land.
+    """
+    attempts: list[float] = []
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(
+        _mod.time, "sleep",
+        lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0)))
+
+    monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: (
+        [{"name": "Python tests", "status": "in_progress", "html_url": "u"}],
+        False))
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses",
+                        lambda *a, **k: [])
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: False)
+
+    def always_failing_upsert(t, r, p, body, comment_id=None):
+        attempts.append(clock["t"])
+        raise _mod.RateLimitError(0.0)
+
+    monkeypatch.setattr(_mod, "upsert_comment", always_failing_upsert)
+
+    budget = 1200
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5", run_url="u",
+             interval=45, timeout=100000, dry_run=False,
+             max_wall_seconds=budget)
+
+    assert len(attempts) >= 2, (
+        f"the failed final snapshot was not retried: {attempts}")
+    # The LAST attempt must still have a full request's worth of room before
+    # the budget ends, or it is launched only to be SIGKILLed mid-flight.
+    last = attempts[-1]
+    assert budget - last >= 30, (
+        f"the final retry was launched at t={last} of a {budget}s budget, "
+        f"{budget - last}s before the deadline — the PATCH it issues cannot "
+        "complete, so the retry loop spent the reserve it was meant to use"
+    )
+
+
+def test_artifact_download_hops_carry_bounded_socket_timeouts(monkeypatch):
+    """F9: the socket-timeout guard must cover the DOWNLOAD path too.
+
+    `test_api_calls_carry_a_socket_timeout` only observes `_api_request`
+    and `upsert_comment`. Measured: `_ARTIFACT_BLOB_TIMEOUT = 0` left the
+    whole file green, and urllib treats `timeout=0` as a non-blocking
+    socket that fails instantly — every artifact download would silently
+    drop its section.
+    """
+    timeouts: list[object] = []
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            timeouts.append(timeout)
+            raise _http_error(302, {"Location": "https://blob/x"})
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *a: _Opener())
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda req, *a, **k: timeouts.append(k.get("timeout")) or _Resp({}, {}))
+
+    artifact = {"id": 1, "name": "review-status-lint",
+                "archive_download_url": "https://api/x"}
+    # No deadline: the UNCLAMPED, shipped values must themselves be sane.
+    _mod._download_artifact("tok", "o/r", artifact, Path("/tmp"))
+
+    assert len(timeouts) >= 2, (
+        f"expected a redirect hop and a blob hop, saw {timeouts}")
+    for t in timeouts:
+        assert isinstance(t, (int, float)) and not isinstance(t, bool), (
+            f"an artifact download hop used a non-numeric timeout: {timeouts}")
+        assert 5 <= t <= 300, (
+            f"an artifact download hop used a {t}s socket timeout; 0 is a "
+            f"non-blocking socket that fails instantly and huge values hang: "
+            f"{timeouts}"
+        )
+
+
+def test_bounded_timeout_never_returns_an_unusable_socket_timeout():
+    """`_bounded_timeout`'s floor is the guard, not an optimisation.
+
+    The clamp exists so a request cannot outlive the deadline, but the
+    clamped value is still handed to `socket.settimeout`. Without the
+    floor a deadline 0.2s away yields a 0.2s socket timeout — in practice
+    an instant failure, which reads as "the artifact is unavailable" and
+    silently drops the section. Measured: dropping `max(1.0, ...)` left
+    the whole file green.
+
+    The expectations are deliberate literals, not read back from the
+    module's constants.
+    """
+    import time as _time
+
+    now = _time.time()
+
+    # Deadline comfortably far away: the caller's own base wins, unclamped.
+    assert _mod._bounded_timeout(30.0, now + 600) == 30.0
+
+    # Deadline nearer than the base: clamped DOWN, but still usable.
+    tight = _mod._bounded_timeout(30.0, now + 0.2)
+    assert tight is not None, (
+        "a deadline 0.2s away returned None; there is still room to try")
+    assert tight >= 1.0, (
+        f"_bounded_timeout handed a {tight}s socket timeout to a real "
+        "request; anything under a second fails effectively instantly and "
+        "reads as an unavailable artifact rather than a timeout")
+
+    # Deadline already gone: refuse to start at all.
+    assert _mod._bounded_timeout(30.0, now - 1) is None, (
+        "a spent deadline must return None so the hop is not started")
+
+    # No deadline at all: unchanged.
+    assert _mod._bounded_timeout(30.0, None) == 30.0
+
+
+def test_a_spent_deadline_stops_the_blob_hop_not_just_the_first_hop(
+        monkeypatch, tmp_path):
+    """Both download hops must refuse to start once the deadline is gone.
+
+    The redirect hop's `None` check was gated; the blob hop's was not.
+    Measured: replacing the blob hop's `if blob_timeout is None: return
+    None` with a fall-back to the unclamped constant left the whole file
+    green — a 60s bulk transfer could then start AFTER the shutdown cutoff
+    and eat the window the final PATCH needs.
+    """
+    import time as _time
+
+    blob_opens: list[object] = []
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            # Hop 1 succeeds (302) but consumes the entire window, so the
+            # blob hop is reached with the deadline already spent.
+            clock["t"] = deadline + 5
+            raise _http_error(302, {"Location": "https://blob/x"})
+
+    clock = {"t": _time.time()}
+    deadline = clock["t"] + 10
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *a: _Opener())
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda req, *a, **k: blob_opens.append(k.get("timeout")))
+
+    artifact = {"id": 1, "name": "review-status-lint",
+                "archive_download_url": "https://api/x"}
+    result = _mod._download_artifact(
+        "tok", "o/r", artifact, tmp_path, deadline=deadline)
+
+    assert result is None
+    assert blob_opens == [], (
+        f"the blob hop started {len(blob_opens)}s past a spent deadline "
+        f"with timeout(s) {blob_opens}; it must not begin at all")
+
+
+def test_the_final_retry_backoff_is_a_real_pause(monkeypatch):
+    """The retry pause must actually pause.
+
+    `_FINAL_RETRY_BACKOFF` bounds how hard the shutdown reserve is spun.
+    Measured: setting it to 0 left the whole file green, which is a busy
+    loop hammering the very API that just rate-limited us — for the whole
+    reserve. It must also stay clamped to the room left, so the last
+    sleep cannot overshoot the retry window.
+    """
+    sleeps: list[float] = []
+    attempts: list[float] = []
+    clock = {"t": 0.0}
+    phase = {"final": False}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+
+    def fake_sleep(s):
+        # Only the pauses INSIDE the shutdown-retry loop are the subject;
+        # the poll loop's own interval sleeps sit in the same range and
+        # would mask a zero retry backoff entirely.
+        if phase["final"]:
+            sleeps.append(s)
+        clock["t"] += max(s, 1.0)
+
+    monkeypatch.setattr(_mod.time, "sleep", fake_sleep)
+    monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: (
+        [{"name": "Python tests", "status": "in_progress", "html_url": "u"}],
+        False))
+
+    def fetch(*a, **k):
+        # The snapshot path is the only caller that passes a deadline; use
+        # that as the phase marker rather than any budget constant.
+        if k.get("deadline") is not None:
+            phase["final"] = True
+        return []
+
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", fetch)
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: False)
+
+    def always_failing_upsert(t, r, p, body, comment_id=None):
+        attempts.append(clock["t"])
+        raise _mod.RateLimitError(0.0)
+
+    monkeypatch.setattr(_mod, "upsert_comment", always_failing_upsert)
+
+    budget = 1200
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5", run_url="u",
+             interval=45, timeout=100000, dry_run=False,
+             max_wall_seconds=budget)
+
+    retry_sleeps = sleeps
+    assert retry_sleeps, (
+        "the shutdown-reserve retry loop never paused between attempts")
+    # Deliberate literals: a pause short enough to be a busy loop is the
+    # defect, and one long enough to swallow the reserve is the other.
+    assert max(retry_sleeps) <= 60, (
+        f"a retry pause of {max(retry_sleeps)}s can swallow the whole "
+        f"shutdown reserve: {retry_sleeps}")
+    assert min(retry_sleeps) >= 1, (
+        f"a retry paused {min(retry_sleeps)}s between attempts — that is a "
+        f"busy loop against an API that just rate-limited us: {retry_sleeps}")
+    assert len(attempts) >= 2, f"no retry was attempted: {attempts}"
