@@ -3169,6 +3169,7 @@ def terminal_tool(
         if _is_supervised_gateway_process():
             from cron.lifecycle_guard import (
                 _MAX_REFERENCED_SCRIPT_BYTES,
+                GATEWAY_LIFECYCLE_BLOCK_MARKER as _GATEWAY_LIFECYCLE_BLOCK_MARKER,
                 contains_gateway_lifecycle_command_or_referenced_script,
                 contains_launchctl_submit_command,
                 describe_self_gateway_identity,
@@ -3192,9 +3193,11 @@ def terminal_tool(
                         "KeepAlive job and is unsafe from inside the gateway process. "
                         "Use Hermes cron for one-shot delayed work, or install an "
                         "explicit LaunchAgent from a separate shell. "
-                        "(launchctl bootstrap of a SIBLING gateway's plist is allowed.)"
+                        "(launchctl bootstrap of a SIBLING gateway's plist, or of an "
+                        "EXISTING non-gateway plist, is allowed.)"
                     ),
                     "status": "error",
+                    "blocked_by": _GATEWAY_LIFECYCLE_BLOCK_MARKER,
                 }, ensure_ascii=False)
             guard_cwd_base = get_session_cwd(session_key)
             if guard_cwd_base is None:
@@ -3278,6 +3281,7 @@ def terminal_tool(
                         "restart` from a separate shell outside the running gateway."
                     ),
                     "status": "error",
+                    "blocked_by": _GATEWAY_LIFECYCLE_BLOCK_MARKER,
                 }, ensure_ascii=False)
 
         # Validate before the source guard resolves an explicit workdir.
