@@ -46,8 +46,23 @@ CONFAB_NOTICE_DISPLAY_KIND = "confab_notice"
 #: The only schema version this consumer understands.
 CONFAB_NOTICE_VERSION = 1
 
-#: The only catch kind defined by v1 of the contract.
+#: Original scaffold kind; retained for callers that distinguish status-only notices.
 CONFAB_NOTICE_KIND = "scaffold_confab_removed"
+
+# Tool guards may be the entire visible turn. Unlike the scaffold status,
+# these local instructions become assistant content and may be replayed so
+# the model can recover. Never interpolate provider-supplied labels here.
+TOOL_CALL_NOTICE_TEXT = {
+    "tool_call_unparseable": (
+        "Tool call not executed: the tool-call JSON could not be parsed. "
+        "Re-issue the tool call with valid JSON matching the tool schema."
+    ),
+    "tool_call_as_text": (
+        "Tool call not executed: it was written as text rather than a native tool call. "
+        "Re-issue the call using the native tool-calling interface, not a text block."
+    ),
+}
+CONFAB_NOTICE_KINDS = (CONFAB_NOTICE_KIND, *TOOL_CALL_NOTICE_TEXT)
 
 #: Allowed ``scope`` values.
 CONFAB_NOTICE_SCOPES = ("visible", "intermediate", "both")
@@ -84,7 +99,7 @@ def validate_confab_notice(raw: Any) -> Optional[Dict[str, Any]]:
         return None
 
     kind = raw.get("kind")
-    if kind != CONFAB_NOTICE_KIND:
+    if kind not in CONFAB_NOTICE_KINDS:
         logger.debug("Ignoring %s: unknown kind %r", CONFAB_NOTICE_FIELD, kind)
         return None
 
@@ -104,6 +119,9 @@ def validate_confab_notice(raw: Any) -> Optional[Dict[str, Any]]:
     if scope not in CONFAB_NOTICE_SCOPES:
         logger.debug("Ignoring %s: invalid scope %r", CONFAB_NOTICE_FIELD, scope)
         return None
+    if kind != CONFAB_NOTICE_KIND and scope != "visible":
+        logger.debug("Ignoring %s: tool-call scope must be visible", CONFAB_NOTICE_FIELD)
+        return None
 
     # ``grammar`` is the detector's bounded label, or null when several catches
     # cannot be represented by one label. Absent is treated as null.
@@ -118,7 +136,7 @@ def validate_confab_notice(raw: Any) -> Optional[Dict[str, Any]]:
 
     return {
         "version": CONFAB_NOTICE_VERSION,
-        "kind": CONFAB_NOTICE_KIND,
+        "kind": kind,
         "request_id": request_id,
         "scope": scope,
         "grammar": grammar,

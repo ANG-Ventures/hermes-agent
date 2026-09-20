@@ -109,7 +109,7 @@ class _NoticeHandler(BaseHTTPRequestHandler):
 
 
 @pytest.fixture()
-def notice_env():
+def notice_env(monkeypatch):
     """Mock provider + isolated HERMES_HOME + shared SessionDB.
 
     Yields ``(make_agent, handler, db, sid)``; ``make_agent(stream=...)``
@@ -128,6 +128,10 @@ def notice_env():
     os.environ["HERMES_HOME"] = os.path.join(test_home, ".hermes")
 
     from run_agent import AIAgent
+
+    # Title generation is unrelated to the consumer and must not discover
+    # external credentials or spawn auxiliary network calls in this HTTP rig.
+    monkeypatch.setattr("agent.title_generator._auto_title_enabled", lambda: False)
 
     db = SessionDB(db_path=Path(test_home) / "state.db")
     sid = "sess-confab"
@@ -181,6 +185,62 @@ def _confab_statuses(statuses) -> list:
 
 @pytest.mark.parametrize("stream", [False, True], ids=["non_stream", "stream"])
 class TestConfabNoticeEndToEnd:
+    def test_scaffold_wins_collision_and_keeps_in_band_tool_guard(self, notice_env, stream):
+        make_agent, handler, db, sid, statuses = notice_env
+        guard = "Tool call not executed. Re-issue the call using the native interface."
+        handler.response_queue.append((guard, dict(VALID_NOTICE)))
+        result = make_agent(stream=stream).run_conversation(
+            "hello", conversation_history=[], task_id="t1",
+        )
+        assert len(_chat_requests(handler)) == 1
+        assert result["final_response"] == guard
+        assert len(_confab_statuses(statuses)) == 1
+        row = [r for r in db.get_messages(sid) if r["role"] == "assistant"][-1]
+        assert row["content"] == guard
+
+    @pytest.mark.parametrize("kind", ["tool_call_unparseable", "tool_call_as_text"])
+    @pytest.mark.parametrize("prose", ["", "Work is incomplete."])
+    def test_tool_notice_renders_before_empty_retry_and_replays_without_metadata(
+        self, notice_env, stream, kind, prose,
+    ):
+        make_agent, handler, db, sid, statuses = notice_env
+        notice = {**VALID_NOTICE, "kind": kind, "grammar": "opaque-reason-label"}
+        handler.response_queue.append((prose, notice))
+        agent = make_agent(stream=stream)
+        result = agent.run_conversation("hello", conversation_history=[], task_id="t1")
+
+        # Real conversation_loop empty-response handling must never retry/fallback.
+        assert len(_chat_requests(handler)) == 1
+        assert not getattr(agent, "_empty_content_retries", 0)
+        row = [r for r in db.get_messages(sid) if r["role"] == "assistant"][-1]
+        text = row["content"]
+        assert text.strip()
+        if prose:
+            assert text.startswith(prose + "\n\n")
+        assert "re-issue" in text.lower()
+        assert ("JSON" in text) == (kind == "tool_call_unparseable")
+        assert ("native" in text.lower()) == (kind == "tool_call_as_text")
+        assert notice["grammar"] not in text
+        assert result["final_response"] == text
+        assert row["display_kind"] == CONFAB_NOTICE_DISPLAY_KIND
+        meta = row["display_metadata"]
+        if isinstance(meta, str):
+            meta = json.loads(meta)
+        assert meta[CONFAB_NOTICE_KEY] == notice
+        assert not _confab_statuses(statuses)  # Not a scaffold catch.
+
+        history = db.get_messages_as_conversation(sid)
+        handler.captured_requests = []
+        handler.response_queue.append(("second", None))
+        make_agent(stream=stream).run_conversation("again", conversation_history=history, task_id="t2")
+        requests = _chat_requests(handler)
+        assert len(requests) == 1
+        blob = json.dumps(requests[0]["messages"])
+        assert "display_kind" not in blob
+        assert "display_metadata" not in blob
+        assert notice["grammar"] not in blob
+        assert any(m.get("content") == text for m in requests[0]["messages"])
+
     def test_status_shown_once_and_row_persisted(self, notice_env, stream):
         make_agent, handler, db, sid, statuses = notice_env
         handler.response_queue.append(("All good here.", dict(VALID_NOTICE)))

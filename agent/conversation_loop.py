@@ -42,7 +42,7 @@ from agent.context_engine import (
     call_with_messages as _call_with_messages,
 )
 from agent.display import KawaiiSpinner
-from agent.confab_notice import CONFAB_NOTICE_TEXT
+from agent.confab_notice import CONFAB_NOTICE_KIND, CONFAB_NOTICE_TEXT, TOOL_CALL_NOTICE_TEXT
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
 from agent.turn_context import (
@@ -7666,7 +7666,7 @@ def run_conversation(
             # stops a retry/fallback that re-normalizes the same response from
             # emitting twice. See agent/confab_notice.py.
             _confab_notice = getattr(normalized, "confab_notice", None)
-            if _confab_notice:
+            if _confab_notice and _confab_notice.get("kind") == CONFAB_NOTICE_KIND:
                 _seen = getattr(agent, "_confab_notices_announced", None)
                 if _seen is None:
                     _seen = set()
@@ -7696,6 +7696,19 @@ def run_conversation(
                     assistant_message.content = "\n".join(parts)
                 else:
                     assistant_message.content = str(raw)
+
+            # A D2 tool-call guard can carry no model prose at all. Render
+            # locally BEFORE the empty-response retry/fallback path, while
+            # retaining the same presentation metadata and replay stripping.
+            # A scaffold notice wins collisions; its in-band guard is untouched.
+            if _confab_notice:
+                _tool_notice_text = TOOL_CALL_NOTICE_TEXT.get(_confab_notice.get("kind"))
+                if _tool_notice_text:
+                    _model_text = assistant_message.content or ""
+                    assistant_message.content = (
+                        f"{_model_text}\n\n{_tool_notice_text}"
+                        if _model_text.strip() else _tool_notice_text
+                    )
 
             # ── Agent-as-provider projection ──────────────────────────────
             # A provider that IS an agent ran its own tools inside its own

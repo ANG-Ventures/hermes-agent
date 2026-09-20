@@ -33,6 +33,18 @@ VALID = {
 
 
 class TestValidator:
+    @pytest.mark.parametrize("kind", [
+        "scaffold_confab_removed", "tool_call_unparseable", "tool_call_as_text",
+    ])
+    def test_all_v1_kinds_round_trip(self, kind):
+        notice = {**VALID, "kind": kind}
+        assert validate_confab_notice(notice) == notice
+
+    @pytest.mark.parametrize("kind", ["tool_call_unparseable", "tool_call_as_text"])
+    @pytest.mark.parametrize("scope", ["intermediate", "both"])
+    def test_tool_call_scope_must_be_visible(self, kind, scope):
+        assert validate_confab_notice({**VALID, "kind": kind, "scope": scope}) is None
+
     def test_valid_v1_notice_round_trips(self):
         assert validate_confab_notice(dict(VALID)) == VALID
 
