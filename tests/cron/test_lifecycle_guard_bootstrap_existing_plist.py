@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+from pathlib import Path
 
 import pytest
 
@@ -34,11 +35,29 @@ from cron import lifecycle_guard
 from cron.lifecycle_guard import contains_launchctl_submit_command
 
 
+def _arg(path) -> str:
+    """Render *path* the way a shell command would carry it.
+
+    The guard tokenizes command text with ``shlex(..., posix=True)``
+    (``cron/lifecycle_guard.py``), which consumes ``\\`` as an escape. A native
+    Windows ``tmp_path`` (``C:\\Users\\...\\x.plist``) therefore reaches the
+    guard as ``C:Usersx.plist`` — a path that does not exist — so the reader
+    returns ``None``.
+
+    That breaks this file in BOTH directions on Windows: the ALLOWED cases fail
+    (the exemption never fires), and — less visibly — the BLOCKED cases pass for
+    the wrong reason, fail-closed on an unreadable path rather than on the
+    ``Label`` / argv fact each one exists to pin. Rendering every path argument
+    POSIX-style keeps the assertions meaningful on every platform.
+    """
+    return Path(path).as_posix()
+
+
 def _write_plist(path, payload) -> str:
-    """Write *payload* as a binary plist and return its path as a string."""
+    """Write *payload* as a binary plist and return its path as a shell argument."""
     with open(path, "wb") as handle:
         plistlib.dump(payload, handle, fmt=plistlib.FMT_BINARY)
-    return str(path)
+    return _arg(path)
 
 
 @pytest.fixture
@@ -185,7 +204,7 @@ class TestBootstrapStillBlocked:
             tmp_path / "com.example.helper2.plist",
             {
                 "Label": "com.example.helper2",
-                "ProgramArguments": ["/bin/sh", str(script)],
+                "ProgramArguments": ["/bin/sh", _arg(script)],
             },
         )
         assert contains_launchctl_submit_command(
@@ -230,6 +249,7 @@ class TestBootstrapStillBlocked:
         """
         first = tmp_path / "com.example.chain-a.plist"
         second = tmp_path / "com.example.chain-b.plist"
+        first_arg, second_arg = _arg(first), _arg(second)
         _write_plist(
             first,
             {
@@ -237,7 +257,7 @@ class TestBootstrapStillBlocked:
                 "ProgramArguments": [
                     "/bin/sh",
                     "-c",
-                    f"launchctl bootstrap gui/501 {second}",
+                    f"launchctl bootstrap gui/501 {second_arg}",
                 ],
             },
         )
@@ -248,7 +268,7 @@ class TestBootstrapStillBlocked:
                 "ProgramArguments": [
                     "/bin/sh",
                     "-c",
-                    f"launchctl bootstrap gui/501 {first}",
+                    f"launchctl bootstrap gui/501 {first_arg}",
                 ],
             },
         )
@@ -261,7 +281,7 @@ class TestBootstrapStillBlocked:
 
         monkeypatch.setattr(lifecycle_guard, "_read_plist_payload", counting_read)
         assert contains_launchctl_submit_command(
-            f"launchctl bootstrap gui/501 {first}"
+            f"launchctl bootstrap gui/501 {first_arg}"
         )
         assert len(reads) <= 8, f"unbounded plist recursion: {len(reads)} reads"
         # The per-thread depth counter must unwind to 0, or the NEXT scan in
@@ -271,7 +291,7 @@ class TestBootstrapStillBlocked:
     def test_nonexistent_path_blocked(self, tmp_path):
         """Nothing to read → the label is still attacker-chosen (#62891)."""
         assert contains_launchctl_submit_command(
-            f"launchctl bootstrap gui/501 {tmp_path / 'not-written-yet.plist'}"
+            f"launchctl bootstrap gui/501 {_arg(tmp_path / 'not-written-yet.plist')}"
         )
 
     def test_variable_in_path_blocked(self):
@@ -294,6 +314,7 @@ class TestBootstrapStillBlocked:
         """`bootstrap <domain> <dir>` loads every plist in the directory."""
         directory = tmp_path / "agents"
         directory.mkdir()
+        directory = _arg(directory)
         assert contains_launchctl_submit_command(
             f"launchctl bootstrap gui/501 {directory}"
         )
@@ -302,15 +323,20 @@ class TestBootstrapStillBlocked:
         path = tmp_path / "com.example.dir.plist"
         path.mkdir()
         assert lifecycle_guard._read_plist_payload(path) is None
+        path = _arg(path)
         assert contains_launchctl_submit_command(
             f"launchctl bootstrap gui/501 {path}"
         )
 
+    @pytest.mark.skipif(
+        not hasattr(os, "mkfifo"), reason="special files need a POSIX filesystem"
+    )
     def test_fifo_argument_blocked(self, tmp_path):
         """A FIFO named `.plist` is refused WITHOUT being read."""
         path = tmp_path / "com.example.fifo.plist"
         os.mkfifo(path)
         assert lifecycle_guard._read_plist_payload(path) is None
+        path = _arg(path)
         assert contains_launchctl_submit_command(
             f"launchctl bootstrap gui/501 {path}"
         )
@@ -318,6 +344,7 @@ class TestBootstrapStillBlocked:
     def test_unparseable_file_blocked(self, tmp_path):
         path = tmp_path / "com.example.broken.plist"
         path.write_text("this is not a plist\n")
+        path = _arg(path)
         assert contains_launchctl_submit_command(
             f"launchctl bootstrap gui/501 {path}"
         )
@@ -342,7 +369,7 @@ class TestBootstrapStillBlocked:
         )
         assert path.stat().st_size > lifecycle_guard._MAX_PLIST_BYTES
         assert contains_launchctl_submit_command(
-            f"launchctl bootstrap gui/501 {path}"
+            f"launchctl bootstrap gui/501 {_arg(path)}"
         )
 
     def test_oversized_file_reader_returns_none(self, tmp_path):
@@ -374,7 +401,7 @@ class TestBootstrapStillBlocked:
     def test_mixed_readable_and_unreadable_blocked(self, router_plist, tmp_path):
         """Every plist argument must clear; one unreadable one blocks all."""
         assert contains_launchctl_submit_command(
-            f"launchctl bootstrap gui/501 {router_plist} {tmp_path / 'gone.plist'}"
+            f"launchctl bootstrap gui/501 {router_plist} {_arg(tmp_path / 'gone.plist')}"
         )
 
     def test_no_plist_argument_blocked(self):
