@@ -35,13 +35,30 @@ STOPPED_BEFORE = "agent:main:discord:group:STOPPED_BEFORE:9"
 IDLE = "agent:main:telegram:dm:IDLE"
 
 
-def _wire_store(runner):
+def _wire_store(runner, release_after_mark=()):
     """The runner's ``async_session_store`` is a read-only facade over
     ``session_store`` (AsyncSessionStore delegates to the sync methods), so one
-    sync mock records BOTH the pre-drain marks and the drain-end clears."""
+    sync mock records BOTH the pre-drain marks and the drain-end clears.
+
+    ``release_after_mark``: session keys whose running slot is released shortly
+    AFTER the pre-drain hedge marks them — modelling a turn that finishes (or a
+    user ``/stop``) during the drain window. Triggered BY the mark, not by a wall
+    clock: a timer-based release lost the race to the hedge on a slow CI runner
+    (merge-group run 2026-09-20: the caller was released before stop() reached
+    the hedge loop, so it was never marked at all)."""
     store = MagicMock()
     store._entries = {}
-    store.mark_resume_pending = MagicMock(return_value=True)
+    released = set()
+
+    def _mark(key, reason, *a, **k):
+        if key in release_after_mark and key not in released:
+            released.add(key)
+            loop = asyncio.get_running_loop()
+            loop.call_later(0.05, lambda: runner._running_agents.__delitem__(key)
+                            if key in runner._running_agents else None)
+        return True
+
+    store.mark_resume_pending = MagicMock(side_effect=_mark)
     store.clear_resume_pending = MagicMock(return_value=True)
     runner.session_store = store
     return store, None
@@ -59,19 +76,14 @@ def _clears(store, _astore=None):
     return {c.args[0] for c in store.clear_resume_pending.call_args_list}
 
 
-async def _release_after(runner, key, delay):
-    """Model a turn ending mid-drain: the caller finishing its reply, or a user
-    ``/stop`` (which releases the running-agent slot)."""
-    await asyncio.sleep(delay)
-    del runner._running_agents[key]
-
 
 @pytest.mark.asyncio
 async def test_four_cases_through_the_real_drain():
     runner, adapter = make_restart_runner()
     adapter.disconnect = AsyncMock()
     runner._restart_drain_timeout = 0.5          # BUSY never finishes -> times out
-    store, astore = _wire_store(runner)
+    # the caller's reply lands, and a user /stop releases another slot, mid-drain
+    store, astore = _wire_store(runner, release_after_mark=(CALLER, STOPPED_DURING))
 
     runner._running_agents = {
         CALLER: MagicMock(),
@@ -84,13 +96,7 @@ async def test_four_cases_through_the_real_drain():
                       (CALLER, BUSY, STOPPED_DURING, STOPPED_BEFORE, IDLE)}
 
     with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
-        stop_task = asyncio.ensure_future(runner.stop())
-        # the caller's reply lands, and a user /stop releases another slot, mid-drain
-        await asyncio.gather(
-            _release_after(runner, CALLER, 0.05),
-            _release_after(runner, STOPPED_DURING, 0.1),
-        )
-        await stop_task
+        await runner.stop()
 
     marks = _marks(store)
     cleared = _clears(store, astore)
@@ -144,16 +150,11 @@ async def test_clean_drain_clears_every_hedge_and_marks_nothing_interrupted():
     runner, adapter = make_restart_runner()
     adapter.disconnect = AsyncMock()
     runner._restart_drain_timeout = 0.5
-    store, astore = _wire_store(runner)
+    store, astore = _wire_store(runner, release_after_mark=(BUSY, STOPPED_DURING))
     runner._running_agents = {BUSY: MagicMock(), STOPPED_DURING: MagicMock()}
     store._entries = {k: MagicMock(resume_reason=None) for k in (BUSY, STOPPED_DURING, IDLE)}
     with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
-        stop_task = asyncio.ensure_future(runner.stop())
-        await asyncio.gather(
-            _release_after(runner, BUSY, 0.05),
-            _release_after(runner, STOPPED_DURING, 0.05),
-        )
-        await stop_task
+        await runner.stop()
     marks = _marks(store)
     assert all(v == ["shutdown_timeout"] for v in marks.values()), marks
     assert _clears(store, astore) == {BUSY, STOPPED_DURING}
