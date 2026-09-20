@@ -10,8 +10,11 @@ name: Fleet CI-fail alert
 on:
   workflow_run:
     workflows:
-      - "Tests"
-      - "Lint (ruff + ty)"
+      # workflow_run only fires for TOP-LEVEL workflows. "Tests" and "Lint (ruff + ty)"
+      # became workflow_call-only reusables on 2026-06-23 (05c896cf52) and never emit
+      # this event; their parent "CI" does. Measured 2026-09-20: 100/100 alert runs
+      # skipped, and a red main (c93bfcc1, 07:18Z) paged nobody.
+      - "CI"
       - "Fleet SAST (semgrep)"
       - "Fleet Secret Scan (gitleaks)"
       - "OSV-Scanner"
