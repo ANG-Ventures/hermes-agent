@@ -70,6 +70,34 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
 - **Pre-dispatch file collision warning** — immediately before spawning a ready card, the dispatcher compares explicit file paths in its body with structured `changed_files` reported by running/review cards and cards blocked within the last seven days. An overlap is logged and written to both cards, naming both task IDs and the shared paths, but **never blocks or cancels dispatch**. If the new card has no explicit paths, or an active card has not reported `changed_files`, the CLI/log/event output says the check was unknown or partial rather than silently implying full coverage. Put paths in the card body and keep `changed_files` in worker handoffs to make this cheap warning useful.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
 
+### Code survivors on completion
+
+Pushing a reviewed branch is preferred. Completion also accepts a harness-written
+`implementation.patch` attachment: it contains the binary Git diff from the recorded
+dispatch baseline to the current files, including non-ignored untracked files. The
+real Git index is not staged or modified. A clean HEAD is accepted as a ref survivor
+only after querying a remote branch that contains it; stale remote-tracking refs
+and a pushed HEAD with dirty files do not qualify.
+
+The completion result and event record the survivor. Patch-only completion says
+`NOT PUSHED` and records the attachment path, SHA-256, and byte count. Apply the patch
+from the workspace root with `git apply /path/to/implementation.patch`, using the
+original base checkout(s). Repeated capture of unchanged content reuses the attachment;
+changed captures preserve earlier versions under distinct names.
+
+If code cannot be captured (missing repository, failed Git/read/write, attachment
+size limit, or an empty patch despite `metadata.changed_files`), completion refuses
+with `survivor_unavailable` and records a durable `workspace_held` event. Cleanup skips
+held workspaces until an explicit successful completion/capture clears the hold.
+Nested repositories inside another repository require separate recovery and are held
+rather than emitting a misleading gitlink patch. Sibling repositories in scratch
+are supported. Repositories created after dispatch use a reachable remote ancestor
+as their base, or a complete initial-tree patch when none is available.
+
+Completion cleanup, deferred-parent cleanup, and archive GC all use the same capture
+guard before removing a workspace. This does not turn arbitrary non-Git scratch files
+into deliverables: continue declaring those in `artifacts`.
+
 ## Boards (multi-project)
 
 Boards let you separate unrelated streams of work — one per project, repo,

@@ -106,7 +106,11 @@ def _write_patch(path, data):
             temp.unlink(missing_ok=True)
             raise
     try:
-        os.replace(temp, path)
+        try:
+            os.link(temp, path)
+        except FileExistsError:
+            # Another completion won publication; never overwrite its survivor.
+            return _write_patch(path, data)
         if os.name != "nt":
             fd = os.open(path.parent, os.O_RDONLY)
             try:
@@ -124,7 +128,10 @@ def _remote_survivor(repo, head):
     # Never trust stale refs/remotes: query the actual remote. A local object
     # for its advertised tip permits ancestry proof; otherwise fall back to patch.
     for remote in _git(repo, "remote").stdout.decode().splitlines():
-        advertised = _git(repo, "ls-remote", "--heads", remote, check=False)
+        try:
+            advertised = _git(repo, "ls-remote", "--heads", remote, check=False)
+        except subprocess.TimeoutExpired:
+            continue
         if advertised.returncode:
             continue
         for line in advertised.stdout.decode().splitlines():
@@ -140,7 +147,10 @@ def _base(repo, bases, key):
     # Repos created after dispatch have no recorded baseline. Preserve their
     # unpublished history from a reachable remote ancestor, or their whole tree.
     for remote in _git(repo, "remote").stdout.decode().splitlines():
-        advertised = _git(repo, "ls-remote", "--heads", remote, check=False)
+        try:
+            advertised = _git(repo, "ls-remote", "--heads", remote, check=False)
+        except subprocess.TimeoutExpired:
+            continue
         if advertised.returncode:
             continue
         for line in advertised.stdout.decode().splitlines():
@@ -199,6 +209,9 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False):
                 raise SurvivorUnavailable("survivor_unavailable: workspace missing")
             return None
         repos = _repos(workspace)
+        if any(a != b and a.is_relative_to(b) for a in repos for b in repos):
+            # A patch cannot add a gitlink and files below the same path.
+            raise SurvivorUnavailable("survivor_unavailable: nested repository requires separate recovery")
         keys = {str(r.relative_to(workspace)) for r in repos}
         if set(bases) - keys:
             raise SurvivorUnavailable("survivor_unavailable: recorded repository missing")
@@ -209,7 +222,8 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False):
             prefix = "" if key == "." else key + "/"
             patch = _snapshot(repo, base, prefix)
             if patch:
-                patches.append(patch)
+                header = f"# kanban repository={json.dumps(key)} base={base}\n".encode()
+                patches.append(header + patch)
             head = _git(repo, "rev-parse", "--verify", "HEAD", check=False)
             dirty = _git(repo, "status", "--porcelain", "--untracked-files=all").stdout
             ref = None
