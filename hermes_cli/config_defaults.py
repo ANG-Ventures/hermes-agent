@@ -388,6 +388,16 @@ DEFAULT_CONFIG = {
         # Sliding window (seconds) over which restart_loop_threshold relapses
         # are counted. Clamped to [1, 86400].
         "restart_loop_window_secs": 300,
+        # How many consecutive boot auto-resumes of the SAME session may be
+        # scheduled before the gateway stops resuming it and clears the marker.
+        # The other two knobs above bound a session that keeps KILLING the
+        # gateway; this one bounds a session that merely keeps being replayed —
+        # on 2026-09-20 one dead Discord session replayed its full ~450k-char
+        # history across ten overnight boots (~4.5M tokens) because nothing
+        # counted resumes per session across boots. Forward progress on a
+        # resumed turn resets the counter, so only fruitless resumes accumulate.
+        # Clamped to [0, 100]; 0 disables the cap.
+        "auto_resume_max_attempts": 3,
         # Clear resume_pending flags that remain stale for at least one day
         # (or six auto-continue freshness windows). The routing entry and
         # transcript remain available; only the dead recovery marker clears.

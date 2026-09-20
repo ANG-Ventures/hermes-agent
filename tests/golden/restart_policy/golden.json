@@ -43,6 +43,7 @@
         "HERMES_AGENT_TIMEOUT": "600",
         "HERMES_AGENT_TIMEOUT_WARNING": "420",
         "HERMES_AUTO_CONTINUE_FRESHNESS": "3600",
+        "HERMES_AUTO_RESUME_MAX_ATTEMPTS": null,
         "HERMES_MAX_ITERATIONS": "50",
         "HERMES_RESTART_DRAIN_TIMEOUT": "45",
         "HERMES_RESTART_INITIATED_TTL_SECS": "600",
@@ -71,6 +72,34 @@
       "return": 1
     }
   },
+  "0fecce5fee476fee92c30ef7b05ddeda032162edb19cd5a58124ec1b551c0847": {
+    "input": {
+      "kind": "auto_resume_max_attempts",
+      "name": "auto-resume cap configured",
+      "value": "7"
+    },
+    "name": "auto-resume cap configured",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 7
+    }
+  },
+  "1407fd8f497f2d0f1c4da2e19935d6b8745b860bfd0f5fba0d6b0f16f61a7694": {
+    "input": {
+      "kind": "auto_resume_max_attempts",
+      "name": "auto-resume cap clamps negative to disabled",
+      "value": "-4"
+    },
+    "name": "auto-resume cap clamps negative to disabled",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 0
+    }
+  },
   "2269f4a323255ee64fcf2a64ec08ea1d9f1618de2c0937050f778e9c53297b93": {
     "input": {
       "agent_cfg": "not-a-dict",
@@ -88,6 +117,7 @@
         "HERMES_AGENT_TIMEOUT": null,
         "HERMES_AGENT_TIMEOUT_WARNING": null,
         "HERMES_AUTO_CONTINUE_FRESHNESS": null,
+        "HERMES_AUTO_RESUME_MAX_ATTEMPTS": null,
         "HERMES_MAX_ITERATIONS": null,
         "HERMES_RESTART_DRAIN_TIMEOUT": null,
         "HERMES_RESTART_INITIATED_TTL_SECS": null,
@@ -158,6 +188,20 @@
       "return": 60.0
     }
   },
+  "3b93a3b811fdbffdac3dce019eef77d80d23beaa2e1a9c92677b368030ce24df": {
+    "input": {
+      "kind": "auto_resume_max_attempts",
+      "name": "auto-resume cap default",
+      "value": null
+    },
+    "name": "auto-resume cap default",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 3
+    }
+  },
   "4977e8b2a2bff9d62ab140ac4733fcb7d7b07ae3cb0ca1bc73445dac265fe5e8": {
     "input": {
       "kind": "restart_loop_window_secs",
@@ -184,6 +228,20 @@
       "env": {},
       "messages": [],
       "return": 12.5
+    }
+  },
+  "59bf84f299b1162b6e13b3cc5f3c3f9f9149d64c6a89128f103260da55402502": {
+    "input": {
+      "kind": "auto_resume_max_attempts",
+      "name": "auto-resume cap malformed",
+      "value": "bad"
+    },
+    "name": "auto-resume cap malformed",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 3
     }
   },
   "66e87b7ac68c9f755cb5616d0ad7a67c20057ce8332684e0f06c534bbc3b512c": {
@@ -282,6 +340,20 @@
       "env": {},
       "messages": [],
       "return": 30.0
+    }
+  },
+  "80f7c998a68ac812dcac5cebb3f5101765b49eaa85dcba84f7baf9e9c12599dd": {
+    "input": {
+      "kind": "auto_resume_max_attempts",
+      "name": "auto-resume cap clamps high",
+      "value": "101"
+    },
+    "name": "auto-resume cap clamps high",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 100
     }
   },
   "8224a31d1526b5f75f8b32e0f22a30c06eea36ad8e057e226444e91760a9a565": {
@@ -416,6 +488,7 @@
         "HERMES_AGENT_TIMEOUT": null,
         "HERMES_AGENT_TIMEOUT_WARNING": null,
         "HERMES_AUTO_CONTINUE_FRESHNESS": null,
+        "HERMES_AUTO_RESUME_MAX_ATTEMPTS": null,
         "HERMES_MAX_ITERATIONS": "42",
         "HERMES_RESTART_DRAIN_TIMEOUT": null,
         "HERMES_RESTART_INITIATED_TTL_SECS": null,
@@ -428,6 +501,20 @@
       },
       "messages": [],
       "return": null
+    }
+  },
+  "d71f67c5ad078008fb599e4c7175ca05d62d3e8332836e54eedc11511b08f938": {
+    "input": {
+      "kind": "auto_resume_max_attempts",
+      "name": "auto-resume cap disabled by zero",
+      "value": "0"
+    },
+    "name": "auto-resume cap disabled by zero",
+    "output": {
+      "db": [],
+      "env": {},
+      "messages": [],
+      "return": 0
     }
   },
   "e2922903c829aa5a9bcf16b3778846adc383d826d85508f4052c7f3c8417a22f": {

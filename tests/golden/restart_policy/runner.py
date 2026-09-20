@@ -15,6 +15,7 @@ def _restart_policy_module():
 _ENV_BY_KIND = {
     "restart_loop_threshold": "HERMES_RESTART_LOOP_THRESHOLD",
     "restart_loop_window_secs": "HERMES_RESTART_LOOP_WINDOW_SECS",
+    "auto_resume_max_attempts": "HERMES_AUTO_RESUME_MAX_ATTEMPTS",
     "restart_initiated_ttl_secs": "HERMES_RESTART_INITIATED_TTL_SECS",
     "startup_restore_drain_timeout_secs": "HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT",
 }

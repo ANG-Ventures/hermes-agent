@@ -88,6 +88,7 @@ from gateway.fork_ext.restart_policy import (
     _RESTART_INITIATED_DIRNAME,
     _SAFE_RESTART_INSPECTION_VERBS,
     _STARTUP_RESTORE_DRAIN_TIMEOUT_SECS_DEFAULT,
+    _auto_resume_max_attempts,
     _bridge_agent_config_to_env,
     _command_invokes_safe_restart,
     _restart_initiated_filename,
@@ -13869,7 +13870,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         ``_session_initiated_restart`` is popped (one-shot per turn) so it can't
         bleed into the next turn. ``resume_pending`` is always cleared (recovery
-        completed; the breaker, not the resume flag, is what trips a loop).
+        completed; the breaker, not the resume flag, is what trips a loop), and it
+        is cleared BEFORE either branch touches the replay/cap counters — see the
+        ordering note at the call site.
 
         The restart-initiator signal comes from THREE sources, OR'd:
         ``_session_initiated_restart`` (F1 ``request_restart`` + C1 progress-
@@ -13903,6 +13906,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # short-circuit, or a C1/F1-flagged turn leaks its breadcrumb (I-3).
         breadcrumb = self._consume_restart_initiated_breadcrumb(session_key)
         initiated_restart = flag or breadcrumb
+        # Clear the recovery marker FIRST, before either branch touches the
+        # replay/cap counters. Recovery is complete either way (the turn ran to
+        # a clean finish); it is the breaker and the cap, not this flag, that
+        # bound a loop. Ordering is load-bearing on the work-progress branch
+        # below, which also zeroes the per-session cap counter: a crash between
+        # the two must not leave a set marker beside a zeroed counter, which
+        # would hand the session a whole extra budget of unattended replays.
+        try:
+            self.session_store.clear_resume_pending(session_key)
+        except Exception as exc:
+            logger.debug("clear_resume_pending failed for %s: %s", session_key, exc)
         if initiated_restart:
             if breadcrumb and not flag:
                 logger.info(
@@ -13944,10 +13958,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._resumed_this_boot.discard(session_key)
             except Exception:
                 pass
-        try:
-            self.session_store.clear_resume_pending(session_key)
-        except Exception as exc:
-            logger.debug("clear_resume_pending failed for %s: %s", session_key, exc)
+            # Real work happened, so the boot-resume replays did their job —
+            # release the per-session cap budget too. Scoped to THIS branch on
+            # purpose: the restart-initiating branch above must keep its count,
+            # or a session whose every resumed turn does nothing but re-restart
+            # would refresh its own budget forever.
+            #
+            # ORDER MATTERS: the marker is cleared BEFORE this, hoisted above
+            # the branch. A crash between the two must not leave
+            # ``resume_pending`` set next to a freshly-zeroed counter — that is
+            # a whole extra budget of unattended replays. The reverse partial
+            # state (marker cleared, counter left) costs at most one skipped
+            # resume, the same fail-towards-fewer-replays direction
+            # ``clear_session_attempts`` already takes on error.
+            try:
+                self._get_auto_resume_attempt_store().clear_session_attempts(
+                    session_key
+                )
+            except Exception as exc:
+                logger.debug(
+                    "clear_session_attempts failed for %s: %s", session_key, exc
+                )
 
     # ------------------------------------------------------------------
     # F2 restart-initiator breadcrumb consume / sweep (per-session, per-boot)
@@ -16079,9 +16110,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # never populates and the per-session breaker could never accrue its
         # marks or suspend — shadowing F2 entirely. So the global guard still
         # RECORDS every restart-interrupted boot (observability + its own
-        # cross-cutting trip for pathological multi-session storms) but only
-        # SHORT-CIRCUITS when the per-session breaker is disabled
-        # (_restart_loop_threshold() <= 0); otherwise F2 owns the break.
+        # cross-cutting trip for pathological multi-session storms) but defers
+        # the actual break to F2 and to the per-session attempt cap below.
+        #
+        # 2026-09-20: this deferral used to be spelled
+        # ``if _tripped and _restart_loop_threshold() <= 0: return 0``, which is
+        # UNREACHABLE — _restart_loop_threshold() clamps to max(1, ...), so it
+        # is never <= 0 for any config or env value. The guard therefore logged
+        # "Restart-loop breaker TRIPPED ... Skipping auto-resume" and then
+        # resumed anyway, 64ms later, in the same boot:
+        #
+        #   02:01:58,227 WARNING Restart-loop breaker TRIPPED: 3 chained ...
+        #   02:01:58,288 WARNING PHASE=boot_resume_scheduled key=...  mode=auto
+        #   02:01:58,291 INFO    Scheduled auto-resume for 1 session(s)
+        #
+        # An operator reading that pair cannot tell a working breaker from a
+        # broken one, which is worse than having no breaker at all. Keep the
+        # deferral (F2 is still the surgical mechanism) but make it HONEST:
+        # ask the breaker whether it owns the break, and say in the log which
+        # mechanism is expected to act. ``deferred_to`` is the field to grep.
         if candidates:
             try:
                 from gateway import restart_loop_guard as _rlg
@@ -16090,8 +16137,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _tripped = _rlg.check_and_record(
                     _max_restarts, _window, max_gap_seconds=_max_gap
                 )
-                if _tripped and _restart_loop_threshold() <= 0:
-                    return 0
+                if _tripped:
+                    # F2 is armed whenever the per-session breaker is enabled,
+                    # which (given the max(1, ...) clamp) it always is. The
+                    # global guard then only short-circuits when F2 cannot
+                    # possibly act, keeping the surgical mechanism in charge.
+                    _f2_armed = _restart_loop_threshold() > 0
+                    logger.warning(
+                        "Restart-loop guard tripped at boot: deferred_to=%s "
+                        "(per-session replay breaker threshold=%s, per-session "
+                        "auto-resume cap=%s). Auto-resume proceeds for sessions "
+                        "that are still under both per-session limits.",
+                        "per_session_breaker" if _f2_armed else "global_guard",
+                        _restart_loop_threshold(),
+                        _auto_resume_max_attempts(),
+                    )
+                    if not _f2_armed:
+                        return 0
             except Exception as exc:  # noqa: BLE001 — breaker must fail OPEN
                 logger.debug("Restart-loop guard check skipped: %s", exc)
 
@@ -16189,6 +16251,89 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 skipped += 1
                 continue
 
+            # Per-session boot-resume cap. The gates above are all per-TURN:
+            # the work check asks whether THIS tail has unfinished work, and
+            # the once-ever credit asks whether THIS assistant rowid was
+            # already continued. Neither can see a session that is re-amputated
+            # every boot, because each restart produces a new tail and a new
+            # rowid — which is how one dead Discord session replayed its entire
+            # ~450k-char history ten times across the 2026-09-20 overnight
+            # restarts (~4.5M tokens) while every per-turn gate read "fresh".
+            # This counter is per-SESSION and survives boots; a resumed turn
+            # that makes real forward progress clears it
+            # (_apply_post_turn_resume_gate), so a healthy session that is
+            # simply unlucky with deploys never accumulates toward the cap.
+            #
+            # At the cap the marker is LEFT SET and only the unprompted replay
+            # stops. This is the opposite of the no-work skip above, and the
+            # difference is the whole point: a no-work session has nothing to
+            # recover, whereas a capped session by construction still has
+            # unfinished work (the work check voted RESUME on every boot that
+            # spent the budget). ``resume_pending`` is not merely a "replay me"
+            # flag — it is the ONLY carrier of the user's recovery context:
+            # ``_clear_resume_pending_entry`` wipes resume_reason / resume_kind
+            # / resume_handoff / resume_request_id with it, and the inbound path
+            # gates the reason-aware resume prompt and the
+            # ``build_resume_recovery_note`` safety net on that same marker.
+            # Clearing it here would mean the user's NEXT real message lands on
+            # an interrupted session with no recovery note and no handoff.
+            #
+            # The clear would also buy nothing. Both jobs it could do are
+            # already done elsewhere: ``session_resume_verdict`` denies the
+            # unattended replay once count >= max regardless of the marker, and
+            # ``_clear_stale_resume_pending_flags`` reaps markers that outlive
+            # their usefulness. The cap counter bounds the replay; the marker
+            # stays until real forward progress or the stale reaper.
+            _max_attempts = _auto_resume_max_attempts()
+            if _max_attempts > 0:
+                # Two shapes of denial. They log differently because they mean
+                # different things operationally, but NEITHER touches the
+                # marker:
+                #
+                #   attempts=<n>    this SESSION provably spent its budget.
+                #                   cause=attempt_cap.
+                #   attempts=None   the attempt store cannot record anything
+                #                   (unwritable dir, full disk). The session is
+                #                   owed a resume it cannot be accounted for,
+                #                   so the denial must evaporate the moment the
+                #                   disk is fixed. cause=cap_unaccountable.
+                #                   Answering "allowed" here instead is what
+                #                   reproduced the incident — 10 boots, 10
+                #                   full-transcript replays, zero cap lines.
+                #
+                # An unreadable store is neither: it self-repairs to an empty
+                # counter file and the session honestly reads zero attempts.
+                # An exception escaping the verdict is treated as "cannot
+                # account" too, for the same reason.
+                _attempt_count: int | None = 0
+                try:
+                    _attempts_store = self._get_auto_resume_attempt_store()
+                    _allowed, _attempt_count = _attempts_store.session_resume_verdict(
+                        entry.session_key, _max_attempts
+                    )
+                except Exception as exc:  # noqa: BLE001 — never abort a boot on this
+                    logger.debug(
+                        "Auto-resume attempt cap check failed for %s: %s",
+                        entry.session_key,
+                        exc,
+                    )
+                    _allowed, _attempt_count = False, None
+                if not _allowed:
+                    _cause = "attempt_cap" if _attempt_count is not None else "cap_unaccountable"
+                    logger.warning(
+                        "PHASE=boot_resume_skipped key=%s reason=%s platform=%s "
+                        "kind=%s cause=%s attempts=%s max=%s",
+                        entry.session_key,
+                        getattr(entry, "resume_reason", None),
+                        getattr(getattr(source, "platform", None), "value", None),
+                        getattr(entry, "resume_kind", None),
+                        _cause,
+                        _attempt_count if _attempt_count is not None else "unknown",
+                        _max_attempts,
+                    )
+                    skipped += 1
+                    continue
+
             resume_mode = "prompt"
             fallback_reason = None
             pending_attempt = None
@@ -16283,6 +16428,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "mode": resume_mode,
                         "reason": fallback_reason,
                     }
+
+            # Charge the per-session cap for EVERY scheduled boot resume, not
+            # just the ``auto``-mode ones that consume a rowid credit above. A
+            # ``prompt``-mode resume and a ``kind=self`` handoff each replay the
+            # full transcript into a fresh agent turn — the exact cost this cap
+            # exists to bound — and ``kind=self`` skips the rowid credit
+            # entirely, which is why the incident session was never counted.
+            # Recorded after create_task for the same reason the credit is: a
+            # scheduling failure must not burn the session's budget.
+            if _max_attempts > 0:
+                try:
+                    self._get_auto_resume_attempt_store().record_session_attempt(
+                        entry.session_key
+                    )
+                except Exception as exc:  # noqa: BLE001 — accounting is best-effort
+                    logger.debug(
+                        "Auto-resume attempt accounting failed for %s: %s",
+                        entry.session_key,
+                        exc,
+                    )
 
             # PHASE observability (spec 2026-07-01): a session PROACTIVELY resumed
             # at boot — reason + origin platform, no content. In auto mode, the

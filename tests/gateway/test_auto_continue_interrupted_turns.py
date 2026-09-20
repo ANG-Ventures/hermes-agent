@@ -122,6 +122,20 @@ def _mark_pending(runner: GatewayRunner, entry, reason: str = "restart_interrupt
     assert runner.session_store.mark_resume_pending(entry.session_key, reason) is True
 
 
+def _rowid_credits(tmp_path: Path) -> list:
+    """The once-ever ``(session_key, assistant_rowid)`` credits on disk.
+
+    The attempt store also carries the per-session boot-resume counter, so
+    "the file does not exist" is no longer a valid proxy for "no credit was
+    consumed" — a prompt-mode or kind=self resume writes the counter without
+    ever touching a credit. Read the credits themselves.
+    """
+    path = tmp_path / "state" / "auto_resume_attempts.json"
+    if not path.exists():
+        return []
+    return json.loads(path.read_text())["attempts"]
+
+
 @pytest.mark.asyncio
 async def test_t1_prompt_default_keeps_note_bytes_and_adds_taxonomy_log(
     tmp_path, monkeypatch, caplog
@@ -230,7 +244,12 @@ async def test_t5_local_surface_keeps_prompt_semantics_without_consuming_cap(
     assert assessment.reason == "unknown or non-messaging surface"
     assert runner._schedule_resume_pending_sessions() == 1
     assert runner._startup_resume_modes[entry.session_key]["mode"] == "prompt"
-    assert not (tmp_path / "state" / "auto_resume_attempts.json").exists()
+    # The once-ever ROWID credit must be untouched — a prompt-mode fallback
+    # never spends it. (Asserted on the credit itself rather than on the file
+    # existing: the same file also carries the per-session boot-resume counter,
+    # which a prompt-mode resume DOES charge because it still replays the
+    # transcript into a real turn.)
+    assert _rowid_credits(tmp_path) == []
     await asyncio.gather(*runner._background_tasks)
     db.close()
 
@@ -417,7 +436,10 @@ async def test_t7_mutation_fallback_does_not_consume_attempt(
     assert surface_and_ask is True
     assert "prompt mode was used" in fallback_note
     assert "terminal" in fallback_note
-    assert not (tmp_path / "state" / "auto_resume_attempts.json").exists()
+    # The mutating-tail fallback must not spend the interrupted turn's
+    # once-ever credit. (The per-session boot counter IS charged — the
+    # prompt-mode resume still replayed the transcript into a real turn.)
+    assert _rowid_credits(tmp_path) == []
     await asyncio.gather(*runner._background_tasks)
     db.close()
 
@@ -613,7 +635,9 @@ async def test_t4_real_attempt_store_and_rowid_survive_double_restart(tmp_path, 
 
     assert await first._prepare_auto_resume_decisions() == 1
     store_path = tmp_path / "state" / "auto_resume_attempts.json"
-    assert store_path.exists() is False, "eligibility evaluation must not consume the cap"
+    assert (
+        _rowid_credits(tmp_path) == []
+    ), "eligibility evaluation must not consume the cap"
     assert first._schedule_resume_pending_sessions() == 1
     assert first._startup_resume_modes[entry.session_key]["mode"] == "auto"
     await asyncio.gather(*first._background_tasks)
@@ -650,7 +674,10 @@ async def test_t4_real_attempt_store_and_rowid_survive_double_restart(tmp_path, 
     assert second._startup_resume_modes[entry.session_key]["mode"] == "prompt"
     assert "already auto-continued once" in second._startup_resume_modes[entry.session_key]["reason"]
     await asyncio.gather(*second._background_tasks)
-    assert json.loads(store_path.read_text()) == persisted
+    # The ROWID credit is unchanged — the second boot fell back to prompt
+    # precisely because it was already spent. The per-session counter DID
+    # advance (two boot resumes happened), so compare the credits, not the file.
+    assert _rowid_credits(tmp_path) == persisted["attempts"]
     second_db.close()
 
 
@@ -681,7 +708,10 @@ async def test_t4_failed_task_creation_does_not_consume_attempt(tmp_path, monkey
     monkeypatch.setattr(asyncio, "create_task", _fail_create_task)
     with pytest.raises(RuntimeError, match="task creation failed"):
         runner._schedule_resume_pending_sessions()
-    assert not (tmp_path / "state" / "auto_resume_attempts.json").exists()
+    # A failed scheduling attempt must not burn the interrupted turn's credit.
+    # (The per-session counter is likewise recorded only after create_task, so
+    # a raise here leaves both budgets intact.)
+    assert _rowid_credits(tmp_path) == []
     db.close()
 
 

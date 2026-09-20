@@ -32,6 +32,27 @@ def _restart_loop_window_secs() -> float:
     return max(1.0, min(value, 86400.0))
 
 
+def _auto_resume_max_attempts() -> int:
+    """Per-session boot auto-resume cap (``agent.auto_resume_max_attempts``).
+
+    Unlike ``_restart_loop_threshold``, the floor here is 0, not 1: 0 is the
+    documented "disable the cap" value and clamping it up to 1 would turn the
+    escape hatch into the strictest possible setting. (That exact off-by-one is
+    what made the global restart-loop breaker's ``<= 0`` short-circuit dead
+    code — see ``_schedule_resume_pending_sessions``.)
+    """
+    raw = os.environ.get("HERMES_AUTO_RESUME_MAX_ATTEMPTS")
+    from gateway.auto_resume import DEFAULT_AUTO_RESUME_MAX_ATTEMPTS
+
+    try:
+        value = (
+            int(raw) if raw not in (None, "") else DEFAULT_AUTO_RESUME_MAX_ATTEMPTS
+        )
+    except (TypeError, ValueError):
+        value = DEFAULT_AUTO_RESUME_MAX_ATTEMPTS
+    return max(0, min(value, 100))
+
+
 def _restart_initiated_ttl_secs() -> float:
     """Freshness backstop for an F2 restart-initiator breadcrumb (D-5/I-5).
 
@@ -98,6 +119,7 @@ _AGENT_CONFIG_ENV_BRIDGE: dict[str, str] = {
     "gateway_startup_restore_drain_timeout": "HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT",
     "restart_loop_threshold": "HERMES_RESTART_LOOP_THRESHOLD",
     "restart_loop_window_secs": "HERMES_RESTART_LOOP_WINDOW_SECS",
+    "auto_resume_max_attempts": "HERMES_AUTO_RESUME_MAX_ATTEMPTS",
     "restart_initiated_ttl_secs": "HERMES_RESTART_INITIATED_TTL_SECS",
     "gateway_stale_lease_wait": "HERMES_STALE_LEASE_WAIT",
 }
