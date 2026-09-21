@@ -107,8 +107,10 @@ class StartupResumePool:
     def submit(self, callback, *args):
         future = asyncio.get_running_loop().create_future()
         self.pending.append((future, callback, args))
-        # Defer the pump until the synchronous scheduler has claimed ALL slots.
-        asyncio.get_running_loop().call_soon(self._pump)
+        # Create admitted tasks now, matching create_task's scheduling timing.
+        # Their bodies cannot run until the synchronous caller yields, so the
+        # startup scheduler still claims every session sentinel first.
+        self._pump()
         return future
 
     def _pump(self):
