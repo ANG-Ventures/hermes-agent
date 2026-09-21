@@ -1763,6 +1763,69 @@ class TestAdvanceNextRuns:
 # Completed one-shot retention sweep
 # =========================================================================
 
+class TestStaleFireLockSweep:
+    """The due-scan GC removes abandoned fire-fence files without touching live ones."""
+
+    def _lock_path(self, tmp_cron_dir, suffix: str):
+        path = tmp_cron_dir / "cron" / f".fire-{suffix * 32}.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+        return path
+
+    def test_due_scan_reaps_unheld_fire_lock_older_than_one_minute(
+        self, tmp_cron_dir
+    ):
+        path = self._lock_path(tmp_cron_dir, "a")
+        old = datetime.now().timestamp() - 61
+        import os
+        os.utime(path, (old, old))
+
+        get_due_jobs()
+
+        assert not path.exists()
+
+    def test_due_scan_keeps_recent_fire_lock(self, tmp_cron_dir):
+        path = self._lock_path(tmp_cron_dir, "b")
+
+        get_due_jobs()
+
+        assert path.exists()
+
+    def test_due_scan_keeps_stale_fire_lock_for_current_job(self, tmp_cron_dir):
+        job = create_job(prompt="Current", schedule="every 1h")
+        cron_dir = tmp_cron_dir / "cron"
+        lock_key = f"{cron_dir.resolve()}::{job['id']}"
+        import uuid
+        lock_name = uuid.uuid5(uuid.NAMESPACE_URL, lock_key).hex
+        path = cron_dir / f".fire-{lock_name}.lock"
+        path.touch()
+        old = datetime.now().timestamp() - 61
+        import os
+        os.utime(path, (old, old))
+
+        get_due_jobs()
+
+        assert path.exists()
+
+    def test_due_scan_keeps_stale_fire_lock_held_by_live_process(
+        self, tmp_cron_dir
+    ):
+        import cron.jobs as jobs_module
+        if jobs_module.fcntl is None:
+            pytest.skip("POSIX flock required")
+        path = self._lock_path(tmp_cron_dir, "c")
+        old = datetime.now().timestamp() - 61
+        import os
+        os.utime(path, (old, old))
+
+        with path.open("a+") as holder:
+            jobs_module.fcntl.flock(
+                holder, jobs_module.fcntl.LOCK_EX | jobs_module.fcntl.LOCK_NB
+            )
+            get_due_jobs()
+            assert path.exists()
+
+
 class TestCompletedOneshotRetentionSweep:
     """Completed one-shots are retained for inspection, then pruned by age."""
 
