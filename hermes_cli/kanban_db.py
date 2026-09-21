@@ -393,6 +393,7 @@ def _fire_dispatch_tick_hook(
             result.timed_out,
             result.auto_blocked,
             result.rate_limited,
+            result.infra_unavailable,
             result.auto_assigned_default,
             result.respawn_guarded,
             result.skipped_per_profile_capped,
@@ -482,6 +483,30 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # conventional "temporary failure, retry later" code, and well clear of the
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
+
+
+# Exit codes that mean the worker HARNESS never ran, so the task never got a
+# chance to fail (card t_263e7303, incident 2026-09-21).
+#
+# These are the shell's own "I could not execute that" codes, emitted BEFORE
+# any worker code runs:
+#   127 — command not found / a wrapper exec'ing a path that does not exist.
+#         The live case: ``~/.local/bin/hermes`` execs the deploy venv's CLI,
+#         the deploy tree was missing for 38 minutes, and every worker spawned
+#         in that window exited 127. Three argus runs on t_671fd52c and three
+#         on t_59c0886e were recorded as CRASHES and their CARDS flipped to
+#         blocked — a deploy-window outage attributed to innocent work.
+#   126 — found but not executable / bad interpreter. Same class: a venv
+#         console script whose absolute shebang points at a renamed venv dies
+#         exactly this way (measured while fixing the shim).
+#
+# A task cannot be at fault for an exit that happened before its worker
+# started, so this is classed like the quota wall: requeue, do NOT count a
+# failure, do NOT flip the card to blocked. It is kept DISTINCT from
+# ``rate_limited`` because the remedy is different — quota needs a timer,
+# this needs the deploy/venv fixed — and the board history should not call an
+# infrastructure outage a quota wall.
+KANBAN_INFRA_EXIT_CODES: frozenset[int] = frozenset({126, 127})
 
 
 def _resolve_crash_grace_seconds() -> int:
@@ -5834,7 +5859,8 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
         "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
-        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited'"
+        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', "
+        "'infra_unavailable'"
         ") ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
@@ -10480,7 +10506,8 @@ _RESPAWN_GUARD_FAILURE_RESET_KINDS: tuple[str, ...] = (
 # other outcome (completed / review_requested / changes_requested / blocked /
 # reclaimed / stale ...) supersedes the stamped text: it belongs to history.
 _RESPAWN_GUARD_FAILURE_OUTCOMES: frozenset[str] = frozenset(
-    {"crashed", "timed_out", "spawn_failed", "gave_up", "rate_limited"}
+    {"crashed", "timed_out", "spawn_failed", "gave_up", "rate_limited",
+     "infra_unavailable"}
 )
 _RESPAWN_GUARD_PR_QUERY_LIMIT = 5
 _RESPAWN_GUARD_PR_QUERY_TIMEOUT_SECONDS = 5
@@ -10839,6 +10866,12 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    infra_unavailable: list[str] = field(default_factory=list)
+    """Task ids whose worker HARNESS could not be executed at all (exit
+    126/127 — the ``hermes`` CLI path missing or unrunnable, e.g. during a
+    deploy that took the runtime venv offline). Released back without
+    counting a failure, exactly like ``rate_limited``, but tracked
+    separately: the remedy is fixing the deploy, not waiting out a quota."""
     lock_holder: dict = field(default_factory=dict)
     """Best-effort pid, age_seconds and acquire_site snapshot on a skipped tick.
     Empty for legacy holders or racing/failed stamp reads; not a liveness probe."""
@@ -10962,6 +10995,12 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       provider rate-limited / exhausted quota, NOT because the task failed.
       ``detect_crashed_workers`` releases the task back to ``ready`` without
       counting a failure, so a long quota window can't trip the breaker.
+    * ``"infra_unavailable"`` — ``WIFEXITED`` with a status in
+      ``KANBAN_INFRA_EXIT_CODES`` (126/127). The worker harness could not be
+      executed at all — the CLI path was missing or unrunnable — so the task
+      never started and cannot be at fault. Handled exactly like
+      ``rate_limited`` (requeue, no failure counted), with its own event kind
+      so the board history names the real cause.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
@@ -10969,8 +11008,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       back to existing crashed-counter behavior.
 
     ``code`` is the exit status (for ``clean_exit`` / ``rate_limited`` /
-    ``nonzero_exit``) or the signal number (for ``signaled``), or ``None``
-    for ``unknown``.
+    ``infra_unavailable`` / ``nonzero_exit``) or the signal number (for
+    ``signaled``), or ``None`` for ``unknown``.
     """
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
@@ -10982,6 +11021,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
         return ("clean_exit", 0)
     if code == KANBAN_RATE_LIMIT_EXIT_CODE:
         return ("rate_limited", code)
+    if code in KANBAN_INFRA_EXIT_CODES:
+        return ("infra_unavailable", code)
     return ("nonzero_exit", code)
 
 
@@ -11014,6 +11055,8 @@ def _classify_run_exit(conn, task_id, run_id, pid):
                 return "clean_exit", code
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return "rate_limited", code
+            if code in KANBAN_INFRA_EXIT_CODES:
+                return "infra_unavailable", code
             return "nonzero_exit", code
     return _classify_worker_exit(pid)
 
@@ -11655,7 +11698,9 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
 
     * ``rate_limited`` runs are neutral and skipped: a quota wall says nothing
       about the task, exactly as it is neutral for the unified
-      ``consecutive_failures`` counter.
+      ``consecutive_failures`` counter. ``infra_unavailable`` runs (the worker
+      CLI could not be executed at all) are neutral for the same reason — the
+      task never started, so it cannot have violated anything.
     * Any other closed run (completed, plain crash, timeout, spawn failure,
       reclaim, …) breaks the streak, so the bounded retry budget counts ONLY
       protocol violations — mixed failure kinds can neither consume nor
@@ -11675,7 +11720,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ).fetchall()
     for row in rows:
         outcome = row["outcome"] or ""
-        if outcome == "rate_limited":
+        if outcome in ("rate_limited", "infra_unavailable"):
             continue
         if outcome == "crashed":
             is_violation = False
@@ -11730,6 +11775,7 @@ def detect_crashed_workers(
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    infra_unavailable: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -11822,6 +11868,40 @@ def detect_crashed_workers(
                 }
                 if exit_class:
                     event_payload["exit_class"] = exit_class
+            elif kind == "infra_unavailable":
+                # The worker HARNESS could not be executed (126/127) — the CLI
+                # path was missing or unrunnable, so no worker code ran and the
+                # task never had a chance to fail. Blaming the card for this is
+                # what happened on 2026-09-21: a 38-minute deploy-tree outage
+                # flipped six innocent argus runs to crashed/blocked.
+                #
+                # Same remedy as the quota wall (requeue, don't count a failure,
+                # defer the respawn so we don't spin against a broken deploy),
+                # but its OWN event kind + error text so the board names the
+                # real cause instead of reporting a quota wall that never
+                # happened.
+                protocol_violation = False
+                rate_limited_exit = True
+                error_text = (
+                    f"pid {pid} exited {code} — the worker CLI could not be "
+                    f"executed (infrastructure, not this task); requeued "
+                    f"without counting a failure"
+                )
+                event_kind = "infra_unavailable"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                    "exit_class": "infra_unavailable",
+                    "next_eligible_at": int(time.time()) + _resolve_rate_limit_cooldown_seconds(),
+                }
+                # The harness never reached the model, so the only evidence of
+                # WHY lives in the spawn log (e.g. the shim's "real CLI not
+                # found" line). Carry it: without this the operator sees an
+                # exit code and no cause.
+                stderr_tail = _worker_log_stderr_tail(row["id"], board=board)
+                if stderr_tail:
+                    event_payload["stderr_tail"] = stderr_tail
             else:
                 protocol_violation = False
                 if kind == "nonzero_exit":
@@ -11852,7 +11932,15 @@ def detect_crashed_workers(
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
                 # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                # An infra-unavailable requeue is the same shape but a
+                # different cause, so it gets its own outcome rather than
+                # being filed under a quota wall it never hit.
+                if kind == "infra_unavailable":
+                    _run_outcome = "infra_unavailable"
+                elif rate_limited_exit:
+                    _run_outcome = "rate_limited"
+                else:
+                    _run_outcome = "crashed"
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -11884,7 +11972,13 @@ def detect_crashed_workers(
                         "UPDATE tasks SET last_failure_error = ?, next_eligible_at = ? WHERE id = ?",
                         (error_text[:500], event_payload["next_eligible_at"], row["id"]),
                     )
-                    rate_limited.append(row["id"])
+                    # Same deferral mechanics, separate ledger: an infra
+                    # outage and a quota wall must not be reported as the
+                    # same thing on the board or in dispatch telemetry.
+                    if kind == "infra_unavailable":
+                        infra_unavailable.append(row["id"])
+                    else:
+                        rate_limited.append(row["id"])
                 else:
                     if protocol_violation:
                         # Stamp the failure error now: a below-budget
@@ -12005,6 +12099,9 @@ def detect_crashed_workers(
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    # Same side-channel for harness-unavailable requeues (126/127): no
+    # failure counted, not a crash, and NOT a quota wall.
+    detect_crashed_workers._last_infra_unavailable = infra_unavailable  # type: ignore[attr-defined]
     # Worker-lifecycle observer (RFC #58548): exit events are tick-derived
     # from this reclaim pass — fired only now, after the main reclaim txn
     # AND the breaker accounting above have committed, so subscribers always
@@ -12519,7 +12616,7 @@ def check_respawn_guard(
         if latest_run is not None and latest_run["ended_at"] is not None
         else None
     )
-    if latest_outcome == "rate_limited":
+    if latest_outcome in ("rate_limited", "infra_unavailable"):
         if failed_at is not None and _respawn_guard_failure_reset_after(
             conn, task_id, failed_at,
         ):
@@ -13512,6 +13609,14 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
+    # Harness-unavailable requeues (exit 126/127, the CLI could not run) —
+    # same "no failure counted" treatment, reported under their own name so
+    # a deploy outage is never read as a quota wall.
+    _crash_infra = getattr(
+        detect_crashed_workers, "_last_infra_unavailable", []
+    )
+    if _crash_infra:
+        result.infra_unavailable.extend(_crash_infra)
     result.timed_out = enforce_max_runtime(conn)
     # PR-gate re-evaluation BEFORE recompute_ready so a card whose external
     # gate is already satisfied becomes spawnable in the SAME tick rather
