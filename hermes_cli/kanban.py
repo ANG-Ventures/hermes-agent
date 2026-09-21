@@ -3350,6 +3350,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         print(json.dumps({
             "reclaimed": res.reclaimed,
+            "skipped_locked": res.skipped_locked,
+            "lock_holder": res.lock_holder,
             "crashed": res.crashed,
             "timed_out": res.timed_out,
             "stale": res.stale,
@@ -3403,6 +3405,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "gate_closed_unmerged": getattr(res, "gate_closed_unmerged", []),
         }, indent=2))
         return 0
+    if res.skipped_locked:
+        print(kb.format_dispatch_lock_skip(res.lock_holder))
     print(f"Reclaimed:    {res.reclaimed}")
     print(f"Crashed:      {len(res.crashed)}")
     if res.crashed:
