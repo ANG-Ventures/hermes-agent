@@ -1611,13 +1611,11 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             "Wait for the cards to finish, or stop them first."
         )
 
-    # Past the refusal: the board IS going away, so reverting the active-board
-    # pin to default is now correct. (Pure hygiene either way --
-    # get_current_board() validates board_exists() before honouring the file,
-    # so a stale pin at a removed board is ignored -- but leaving it dangling
-    # on the REFUSAL path was the bug.)
-    if get_current_board() == normed:
-        clear_current_board()
+    # Remember the active pin while the board still exists. It is cleared only
+    # after the archive/delete succeeds; either operation has later failure
+    # boundaries (rename errors and survivor-held hard deletes) that must leave
+    # the operator pointed at the still-present board.
+    was_current_board = get_current_board() == normed
 
     # A concurrent connect(board=normed) after the rename/delete recreates
     # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
@@ -1669,6 +1667,8 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             detail=f"board={normed} action=archive dest={target}",
             board=normed,
         )
+        if was_current_board:
+            clear_current_board()
         return {"slug": normed, "action": "archived", "new_path": str(target)}
     else:
         from hermes_cli.kanban_survivor import remove_workspace_dir
@@ -1709,6 +1709,8 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             d, task_id=None, reason="remove_board", outcome=AUDIT_DELETE,
             detail=f"board={normed}", board=normed,
         )
+        if was_current_board:
+            clear_current_board()
         return {"slug": normed, "action": "deleted", "new_path": ""}
 
 

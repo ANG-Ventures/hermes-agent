@@ -26,10 +26,9 @@ function, every destructive/relocating call must be preceded by a gate call
 whose set of enclosing conditionals is a SUBSET of its own -- i.e. the gate
 cannot sit behind a branch that the destructive call does not itself require.
 
-Recognised gates are the kanban tree's real ones (liveness checks and the
-audit choke point), plus ``# noqa: gate-dominance`` with a reason for call
-sites that genuinely cannot enclose a workspace (log rotation, atomic
-single-file swaps).
+Recognised gates are the kanban tree's real liveness checks and the safe-removal
+choke point, plus ``# noqa: gate-dominance`` with a reason for call sites that
+genuinely cannot enclose a workspace (log rotation, atomic single-file swaps).
 """
 
 from __future__ import annotations
@@ -106,6 +105,17 @@ def _names_in(node: ast.AST) -> set[str]:
     return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
 
 
+def _block_exits(stmts: list[ast.stmt]) -> bool:
+    """Whether executing *stmts* must leave the current control-flow path."""
+    for stmt in stmts:
+        if isinstance(stmt, (ast.Raise, ast.Return, ast.Break, ast.Continue)):
+            return True
+        if isinstance(stmt, ast.If) and stmt.orelse:
+            if _block_exits(stmt.body) and _block_exits(stmt.orelse):
+                return True
+    return False
+
+
 class _Collector(ast.NodeVisitor):
     """Record every call with the chain of ``if`` tests enclosing it.
 
@@ -117,35 +127,47 @@ class _Collector(ast.NodeVisitor):
 
     * ``checked`` -- the identifiers the gate was asked ABOUT, so a gate on
       some other object cannot bless the destruction of this one; and
-    * ``refusing`` -- whether the gate's answer is actually consumed by a
-      conditional. A gate whose result nothing reads refuses nothing.
+    * ``refusals`` -- terminating conditional branches driven by the gate,
+      recorded with position so logging-only and post-deletion checks cannot
+      certify a destructive call.
     """
 
     def __init__(self) -> None:
         self.stack: list[int] = []
-        # (short_name, lineno, ctx, is_gate, checked_names, refusing, bound_to)
+        # (short_name, lineno, ctx, is_gate, checked_names, bound_to)
         self.calls: list[tuple] = []
-        #: Identifiers that appear in some ``if``/``while`` test in this
-        #: function -- i.e. names whose value can drive a refusal.
-        self.tested_names: set[str] = set()
+        #: Conditional checks that terminate one branch before execution can
+        #: continue: (lineno, enclosing context, tested names, gate-call lines).
+        self.refusals: list[tuple[int, tuple[int, ...], frozenset[str], frozenset[int]]] = []
         #: ``name -> names it was derived from`` for single-target assignments,
         #: so ``d = board_dir(slug)`` links ``d`` back to ``slug``.
         self.provenance: dict[str, set[str]] = {}
-        #: Depth of ``if``/``while`` test expressions currently being visited.
-        self._in_test = 0
         #: Name the current assignment binds to, if any.
         self._assign_target: str | None = None
 
     # -- structure ---------------------------------------------------------
 
     def visit_If(self, node: ast.If) -> None:
+        # A conditional is a refusal only when one branch terminates before
+        # control can reach a later deletion. Merely logging in the branch is
+        # observation, not enforcement.
+        if _block_exits(node.body) or _block_exits(node.orelse):
+            gate_lines = {
+                child.lineno
+                for child in ast.walk(node.test)
+                if isinstance(child, ast.Call)
+                and _dotted(child.func).rsplit(".", 1)[-1] in GATES
+            }
+            self.refusals.append((
+                node.lineno,
+                tuple(self.stack),
+                frozenset(_names_in(node.test)),
+                frozenset(gate_lines),
+            ))
         # The test itself runs in the ENCLOSING context, not the branch it
         # guards -- `if _board_has_live_cards(d): raise` is a gate that
         # dominates both arms, so it must be recorded at the current depth.
-        self.tested_names |= _names_in(node.test)
-        self._in_test += 1
         self.visit(node.test)
-        self._in_test -= 1
         # Body and each orelse arm are distinct branch contexts; the test's
         # own line id distinguishes them, negated for the else arm.
         self.stack.append(node.lineno)
@@ -158,10 +180,7 @@ class _Collector(ast.NodeVisitor):
         self.stack.pop()
 
     def visit_While(self, node: ast.While) -> None:
-        self.tested_names |= _names_in(node.test)
-        self._in_test += 1
         self.visit(node.test)
-        self._in_test -= 1
         self.stack.append(node.lineno)
         for stmt in node.body:
             self.visit(stmt)
@@ -200,11 +219,9 @@ class _Collector(ast.NodeVisitor):
             if isinstance(node.func, ast.Attribute):
                 # `d.rename(dest)` destroys `d`, which is the receiver.
                 checked |= _names_in(node.func.value)
-            # Self-gating helpers refuse internally, so using one IS the gate.
-            refusing = bool(self._in_test) or short in SELF_GATING
             self.calls.append((
                 short, node.lineno, tuple(self.stack), is_gate,
-                frozenset(checked), refusing, self._assign_target,
+                frozenset(checked), self._assign_target,
             ))
         prev, self._assign_target = self._assign_target, None
         self.generic_visit(node)
@@ -260,7 +277,7 @@ def _violations(path: Path) -> list[str]:
         branches = {d[2] for d in destructive}
         if len(branches) < 2:
             continue
-        for name, lineno, ctx, _is_gate, target_names, _r, _b in destructive:
+        for name, lineno, ctx, _is_gate, target_names, _b in destructive:
             line = lines[lineno - 1] if lineno - 1 < len(lines) else ""
             if NOQA in line:
                 continue
@@ -269,15 +286,19 @@ def _violations(path: Path) -> list[str]:
             targets = _related(target_names, prov)
             dominating = []
             for g in gates:
-                g_name, g_line, g_ctx, _, g_checked, g_refusing, g_bound = g
+                g_name, g_line, g_ctx, _, g_checked, g_bound = g
                 if g_line >= lineno or not set(g_ctx).issubset(set(ctx)):
                     continue
-                # A gate nothing reads refuses nothing. Either the call sits
-                # in a conditional test, or its result is bound to a name that
-                # some later test reads (`live = _board_has_live_cards(slug)`
-                # ... `if live:`).
-                if not (g_refusing
-                        or (g_bound and g_bound in collector.tested_names)):
+                # A gate must drive a terminating conditional before this
+                # destructive call. Logging in a branch, or raising only after
+                # destruction, does not protect the target.
+                refusal_dominates = any(
+                    r_line < lineno
+                    and set(r_ctx).issubset(set(ctx))
+                    and (g_line in r_gate_lines or (g_bound and g_bound in r_names))
+                    for r_line, r_ctx, r_names, r_gate_lines in collector.refusals
+                )
+                if g_name not in SELF_GATING and not refusal_dominates:
                     continue
                 # ...and it has to be a gate about THIS target: asking whether
                 # some OTHER card is live is the cross-owner data-loss shape.
@@ -425,6 +446,48 @@ def test_a_discarded_gate_result_does_not_dominate(tmp_path):
         "        shutil.rmtree(d)\n"
     ))
     assert any("rename" in v for v in found), found
+
+
+@pytest.mark.parametrize(
+    "gate_src",
+    [
+        pytest.param(
+            "    if _board_has_live_cards(d):\n"
+            "        print('live')\n",
+            id="direct-log-only",
+        ),
+        pytest.param(
+            "    live = _board_has_live_cards(d)\n"
+            "    if live:\n"
+            "        print('live')\n",
+            id="bound-log-only",
+        ),
+        pytest.param(
+            "    live = _board_has_live_cards(d)\n",
+            id="bound-refusal-after-deletion",
+        ),
+    ],
+)
+def test_a_gate_must_refuse_before_the_deletion(tmp_path, gate_src):
+    """Logging, or refusing only after destruction, cannot certify a gate."""
+    suffix = (
+        "    if live:\n"
+        "        raise ValueError('live')\n"
+        if "live =" in gate_src and "if live:" not in gate_src
+        else ""
+    )
+    found = _lint(tmp_path, (
+        "import shutil\n"
+        "def retire(d, *, archive=True):\n"
+        f"{gate_src}"
+        "    if archive:\n"
+        "        d.rename(dest)\n"
+        "    else:\n"
+        "        shutil.rmtree(d)\n"
+        f"{suffix}"
+    ))
+    assert any("rename" in v for v in found), found
+    assert any("rmtree" in v for v in found), found
 
 
 def test_a_gate_bound_to_a_name_and_then_refused_does_dominate(tmp_path):

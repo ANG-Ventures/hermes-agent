@@ -544,6 +544,55 @@ def test_remove_board_refusal_leaves_the_active_board_pin_intact(kanban_home):
     )
 
 
+@pytest.mark.parametrize("archive", [False, True], ids=["delete", "archive"])
+def test_remove_board_failure_leaves_the_active_board_pin_intact(
+    kanban_home, monkeypatch, archive
+):
+    """The pin moves only after the board directory actually goes away."""
+    kb.create_board("pinned", name="Pinned")
+    kb.set_current_board("pinned")
+    bdir = kb.board_dir("pinned")
+
+    if archive:
+        original_rename = Path.rename
+
+        def fail_board_rename(path, target):
+            if path == bdir:
+                raise OSError("forced archive failure")
+            return original_rename(path, target)
+
+        monkeypatch.setattr(Path, "rename", fail_board_rename)
+        expected = OSError
+    else:
+        monkeypatch.setattr(
+            "hermes_cli.kanban_survivor.remove_workspace_dir",
+            lambda *_args, **_kwargs: False,
+        )
+        expected = ValueError
+
+    with pytest.raises(expected):
+        kb.remove_board("pinned", archive=archive)
+
+    assert bdir.is_dir()
+    assert kb.get_current_board() == "pinned", (
+        "a failed removal reset the operator's active-board pin"
+    )
+
+
+@pytest.mark.parametrize("archive", [False, True], ids=["delete", "archive"])
+def test_successful_remove_board_clears_the_active_board_pin(kanban_home, archive):
+    """ALLOW control: a successful removal still reverts the pin to default."""
+    kb.create_board("pinned", name="Pinned")
+    kb.set_current_board("pinned")
+    bdir = kb.board_dir("pinned")
+
+    result = kb.remove_board("pinned", archive=archive)
+
+    assert result["action"] == ("archived" if archive else "deleted")
+    assert not bdir.exists()
+    assert kb.get_current_board() == "default"
+
+
 def test_board_liveness_gate_ignores_an_ambient_db_pin(kanban_home, monkeypatch):
     """``HERMES_KANBAN_DB`` must not be able to answer for another board.
 
