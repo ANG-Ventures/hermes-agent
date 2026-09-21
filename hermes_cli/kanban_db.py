@@ -11916,7 +11916,8 @@ def _record_task_failure(
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries, current_run_id "
+            "SELECT consecutive_failures, status, max_retries, current_run_id, "
+            "block_kind, block_recurrences "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
@@ -11947,20 +11948,56 @@ def _record_task_failure(
             # ``capability`` wall a human must re-point). None keeps the legacy
             # untyped block.
             _bk = block_kind if block_kind in VALID_BLOCK_KINDS else None
+
+            # A TYPED breaker block is a deliberate, human-gated stop — it must
+            # behave like ``block_task``, not like an ordinary breaker trip:
+            #
+            #  * ``gave_up`` alone is NOT sticky (``_has_sticky_block`` reads
+            #    'blocked'/'unblocked' events only), so ``recompute_ready``
+            #    promotes the card straight back to ``ready`` on the next tick
+            #    and it burns the retry budget anyway. We emit a real
+            #    ``blocked`` event so the hold holds.
+            #  * the unblock-loop breaker counts ``block_recurrences``. Without
+            #    arming it, an operator who unblocks without fixing the cause
+            #    gets an unbounded unblock -> re-block loop with no escalation.
+            _recurrences = 0
+            _typed_status = "blocked"
+            if _bk:
+                _prev_kind = (
+                    row["block_kind"] if "block_kind" in row.keys() else None
+                )
+                _prev_recurrences = (
+                    int(row["block_recurrences"])
+                    if "block_recurrences" in row.keys()
+                    and row["block_recurrences"] is not None
+                    else 0
+                )
+                _recurrences = (
+                    _prev_recurrences + 1 if _prev_kind == _bk else 1
+                )
+                if _recurrences >= BLOCK_RECURRENCE_LIMIT:
+                    _typed_status = "triage"
+
             if release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
-                    "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ?, "
-                    "block_kind = COALESCE(?, block_kind) "
+                    "block_kind = COALESCE(?, block_kind), "
+                    "block_recurrences = CASE WHEN ? IS NULL "
+                    "THEN block_recurrences ELSE ? END "
                     "WHERE id = ? AND status IN ('running', 'ready', 'review')",
-                    (failures, error[:500], _bk, task_id),
+                    (
+                        _typed_status if _bk else "blocked",
+                        failures, error[:500], _bk, _bk, _recurrences, task_id,
+                    ),
                 )
             else:
                 # Timeout/crash path: source phase already restored with claim
                 # cleared; just flip to blocked + update
-                # counter fields.
+                # counter fields. No current timeout/crash caller supplies a
+                # typed ``block_kind``; typed auto-blocking is a spawn path.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
@@ -11992,11 +12029,33 @@ def _record_task_failure(
             }
             if _bk:
                 payload["block_kind"] = _bk
+                payload["recurrences"] = _recurrences
+                payload["block_status"] = _typed_status
             if event_payload_extra:
                 payload.update(event_payload_extra)
             _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
+            if _bk:
+                # ``gave_up`` is deliberately NOT sticky — the breaker's normal
+                # trips are meant to auto-recover. A typed block is a human
+                # gate, so it also emits the event ``_has_sticky_block`` reads
+                # (or ``block_loop_detected`` once the recurrence limit trips,
+                # matching ``block_task``'s escalation).
+                _append_event(
+                    conn, task_id,
+                    "block_loop_detected" if _typed_status == "triage"
+                    else "blocked",
+                    {
+                        "reason": error[:500],
+                        "kind": _bk,
+                        "recurrences": _recurrences,
+                        "limit": BLOCK_RECURRENCE_LIMIT,
+                        "source_status": retry_status,
+                        "auto": True,
+                    },
+                    run_id=run_id,
+                )
             blocked = True
         else:
             # Below threshold.
@@ -12072,10 +12131,14 @@ def _record_spawn_failure(
 # total) before gave_up parked them in an untyped ``blocked`` with no
 # actionable reason. These are capability walls — only a human re-pointing the
 # card fixes them — so they block on failure #1.
+#
+# Every marker here must describe state that CANNOT change between ticks.
+# "board has no default_workdir" deliberately does NOT qualify: that is board
+# metadata an operator can set without touching the card, so a card blocked on
+# it is recoverable and keeps its ordinary retry budget.
 _UNUSABLE_WORKSPACE_MARKERS = (
     "is not inside a git repo and does not point at a git repo root",
     "workspace path must be absolute",
-    "has no default_workdir",
 )
 
 
@@ -12084,17 +12147,23 @@ def _unusable_workspace_reason(exc: BaseException) -> Optional[str]:
 
     ``None`` means "treat as an ordinary, possibly-transient spawn failure and
     let the normal retry budget apply".
+
+    The operator instructions LEAD. ``_record_task_failure`` persists
+    ``error[:500]``, and the raw exception embeds a full workspace path — a
+    deep path pushed the entire actionable half past the cut, storing 500
+    characters that ended mid-path and told the reader nothing.
     """
     text = str(exc)
     if not any(marker in text for marker in _UNUSABLE_WORKSPACE_MARKERS):
         return None
     return (
-        f"workspace: {text} — this cannot succeed on retry, so the card is "
+        "workspace is unusable and NO retry can fix it, so the card is "
         "blocked on the FIRST failure instead of burning the retry budget. "
         "Fix: re-create the card with --workspace worktree:/abs/path/to/a/"
         "NON-BARE checkout (a bare repo has no work tree to anchor on), or "
         "--workspace scratch for a read-only probe. There is no "
-        "'edit --workspace', so the card must be archived and re-created."
+        f"'edit --workspace', so the card must be archived and re-created. "
+        f"Underlying error: {text}"
     )
 
 
