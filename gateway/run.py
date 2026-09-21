@@ -34240,7 +34240,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # real user message re-enters _is_resume_pending and receives the same
         # recovery note even though the user deliberately cancelled that turn.
         try:
-            self.session_store.clear_resume_pending(session_key)
+            await self.async_session_store.clear_resume_pending(session_key)
         except Exception:
             logger.debug(
                 "resume-pending clear skipped for stopped session %s",

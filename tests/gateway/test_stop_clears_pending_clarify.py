@@ -106,7 +106,12 @@ async def test_stop_consumes_resume_pending_recovery_state():
     runner = _bare_runner()
     runner._startup_resume_modes = {SESSION_KEY: {"mode": "auto"}}
     runner._resumed_this_boot = {SESSION_KEY}
-    clear_resume_pending = MagicMock()
+    # The clear goes through the awaited async_session_store facade (the
+    # AST contract in tests/gateway/test_async_session_store.py forbids raw
+    # session_store calls inside async gateway code). The facade is a
+    # read-only property wrapping session_store, so mock the sync store and
+    # let the real boundary route the call off-loop.
+    clear_resume_pending = MagicMock(return_value=True)
     runner.session_store.clear_resume_pending = clear_resume_pending
 
     await runner._interrupt_and_clear_session(
