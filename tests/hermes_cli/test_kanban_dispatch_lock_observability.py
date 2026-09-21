@@ -48,12 +48,17 @@ def test_cli_reports_real_contention(conn, capsys, json_output):
         assert "_dispatch_tick_lock" in output
 
 
-@pytest.mark.parametrize("payload", [b"", b" {", b" []", b' {"pid": "bad"}'])
+@pytest.mark.parametrize("payload", [b"", b" {", b" []", b' {"pid": "bad"}',
+    b" " + json.dumps({"pid": 1, "monotonic": 10**1000, "acquire_site": "test"}).encode(),
+    b' {"pid": 1, "monotonic": NaN, "acquire_site": "test"}'])
 def test_legacy_or_malformed_stamp_does_not_hide_skip(conn, payload):
     path = kb.kanban_db_path()
     with kb._dispatch_tick_lock(path) as held:
         assert held
-        path.with_name(path.name + ".dispatch.lock").write_bytes(payload)
+        with path.with_name(path.name + ".dispatch.lock").open("r+b") as stamp:
+            stamp.seek(1)  # Do not write the Windows locked byte.
+            stamp.write(payload[1:])
+            stamp.truncate()
         result = kb.dispatch_once(conn, dry_run=True)
         assert result.skipped_locked
         assert result.lock_holder == {}
