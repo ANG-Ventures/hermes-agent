@@ -2240,6 +2240,24 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Board-level, time-boxed model routing. A row here re-routes every spawn
+-- for its lane that does NOT carry its own per-card override, and expires on
+-- the dispatcher clock (``expires_at``) so a capacity workaround cannot
+-- become a standing default the way editing a profile's config.yaml does.
+-- ``assignee IS NULL`` is the board-wide lane; a row naming an assignee wins
+-- over it for that profile. One active row per lane (PRIMARY KEY collapses
+-- re-sets to an upsert), so ``lane-model set`` is idempotent.
+CREATE TABLE IF NOT EXISTS lane_model_overrides (
+    assignee     TEXT PRIMARY KEY,   -- '' == board-wide lane (NULL can't be a PK)
+    provider     TEXT NOT NULL,
+    model        TEXT NOT NULL,
+    reason       TEXT,
+    firepower    TEXT,               -- justification when the model is flagship-class
+    created_by   TEXT,
+    created_at   INTEGER NOT NULL,
+    expires_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lane_model_expires ON lane_model_overrides(expires_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -10652,6 +10670,16 @@ class DispatchResult:
     """List of ``(task_id, assignee, workspace_path)`` triples."""
     spawn_routes: dict[str, str] = field(default_factory=dict)
     """Effective ``provider/model`` route for each task spawned this tick."""
+    spawn_route_sources: dict[str, str] = field(default_factory=dict)
+    """Where each spawned task's route came from — ``card-override``,
+    ``lane-override(<n>s remaining)``, or ``profile-default``. Paired with
+    ``spawn_routes`` so a tick log can say WHY a worker got the model it got
+    instead of leaving an operator to guess which layer won."""
+    expired_lane_models: list[tuple[str, str]] = field(default_factory=list)
+    """Lane overrides retired this tick as ``(lane, route)``, where ``lane`` is
+    the assignee or ``*`` for the board-wide row. Reported exactly once — the
+    rows are deleted when they expire — so the tick log carries a single
+    ``lane-model expired -> profile default`` line per window."""
     skipped_unassigned: list[str] = field(default_factory=list)
     """Ready task ids skipped because they have no assignee at all.
     Operator-actionable — usually a misfiled task waiting for routing."""
@@ -13139,6 +13167,30 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
+
+    # ---- lane-model overrides (board-level, time-boxed routing) ----
+    # One clock read for the whole tick so every card in this pass sees the
+    # same TTL and a window cannot expire halfway through a batch.
+    _tick_now = int(time.time())
+    if not dry_run:
+        # Retire elapsed windows first: the rows are deleted, so each expiry
+        # is reported exactly once and the routing below can never read a
+        # stale override. A dry run reports the board as-is and writes nothing.
+        result.expired_lane_models = [
+            (row.assignee or "*", row.route)
+            for row in expire_lane_model_overrides(conn, now=_tick_now)
+        ]
+    _lane_override_cache: dict[str, Optional[LaneModelOverride]] = {}
+
+    def _lane_override_for(assignee: Optional[str]) -> Optional[LaneModelOverride]:
+        """Active override for ``assignee``, memoized for this tick."""
+        key = (assignee or "").strip()
+        if key not in _lane_override_cache:
+            _lane_override_cache[key] = get_lane_model_override(
+                conn, assignee=key or None, now=_tick_now,
+            )
+        return _lane_override_cache[key]
+
     pr_cycle_key = _pr_state_cache_key(kanban_db_path(board))
     pr_nonterminal_cache, pr_cycle_skip = _pr_state_caches_for_board(pr_cycle_key)
     pr_state_resolver = _PrStateResolver(
@@ -13505,6 +13557,14 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        # Board-level routing: applies only to cards with no override of
+        # their own, and only while the window is live (already filtered by
+        # the tick's expiry pass above). Mutating the in-memory claimed Task
+        # is deliberate — the override must not be persisted onto the card,
+        # or it would outlive its TTL as a permanent per-card override.
+        route_source = apply_lane_model_override(
+            claimed, _lane_override_for(claimed.assignee), now=_tick_now,
+        ) or ("card-override" if claimed.model_override else "profile-default")
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -13559,6 +13619,7 @@ def _dispatch_once_locked(
             # complete_task).
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             result.spawn_routes[claimed.id] = effective_worker_route(claimed)
+            result.spawn_route_sources[claimed.id] = route_source
             spawned += 1
             # Track the new in-flight count for this profile so later
             # iterations in this same tick respect the per-profile cap
@@ -13678,6 +13739,12 @@ def _dispatch_once_locked(
         claimed.skills = list(
             dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
         )
+        # Review spawns are workers too: a capacity window that re-routes the
+        # ready lane but silently leaves reviewers on a capped provider would
+        # strand exactly the lane that unblocks everything else.
+        review_route_source = apply_lane_model_override(
+            claimed, _lane_override_for(claimed.assignee), now=_tick_now,
+        ) or ("card-override" if claimed.model_override else "profile-default")
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
@@ -13698,6 +13765,7 @@ def _dispatch_once_locked(
             )
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             result.spawn_routes[claimed.id] = effective_worker_route(claimed)
+            result.spawn_route_sources[claimed.id] = review_route_source
             spawned += 1
             if _per_profile_cap is not None and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
@@ -14113,6 +14181,203 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _retagged_workspace_roots.add(workspaces_root_path)
     except Exception as exc:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
+
+
+@dataclass
+class LaneModelOverride:
+    """An active board-level model route with an expiry on the dispatcher clock."""
+
+    assignee: Optional[str]
+    provider: str
+    model: str
+    reason: Optional[str] = None
+    firepower: Optional[str] = None
+    created_by: Optional[str] = None
+    created_at: int = 0
+    expires_at: int = 0
+
+    @property
+    def route(self) -> str:
+        return f"{self.provider}/{self.model}"
+
+    def ttl_remaining(self, now: Optional[int] = None) -> int:
+        """Seconds left before the dispatcher stops applying this row."""
+
+        current = int(time.time()) if now is None else int(now)
+        return max(0, int(self.expires_at) - current)
+
+
+def _lane_model_row(row) -> LaneModelOverride:
+    return LaneModelOverride(
+        assignee=(row["assignee"] or None),
+        provider=row["provider"],
+        model=row["model"],
+        reason=row["reason"],
+        firepower=row["firepower"],
+        created_by=row["created_by"],
+        created_at=int(row["created_at"]),
+        expires_at=int(row["expires_at"]),
+    )
+
+
+def set_lane_model_override(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    model: str,
+    expires_at: int,
+    reason: Optional[str] = None,
+    assignee: Optional[str] = None,
+    firepower: Optional[str] = None,
+    created_by: Optional[str] = None,
+    now: Optional[int] = None,
+) -> LaneModelOverride:
+    """Install (or replace) the lane override for ``assignee``.
+
+    ``assignee=None`` sets the board-wide lane. Re-setting the same lane is an
+    upsert, so an operator extending a window never stacks duplicate rows.
+    """
+
+    created = int(time.time()) if now is None else int(now)
+    key = (assignee or "").strip()
+    with write_txn(conn):
+        conn.execute(
+            "INSERT INTO lane_model_overrides "
+            "(assignee, provider, model, reason, firepower, created_by, "
+            " created_at, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(assignee) DO UPDATE SET "
+            "  provider=excluded.provider, model=excluded.model, "
+            "  reason=excluded.reason, firepower=excluded.firepower, "
+            "  created_by=excluded.created_by, created_at=excluded.created_at, "
+            "  expires_at=excluded.expires_at",
+            (
+                key, provider, model, reason, firepower, created_by,
+                created, int(expires_at),
+            ),
+        )
+    return LaneModelOverride(
+        assignee=(key or None), provider=provider, model=model,
+        reason=reason, firepower=firepower, created_by=created_by,
+        created_at=created, expires_at=int(expires_at),
+    )
+
+
+def get_lane_model_override(
+    conn: sqlite3.Connection,
+    *,
+    assignee: Optional[str] = None,
+    now: Optional[int] = None,
+) -> Optional[LaneModelOverride]:
+    """Return the active override for ``assignee``, or None.
+
+    An assignee-specific row beats the board-wide row. Expiry is exclusive —
+    a row is live strictly before ``expires_at`` — so the TTL boundary belongs
+    to the profile default and a 0-second window is never "briefly active".
+    """
+
+    current = int(time.time()) if now is None else int(now)
+    row = conn.execute(
+        "SELECT * FROM lane_model_overrides "
+        "WHERE assignee IN (?, '') AND expires_at > ? "
+        # '' (board-wide) sorts before any real name, so DESC puts the
+        # assignee-specific row first when both lanes are active.
+        "ORDER BY assignee DESC LIMIT 1",
+        ((assignee or "").strip(), current),
+    ).fetchone()
+    return _lane_model_row(row) if row else None
+
+
+def list_lane_model_overrides(
+    conn: sqlite3.Connection,
+    *,
+    now: Optional[int] = None,
+    include_expired: bool = False,
+) -> list[LaneModelOverride]:
+    """All lane overrides, active-only by default, board-wide lane first."""
+
+    current = int(time.time()) if now is None else int(now)
+    if include_expired:
+        rows = conn.execute(
+            "SELECT * FROM lane_model_overrides ORDER BY assignee ASC"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM lane_model_overrides WHERE expires_at > ? "
+            "ORDER BY assignee ASC",
+            (current,),
+        ).fetchall()
+    return [_lane_model_row(row) for row in rows]
+
+
+def clear_lane_model_override(
+    conn: sqlite3.Connection,
+    *,
+    assignee: Optional[str] = None,
+) -> Optional[LaneModelOverride]:
+    """Drop the lane override for ``assignee``; return what was removed."""
+
+    key = (assignee or "").strip()
+    row = conn.execute(
+        "SELECT * FROM lane_model_overrides WHERE assignee = ?", (key,),
+    ).fetchone()
+    if not row:
+        return None
+    removed = _lane_model_row(row)
+    with write_txn(conn):
+        conn.execute("DELETE FROM lane_model_overrides WHERE assignee = ?", (key,))
+    return removed
+
+
+def expire_lane_model_overrides(
+    conn: sqlite3.Connection,
+    *,
+    now: Optional[int] = None,
+) -> list[LaneModelOverride]:
+    """Delete every elapsed override and return them.
+
+    The dispatcher calls this once per tick. Because the rows are DELETED,
+    a given expiry is reported exactly once — the tick that retires the
+    override logs ``lane-model expired``, later ticks stay quiet.
+    """
+
+    current = int(time.time()) if now is None else int(now)
+    rows = conn.execute(
+        "SELECT * FROM lane_model_overrides WHERE expires_at <= ? "
+        "ORDER BY assignee ASC",
+        (current,),
+    ).fetchall()
+    if not rows:
+        return []
+    expired = [_lane_model_row(row) for row in rows]
+    with write_txn(conn):
+        conn.execute(
+            "DELETE FROM lane_model_overrides WHERE expires_at <= ?", (current,),
+        )
+    return expired
+
+
+def apply_lane_model_override(
+    task: Task,
+    override: Optional[LaneModelOverride],
+    *,
+    now: Optional[int] = None,
+) -> Optional[str]:
+    """Route ``task`` through ``override`` when it has no override of its own.
+
+    Returns the ``source`` label for the spawn's route line, or ``None`` when
+    the lane override did not apply. A per-card override always wins: the card
+    is the narrower, explicitly-chosen instruction, and silently overwriting it
+    from a board-wide row would make ``set-model`` unreliable.
+    """
+
+    if override is None:
+        return None
+    if task.model_override:
+        return None
+    task.model_override = override.model
+    task.provider_override = override.provider
+    return f"lane-override({override.ttl_remaining(now)}s remaining)"
 
 
 def effective_worker_route(task: Task) -> str:
@@ -14808,10 +15073,33 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         if oldest_row and oldest_row["ts"] is not None else None
     )
 
+    # Active lane overrides ride along with the counts so `kanban stats` —
+    # the first thing anyone reads when workers behave oddly — shows that the
+    # board is re-routing spawns, and for how much longer. A silent override
+    # is the failure mode this feature exists to avoid.
+    try:
+        lane_overrides = [
+            {
+                "assignee": row.assignee,
+                "provider": row.provider,
+                "model": row.model,
+                "reason": row.reason,
+                "created_at": row.created_at,
+                "expires_at": row.expires_at,
+                "ttl_remaining_seconds": row.ttl_remaining(now),
+            }
+            for row in list_lane_model_overrides(conn, now=now)
+        ]
+    except sqlite3.Error:
+        # Stats must never fail closed on a board whose schema predates the
+        # table and hasn't been reopened through connect()'s migration pass.
+        lane_overrides = []
+
     return {
         "by_status": by_status,
         "by_assignee": by_assignee,
         "oldest_ready_age_seconds": oldest_ready_age,
+        "lane_model_overrides": lane_overrides,
         "now": now,
     }
 
