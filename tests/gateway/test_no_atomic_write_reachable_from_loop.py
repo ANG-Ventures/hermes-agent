@@ -97,8 +97,6 @@ REACHABLE_BASELINE = frozenset({
     "gateway/platforms/weixin.py _poll_loop -> atomic_json_write",
     "gateway/platforms/weixin.py connect -> atomic_json_write",
     "gateway/platforms/weixin.py qr_login -> atomic_json_write",
-    "gateway/platforms/whatsapp_cloud.py _build_message_event_from_cloud -> os.replace",
-    "gateway/platforms/whatsapp_cloud.py send -> os.replace",
     "gateway/platforms/yuanbao.py open -> atomic_json_write",
     "gateway/run.py _await_active_work_before_restart -> atomic_json_write",
     "gateway/run.py _cancel_pending_boot_resumes_for_shutdown -> os.replace",
@@ -136,8 +134,6 @@ REACHABLE_BASELINE = frozenset({
     "plugins/platforms/telegram/adapter.py _handle_media_message -> atomic_json_write",
     "plugins/platforms/telegram/adapter.py _handle_sticker -> os.fsync",
     "plugins/platforms/telegram/adapter.py _handle_text_message -> atomic_json_write",
-    "plugins/platforms/telegram/adapter.py _try_edit_rich -> os.replace",
-    "plugins/platforms/telegram/adapter.py _try_send_rich -> os.replace",
     "plugins/platforms/telegram/adapter.py connect -> atomic_json_write",
 })
 

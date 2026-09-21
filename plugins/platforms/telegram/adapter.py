@@ -2391,7 +2391,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # what we sent — replies to this message resolve via this index.
             try:
                 from gateway import rich_sent_store
-                rich_sent_store.record(str(chat_id), str(message_id), content)
+                await rich_sent_store.record_async(str(chat_id), str(message_id), content)
             except Exception:
                 pass
         return SendResult(
@@ -2474,7 +2474,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # replies to it would have no native echo to recover from.
         try:
             from gateway import rich_sent_store
-            rich_sent_store.record(str(chat_id), str(message_id), content)
+            await rich_sent_store.record_async(str(chat_id), str(message_id), content)
         except Exception:
             pass
         return SendResult(success=True, message_id=message_id)
