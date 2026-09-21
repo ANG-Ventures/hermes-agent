@@ -133,7 +133,7 @@ def test_review_cli_round_trip_preserves_handoff(
 
     output = kc.run_slash(
         f"request-review {task_id} --summary 'ready for review' "
-        "--reviewer reviewer --metadata '{\"tests_run\": 3}'"
+        "--reviewer argus --metadata '{\"tests_run\": 3}'"
     )
     assert "Requested review" in output
 
