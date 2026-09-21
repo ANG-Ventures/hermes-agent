@@ -310,6 +310,20 @@ def _format_parent_satisfied_sticky_summary(task_ids) -> str:
     return f"parents_done_sticky={len(ids)} ({', '.join(ids)})"
 
 
+def _format_spawn_routes(routes) -> str:
+    """Format one explicit provider/model announcement per spawned task."""
+
+    from hermes_cli.model_policy import route_kind
+
+    entries = dict(routes or {})
+    if not entries:
+        return "routes=-"
+    return "routes=" + "; ".join(
+        f"{task_id} route={route} kind={route_kind(route)}"
+        for task_id, route in entries.items()
+    )
+
+
 def _format_respawn_guarded_summary(guarded) -> str:
     """Format guarded task ids by reason for the per-tick gateway log."""
     entries = list(guarded or [])
@@ -2300,6 +2314,9 @@ class GatewayKanbanWatchersMixin:
                                 len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
                                 res.promoted,
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
+                                _format_spawn_routes(
+                                    getattr(res, "spawn_routes", None)
+                                ),
                                 _format_respawn_guarded_summary(guarded),
                                 _format_parent_satisfied_sticky_summary(parent_satisfied_sticky),
                             )
