@@ -208,20 +208,35 @@ def prune_exhausted_entries(
     return result
 
 
+def reset_quota_gate_turn_state(agent) -> None:
+    """Clear quota-gate decisions at the start of a new turn.
+
+    Gateway agents are cached across turns, but quota observations are not:
+    a five-hour window can recover while the cached agent stays alive. Keep the
+    configured chain immutable and discard every snapshot-derived decision at
+    the turn boundary so recovered subscriptions re-enter the walk.
+    """
+    agent._quota_gate_applied = False
+    agent._quota_gate_skipped_providers = set()
+    agent._quota_gate_status_emitted = False
+    agent._quota_gate_soonest_reset_text = None
+
+
 def apply_quota_gate(
     agent,
     *,
     snapshot: Optional[Dict[str, Any]] = None,
 ) -> Optional[PruneResult]:
-    """Prune the agent's UNWALKED fallback entries once per turn.
+    """Classify the agent's UNWALKED fallback entries once per turn.
 
-    Only the tail from ``_fallback_index`` onward is considered: the consumed
-    prefix must keep its length or the index stops meaning what the walker
-    thinks it means.
+    Only the tail from ``_fallback_index`` onward is considered. The configured
+    chain itself stays immutable: skipped providers are memoized separately for
+    the walker, then discarded by :func:`reset_quota_gate_turn_state` on the
+    next turn. This lets recovered subscriptions re-enter a cached agent's walk.
 
     Returns the :class:`PruneResult` on the pass that actually ran, or ``None``
     when the gate already ran this turn (or has nothing to act on). Stamps
-    ``_quota_gate_soonest_reset_text`` when the whole tail was pruned so the
+    ``_quota_gate_soonest_reset_text`` when the whole tail was skipped so the
     caller can fail fast with a real time.
     """
     if getattr(agent, "_quota_gate_applied", False):
@@ -243,9 +258,9 @@ def apply_quota_gate(
     if not result.skipped_count:
         return result
 
-    agent._fallback_chain = list(chain[:index]) + list(result.eligible)
-    agent._quota_gate_summary_line = result.summary_line
-    agent._quota_gate_skipped_count = result.skipped_count
+    agent._quota_gate_skipped_providers = {
+        provider.strip().lower() for provider, _ in result.skipped
+    }
     if result.soonest_reset_at is not None:
         agent._quota_gate_soonest_reset_text = result.soonest_reset_text
     logger.info(
@@ -256,14 +271,18 @@ def apply_quota_gate(
     return result
 
 
-def rate_limited_status_line(agent) -> str:
-    """Return the ONE status line for a quota failover, applying the gate.
+def rate_limited_status_line(agent) -> Optional[str]:
+    """Return at most ONE user-visible status line per quota cascade.
 
-    Replaces the bare ``"⚠️ Rate limited — switching to fallback provider..."``
-    at the conversation loop's quota-failover site. When the registry pruned
-    entries this turn, the line names the count instead of the walker emitting
-    one line per dead sub.
+    The fallback loop re-enters this site after each surviving provider fails.
+    Suppress those later entries: the first line already tells the user that
+    Hermes is walking fallbacks, and repeating it is the ×10 spam this gate
+    exists to remove.
     """
+    if getattr(agent, "_quota_gate_status_emitted", False):
+        return None
+    agent._quota_gate_status_emitted = True
+
     default = "⚠️ Rate limited — switching to fallback provider..."
     try:
         result = apply_quota_gate(agent)
@@ -286,6 +305,14 @@ def quota_exhausted_chain_message(agent) -> Optional[str]:
     )
 
 
+def append_quota_exhaustion_message(agent, response: str) -> str:
+    """Append the registry's soonest-reset evidence to a terminal response."""
+    message = quota_exhausted_chain_message(agent)
+    if not message:
+        return response
+    return f"{response}\n\n{message}"
+
+
 def default_snapshot_path() -> Path:
     """Path to the usage system's published snapshot under the Hermes home."""
     try:
@@ -304,7 +331,7 @@ def load_registry_snapshot(path: Optional[Path] = None) -> Dict[str, Any]:
     """
     target = Path(path) if path is not None else default_snapshot_path()
     try:
-        raw = json.loads(target.read_text())
+        raw = json.loads(target.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
     except Exception:

@@ -6885,7 +6885,9 @@ def run_conversation(
                             # exhausted, this names the count instead of the
                             # walker emitting N "switching..." lines (the
                             # 2026-09-21 ×10 spam). See quota_registry_gate.
-                            agent._buffer_status(rate_limited_status_line(agent))
+                            _quota_status = rate_limited_status_line(agent)
+                            if _quota_status:
+                                agent._buffer_status(_quota_status)
                         if agent._try_activate_fallback(
                             reason=classified.reason,
                             display_reason=classified.display_reason,
@@ -8012,6 +8014,16 @@ def run_conversation(
                             "execute_code with Python's open() for large "
                             "files, or to write in smaller sections."
                         )
+                    # When the registry proved the whole fallback tail dead,
+                    # surface the useful fail-fast fact instead of discarding
+                    # the producer-only reset timestamp.
+                    from agent.quota_registry_gate import (
+                        append_quota_exhaustion_message,
+                    )
+
+                    _final_response = append_quota_exhaustion_message(
+                        agent, _final_response
+                    )
                     # ── Durable handoff at the cut (2026-09-21) ──────────
                     # The chain is exhausted and this turn is about to die.
                     # Persist what was in flight (the request, the tool calls

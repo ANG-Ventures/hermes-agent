@@ -602,6 +602,15 @@ def build_turn_context(
     # new episode by definition, so clear it unconditionally here — before the
     # restore path can early-return — so a genuinely new failover always announces.
     agent._last_fallback_announced = None
+    # Quota verdicts are snapshot-derived and therefore turn-scoped. Cached
+    # gateway agents must reconsider the configured chain each turn so a sub
+    # whose five-hour window recovered is not permanently amputated.
+    try:
+        from agent.quota_registry_gate import reset_quota_gate_turn_state
+
+        reset_quota_gate_turn_state(agent)
+    except Exception:
+        logger.debug("Could not reset quota-gate turn state", exc_info=True)
     try:
         from agent.shared_transport_guard import reset_turn_state
 

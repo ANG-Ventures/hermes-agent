@@ -221,7 +221,7 @@ def write_turn_handoff(
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
         try:
-            with os.fdopen(fd, "w") as fh:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(handoff, fh)
             os.replace(tmp, path)
         except Exception:
@@ -249,7 +249,7 @@ def consume_turn_handoff(
     """
     path = handoff_path_for(session_key, root=root)
     try:
-        raw = path.read_text()
+        raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
     except Exception:
@@ -292,7 +292,7 @@ def prune_expired_handoffs(*, root: Optional[Path] = None) -> int:
     now = time.time()
     for path in entries:
         try:
-            payload = json.loads(path.read_text())
+            payload = json.loads(path.read_text(encoding="utf-8"))
             created_at = float(payload.get("created_at") or 0)
         except Exception:
             created_at = 0.0

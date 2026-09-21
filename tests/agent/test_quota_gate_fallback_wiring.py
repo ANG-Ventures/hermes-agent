@@ -10,6 +10,7 @@ seam — a stubbed registry in, an observed chain walk out.
 
 from __future__ import annotations
 
+import inspect
 import time
 import types
 
@@ -18,7 +19,12 @@ import pytest
 import agent.auxiliary_client as ac
 from agent.chat_completion_helpers import try_activate_fallback
 from agent.error_classifier import FailoverReason
-from agent.quota_registry_gate import apply_quota_gate, rate_limited_status_line
+from agent.quota_registry_gate import (
+    append_quota_exhaustion_message,
+    apply_quota_gate,
+    rate_limited_status_line,
+    reset_quota_gate_turn_state,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -161,6 +167,33 @@ def test_the_switching_spam_collapses_to_one_line(monkeypatch):
     assert "skipping 9 exhausted subs" in switching[0]
 
 
+def test_the_switching_spam_collapses_to_one_emitted_line(monkeypatch):
+    """21 candidates with 17 known-dead subs emit exactly ONE status line.
+
+    This drives the emitted-message sequence across every surviving provider,
+    not merely the text returned by the first helper call. It is the exact
+    regression shape from the 2026-09-21 cascade.
+    """
+    _patch_resolver(monkeypatch)
+    snapshot = {f"claude-apx-{i}": _exhausted() for i in range(1, 18)}
+    for i in range(18, 22):
+        snapshot[f"claude-apx-{i}"] = _healthy()
+    chain = [_entry(f"claude-apx-{i}") for i in range(1, 22)]
+    agent = _agent(chain, snapshot)
+
+    # Primary failure + each of the four surviving fallbacks failing in turn.
+    for _ in range(5):
+        line = rate_limited_status_line(agent)
+        if line:
+            agent._buffer_status(line)
+        try_activate_fallback(agent, reason=FailoverReason.rate_limit)
+
+    assert agent.status_messages == [
+        "⚠️ Rate limited — skipping 17 exhausted subs "
+        "(quota registry) and switching to fallback provider..."
+    ]
+
+
 def test_healthy_chain_emits_the_plain_line(monkeypatch):
     _patch_resolver(monkeypatch)
     agent = _agent([_entry("claude-apx-17")], {"claude-apx-17": _healthy()})
@@ -183,6 +216,73 @@ def test_all_exhausted_fails_fast_with_the_soonest_reset(monkeypatch):
 
 
 # ── the gate must not change behaviour it has no evidence about ─────────
+
+
+def test_recovered_sub_returns_on_the_next_turn(monkeypatch):
+    """A temporary quota verdict must not amputate the cached agent's chain."""
+    seen = _patch_resolver(monkeypatch)
+    chain = [_entry("claude-apx-1"), _entry("claude-apx-2")]
+    agent = _agent(
+        chain,
+        {"claude-apx-1": _exhausted(resets_in=2 * 3600),
+         "claude-apx-2": _healthy()},
+    )
+
+    # Turn 1 skips apx-1 and reaches apx-2 without mutating the source chain.
+    assert try_activate_fallback(agent, reason=FailoverReason.rate_limit) is True
+    assert seen == ["claude-apx-2"]
+    assert agent._fallback_chain == chain
+
+    # Turn 2: apx-1 has recovered. The real turn prologue resets gate state;
+    # the walker must now see the recovered first entry again.
+    agent._fallback_index = 0
+    agent._fallback_activated = False
+    agent._quota_registry_snapshot = {
+        "claude-apx-1": _healthy(),
+        "claude-apx-2": _healthy(),
+    }
+    reset_quota_gate_turn_state(agent)
+
+    assert try_activate_fallback(agent, reason=FailoverReason.rate_limit) is True
+    assert seen == ["claude-apx-2", "claude-apx-1"]
+
+
+def test_all_exhausted_terminal_response_names_soonest_reset(monkeypatch):
+    """The producer's reset time must reach the user-facing terminal response."""
+    _patch_resolver(monkeypatch)
+    snapshot = {
+        "claude-apx-1": _exhausted(resets_in=3 * 86400),
+        "claude-apx-2": _exhausted(resets_in=6 * 3600),
+    }
+    agent = _agent([_entry("claude-apx-1"), _entry("claude-apx-2")], snapshot)
+
+    assert try_activate_fallback(agent, reason=FailoverReason.rate_limit) is False
+    terminal = append_quota_exhaustion_message(agent, "provider is rate-limiting")
+    assert terminal == (
+        "provider is rate-limiting\n\n"
+        "Every fallback subscription is quota-exhausted per the usage "
+        "registry; the soonest resets in 6h."
+    )
+
+
+def test_turn_prologue_resets_snapshot_derived_gate_state():
+    """The cached gateway-agent path must clear gate state every turn."""
+    from agent.turn_context import build_turn_context
+
+    source = inspect.getsource(build_turn_context)
+    assert "reset_quota_gate_turn_state(agent)" in source
+    assert source.index("reset_quota_gate_turn_state(agent)") < source.index(
+        "agent._restore_primary_runtime()"
+    )
+
+
+def test_terminal_failure_consumes_the_soonest_reset_message():
+    """Lock the producer to its user-facing consumer in the live loop."""
+    from agent.conversation_loop import run_conversation
+
+    source = inspect.getsource(run_conversation)
+    assert "append_quota_exhaustion_message" in source
+    assert "agent, _final_response" in source
 
 
 def test_non_quota_failures_do_not_prune(monkeypatch):

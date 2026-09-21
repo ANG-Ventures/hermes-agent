@@ -3512,10 +3512,10 @@ def try_activate_fallback(
     # ── Registry-driven pruning (2026-09-21 cascade) ────────────────────
     # A quota failure means the chain is about to be walked for quota
     # reasons, and the usage-tracking system has already recorded which subs
-    # are exhausted. Drop those entries in ONE pass — before any client is
-    # constructed — so the walk costs one request instead of N, and the user
-    # sees one "skipping N exhausted subs" line instead of N "switching..."
-    # lines. Fails open on any registry problem; see agent.quota_registry_gate.
+    # are exhausted. Mark those entries in ONE pass — before any client is
+    # constructed — so the walker skips them locally instead of spending N
+    # requests. The configured chain stays intact so recovered subs return on
+    # the next turn; see agent.quota_registry_gate.
     if reason in {FailoverReason.rate_limit, FailoverReason.billing,
                   FailoverReason.upstream_rate_limit}:
         try:
@@ -3606,6 +3606,17 @@ def try_activate_fallback(
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
         return agent._try_activate_fallback(reason, error_context=error_context, display_reason=display_reason)
     fb_provider = (fb.get("provider") or "").strip().lower()
+    quota_skipped = getattr(agent, "_quota_gate_skipped_providers", set()) or set()
+    if fb_provider in quota_skipped:
+        logger.debug(
+            "Fallback skip: %s is quota-exhausted per the usage registry",
+            fb_provider,
+        )
+        return agent._try_activate_fallback(
+            reason,
+            error_context=error_context,
+            display_reason=display_reason,
+        )
     fb_model = (fb.get("model") or "").strip()
     if not fb_provider or not fb_model:
         return agent._try_activate_fallback(reason, error_context=error_context, display_reason=display_reason)  # skip invalid, try next
