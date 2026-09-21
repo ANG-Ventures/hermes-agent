@@ -1296,3 +1296,80 @@ def test_is_deletion_audit_path_recognises_every_durable_destination(kanban_home
         "workspace-deletions.txt",
     ):
         assert not kb.is_deletion_audit_path(Path("/any/dir") / name), name
+
+
+# ---------------------------------------------------------------------------
+# Cost. The choke point is on `kanban gc`'s hot path, once per archived
+# scratch row, and in steady state almost every one of those workspaces was
+# already removed at completion (FleetReview on PR #785).
+# ---------------------------------------------------------------------------
+
+def test_a_vanished_workspace_costs_no_owner_scan_and_no_audit_line(kanban_home):
+    """An absent directory must short-circuit before the expensive gates.
+
+    `_live_owners_of_path` opens a connection and full-scans `tasks`,
+    resolving every row's path. Running that for a path with nothing at it --
+    and appending a permanent REFUSED line to a log that is deliberately
+    never reaped -- turned `kanban gc` into minutes of syscalls and unbounded
+    audit noise for zero removals.
+    """
+    root = _scratch_root()
+    task_id = _mktask("already cleaned")
+    gone = root / task_id
+    assert not gone.exists()
+
+    before = len(_audit_lines())
+    scans = {"n": 0}
+    real = kb._live_owners_of_path
+
+    def counting(*a, **kw):
+        scans["n"] += 1
+        return real(*a, **kw)
+
+    kb._live_owners_of_path = counting
+    try:
+        with kb.connect_closing() as conn:
+            removed = kb.safe_remove_workspace_dir(
+                gone, task_id=task_id, reason="gc_archived", conn=conn,
+            )
+    finally:
+        kb._live_owners_of_path = real
+
+    assert removed is False
+    assert scans["n"] == 0, "a vanished workspace still paid for an owner scan"
+    assert len(_audit_lines()) == before, (
+        "a vanished workspace appended a permanent, never-reapable audit line"
+    )
+
+
+def test_owner_lookup_reuses_the_callers_connection_for_the_same_board(kanban_home):
+    """No second connection to a database the caller already has open.
+
+    Completion calls this while holding the completing task's connection; a
+    redundant connection to the same file is pure cost on that path.
+    """
+    root = _scratch_root()
+    task_id = _mktask("owner")
+    ws = root / task_id
+    ws.mkdir()
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET workspace_path=? WHERE id=?", (str(ws), task_id)
+        )
+        conn.commit()
+
+        opened: list = []
+        real = kb.connect
+
+        def counting(*a, **kw):
+            opened.append(kw.get("board"))
+            return real(*a, **kw)
+
+        kb.connect = counting
+        try:
+            owners = kb._live_owners_of_path(ws, conn=conn, live_only=False)
+        finally:
+            kb.connect = real
+
+    assert owners == [task_id], owners
+    assert opened == [], f"opened a redundant connection: {opened}"

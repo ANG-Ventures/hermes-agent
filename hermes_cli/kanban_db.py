@@ -7160,6 +7160,34 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
 _TASK_DIR_NAME_RE = re.compile(r"^t_[0-9a-f]{4,}$")
 
 
+def _conn_is_board(conn: sqlite3.Connection, board: str) -> bool:
+    """True when *conn* is already open on *board*'s database file.
+
+    Asks the connection which file it is attached to (``PRAGMA
+    database_list``) rather than trusting what the caller believes: under an
+    ambient ``HERMES_KANBAN_DB`` pin a connection opened "for" one board can
+    be attached to another's file. Any uncertainty answers False, which costs
+    one redundant connection -- never a wrong reuse.
+    """
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+    except Exception:
+        return False
+    actual = ""
+    for row in rows:
+        # (seq, name, file) -- `main` is the connection's primary database.
+        if (row[1] if not isinstance(row, sqlite3.Row) else row["name"]) == "main":
+            actual = (row[2] if not isinstance(row, sqlite3.Row) else row["file"]) or ""
+            break
+    if not actual:
+        return False
+    try:
+        want = _board_db_path_ignoring_pin(_normalize_board_slug(board) or board)
+        return Path(actual).resolve(strict=False) == want.resolve(strict=False)
+    except Exception:
+        return False
+
+
 def _live_owners_of_path(
     path: Path,
     *,
@@ -7218,7 +7246,13 @@ def _live_owners_of_path(
         try:
             if is_managed and board:
                 # The directory's own board, which may not be the caller's.
-                conns.append(stack.enter_context(connect_closing(board=board)))
+                # Reuse the caller's connection when it is ALREADY that board:
+                # opening a second connection to the same database is pure
+                # cost on the completion path, which calls this while holding
+                # the completing task's connection (FleetReview on PR #785 --
+                # measured one redundant connection per call).
+                if not (conn is not None and _conn_is_board(conn, board)):
+                    conns.append(stack.enter_context(connect_closing(board=board)))
             elif conn is None:
                 conns.append(stack.enter_context(connect_closing()))
         except Exception:
@@ -7521,6 +7555,24 @@ def safe_remove_workspace_dir(
         )
         return False
 
+    # Nothing to remove. Checked BEFORE the liveness and owner scans, which
+    # are the expensive gates: `_live_owners_of_path` opens a second
+    # connection and full-scans `tasks`, resolving every row's path. In gc's
+    # steady state most archived cards' workspaces were already removed at
+    # completion, so leaving this check last turned `kanban gc` into O(M)
+    # extra connections plus O(M*N) path resolutions for zero removals -- and
+    # appended one permanent `REFUSED` line per already-clean row to an
+    # append-only log that `gc_worker_logs` is deliberately forbidden to reap,
+    # burying the DELETE/ATTEMPT records the audit exists to surface
+    # (FleetReview on PR #785, measured: 1 owner scan + 1 audit line for a
+    # path that does not exist).
+    #
+    # No audit line either: the log records deletions and refusals TO DELETE.
+    # A path with nothing at it was never a deletion, and a per-row entry that
+    # can never be reaped is exactly the noise the finding named.
+    if not resolved.is_dir():
+        return False
+
     if _task_has_live_run(conn, task_id):
         _audit_workspace_deletion(
             resolved, task_id=task_id, reason=reason, allowed=False,
@@ -7547,13 +7599,6 @@ def safe_remove_workspace_dir(
             "Refusing to remove workspace %s (caller task %s, reason %s): it "
             "is owned by live card(s) %s",
             resolved, task_id, reason, ",".join(owners),
-        )
-        return False
-
-    if not resolved.is_dir():
-        _audit_workspace_deletion(
-            resolved, task_id=task_id, reason=reason, allowed=False,
-            detail="not-a-directory",
         )
         return False
 
