@@ -16733,8 +16733,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pool = getattr(self, "_startup_resume_pool", None)
             if pool is None:
                 from gateway.turn_admission import StartupResumePool
+                concurrency = getattr(self.config, "startup_resume_concurrency", 3)
+                if type(concurrency) is not int or concurrency <= 0:
+                    logger.warning(
+                        "Invalid gateway.startup_resume_concurrency value %r; using 3",
+                        concurrency,
+                    )
+                    concurrency = 3
                 pool = self._startup_resume_pool = StartupResumePool(
-                    getattr(self.config, "startup_resume_concurrency", 3) or 3
+                    concurrency
                 )
             task = pool.submit(
                 self._run_startup_resume_event, adapter, event, entry.session_key,
@@ -24472,10 +24479,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # visible to inbound coalescing, but queued work cannot become a stale
         # transcript-lease holder if /stop invalidates its generation.
         async with self._get_turn_admission().slot(
-            _quick_key, internal=event.internal,
+            _quick_key, internal=getattr(event, "internal", False),
             ack=lambda: self._ack_turn_slot_wait(source),
         ):
-            if not self._is_session_run_current(_quick_key, run_generation):
+            # Production dispatch creates this state immediately before calling
+            # us. Keep direct/internal callers that have no generation state on
+            # the legacy path while still dropping queued turns invalidated by
+            # /stop after they began waiting for admission.
+            if (
+                self._peek_session_state(_quick_key) is not None
+                and not self._is_session_run_current(_quick_key, run_generation)
+            ):
                 return None
             return await self._handle_message_with_agent_admitted(
                 event, source, _quick_key, run_generation,
@@ -35761,6 +35775,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         admission = getattr(self, "_turn_admission", None)
         if admission is None:
             cap = getattr(getattr(self, "config", None), "max_concurrent_turns", None)
+            if type(cap) is not int or cap <= 0:
+                if cap is not None and not (type(cap) is int and cap == 0):
+                    logger.warning(
+                        "Invalid gateway.max_concurrent_turns value %r; using unbounded",
+                        cap,
+                    )
+                cap = None
             admission = self._turn_admission = TurnAdmission(cap)
         return admission
 

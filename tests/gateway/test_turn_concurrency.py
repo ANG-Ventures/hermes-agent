@@ -5,13 +5,14 @@ import logging
 import sys
 import threading
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform, load_gateway_config
 from gateway.platforms.base import MessageEvent, MessageType
-from gateway.run import _AGENT_PENDING_SENTINEL
+from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
 from gateway.session import SessionEntry
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 from tests.gateway.test_streaming_tts_gateway_regression import (
@@ -258,6 +259,77 @@ async def test_turn_admission_repeated_bursts_release_all_resources():
         assert admission.internal._value == 1
 
 
+def test_runtime_non_integer_turn_cap_is_unbounded_and_warns_once(caplog):
+    runner = object.__new__(GatewayRunner)
+    runner.__dict__["config"] = SimpleNamespace(max_concurrent_turns=object())
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        first = runner._get_turn_admission()
+        second = runner._get_turn_admission()
+
+    assert first is second
+    assert first.cap is None
+    assert first.total is None
+    warnings = [
+        record for record in caplog.records
+        if "Invalid gateway.max_concurrent_turns" in record.message
+    ]
+    assert len(warnings) == 1
+
+
+@pytest.mark.asyncio
+async def test_direct_handler_without_generation_state_keeps_legacy_contract():
+    runner = object.__new__(GatewayRunner)
+    runner.__dict__["config"] = GatewayConfig()
+    runner._handle_message_with_agent_admitted = AsyncMock(return_value="handled")
+    event = SimpleNamespace(internal=False)
+
+    result = await runner._handle_message_with_agent(
+        event, make_restart_source("direct"), "direct-key", 1,
+    )
+
+    assert result == "handled"
+    runner._handle_message_with_agent_admitted.assert_awaited_once_with(
+        event, make_restart_source("direct"), "direct-key", 1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_queued_handler_drops_generation_invalidated_while_waiting():
+    runner = object.__new__(GatewayRunner)
+    runner.__dict__["config"] = GatewayConfig(max_concurrent_turns=1)
+    runner._handle_message_with_agent_admitted = AsyncMock(return_value="handled")
+    admission = runner._get_turn_admission()
+    release = asyncio.Event()
+    holder_entered = asyncio.Event()
+    event = SimpleNamespace(internal=False)
+
+    async def hold_slot():
+        async with admission.slot("holder"):
+            holder_entered.set()
+            await release.wait()
+
+    holder = asyncio.create_task(hold_slot())
+    await asyncio.wait_for(holder_entered.wait(), 5)
+    generation = runner._begin_session_run_generation("queued-key")
+    waiter = asyncio.create_task(runner._handle_message_with_agent(
+        event, make_restart_source("queued"), "queued-key", generation,
+    ))
+    try:
+        for _ in range(100):
+            if admission.waiting == 1:
+                break
+            await asyncio.sleep(0)
+        assert admission.waiting == 1
+        runner._invalidate_session_run_generation("queued-key", reason="test")
+    finally:
+        release.set()
+        await holder
+
+    assert await waiter is None
+    runner._handle_message_with_agent_admitted.assert_not_awaited()
+
+
 @pytest.mark.parametrize("entry_count", [4, 7])
 @pytest.mark.asyncio
 async def test_boot_resume_claims_all_slots_but_runs_three(
@@ -309,6 +381,43 @@ async def test_boot_resume_claims_all_slots_but_runs_three(
     assert active == 0
     assert not runner._startup_resume_pool.pending
     assert not runner._startup_resume_pool.running
+
+
+@pytest.mark.asyncio
+async def test_runtime_non_integer_startup_resume_cap_defaults_to_three(
+    monkeypatch, caplog,
+):
+    runner, _ = make_restart_runner()
+    runner.config.__dict__["startup_resume_concurrency"] = object()
+    runner._persist_active_agents = MagicMock()
+    now = datetime.now()
+    entries = [SessionEntry(
+        session_key=f"invalid-key-{i}", session_id=f"invalid-sid-{i}", created_at=now,
+        updated_at=now, origin=make_restart_source(str(i)),
+        platform=Platform.TELEGRAM, chat_type="dm", resume_pending=True,
+        resume_reason="restart_interrupted", last_resume_marked_at=now,
+    ) for i in range(4)]
+    runner.session_store._entries = {entry.session_key: entry for entry in entries}
+    release = asyncio.Event()
+
+    async def resume(*_args):
+        await release.wait()
+
+    monkeypatch.setattr(runner, "_run_startup_resume_event", resume)
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        assert runner._schedule_resume_pending_sessions() == 4
+
+    tasks = list(runner._background_tasks)
+    try:
+        assert runner._startup_resume_pool.concurrency == 3
+        warnings = [
+            record for record in caplog.records
+            if "Invalid gateway.startup_resume_concurrency" in record.message
+        ]
+        assert len(warnings) == 1
+    finally:
+        release.set()
+        await asyncio.gather(*tasks)
 
 
 @pytest.mark.asyncio

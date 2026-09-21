@@ -99,7 +99,7 @@ REACHABLE_BASELINE = frozenset({
     "gateway/run.py _execute_mcp_reload -> atomic_json_write",
     "gateway/run.py _finalize_shutdown_agents -> atomic_json_write",
     "gateway/run.py _handle_message -> atomic_replace",
-    "gateway/run.py _handle_message_with_agent -> atomic_json_write",
+    "gateway/run.py _handle_message_with_agent_admitted -> atomic_json_write",
     "gateway/run.py _prepare_auto_resume_decisions -> os.replace",
     # Unmasked by the status-write fix, NOT introduced by it: the DFS reports
     # only the FIRST sink per coroutine, so the
