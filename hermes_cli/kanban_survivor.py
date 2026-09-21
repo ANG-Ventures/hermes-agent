@@ -139,6 +139,12 @@ def _temporary_roots():
     return [Path(tempfile.gettempdir()), Path("/tmp"), Path("/var/tmp")]
 
 
+def _excluded_roots(workspace):
+    """Roots a repo must NOT live under to count as durable/canonical."""
+    return [workspace, kb.workspaces_root(), kb.kanban_home() / "kanban" / "workspaces",
+            kb.kanban_home() / "kanban" / "boards", *_temporary_roots()]
+
+
 def _durable_remote(repo, remote, workspace):
     # Expand insteadOf aliases, then resolve symlinks before checking scope.
     url = _git(repo, "remote", "get-url", remote).stdout.decode().strip()
@@ -151,9 +157,7 @@ def _durable_remote(repo, remote, workspace):
         return False
     path = Path(unquote(parsed.path) if parsed.scheme else url).expanduser()
     path = (repo / path).resolve()
-    roots = [workspace, kb.workspaces_root(), kb.kanban_home() / "kanban" / "workspaces",
-             kb.kanban_home() / "kanban" / "boards", *_temporary_roots()]
-    return remote == "origin" and not any(path.is_relative_to(root.resolve()) for root in roots)
+    return remote == "origin" and not any(path.is_relative_to(root.resolve()) for root in _excluded_roots(workspace))
 
 
 def _published_refs(repo, workspace):
@@ -181,10 +185,70 @@ def _remote_survivor(repo, head, published):
 # A rewriting mirror (hermes-home's "isolated remote sync") republishes every
 # commit under a NEW sha, so `_remote_survivor` can never match a clone of it and
 # the capture falls through to a bundle of a 94 MB home tree, which always
-# exceeds KANBAN_ATTACHMENT_MAX_BYTES (2026-09-20, t_e69d693a). `git patch-id`
-# is the content identity that survives the rewrite: same diff, same id, any sha.
+# exceeds KANBAN_ATTACHMENT_MAX_BYTES (2026-09-20, t_e69d693a).
+#
+# `git patch-id` survives the rewrite, but it is the identity of a commit's
+# DIFF, not of its content: two commits on different parents can produce
+# byte-identical diffs over different trees, and patch-id normalises whitespace
+# away. The live hermes-home mirror demonstrates this on the very pair the fix
+# was designed around — 9f25d7cce and e747d18db share a patch-id while their
+# trees differ by 58 files. So a patch-id hit is ADVISORY ANNOTATION ONLY and
+# never authority to delete a workspace (Apollo ruling, 2026-09-20).
+#
+# The durable target for a home-clone workspace is the LIVE CANONICAL TREE it
+# was cloned from — a local repository outside every kanban/temp root — which is
+# covered by the fleet-backup tier. The rewriting mirror is not a faithful copy
+# and must not be the bar.
 _CONTENT_SCAN_DEPTH = 25
 _CONTENT_SCAN_BUDGET = 100
+
+
+def _canonical_repos(repo, workspace):
+    """Local repositories this repo's remotes resolve to, outside every disposable root.
+
+    A `file:`/path remote pointing at a live checkout (``~/.hermes``) is the
+    canonical tree: it holds the real objects, it is what the workspace was
+    cloned from, and it is what the fleet-backup tier covers. Remotes inside a
+    kanban workspace, board, or temp root are disposable and never canonical.
+    """
+    excluded = [root.resolve() for root in _excluded_roots(workspace)]
+    for remote in _git(repo, "remote").stdout.decode().splitlines():
+        url = _git(repo, "remote", "get-url", remote, check=False)
+        if url.returncode:
+            continue
+        raw = url.stdout.decode().strip()
+        parsed = urlsplit(raw)
+        if parsed.scheme not in {"", "file"} or parsed.netloc not in {"", "localhost"}:
+            continue
+        if not parsed.scheme and ":" in raw and not raw.startswith(("/", ".")):
+            continue  # scp-style SSH: not a local path
+        path = Path(unquote(parsed.path) if parsed.scheme else raw).expanduser()
+        try:
+            path = (repo / path).resolve(strict=True)
+        except OSError:
+            continue
+        if any(path.is_relative_to(root) for root in excluded):
+            continue
+        if _git(path, "rev-parse", "--git-dir", check=False).returncode:
+            continue
+        yield {"remote": remote, "repository_path": str(path)}
+
+
+def _canonical_survivor(repo, head, workspace):
+    """Accept ``head`` when a LIVE canonical tree can reach it from its HEAD.
+
+    This is the deletion authority for a home-clone workspace: the commit is not
+    only present in a durable local repo, it is on that repo's current line of
+    work. Reachability (not sha equality) is the predicate, so the rewriting
+    mirror never enters into it.
+    """
+    for candidate in _canonical_repos(repo, workspace):
+        live = Path(candidate["repository_path"])
+        if _git(live, "merge-base", "--is-ancestor", head, "HEAD", check=False).returncode == 0:
+            return dict(candidate, sha=head, head=head, matched_by="canonical",
+                        branch=_git(live, "rev-parse", "--abbrev-ref", "HEAD",
+                                    check=False).stdout.decode().strip() or "HEAD")
+    return None
 
 
 def _patch_id(repo, sha, env=None):
@@ -202,8 +266,13 @@ def _patch_id(repo, sha, env=None):
     return result.stdout.split()[0].decode()
 
 
-def _content_survivor(repo, head, published, *, budget=_CONTENT_SCAN_BUDGET):
-    """Find a published commit whose diff is byte-identical to ``head``'s.
+def _content_advisory(repo, head, published, *, budget=_CONTENT_SCAN_BUDGET):
+    """ADVISORY ONLY: a published commit whose diff is byte-identical to ``head``'s.
+
+    Recorded in the sidecar as a recovery hint ("the mirror's <sha> looks like
+    this work"), NEVER as authority to delete a workspace: patch-id is diff
+    identity, not content identity, and the live hermes-home mirror produces
+    false positives on exactly the pair this feature was designed around.
 
     Fetches each durable remote head shallowly into a throwaway bare repo that
     borrows ``repo``'s objects, then walks it looking for a matching patch-id.
@@ -242,18 +311,32 @@ def _content_survivor(repo, head, published, *, budget=_CONTENT_SCAN_BUDGET):
                 budget -= 1
                 if _patch_id(probe, sha, env=env) == target:
                     return dict(ref, sha=sha, head=head, matched_by="patch-id",
-                                patch_id=target)
+                                advisory=True, patch_id=target)
             _git(probe, "update-ref", "-d", "refs/heads/candidate", env=env, check=False)
     return None
 
 
 def _verify_landed(entries, workspace):
-    """Verify an explicit `landed` claim: reachable from HEAD AND published.
+    """Verify an explicit `landed` claim against a LIVE CANONICAL repository.
 
     The escape hatch for work that was committed into a repo the workspace only
-    mirrors. Every failure mode raises — an unverifiable claim must never be
-    accepted as a survivor, because accepting it authorises deleting the only
-    remaining copy of the code.
+    mirrors. The bar (Apollo ruling, 2026-09-20): the named repository must be a
+    real repository OUTSIDE every disposable root — a live tree covered by the
+    fleet-backup tier — and the sha must resolve there AND be reachable from that
+    tree's HEAD. Publication on a durable remote is NOT required, because the
+    hermes-home mirror rewrites trees and is not a faithful copy; requiring it
+    would make the claim unsatisfiable by construction.
+
+    A patch-id hit on a durable remote is attached as ADVISORY annotation only —
+    a recovery hint, never part of the accept decision.
+
+    Note: `landed` short-circuits the per-repo walk in ``preserve()`` and so also
+    bypasses the nested-repository guard. That is acceptable precisely because
+    nothing is being captured: no patch is built, so the guard's invariant (a
+    patch cannot add a gitlink and files below the same path) does not apply.
+
+    Every failure mode raises — an unverifiable claim must never be accepted,
+    because accepting it authorises deleting the only remaining copy of the code.
     """
     verified = []
     for entry in entries:
@@ -266,19 +349,34 @@ def _verify_landed(entries, workspace):
         if not repo.is_dir():
             raise SurvivorUnavailable("survivor_unavailable: landed repository missing")
         repo = repo.resolve(strict=True)
+        if _git(repo, "rev-parse", "--git-dir", check=False).returncode:
+            raise SurvivorUnavailable("survivor_unavailable: landed path is not a repository")
+        if any(repo.is_relative_to(root.resolve()) for root in _excluded_roots(workspace)):
+            # A workspace/board/temp tree is itself disposable: pointing `landed`
+            # at one would let the capture authorise deleting its own only copy.
+            raise SurvivorUnavailable("survivor_unavailable: landed repository is not a durable tree")
         resolved = _git(repo, "rev-parse", "--verify", f"{sha}^{{commit}}", check=False)
         if resolved.returncode:
             raise SurvivorUnavailable("survivor_unavailable: landed commit not in repository")
         sha = resolved.stdout.decode().strip()
         if _git(repo, "merge-base", "--is-ancestor", sha, "HEAD", check=False).returncode:
             raise SurvivorUnavailable("survivor_unavailable: landed commit not reachable from HEAD")
+        record = {"repository": str(repo), "sha": sha, "matched_by": "canonical",
+                  "branch": _git(repo, "rev-parse", "--abbrev-ref", "HEAD",
+                                 check=False).stdout.decode().strip() or "HEAD"}
         published = list(_published_refs(repo, workspace))
-        ref = _remote_survivor(repo, sha, published) or _content_survivor(repo, sha, published)
-        if not ref:
-            raise SurvivorUnavailable("survivor_unavailable: landed commit is not published on a durable remote")
-        verified.append({"repository": str(repo), "sha": sha, "remote": ref["remote"],
-                         "branch": ref["branch"], "published_sha": ref["sha"],
-                         "matched_by": ref.get("matched_by", "sha")})
+        ref = _remote_survivor(repo, sha, published)
+        if ref:
+            record["published"] = {"remote": ref["remote"], "branch": ref["branch"],
+                                   "sha": ref["sha"], "matched_by": "sha"}
+        else:
+            hint = _content_advisory(repo, sha, published)
+            if hint:
+                # Advisory: same diff on the mirror. Not why we accepted.
+                record["published"] = {"remote": hint["remote"], "branch": hint["branch"],
+                                       "sha": hint["sha"], "matched_by": "patch-id",
+                                       "advisory": True}
+        verified.append(record)
     return verified
 
 
@@ -384,9 +482,10 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None):
             if not isinstance(landed, list):
                 raise SurvivorUnavailable("survivor_unavailable: landed must be a list")
             # Explicit opt-in: the worker asserts the code already lives in a
-            # named repo, and we verify that claim against that repo's durable
-            # remote. Verified publication makes the workspace disposable, so we
-            # never pay for a snapshot of a 94 MB home clone.
+            # named LIVE repo, and we verify that claim against that repo (sha
+            # resolves + reachable from its HEAD). A verified live tree makes the
+            # workspace disposable, so we never pay for a snapshot of a 94 MB
+            # home clone.
             survivor = {"kind": "landed", "landed": _verify_landed(landed, workspace)}
             survivor["sidecar"] = _store(
                 conn, task_id, "implementation.json",
@@ -403,8 +502,18 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None):
             if not dirty and head.returncode == 0:
                 sha = head.stdout.decode().strip()
                 # A rewriting mirror republishes the same content under a new
-                # sha, so sha equality can never hold; fall back to content.
-                ref = _remote_survivor(repo, sha, published) or _content_survivor(repo, sha, published)
+                # sha, so sha equality can never hold for a home clone. The
+                # fallback is the LIVE CANONICAL TREE the workspace was cloned
+                # from — never a patch-id hit, which is diff identity only.
+                ref = (_remote_survivor(repo, sha, published)
+                       or _canonical_survivor(repo, sha, workspace))
+                if ref and ref.get("matched_by") == "canonical":
+                    hint = _content_advisory(repo, sha, published)
+                    if hint:
+                        ref = dict(ref, mirror_hint={
+                            "remote": hint["remote"], "branch": hint["branch"],
+                            "sha": hint["sha"], "matched_by": "patch-id", "advisory": True,
+                        })
             if ref:
                 refs.append(dict(ref, repository=key))
                 continue
@@ -420,11 +529,12 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None):
                 patches.append(header + data)
             repositories.append({"repository": key, "base_sha": base})
         if repos and len(refs) == len(repos):
-            by_content = any(ref.get("matched_by") == "patch-id" for ref in refs)
-            survivor = {"kind": "ref-by-content" if by_content else "ref", "refs": refs}
-            if by_content:
-                # The local sha exists nowhere durable; the manifest is the only
-                # record of which published commit carries the same content.
+            canonical = any(ref.get("matched_by") == "canonical" for ref in refs)
+            survivor = {"kind": "ref", "refs": refs}
+            if canonical:
+                # The published remote does not carry this sha; the manifest is
+                # the only record of which LIVE tree holds the work (plus any
+                # advisory mirror hint).
                 survivor["sidecar"] = _store(
                     conn, task_id, "implementation.json",
                     json.dumps(survivor, sort_keys=True).encode(), "application/json",

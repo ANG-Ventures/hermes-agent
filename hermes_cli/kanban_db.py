@@ -6570,18 +6570,16 @@ def complete_task(
         elif survivor['kind'] == 'bundle':
             survivor_note = f"survivor=bundle {survivor['sidecar']} NOT PUSHED"
         elif survivor['kind'] == 'landed':
-            # Verified published elsewhere: name the repo and the commit that
-            # actually carries the content on the durable remote.
+            # Verified against a LIVE canonical tree: name the repo and the
+            # commit that carries the work there.
             survivor_note = "survivor=landed " + " ".join(
-                f"{entry['repository']}@{entry['sha']}"
-                f"->{entry['remote']}/{entry['branch']}@{entry['published_sha']}"
-                f" ({entry['matched_by']})"
+                f"{entry['repository']}@{entry['sha']} ({entry['matched_by']})"
                 for entry in survivor["landed"]
             )
-        else:  # ref / ref-by-content
+        else:  # ref
             survivor_note = f"survivor={survivor['kind']} " + " ".join(
-                f"{ref['remote']}/{ref['branch']}@{ref['sha']}"
-                + (f" (patch-id of {ref['head']})" if ref.get("matched_by") == "patch-id" else "")
+                f"{ref.get('repository_path') or ref['remote']}/{ref['branch']}@{ref['sha']}"
+                + (" (live tree)" if ref.get("matched_by") == "canonical" else "")
                 for ref in survivor["refs"]
             )
         result = '\n'.join(filter(None, [result, survivor_note]))
