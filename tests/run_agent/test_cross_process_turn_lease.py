@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent import relay_runtime
+import hermes_state
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -681,6 +682,28 @@ def test_same_pid_active_holder_survives_expiry_until_release_unregisters(
     second.release_session_turn_lease("shared", waiter)
     first.close()
     second.close()
+
+
+def test_try_acquire_registers_before_write_and_unregisters_on_error(
+    tmp_path, monkeypatch
+):
+    db = SessionDB(tmp_path / "state.db")
+    holder = f"pid={os.getpid()}:turn=write-error:platform=discord"
+    observed = {"registered_during_write": False}
+
+    def fail_write(_fn, patience_s=None):
+        observed["registered_during_write"] = (
+            hermes_state._is_active_local_session_turn_lease_holder(holder)
+        )
+        raise sqlite3.OperationalError("forced acquire failure")
+
+    monkeypatch.setattr(db, "_execute_write", fail_write)
+    with pytest.raises(sqlite3.OperationalError, match="forced acquire failure"):
+        db.try_acquire_session_turn_lease("shared", holder)
+
+    assert observed["registered_during_write"] is True
+    assert not hermes_state._is_active_local_session_turn_lease_holder(holder)
+    db.close()
 
 
 def test_same_process_lease_contention_logs_both_relay_turn_ids(

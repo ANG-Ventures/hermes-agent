@@ -8652,9 +8652,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
             return owner is not None and owner["holder"] == holder
 
-        acquired = bool(self._execute_write(_do, patience_s=patience_s))
-        if acquired:
-            _register_active_session_turn_lease_holder(holder)
+        # Register before the durable write so another thread in this process
+        # cannot reclaim the just-expired row in the gap between SQLite commit
+        # and process-local registration. Roll back the registration whenever
+        # admission fails or raises.
+        _register_active_session_turn_lease_holder(holder)
+        try:
+            acquired = bool(self._execute_write(_do, patience_s=patience_s))
+        except Exception:
+            _unregister_active_session_turn_lease_holder(holder)
+            raise
+        if not acquired:
+            _unregister_active_session_turn_lease_holder(holder)
         return acquired
 
     def get_session_turn_lease_holder(self, session_id: str) -> Optional[str]:

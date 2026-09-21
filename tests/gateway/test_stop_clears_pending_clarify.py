@@ -14,6 +14,9 @@ The fix: ``_interrupt_and_clear_session`` calls ``clarify_gateway
 unblocks the waiting agent thread via the empty-string sentinel).
 """
 
+import logging
+import os
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -21,6 +24,7 @@ import pytest
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 from gateway.platforms.base import Platform
+from hermes_state import SessionDB
 from tools import clarify_gateway
 
 
@@ -124,6 +128,60 @@ async def test_stop_consumes_resume_pending_recovery_state():
     clear_resume_pending.assert_called_once_with(SESSION_KEY)
     assert SESSION_KEY not in runner._startup_resume_modes
     assert SESSION_KEY not in runner._resumed_this_boot
+
+
+@pytest.mark.asyncio
+async def test_stop_keeps_memory_resume_markers_when_durable_clear_fails(caplog):
+    runner = _bare_runner()
+    startup_marker = {"mode": "auto"}
+    runner._startup_resume_modes = {SESSION_KEY: startup_marker}
+    runner._resumed_this_boot = {SESSION_KEY}
+    runner.session_store.clear_resume_pending = MagicMock(
+        side_effect=OSError("state db unavailable")
+    )
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        await runner._interrupt_and_clear_session(
+            SESSION_KEY,
+            _source(),
+            interrupt_reason="stop_command",
+            invalidation_reason="stop_command",
+        )
+
+    assert runner._startup_resume_modes[SESSION_KEY] is startup_marker
+    assert SESSION_KEY in runner._resumed_this_boot
+    assert "Failed to clear resume-pending state" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_stop_releases_registered_turn_lease_before_cache_eviction(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("session-1", source="test")
+    active = f"pid={os.getpid()}:turn=stopped:platform=discord"
+    waiter = f"pid={os.getpid()}:turn=next:platform=discord"
+    assert db.try_acquire_session_turn_lease("session-1", active, ttl_seconds=300)
+
+    runner = _bare_runner()
+    agent = SimpleNamespace(
+        session_id="session-1",
+        _session_db=db,
+        _active_session_turn_lease_holder=active,
+        interrupt=MagicMock(),
+    )
+    runner._session_state(SESSION_KEY).turn.agent = agent
+
+    await runner._interrupt_and_clear_session(
+        SESSION_KEY,
+        _source(),
+        interrupt_reason="stop_command",
+        invalidation_reason="stop_command",
+    )
+
+    assert db.try_acquire_session_turn_lease("session-1", waiter, ttl_seconds=300)
+    # Keep the stale agent attribute as the late-flush ownership fence.
+    assert agent._active_session_turn_lease_holder == active
+    db.release_session_turn_lease("session-1", waiter)
+    db.close()
 
 
 @pytest.mark.asyncio
