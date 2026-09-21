@@ -751,3 +751,256 @@ def test_raising_lookup_without_prefetch_is_a_noop_with_one_warning(
     ]
     assert len(warnings) == 1, [r.getMessage() for r in warnings]
     assert "RuntimeError" in warnings[0].getMessage()
+
+
+
+
+def test_dispatch_tick_runs_no_subprocess_under_dispatch_lock(
+    kanban_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ZERO subprocesses under the writer lock — the whole class, not just gh.
+
+    Round-1 finding 4 was "network latency must not extend the board's
+    single-writer lock". Moving ``query_pr`` into the unlocked prefetch closed
+    the ``gh`` seam but left its sibling: ``repo_context()`` ->
+    ``_remotes_for()`` shells out to ``git remote -v`` with the same 5 s
+    timeout, and the locked revalidation pass re-parses every blocked card. A
+    degraded workspace (stale NFS mount, reclaimed scratch dir, held
+    ``index.lock``) therefore still held the lock for seconds per card.
+
+    The guard is deliberately on the SUBPROCESS seam rather than on either
+    function, so any future shell-out added to the locked pass fails here.
+    """
+    repo = tmp_path / "wt"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:o/r.git"],
+        cwd=repo, check=True,
+    )
+
+    lock_held = False
+    under_lock: list[list[str]] = []
+    real_run = subprocess.run
+
+    @contextlib.contextmanager
+    def tracked_lock(_db_path):
+        nonlocal lock_held
+        lock_held = True
+        try:
+            yield True
+        finally:
+            lock_held = False
+
+    def watched_run(argv, *a, **k):
+        if lock_held:
+            under_lock.append(list(argv)[:3])
+        return real_run(argv, *a, **k)
+
+    monkeypatch.setattr(kanban_db_connect, "_dispatch_tick_lock", tracked_lock)
+    monkeypatch.setattr(prg.subprocess, "run", watched_run)
+    monkeypatch.setattr(prg, "query_pr", lambda repo_, number: _merged())
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="gated card", workspace_path=str(repo),
+        )
+        kb.claim_task(conn, tid)
+        assert kb.block_task(
+            conn, tid, reason="merge PR #7 then unblock me", kind="needs_input",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+
+    with kb.connect() as conn:
+        result = kanban_db_dispatch.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
+
+    assert under_lock == [], f"subprocess ran under the dispatch lock: {under_lock}"
+    # The bare #7 still resolved against the workspace remote, so the gate
+    # actually fired — this is not a vacuous green from a skipped card.
+    assert result.gate_auto_resolved == [tid]
+
+
+def test_prefetch_repo_context_is_not_reused_when_the_card_changes(
+    kanban_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A card re-pointed between prefetch and the locked pass fails safe.
+
+    The prefetch's repo-context snapshot is only valid for the workspace/body
+    it was taken from. If either moved, the locked pass must take NO action
+    rather than resolve a bare ``#N`` against a stale repository.
+    """
+    repo = tmp_path / "wt"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:o/r.git"],
+        cwd=repo, check=True,
+    )
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="gated card", workspace_path=str(repo),
+        )
+        kb.claim_task(conn, tid)
+        assert kb.block_task(
+            conn, tid, reason="merge PR #7 then unblock me", kind="needs_input",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        prefetched = prg.prefetch_pr_gate_states(
+            conn, query_fn=_stub({("o/r", 7): _merged()}),
+        )
+        # The card moves to a different repository after the snapshot.
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            (str(tmp_path / "elsewhere"), tid),
+        )
+        conn.commit()
+        outcomes = prg.reevaluate_pr_gates(
+            conn, query_fn=_stub({("o/r", 7): _merged()}), prefetched=prefetched,
+        )
+
+    assert [o.action for o in outcomes] == []
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# Harness safety: a stubbed oracle may never write to a live board
+# ---------------------------------------------------------------------------
+
+
+def test_explicit_hermes_home_with_ambient_pin_is_not_treated_as_sandboxed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``HERMES_HOME`` alone does NOT sandbox kanban — prove it, don't assume.
+
+    ``HERMES_KANBAN_DB`` outranks ``HERMES_HOME`` in
+    :func:`kanban_db.kanban_db_path`, which is precisely why redirecting only
+    ``HERMES_HOME`` let a 2026-09-21 probe write to the production board. The
+    sandbox predicate must report False for that combination, and True once the
+    pin is neutralised.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    live = tmp_path / "live" / "kanban.db"
+    live.parent.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
+
+    # The pin wins, so the DB is NOT inside the sandbox home.
+    assert prg._db_is_sandboxed() is False
+
+    # Neutralising the pin is what actually sandboxes it.
+    monkeypatch.delenv("HERMES_KANBAN_DB")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    assert prg._db_is_sandboxed() is True
+
+
+def test_stubbed_oracle_against_a_non_sandbox_db_raises_instead_of_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact 2026-09-21 shape: stubbed ``query_pr`` + live board pin.
+
+    The probe redirected ``HERMES_HOME``, stubbed the oracle to return MERGED
+    unconditionally, and wrote 20 ``gate_auto_resolved`` events to production.
+    That combination must now fail closed and loudly, before any card is read.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    live = tmp_path / "live" / "kanban.db"
+    live.parent.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
+
+    with pytest.raises(prg.SandboxEscape) as excinfo:
+        prg.reevaluate_pr_gates(None, query_fn=_stub({("o/r", 7): _merged()}))
+
+    message = str(excinfo.value)
+    assert "STUBBED PR oracle" in message
+    assert "HERMES_KANBAN_SANDBOX=1" in message
+    # Nothing was created: the refusal precedes every read and every write.
+    assert not live.exists()
+
+
+def test_monkeypatching_the_module_attribute_does_not_vouch_for_the_stub(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rebinding ``prg.query_pr`` must not let a stub pass as the real oracle.
+
+    The guard compares against the oracle captured at import, so a harness that
+    monkeypatches the module attribute — which is what a probe calling
+    ``dispatch_once`` with no explicit ``query_fn`` does — is still caught.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    live = tmp_path / "live" / "kanban.db"
+    live.parent.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
+    monkeypatch.setattr(prg, "query_pr", lambda repo, number: _merged())
+
+    with pytest.raises(prg.SandboxEscape):
+        prg.reevaluate_pr_gates(None)
+
+    assert not live.exists()
+
+
+def test_the_real_oracle_is_allowed_even_in_a_test_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard gates FABRICATION, not test execution.
+
+    A genuine ``gh``-backed run carries real evidence, so it must pass even
+    under pytest against a non-sandbox board — otherwise the guard would break
+    the production dispatcher the moment anything set ``PYTEST_CURRENT_TEST``.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    live = tmp_path / "live" / "kanban.db"
+    live.parent.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
+
+    prg.assert_write_allowed(None)
+    prg.assert_write_allowed(prg._REAL_QUERY_PR)
+
+
+def test_a_sandboxed_board_allows_a_stubbed_oracle(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A correctly-sandboxed harness is unaffected — the guard is not a tax.
+
+    This is the negative control for the three tests above: the whole existing
+    suite runs stubbed oracles, and must keep running them.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    prg.assert_write_allowed(_stub({}))
+
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, reason="merge o/r#7 then unblock me")
+        outcomes = prg.reevaluate_pr_gates(
+            conn, query_fn=_stub({("o/r", 7): _merged()}),
+        )
+    assert [o.action for o in outcomes] == ["unblocked"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status in {"ready", "running"}
+
+
+def test_dispatch_once_propagates_a_sandbox_escape_instead_of_absorbing_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end replay of the 2026-09-21 incident, through ``dispatch_once``.
+
+    The dispatcher's PR-gate hooks are deliberately fail-open so a diagnostic
+    can never brick a tick. A sandbox escape is the one exception: absorbing it
+    would turn a loud, actionable refusal into a WARN the harness author never
+    reads — which is precisely how the original probe got to write 20 events.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    live = tmp_path / "pretend_production" / "kanban.db"
+    live.parent.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
+    # The incident shape exactly: the module attribute is rebound, so the
+    # dispatcher's own no-argument call picks up the fabricated oracle.

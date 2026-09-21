@@ -1936,6 +1936,8 @@ def _prefetch_pr_gates_for_tick(
 
         return kanban_pr_gate.prefetch_pr_gate_states(conn)
     except Exception as exc:
+        if type(exc).__name__ == "SandboxEscape":
+            raise  # see _reevaluate_pr_gates_for_tick: never absorbed.
         _kb._log.warning(
             "kanban dispatch: PR-gate prefetch failed (%s: %s); "
             "continuing this tick without gate mutation",
@@ -2216,6 +2218,13 @@ def _reevaluate_pr_gates(
             elif outcome.action == "closed_unmerged":
                 result.gate_closed_unmerged.append(outcome.task_id)
     except Exception as exc:
+        # A sandbox escape is NOT an ordinary fault to absorb: it means a
+        # harness with a fabricated PR oracle is pointed at a real board. The
+        # fail-open policy below exists so a diagnostic cannot brick dispatch;
+        # applying it here would instead reduce a loud, actionable refusal to a
+        # log line the harness author never reads. Re-raise.
+        if type(exc).__name__ == "SandboxEscape":
+            raise
         _kb._log.warning(
             "kanban dispatch: PR-gate re-evaluation failed (%s: %s); "
             "continuing this tick",
