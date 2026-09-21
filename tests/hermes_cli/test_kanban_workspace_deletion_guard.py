@@ -1373,3 +1373,52 @@ def test_owner_lookup_reuses_the_callers_connection_for_the_same_board(kanban_ho
 
     assert owners == [task_id], owners
     assert opened == [], f"opened a redundant connection: {opened}"
+
+
+def test_completion_commits_before_cleanup_so_the_workspace_is_removed(kanban_home):
+    """DISPUTE evidence for the "Completion cleanup gated" finding (#785).
+
+    The finding argued that `complete_task` passes the completing card's own
+    id into the new liveness gates, so if the terminal status and the claim
+    were not already committed, EVERY successful completion would silently
+    skip workspace removal and completed workspaces would accumulate.
+
+    Measured: they are. `complete_task` writes `status='done'`,
+    `claim_lock=NULL`, `claim_expires=NULL` inside `write_txn` BEFORE
+    `_cleanup_workspace` runs, so self-liveness is already False by then and
+    the directory is removed. This test pins that ORDERING, which is the load
+    bearing fact -- if a future change moves cleanup inside the transaction,
+    the gate really would refuse every completion and this goes red.
+    """
+    root = _scratch_root()
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn, title="completes", assignee="daedalus", workspace_kind="scratch",
+        )
+        ws = root / task_id
+        ws.mkdir(parents=True)
+        (ws / "work.txt").write_text("ephemeral\n", encoding="utf-8")
+        conn.execute(
+            "UPDATE tasks SET workspace_path=? WHERE id=?", (str(ws), task_id)
+        )
+        conn.commit()
+
+        # Claim it exactly as the dispatcher does: running + a live lock, the
+        # two conditions `_task_has_live_run` refuses on.
+        assert kb.claim_task(conn, task_id, claimer="probe:1", ttl_seconds=900)
+        assert kb.get_task(conn, task_id).status == "running"
+
+        assert kb.complete_task(conn, task_id, result="done", summary="s") is True
+
+        row = conn.execute(
+            "SELECT status, claim_expires FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+
+    assert row["status"] == "done"
+    assert row["claim_expires"] is None
+    assert not ws.exists(), (
+        "completion left its scratch workspace behind — the self-liveness "
+        "gate refused a card that had already been committed terminal"
+    )
+    lines = _audit_lines()
+    assert any("\tDELETE\t" in ln and "reason=complete_task" in ln for ln in lines), lines
