@@ -10274,13 +10274,58 @@ def set_task_model(
     ``task_id`` returns ``0`` (never a silent success), so callers can tell
     a real write from a no-op.
     """
-    return int(set_model_override(
-        conn,
-        task_id,
-        model,
-        firepower_reason=firepower_reason,
-        audit_comment_author=audit_comment_author,
-    ))
+    # NOTE: this deliberately does NOT delegate to ``set_model_override``.
+    # The two setters have different empty-string contracts: that one treats
+    # ``""`` as "clear the override" (-> NULL), while this one is literal and
+    # stores ``""`` verbatim. Delegating silently converted a literal ``""``
+    # into NULL. The flagship guard still runs here, so no writer skips it.
+    from hermes_cli.model_policy import (
+        firepower_guard_error,
+        format_firepower_audit,
+        is_firepower_model,
+    )
+
+    model, provider = _resolve_stored_model_pair(model, None)
+    guard_error = firepower_guard_error(
+        model, firepower_reason, reason_field="firepower_reason"
+    )
+    if guard_error:
+        raise ValueError(guard_error)
+
+    audit_comment_body: Optional[str] = None
+    if is_firepower_model(model):
+        audit_comment_body = format_firepower_audit(
+            model or "", provider, firepower_reason or ""
+        )
+        audit_comment_author = audit_comment_author or "operator"
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return 0
+        if row["status"] == "archived":
+            raise RuntimeError(
+                f"cannot set model override on archived task {task_id}"
+            )
+        cur = conn.execute(
+            "UPDATE tasks SET model_override = ?, provider_override = ? "
+            "WHERE id = ?",
+            (model, provider, task_id),
+        )
+        affected = int(cur.rowcount or 0)
+        _append_event(
+            conn, task_id, "model_override_set",
+            {"model": model, "provider": provider},
+        )
+        if audit_comment_body:
+            add_comment(
+                conn, task_id, audit_comment_author or "", audit_comment_body
+            )
+    # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
+    notify_task_updated(conn, task_id, ("model_override", "provider_override"))
+    return affected
 
 
 def set_branch_name(

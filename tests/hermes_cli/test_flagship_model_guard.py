@@ -337,3 +337,34 @@ def test_dispatch_tick_records_route_for_each_spawn(kanban_home, monkeypatch):
     assert result.spawn_routes == {
         task_id: "openai-codex/gpt-5.6-sol-900k",
     }
+
+
+def test_set_task_model_keeps_literal_empty_string_while_guarded(kanban_home):
+    """Guarding ``set_task_model`` must not change its empty-string contract.
+
+    ``set_task_model`` is literal: ``""`` is stored verbatim, unlike
+    ``set_model_override`` which treats ``""`` as "clear the override".
+    Routing the guard through the latter silently coerced ``""`` to NULL.
+    """
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="literal", assignee="worker")
+
+        assert kb.set_task_model(conn, task_id, "") == 1
+        raw = conn.execute(
+            "SELECT model_override FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        assert raw["model_override"] == ""
+
+        # None still clears to SQL NULL.
+        assert kb.set_task_model(conn, task_id, None) == 1
+        raw = conn.execute(
+            "SELECT model_override FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        assert raw["model_override"] is None
+
+        # A nonexistent id is a no-op, never a silent success.
+        assert kb.set_task_model(conn, "t_missing", "claude-opus-5") == 0
+
+        # ...and the guard is still armed on this path.
+        with pytest.raises(ValueError, match="firepower"):
+            kb.set_task_model(conn, task_id, "gpt-6-astra-900k")

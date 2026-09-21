@@ -248,6 +248,10 @@ def test_vendor_prefixed_override_forces_provider_on_spawn(
     Regression: passing the whole ``provider/model`` value through ``-m`` let
     the CLI strip the prefix while retaining the profile's openai-codex
     provider, routing ``claude-fable-5`` to the Codex endpoint.
+
+    ``claude-fable-5`` is a firepower model, so this explicitly deliberate
+    route carries a ``firepower_reason``; the subject under test is the
+    provider-prefix split, not the flagship guard.
     """
     profile_home = kanban_home / "profiles" / "worker"
     profile_home.mkdir(parents=True)
@@ -261,6 +265,7 @@ def test_vendor_prefixed_override_forces_provider_on_spawn(
             title="fable task",
             assignee="worker",
             model_override="claude-apx-6/claude-fable-5",
+            firepower_reason="regression fixture: vendor-prefixed route split",
         )
         task = kb.get_task(conn, tid)
 
