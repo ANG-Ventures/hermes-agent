@@ -16,6 +16,7 @@ import math
 import os
 import shutil
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass, replace
@@ -152,6 +153,15 @@ class DeferredRestartCoordinator:
         self._scheduled: dict[str, asyncio.Task] = {}
         self._owned_requests: dict[str, DeferredRestartRequest] = {}
         self._delivery_ready: set[str] = set()
+        # Leader-latch I/O is serialized so a durable write running on a worker
+        # thread cannot interleave with the compensating cleanup that runs when
+        # the awaiting coroutine is cancelled mid-write. Without this, the
+        # cleanup rmtree's the latch and the straggler write then RESURRECTS it
+        # (``_atomic_write_json`` re-mkdirs its parent), leaving an orphaned
+        # ``committed: true`` latch for a restart that was never signalled.
+        self._latch_io = threading.Lock()
+        self._latch_abandoned = False
+        self._latch_discard_thread: threading.Thread | None = None
 
     def scan(self) -> list[DeferredRestartRequest]:
         try:
@@ -287,17 +297,66 @@ class DeferredRestartCoordinator:
         committed: bool,
         commit_ts: float | None = None,
     ) -> None:
-        _atomic_write_json(
-            self.leader_dir / "meta.json",
-            {
-                "request_id": request.request_id,
-                "epoch": self.boot_id,
-                "pid": os.getpid(),
-                "boot_id": self.boot_id,
-                "committed": bool(committed),
-                "commit_ts": commit_ts,
-            },
+        with self._latch_io:
+            if self._latch_abandoned:
+                # This leadership attempt was already compensated (the awaiting
+                # coroutine was cancelled and the latch discarded). Writing now
+                # would re-create the latch directory underneath the cleanup and
+                # publish a committed latch for a restart nobody will signal.
+                logger.debug(
+                    "leader meta publish skipped for %s; latch already abandoned",
+                    request.request_id,
+                )
+                return
+            _atomic_write_json(
+                self.leader_dir / "meta.json",
+                {
+                    "request_id": request.request_id,
+                    "epoch": self.boot_id,
+                    "pid": os.getpid(),
+                    "boot_id": self.boot_id,
+                    "committed": bool(committed),
+                    "commit_ts": commit_ts,
+                },
+            )
+
+    def _claim_leader_latch(self) -> None:
+        """Mark a freshly-won latch as live again after a previous discard."""
+        with self._latch_io:
+            self._latch_abandoned = False
+
+    def _settle_leader_latch(self) -> None:
+        """Block until any pending discard has finished removing the latch.
+
+        The retry loop re-attempts the ``os.mkdir`` CAS; if a discard from the
+        previous attempt were still pending, it would delete the latch this
+        attempt just won.
+        """
+        thread = self._latch_discard_thread
+        if thread is not None:
+            thread.join(timeout=5.0)
+            self._latch_discard_thread = None
+
+    def _discard_leader_latch(self) -> None:
+        """Abandon this leadership attempt and remove the latch.
+
+        Runs on a daemon thread rather than inline: it must be able to WAIT for
+        an in-flight worker-thread meta publish to finish, and its caller is a
+        ``finally`` block that may already be unwinding a cancellation (where an
+        ``await`` would immediately re-raise) and must not block the event loop
+        on latch I/O either way.
+        """
+
+        def _discard() -> None:
+            with self._latch_io:
+                self._latch_abandoned = True
+                shutil.rmtree(self.leader_dir, ignore_errors=True)
+
+        thread = threading.Thread(
+            target=_discard, name="deferred-restart-latch-discard", daemon=True
         )
+        self._latch_discard_thread = thread
+        thread.start()
 
     def _read_leader_meta(self) -> dict[str, Any] | None:
         try:
@@ -329,12 +388,17 @@ class DeferredRestartCoordinator:
 
         retry_delay = 0.01
         while True:
+            # A discard from a previous attempt runs on its own thread; let it
+            # finish before re-running the CAS, or it would delete the latch
+            # this attempt is about to win.
+            await asyncio.to_thread(self._settle_leader_latch)
             try:
                 os.mkdir(self.leader_dir)
                 winner = True
             except FileExistsError:
                 winner = False
             if winner:
+                self._claim_leader_latch()
                 try:
                     return await self._run_as_leader(
                         request,
@@ -486,7 +550,7 @@ class DeferredRestartCoordinator:
             return "signaled"
         finally:
             if not committed:
-                shutil.rmtree(self.leader_dir, ignore_errors=True)
+                self._discard_leader_latch()
 
 
 def reconcile_deferred_restarts_at_boot(

@@ -330,3 +330,131 @@ async def test_delivery_barrier_is_registered_before_the_arm_returns(tmp_path):
 
     release_arm.set()
     await asyncio.gather(*runner._background_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_commit_publish_cannot_resurrect_the_leader_latch(tmp_path):
+    """A cancelled leader must not leave a committed latch behind.
+
+    Moving ``_publish_leader_meta`` to a worker thread opened a window: cancel
+    the awaiting task while the COMMIT publish is in flight and ``committed``
+    stays False, so the ``finally`` removes the latch -- and the straggler
+    worker-thread write then RE-CREATES it, because ``_atomic_write_json``
+    does ``path.parent.mkdir(parents=True, exist_ok=True)``.  The result is an
+    orphaned ``committed: true`` latch for a restart that was never signalled,
+    which the next boot's reconciliation reads as a real actuation.
+
+    This pins the invariant directly: after the dust settles, there is no
+    committed latch unless ``signal_restart`` actually fired.
+    """
+    submit_deferred_restart(
+        tmp_path, session_key=SESSION_KEY, handoff="h", boot_id=BOOT_ID
+    )
+    coordinator = DeferredRestartCoordinator(tmp_path, boot_id=BOOT_ID)
+    coordinator.arm_for_session(SESSION_KEY, consume_breadcrumb=lambda _k: True)
+
+    in_commit = threading.Event()
+    release_commit = threading.Event()
+    real_publish = coordinator._publish_leader_meta
+
+    def _slow_commit_publish(request, *, committed: bool, commit_ts=None):
+        if committed:
+            in_commit.set()
+            # Bounded so a genuine deadlock fails rather than hangs.
+            release_commit.wait(timeout=10.0)
+        return real_publish(request, committed=committed, commit_ts=commit_ts)
+
+    coordinator._publish_leader_meta = _slow_commit_publish  # type: ignore[method-assign]
+
+    signalled: list[str] = []
+    delivered = asyncio.Event()
+    delivered.set()
+
+    task = coordinator.schedule_armed(
+        SESSION_KEY,
+        delivery_event=delivered,
+        delivery_timeout=1.0,
+        record_replay=lambda _request: None,
+        mark_self=lambda _request: None,
+        signal_restart=lambda: signalled.append("signal"),
+    )
+
+    assert await asyncio.to_thread(in_commit.wait, 10.0), (
+        "the leader never reached its commit publish"
+    )
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The compensating cleanup has run.  Now let the parked worker thread
+    # finish its write and give the discard thread time to settle.
+    release_commit.set()
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if not coordinator.leader_dir.exists():
+            break
+
+    assert not signalled, "the cancelled leader must not have signalled a restart"
+    meta = coordinator._read_leader_meta()
+    assert not (meta and meta.get("committed") is True), (
+        "a cancelled leader resurrected a committed latch: the next boot would "
+        f"read it as a real actuation ({meta})"
+    )
+    assert not coordinator.leader_dir.exists(), (
+        "the leader latch survived the cancelled attempt and will block every "
+        "later election this boot"
+    )
+
+
+def test_replay_mark_autosuspend_persists_under_the_store_lock(tmp_path, monkeypatch):
+    """The auto-suspend RMW must be one critical section under ``_lock``.
+
+    This PR hands ``_record_restart_replay_mark`` to ``asyncio.to_thread`` via
+    the deferred SELF ``record_replay`` callback, so it now runs concurrently
+    with loop-side store mutations.  ``SessionStore._save`` is documented
+    "while the caller holds ``_lock``"; reading the entry, mutating it and
+    persisting without that lock can publish a torn snapshot.
+    """
+    import gateway.run as run
+    from gateway.config import GatewayConfig, Platform
+    from gateway.session import SessionSource, SessionStore
+
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    entry = store.get_or_create_session(
+        SessionSource(platform=Platform.TELEGRAM, chat_id="123", user_id="u1")
+    )
+
+    runner = object.__new__(run.GatewayRunner)
+    runner.session_store = store
+    counts: dict = {}
+    runner._load_restart_failure_counts = lambda: counts
+    runner._save_restart_failure_counts = lambda data: counts.update(data)
+
+    monkeypatch.setattr(run, "_restart_loop_threshold", lambda: 1)
+    monkeypatch.setattr(run, "_restart_loop_window_secs", lambda: 3600.0)
+
+    lock_held_at_save: list[bool] = []
+    real_save = store._save
+
+    def _spy_save(*args, **kwargs):
+        # ``threading.Lock`` exposes no owner; a non-blocking acquire from this
+        # same thread fails iff the lock is currently held by anyone.
+        acquired = store._lock.acquire(blocking=False)
+        if acquired:
+            store._lock.release()
+        lock_held_at_save.append(not acquired)
+        return real_save(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_save", _spy_save)
+
+    runner._record_restart_replay_mark(entry.session_key)
+
+    assert store._entries[entry.session_key].suspended, (
+        "the auto-suspend branch did not run, so this test proved nothing"
+    )
+    assert lock_held_at_save and all(lock_held_at_save), (
+        "_record_restart_replay_mark persisted the session store without "
+        "holding SessionStore._lock; on a worker thread that can interleave "
+        "with a loop-side write and persist a torn snapshot"
+    )

@@ -13968,10 +13968,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         alert = False
         if len(marks) >= threshold:
             try:
-                session_entry = self.session_store._entries.get(session_key)
-                if session_entry and not session_entry.suspended:
-                    session_entry.suspended = True
-                    self.session_store._save()
+                # ``_save`` is documented "while the caller holds ``_lock``" and
+                # this whole method now runs on a worker thread (the deferred
+                # SELF ``record_replay`` hands it to ``asyncio.to_thread``), so
+                # the single-threaded accident that made the bare call benign is
+                # gone: the read/mutate/persist must be one locked critical
+                # section or it can interleave with a loop-side store write and
+                # persist a torn snapshot. ``_lock`` is a plain, non-reentrant
+                # ``threading.Lock``, so this inlines ``suspend_session``'s body
+                # rather than calling it. Loading is deliberately NOT forced
+                # here: an unloaded store has no entry to suspend, which is the
+                # pre-existing behaviour of this branch.
+                with self.session_store._lock:  # noqa: SLF001 — locked RMW
+                    session_entry = self.session_store._entries.get(session_key)
+                    if session_entry and not session_entry.suspended:
+                        session_entry.suspended = True
+                        self.session_store._save()
             except Exception:
                 pass
             if not entry.get("armed", False):
