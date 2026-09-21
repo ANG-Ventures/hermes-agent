@@ -11025,8 +11025,8 @@ def _release_claim_for_workspace_refusal(conn, task_id, result, reason):
         retry_status = _retry_status_for_run(conn, task_id, run_id)
         conn.execute(
             "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, "
-            "worker_pid=NULL WHERE id=? AND status='running'",
-            (retry_status, task_id),
+            "worker_pid=NULL WHERE id=? AND current_run_id=?",
+            (retry_status, task_id, run_id),
         )
         closed_run_id = _end_run(
             conn, task_id, outcome="workspace_refused",
@@ -15054,12 +15054,26 @@ def _dispatch_once_locked(
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        from hermes_cli.kanban_workspace_policy import (
+            WorkspaceUnavailable, validate_persisted, validate_target,
+        )
         try:
+            protected = _validate_workspace_admission(
+                claimed, board=board, conn=conn,
+            )
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = resolve_workspace(claimed, board=board)
+            if protected is not None:
+                validate_target(protected, workspace)
+                validate_persisted(workspace)
+        except WorkspaceUnavailable as exc:
+            _release_claim_for_workspace_refusal(
+                conn, claimed.id, result, str(exc),
+            )
+            continue
         except Exception as exc:
             # A workspace anchor that can never resolve (bare repo, non-repo
             # path, missing default_workdir) is a capability wall: retrying it

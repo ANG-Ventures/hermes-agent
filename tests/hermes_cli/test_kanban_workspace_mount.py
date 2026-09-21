@@ -247,6 +247,36 @@ def test_post_claim_mount_race_requeues_without_failure_charge(home, monkeypatch
         assert run['outcome'] == 'workspace_refused'
 
 
+def test_review_post_claim_mount_race_returns_to_review(home, monkeypatch):
+    root = home / 'volume' / 'kanban-workspaces'
+    root.mkdir(parents=True)
+    configure(home, root)
+    monkeypatch.setattr('os.path.ismount', lambda p: Path(p) == root.parent)
+    from hermes_cli import kanban_workspace_policy as policy
+
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title='review mount race', assignee='default')
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        assert kb.request_review(
+            conn, task_id, reviewer='default',
+            expected_run_id=claimed.current_run_id,
+        )
+
+        def vanish_during_create(_root, _path):
+            raise policy.WorkspaceUnavailable(f'workspaces_root_unmounted: {root}')
+
+        monkeypatch.setattr(policy, 'create_scratch', vanish_during_create)
+        result = kb.dispatch_once(conn, spawn_fn=lambda *_args, **_kw: None)
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == 'review'
+        assert task.current_run_id is None
+        assert task.consecutive_failures == 0
+        assert not result.spawn_failed
+        assert task_id in [item[0] for item in result.workspace_refused]
+
+
 def test_most_specific_historical_root_wins(home, monkeypatch):
     broad = home / 'volume'
     specific = broad / 'kanban-workspaces'
