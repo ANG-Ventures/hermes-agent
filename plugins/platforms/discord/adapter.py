@@ -2701,7 +2701,7 @@ class DiscordAdapter(BasePlatformAdapter):
             # 429. The scheduled in-process retry owns recovery; this reconnect
             # stands down.
             backoff_until = float(entry.get("backoff_until") or 0)
-            if backoff_until > now:
+            if backoff_until > now and entry.get("fingerprint") == fingerprint:
                 remaining = max(1, int(backoff_until - now))
                 attempts = int(entry.get("retry_attempts") or 0)
                 return (
@@ -2772,7 +2772,9 @@ class DiscordAdapter(BasePlatformAdapter):
         if attempts >= _DISCORD_COMMAND_SYNC_RETRY_MAX_ATTEMPTS:
             return None
         retry_after_until = float(entry.get("retry_after_until") or 0)
-        delay = max(0.0, retry_after_until - time.time())
+        # The in-process retry must serve the escalating backoff too.
+        backoff_until = float(entry.get("backoff_until") or 0)
+        delay = max(0.0, max(retry_after_until, backoff_until) - time.time())
         # Jitter so a fleet of adapters recovering from the same outage does
         # not stampede Discord's bucket at the identical instant.
         return delay + random.uniform(0.0, _DISCORD_COMMAND_SYNC_RETRY_JITTER_SECONDS)
@@ -2846,6 +2848,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 for command in await tree.fetch_commands()
             }
         except Exception:
+            # Throttle failed attempts too: liveness probes run every 15s.
+            self._last_command_drift_check_at = time.time()
             logger.debug("[%s] Command registry drift check failed", self.name, exc_info=True)
             return None
 
@@ -2865,6 +2869,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def _maybe_check_command_registry_drift(self) -> None:
         """Run the drift check at most once per interval (fail-soft)."""
+        if self._get_discord_command_sync_policy() != "safe":
+            return
         last = getattr(self, "_last_command_drift_check_at", 0.0) or 0.0
         if time.time() - last < _DISCORD_COMMAND_DRIFT_CHECK_INTERVAL_SECONDS:
             return
@@ -2973,6 +2979,20 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def _run_post_connect_initialization(self, *, is_rate_limit_retry: bool = False) -> None:
         """Finish non-critical startup work after Discord is connected."""
+        if not self._client:
+            return
+        # Retry and reconnect can arrive together at the backoff deadline.
+        # Serialize them so the waiter rechecks the persisted sync state.
+        lock = getattr(self, "_post_connect_sync_lock", None)
+        if lock is None:
+            lock = self._post_connect_sync_lock = asyncio.Lock()
+        async with lock:
+            await self._run_post_connect_initialization_locked(
+                is_rate_limit_retry=is_rate_limit_retry
+            )
+
+    async def _run_post_connect_initialization_locked(self, *, is_rate_limit_retry: bool = False) -> None:
+        # The client may have been torn down while waiting for the lock.
         if not self._client:
             return
         try:
