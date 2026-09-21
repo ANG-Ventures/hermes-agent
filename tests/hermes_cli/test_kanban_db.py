@@ -720,12 +720,20 @@ def test_delete_task_missing_returns_false_not_running_error(kanban_home):
 # wrote six real cards to the production board.
 
 def test_kanban_db_override_outranks_hermes_home_without_sandbox(tmp_path, monkeypatch):
-    """Documents the trap: HERMES_HOME alone does NOT sandbox kanban."""
+    """The trap is now closed: HERMES_HOME alone does not sandbox, so we refuse.
+
+    The pin still OUTRANKS ``HERMES_HOME`` — that precedence is unchanged and is
+    what the dispatcher→worker handoff depends on. What changed is that a caller
+    which stated an isolation intent and would have silently got the live board
+    gets an error instead of a path.
+    """
     live = tmp_path / "live" / "kanban.db"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "scratch"))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
     monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
-    assert kb.kanban_db_path() == live
+    monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.kanban_db_path()
 
 
 def test_sandbox_flag_makes_hermes_home_win_over_every_path_pin(tmp_path, monkeypatch):
@@ -892,8 +900,13 @@ def test_sandboxed_worker_env_cannot_reach_live_board(tmp_path, monkeypatch):
     assert not live_board.exists()
 
 
-def test_override_escaping_hermes_home_warns_once(tmp_path, monkeypatch, caplog):
-    """The escape is loud, not silent — but only once per (root, target)."""
+def test_override_escaping_hermes_home_REFUSES(tmp_path, monkeypatch):
+    """The escape is REFUSED, not merely logged — every time, not once.
+
+    This is the t_d2b884e7 shape: the warning fired, verbatim and accurate,
+    and the probe wrote a junk card plus 17 events onto 16 production cards
+    anyway. A warning on a destructive path is fail-open.
+    """
     live = tmp_path / "live" / "kanban.db"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "scratch"))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
@@ -902,16 +915,81 @@ def test_override_escaping_hermes_home_warns_once(tmp_path, monkeypatch, caplog)
     monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
     monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
 
-    with caplog.at_level("WARNING", logger=kb.__name__):
-        assert kb.kanban_db_path() == live
-        assert kb.kanban_db_path() == live
-    warnings = [r for r in caplog.records if "did NOT" in r.getMessage()]
-    assert len(warnings) == 1
-    assert "HERMES_KANBAN_SANDBOX=1" in warnings[0].getMessage()
+    with pytest.raises(kb.KanbanPinDivergenceError) as first:
+        kb.kanban_db_path()
+    assert "did NOT" in str(first.value)
+    assert "HERMES_KANBAN_SANDBOX=1" in str(first.value)
+    # A second call must refuse too: a warn-once ledger here would let a
+    # caller simply retry its way onto the live board.
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.kanban_db_path()
+    # And the live DB was never created, because no path was ever handed back.
+    assert not live.exists()
 
 
-def test_no_warning_when_override_lives_inside_hermes_home(tmp_path, monkeypatch, caplog):
-    """The dispatcher's normal pin (inside the root) must not warn."""
+def test_diverged_pin_cannot_create_a_task_or_append_an_event(tmp_path, monkeypatch):
+    """The acceptance shape: no WRITE can reach the pinned live board.
+
+    The incident was not a bad path string, it was rows on production cards.
+    Drive the actual mutation entry points, not just the resolver.
+    """
+    live_root = tmp_path / "live"
+    live_root.mkdir()
+    live = live_root / "kanban.db"
+    # Build a REAL board at the pinned path first, with HERMES_HOME agreeing,
+    # so the refusal below cannot be confused with "the DB did not exist".
+    monkeypatch.setenv("HERMES_HOME", str(live_root))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
+    with kb.connect() as conn:
+        real_task = kb.create_task(conn, title="production card", assignee="alice")
+    before = _row_and_event_counts(live)
+    assert before["tasks"] == 1
+
+    # Now the incident: redirect HERMES_HOME to sandbox, pin still points live.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "scratch"))
+    monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
+
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.kanban_db_path()
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.connect()
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        with kb.connect_closing() as conn:
+            kb.create_task(conn, title="junk card")
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        with kb.connect_closing() as conn:
+            kb._append_event(conn, real_task, "review_stale_alerted", {})
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.init_db()
+
+    assert _row_and_event_counts(live) == before
+
+
+def _row_and_event_counts(db_path: Path) -> dict:
+    """Read tasks/events straight off disk, bypassing kanban_db entirely.
+
+    Deliberately NOT via ``kb.connect()``: the guard under test refuses that,
+    and a counting helper that the guard can block would make the assertion
+    vacuous.
+    """
+    import sqlite3 as _sqlite3
+
+    conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        return {
+            "tasks": conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
+            "events": conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0],
+        }
+    finally:
+        conn.close()
+
+
+def test_no_refusal_when_override_lives_inside_hermes_home(tmp_path, monkeypatch):
+    """The dispatcher's normal pin (inside the root) must resolve untouched."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
@@ -920,20 +998,35 @@ def test_no_warning_when_override_lives_inside_hermes_home(tmp_path, monkeypatch
     monkeypatch.setenv("HERMES_KANBAN_DB", str(inside))
     monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
 
-    with caplog.at_level("WARNING", logger=kb.__name__):
-        assert kb.kanban_db_path() == inside
-    assert [r for r in caplog.records if "did NOT" in r.getMessage()] == []
+    assert kb.kanban_db_path() == inside
+
+
+def test_pin_without_hermes_home_still_resolves(tmp_path, monkeypatch):
+    """The ordinary operator case: a pin and no HERMES_HOME at all.
+
+    Nobody claimed an isolation intent here, so there is no divergence to
+    refuse and the pin must keep working exactly as before.
+    """
+    live = tmp_path / "live" / "kanban.db"
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
+
+    assert kb.kanban_db_path() == live
 
 
 # --- pin vs EXPLICIT board argument ----------------------------------------
 #
-# The other silent shape: the caller passes a board argument, the pin resolves
-# to a DIFFERENT board's DB, and the pin wins with no signal — so the caller
-# reads a board it did not ask for. Produced two wrong readings inside one task
-# (t_a1e6e877): a repro that wrote junk cards to the live default board, and a
-# review probe that nearly became a false BEHAVIOUR finding against correct
-# code. Resolution stays pin-wins (the dispatcher->worker handoff depends on
-# it); only the silence is fixed.
+# The other shape of the same class: the caller passes a board argument, the
+# pin resolves to a DIFFERENT board's DB, and the pin wins — so the caller
+# reads (and writes) a board it did not ask for. Produced two wrong readings
+# inside one task (t_a1e6e877): a repro that wrote junk cards to the live
+# default board, and a review probe that nearly became a false BEHAVIOUR
+# finding against correct code. Making it loud did not stop it (t_d2b884e7),
+# so the contradiction now REFUSES.
 
 _CONTRADICTION_MARKER = "outranks the board argument"
 
@@ -947,116 +1040,103 @@ def _pin_contradiction_env(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
     monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
     monkeypatch.setattr(kb, "_CHECKED_PIN_BOARD_CONTRADICTIONS", set())
-    monkeypatch.setattr(kb, "_PIN_CONTRADICTION_WARNED", {})
     pinned = kb.board_dir("pinned-board") / "kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
     return pinned
 
 
-def test_pin_contradicting_explicit_board_arg_warns_once(
-    _pin_contradiction_env, caplog,
-):
-    """The contradiction is loud, names both paths, and fires once."""
+def test_pin_contradicting_explicit_board_arg_REFUSES(_pin_contradiction_env):
+    """The contradiction raises, names both paths, and raises EVERY time."""
     pinned = _pin_contradiction_env
-    with caplog.at_level("WARNING", logger=kb.__name__):
-        # Resolution is UNCHANGED: the pin still wins.
-        assert kb.kanban_db_path("other-board") == pinned
-        assert kb.kanban_db_path("other-board") == pinned
-    warnings = [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()]
-    assert len(warnings) == 1
-    message = warnings[0].getMessage()
+    with pytest.raises(kb.KanbanPinDivergenceError) as first:
+        kb.kanban_db_path("other-board")
+    message = str(first.value)
+    assert _CONTRADICTION_MARKER in message
     # Must name the board asked for AND both paths, or it can't be acted on.
     assert "other-board" in message
     assert str(pinned) in message
     assert str(kb.board_dir("other-board") / "kanban.db") in message
     assert "HERMES_KANBAN_SANDBOX=1" in message
+    # Not warn-once: a retry must not succeed where the first call refused.
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.kanban_db_path("other-board")
+    # And the same refusal reaches a caller going through connect().
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.connect(board="other-board")
 
 
-def test_pin_contradiction_warns_without_hermes_home(
-    _pin_contradiction_env, monkeypatch, caplog,
+def test_pin_contradiction_refuses_without_hermes_home(
+    _pin_contradiction_env, monkeypatch,
 ):
-    """The gap shape: no HERMES_HOME, so the escape warning cannot fire.
+    """The gap shape: no HERMES_HOME, so the escape guard cannot fire.
 
-    ``_warn_if_override_escapes_hermes_home`` returns early with no
-    ``HERMES_HOME`` set. This case must still be loud, or the exact situation
-    that produced the two wrong readings stays silent.
+    ``_refuse_if_override_escapes_hermes_home`` returns early with no
+    ``HERMES_HOME`` set. This case must still refuse, or the exact situation
+    that produced the two wrong readings stays fail-open.
     """
     monkeypatch.delenv("HERMES_HOME", raising=False)
-    with caplog.at_level("WARNING", logger=kb.__name__):
+    with pytest.raises(kb.KanbanPinDivergenceError) as err:
         kb.kanban_db_path("other-board")
-    assert [r for r in caplog.records if "did NOT" in r.getMessage()] == []
-    assert [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()]
+    assert _CONTRADICTION_MARKER in str(err.value)
+    assert "did NOT" not in str(err.value)
 
 
-def test_no_contradiction_warning_when_pin_matches_requested_board(
-    _pin_contradiction_env, caplog,
-):
-    """The normal worker case: pin and board argument agree. Must be silent."""
-    with caplog.at_level("WARNING", logger=kb.__name__):
-        assert kb.kanban_db_path("pinned-board") == _pin_contradiction_env
-    assert [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()] == []
+def test_no_refusal_when_pin_matches_requested_board(_pin_contradiction_env):
+    """The normal worker case: pin and board argument agree. Must resolve."""
+    assert kb.kanban_db_path("pinned-board") == _pin_contradiction_env
 
 
-def test_no_contradiction_warning_when_board_arg_is_none(
-    _pin_contradiction_env, caplog,
-):
+def test_no_refusal_when_board_arg_is_none(_pin_contradiction_env):
     """board=None means the pin IS the intended source of truth — no conflict."""
-    with caplog.at_level("WARNING", logger=kb.__name__):
-        assert kb.kanban_db_path() == _pin_contradiction_env
-    assert [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()] == []
+    assert kb.kanban_db_path() == _pin_contradiction_env
 
 
-def test_sandbox_flag_suppresses_contradiction_warning(
-    _pin_contradiction_env, monkeypatch, caplog,
+def test_sandbox_flag_neutralises_the_pin_so_nothing_refuses(
+    _pin_contradiction_env, monkeypatch,
 ):
-    """Under the sandbox the pin is neutralised, so there is nothing to warn about."""
+    """The documented escape hatch: HERMES_KANBAN_SANDBOX=1 still isolates.
+
+    Under the sandbox the pin is neutralised, so the divergence cannot arise
+    and the requested board resolves for real.
+    """
     monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")
-    with caplog.at_level("WARNING", logger=kb.__name__):
-        resolved = kb.kanban_db_path("other-board")
+    resolved = kb.kanban_db_path("other-board")
     assert resolved == kb.board_dir("other-board") / "kanban.db"
-    assert [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()] == []
 
 
-def test_board_enumeration_does_not_spam_contradiction_warnings(
-    _pin_contradiction_env, caplog,
-):
-    """Bulk enumeration must stay quiet, or the guard gets trained away.
+def test_board_enumeration_does_not_trip_the_refusal(_pin_contradiction_env):
+    """Bulk enumeration must not refuse, or every sweep dies under a pin.
 
     ``read_board_metadata`` fills a display ``db_path`` for every board on
-    disk; under a pin every non-active slug trivially disagrees. Measured at
-    64 warnings on one dispatcher sweep before this was scoped out.
+    disk; under a pin every non-active slug trivially disagrees. With the
+    guard raising, an unscoped sweep would not merely be noisy — it would
+    break the dispatcher.
     """
     for slug in ("alpha-board", "beta-board", "gamma-board"):
         (kb.board_dir(slug)).mkdir(parents=True, exist_ok=True)
         (kb.board_dir(slug) / "board.json").write_text("{}", encoding="utf-8")
-    with caplog.at_level("WARNING", logger=kb.__name__):
-        boards = kb.list_boards(include_archived=False)
-        kb.count_running_tasks_other_boards(board="pinned-board")
+    boards = kb.list_boards(include_archived=False)
+    kb.count_running_tasks_other_boards(board="pinned-board")
     assert len(boards) >= 4  # default + the three created above
-    assert [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()] == []
 
 
-def test_no_board_enumerator_spams_contradiction_warnings(
-    _pin_contradiction_env, caplog,
-):
-    """Class gate, part 1: every REACHABLE board-enumerating entry point.
+def test_no_board_enumerator_trips_the_refusal(_pin_contradiction_env):
+    """Class gate: every REACHABLE board-enumerating entry point must survive.
 
     Discovery is derived from ``list_boards()`` rather than from a hand-written
     list of slugs, and each entry point is driven end-to-end so the nested
     ``connect()`` / ``connect_closing()`` resolutions are covered too. That
-    nesting is why the first cut failed review: it passed a per-call
-    ``warn_on_pin_contradiction=False`` flag at each ``kanban_db_path()`` site,
-    but ``_board_task_counts`` and ``_board_counts`` also open the board, and
-    ``connect()`` re-resolves the path internally with no flag to thread
-    through. Measured on that design, ``_board_task_counts`` still emitted 8
-    warnings over 8 boards despite its call site being flagged.
+    nesting is why a per-call flag cannot work: ``_board_task_counts`` and
+    ``_board_counts`` also open the board, and ``connect()`` re-resolves the
+    path internally with no flag to thread through.
+
+    Now that the guard RAISES, an unscoped enumerator is not a noise bug — it
+    is an outage. This gate is what proves the ``enumerating_boards`` extent
+    covers them all.
 
     DOES NOT COVER: enumerators that are nested closures inside a running
     coroutine (``gateway/kanban_watchers.py``'s ``_board_db_fingerprint``) are
-    not importable and cannot be driven from here. Those are bounded instead by
-    the per-process ceiling — see
-    ``test_pin_contradiction_warnings_are_capped_regardless_of_board_count``,
-    which is the part of this gate that does not require registration.
+    not importable and cannot be driven from here.
     """
     from hermes_cli import kanban as kc
     from plugins.kanban.dashboard import plugin_api
@@ -1073,7 +1153,7 @@ def test_no_board_enumerator_spams_contradiction_warnings(
     # for all of them, matching the live worker shape.
     with kb.enumerating_boards():
         kb.connect(board="pinned-board").close()
-    assert kb.kanban_db_path("alpha-board").exists()
+        assert kb.kanban_db_path("alpha-board").exists()
 
     def _slugs():
         return [b["slug"] for b in kb.list_boards(include_archived=False)]
@@ -1091,133 +1171,101 @@ def test_no_board_enumerator_spams_contradiction_warnings(
         ),
         # The enrich loops themselves, driven end-to-end. These are the
         # body-spanning extents; a half-applied one (resolve scoped, open not)
-        # shows up here as a non-zero count.
+        # shows up here as a refusal.
         "dashboard GET /boards (enrich loop)": (
             lambda: plugin_api.list_boards(include_archived=False)
         ),
     }
     offenders = {}
     for name, call in entry_points.items():
-        caplog.clear()
         kb._CHECKED_PIN_BOARD_CONTRADICTIONS.clear()
-        kb._PIN_CONTRADICTION_WARNED.clear()
-        with caplog.at_level("WARNING", logger=kb.__name__):
+        try:
             call()
-        hits = [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()]
-        if hits:
-            offenders[name] = len(hits)
-    assert offenders == {}, f"board enumerators spamming the pin guard: {offenders}"
+        except kb.KanbanPinDivergenceError as exc:
+            offenders[name] = str(exc)
+    assert offenders == {}, f"board enumerators tripping the pin guard: {offenders}"
 
 
-def test_pin_contradiction_warnings_are_capped_regardless_of_board_count(
-    _pin_contradiction_env, caplog,
+def test_unscoped_sweep_refuses_on_the_FIRST_board_not_the_eightieth(
+    _pin_contradiction_env,
 ):
-    """Class gate, part 2: the ceiling holds for an UNREGISTERED enumerator.
+    """A forgetful enumerator fails fast and identically at any scale.
 
-    Part 1 can only drive enumerators a test can reach. The failure it cannot
-    prevent is the one that already happened twice: a new per-board loop lands
-    somewhere nobody registers, and at 65 live boards it burns 65 log lines per
-    process and trains operators to ignore the guard.
-
-    So the bound is structural rather than registered. This drives a
-    deliberately UNSCOPED sweep — exactly what a forgetful author would
-    write — over two board counts an order of magnitude apart, and asserts the
-    emitted volume is capped and SCALE-INVARIANT. No registration required for
-    a new site to be bounded; forgetting the extent costs a handful of lines,
-    never one per board.
+    The previous design bounded WARNINGS with a per-call-site budget, and that
+    budget was itself a fail-open surface: past the ceiling a genuine
+    single-board misreading went silent. A refusal has no budget to exhaust —
+    it stops at the first divergence, at 8 boards and at 80 alike.
     """
-    def _unscoped_sweep(n: int) -> int:
+    def _boards_reached_before_refusal(n: int) -> int:
         kb._CHECKED_PIN_BOARD_CONTRADICTIONS.clear()
-        kb._PIN_CONTRADICTION_WARNED.clear()
-        caplog.clear()
-        with caplog.at_level("WARNING", logger=kb.__name__):
-            for i in range(n):
+        reached = 0
+        for i in range(n):
+            try:
                 kb.kanban_db_path(f"sweep{n}-board-{i}")  # no enumerating_boards()
-        return len([
-            r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()
-        ])
+            except kb.KanbanPinDivergenceError:
+                break
+            reached += 1
+        return reached
 
-    small = _unscoped_sweep(8)
-    large = _unscoped_sweep(80)
-    assert small <= kb._PIN_CONTRADICTION_WARN_BUDGET
-    # Scale invariance is the property: 10x the boards must not mean 10x the
-    # noise. A per-board warning would make this 8 vs 80.
-    assert small == large, (
-        f"contradiction warnings scale with board count: {small} at 8 boards, "
-        f"{large} at 80 — the per-process ceiling is not holding"
-    )
+    assert _boards_reached_before_refusal(8) == 0
+    assert _boards_reached_before_refusal(80) == 0
 
 
-def test_enumeration_noise_cannot_silence_a_later_addressing_warning(
-    _pin_contradiction_env, caplog,
+def test_enumeration_cannot_exhaust_a_later_addressing_refusal(
+    _pin_contradiction_env,
 ):
-    """The ceiling must not reintroduce this card's own defect one level up.
+    """The refusal must not be spendable by prior enumeration.
 
-    With a PROCESS-GLOBAL budget, any per-board loop that forgot the extent
-    looked like N addressing calls, burned the whole budget, and the genuine
-    single-board misreading the guard exists to surface went SILENT afterwards.
-    Measured on that design: 8 unscoped ``connect(board=slug)`` calls emitted 5
-    warnings, then ``kanban_db_path('account-health')`` returned the pin path
-    with 0 warnings — run-1022's exact probe, silent again, in a process that
-    merely enumerated boards first.
-
-    The budget is therefore charged PER CALL SITE. This drives both the loud
-    and the silent shapes of enumeration noise and asserts a subsequent
-    addressing call still warns in every one.
+    With a per-call-site WARNING budget, any per-board loop that forgot the
+    extent burned the budget and the genuine single-board misreading the guard
+    exists to surface went SILENT afterwards. A refusal has to survive an
+    arbitrary amount of prior enumeration, scoped or not.
     """
-    def _addressing_is_loud(slug: str) -> bool:
-        caplog.clear()
-        with caplog.at_level("WARNING", logger=kb.__name__):
+    def _addressing_refuses(slug: str) -> bool:
+        try:
             kb.kanban_db_path(slug)
-        return bool([
-            r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()
-        ])
+        except kb.KanbanPinDivergenceError:
+            return True
+        return False
 
-    # (a) an UNSCOPED per-board sweep — the forgetful-author shape.
-    with caplog.at_level("WARNING", logger=kb.__name__):
-        for i in range(kb._PIN_CONTRADICTION_WARN_BUDGET * 4):
-            kb.kanban_db_path(f"noisy-sweep-board-{i}")
-    assert _addressing_is_loud("addressed-after-unscoped"), (
-        "enumeration noise consumed the budget and silenced a genuine "
-        "single-board contradiction"
-    )
+    # (a) a correctly SCOPED sweep of many boards must not spend anything.
+    for i in range(40):
+        with kb.enumerating_boards():
+            kb.kanban_db_path(f"scoped-sweep-board-{i}")
+    assert _addressing_refuses("addressed-after-scoped")
 
-    # (b) a correctly SCOPED sweep must equally not spend anyone's budget.
-    with caplog.at_level("WARNING", logger=kb.__name__):
-        for i in range(kb._PIN_CONTRADICTION_WARN_BUDGET * 4):
-            with kb.enumerating_boards():
-                kb.kanban_db_path(f"scoped-sweep-board-{i}")
-    assert _addressing_is_loud("addressed-after-scoped")
+    # (b) repeated refusals from unscoped calls must not become permissive.
+    for i in range(40):
+        assert _addressing_refuses(f"noisy-sweep-board-{i}")
+    assert _addressing_refuses("addressed-after-unscoped")
 
 
-def test_enumerating_each_scopes_the_whole_loop_body(
-    _pin_contradiction_env, caplog,
-):
+def test_enumerating_each_scopes_the_whole_loop_body(_pin_contradiction_env):
     """The extent must cover the OPEN, not just the path resolve.
 
     Wrapping only ``kanban_db_path`` inside a per-board loop half-applies: the
     body then calls ``connect(board=slug)`` / ``count_notify_subs(board=slug)``,
     which re-resolve internally and land outside the extent. That is what the
-    dispatcher tick shipped as, and it both spammed and then went silent.
-    ``enumerating_each`` wraps the body, which cannot half-apply.
+    dispatcher tick shipped as. ``enumerating_each`` wraps the body, which
+    cannot half-apply.
     """
     slugs = [f"body-board-{i}" for i in range(6)]
 
     def _sweep(iterator) -> int:
+        """Return how many boards completed a resolve AND an open."""
         kb._CHECKED_PIN_BOARD_CONTRADICTIONS.clear()
-        kb._PIN_CONTRADICTION_WARNED.clear()
-        caplog.clear()
-        with caplog.at_level("WARNING", logger=kb.__name__):
-            for slug in iterator:
-                # A resolve AND an open, the real per-board loop shape.
-                kb.kanban_db_path(slug)
-                kb.count_notify_subs(board=slug)
-        return len([
-            r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()
-        ])
+        completed = 0
+        for slug in iterator:
+            # A resolve AND an open, the real per-board loop shape.
+            kb.kanban_db_path(slug)
+            kb.count_notify_subs(board=slug)
+            completed += 1
+        return completed
 
-    assert _sweep(iter(slugs)) > 0  # control: unscoped really does warn
-    assert _sweep(kb.enumerating_each(slugs)) == 0
+    # control: unscoped really does refuse.
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        _sweep(iter(slugs))
+    assert _sweep(kb.enumerating_each(slugs)) == len(slugs)
 
     # `break` must not leak the extent past the loop.
     for slug in kb.enumerating_each(slugs):
@@ -1229,29 +1277,6 @@ def test_enumerating_each_scopes_the_whole_loop_body(
         for slug in kb.enumerating_each(slugs):
             raise RuntimeError("body blew up")
     assert kb._enumeration_depth() == 0
-
-
-def test_pin_contradiction_ceiling_announces_itself_before_going_quiet(
-    _pin_contradiction_env, caplog,
-):
-    """Suppression must be visible, or the ceiling becomes a silent gap.
-
-    Going quiet without saying so would reintroduce this card's whole defect
-    class one level up: an operator reading 5 warnings on a 65-board host must
-    be able to tell that more were withheld.
-    """
-    with caplog.at_level("WARNING", logger=kb.__name__):
-        for i in range(kb._PIN_CONTRADICTION_WARN_BUDGET + 4):
-            kb.kanban_db_path(f"ceiling-board-{i}")
-    per_board = [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()]
-    suppressed = [
-        r for r in caplog.records
-        if "suppressing further per-board contradiction warnings" in r.getMessage()
-    ]
-    assert len(per_board) == kb._PIN_CONTRADICTION_WARN_BUDGET
-    # Exactly one summary line, not one per suppressed board.
-    assert len(suppressed) == 1
-    assert "HERMES_KANBAN_SANDBOX=1" in suppressed[0].getMessage()
 
 
 def test_enumerating_boards_extent_is_thread_local(_pin_contradiction_env):
@@ -1312,32 +1337,35 @@ def test_enumerating_boards_is_reentrant_and_restores_depth(_pin_contradiction_e
     assert kb._enumeration_depth() == 0
 
 
-def test_dispatcher_worker_pin_handoff_still_wins_over_board_arg(
-    _pin_contradiction_env, caplog,
+def test_dispatcher_worker_pin_handoff_still_wins_when_the_board_AGREES(
+    _pin_contradiction_env,
 ):
-    """The contract option (b) would have broken: pin beats the board argument.
+    """The dispatcher→worker handoff must keep working under the refusal.
 
     ``_default_spawn`` injects ``HERMES_KANBAN_DB`` so a worker that re-resolves
     kanban paths (e.g. under a profile-rewritten HERMES_HOME) still converges on
-    the DB the dispatcher claimed its task from. Honouring the board argument
-    over the pin would silently undo that. This asserts the precedence the
-    warning is explicitly NOT changing — including through ``connect()``, which
-    is what a worker's board-scoped reads actually go through.
+    the DB the dispatcher claimed its task from. That handoff is the reason the
+    pin outranks everything, and it is untouched here: the worker's own board
+    argument AGREES with the pin, so nothing diverges and the pin resolves —
+    including through ``connect()``, which is what a worker's board-scoped reads
+    actually go through.
+
+    Asking for a DIFFERENT board is the divergence, and that now refuses rather
+    than silently handing back the pinned board.
     """
     pinned = _pin_contradiction_env
-    with caplog.at_level("WARNING", logger=kb.__name__):
-        assert kb.kanban_db_path("other-board") == pinned
-        # A worker asking for a different board still lands on the pinned DB.
-        kb.init_db()
-        with kb.connect(board="other-board") as conn:
-            task_id = kb.create_task(conn, title="handoff card", assignee="alice")
-        assert pinned.exists()
-        assert not (kb.board_dir("other-board") / "kanban.db").exists()
-        # And the card is readable back through the pin, board arg or not.
-        with kb.connect() as conn:
-            assert kb.get_task(conn, task_id) is not None
-    # The contradiction was still reported — pin-wins is not silent any more.
-    assert [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()]
+    assert kb.kanban_db_path("pinned-board") == pinned
+    kb.init_db()
+    with kb.connect(board="pinned-board") as conn:
+        task_id = kb.create_task(conn, title="handoff card", assignee="alice")
+    assert pinned.exists()
+    # And the card is readable back through the pin with no board arg at all.
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id) is not None
+    # The divergent ask refuses instead of quietly returning `pinned`.
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.kanban_db_path("other-board")
+    assert not (kb.board_dir("other-board") / "kanban.db").exists()
 
 
 # ---------------------------------------------------------------------------
