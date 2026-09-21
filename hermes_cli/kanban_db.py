@@ -4544,19 +4544,19 @@ def create_task(
                     },
                 )
                 if task_status == "blocked":
-                    # Parking a card in blocked at creation time is an
-                    # explicit operator decision (the documented purpose of
-                    # --initial-status blocked is the human-ops / R3 gate).
-                    # Emit the same "blocked" event that block_task emits so
-                    # _has_sticky_block treats it as sticky — otherwise
-                    # recompute_ready auto-promotes a parentless blocked
-                    # card to ready on the next dispatcher tick and a worker
-                    # gets spawned, defeating the flag entirely.
+                    # Tag the source so dependency resolution can distinguish
+                    # this creation-time hold from a later explicit worker or
+                    # operator block. Parentless creation holds remain sticky;
+                    # a creation hold with a real ``blocks`` edge may release
+                    # automatically once every parent is terminal.
                     _append_event(
                         conn,
                         task_id,
                         "blocked",
-                        {"reason": "created with initial_status=blocked"},
+                        {
+                            "reason": "created with initial_status=blocked",
+                            "source": "initial_status",
+                        },
                     )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
@@ -5634,42 +5634,62 @@ def _synthesize_ended_run(
 # Dependency resolution (todo -> ready)
 # ---------------------------------------------------------------------------
 
-def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return True when ``task_id`` is sticky-blocked by an explicit
-    worker/operator ``kanban_block`` call (#28712).
+def _latest_block_source(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Classify the task's active block as ``initial_status`` or ``explicit``.
 
-    A ``blocked`` status can come from two very different sources:
-
-    * **Worker- or operator-initiated** — a worker called
-      ``kanban_block(reason="review-required: ...")`` (or somebody ran
-      ``hermes kanban block <id>``).  This is a deliberate handoff that
-      should stay blocked until an operator unblocks it.  The block tool
-      emits a ``"blocked"`` event row in ``task_events``.
-
-    * **Circuit-breaker** — ``_record_task_failure`` tripped after
-      repeated crashes / spawn failures / timeouts.  This emits
-      ``"gave_up"``, *not* ``"blocked"``, and is meant to recover
-      automatically once the underlying conditions change (e.g. parents
-      finish, transient infra error clears).
-
-    The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
-    no ``"unblocked"`` event has fired since), the task is sticky and
-    ``recompute_ready`` must *not* auto-promote it.
-
-    Returns ``False`` when there is no such event at all (e.g. the task
-    was set to ``status='blocked'`` by the circuit breaker or by direct
-    DB manipulation) — preserves the pre-#28712 auto-recover semantics
-    for that path.
+    The exact legacy reason is recognized so cards created before the source
+    tag was introduced receive the same dependency-release behavior.
     """
     row = conn.execute(
-        "SELECT kind FROM task_events "
+        "SELECT kind, payload FROM task_events "
         "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    if not row or row["kind"] != "blocked":
+        return None
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    if isinstance(payload, dict) and (
+        payload.get("source") == "initial_status"
+        or payload.get("reason") == "created with initial_status=blocked"
+    ):
+        return "initial_status"
+    return "explicit"
+
+
+def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when ``task_id`` has an active block event.
+
+    Creation-time holds are sticky while parentless, but unlike explicit
+    worker/operator blocks they may be released by ``recompute_ready`` after a
+    real ``blocks`` parent reaches a terminal state.
+    """
+    return _latest_block_source(conn, task_id) is not None
+
+
+def find_parent_satisfied_sticky_blocks(conn: sqlite3.Connection) -> list[str]:
+    """Name explicit blocks whose graph dependencies are all terminal."""
+    rows = conn.execute(
+        "SELECT t.id FROM tasks t "
+        "WHERE t.status = 'blocked' "
+        "AND EXISTS ("
+        "  SELECT 1 FROM task_links l WHERE l.child_id = t.id "
+        "  AND COALESCE(l.kind, ?) = ?"
+        ") "
+        "AND NOT EXISTS ("
+        "  SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+        "  WHERE l.child_id = t.id AND COALESCE(l.kind, ?) = ? "
+        "  AND p.status NOT IN ('done', 'archived')"
+        ") ORDER BY t.id",
+        (DEFAULT_LINK_KIND, LINK_KIND_BLOCKS, DEFAULT_LINK_KIND, LINK_KIND_BLOCKS),
+    ).fetchall()
+    return [
+        row["id"] for row in rows
+        if _latest_block_source(conn, row["id"]) == "explicit"
+    ]
 
 
 def find_stranded_by_triage(
@@ -5747,9 +5767,11 @@ def recompute_ready(
     blocked purely by a parent dependency unblocks itself when the
     parent completes), *except* in two cases:
 
-    1. The most recent block event was a worker-initiated
-       ``kanban_block`` — those stay blocked until an explicit
-       ``kanban_unblock`` (#28712).
+    1. The active block was an explicit worker/operator ``kanban_block``;
+       those stay blocked until ``kanban_unblock`` (#28712). A creation-time
+       ``initial_status=blocked`` hold is different: it stays sticky while
+       parentless (the human-ops/R3 gate), but auto-releases when it has at
+       least one ``blocks`` parent and every such parent is terminal.
 
     2. The task's ``consecutive_failures`` has reached the effective
        failure limit.  This prevents infinite retry loops when a task
@@ -5777,18 +5799,20 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Worker / operator asked for explicit human intervention — do not
-                # silently auto-recover.  ``unblock_task`` is the only
-                # legitimate exit (it emits ``"unblocked"`` which flips
-                # this predicate back).
-                continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ? AND COALESCE(l.kind, ?) = ?",
                 (task_id, DEFAULT_LINK_KIND, LINK_KIND_BLOCKS),
             ).fetchall()
+            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
+                block_source = _latest_block_source(conn, task_id)
+                if block_source != "initial_status" or not parents:
+                    # Explicit worker/operator blocks always require an unblock.
+                    # Parentless creation holds are the human-ops/R3 gate and
+                    # remain sticky too. Only a creation hold backed by at
+                    # least one real dependency edge may auto-release.
+                    continue
             if all(p["status"] in ("done", "archived") for p in parents):
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
@@ -10699,6 +10723,12 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    parent_satisfied_sticky: list[str] = field(default_factory=list)
+    """Explicitly blocked task ids that have one or more ``blocks`` parents
+    and whose parents are all terminal. The graph is satisfied, but the
+    worker/operator handoff intentionally remains sticky until an explicit
+    unblock. Surfaced so a zero-promotion tick names the hold instead of
+    silently reporting ``promoted=0``."""
     stranded_by_triage: list[tuple[str, str]] = field(default_factory=list)
     """``(child_id, parent_id)`` pairs where a ``todo`` card is held ONLY
     because a parent sits in ``triage``/``blocked`` — i.e. behind a card that
@@ -13160,6 +13190,10 @@ def _dispatch_once_locked(
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    # Explicit human holds whose graph dependencies are already satisfied.
+    # Computed after promotion so creation-source dependency holds have left
+    # ``blocked`` and only intentionally sticky worker/operator blocks remain.
+    result.parent_satisfied_sticky = find_parent_satisfied_sticky_blocks(conn)
     # Children held in ``todo`` behind a parent only a human can clear.
     # Computed AFTER recompute_ready so anything promotable this tick has
     # already left ``todo`` and can't be mis-reported as stranded.

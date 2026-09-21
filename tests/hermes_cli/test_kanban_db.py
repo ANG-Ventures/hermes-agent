@@ -236,6 +236,47 @@ def test_initial_status_blocked_unblock_releases(kanban_home):
         assert kb.get_task(conn, t).status in ("ready", "todo")
 
 
+def test_initial_status_blocked_with_satisfied_parent_promotes_on_tick(kanban_home):
+    """A creation hold becomes dependency-backed once a blocks edge is added."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(
+            conn, title="dependency hold", assignee="worker",
+            initial_status="blocked",
+        )
+        kb.link_tasks(conn, parent, child, kind="blocks")
+        assert kb.get_task(conn, child).status == "blocked"
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+                (int(time.time()), parent),
+            )
+        result = kb.dispatch_once(conn, dry_run=True)
+
+        assert kb.get_task(conn, child).status == "ready"
+        assert result.promoted == 1
+        assert result.parent_satisfied_sticky == []
+
+
+def test_explicit_block_with_satisfied_parent_stays_blocked_and_is_named(kanban_home):
+    """Parent completion never overrides an explicit worker/operator block."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="needs input", assignee="worker")
+        assert kb.block_task(
+            conn, child, reason="choose an API", kind="needs_input",
+        )
+        kb.link_tasks(conn, parent, child, kind="blocks")
+
+        assert kb.complete_task(conn, parent, result="done")
+        result = kb.dispatch_once(conn, dry_run=True)
+
+        assert kb.get_task(conn, child).status == "blocked"
+        assert result.spawned == []
+        assert result.parent_satisfied_sticky == [child]
+
+
 # ---------------------------------------------------------------------------
 # Atomic claim (CAS)
 # ---------------------------------------------------------------------------
