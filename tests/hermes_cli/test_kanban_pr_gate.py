@@ -20,6 +20,7 @@ These tests pin:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import subprocess
 from pathlib import Path
@@ -266,6 +267,36 @@ def test_closed_unmerged_comments_only_once_across_ticks(kanban_home: Path) -> N
         ).fetchone()["c"] == 1
 
 
+def test_closed_unmerged_advisory_is_keyed_to_the_current_pr_set(
+    kanban_home: Path,
+) -> None:
+    """Re-blocking on a different dead PR gets its own human advisory."""
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, reason="merge o/r#9 then unblock me")
+        prg.reevaluate_pr_gates(conn, query_fn=_stub({("o/r", 9): _closed()}))
+
+        # Simulate the operator re-pointing the existing blocked gate. The
+        # re-evaluator keys off the latest blocked event, not stale task prose.
+        with kb.write_txn(conn, allow_nested=True):
+            kb._append_event(
+                conn,
+                tid,
+                "blocked",
+                {"reason": "replacement gate is o/r#10", "kind": "needs_input"},
+            )
+        prg.reevaluate_pr_gates(conn, query_fn=_stub({("o/r", 10): _closed()}))
+
+        comments = [
+            row["body"]
+            for row in conn.execute(
+                "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id", (tid,)
+            )
+        ]
+    assert len(comments) == 2
+    assert "o/r#9" in comments[0]
+    assert "o/r#10" in comments[1]
+
+
 def test_lookup_failure_is_a_noop(kanban_home: Path) -> None:
     with kb.connect() as conn:
         tid = _blocked_card(conn, reason="merge o/r#7 then unblock me")
@@ -275,6 +306,26 @@ def test_lookup_failure_is_a_noop(kanban_home: Path) -> None:
         assert conn.execute(
             "SELECT COUNT(*) c FROM task_comments WHERE task_id = ?", (tid,)
         ).fetchone()["c"] == 0
+
+
+def test_lookup_failure_is_deduplicated_within_one_tick(
+    kanban_home: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A shared failed lookup costs one call and one warning opportunity per tick."""
+    calls: list = []
+    with kb.connect() as conn:
+        for _ in range(3):
+            _blocked_card(conn, reason="merge o/r#7 then unblock me")
+        outcomes = prg.reevaluate_pr_gates(
+            conn, query_fn=_stub({}, calls=calls),
+        )
+    assert calls == [("o/r", 7)]
+    assert [o.action for o in outcomes] == ["lookup_failed"] * 3
+    warnings = [
+        record for record in caplog.records
+        if "could not resolve PR state" in record.getMessage()
+    ]
+    assert len(warnings) == 1
 
 
 def test_lookup_failure_is_not_cached(kanban_home: Path) -> None:
@@ -419,6 +470,36 @@ def test_open_state_is_cached_for_the_ttl_then_requeried(kanban_home: Path) -> N
         assert len(calls) == 2, "TTL expiry must re-query"
 
 
+def test_closed_state_is_cached_for_ttl_then_requeried_after_reopen(
+    kanban_home: Path,
+) -> None:
+    """CLOSED is reversible on GitHub; only MERGED may be cached forever."""
+    calls: list = []
+    responses = iter([_closed(), _merged()])
+
+    def query(repo: str, number: int):
+        calls.append((repo, number))
+        return next(responses)
+
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, reason="merge o/r#7 then unblock me")
+        prg.reevaluate_pr_gates(conn, query_fn=query, now=1_000_000.0)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        prg.reevaluate_pr_gates(conn, query_fn=query, now=1_000_060.0)
+        assert len(calls) == 1
+        prg.reevaluate_pr_gates(
+            conn,
+            query_fn=query,
+            now=1_000_000.0 + prg.CACHE_TTL_SECONDS + 1,
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready"
+    assert calls == [("o/r", 7), ("o/r", 7)]
+
+
 def test_merged_state_is_cached_permanently(kanban_home: Path) -> None:
     calls: list = []
     with kb.connect() as conn:
@@ -476,6 +557,42 @@ def test_dispatch_tick_resolves_a_satisfied_gate(
             "WHERE task_id = ? AND kind = 'gate_auto_resolved'",
             (tid,),
         ).fetchone()["c"] == 1
+
+
+def test_dispatch_tick_queries_github_before_taking_dispatch_lock(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Slow GitHub I/O must never extend the board's single-writer lock hold."""
+    lock_held = False
+    calls: list = []
+
+    @contextlib.contextmanager
+    def tracked_lock(_db_path):
+        nonlocal lock_held
+        assert not lock_held
+        lock_held = True
+        try:
+            yield True
+        finally:
+            lock_held = False
+
+    def query(repo: str, number: int):
+        assert not lock_held, "GitHub lookup ran under _dispatch_tick_lock"
+        calls.append((repo, number))
+        return _merged()
+
+    monkeypatch.setattr(kb, "_dispatch_tick_lock", tracked_lock)
+    monkeypatch.setattr(prg, "query_pr", query)
+
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, reason="merge o/r#7 then unblock me")
+        result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status in {"ready", "running"}
+
+    assert calls == [("o/r", 7)]
+    assert result.gate_auto_resolved == [tid]
 
 
 def test_dispatch_tick_leaves_a_non_pr_block_alone(
