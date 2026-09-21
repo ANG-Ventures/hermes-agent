@@ -32,11 +32,14 @@ outranks it (see :func:`hermes_cli.kanban_db.kanban_db_path`) — so a probe tha
 redirects only ``HERMES_HOME`` still resolves to production. On 2026-09-21 a
 lock-timing probe did exactly that and wrote 20 ``gate_auto_resolved`` events
 to the live board, falsely unblocking seven real cards.
-:func:`assert_write_allowed` closes that: a non-default ``query_fn`` writing to
-a DB outside the ``HERMES_HOME`` root raises :class:`SandboxEscape` instead of
-landing. It gates on ORACLE IDENTITY alone, never on a test-context marker: the
-incident probe was a bare script that set no marker, so a marker-gated guard
-would return before ever examining the oracle.
+:func:`assert_write_allowed` closes that: a non-default ``query_fn`` raises
+:class:`SandboxEscape` instead of landing, unless isolation has been declared
+POSITIVELY via ``HERMES_KANBAN_SANDBOX=1``. Containment is deliberately not the
+test — the fleet exports ``HERMES_HOME=~/.hermes`` and the live board sits
+inside it, so "the DB is under the declared home" is a relation production
+already satisfies. It gates on ORACLE IDENTITY alone, never on a test-context
+marker: the incident probe was a bare script that set no marker, so a
+marker-gated guard would return before ever examining the oracle.
 """
 
 from __future__ import annotations
@@ -225,26 +228,44 @@ def _in_test_context() -> bool:
 
 
 def _db_is_sandboxed() -> bool:
-    """True when the resolved board DB lives under the DECLARED ``HERMES_HOME``.
+    """True only when isolation is POSITIVELY declared, never merely observed.
 
-    The anchor is deliberately ``HERMES_HOME`` itself and never
-    :func:`hermes_cli.kanban_db.kanban_home`. That function resolves the SHARED
-    kanban root — the board is shared across profiles by design, and the
-    ``HERMES_KANBAN_*`` pins outrank ``HERMES_HOME`` — so comparing the DB
-    against it only asks "is this board internally consistent with its own
-    root?", which the LIVE board answers yes to. A production DB that proves
-    itself sandboxed is the whole failure: it is the only remaining escape
-    valve once :func:`assert_write_allowed` keys on oracle identity.
+    Isolation has to be proven by a property a production process cannot
+    satisfy. Two containment-based anchors were tried and both were satisfiable
+    by the live board:
 
-    Fail CLOSED: an unset ``HERMES_HOME``, or any resolution error, counts as
-    not-sandboxed. A guard that cannot prove isolation must not grant it.
+    * :func:`hermes_cli.kanban_db.kanban_home` — the SHARED kanban root, so the
+      production DB sits under it by construction ("is this board internally
+      consistent with its own root?" is always yes).
+    * the DECLARED ``HERMES_HOME`` — the fleet exports
+      ``HERMES_HOME=~/.hermes`` from ~20 installed launchd jobs and shell
+      helpers, and the live ``kanban.db`` sits directly inside it. Measured
+      2026-09-21 with no pins and no pytest marker: ``sandboxed=True``, a
+      fabricated oracle ALLOWED on the real board.
+
+    So containment is not evidence — any relation the live layout already
+    satisfies can be reached by inheriting the ordinary fleet env. The predicate
+    is instead the explicit opt-in the refusal message already prescribes,
+    ``HERMES_KANBAN_SANDBOX=1`` (:func:`kanban_db.kanban_sandbox_enabled`),
+    which no fleet component sets and which additionally makes every kanban path
+    resolve from ``HERMES_HOME`` and ignore the ``HERMES_KANBAN_*`` pins.
+
+    Containment under the declared ``HERMES_HOME`` is retained as a SECOND
+    condition, not a substitute: the flag says "I intend to be isolated", the
+    containment check confirms the resolution actually landed there.
+
+    Fail CLOSED: a missing flag, an unset ``HERMES_HOME``, or any resolution
+    error counts as not-sandboxed. A guard that cannot prove isolation must not
+    grant it.
     """
-    declared = os.environ.get("HERMES_HOME", "").strip()
-    if not declared:
-        return False
     try:
         from hermes_cli import kanban_db as kb
 
+        if not kb.kanban_sandbox_enabled():
+            return False
+        declared = os.environ.get("HERMES_HOME", "").strip()
+        if not declared:
+            return False
         target = Path(kb.kanban_db_path()).resolve(strict=False)
         root = Path(declared).expanduser().resolve(strict=False)
     except Exception:
@@ -285,14 +306,27 @@ def assert_write_allowed(query_fn: Optional[Callable] = None) -> None:
         if _in_test_context()
         else "this process carries NO test marker (a bare probe script)"
     )
+    try:
+        from hermes_cli import kanban_db as kb
+
+        opted_in = kb.kanban_sandbox_enabled()
+    except Exception:  # pragma: no cover - diagnostic only
+        opted_in = False
+    why = (
+        f"HERMES_KANBAN_SANDBOX is not set, so isolation was never declared "
+        f"(resolved DB {resolved})"
+        if not opted_in
+        else f"resolved DB {resolved} is not inside the declared HERMES_HOME "
+        f"root ({os.environ.get('HERMES_HOME') or '<unset>'})"
+    )
     raise SandboxEscape(
         "kanban PR-gate: refusing to mutate a board with a STUBBED PR oracle. "
-        f"Resolved DB {resolved} is not inside the HERMES_HOME root "
-        f"({os.environ.get('HERMES_HOME') or '<unset>'}); {marker}. "
-        "HERMES_HOME alone does NOT sandbox kanban — HERMES_KANBAN_DB "
-        "outranks it. Set HERMES_KANBAN_SANDBOX=1 (or unset the "
-        "HERMES_KANBAN_* path pins) so the board resolves inside the sandbox "
-        "before running this harness."
+        f"{why}; {marker}. Containment alone is NOT proof of isolation — the "
+        "fleet exports HERMES_HOME=~/.hermes and the live board sits inside "
+        "it, so isolation must be declared positively. Set "
+        "HERMES_KANBAN_SANDBOX=1 with HERMES_HOME pointed at a throwaway root "
+        "(the flag also neutralises the HERMES_KANBAN_* path pins) before "
+        "running this harness."
     )
 
 
