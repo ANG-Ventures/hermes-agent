@@ -3372,6 +3372,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "collision_check_failed": getattr(
                 res, "collision_check_failed", []
             ),
+            "gate_auto_resolved": getattr(res, "gate_auto_resolved", []),
+            "gate_closed_unmerged": getattr(res, "gate_closed_unmerged", []),
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -3388,6 +3390,18 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
     print(f"Promoted:     {res.promoted}")
+    gate_resolved = getattr(res, "gate_auto_resolved", [])
+    if gate_resolved:
+        print(
+            f"Gate auto-resolved (referenced PR(s) merged): "
+            f"{', '.join(gate_resolved)}"
+        )
+    gate_closed = getattr(res, "gate_closed_unmerged", [])
+    if gate_closed:
+        print(
+            "WARNING — gate PR closed WITHOUT merging; card left blocked for "
+            f"a human: {', '.join(gate_closed)}"
+        )
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""

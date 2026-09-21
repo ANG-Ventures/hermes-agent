@@ -10769,6 +10769,18 @@ class DispatchResult:
     """Task ids whose warning-only collision check raised unexpectedly. The
     failure is logged loudly and dispatch continues (fail-open), preserving
     the rule that this diagnostic must never become an approval gate."""
+    gate_auto_resolved: list[str] = field(default_factory=list)
+    """Task ids the PR-gate re-evaluator unblocked this tick because every
+    GitHub PR named in their block reason had merged (see
+    :mod:`hermes_cli.kanban_pr_gate`). Before this, a card blocked on "merge
+    PR #N then unblock me" stayed blocked until a human board sweep noticed —
+    six cards sat up to 12 h that way on 2026-09-21. Surfaced here so the
+    dispatch report and sweep tooling can COUNT the automation rather than
+    infer it from card history."""
+    gate_closed_unmerged: list[str] = field(default_factory=list)
+    """Task ids whose gate PR is CLOSED WITHOUT MERGING. Deliberately NOT
+    unblocked — the premise died rather than being satisfied, so a human has
+    to re-point or retire the card. One advisory comment is posted once."""
     memory_pressure: Optional[str] = None
     """System memory pressure observed at spawn time when the memory guard
     restricted this tick (OOF-30/OOF-77): ``"critical"`` — no new workers
@@ -13024,6 +13036,25 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+def _prefetch_pr_gates_for_tick(
+    conn: sqlite3.Connection, *, dry_run: bool = False,
+):
+    """Perform bounded GitHub I/O before the dispatcher writer lock."""
+    if dry_run:
+        return None
+    try:
+        from hermes_cli import kanban_pr_gate
+
+        return kanban_pr_gate.prefetch_pr_gate_states(conn)
+    except Exception as exc:
+        _log.warning(
+            "kanban dispatch: PR-gate prefetch failed (%s: %s); "
+            "continuing this tick without gate mutation",
+            type(exc).__name__, exc,
+        )
+        return None
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -13054,6 +13085,7 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
+    pr_gate_prefetch = _prefetch_pr_gates_for_tick(conn, dry_run=dry_run)
     try:
         db_path = kanban_db_path(board=board)
     except Exception:
@@ -13073,6 +13105,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            pr_gate_prefetch=pr_gate_prefetch,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -13093,6 +13126,7 @@ def dispatch_once(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
+                pr_gate_prefetch=pr_gate_prefetch,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -13104,6 +13138,40 @@ def dispatch_once(
     # the lock hold and stall a sibling dispatcher's tick.
     _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
     return result
+
+
+def _reevaluate_pr_gates_for_tick(
+    conn: sqlite3.Connection,
+    result: "DispatchResult",
+    *,
+    dry_run: bool = False,
+    prefetched=None,
+) -> None:
+    """Resolve blocked cards whose external PR gate has already been satisfied.
+
+    Fail-open by construction: any exception is logged and dispatch continues.
+    A diagnostic that can brick the dispatcher is worse than the stale-block
+    class it exists to close. ``dry_run`` skips it entirely — a dry run must
+    not mutate the board.
+    """
+    if dry_run or prefetched is None:
+        return
+    try:
+        from hermes_cli import kanban_pr_gate
+
+        for outcome in kanban_pr_gate.reevaluate_pr_gates(
+            conn, prefetched=prefetched,
+        ):
+            if outcome.action == "unblocked":
+                result.gate_auto_resolved.append(outcome.task_id)
+            elif outcome.action == "closed_unmerged":
+                result.gate_closed_unmerged.append(outcome.task_id)
+    except Exception as exc:
+        _log.warning(
+            "kanban dispatch: PR-gate re-evaluation failed (%s: %s); "
+            "continuing this tick",
+            type(exc).__name__, exc,
+        )
 
 
 def _dispatch_once_locked(
@@ -13120,6 +13188,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    pr_gate_prefetch=None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -13199,6 +13268,13 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    # PR-gate re-evaluation BEFORE recompute_ready so a card whose external
+    # gate is already satisfied becomes spawnable in the SAME tick rather
+    # than waiting for the next one. Bounded + cached + fail-safe: see
+    # hermes_cli.kanban_pr_gate for why every uncertain path is a no-op.
+    _reevaluate_pr_gates_for_tick(
+        conn, result, dry_run=dry_run, prefetched=pr_gate_prefetch,
+    )
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
     # Explicit human holds whose graph dependencies are already satisfied.
     # Computed after promotion so creation-source dependency holds have left
