@@ -1578,10 +1578,6 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
 
-    # If the user removed the currently-active board, revert to default.
-    if get_current_board() == normed:
-        clear_current_board()
-
     # A board directory CONTAINS that board's workspaces/ -- retiring it
     # takes every card's scratch dir at once, the same blast radius as the
     # 2026-09-20 incident. BOTH branches do that: archive renames the tree
@@ -1594,7 +1590,12 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     #
     # Checked BEFORE the cache invalidation below: it opens the board DB
     # (which would re-populate _INITIALIZED_PATHS) and it can abort, so no
-    # state may be torn down ahead of it.
+    # state may be torn down ahead of it -- INCLUDING the active-board pin,
+    # which used to be cleared above this gate. A refused removal that had
+    # already unlinked <root>/kanban/current left get_current_board() falling
+    # through to DEFAULT_BOARD, so every later `kanban add` / `list` /
+    # `dispatch` silently addressed the default board with nothing saying the
+    # pin had moved (FleetReview on PR #785, measured).
     live = _board_has_live_cards(normed)
     if live:
         verb = "archive" if archive else "delete"
@@ -1609,6 +1610,14 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             f"{verb} its directory, which contains their workspaces. "
             "Wait for the cards to finish, or stop them first."
         )
+
+    # Past the refusal: the board IS going away, so reverting the active-board
+    # pin to default is now correct. (Pure hygiene either way --
+    # get_current_board() validates board_exists() before honouring the file,
+    # so a stale pin at a removed board is ignored -- but leaving it dangling
+    # on the REFUSAL path was the bug.)
+    if get_current_board() == normed:
+        clear_current_board()
 
     # A concurrent connect(board=normed) after the rename/delete recreates
     # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
@@ -1706,11 +1715,28 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
 def _board_has_live_cards(slug: str) -> list:
     """Return the ids of cards on *slug* that are running or claim-locked.
 
+    Opens that board's CANONICAL DB path directly rather than going through
+    ``connect_closing(board=slug)``: ``kanban_db_path`` gives an ambient
+    ``HERMES_KANBAN_DB`` pin precedence even over an explicit board argument,
+    and the dispatcher pins that variable into every worker env. Under a pin,
+    the board argument was silently ignored, so removing board B inspected
+    board A's tasks, concluded B was idle, and archived it out from under a
+    live worker -- the primary data-loss guard answering for the wrong
+    database (FleetReview on PR #785, measured).
+
     Fail-closed: if the board's DB cannot be read, return a sentinel so the
     caller refuses rather than deleting a board whose state is unknown.
     """
     try:
-        with connect_closing(board=slug) as conn:
+        db_path = _board_db_path_ignoring_pin(_normalize_board_slug(slug) or slug)
+    except Exception:
+        return ["<unreadable-board-db>"]
+    if not db_path.is_file():
+        # No DB on disk means no rows to be live. A board directory that
+        # exists without one is empty as far as cards are concerned.
+        return []
+    try:
+        with connect_closing(db_path=db_path) as conn:
             rows = conn.execute(
                 "SELECT id, status, claim_expires FROM tasks "
                 "WHERE status = 'running' OR claim_expires IS NOT NULL"

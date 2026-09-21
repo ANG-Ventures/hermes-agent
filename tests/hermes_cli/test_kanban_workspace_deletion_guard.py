@@ -516,6 +516,63 @@ def test_remove_board_archive_refuses_while_a_card_is_running(kanban_home):
     ), _audit_lines()
 
 
+def test_remove_board_refusal_leaves_the_active_board_pin_intact(kanban_home):
+    """A REFUSED removal must not silently re-point the operator at `default`.
+
+    FleetReview on #785: ``remove_board`` cleared ``<root>/kanban/current``
+    before running the liveness gate, so an operator who ran
+    ``boards switch mine`` then ``boards rm mine`` while a card was running
+    got the (correct) refusal -- and every subsequent ``kanban add`` / ``list``
+    / ``dispatch`` silently addressed the DEFAULT board, with no message
+    saying the pin had moved.
+    """
+    kb.create_board("pinned", name="Pinned")
+    kb.set_current_board("pinned")
+    assert kb.get_current_board() == "pinned"
+
+    with kb.connect_closing(board="pinned") as conn:
+        task_id = kb.create_task(conn, title="live", assignee="daedalus")
+        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
+        conn.commit()
+
+    with pytest.raises(ValueError, match="running or holding"):
+        kb.remove_board("pinned", archive=True)
+
+    assert kb.board_dir("pinned").is_dir()
+    assert kb.get_current_board() == "pinned", (
+        "a refused removal reset the operator's active-board pin"
+    )
+
+
+def test_board_liveness_gate_ignores_an_ambient_db_pin(kanban_home, monkeypatch):
+    """``HERMES_KANBAN_DB`` must not be able to answer for another board.
+
+    FleetReview on #785: ``_board_has_live_cards`` reached the board through
+    ``connect_closing(board=slug)``, and ``kanban_db_path`` gives the ambient
+    pin precedence even over an explicit board argument. In the routinely
+    pinned worker environment that means removing board B inspects board A's
+    tasks, concludes B is idle, and archives it out from under a live worker.
+    """
+    kb.create_board("busy", name="Busy")
+    kb.create_board("idle", name="Idle")
+    kb.init_db(board="idle")
+    with kb.connect_closing(board="busy") as conn:
+        task_id = kb.create_task(conn, title="live", assignee="daedalus")
+        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
+        conn.commit()
+
+    # Pin the process at the IDLE board, as the dispatcher pins every worker.
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.board_dir("idle") / "kanban.db"))
+
+    assert kb._board_has_live_cards("busy") == [task_id], (
+        "the ambient DB pin answered the liveness question for another board"
+    )
+    with pytest.raises(ValueError, match="running or holding"):
+        kb.remove_board("busy", archive=True)
+    assert kb.board_dir("busy").is_dir()
+
+
 def test_remove_board_archive_refuses_on_a_live_claim_lock(kanban_home):
     """Liveness is status OR an unexpired claim lock, on this branch too."""
     kb.create_board("locked", name="Locked")
