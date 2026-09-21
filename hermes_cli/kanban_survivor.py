@@ -241,8 +241,15 @@ def _remote_urls(repos):
     return urls
 
 
-def _external(conn, task_id, metadata, evidence, urls, explicit):
-    ref = explicit or _ext.discover(conn, task_id, metadata, evidence, urls)
+def _external(conn, task_id, metadata, evidence, urls, explicit, *, discover):
+    """Infer a survivor only for work that claims one.
+
+    An operator-named flag is authority and always applies; text mining is a
+    guess, so it must stay behind the same claim test that decides whether the
+    absence of a survivor is an error. Otherwise an incidental `owner/repo#N`
+    in a research card's comment is recorded as that card's deliverable.
+    """
+    ref = explicit or (_ext.discover(conn, task_id, metadata, evidence, urls) if discover else None)
     return {"kind": "ref", "refs": [dict(ref, repository=".")]} if ref else None
 
 
@@ -288,7 +295,8 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         )
         workspace = Path(workspace or task.workspace_path) if workspace or task.workspace_path else None
         if workspace is None or not workspace.is_dir():
-            external = _external(conn, task_id, metadata, evidence, (), explicit)
+            external = _external(conn, task_id, metadata, evidence, (), explicit,
+                                 discover=bool(cleanup or bases or claimed))
             if external:
                 return _record(conn, task_id, external, previous)
             if cleanup or bases or claimed:
@@ -341,7 +349,8 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                              json.dumps(manifest, sort_keys=True).encode(), "application/json")
             survivor["sidecar"] = sidecar["path"]
         elif claimed:
-            external = _external(conn, task_id, metadata, evidence, _remote_urls(repos), explicit)
+            external = _external(conn, task_id, metadata, evidence, _remote_urls(repos), explicit,
+                                 discover=True)
             if external:
                 return _record(conn, task_id, dict(external, refs=external["refs"] + refs), previous)
             raise SurvivorUnavailable(

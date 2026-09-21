@@ -98,6 +98,35 @@ def test_review_approval_discovers_comment_and_preserves_on_cleanup(board, remot
     assert not [e for e in kb.list_events(board, tid) if e.kind == "workspace_held"]
 
 
+@pytest.mark.parametrize("source", ["result", "comment"])
+def test_non_code_card_does_not_mine_an_incidental_pr(board, remote, source):
+    """A card that claims no code has no deliverable to infer.
+
+    Discussion text routinely cites other cards' PRs. Mining it would record
+    another card's work as this one's survivor, and nothing downstream
+    re-checks a recovery pointer.
+    """
+    mention = f"FYI unrelated context: see {PR} for the survivor work."
+    tid = kb.create_task(board, title="research card, no code at all")
+    if source == "comment":
+        kb.add_comment(board, tid, "reviewer", mention)
+    assert kb.complete_task(board, tid, result=mention if source == "result" else "No code changed.")
+    assert (kb.latest_run(board, tid).metadata or {}).get("survivor") is None
+    assert not board.execute(
+        "SELECT survivor FROM task_workspace_survivors WHERE task_id = ? AND survivor IS NOT NULL",
+        (tid,)).fetchall()
+    assert remote[1] == [], "must not consult the remote for unclaimed work"
+
+
+def test_claimed_card_still_reaches_the_remote(board, remote):
+    """Teeth for the tripwire above: a stub that can never record would pass it."""
+    tid = kb.create_task(board, title="external implementation")
+    kb.add_comment(board, tid, "reviewer", f"Shipped {PR} at {HEAD}")
+    assert kb.complete_task(board, tid, result="done", metadata={"changed_files": ["code.py"]})
+    assert kb.latest_run(board, tid).metadata["survivor"]["kind"] == "ref"
+    assert len(remote[1]) == 1
+
+
 def test_explicit_pr_keeps_dirty_workspace_capture(board, remote, tmp_path):
     tid = kb.create_task(board, title="dirty implementation")
     ws = kb.resolve_workspace(kb.get_task(board, tid))
