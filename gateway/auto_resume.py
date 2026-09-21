@@ -26,6 +26,8 @@ import json
 import logging
 import os
 import tempfile
+import threading
+from functools import wraps
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -377,6 +379,15 @@ def assess_interrupted_turn(
     return InterruptedTurnAssessment(turn_rowid=turn_rowid, auto_eligible=True)
 
 
+def _serialized_store_call(method):
+    """Serialize read/modify/write across dispatch workers sharing one store."""
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return locked
+
+
 class AutoResumeAttemptStore:
     """Seven-day durable once-ever auto-resume credits plus per-session counters.
 
@@ -407,6 +418,7 @@ class AutoResumeAttemptStore:
         *,
         now: Callable[[], float] = time.time,
     ) -> None:
+        self._lock = threading.RLock()
         self.path = Path(path)
         self.session_path = self.path.with_name(self.path.stem + ".sessions-v2.json")
         self._warned_legacy_reset = False
@@ -682,6 +694,7 @@ class AutoResumeAttemptStore:
                 except OSError:
                     pass
 
+    @_serialized_store_call
     def has_attempt(self, session_key: str, assistant_rowid: int) -> bool:
         """True when this interrupted turn already spent its once-ever credit.
 
@@ -707,6 +720,7 @@ class AutoResumeAttemptStore:
             for item in attempts
         )
 
+    @_serialized_store_call
     def consume(self, session_key: str, assistant_rowid: int) -> bool:
         """Record a scheduled auto continuation; false means fail closed.
 
@@ -743,6 +757,7 @@ class AutoResumeAttemptStore:
     # we resumed this session without it getting anywhere", which is the
     # question the 2026-09-20 replay storm needed answered.
 
+    @_serialized_store_call
     def session_attempt_count(self, session_key: str) -> int | None:
         """Attempts recorded for ``session_key``; ``None`` when unknowable.
 
@@ -775,6 +790,7 @@ class AutoResumeAttemptStore:
             return True
         return self._persist(attempts, session_attempts)
 
+    @_serialized_store_call
     def session_resume_verdict(
         self, session_key: str, max_attempts: int
     ) -> tuple[bool, int | None]:
@@ -806,11 +822,13 @@ class AutoResumeAttemptStore:
         count = int(session_attempts.get(session_key, {}).get("count", 0))
         return count < max_attempts, count
 
+    @_serialized_store_call
     def session_cap_reached(self, session_key: str, max_attempts: int) -> bool:
         """True when ``session_key`` may not be boot-resumed again."""
         allowed, _count = self.session_resume_verdict(session_key, max_attempts)
         return not allowed
 
+    @_serialized_store_call
     def record_session_attempt(self, session_key: str) -> int | None:
         """Increment and persist ``session_key``'s counter; return the new count.
 
@@ -832,6 +850,7 @@ class AutoResumeAttemptStore:
             return None
         return count
 
+    @_serialized_store_call
     def clear_session_attempts(self, session_key: str) -> None:
         """Forget ``session_key``'s counter after real forward progress.
 

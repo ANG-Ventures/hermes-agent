@@ -14836,7 +14836,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Charge all resume modes only after the adapter accepts the turn.
             if _auto_resume_max_attempts() > 0:
                 try:
-                    self._get_auto_resume_attempt_store().record_session_attempt(session_key)
+                    await asyncio.to_thread(
+                        self._get_auto_resume_attempt_store().record_session_attempt,
+                        session_key,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("Auto-resume attempt accounting failed for %s: %s", session_key, exc)
             session_tasks = getattr(adapter, "_session_tasks", {})

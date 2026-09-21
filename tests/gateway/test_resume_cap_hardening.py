@@ -107,3 +107,14 @@ def test_v2_repair_keeps_legacy_credits(tmp_path):
     fresh = AutoResumeAttemptStore(path)
     assert fresh.has_attempt("s", 42)
     assert fresh.session_attempt_count("s") == 1
+
+
+def test_concurrent_session_accounting_does_not_lose_increments(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    store = AutoResumeAttemptStore(tmp_path / "attempts.json")
+    assert store.session_resume_verdict("s", 100) == (True, 0)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        counts = list(pool.map(lambda _: store.record_session_attempt("s"), range(24)))
+    assert sorted(counts) == list(range(1, 25))
+    assert AutoResumeAttemptStore(store.path).session_attempt_count("s") == 24
