@@ -728,6 +728,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument("--survivor-ref", default=None, metavar="URL#SHA",
+                            help="Name an external survivor when the implementation lives on a "
+                                 "remote, not in the workspace. Verified with git ls-remote; "
+                                 "an unverifiable claim refuses the completion.")
+    p_complete.add_argument("--survivor-pr", default=None, metavar="OWNER/REPO#N",
+                            help="Name an external survivor by pull request. Verified with "
+                                 "gh pr view (state OPEN or MERGED); an unverifiable claim "
+                                 "refuses the completion.")
 
     p_edit = sub.add_parser(
         "edit",
@@ -2759,10 +2767,13 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
     # Refuse instead of silently doing the wrong thing.
-    if len(ids) > 1 and (summary or raw_meta):
+    survivor_ref = getattr(args, "survivor_ref", None)
+    survivor_pr = getattr(args, "survivor_pr", None)
+    if len(ids) > 1 and (summary or raw_meta or survivor_ref or survivor_pr):
         print(
-            "kanban: --summary / --metadata are per-task and can't be used "
-            "with multiple ids (would apply the same handoff to every task). "
+            "kanban: --summary / --metadata / --survivor-ref / --survivor-pr are per-task "
+            "and can't be used with multiple ids (would apply the same handoff, and record "
+            "the same survivor, for every task). "
             "Complete tasks one at a time, or drop the flags for the bulk close.",
             file=sys.stderr,
         )
@@ -2802,6 +2813,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 summary=summary,
                 metadata=metadata,
                 expected_run_id=_worker_run_id_for(tid),
+                survivor_ref=survivor_ref,
+                survivor_pr=survivor_pr,
             ):
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)

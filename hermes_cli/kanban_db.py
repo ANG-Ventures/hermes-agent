@@ -6614,6 +6614,8 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    survivor_ref: Optional[str] = None,
+    survivor_pr: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -6687,7 +6689,11 @@ def complete_task(
     if expected_run_id is not None and candidate.current_run_id != expected_run_id:
         return False
     from hermes_cli.kanban_survivor import preserve
-    survivor = preserve(conn, task_id, metadata)
+    survivor = preserve(
+        conn, task_id, metadata,
+        survivor_ref=survivor_ref, survivor_pr=survivor_pr,
+        evidence=[t for t in (summary, result) if t],
+    )
     if survivor:
         metadata = dict(metadata or {}, survivor=survivor)
         survivor_note = (
