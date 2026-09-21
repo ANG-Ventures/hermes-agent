@@ -139,6 +139,68 @@ class TestMatcher:
         assert spec.matches_tool("anything")
 
 
+class TestHookDisplayName:
+    """``hook_display_name`` is the secret boundary for model-facing text."""
+
+    # Each entry is (command, secret embedded in it). The secret must never
+    # survive into the display name, whatever shape the command takes.
+    SECRET_BEARING = [
+        ("/bin/sh -c 'export TOK={s}; sleep 30'", "hunter2PRODSup3rSecret"),
+        ('bash -c "curl -H \'Bearer {s}\' https://x"', "sk-abc123"),
+        ("guard.sh --token={s}", "SECRET123"),
+        ("env TOK={s} /opt/hooks/g.py", "SEKRET"),
+        ("env  TOK={s}  python3 /opt/hooks/g.py", "SEKRET"),
+        ("/x/y/hook.py --token {s}", "SEKRET"),
+        ("https://user:{s}@host/path", "SEKRET"),
+        ("./run {s}", "SEKRET"),
+        ("python3 -c 'import os; print(os.environ[\"{s}\"])'", "SEKRET"),
+        ("unclosed 'quote --tok={s}", "SEKRET"),  # shlex raises; still safe
+    ]
+
+    @pytest.mark.parametrize("template,secret", SECRET_BEARING)
+    def test_secret_never_survives_into_display_name(self, template, secret):
+        command = template.format(s=secret)
+        assert secret not in shell_hooks.hook_display_name(command)
+
+    def test_names_the_script_not_the_interpreter(self):
+        """Real configs are ``<interpreter> <script>`` — identify the script.
+
+        Both live pre_tool_call hooks share ``/usr/bin/python3``; collapsing
+        them to "python3" would make refusals unattributable.
+        """
+        sleep_guard = shell_hooks.hook_display_name(
+            "/usr/bin/python3 /home/u/.hermes/hooks/sleep-ttl-guard.py"
+        )
+        vision_guard = shell_hooks.hook_display_name(
+            "/usr/bin/python3 /home/u/.hermes/hooks/vision-dedup-guard.py"
+        )
+
+        assert sleep_guard.startswith("sleep-ttl-guard.py#")
+        assert vision_guard.startswith("vision-dedup-guard.py#")
+        assert sleep_guard != vision_guard
+
+    def test_distinguishes_hooks_that_share_a_label(self):
+        """Two ``sh -c`` hooks must not collapse to the same identifier."""
+        a = shell_hooks.hook_display_name("/bin/sh -c 'one'")
+        b = shell_hooks.hook_display_name("/bin/sh -c 'two'")
+
+        assert a != b
+
+    def test_is_stable_across_calls(self):
+        """The same command always yields the same name (log correlation)."""
+        command = "/usr/bin/python3 /home/u/.hermes/hooks/test-guard.py"
+
+        assert shell_hooks.hook_display_name(
+            command
+        ) == shell_hooks.hook_display_name(command)
+
+    @pytest.mark.parametrize("command", ["", "   "])
+    def test_degenerate_commands_still_yield_a_name(self, command):
+        name = shell_hooks.hook_display_name(command)
+
+        assert name.startswith("hook#")
+
+
 # ── End-to-end subprocess behaviour ───────────────────────────────────────
 
 
@@ -156,6 +218,43 @@ class TestCallbackSubprocess:
 
         assert getattr(advisory, "_hermes_timeout_fail_closed") is False
         assert getattr(enforcing, "_hermes_timeout_fail_closed") is True
+
+    def test_callback_name_omits_the_raw_command(self):
+        """__name__ reaches model-facing refusals — it must not carry secrets.
+
+        The dispatcher interpolates the callback's ``__name__`` into the
+        pre_tool_call block message returned to the model, so a command with
+        an inline credential must not be reconstructible from it.
+        """
+        secret = "hunter2PRODSup3rSecret"
+        cb = shell_hooks._make_callback(
+            shell_hooks.ShellHookSpec(
+                event="pre_tool_call",
+                command=f"/bin/sh -c 'export TOK={secret}; sleep 30'",
+                fail_closed=True,
+            )
+        )
+
+        assert secret not in cb.__name__
+        assert secret not in cb.__qualname__
+        # Still identifies the hook and its event.
+        assert cb.__name__.startswith("shell_hook[pre_tool_call:")
+
+    def test_fail_closed_block_message_omits_the_raw_command(self):
+        """The fail_closed refusal is returned to the model — no secrets."""
+        secret = "hunter2PRODSup3rSecret"
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call",
+            command=f"/bin/sh -c 'export TOK={secret}; exit 3'",
+            fail_closed=True,
+        )
+
+        block = shell_hooks._fail_closed_block(spec, "hook exited 3")
+
+        assert block["action"] == "block"
+        assert secret not in block["message"]
+        assert "failed closed" in block["message"]
+        assert "hook exited 3" in block["message"]
 
     def test_block_translation_end_to_end(self, tmp_path):
         """v1 schema-bug regression gate.

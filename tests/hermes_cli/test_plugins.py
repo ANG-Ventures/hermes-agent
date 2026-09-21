@@ -1284,6 +1284,51 @@ class TestForceReloadSymmetry:
         hold.set()
         assert policy_returned.wait(10), "abandoned policy worker never drained"
 
+    def test_refusals_do_not_disclose_a_shell_hook_command(self, monkeypatch):
+        """A hook command's secrets must not reach the MODEL-facing refusal.
+
+        The refusal messages interpolate the callback's ``__name__``, and a
+        shell hook's command is operator-supplied text that routinely embeds
+        credentials inline. Drives the real shell-hook callback through the
+        real dispatcher so the whole producer→consumer chain is covered, not
+        just the formatting helper.
+        """
+        from agent import shell_hooks
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
+        )
+
+        secret = "hunter2PRODSup3rSecret"
+        callback = shell_hooks._make_callback(
+            shell_hooks.ShellHookSpec(
+                event="pre_tool_call",
+                command=f"/bin/sh -c 'export TOK={secret}; sleep 30'",
+                fail_closed=True,
+            )
+        )
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [callback]
+
+        import hermes_cli.plugins as plugins_mod
+
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+
+        timeout_msg = resolve_pre_tool_block("web_search", {"query": "x"})
+        suppressed_msg = resolve_pre_tool_block("web_search", {"query": "y"})
+
+        # Both fail-closed paths block (policy preserved) ...
+        assert timeout_msg is not None
+        assert suppressed_msg is not None
+        # ... and neither discloses the command that produced them.
+        assert secret not in timeout_msg
+        assert secret not in suppressed_msg
+        # The hook is still identifiable in each refusal.
+        assert "shell_hook[pre_tool_call:" in timeout_msg
+        assert "shell_hook[pre_tool_call:" in suppressed_msg
+
     def test_pre_tool_call_timeout_does_not_reach_tool_handler(self, monkeypatch):
         """E2E: timed-out pre_tool_call blocks handle_function_call before dispatch."""
         import json
