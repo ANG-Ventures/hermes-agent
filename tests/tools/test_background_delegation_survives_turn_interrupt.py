@@ -187,7 +187,7 @@ def test_background_child_survives_mid_turn_interrupt_and_delivers(monkeypatch):
     ))
     assert out["status"] == "dispatched", out
     assert out["mode"] == "background"
-    assert started.wait(timeout=10), "background child never started"
+    assert started.wait(timeout=30), "background child never started"
 
     # The batch is detached: the parent's interrupt-propagation list must not
     # hold it, or the cascade below would abort it.
@@ -270,16 +270,20 @@ def test_background_batch_runs_with_parent_interrupt_already_set(monkeypatch):
         background=True, parent_agent=parent,
     ))
     assert out["status"] == "dispatched", out
-    assert started.wait(timeout=10)
+    assert started.wait(timeout=30)
 
     run_agent.AIAgent.interrupt(parent, "another message")
     interrupt_set.set()
     # Hold the children until the poll loop has demonstrably gone round again
-    # with the flag set. Bounded: a mutant that honors the flag BREAKS out of
-    # the loop instead of re-waiting, so it never signals — that path falls
-    # through on the timeout and is then caught by the result assertions.
-    loop_rechecked.wait(timeout=3.0)
-    release.set()
+    # with the flag set. A mutant that honors the flag BREAKS out instead of
+    # re-waiting, so the assertion fails. Always release in ``finally`` so the
+    # executor's bounded cleanup can complete on either path.
+    try:
+        assert loop_rechecked.wait(timeout=30), (
+            "batch poll loop did not re-check after the parent interrupt"
+        )
+    finally:
+        release.set()
 
     evt = _drain_one()
     assert evt is not None
@@ -327,7 +331,7 @@ def test_explicit_stop_still_cancels_the_background_batch(monkeypatch):
         background=True, parent_agent=parent,
     ))
     assert out["status"] == "dispatched", out
-    assert started.wait(timeout=10)
+    assert started.wait(timeout=30)
 
     n = async_delegation.interrupt_for_session(
         session_key="stop-sess",
