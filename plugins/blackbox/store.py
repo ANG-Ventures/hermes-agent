@@ -299,13 +299,29 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 if "duplicate column" not in str(e).lower():
                     raise
     if migrating_legacy_unknown_schema:
+        # The all-zero-counts guard may only name token columns this DB actually
+        # has. `turns` is created with them, but a table that already existed
+        # never gains them (CREATE TABLE IF NOT EXISTS is a no-op and no ALTER
+        # adds them), so a sufficiently old DB can reach here without e.g.
+        # `cache_write` — naming it unconditionally aborts the whole migration
+        # with "no such column". When a count column is absent the row cannot
+        # carry a measurement in it, which is exactly the zero the guard tests
+        # for, so omitting it from the sum preserves the condition's meaning.
+        _count_cols = [
+            c for c in ("input_tokens", "output_tokens", "cache_read", "cache_write")
+            if c in _existing
+        ]
+        _all_zero = (
+            " + ".join(f"COALESCE({c}, 0)" for c in _count_cols) + " = 0"
+            if _count_cols
+            else "1 = 1"
+        )
         conn.execute(
             "UPDATE turns SET usage_unknown = 1 "
             "WHERE cost_usd IS NULL "
             "AND cost_uncached_usd IS NULL AND cost_cache_read_usd IS NULL "
             "AND cost_cache_write_usd IS NULL AND cost_output_usd IS NULL "
-            "AND COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) "
-            "  + COALESCE(cache_read, 0) + COALESCE(cache_write, 0) = 0"
+            f"AND {_all_zero}"
         )
     _ensure_turn_indexes(conn)
     conn.commit()

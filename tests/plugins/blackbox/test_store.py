@@ -396,6 +396,55 @@ def test_schema_migration_adds_columns_to_preexisting_table(tmp_path, monkeypatc
         conn.execute("SELECT last_cache_read FROM turns").fetchall()
 
 
+def test_migration_survives_a_db_missing_some_token_count_columns(tmp_path, monkeypatch):
+    """The unknown-latch must not name a token column this DB does not have.
+
+    `turns` is created WITH the four count columns, but a table that already
+    exists never gains them: CREATE TABLE IF NOT EXISTS is a no-op and no ALTER
+    adds them. A sufficiently old DB therefore reaches the latch without e.g.
+    `cache_write`, and naming it unconditionally aborts the ENTIRE _ensure_schema
+    with "no such column" — taking every later migration down with it.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db_path = store._db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy = sqlite3.connect(str(db_path))
+    # Only input_tokens survives of the four count columns.
+    legacy.execute(
+        "CREATE TABLE turns ("
+        "turn_id TEXT PRIMARY KEY, platform TEXT, chat_id TEXT, ts_end REAL, "
+        "cost_usd REAL, context_used INT, last_uncached INT, input_tokens INT)"
+    )
+    legacy.execute(
+        "INSERT INTO turns (turn_id, input_tokens, cost_usd) "
+        "VALUES ('ancient-measured', 100, NULL)"
+    )
+    legacy.execute(
+        "INSERT INTO turns (turn_id, input_tokens, cost_usd) "
+        "VALUES ('ancient-empty', 0, NULL)"
+    )
+    legacy.commit()
+    legacy.close()
+
+    with store._connect() as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(turns)").fetchall()}
+        measured = conn.execute(
+            "SELECT usage_unknown FROM turns WHERE turn_id = 'ancient-measured'"
+        ).fetchone()[0]
+        empty = conn.execute(
+            "SELECT usage_unknown FROM turns WHERE turn_id = 'ancient-empty'"
+        ).fetchone()[0]
+
+    # The later migrations still ran — they would have been skipped had the
+    # latch raised.
+    assert {"comp_sys_tokens", "comp_calls_json", "cost_output_usd"} <= cols
+    assert {"usage_unknown", "output_tokens_unknown"} <= cols
+    # The guard keeps its meaning over the columns that DO exist: a row with a
+    # real count is not latched, a genuinely empty one is.
+    assert measured == 0
+    assert empty == 1
+
+
 # ---------------------------------------------------------------------------
 # SPEC-C Phase 3 — per-class cost columns persist + migrate (additive, NULL-safe)
 # ---------------------------------------------------------------------------
