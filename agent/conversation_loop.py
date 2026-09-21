@@ -563,7 +563,8 @@ def _last_turn_snapshot_kwargs(usage: Any) -> dict[str, Any]:
 
     These are SNAPSHOT columns, written ``COALESCE(?, existing)``
     (``hermes_state._TOKEN_DELTA_SNAPSHOT_FIELDS``), and the sessions schema
-    has no ``*_unknown`` companion columns — so a 0 written here is
+    has no per-bucket VALUE-preserving companion (the ``*_unknown`` flags record
+    provenance, not the value) — so a 0 written here is
     indistinguishable from a measured 0 and, because ``COALESCE(0, existing)``
     is ``0``, it also DESTROYS the previous turn's real persisted split. An
     unmeasured call must therefore write ``None`` and leave the last real
@@ -5192,6 +5193,19 @@ def run_conversation(
                         _turn_call = _turn_calls[-1]
                     except Exception:
                         pass  # telemetry must never break the conversation loop
+                    # Cumulative UNKNOWN provenance for the session_*_tokens
+                    # counters committed above. ABSORBING: those counters are
+                    # sums, so an unmeasured call contributes 0 and is
+                    # indistinguishable from a dead call once summed. One
+                    # unknown call therefore latches the SESSION term for the
+                    # rest of the window — a last-call-only guard cannot
+                    # recover it after a measured call follows an unmeasured
+                    # one. Lives here (not beside the += lines) so it stays
+                    # inside the same successful-usage commit block without
+                    # widening the append/commit adjacency invariant.
+                    for _flag_key, _flag_value in usage_flags.items():
+                        if _flag_value:
+                            setattr(agent, f"session_{_flag_key}", True)
                     # Rolling history for status-bar averages (last 10).
                     # An unmeasured output is not 0 tok/s. The two deques are
                     # appended together and consumers (cli.py status bar,
@@ -5348,6 +5362,16 @@ def run_conversation(
                                 model=agent.model,
                                 api_call_count=1,
                                 **_last_turn_snapshot_kwargs(canonical_usage),
+                                # UNKNOWN != 0. The cumulative flags are
+                                # ABSORBING in the store (one unmeasured call
+                                # latches the session total); the last_turn_*
+                                # ones are last-write-wins, mirroring the
+                                # snapshot counters they discriminate.
+                                **usage_flags,
+                                **{
+                                    f"last_turn_{key}": value
+                                    for key, value in usage_flags.items()
+                                },
                             )
                         except Exception as e:
                             # Log token persistence failures so they're

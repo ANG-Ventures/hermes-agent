@@ -6424,6 +6424,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "session_completion_tokens": 0,
             "session_total_tokens": 0,
             "session_api_calls": 0,
+            # UNKNOWN != 0 (cumulative, absorbing). Default measured so a
+            # snapshot built before any agent exists reads exactly as today.
+            "input_tokens_unknown": False,
+            "output_tokens_unknown": False,
+            "cache_read_tokens_unknown": False,
+            "cache_write_tokens_unknown": False,
+            "usage_unknown": False,
+            "session_prompt_tokens_unknown": False,
+            "session_total_tokens_unknown": False,
             "compressions": 0,
             "active_background_tasks": 0,
             "active_background_processes": 0,
@@ -6518,6 +6527,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         snapshot["session_completion_tokens"] = getattr(agent, "session_completion_tokens", 0) or 0
         snapshot["session_total_tokens"] = getattr(agent, "session_total_tokens", 0) or 0
         snapshot["session_api_calls"] = getattr(agent, "session_api_calls", 0) or 0
+        # UNKNOWN != 0, cumulative. Shared rule from agent.usage_pricing — the
+        # cumulative figures are sums over the same canonical usage the per-turn
+        # Blackbox card reads, so they use the SAME unknown vocabulary rather
+        # than a forked status-bar-only one.
+        try:
+            from agent.usage_pricing import (
+                prompt_tokens_unknown, session_total_tokens_unknown,
+                session_usage_unknown_flags,
+            )
+
+            _session_flags = session_usage_unknown_flags(agent)
+            snapshot.update(_session_flags)
+            snapshot["session_prompt_tokens_unknown"] = prompt_tokens_unknown(_session_flags)
+            snapshot["session_total_tokens_unknown"] = session_total_tokens_unknown(agent)
+        except Exception:
+            pass
 
         compressor = getattr(agent, "context_compressor", None)
         if compressor:
@@ -6545,6 +6570,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         #   see agent/conversation_loop.py:4314  cache=read/prompt (87%)
         #   and CanonicalUsage.prompt_tokens = input+read+write
         try:
+            from agent.usage_pricing import UNKNOWN_TOKENS_LABEL
+
             base_model = getattr(self, "_cache_hit_baseline_model", None)
             base_prompt = int(getattr(self, "_cache_hit_baseline_prompt", 0) or 0)
             base_read = int(getattr(self, "_cache_hit_baseline_read", 0) or 0)
@@ -6574,10 +6601,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 base_read = cur_read
             delta_prompt = cur_prompt - base_prompt
             delta_read = cur_read - base_read
+            # A cache RATIO over cumulative counters is only a measurement when
+            # both terms are. An unmeasured call contributes 0 to each sum, so
+            # a ratio computed across it is fabricated — it reads as a cache
+            # miss that never happened (or a 100% hit that did not). Suppress
+            # the segment instead, exactly like the zero-read regime below.
+            if snapshot.get("session_prompt_tokens_unknown") or snapshot.get(
+                "cache_read_tokens_unknown"
+            ) or snapshot.get("usage_unknown"):
+                snapshot["cache_hit_pct"] = None
+                snapshot["cache_hit_label"] = UNKNOWN_TOKENS_LABEL
             # A zero-read regime hides the segment entirely (no cache data
             # is not the same as a 0% hit worth alarming about), and the pct
             # stays a float so renderers control their own precision.
-            if delta_prompt > 0 and delta_read > 0:
+            elif delta_prompt > 0 and delta_read > 0:
                 pct = max(0.0, min(100.0, (delta_read / delta_prompt) * 100))
                 snapshot["cache_hit_pct"] = pct
                 snapshot["cache_hit_label"] = f"{pct:.0f}%"
@@ -7487,7 +7524,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # list, so default bars never widen.
             total_tokens = snapshot.get("session_total_tokens", 0)
             if total_tokens and field_set is not None and "total_tokens" in field_set:
-                parts.append(f"Σ{format_token_count_compact(total_tokens)}")
+                from agent.usage_pricing import format_token_count
+
+                parts.append(
+                    "Σ" + format_token_count(
+                        total_tokens,
+                        unknown=bool(snapshot.get("session_total_tokens_unknown")),
+                        formatter=format_token_count_compact,
+                    )
+                )
             if not parts:
                 parts = [f"⚕ {snapshot['model_short']}"]
             return self._right_align_status_title(" │ ".join(parts), session_title, width)
@@ -7653,7 +7698,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # fields list, so default bars never widen.
                     total_tokens = snapshot.get("session_total_tokens", 0)
                     if total_tokens and field_set is not None and "total_tokens" in field_set:
-                        _append(frags, " │ ", ("class:status-bar-dim", f"Σ{format_token_count_compact(total_tokens)}"))
+                        from agent.usage_pricing import format_token_count
+
+                        _append(frags, " │ ", ("class:status-bar-dim", "Σ" + format_token_count(
+                            total_tokens,
+                            unknown=bool(snapshot.get("session_total_tokens_unknown")),
+                            formatter=format_token_count_compact,
+                        )))
                     if not frags:
                         frags = [
                             ("class:status-bar", " ⚕ "),
@@ -14433,16 +14484,34 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         msg_count = len(self.conversation_history)
         elapsed = format_duration_compact((datetime.now() - self.session_start).total_seconds())
 
+        # UNKNOWN != 0, cumulative + absorbing. Shared rule (the same
+        # format_token_count the Blackbox card and status bar use) so one
+        # unmeasured call in the window renders that term "unknown" here
+        # instead of a right-aligned number the user would read as measured.
+        from agent.usage_pricing import (
+            format_token_count, prompt_tokens_unknown,
+            session_total_tokens_unknown, session_usage_unknown_flags,
+        )
+
+        _flags = session_usage_unknown_flags(agent)
+        _any = session_total_tokens_unknown(agent)
+        _prompt_unknown = prompt_tokens_unknown(_flags)
+
+        def _tok(value: int, unknown: bool) -> str:
+            return format_token_count(
+                value, unknown=unknown, formatter=lambda v: f"{int(v):,}"
+            ).rjust(10)
+
         print("  📊 Session Token Usage")
         print(f"  {'─' * 40}")
         print(f"  Model:                     {agent.model}")
-        print(f"  Input tokens:              {input_tokens:>10,}")
-        print(f"  Output tokens:             {output_tokens:>10,}")
+        print(f"  Input tokens:              {_tok(input_tokens, _flags['input_tokens_unknown'] or _flags['usage_unknown'])}")
+        print(f"  Output tokens:             {_tok(output_tokens, _flags['output_tokens_unknown'] or _flags['usage_unknown'])}")
         if reasoning_tokens:
             print(f"  ↳ Reasoning (subset):      {reasoning_tokens:>10,}")
-        print(f"  Prompt tokens (total):     {prompt:>10,}")
-        print(f"  Completion tokens:         {completion:>10,}")
-        print(f"  Total tokens:              {total:>10,}")
+        print(f"  Prompt tokens (total):     {_tok(prompt, _prompt_unknown)}")
+        print(f"  Completion tokens:         {_tok(completion, _flags['output_tokens_unknown'] or _flags['usage_unknown'])}")
+        print(f"  Total tokens:              {_tok(total, _any)}")
         print(f"  API calls:                 {calls:>10,}")
         print(f"  Session duration:          {elapsed:>10}")
         print(f"  {'─' * 40}")
