@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -102,6 +103,13 @@ def read_last_teardown_seconds(home: Optional[Path] = None) -> Optional[float]:
     try:
         value = float(raw)
     except (TypeError, ValueError):
+        return None
+    # ``inf`` survives a bare ``>= 0.0`` check and is not a measurement any
+    # completed teardown can produce — it only arrives from a corrupt or
+    # hand-edited file. Letting it through makes the teardown reserve
+    # unbounded, which silently drives the next shutdown's drain budget to
+    # zero. ``nan`` already fails the comparison; reject both explicitly.
+    if not math.isfinite(value):
         return None
     return value if value >= 0.0 else None
 
