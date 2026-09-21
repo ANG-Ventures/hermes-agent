@@ -3093,6 +3093,14 @@ def init_agent(
     agent.session_cache_read_tokens = 0
     agent.session_cache_write_tokens = 0
     agent.session_reasoning_tokens = 0
+    # Cumulative UNKNOWN provenance for the counters above (ABSORBING — see
+    # agent/conversation_loop.py). A set flag means that cumulative term is not
+    # a measurement and must render unknown rather than as a fabricated number.
+    agent.session_input_tokens_unknown = False
+    agent.session_output_tokens_unknown = False
+    agent.session_cache_read_tokens_unknown = False
+    agent.session_cache_write_tokens_unknown = False
+    agent.session_usage_unknown = False
     # Per-call snapshot for the most recent successful provider response.
     # Cumulative session_* counters are still the source of truth for totals.
     agent.last_turn_usage = None

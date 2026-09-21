@@ -851,6 +851,14 @@ class AIAgent:
         self.session_cache_write_tokens = 0
         self.session_reasoning_tokens = 0
         self.session_api_calls = 0
+        # Cumulative UNKNOWN provenance for the counters above (ABSORBING —
+        # see agent/conversation_loop.py). A cumulative total whose flag is set
+        # is NOT a measurement and must render as unknown, never as a number.
+        self.session_input_tokens_unknown = False
+        self.session_output_tokens_unknown = False
+        self.session_cache_read_tokens_unknown = False
+        self.session_cache_write_tokens_unknown = False
+        self.session_usage_unknown = False
         # Snapshot of the most recent successful provider call, normalized into
         # Hermes' canonical usage shape. Session counters above are cumulative;
         # this per-call record lets status/usage surfaces show the last turn's

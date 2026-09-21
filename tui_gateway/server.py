@@ -7808,10 +7808,28 @@ def _get_usage(agent) -> dict:
     # data exists — e.g. Codex app-server reports no latency, and a session
     # with zero cache reads shows no hit% rather than an alarming 0.
     try:
+        from agent.usage_pricing import (
+            prompt_tokens_unknown, session_total_tokens_unknown,
+            session_usage_unknown_flags,
+        )
+
         _prompt_total = int(getattr(agent, "session_prompt_tokens", 0) or 0)
         _cache_read = int(getattr(agent, "session_cache_read_tokens", 0) or 0)
-        if _prompt_total > 0 and _cache_read > 0:
+        # UNKNOWN != 0, cumulative. Same absorbing rule as the classic CLI bar:
+        # an unmeasured call adds 0 to both terms, so a ratio over it is
+        # fabricated. Emit the explicit unknown flag and NO pct, rather than a
+        # number the TUI would colour as a real hit rate.
+        _flags = session_usage_unknown_flags(agent)
+        _ratio_unknown = (
+            prompt_tokens_unknown(_flags) or _flags["cache_read_tokens_unknown"]
+        )
+        if _ratio_unknown:
+            usage["cache_hit_unknown"] = True
+        elif _prompt_total > 0 and _cache_read > 0:
             usage["cache_hit_pct"] = max(0, min(100, round(_cache_read / _prompt_total * 100)))
+        usage.update({f"session_{k}": v for k, v in _flags.items() if v})
+        if session_total_tokens_unknown(agent):
+            usage["session_total_tokens_unknown"] = True
     except Exception:
         pass
     try:

@@ -454,6 +454,26 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_turn_cache_read_tokens INTEGER,
     last_turn_cache_write_tokens INTEGER,
     last_turn_reasoning_tokens INTEGER,
+    -- UNKNOWN != 0 (agent/usage_pricing.py USAGE_UNKNOWN_FIELDS). A provider
+    -- can declare a term UNMEASURED rather than zero; the integer counters
+    -- above stay ints so every arithmetic consumer is untouched and these
+    -- flags are the discriminator. The cumulative ones are ABSORBING (OR'd
+    -- per delta): once any call in the session was unmeasured for a term,
+    -- the session total for that term is not a measurement. DEFAULT 0 means
+    -- every legacy row reads back "measured", which is the correct reading
+    -- for providers that never speak this dialect.
+    input_tokens_unknown INTEGER NOT NULL DEFAULT 0,
+    output_tokens_unknown INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens_unknown INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens_unknown INTEGER NOT NULL DEFAULT 0,
+    usage_unknown INTEGER NOT NULL DEFAULT 0,
+    -- Last-turn snapshot flags: last-write-wins (NOT absorbing), mirroring
+    -- the last_turn_*_tokens columns they discriminate.
+    last_turn_input_tokens_unknown INTEGER,
+    last_turn_output_tokens_unknown INTEGER,
+    last_turn_cache_read_tokens_unknown INTEGER,
+    last_turn_cache_write_tokens_unknown INTEGER,
+    last_turn_usage_unknown INTEGER,
     git_branch TEXT,
     git_repo_root TEXT,
     git_metadata_generation INTEGER NOT NULL DEFAULT 0,
@@ -532,6 +552,15 @@ CREATE TABLE IF NOT EXISTS session_model_usage (
     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
     cache_write_tokens INTEGER NOT NULL DEFAULT 0,
     reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    -- UNKNOWN != 0, absorbing per (session, route, task) bucket. See the
+    -- sessions-table comment: the integer counters stay ints, these flags
+    -- say which of them are not measurements. DEFAULT 0 → legacy rows and
+    -- providers that never declare an unknown read back as measured.
+    input_tokens_unknown INTEGER NOT NULL DEFAULT 0,
+    output_tokens_unknown INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens_unknown INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens_unknown INTEGER NOT NULL DEFAULT 0,
+    usage_unknown INTEGER NOT NULL DEFAULT 0,
     estimated_cost_usd REAL NOT NULL DEFAULT 0,
     actual_cost_usd REAL NOT NULL DEFAULT 0,
     cost_status TEXT,

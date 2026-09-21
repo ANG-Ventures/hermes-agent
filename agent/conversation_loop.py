@@ -4856,6 +4856,19 @@ def run_conversation(
                         _turn_call = _turn_calls[-1]
                     except Exception:
                         pass  # telemetry must never break the conversation loop
+                    # Cumulative UNKNOWN provenance for the session_*_tokens
+                    # counters committed above. ABSORBING: those counters are
+                    # sums, so an unmeasured call contributes 0 and is
+                    # indistinguishable from a dead call once summed. One
+                    # unknown call therefore latches the SESSION term for the
+                    # rest of the window — a last-call-only guard cannot
+                    # recover it after a measured call follows an unmeasured
+                    # one. Lives here (not beside the += lines) so it stays
+                    # inside the same successful-usage commit block without
+                    # widening the append/commit adjacency invariant.
+                    for _flag_key, _flag_value in usage_flags.items():
+                        if _flag_value:
+                            setattr(agent, f"session_{_flag_key}", True)
                     # Rolling history for status-bar averages (last 10).
                     try:
                         hist = getattr(agent, "_api_latency_history", None)
@@ -4994,6 +5007,16 @@ def run_conversation(
                                 last_turn_cache_read_tokens=canonical_usage.cache_read_tokens,
                                 last_turn_cache_write_tokens=canonical_usage.cache_write_tokens,
                                 last_turn_reasoning_tokens=canonical_usage.reasoning_tokens,
+                                # UNKNOWN != 0. The cumulative flags are
+                                # ABSORBING in the store (one unmeasured call
+                                # latches the session total); the last_turn_*
+                                # ones are last-write-wins, mirroring the
+                                # snapshot counters they discriminate.
+                                **usage_flags,
+                                **{
+                                    f"last_turn_{key}": value
+                                    for key, value in usage_flags.items()
+                                },
                             )
                         except Exception as e:
                             # Log token persistence failures so they're
