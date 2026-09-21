@@ -457,6 +457,29 @@ _HOOK_CALLER_THREAD_HOOKS: Set[str] = {"subagent_stop"}
 # repeatedly invoked hung hook cannot accumulate abandoned daemon threads.
 _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
 
+# Policy hooks use an isolated daemon pool. They must not queue behind asyncio's
+# process-wide default executor, which is also used by cron and tool work. Four
+# workers bound damage from distinct hung policies while allowing concurrent
+# sessions to run fast policy checks independently.
+_HOOK_POLICY_EXECUTOR_WORKERS = 4
+_hook_policy_executor: Any = None
+_hook_policy_executor_lock = threading.Lock()
+
+
+def _get_hook_callback_executor():
+    global _hook_policy_executor
+    if _hook_policy_executor is None:
+        with _hook_policy_executor_lock:
+            if _hook_policy_executor is None:
+                from tools.daemon_pool import DaemonThreadPoolExecutor
+
+                _hook_policy_executor = DaemonThreadPoolExecutor(
+                    max_workers=_HOOK_POLICY_EXECUTOR_WORKERS,
+                    thread_name_prefix="hermes-policy-hook",
+                )
+    return _hook_policy_executor
+
+
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = (
     "pre_tool_call plugin callback timed out or is still running"
 )
@@ -5688,14 +5711,20 @@ class PluginManager:
                             callback_key
                         )
                         running = callback_key in self._hook_running_callbacks
-                        if (
+                        suppressed = (
                             suppressed_until is not None and suppressed_until > now
-                        ) or running:
+                        )
+                        if suppressed or running:
+                            reason = (
+                                "suppressed after callback runtime timeout"
+                                if suppressed
+                                else "skipped while callback is still running"
+                            )
                             logger.warning(
-                                "Hook '%s' callback %s skipped after previous "
-                                "timeout or while still running",
+                                "Hook '%s' callback %s %s",
                                 hook_name,
                                 callback_name,
+                                reason,
                             )
                             if fail_closed:
                                 results.append(_pre_tool_call_timeout_block())
@@ -5705,7 +5734,10 @@ class PluginManager:
                         self._hook_running_callbacks[callback_key] = token
 
                     context = contextvars.copy_context()
+                    submitted_at = time.monotonic()
+                    started = threading.Event()
                     done = threading.Event()
+                    timing: Dict[str, float] = {}
                     outcome: Dict[str, Any] = {}
                     failure: Dict[str, Exception] = {}
 
@@ -5714,6 +5746,8 @@ class PluginManager:
                         _key: tuple = callback_key,
                         _token: object = token,
                     ) -> None:
+                        timing["started_at"] = time.monotonic()
+                        started.set()
                         try:
                             # Route through _invoke_hook_callback so the
                             # additive-payload signature filtering (narrow
@@ -5724,28 +5758,67 @@ class PluginManager:
                         except Exception as exc:
                             failure["exc"] = exc
                         finally:
+                            timing["finished_at"] = time.monotonic()
                             with self._hook_timeout_lock:
                                 if self._hook_running_callbacks.get(_key) is _token:
                                     self._hook_running_callbacks.pop(_key, None)
                             done.set()
 
-                    thread = threading.Thread(
-                        target=_runner,
-                        name=f"hermes-hook-{callback_name}"[:40],
-                        daemon=True,
-                    )
-                    thread.start()
+                    future = None
+                    if fail_closed:
+                        # Policy callbacks need a pool isolated from unrelated
+                        # asyncio/cron/tool work. Daemon workers preserve the
+                        # abandon-without-join timeout contract.
+                        future = _get_hook_callback_executor().submit(_runner)
+                    else:
+                        thread = threading.Thread(
+                            target=_runner,
+                            name=f"hermes-hook-{callback_name}"[:40],
+                            daemon=True,
+                        )
+                        thread.start()
+
+                    if not started.wait(timeout=timeout):
+                        queue_wait = time.monotonic() - submitted_at
+                        cancelled = future is not None and future.cancel()
+                        if cancelled:
+                            with self._hook_timeout_lock:
+                                if self._hook_running_callbacks.get(callback_key) is token:
+                                    self._hook_running_callbacks.pop(callback_key, None)
+                        logger.warning(
+                            "Hook '%s' callback %s dispatch timed out before start: "
+                            "queue_wait=%.3fs run_time=0s budget=%gs — skipping",
+                            hook_name,
+                            callback_name,
+                            queue_wait,
+                            timeout,
+                        )
+                        # Dispatch starvation is not callback slowness. Never
+                        # start the 60s suppression window for work that did
+                        # not execute; a later call gets a fresh policy check.
+                        if fail_closed:
+                            results.append(_pre_tool_call_timeout_block())
+                        continue
+
+                    started_at = timing["started_at"]
+                    queue_wait = started_at - submitted_at
                     if not done.wait(timeout=timeout):
                         # Do not join — that would reintroduce the #6622 hang.
+                        # Suppression is reserved for callbacks that actually
+                        # started and exhausted their own runtime budget.
+                        run_time = time.monotonic() - started_at
                         with self._hook_timeout_lock:
                             self._hook_timeout_suppressed_until[callback_key] = (
                                 time.monotonic()
                                 + self._hook_timeout_suppression_seconds
                             )
                         logger.warning(
-                            "Hook '%s' callback %s timed out after %gs — skipping",
+                            "Hook '%s' callback %s timed out: queue_wait=%.3fs "
+                            "run_time=%.3fs budget=%gs — skipping",
                             hook_name,
                             callback_name,
+                            queue_wait,
+                            run_time,
                             timeout,
                         )
                         if fail_closed:

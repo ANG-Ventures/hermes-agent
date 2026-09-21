@@ -1,5 +1,7 @@
 """Tests for the Hermes plugin system (hermes_cli.plugins)."""
 
+import asyncio
+from concurrent.futures import Future, ThreadPoolExecutor
 import logging
 import json
 import sys
@@ -1072,6 +1074,118 @@ class TestForceReloadSymmetry:
         assert mgr.invoke_hook("pre_llm_call", session_id="s1") == [
             {"context": "hi"}
         ]
+
+    def test_pre_tool_call_ignores_saturated_default_executor(self, monkeypatch):
+        """Unrelated asyncio work must not consume the policy hook's dispatch lane."""
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.2
+        )
+        loop = asyncio.new_event_loop()
+        default_pool = ThreadPoolExecutor(max_workers=1)
+        hold = threading.Event()
+        loop.set_default_executor(default_pool)
+        blocker = loop.run_in_executor(None, hold.wait, 10.0)
+        loop.run_until_complete(asyncio.sleep(0))
+
+        calls = []
+        callback_threads = []
+
+        def fast_policy(**_kwargs):
+            threading.Event().wait(0.03)
+            calls.append(1)
+            callback_threads.append(threading.current_thread().name)
+            return None
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [fast_policy]
+        try:
+            assert mgr.invoke_hook("pre_tool_call", tool_name="terminal") == []
+            assert calls == [1]
+            assert callback_threads[0].startswith("hermes-policy-hook")
+        finally:
+            hold.set()
+            loop.run_until_complete(blocker)
+            default_pool.shutdown(wait=True)
+            loop.close()
+
+    def test_dispatch_timeout_does_not_suppress_next_policy_call(
+        self, monkeypatch, caplog
+    ):
+        """A callback that never started must not poison the 60s suppression map."""
+        from hermes_cli import plugins as plugins_mod
+        from hermes_cli.plugins import _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
+
+        monkeypatch.setattr(
+            plugins_mod, "_resolve_hook_callback_timeout", lambda: 0.05
+        )
+
+        class QueuedExecutor:
+            def __init__(self):
+                self.run_inline = False
+
+            def submit(self, callback):
+                future = Future()
+                if self.run_inline:
+                    try:
+                        future.set_result(callback())
+                    except BaseException as exc:
+                        future.set_exception(exc)
+                return future
+
+        executor = QueuedExecutor()
+        monkeypatch.setattr(
+            plugins_mod,
+            "_get_hook_callback_executor",
+            lambda: executor,
+            raising=False,
+        )
+        calls = []
+
+        def policy(**_kwargs):
+            calls.append(1)
+            return None
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [policy]
+
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
+            first = mgr.invoke_hook("pre_tool_call", tool_name="terminal")
+
+        assert first == [
+            {"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE}
+        ]
+        assert calls == []
+        assert mgr._hook_timeout_suppressed_until == {}
+        assert "queue_wait=" in caplog.text
+        assert "run_time=0" in caplog.text
+
+        executor.run_inline = True
+        assert mgr.invoke_hook("pre_tool_call", tool_name="terminal") == []
+        assert calls == [1]
+
+    def test_running_hook_timeout_logs_queue_and_runtime(self, monkeypatch, caplog):
+        from hermes_cli import plugins as plugins_mod
+
+        monkeypatch.setattr(
+            plugins_mod, "_resolve_hook_callback_timeout", lambda: 0.05
+        )
+        hold = threading.Event()
+        started = threading.Event()
+
+        def hung_policy(**_kwargs):
+            started.set()
+            hold.wait(timeout=10.0)
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [hung_policy]
+        try:
+            with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
+                mgr.invoke_hook("pre_tool_call", tool_name="terminal")
+            assert started.is_set()
+            assert "queue_wait=" in caplog.text
+            assert "run_time=" in caplog.text
+        finally:
+            hold.set()
 
     def test_hook_exception_still_isolated_under_timeout_path(self, monkeypatch):
         monkeypatch.setattr(
