@@ -19,6 +19,7 @@ import contextlib
 import json
 import os
 import shlex
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -845,7 +846,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_request_review.add_argument(
         "--reviewer", default=None,
-        help="Optional reviewer profile; reassigns the task before review dispatch.",
+        help=(
+            "Reviewer profile (or the explicit sentinel 'human' / "
+            "'human:<name>'); reassigns the task before review dispatch. "
+            "Defaults to config kanban.review_assignee. A reviewer that is "
+            "neither an installed profile nor 'human' is refused."
+        ),
+    )
+    p_request_review.add_argument(
+        "--allow-same-actor", action="store_true",
+        help=(
+            "Permit the implementer to review their own work (normally "
+            "refused). Recorded on the review_requested event."
+        ),
     )
     p_request_review.add_argument(
         "--metadata", default=None,
@@ -3055,6 +3068,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             reviewer=reviewer,
             expected_run_id=_worker_run_id_for(tid),
             force=bool(getattr(args, "force", False)),
+            allow_same_actor=bool(getattr(args, "allow_same_actor", False)),
             with_reason=True,
         )
         if not ok:
@@ -3445,11 +3459,80 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             )
     if res.skipped_nonspawnable:
         print(
-            f"Skipped (non-spawnable assignee — terminal lane, OK): "
+            f"Skipped (non-spawnable assignee — HUMAN review required): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    _print_review_awaiting_human()
     _print_stranded_by_triage(res.stranded_by_triage)
     return 0
+
+
+def _notify_script_path():
+    """Locate ``notify.py`` (the out-of-agent Discord/Telegram alert helper)."""
+    candidates = [
+        os.path.expanduser("~/.hermes/scripts/notify.py"),
+        os.path.expanduser(
+            "~/.hermes/skills-shared/general/scheduler/scripts/notify.py"
+        ),
+        os.path.expanduser("~/.hermes/skills/devops/scheduler/scripts/notify.py"),
+    ]
+    for path in candidates:
+        try:
+            if os.path.exists(path):
+                return path
+        except Exception:
+            continue
+    return None
+
+
+def _send_review_stale_alert(entries) -> None:
+    """Fire one #alerts message for cards that just crossed the threshold."""
+    script = _notify_script_path()
+    if script is None:
+        return
+    lines = [
+        f"  • {e['task_id']} → {e['assignee'] or '(unassigned)'} "
+        f"({e['age_minutes']}m, {e['reason']})"
+        for e in entries[:10]
+    ]
+    body = (
+        "🕰️ Kanban review lane awaiting a HUMAN\n"
+        + "\n".join(lines)
+        + "\nNo autonomous reviewer will pick these up. Reassign with: "
+        "hermes kanban assign <id> argus"
+    )
+    try:
+        subprocess.run(
+            [sys.executable, str(script), "--send", body, "--channel", "discord"],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+    except Exception:
+        pass
+
+
+def _print_review_awaiting_human(*, alert: bool = True) -> None:
+    """Report review cards nothing will ever spawn, and alert once each.
+
+    Before this, the dispatcher printed those cards as "terminal lane, OK"
+    and there was no other signal — 10 cards sat in review (one 2h+) with
+    nothing raised (incident 2026-09-21).
+    """
+    try:
+        with kb.connect_closing() as conn:
+            entries = kb.review_awaiting_human(conn)
+            line = kb.format_review_awaiting_human(entries)
+            if line:
+                print(line)
+            if entries and alert:
+                fresh = kb.arm_review_stale_alerts(conn, entries)
+                if fresh:
+                    _send_review_stale_alert(fresh)
+    except Exception:
+        return
 
 
 def _print_stranded_by_triage(stranded) -> None:
@@ -3675,6 +3758,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 def _cmd_stats(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         stats = kb.board_stats(conn)
+        stats["review_awaiting_human"] = kb.review_awaiting_human(conn)
     if getattr(args, "json", False):
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0
@@ -3701,6 +3785,9 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     age = stats["oldest_ready_age_seconds"]
     if age is not None:
         print(f"\nOldest ready task age: {int(age)}s")
+    line = kb.format_review_awaiting_human(stats.get("review_awaiting_human") or [])
+    if line:
+        print(f"\n{line}")
     return 0
 
 

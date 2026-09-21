@@ -92,7 +92,7 @@ def test_review_approval_discovers_handoff_summary_and_preserves_on_cleanup(boar
     kb.set_workspace_path(board, tid, ws)
     assert kb.request_review(board, tid, summary=f"Shipped {PR} at {HEAD}",
                              metadata={"changed_files": ["code.py"]})
-    kb.add_comment(board, tid, "reviewer", "Approved")
+    kb.add_comment(board, tid, "argus", "Approved")
     assert kb.complete_task(board, tid, summary="Approved")
     assert kb.latest_run(board, tid).metadata["survivor"]["kind"] == "ref"
     assert not ws.exists()
@@ -110,7 +110,7 @@ def test_non_code_card_does_not_mine_an_incidental_pr(board, remote, source):
     mention = f"FYI unrelated context: see {PR} for the survivor work."
     tid = kb.create_task(board, title="research card, no code at all")
     if source == "comment":
-        kb.add_comment(board, tid, "reviewer", mention)
+        kb.add_comment(board, tid, "argus", mention)
     assert kb.complete_task(board, tid, result=mention if source == "result" else "No code changed.")
     assert (kb.latest_run(board, tid).metadata or {}).get("survivor") is None
     assert not board.execute(
@@ -200,7 +200,7 @@ def test_mined_pr_whose_branch_names_the_task_is_accepted(board, remote):
 def test_comments_are_discussion_not_handoff(board, remote):
     """Another card's PR cited (with its SHA) in a comment must not become this card's survivor."""
     tid = kb.create_task(board, title="external implementation")
-    kb.add_comment(board, tid, "reviewer", f"context: t_other shipped {PR} at {HEAD}")
+    kb.add_comment(board, tid, "argus", f"context: t_other shipped {PR} at {HEAD}")
     with pytest.raises(ValueError, match="survivor-pr"):
         kb.complete_task(board, tid, result="done", metadata={"changed_files": ["code.py"]})
     assert kb.get_task(board, tid).status != "done"
