@@ -83,12 +83,18 @@ def test_capture_without_a_session_key_is_a_silent_no_op(tmp_path):
     assert list(tmp_path.glob("*.json")) == []
 
 
-def test_capture_of_an_empty_turn_writes_nothing(tmp_path):
+def test_capture_of_an_early_cut_preserves_the_request_and_todo(tmp_path):
     agent = _agent()
     msgs = [{"role": "user", "content": "hi", "row_id": 1}]
-    assert capture_turn_handoff(agent, msgs, turn_start_idx=0,
-                                reason="x", root=tmp_path) == ""
-    assert list(tmp_path.glob("*.json")) == []
+
+    notice = capture_turn_handoff(
+        agent, msgs, turn_start_idx=0, reason="x", root=tmp_path
+    )
+    context = consume_handoff_context(agent, root=tmp_path)
+
+    assert "Handoff saved" in notice
+    assert "hi" in context
+    assert "finish the audit" in context
 
 
 def test_capture_never_raises(tmp_path):

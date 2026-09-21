@@ -122,14 +122,34 @@ def build_turn_handoff(
     """Snapshot the in-flight state of the turn being cut.
 
     ``turn_start_idx`` is the index of THIS turn's user message in ``messages``
-    — everything from there on is the work in flight. Returns ``None`` when
-    there is nothing worth resuming (no assistant text, no tool calls).
+    — everything from there on is the work in flight. Returns ``None`` only
+    when there is no user request, visible assistant progress, tool call, or
+    open todo worth resuming.
     """
     try:
         return _build_turn_handoff(agent, messages, turn_start_idx, reason)
     except Exception:
         logger.debug("turn handoff build failed", exc_info=True)
         return None
+
+
+def _merge_progress(materialized: str, streamed: str) -> str:
+    """Append streamed progress without repeating its materialized prefix."""
+    if not materialized:
+        return streamed
+    if not streamed or streamed in materialized:
+        return materialized
+    if materialized in streamed:
+        return streamed
+
+    # A completed interim assistant row can also be the prefix of the current
+    # live stream. Preserve earlier rows while removing the longest exact
+    # overlap at that boundary.
+    max_overlap = min(len(materialized), len(streamed))
+    for size in range(max_overlap, 7, -1):
+        if materialized.endswith(streamed[:size]):
+            return materialized + streamed[size:]
+    return f"{materialized}\n\n{streamed}"
 
 
 def _build_turn_handoff(agent, messages, turn_start_idx, reason):
@@ -187,10 +207,24 @@ def _build_turn_handoff(agent, messages, turn_start_idx, reason):
                 ),
             })
 
-    assistant_progress = _truncate("\n\n".join(progress),
-                                   _ASSISTANT_PROGRESS_CHARS)
+    materialized_progress = "\n\n".join(progress)
+    streamed_progress = getattr(agent, "_current_streamed_assistant_text", "") or ""
+    if not isinstance(streamed_progress, str):
+        streamed_progress = ""
+    if streamed_progress:
+        strip_think_blocks = getattr(agent, "_strip_think_blocks", None)
+        if callable(strip_think_blocks):
+            streamed_progress = strip_think_blocks(streamed_progress)
+        if not isinstance(streamed_progress, str):
+            streamed_progress = ""
+        streamed_progress = streamed_progress.strip()
+
+    assistant_progress = _truncate(
+        _merge_progress(materialized_progress, streamed_progress),
+        _ASSISTANT_PROGRESS_CHARS,
+    )
     open_todos = _open_todos(agent)
-    if not assistant_progress and not tool_calls:
+    if not last_user and not assistant_progress and not tool_calls and not open_todos:
         return None
 
     return {

@@ -28,6 +28,8 @@ from agent.turn_handoff import (
     HANDOFF_TTL_SECONDS,
     TOOL_RESULT_PREVIEW_CHARS,
     build_turn_handoff,
+    capture_turn_handoff,
+    consume_handoff_context,
     consume_turn_handoff,
     format_handoff_notice,
     handoff_path_for,
@@ -65,12 +67,23 @@ class _Store:
 
 
 class _Agent:
-    def __init__(self, *, session_key="discord:123", todos=None):
+    def __init__(
+        self,
+        *,
+        session_key="discord:123",
+        todos=None,
+        streamed_text="",
+    ):
         self._gateway_session_key = session_key
         self.session_id = "sess-abc"
         self.model = "claude-opus-5"
         self.provider = "claude-bpx-17"
         self._todo_store = _Store(todos or [])
+        self._current_streamed_assistant_text = streamed_text
+
+    @staticmethod
+    def _strip_think_blocks(text):
+        return text.replace("<think>secret scratchpad</think>", "")
 
 
 # ── building ────────────────────────────────────────────────────────────
@@ -137,11 +150,48 @@ class TestBuildTurnHandoff:
         assert h["model"] == "claude-opus-5"
         assert h["created_at"] == pytest.approx(time.time(), abs=5)
 
-    def test_a_turn_with_no_progress_yields_no_handoff(self):
-        """Nothing in flight means nothing worth resuming."""
+    def test_partial_stream_is_preserved_without_reasoning(self):
+        agent = _Agent(
+            streamed_text=(
+                "<think>secret scratchpad</think>"
+                "Half-written answer visible to the user…"
+            )
+        )
         msgs = [{"role": "user", "content": "hi", "row_id": 1}]
-        assert build_turn_handoff(_Agent(), msgs, turn_start_idx=0,
-                                  reason="x") is None
+
+        h = build_turn_handoff(agent, msgs, turn_start_idx=0, reason="x")
+
+        assert h is not None
+        assert h["assistant_progress"] == "Half-written answer visible to the user…"
+        assert "secret scratchpad" not in h["assistant_progress"]
+
+    def test_partial_stream_and_materialized_progress_are_preserved_once(self):
+        agent = _Agent(
+            streamed_text=(
+                "Earlier completed progress.\n\n"
+                "Half-written answer visible to the user…"
+            )
+        )
+        msgs = [
+            {"role": "user", "content": "hi", "row_id": 1},
+            {"role": "assistant", "content": "Earlier completed progress."},
+        ]
+
+        h = build_turn_handoff(agent, msgs, turn_start_idx=0, reason="x")
+
+        assert h is not None
+        assert h["assistant_progress"].count("Earlier completed progress.") == 1
+        assert "Half-written answer visible to the user…" in h["assistant_progress"]
+
+    def test_a_user_only_early_cut_still_yields_a_handoff(self):
+        msgs = [{"role": "user", "content": "hi", "row_id": 1}]
+
+        h = build_turn_handoff(_Agent(), msgs, turn_start_idx=0, reason="x")
+
+        assert h is not None
+        assert h["last_user_message"] == {"row_id": 1, "content": "hi"}
+        assert h["assistant_progress"] == ""
+        assert h["tool_calls"] == []
 
     def test_an_out_of_range_turn_index_is_tolerated(self):
         assert build_turn_handoff(_Agent(), _messages(), turn_start_idx=99,
@@ -158,6 +208,36 @@ class TestBuildTurnHandoff:
 
 
 class TestRoundTrip:
+    def test_partial_stream_user_and_todo_round_trip_into_next_turn(self, tmp_path):
+        agent = _Agent(
+            todos=[{
+                "id": "todo-1",
+                "content": "finish the fleet audit",
+                "status": "in_progress",
+            }],
+            streamed_text="Half-written answer visible to the user…",
+        )
+        msgs = [{
+            "role": "user",
+            "content": "audit the fleet cron jobs",
+            "row_id": 42,
+        }]
+
+        notice = capture_turn_handoff(
+            agent,
+            msgs,
+            turn_start_idx=0,
+            reason="quota wall",
+            root=tmp_path,
+        )
+        context = consume_handoff_context(agent, root=tmp_path)
+
+        assert "Handoff saved" in notice
+        assert "audit the fleet cron jobs" in context
+        assert "Half-written answer visible to the user…" in context
+        assert "finish the fleet audit" in context
+        assert consume_handoff_context(agent, root=tmp_path) == ""
+
     def test_write_then_consume_returns_the_same_payload(self, tmp_path):
         h = build_turn_handoff(_Agent(), _messages(), turn_start_idx=2,
                                reason="quota wall")
