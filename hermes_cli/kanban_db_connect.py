@@ -179,7 +179,7 @@ def _read_dispatch_lock_holder(db_path: Path) -> dict:
         if not 0 <= age < float("inf") or not isinstance(site, str):
             return {}
         return {"pid": pid, "age_seconds": age, "acquire_site": site}
-    except (OSError, ValueError, KeyError):
+    except (OSError, ValueError, KeyError, OverflowError):
         return {}
 
 
