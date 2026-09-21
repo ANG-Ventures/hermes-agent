@@ -203,10 +203,12 @@ def read_entries_with_health(
 ) -> tuple[List[Dict[str, Any]], int]:
     """``(entries, malformed_line_count)`` — see ``read_entries``.
 
-    ``malformed_line_count`` counts every non-empty line that could not be
-    parsed into a record with a usable timestamp, ANYWHERE in the file (not
-    only inside the window): a record we cannot read is a record whose
-    timestamp we cannot trust to place inside or outside the window.
+    ``malformed_line_count`` counts every non-empty line that is not a valid
+    lifecycle record, ANYWHERE in the file (not only inside the window): the
+    record must be an object with a recognized event, a non-empty string
+    ``job_id``, and a usable timestamp. A record we cannot validate is a record
+    whose timestamp or lifecycle effect we cannot trust to place inside or
+    outside the window.
     """
     path = _journal_path()
     if not path.exists():
@@ -221,6 +223,16 @@ def read_entries_with_health(
                 continue
             try:
                 rec = json.loads(line)
+                if not isinstance(rec, dict):
+                    raise ValueError("lifecycle record is not an object")
+                event = rec.get("event")
+                if not isinstance(event, str) or event not in (
+                    EVENT_CREATED, EVENT_REMOVED
+                ):
+                    raise ValueError("lifecycle record has an unknown event")
+                job_id = rec.get("job_id")
+                if not isinstance(job_id, str) or not job_id.strip():
+                    raise ValueError("lifecycle record has no usable job_id")
                 at = _parse_at(rec.get("at"))
             except Exception:
                 malformed += 1
@@ -434,8 +446,8 @@ def check_vanished_jobs(
             status=STATUS_UNAVAILABLE,
             window_hours=window_hours,
             detail=(
-                f"{malformed} unparseable journal record(s) — the guard cannot "
-                "certify a store it could not fully read"
+                f"{malformed} invalid or unparseable journal record(s) — the "
+                "guard cannot certify a store it could not fully read"
             ),
         )
 

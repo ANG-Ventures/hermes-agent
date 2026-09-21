@@ -146,6 +146,69 @@ def test_record_with_an_unusable_timestamp_also_prevents_green(store):
     assert journal.check_vanished_jobs().status == journal.STATUS_UNAVAILABLE
 
 
+@pytest.mark.parametrize("invalid_fields", [
+    pytest.param({"job_id": "A"}, id="event-missing"),
+    pytest.param({"event": None, "job_id": "A"}, id="event-null"),
+    pytest.param({"event": "", "job_id": "A"}, id="event-empty"),
+    pytest.param({"event": "   ", "job_id": "A"}, id="event-whitespace"),
+    pytest.param({"event": "typo", "job_id": "A"}, id="event-unknown"),
+    pytest.param({"event": 1, "job_id": "A"}, id="event-number"),
+    pytest.param({"event": True, "job_id": "A"}, id="event-bool"),
+    pytest.param({"event": [], "job_id": "A"}, id="event-list"),
+    pytest.param({"event": {}, "job_id": "A"}, id="event-object"),
+    pytest.param({"event": journal.EVENT_CREATED}, id="job-id-missing"),
+    pytest.param({"event": journal.EVENT_CREATED, "job_id": None}, id="job-id-null"),
+    pytest.param({"event": journal.EVENT_CREATED, "job_id": ""}, id="job-id-empty"),
+    pytest.param(
+        {"event": journal.EVENT_CREATED, "job_id": "   "},
+        id="job-id-whitespace",
+    ),
+    pytest.param({"event": journal.EVENT_CREATED, "job_id": 123}, id="job-id-number"),
+    pytest.param({"event": journal.EVENT_CREATED, "job_id": True}, id="job-id-bool"),
+    pytest.param({"event": journal.EVENT_CREATED, "job_id": []}, id="job-id-list-empty"),
+    pytest.param(
+        {"event": journal.EVENT_CREATED, "job_id": ["A"]},
+        id="job-id-list-nonempty",
+    ),
+    pytest.param({"event": journal.EVENT_CREATED, "job_id": {}}, id="job-id-object-empty"),
+    pytest.param(
+        {"event": journal.EVENT_CREATED, "job_id": {"id": "A"}},
+        id="job-id-object-nonempty",
+    ),
+])
+def test_every_semantically_invalid_record_shape_prevents_green(
+    store, invalid_fields
+):
+    """Every shape reconciliation used to skip must make health unknown."""
+    jobs.save_jobs([], replace=True)
+    record = {"at": journal._hermes_now().isoformat(), **invalid_fields}
+    with open(_journal(store), "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+    report = journal.check_vanished_jobs()
+
+    assert report.status == journal.STATUS_UNAVAILABLE
+    assert report.should_alert
+    assert "invalid" in (report.detail or "")
+
+
+@pytest.mark.parametrize(
+    "invalid_record",
+    [
+        pytest.param(None, id="null"),
+        pytest.param([], id="list"),
+        pytest.param("record", id="string"),
+        pytest.param(123, id="number"),
+    ],
+)
+def test_non_object_json_record_prevents_green(store, invalid_record):
+    jobs.save_jobs([], replace=True)
+    with open(_journal(store), "a", encoding="utf-8") as f:
+        f.write(json.dumps(invalid_record) + "\n")
+
+    assert journal.check_vanished_jobs().status == journal.STATUS_UNAVAILABLE
+
+
 # ------------------------------------------------------------------- #6
 def test_removal_after_a_create_is_honoured_despite_a_skewed_clock(store):
     """Causality comes from append order, not from writer wall clocks."""
