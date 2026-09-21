@@ -345,7 +345,11 @@ def test_schema_migration_adds_columns_to_preexisting_table(tmp_path, monkeypatc
     )
     legacy.execute(
         "INSERT INTO turns (turn_id, input_tokens, output_tokens, cost_usd) "
-        "VALUES ('legacy-unpriced', 100, 0, NULL)"
+        "VALUES ('legacy-unpriced-measured', 100, 0, NULL)"
+    )
+    legacy.execute(
+        "INSERT INTO turns (turn_id, input_tokens, output_tokens, cache_read, "
+        "cache_write, cost_usd) VALUES ('legacy-unpriced-empty', 0, 0, 0, 0, NULL)"
     )
     legacy.commit()
     legacy.close()
@@ -353,14 +357,30 @@ def test_schema_migration_adds_columns_to_preexisting_table(tmp_path, monkeypatc
     # Re-open through the store: _ensure_schema must ALTER in the new columns.
     with store._connect() as conn:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(turns)").fetchall()}
-        legacy_unknown = conn.execute(
-            "SELECT usage_unknown FROM turns WHERE turn_id = 'legacy-unpriced'"
+        measured_unknown = conn.execute(
+            "SELECT usage_unknown FROM turns WHERE turn_id = 'legacy-unpriced-measured'"
+        ).fetchone()[0]
+        empty_unknown = conn.execute(
+            "SELECT usage_unknown FROM turns WHERE turn_id = 'legacy-unpriced-empty'"
         ).fetchone()[0]
     assert {"last_cache_read", "last_cache_write", "last_uncached"} <= cols
-    assert legacy_unknown == 1, (
-        "pre-discriminator unpriced rows are ambiguous and must not be repriced "
-        "as though every token component had been measured"
+    assert empty_unknown == 1, (
+        "a pre-discriminator unpriced row with NO token counts is genuinely "
+        "ambiguous and must not be repriced as though it had been measured"
     )
+    assert measured_unknown == 0, (
+        "a row is routinely unpriced because pricing REFUSED the route, not "
+        "because usage was absent; latching usage_unknown on it rewrites its "
+        "real provider-measured counts as unmeasured, irreversibly"
+    )
+    # `usage_unknown` is the shared DISPLAY discriminator, so prove the claim
+    # at the surface the user actually sees, not just at the column.
+    from plugins.blackbox.last_turn import render_last_turn_record
+
+    measured_row = store.get_turn("legacy-unpriced-measured")
+    rendered = "\n".join(render_last_turn_record(measured_row))
+    assert "Tokens in: 100" in rendered
+    assert "Tokens in: unknown" not in rendered
 
     # A new record round-trips through the migrated columns.
     store.insert_turn(make_record("post-migrate", last_cache_read_tokens=7,

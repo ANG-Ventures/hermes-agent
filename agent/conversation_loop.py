@@ -519,10 +519,18 @@ def _build_moa_pricing_calls(
 def _canonical_usage_from_response(
     response: Any, *, provider: str | None, api_mode: str | None
 ) -> CanonicalUsage:
-    """Normalize a response's usage; omission is UNKNOWN, never measured zero."""
+    """Normalize a response's usage; omission is UNKNOWN, never measured zero.
+
+    An omitted payload leaves EVERY bucket unmeasured, so every discriminator
+    is set — not just the aggregate ``usage_unknown``. Consumers read these
+    flags narrowly (``output_tokens_unknown`` alone gates the ``out=`` log and
+    the thin card's output line; ``prompt_tokens_unknown`` ORs the three input
+    flags), so an aggregate-only UNKNOWN would still let a narrow reader print
+    this call's placeholder 0 as a measurement.
+    """
     response_usage = getattr(response, "usage", None)
     if not response_usage:
-        return CanonicalUsage(usage_unknown=True)
+        return CanonicalUsage.fully_unknown()
     return normalize_usage(response_usage, provider=provider, api_mode=api_mode)
 
 
@@ -531,6 +539,61 @@ def _capture_measured_usage_anchor(usage: Any, messages: list[dict[str, Any]]) -
     if bool(getattr(usage, "total_tokens_unknown", False)):
         return None
     return capture_usage_anchor(usage.prompt_tokens, usage.output_tokens, messages)
+
+
+def _last_turn_snapshot_kwargs(usage: Any) -> dict[str, Any]:
+    """The five ``last_turn_*`` kwargs for ``queue_token_counts``.
+
+    These are SNAPSHOT columns, written ``COALESCE(?, existing)``
+    (``hermes_state._TOKEN_DELTA_SNAPSHOT_FIELDS``), and the sessions schema
+    has no ``*_unknown`` companion columns — so a 0 written here is
+    indistinguishable from a measured 0 and, because ``COALESCE(0, existing)``
+    is ``0``, it also DESTROYS the previous turn's real persisted split. An
+    unmeasured call must therefore write ``None`` and leave the last real
+    snapshot standing, rather than stamping an unmeasured zero over it.
+
+    All five move together: the snapshot is one turn's coherent split, so
+    mixing this call's measured buckets with a prior turn's retained ones
+    would persist a blend of two different turns.
+    """
+    if bool(getattr(usage, "total_tokens_unknown", False)):
+        return {
+            "last_turn_input_tokens": None,
+            "last_turn_output_tokens": None,
+            "last_turn_cache_read_tokens": None,
+            "last_turn_cache_write_tokens": None,
+            "last_turn_reasoning_tokens": None,
+        }
+    return {
+        "last_turn_input_tokens": usage.input_tokens,
+        "last_turn_output_tokens": usage.output_tokens,
+        "last_turn_cache_read_tokens": usage.cache_read_tokens,
+        "last_turn_cache_write_tokens": usage.cache_write_tokens,
+        "last_turn_reasoning_tokens": usage.reasoning_tokens,
+    }
+
+
+def _session_cost_status_with_known_spend(
+    call_status: str, *, session_cost_usd: Any
+) -> str:
+    """Do not relabel a session that already holds priced dollars as unknown.
+
+    ``session_cost_status`` describes the SESSION, not one call. One
+    unpriceable call inside a session with real accumulated spend makes that
+    session's total incomplete — which the codebase spells ``partial`` — not
+    wholly unmeasured. Declaring ``unknown`` while
+    ``session_estimated_cost_usd`` still carries every previously priced
+    dollar both misreports the session in ``/cost`` and ``insights`` and
+    permanently strands it: ``unknown`` is outside the repricing allowlist,
+    so the mislabel never heals.
+    """
+    if call_status != "unknown":
+        return call_status
+    try:
+        has_known_spend = float(session_cost_usd or 0) > 0
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        has_known_spend = False
+    return "partial" if has_known_spend else "unknown"
 
 
 def _moa_session_cost_status(
@@ -543,8 +606,14 @@ def _moa_session_cost_status(
     A known-only advisor subtotal is not a complete cost when another advisor's
     usage was unpriceable. Blackbox already reconciles physical calls worst-of;
     the session lane must not downgrade the same turn back to ``estimated``.
+
+    The mirror case is reconciled here too: an unpriceable AGGREGATOR beside
+    priced advisors is ``partial``, not ``unknown`` — the turn really did
+    spend the advisor dollars that line 5014 adds to the session total. For a
+    non-MoA turn (no advisor calls, no advisor cost) ``any_known`` stays False,
+    so the existing ``unknown`` is still returned.
     """
-    any_unpriceable = False
+    any_unpriceable = cost_result.amount_usd is None
     any_known = cost_result.amount_usd is not None or advisor_cost is not None
     for call in advisor_calls:
         if not isinstance(call, dict):
@@ -4779,7 +4848,27 @@ def run_conversation(
                             False,
                         )
                     )
-                    agent.context_compressor.update_from_response(usage_dict)
+                    # UNKNOWN is not a context measurement. The compressor's
+                    # update_from_response() assigns last_prompt_tokens /
+                    # last_completion_tokens / last_total_tokens
+                    # unconditionally and no context-engine consumer reads the
+                    # UNKNOWN flags, so feeding it a usage-less response's
+                    # placeholder zeros overwrites the previous REAL reading
+                    # with a measured-looking 0 — which then propagates to the
+                    # status-bar context meter, turn_finalizer's
+                    # `last_prompt_tokens` / Blackbox `context_used`, and the
+                    # persisted session entry. Gate on a measured payload
+                    # exactly as the context-probe persistence below does, and
+                    # still consume the pending compaction verdict so preflight
+                    # deferral cannot stay latched.
+                    if getattr(response, "usage", None):
+                        agent.context_compressor.update_from_response(usage_dict)
+                    elif getattr(
+                        agent.context_compressor,
+                        "awaiting_real_usage_after_compression",
+                        False,
+                    ):
+                        agent.context_compressor.update_from_response({})
                     # Usage-anchored context accounting: snapshot this
                     # response's exact provider-reported usage against the
                     # durable transcript. Later context-size checks anchor on
@@ -4934,13 +5023,25 @@ def run_conversation(
                     except Exception:
                         pass  # telemetry must never break the conversation loop
                     # Rolling history for status-bar averages (last 10).
+                    # An unmeasured output is not 0 tok/s. The two deques are
+                    # appended together and consumers (cli.py status bar,
+                    # tui_gateway) divide sum(outputs)/sum(latencies) with no
+                    # UNKNOWN discriminator available, so appending a
+                    # placeholder 0 beside a real latency silently drags the
+                    # reported velocity down. Skip the pair entirely for an
+                    # unmeasured call — the average is then over the calls that
+                    # were actually measured, which is what it claims to be.
                     try:
+                        _output_measured = not (
+                            output_unknown or canonical_usage.usage_unknown
+                        )
                         hist = getattr(agent, "_api_latency_history", None)
-                        if hist is not None:
-                            hist.append(float(api_duration))
                         ohist = getattr(agent, "_api_output_history", None)
-                        if ohist is not None:
-                            ohist.append(int(canonical_usage.output_tokens or 0))
+                        if _output_measured:
+                            if hist is not None:
+                                hist.append(float(api_duration))
+                            if ohist is not None:
+                                ohist.append(int(canonical_usage.output_tokens or 0))
                     except Exception:
                         pass
 
@@ -5004,8 +5105,11 @@ def run_conversation(
                         base_url=_agg_cost_base_url,
                         api_key=getattr(agent, "api_key", ""),
                     )
-                    _cost_status = _moa_session_cost_status(
-                        cost_result, _moa_ref_pricing_calls, _moa_ref_cost
+                    _cost_status = _session_cost_status_with_known_spend(
+                        _moa_session_cost_status(
+                            cost_result, _moa_ref_pricing_calls, _moa_ref_cost
+                        ),
+                        session_cost_usd=agent.session_estimated_cost_usd,
                     )
                     if cost_result.amount_usd is not None:
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
@@ -5069,11 +5173,7 @@ def run_conversation(
                                 if cost_result.status == "included" else None,
                                 model=agent.model,
                                 api_call_count=1,
-                                last_turn_input_tokens=canonical_usage.input_tokens,
-                                last_turn_output_tokens=canonical_usage.output_tokens,
-                                last_turn_cache_read_tokens=canonical_usage.cache_read_tokens,
-                                last_turn_cache_write_tokens=canonical_usage.cache_write_tokens,
-                                last_turn_reasoning_tokens=canonical_usage.reasoning_tokens,
+                                **_last_turn_snapshot_kwargs(canonical_usage),
                             )
                         except Exception as e:
                             # Log token persistence failures so they're

@@ -260,12 +260,20 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 if "duplicate column" not in str(e).lower():
                     raise
     # UNKNOWN != 0 discriminator columns. New rows default measured, but rows
-    # that PRE-DATE this schema are ambiguous: old Hermes collapsed an omitted
-    # provider usage payload into integer zeroes and had no discriminator with
-    # which to distinguish that from a measured zero. Conservatively latch
-    # ``usage_unknown`` on legacy unpriced rows so a later reprice pass cannot
-    # manufacture a complete-looking historical cost from potentially partial
-    # counts. Already-priced history is left untouched.
+    # that PRE-DATE this schema can be ambiguous: old Hermes collapsed an
+    # omitted provider usage payload into integer zeroes and had no
+    # discriminator with which to distinguish that from a measured zero.
+    #
+    # The latch is therefore restricted to unpriced rows whose token counts are
+    # ALL ZERO — the only rows that are actually ambiguous. A blanket
+    # "unpriced" latch was wrong on both ends: `usage_unknown` is not a
+    # pricing-private column, it is the shared DISPLAY discriminator
+    # (`agent.usage_pricing.prompt_tokens_unknown`, `plugins/blackbox/
+    # last_turn.py`, `plugins/blackbox/card.py` all branch on it), and a row is
+    # routinely NULL-cost because pricing REFUSED (no catalog entry for the
+    # route) while carrying perfectly good provider-measured counts. Latching
+    # those rewrote real measurements as "unknown" on every user-facing card,
+    # irreversibly. Already-priced history is left untouched either way.
     unknown_columns = {
         "output_tokens_unknown",
         "input_tokens_unknown",
@@ -295,7 +303,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             "UPDATE turns SET usage_unknown = 1 "
             "WHERE cost_usd IS NULL "
             "AND cost_uncached_usd IS NULL AND cost_cache_read_usd IS NULL "
-            "AND cost_cache_write_usd IS NULL AND cost_output_usd IS NULL"
+            "AND cost_cache_write_usd IS NULL AND cost_output_usd IS NULL "
+            "AND COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) "
+            "  + COALESCE(cache_read, 0) + COALESCE(cache_write, 0) = 0"
         )
     _ensure_turn_indexes(conn)
     conn.commit()

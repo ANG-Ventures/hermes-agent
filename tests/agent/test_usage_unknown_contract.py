@@ -463,7 +463,12 @@ def test_new_unknown_flags_survive_blackbox(flag, tmp_path, monkeypatch):
     store.insert_turn(rec)
     row = store.get_turn(rec.turn_id)
     assert row[flag] == 1
-    assert "unknown" in "\n".join(render_last_turn_record(row))
+    # Assert the TOKEN line, not just "unknown" anywhere in the block: a
+    # cost_status of "unknown" already emits "• Turn Cost: n/a (unknown)", so a
+    # substring check on the whole block passes even if the token rows regress
+    # to "• Tokens in: 0 billed" — the exact defect this file exists to pin.
+    block = "\n".join(render_last_turn_record(row))
+    assert "Tokens in: unknown" in block
 
 
 def test_sdk_absent_optional_fields_remain_legacy():
@@ -601,3 +606,107 @@ def test_unpriceable_moa_advisor_makes_known_subtotal_partial():
     }
     assert aggregator.amount_usd is not None
     assert _moa_session_cost_status(aggregator, [advisor]) == "partial"
+
+
+def test_unpriceable_moa_aggregator_beside_priced_advisors_is_partial():
+    """r4 finding 4's MIRROR case — the arm that was green without this pin.
+
+    ``any_unpriceable`` used to be seeded ``False`` and set only from the
+    advisor loop, so an unpriceable AGGREGATOR next to priced advisors returned
+    ``"unknown"`` while the turn had really spent the advisor dollars that
+    ``session_estimated_cost_usd`` already absorbed. ``partial`` is the status
+    the helper's own docstring — and ``plugins/blackbox/sentinel.py``'s
+    deliberate exclusion of ``"partial"`` from ``_UNPRICED_STATUSES`` — argues
+    for.
+    """
+    from agent.conversation_loop import _moa_session_cost_status
+
+    aggregator = estimate_usage_cost(
+        "claude-sonnet-4-5",
+        CanonicalUsage.fully_unknown(),
+        provider="anthropic",
+    )
+    assert aggregator.amount_usd is None
+    priced_advisor = {
+        "model": "claude-sonnet-4-5",
+        "provider": "anthropic",
+        "input_tokens": 100,
+        "output_tokens": 20,
+    }
+    assert (
+        _moa_session_cost_status(aggregator, [priced_advisor], 0.0012) == "partial"
+    )
+    # Control: a NON-MoA turn (no advisors, no advisor cost) stays "unknown" —
+    # seeding any_unpriceable from the aggregator must not manufacture a
+    # partial out of a turn that priced nothing at all.
+    assert _moa_session_cost_status(aggregator, []) == "unknown"
+
+
+def test_an_omitted_payload_sets_every_discriminator_not_just_the_aggregate():
+    """r4 finding 9 — the arm that was green without this pin.
+
+    Consumers read these flags NARROWLY: ``output_tokens_unknown`` alone gates
+    the thin card's output line and the ``out=`` API log, and
+    ``prompt_tokens_unknown`` ORs only the three input flags. An
+    aggregate-only ``usage_unknown`` therefore still lets a narrow reader
+    present the placeholder 0 as a measurement.
+    """
+    from agent.usage_pricing import USAGE_UNKNOWN_FIELDS, prompt_tokens_unknown
+
+    usage = CanonicalUsage.fully_unknown()
+    for field in USAGE_UNKNOWN_FIELDS:
+        assert getattr(usage, field) is True, field
+    assert prompt_tokens_unknown(usage) is True
+    assert usage.output_tokens_unknown is True
+    # Control: a measured payload sets none of them.
+    measured = CanonicalUsage(input_tokens=10, output_tokens=4)
+    assert not any(getattr(measured, f) for f in USAGE_UNKNOWN_FIELDS)
+
+
+def test_a_measured_cache_count_suppresses_a_null_alias_in_the_other_location():
+    """r4 finding 11 — the arm that was green without this pin.
+
+    A cache count arrives in EITHER the details container or a top-level
+    alias. Because sibling-alias protection only looks at keys on the SAME
+    object, OR-ing two independent ``_bucket_is_unknown`` calls let a JSON null
+    on the dialect the provider is not speaking override a measured value in
+    the other location — a unified OpenAI-compatible schema serialized without
+    ``exclude_none`` emits exactly that shape.
+    """
+    mixed = {
+        "prompt_tokens": 150,
+        "completion_tokens": 50,
+        "prompt_tokens_details": {"cached_tokens": 200},
+        "cache_read_input_tokens": None,
+    }
+    usage = normalize_usage(mixed, provider="openai", api_mode="chat_completions")
+    assert usage.cache_read_tokens == 200
+    assert usage.cache_read_tokens_unknown is False
+    assert usage.total_tokens_unknown is False
+    assert estimate_usage_cost("gpt-4o", usage, provider="openai").amount_usd is not None
+
+    # CONTROLS — the standing consensus must NOT be weakened by the above.
+    # (a) a null count inside a PRESENT container, with no measured value
+    #     anywhere, is still UNKNOWN.
+    still_unknown = normalize_usage(
+        {
+            "prompt_tokens": 150,
+            "completion_tokens": 50,
+            "prompt_tokens_details": {"cached_tokens": None},
+        },
+        provider="openai",
+        api_mode="chat_completions",
+    )
+    assert still_unknown.cache_read_tokens_unknown is True
+    # (b) an explicit unavailable FLAG wins even beside a measured count.
+    flagged = normalize_usage(
+        {
+            "prompt_tokens": 150,
+            "completion_tokens": 50,
+            "prompt_tokens_details": {"cached_tokens": 200},
+            "cache_read_tokens_unavailable": True,
+        },
+        provider="openai",
+        api_mode="chat_completions",
+    )
+    assert flagged.cache_read_tokens_unknown is True

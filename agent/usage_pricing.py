@@ -280,6 +280,25 @@ class CanonicalUsage:
     cache_write_tokens_unknown: bool = False
     usage_unknown: bool = False
 
+    @classmethod
+    def fully_unknown(cls) -> "CanonicalUsage":
+        """Usage for a call the provider measured in NO bucket.
+
+        Every discriminator is set, not just the aggregate ``usage_unknown``.
+        Consumers read these flags narrowly — ``output_tokens_unknown`` alone
+        gates the output line on the thin ``/usage`` card and the ``out=``
+        API log, ``prompt_tokens_unknown`` ORs only the three input flags — so
+        an aggregate-only UNKNOWN still lets a narrow reader present this
+        object's placeholder 0 as a measurement.
+        """
+        return cls(
+            input_tokens_unknown=True,
+            output_tokens_unknown=True,
+            cache_read_tokens_unknown=True,
+            cache_write_tokens_unknown=True,
+            usage_unknown=True,
+        )
+
     @property
     def prompt_tokens(self) -> int:
         return self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
@@ -1659,6 +1678,42 @@ def _bucket_is_unknown(obj: Any, keys: tuple[str, ...], flags: tuple[str, ...] =
     )
 
 
+def _cache_bucket_is_unknown(
+    locations: tuple[tuple[Any, tuple[str, ...]], ...],
+    flag_obj: Any,
+    flags: tuple[str, ...],
+) -> bool:
+    """Cross-location version of ``_bucket_is_unknown`` for the cache buckets.
+
+    A cache count can arrive in EITHER of two places: inside the details
+    container (``prompt_tokens_details.cached_tokens``) or as a top-level alias
+    (``cache_read_input_tokens``). ``_bucket_is_unknown``'s sibling-alias
+    protection only looks at keys on the SAME object, so OR-ing two independent
+    calls lets a JSON-null on the dialect the provider is not speaking override
+    a measured value in the other location — a unified OpenAI-compatible schema
+    serialized without ``exclude_none`` emits exactly that shape, and the
+    resulting ``cache_read_tokens_unknown`` escalates into
+    ``total_tokens_unknown``, makes the turn unpriceable, and ``reprice_unpriced``
+    never heals it.
+
+    Same rule as ``_bucket_is_unknown``, one bucket spanning both locations:
+    an explicit unavailable flag wins; otherwise a declared wire null means
+    UNKNOWN only when NO location carries a measured value for this bucket.
+    """
+    extra = _usage_get(flag_obj, "model_extra", {}) or {}
+    if any(_usage_get(flag_obj, key, False) or _usage_get(extra, key, False) for key in flags):
+        return True
+    if not any(
+        _declared_null(obj, key) for obj, keys in locations for key in keys
+    ):
+        return False
+    return not any(
+        _usage_has(obj, key) and _usage_get(obj, key) is not None
+        for obj, keys in locations
+        for key in keys
+    )
+
+
 def prompt_tokens_unknown(usage: Any) -> bool:
     """Shared display rule for an input total derived from three buckets."""
     return any(bool(_usage_get(usage, key, False)) for key in (
@@ -2440,15 +2495,21 @@ def normalize_usage(
     # counter the provider actually uses (``cached_tokens: null`` inside a PRESENT
     # container, a null top-level cache field) or an explicit ``cache_*_unavailable``
     # discriminator is a declaration that the bucket was not measured.
-    cache_read_unknown = (
-        _bucket_is_unknown(details, ("cached_tokens",))
-        or _bucket_is_unknown(response_usage, ("cache_read_input_tokens", "prompt_cache_hit_tokens", "cached_tokens"),
-                              ("cache_read_tokens_unavailable",))
+    cache_read_unknown = _cache_bucket_is_unknown(
+        (
+            (details, ("cached_tokens",)),
+            (response_usage, ("cache_read_input_tokens", "prompt_cache_hit_tokens", "cached_tokens")),
+        ),
+        response_usage,
+        ("cache_read_tokens_unavailable",),
     )
-    cache_write_unknown = (
-        _bucket_is_unknown(details, ("cache_write_tokens", "cache_creation_tokens", "cache_creation_input_tokens"))
-        or _bucket_is_unknown(response_usage, ("cache_creation_input_tokens", "cache_write_tokens"),
-                              ("cache_write_tokens_unavailable",))
+    cache_write_unknown = _cache_bucket_is_unknown(
+        (
+            (details, ("cache_write_tokens", "cache_creation_tokens", "cache_creation_input_tokens")),
+            (response_usage, ("cache_creation_input_tokens", "cache_write_tokens")),
+        ),
+        response_usage,
+        ("cache_write_tokens_unavailable",),
     )
     if mode != "anthropic_messages" and provider_name != "anthropic":
         input_unknown = input_unknown or cache_read_unknown or cache_write_unknown

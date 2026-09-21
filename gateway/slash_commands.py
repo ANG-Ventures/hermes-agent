@@ -214,9 +214,20 @@ def render_thin_last_turn_lines(thin_snap, fallback_label=None) -> list:
 
     ``thin_snap`` is whatever the two real producers hand over:
     ``HermesState.get_last_turn_usage`` (persisted, agent evicted) or the
-    resident agent's session counters. BOTH now carry the UNKNOWN
-    discriminators, so an unmeasured bucket renders ``unknown`` here rather
-    than presenting the stored 0 as a measurement.
+    resident agent's session counters.
+
+    The RESIDENT producer carries the UNKNOWN discriminators, so an unmeasured
+    bucket renders ``unknown`` here rather than presenting the stored 0 as a
+    measurement. The PERSISTED producer does NOT: the sessions schema has no
+    ``last_turn_*_unknown`` columns (``hermes_state_common.py``), and
+    ``get_last_turn_usage`` returns exactly five integer keys. Adding them is a
+    schema change owned by PR #797. What this lane guarantees instead is that
+    the persisted snapshot is never an unmeasured zero in the first place:
+    ``conversation_loop._last_turn_snapshot_kwargs`` writes ``None`` for an
+    unknown call, so ``COALESCE`` retains the last REAL split rather than
+    stamping a measured-looking 0 over it. This renderer therefore only ever
+    sees measured values on the persisted lane, and the flag lookups below are
+    a no-op there by construction, not by guarantee.
     """
     from agent.usage_pricing import format_token_count, prompt_tokens_unknown
 
