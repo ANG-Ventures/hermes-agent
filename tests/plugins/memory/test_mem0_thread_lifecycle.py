@@ -109,6 +109,33 @@ def test_one_capture_drain_owner_per_durable_queue(tmp_path):
     second.stop()
 
 
+def test_owner_shutdown_hands_drain_off_to_surviving_sibling(tmp_path):
+    """Stopping the owning provider must not strand pending rows in a sibling pipeline."""
+    store = _BlockingStore()
+    first = _capture_pipeline(tmp_path, store)
+
+    assert first.enqueue_turn("first durable fact", "ok", session_id="s", turn_ordinal=1)
+    assert store.started.wait(timeout=5.0)
+
+    second = _capture_pipeline(tmp_path, store)
+    assert second.enqueue_turn("second durable fact", "ok", session_id="s", turn_ordinal=2)
+    assert second._worker._thread is None, "sibling should start as a threadless standby"
+
+    # Stop the owner while its thread is still parked inside add(): the join returns without the
+    # owner ever looping back to pick up the pending second row, so only a promoted sibling can
+    # drain it. No later enqueue happens.
+    first._worker.stop(timeout=0.1)
+    store.release.set()
+
+    assert _wait_until(lambda: len(store.rows) == 2), (
+        f"pending row stranded after owner shutdown; rows={store.rows} "
+        f"counts={second._queue.counts()} second_thread={second._worker._thread}"
+    )
+    assert second._worker._thread is not None
+    first.stop()
+    second.stop()
+
+
 def test_idle_drain_worker_exits_and_restarts_for_later_work(tmp_path):
     """A cached provider must not retain one polling thread after its queue drains."""
     store = _FakeStore()

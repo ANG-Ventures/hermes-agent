@@ -29,6 +29,7 @@ import os
 import re as _re
 import threading
 import time
+import weakref
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,12 @@ logger = logging.getLogger(__name__)
 # polling and contending on the same SQLite file.
 _ACTIVE_DRAIN_LOCK = threading.Lock()
 _ACTIVE_DRAINS: Dict[str, "CaptureDrainWorker"] = {}
+# Every worker that has been start()ed and not yet stop()ed, keyed by queue. Exactly one of them
+# owns the drain thread; the others are standbys. Ownership must SURVIVE the shutdown of any one
+# cached provider: without a handoff, stopping the owner leaves the siblings started-but-threadless
+# and strands already-pending rows until an unrelated later enqueue or a process restart.
+# WeakSet so a provider that is garbage-collected without stop() does not pin its worker.
+_DRAIN_MEMBERS: Dict[str, "weakref.WeakSet"] = {}
 
 # HTTP status appearing in an add() error string. Two anchored shapes, so a stray 3-digit number in
 # the body (a memory id fragment, a byte count) can't be misread as a status:
@@ -152,40 +159,85 @@ class CaptureDrainWorker:
         self.stats = {"drained": 0, "dead": 0, "retried": 0, "reaped": 0, "scrubbed": 0, "scrub_dead": 0}
 
     # ---- lifecycle ---------------------------------------------------------
+    def _members(self) -> "weakref.WeakSet":
+        """Live standby set for this queue. Caller MUST hold _ACTIVE_DRAIN_LOCK."""
+        members = _DRAIN_MEMBERS.get(self._queue_key)
+        if members is None:
+            members = weakref.WeakSet()
+            _DRAIN_MEMBERS[self._queue_key] = members
+        return members
+
+    def _become_owner_locked(self) -> None:
+        """Take drain ownership for this queue and spawn the loop. Caller holds _ACTIVE_DRAIN_LOCK."""
+        with self._thread_lock:
+            if self._accepting_work and self._thread and self._thread.is_alive():
+                _ACTIVE_DRAINS[self._queue_key] = self
+                return
+            stop_event = threading.Event()
+            self._stop = stop_event
+            self._accepting_work = True
+            self._thread = threading.Thread(
+                target=self._loop,
+                args=(stop_event,),
+                daemon=True,
+                name="mem0-capture-drain",
+            )
+            _ACTIVE_DRAINS[self._queue_key] = self
+            self._thread.start()
+
     def start(self) -> None:
+        with _ACTIVE_DRAIN_LOCK:
+            # Register as a standby FIRST: even when another worker owns the thread, this worker
+            # must be promotable if that owner is shut down while queue work remains.
+            self._members().add(self)
+            owner = _ACTIVE_DRAINS.get(self._queue_key)
+            if owner is not None and owner is not self:
+                with owner._thread_lock:
+                    if owner._accepting_work and owner._thread and owner._thread.is_alive():
+                        return
+            self._become_owner_locked()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        with _ACTIVE_DRAIN_LOCK:
+            self._members().discard(self)
+            with self._thread_lock:
+                stop_event = self._stop
+                self._accepting_work = False
+                thread = self._thread
+            was_owner = _ACTIVE_DRAINS.get(self._queue_key) is self
+            if was_owner:
+                _ACTIVE_DRAINS.pop(self._queue_key, None)
+        stop_event.set()
+        if thread:
+            thread.join(timeout=timeout)
+        if was_owner:
+            self._promote_successor()
+
+    def _promote_successor(self) -> None:
+        """Hand ownership to a surviving standby when the owner stops with queue work outstanding.
+
+        One cached provider shutting down must not strand rows the shared durable queue still holds:
+        the sole owner is leaving, so a sibling that already returned from start() (threadless by
+        design) has to pick the thread up without waiting for an unrelated later enqueue.
+        """
+        try:
+            counts = self._q.counts()
+        except Exception as e:
+            logger.debug("capture successor check failed: %s", e)
+            return
+        if counts.get("pending", 0) == 0 and counts.get("inflight", 0) == 0:
+            return
         with _ACTIVE_DRAIN_LOCK:
             owner = _ACTIVE_DRAINS.get(self._queue_key)
             if owner is not None and owner is not self:
                 with owner._thread_lock:
                     if owner._accepting_work and owner._thread and owner._thread.is_alive():
                         return
-            with self._thread_lock:
-                if self._accepting_work and self._thread and self._thread.is_alive():
-                    _ACTIVE_DRAINS[self._queue_key] = self
-                    return
-                stop_event = threading.Event()
-                self._stop = stop_event
-                self._accepting_work = True
-                self._thread = threading.Thread(
-                    target=self._loop,
-                    args=(stop_event,),
-                    daemon=True,
-                    name="mem0-capture-drain",
-                )
-                _ACTIVE_DRAINS[self._queue_key] = self
-                self._thread.start()
-
-    def stop(self, timeout: float = 5.0) -> None:
-        with _ACTIVE_DRAIN_LOCK:
-            with self._thread_lock:
-                stop_event = self._stop
-                self._accepting_work = False
-                thread = self._thread
-            if _ACTIVE_DRAINS.get(self._queue_key) is self:
-                _ACTIVE_DRAINS.pop(self._queue_key, None)
-        stop_event.set()
-        if thread:
-            thread.join(timeout=timeout)
+            for candidate in list(self._members()):
+                if candidate is self:
+                    continue
+                candidate._become_owner_locked()
+                return
 
     # ---- the loop ----------------------------------------------------------
     def _loop(self, stop_event: threading.Event) -> None:
