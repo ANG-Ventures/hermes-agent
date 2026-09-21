@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -984,6 +986,174 @@ def test_a_sandboxed_board_allows_a_stubbed_oracle(
     assert [o.action for o in outcomes] == ["unblocked"]
     with kb.connect() as conn:
         assert kb.get_task(conn, tid).status in {"ready", "running"}
+
+
+_BARE_PROBE = '''
+import json, os, sys
+sys.path.insert(0, {repo!r})
+# The incident shape: a bare script. NOTHING marks this as a test context.
+for marker in ("PYTEST_CURRENT_TEST", "HERMES_IN_PYTEST"):
+    os.environ.pop(marker, None)
+os.environ["HERMES_HOME"] = {home!r}
+os.environ["HERMES_KANBAN_DB"] = {live!r}
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_pr_gate as prg
+
+# Fabricated oracle: every PR is MERGED, and gh is never consulted.
+prg.query_pr = lambda repo, number: {{
+    "state": "MERGED", "mergedAt": "2026-09-21T07:32:50Z",
+    "mergeCommitSha": "deadbeefcafe1234",
+}}
+
+kb.init_db()
+refused = False
+with kb.connect() as conn:
+    tid = kb.create_task(conn, title="gated", assignee="daedalus-opus")
+    kb.claim_task(conn, tid)
+    kb.block_task(
+        conn, tid, reason="merge o/r#7 then unblock me", kind="needs_input",
+        expected_run_id=kb.get_task(conn, tid).current_run_id,
+    )
+    try:
+        kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
+    except prg.SandboxEscape:
+        refused = True
+    status = kb.get_task(conn, tid).status
+    events = conn.execute(
+        "SELECT COUNT(*) c FROM task_events WHERE kind = 'gate_auto_resolved'"
+    ).fetchone()["c"]
+print(json.dumps({{
+    "in_test_context": prg._in_test_context(),
+    "refused": refused, "status": status, "gate_auto_resolved": events,
+}}))
+'''
+
+
+def test_a_bare_probe_script_with_a_stubbed_oracle_is_refused(
+    tmp_path: Path,
+) -> None:
+    """The 2026-09-21 incident EXACTLY: a bare ``python probe.py``, no markers.
+
+    Every other sandbox test in this file runs under pytest, so all of them
+    satisfy ``_in_test_context()`` for free — none of them can observe the arm
+    that matters. The probe that actually wrote 20 ``gate_auto_resolved`` events
+    to production was a plain script: it set neither ``PYTEST_CURRENT_TEST`` nor
+    ``HERMES_IN_PYTEST``, so a guard preconditioned on a test marker returns
+    before it ever looks at the oracle.
+
+    Fabrication must therefore be provable from the ORACLE IDENTITY alone, which
+    needs no opt-in. This test runs in a child interpreter with both markers
+    scrubbed so the precondition cannot be satisfied accidentally.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    live = tmp_path / "pretend_production" / "kanban.db"
+    live.parent.mkdir()
+    script = tmp_path / "probe.py"
+    script.write_text(
+        _BARE_PROBE.format(repo=str(repo_root), home=str(home), live=str(live))
+    )
+
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("PYTEST_", "HERMES_"))}
+    env["PATH"] = os.environ.get("PATH", "")
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True, text=True, timeout=120, env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    observed = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    # The precondition the old guard depended on is genuinely absent...
+    assert observed["in_test_context"] is False
+    # ...and the write is refused anyway, on oracle identity alone.
+    assert observed["refused"] is True
+    assert observed["gate_auto_resolved"] == 0
+    assert observed["status"] == "blocked"
+
+
+_UNSANDBOXED_PROBE = '''
+import json, os, sys
+sys.path.insert(0, {repo!r})
+# The careless shape: a bare script that sandboxes NOTHING. It simply inherits
+# the dispatcher's worker env, which pins HERMES_KANBAN_DB at the live board.
+for marker in ("PYTEST_CURRENT_TEST", "HERMES_IN_PYTEST"):
+    os.environ.pop(marker, None)
+os.environ["HERMES_HOME"] = {home!r}
+os.environ["HERMES_KANBAN_DB"] = {live!r}
+os.environ["HERMES_KANBAN_HOME"] = {live_root!r}
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_pr_gate as prg
+
+refused = False
+try:
+    prg.assert_write_allowed(lambda repo, number: {{"state": "MERGED"}})
+except prg.SandboxEscape:
+    refused = True
+print(json.dumps({{
+    "db": str(kb.kanban_db_path()),
+    "shared_root": str(kb.kanban_home()),
+    "declared_home": os.environ["HERMES_HOME"],
+    "sandboxed": prg._db_is_sandboxed(),
+    "refused": refused,
+}}))
+'''
+
+
+def test_a_board_outside_the_declared_hermes_home_is_not_sandboxed(
+    tmp_path: Path,
+) -> None:
+    """A live board must never be able to prove ITSELF sandboxed.
+
+    ``_db_is_sandboxed`` is the only remaining escape valve once the guard keys
+    on oracle identity, so its notion of "inside the sandbox" has to mean
+    "inside the home this process DECLARED" — not "internally consistent".
+
+    The hole: ``kanban_home()`` deliberately resolves the SHARED kanban root
+    (the board is shared across profiles by design) and the pins outrank
+    ``HERMES_HOME``. So for a probe that sandboxes nothing, the production DB
+    sits under the production kanban root, ``target.is_relative_to(root)`` is
+    True, and a fabricated oracle is waved through onto the live board — the
+    strictly-more-careless sibling of the 2026-09-21 incident.
+
+    Runs in a child interpreter: the pins must be real process env, and no
+    pytest marker may be present.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    live_root = tmp_path / "pretend_production"
+    live = live_root / "kanban.db"
+    live_root.mkdir()
+    script = tmp_path / "unsandboxed_probe.py"
+    script.write_text(
+        _UNSANDBOXED_PROBE.format(
+            repo=str(repo_root), home=str(home),
+            live=str(live), live_root=str(live_root),
+        )
+    )
+
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("PYTEST_", "HERMES_"))}
+    env["PATH"] = os.environ.get("PATH", "")
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True, text=True, timeout=120, env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    observed = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    # Precondition: the DB is internally consistent with the SHARED root, which
+    # is exactly what made the old predicate answer True.
+    assert observed["db"].startswith(observed["shared_root"])
+    # ...but it is NOT under the home this process declared.
+    assert not observed["db"].startswith(observed["declared_home"])
+    # So isolation is not proven, and the fabricated oracle is refused.
+    assert observed["sandboxed"] is False
+    assert observed["refused"] is True
 
 
 def test_dispatch_once_propagates_a_sandbox_escape_instead_of_absorbing_it(

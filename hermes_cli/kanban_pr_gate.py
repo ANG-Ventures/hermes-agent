@@ -32,9 +32,11 @@ outranks it (see :func:`hermes_cli.kanban_db.kanban_db_path`) — so a probe tha
 redirects only ``HERMES_HOME`` still resolves to production. On 2026-09-21 a
 lock-timing probe did exactly that and wrote 20 ``gate_auto_resolved`` events
 to the live board, falsely unblocking seven real cards.
-:func:`assert_write_allowed` closes that: under a test context with a
-non-default ``query_fn``, a write to a DB outside the ``HERMES_HOME`` root
-raises :class:`SandboxEscape` instead of landing.
+:func:`assert_write_allowed` closes that: a non-default ``query_fn`` writing to
+a DB outside the ``HERMES_HOME`` root raises :class:`SandboxEscape` instead of
+landing. It gates on ORACLE IDENTITY alone, never on a test-context marker: the
+incident probe was a bare script that set no marker, so a marker-gated guard
+would return before ever examining the oracle.
 """
 
 from __future__ import annotations
@@ -223,18 +225,28 @@ def _in_test_context() -> bool:
 
 
 def _db_is_sandboxed() -> bool:
-    """True when the resolved board DB lives under the ``HERMES_HOME`` root.
+    """True when the resolved board DB lives under the DECLARED ``HERMES_HOME``.
+
+    The anchor is deliberately ``HERMES_HOME`` itself and never
+    :func:`hermes_cli.kanban_db.kanban_home`. That function resolves the SHARED
+    kanban root — the board is shared across profiles by design, and the
+    ``HERMES_KANBAN_*`` pins outrank ``HERMES_HOME`` — so comparing the DB
+    against it only asks "is this board internally consistent with its own
+    root?", which the LIVE board answers yes to. A production DB that proves
+    itself sandboxed is the whole failure: it is the only remaining escape
+    valve once :func:`assert_write_allowed` keys on oracle identity.
 
     Fail CLOSED: an unset ``HERMES_HOME``, or any resolution error, counts as
     not-sandboxed. A guard that cannot prove isolation must not grant it.
     """
-    if not os.environ.get("HERMES_HOME", "").strip():
+    declared = os.environ.get("HERMES_HOME", "").strip()
+    if not declared:
         return False
     try:
         from hermes_cli import kanban_db as kb
 
         target = Path(kb.kanban_db_path()).resolve(strict=False)
-        root = Path(kb.kanban_home()).resolve(strict=False)
+        root = Path(declared).expanduser().resolve(strict=False)
     except Exception:
         return False
     return target.is_relative_to(root)
@@ -243,16 +255,21 @@ def _db_is_sandboxed() -> bool:
 def assert_write_allowed(query_fn: Optional[Callable] = None) -> None:
     """Refuse a gate mutation driven by a fabricated oracle on a live board.
 
-    The dangerous combination is exactly two facts: (1) we are in a test or
-    probe context, and (2) ``query_fn`` is NOT the real :func:`query_pr`, so
-    whatever "MERGED" it reports is invented. Writing a ``gate_auto_resolved``
-    under those conditions unblocks real cards on evidence that does not exist.
+    The one fact that matters is ORACLE IDENTITY: if ``query_fn`` is not the
+    real :func:`query_pr`, whatever "MERGED" it reports is invented, and writing
+    a ``gate_auto_resolved`` from it unblocks real cards on evidence that does
+    not exist. That is provable without any cooperation from the harness.
 
-    Production is untouched: outside a test context this returns immediately,
-    and a real ``gh``-backed run passes even inside one.
+    It is deliberately NOT preconditioned on a test marker. The 2026-09-21
+    incident probe was a bare ``python probe.py`` that set neither
+    ``PYTEST_CURRENT_TEST`` nor ``HERMES_IN_PYTEST``, so a guard gated behind
+    :func:`_in_test_context` returns before it ever examines the oracle — i.e.
+    it cannot stop the one shape it was written for. The marker survives only to
+    enrich the refusal message.
+
+    Production is untouched: the dispatcher passes ``None`` or the real
+    ``gh``-backed oracle, both of which return immediately.
     """
-    if not _in_test_context():
-        return
     if query_fn is None or query_fn is _REAL_QUERY_PR:
         return  # real oracle: the verdict is evidence, not fabrication.
     if _db_is_sandboxed():
@@ -263,13 +280,19 @@ def assert_write_allowed(query_fn: Optional[Callable] = None) -> None:
         resolved = str(kb.kanban_db_path())
     except Exception:  # pragma: no cover - diagnostic only
         resolved = "<unresolvable>"
+    marker = (
+        "this process IS marked as a test context"
+        if _in_test_context()
+        else "this process carries NO test marker (a bare probe script)"
+    )
     raise SandboxEscape(
         "kanban PR-gate: refusing to mutate a board with a STUBBED PR oracle. "
         f"Resolved DB {resolved} is not inside the HERMES_HOME root "
-        f"({os.environ.get('HERMES_HOME') or '<unset>'}). HERMES_HOME alone "
-        "does NOT sandbox kanban — HERMES_KANBAN_DB outranks it. Set "
-        "HERMES_KANBAN_SANDBOX=1 (or unset the HERMES_KANBAN_* path pins) so "
-        "the board resolves inside the sandbox before running this harness."
+        f"({os.environ.get('HERMES_HOME') or '<unset>'}); {marker}. "
+        "HERMES_HOME alone does NOT sandbox kanban — HERMES_KANBAN_DB "
+        "outranks it. Set HERMES_KANBAN_SANDBOX=1 (or unset the "
+        "HERMES_KANBAN_* path pins) so the board resolves inside the sandbox "
+        "before running this harness."
     )
 
 
