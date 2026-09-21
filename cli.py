@@ -6213,7 +6213,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return "class:status-bar-warn"
         return "class:status-bar-good"
 
-    def _cache_hit_rate(self, snapshot: dict, precision: int = 1) -> "tuple[float, str] | None":
+    @staticmethod
+    def _cache_ratio_unknown(snapshot: dict) -> bool:
+        """True when a cache RATIO over this snapshot would be fabricated.
+
+        Mirrors the producer's suppression rule. An unmeasured call
+        contributes 0 to both the prompt and the cache-read sum, so ANY
+        unknown term in the window makes every ratio over those cumulative
+        counters — delta OR session-lifetime — a number nobody measured.
+        """
+        return bool(
+            snapshot.get("session_prompt_tokens_unknown")
+            or snapshot.get("cache_read_tokens_unknown")
+            or snapshot.get("usage_unknown")
+        )
+
+    def _cache_hit_rate(
+        self, snapshot: dict, precision: int = 1
+    ) -> "tuple[float | None, str] | None":
         """Return (cache_pct, formatted_label) or None if no cache data.
 
         Centralises the cache-hit-rate computation so both the plain-text
@@ -6222,7 +6239,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         ``_get_status_bar_snapshot`` (resets on model switch / compression,
         so it reflects the *current* cache regime); falls back to the
         session-lifetime ratio when no delta is available.
+
+        When the window carries an UNKNOWN term the segment says so and the
+        pct is ``None``: suppressing only the delta would hand the render
+        straight to the session-lifetime fallback below, which divides the
+        same raw unflagged counters and prints the fabricated ratio the
+        suppression exists to prevent.
         """
+        if self._cache_ratio_unknown(snapshot):
+            from agent.usage_pricing import UNKNOWN_TOKENS_LABEL
+
+            # Consume the producer label only when it agrees with provenance;
+            # stale snapshots must not smuggle a percentage past this guard.
+            label = snapshot.get("cache_hit_label")
+            if label != UNKNOWN_TOKENS_LABEL:
+                label = UNKNOWN_TOKENS_LABEL
+            return None, f"◎ {label}"
         delta_pct = snapshot.get("cache_hit_pct")
         if delta_pct is not None:
             return float(delta_pct), f"◎ {float(delta_pct):.{precision}f}%"
@@ -6233,8 +6265,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return cache_pct, f"◎ {cache_pct:.{precision}f}%"
         return None
 
-    def _cache_hit_rate_style(self, cache_pct: float) -> str:
-        """Style for cache hit rate — higher is better (opposite of context %)."""
+    def _cache_hit_rate_style(self, cache_pct: "float | None") -> str:
+        """Style for cache hit rate — higher is better (opposite of context %).
+
+        ``None`` is the UNKNOWN arm of ``_cache_hit_rate`` — there is no pct to
+        grade, so it renders dim rather than being scored as a bad hit rate.
+        """
+        if cache_pct is None:
+            return "class:status-bar-dim"
         if cache_pct >= 70:
             return "class:status-bar-good"
         if cache_pct >= 40:
@@ -6604,7 +6642,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # both terms are. An unmeasured call contributes 0 to each sum, so
             # a ratio computed across it is fabricated — it reads as a cache
             # miss that never happened (or a 100% hit that did not). Suppress
-            # the segment instead, exactly like the zero-read regime below.
+            # the percentage and render the explicit unknown label instead.
             if snapshot.get("session_prompt_tokens_unknown") or snapshot.get(
                 "cache_read_tokens_unknown"
             ) or snapshot.get("usage_unknown"):
