@@ -1,0 +1,690 @@
+"""Re-evaluate kanban blocks whose premise is an external GitHub PR.
+
+A worker that finishes its code and needs a sibling PR merged before it can
+continue blocks with a reason like ``"merge PR #787 then unblock me"``. Nothing
+in the dispatcher ever re-read that reason, so the card sat ``blocked`` until a
+human board sweep noticed — measured 2026-09-21: six ``needs_input`` cards held
+up to **12 hours** on gates whose referenced PRs had already merged.
+
+This module makes that mechanical. Each dispatcher tick:
+
+1. parse the LAST ``blocked``-family event's reason for PR references,
+2. resolve each reference's state through ``gh`` (bounded + cached),
+3. when EVERY referenced PR is MERGED, unblock the card, post the evidence as a
+   comment, and write one ``gate_auto_resolved`` event so a sweep can count it.
+
+Deliberate non-actions, each one a fail-safe:
+
+* only ``needs_input`` / ``capability`` / ``dependency`` block kinds — a
+  ``transient`` or un-typed block is not a "waiting on an external object" claim;
+* a reason naming no PR is never touched, and burns no lookup budget;
+* a bare ``#N`` with no unambiguous repo context is dropped rather than guessed;
+* CLOSED-unmerged posts ONE advisory comment and never unblocks;
+* any lookup failure is a no-op plus one WARN — never a page, never an unblock.
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import json
+import logging
+import re
+import subprocess
+import sqlite3
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Iterable, Optional
+
+_log = logging.getLogger(__name__)
+
+# Block kinds whose reason can legitimately name an external gate. ``transient``
+# is excluded on purpose: it means "this may clear on its own", not "this waits
+# on a specific object", and auto-resolving it would race the worker's own retry.
+GATE_BLOCK_KINDS: frozenset[str] = frozenset(
+    {"needs_input", "capability", "dependency"}
+)
+
+# Per-tick hard cap on GitHub lookups. Cards past the budget are deferred to a
+# later tick, not failed: the board keeps making progress without ever turning a
+# 60-second tick into a rate-limit incident.
+MAX_LOOKUPS_PER_TICK = 30
+
+# How long a NONTERMINAL (open) state is reused before re-querying. MERGED and
+# CLOSED are terminal and cached for the process lifetime instead.
+CACHE_TTL_SECONDS = 300
+
+_QUERY_TIMEOUT_SECONDS = 5
+_CACHE_LIMIT = 2048
+
+# Event kinds that carry a block reason. ``dependency_wait`` is the
+# ``kind="dependency"`` landing event; ``block_loop_detected`` is the
+# triage escalation. All three can name a PR.
+_BLOCK_EVENT_KINDS: tuple[str, ...] = (
+    "blocked",
+    "dependency_wait",
+    "block_loop_detected",
+)
+
+_OWNER_REPO = r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+"
+# Full canonical PR URL. Matched first so its digits are never re-read as a
+# bare ``#N``/``pull/N`` by the looser patterns below.
+_URL_RE = re.compile(
+    rf"https?://github\.com/({_OWNER_REPO})/pull/(\d+)",
+    re.IGNORECASE,
+)
+# ``owner/repo#123`` — carries its own context.
+_QUALIFIED_RE = re.compile(rf"\b({_OWNER_REPO})#(\d+)\b")
+# Bare ``#123`` / ``pull/123`` — needs a repo context to be resolvable.
+_BARE_RE = re.compile(r"(?:(?<![\w/#])#|\bpull/)(\d+)\b")
+
+_REPO_MENTION_RE = re.compile(rf"\b({_OWNER_REPO})\b")
+_GIT_REMOTE_RE = re.compile(
+    rf"(?:git@github\.com:|https?://(?:[^@/\s]+@)?github\.com/)({_OWNER_REPO}?)"
+    r"(?:\.git)?/?\s*$",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class PrRef:
+    """One resolved PR reference: an explicit repo plus a number."""
+
+    repo: str
+    number: int
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return f"{self.repo}#{self.number}"
+
+
+@dataclass(frozen=True)
+class GateOutcome:
+    """What the re-evaluator did (or deliberately did not do) for one card."""
+
+    task_id: str
+    action: str
+    prs: tuple[str, ...] = ()
+    detail: str = ""
+
+
+@dataclass
+class _CacheEntry:
+    state: str
+    sha: Optional[str]
+    merged_at: Optional[str]
+    fetched_at: float
+    terminal: bool
+
+
+@dataclass(frozen=True)
+class _PrefetchResult:
+    """Network results captured before the dispatcher takes its writer lock."""
+
+    payloads: dict[tuple[str, int], Optional[dict]]
+    capped: frozenset[tuple[str, int]]
+    now: float
+
+
+# Process-lifetime cache keyed by ``(repo.lower(), number)``. MERGED is the
+# only irreversible state and therefore the only process-lifetime entry;
+# OPEN/CLOSED are reused for CACHE_TTL_SECONDS because GitHub permits reopen.
+_CACHE: dict[tuple[str, int], _CacheEntry] = {}
+
+
+def clear_cache() -> None:
+    """Drop all cached PR states (tests; operator repair)."""
+    _CACHE.clear()
+
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
+
+
+def parse_pr_refs(
+    text: Optional[str], *, default_repo: Optional[str] = None
+) -> list[PrRef]:
+    """Extract PR references from a block reason, in first-seen order.
+
+    ``default_repo`` resolves bare ``#N`` / ``pull/N`` forms. When it is None
+    those forms are DROPPED rather than guessed — an unblock is a real state
+    transition and must never rest on an inferred repository.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return []
+
+    refs: list[PrRef] = []
+    seen: set[tuple[str, int]] = set()
+    found: list[tuple[int, PrRef]] = []
+
+    def add(position: int, repo: Optional[str], raw_number: str) -> None:
+        if not repo:
+            return
+        try:
+            number = int(raw_number)
+        except (TypeError, ValueError):
+            return
+        if number <= 0:
+            return
+        key = (repo.lower(), number)
+        if key in seen:
+            return
+        seen.add(key)
+        found.append((position, PrRef(repo=repo, number=number)))
+
+    # Consume the specific forms first, blanking each match so a later, looser
+    # pattern cannot re-read the same digits as a different reference. Order is
+    # restored by source position afterwards, so the returned list reads in the
+    # order a human sees the references in the reason text.
+    remaining = text
+    for pattern in (_URL_RE, _QUALIFIED_RE):
+        out: list[str] = []
+        last = 0
+        for match in pattern.finditer(remaining):
+            add(match.start(), match.group(1), match.group(2))
+            out.append(remaining[last:match.start()])
+            out.append(" " * (match.end() - match.start()))
+            last = match.end()
+        out.append(remaining[last:])
+        remaining = "".join(out)
+
+    if default_repo:
+        for match in _BARE_RE.finditer(remaining):
+            add(match.start(), default_repo, match.group(1))
+
+    refs = [ref for _, ref in sorted(found, key=lambda pair: pair[0])]
+    return refs
+
+
+def _remotes_for(workspace_path: str) -> set[str]:
+    """Return the distinct ``owner/repo`` slugs a checkout's remotes point at."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", workspace_path, "remote", "-v"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=_QUERY_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, TimeoutError):
+        return set()
+    if proc.returncode != 0:
+        return set()
+    slugs: set[str] = set()
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        match = _GIT_REMOTE_RE.search(parts[1])
+        if match:
+            slugs.add(match.group(1).removesuffix(".git"))
+    return slugs
+
+
+def repo_context(
+    *, workspace_path: Optional[str], body: Optional[str]
+) -> Optional[str]:
+    """Best-effort repository for resolving a bare ``#N``.
+
+    Order: the card's workspace remote (only when EVERY remote agrees — the
+    hermes-agent checkout has ``origin`` = upstream and ``fork`` = ours, so a
+    bare ``#787`` there is genuinely ambiguous), then the first ``owner/repo``
+    mentioned in the card body. None means "do not resolve bare numbers".
+    """
+    if workspace_path:
+        try:
+            exists = Path(workspace_path).is_dir()
+        except OSError:
+            exists = False
+        if exists:
+            slugs = _remotes_for(workspace_path)
+            if len(slugs) == 1:
+                return next(iter(slugs))
+            if len(slugs) > 1 and isinstance(body, str):
+                # Ambiguous remotes: let an explicit body mention pick one.
+                lowered = {s.lower(): s for s in slugs}
+                for match in _REPO_MENTION_RE.finditer(body):
+                    hit = lowered.get(match.group(1).lower())
+                    if hit:
+                        return hit
+                return None
+            if len(slugs) > 1:
+                return None
+    if isinstance(body, str):
+        match = _REPO_MENTION_RE.search(body)
+        if match:
+            return match.group(1)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# GitHub lookup
+# ---------------------------------------------------------------------------
+
+
+def query_pr(repo: str, number: int) -> Optional[dict]:
+    """Return normalized PR JSON from ``gh api``, or None on ANY failure.
+
+    The normalized shape matches the in-process test seam:
+    ``state`` (OPEN/CLOSED/MERGED), ``mergedAt``, ``mergeCommitSha``.
+    None is deliberately indistinguishable from "cannot tell" so every caller
+    degrades to no-action rather than to a wrong action.
+    """
+    try:
+        proc = subprocess.run(
+            ["gh", "api", f"repos/{repo}/pulls/{number}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=_QUERY_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, TimeoutError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        payload = json.loads(proc.stdout or "{}")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    merged_at = payload.get("merged_at")
+    state = str(payload.get("state") or "").upper()
+    return {
+        "state": "MERGED" if merged_at else state,
+        "mergedAt": merged_at,
+        "mergeCommitSha": payload.get("merge_commit_sha"),
+    }
+
+
+def _merge_sha(payload: dict) -> Optional[str]:
+    commit = payload.get("mergeCommit")
+    if isinstance(commit, dict):
+        oid = commit.get("oid") or commit.get("sha")
+        if oid:
+            return str(oid)
+    for key in ("mergeCommitSha", "mergeCommitOid"):
+        if payload.get(key):
+            return str(payload[key])
+    return None
+
+
+def _prune_cache() -> None:
+    while len(_CACHE) > _CACHE_LIMIT:
+        _CACHE.pop(next(iter(_CACHE)))
+
+
+class _Resolver:
+    """Bounded, cached PR-state resolution for one tick."""
+
+    def __init__(
+        self,
+        *,
+        query_fn: Callable[[str, int], Optional[dict]],
+        max_lookups: int,
+        now: float,
+        prefetched: Optional[_PrefetchResult] = None,
+    ) -> None:
+        self._query_fn = query_fn
+        self._remaining = max_lookups
+        self._now = now
+        self._prefetched = prefetched
+        # Includes failures. A failed unique PR lookup is attempted once in this
+        # tick, but remains retryable on the next tick because it never enters
+        # the process-lifetime cache.
+        self._attempted: dict[tuple[str, int], Optional[_CacheEntry]] = {}
+        self.budget_exhausted = False
+
+    def resolve(self, ref: PrRef) -> Optional[_CacheEntry]:
+        """Return the cached/fresh state, or None when it cannot be determined."""
+        key = (ref.repo.lower(), ref.number)
+        if key in self._attempted:
+            return self._attempted[key]
+        entry = _CACHE.get(key)
+        if entry is not None and (
+            entry.terminal or self._now - entry.fetched_at < CACHE_TTL_SECONDS
+        ):
+            self._attempted[key] = entry
+            return entry
+
+        if self._prefetched is not None:
+            if key in self._prefetched.capped:
+                self.budget_exhausted = True
+                self._attempted[key] = None
+                return None
+            # A missing key means the card's block changed after the unlocked
+            # snapshot. Never perform replacement network I/O under the lock.
+            payload = self._prefetched.payloads.get(key)
+        else:
+            if self._remaining <= 0:
+                self.budget_exhausted = True
+                self._attempted[key] = None
+                return None
+            self._remaining -= 1
+            payload = self._query_fn(ref.repo, ref.number)
+
+        if payload is None:
+            self._attempted[key] = None
+            return None
+        merged_at = payload.get("mergedAt")
+        state = "MERGED" if merged_at else str(payload.get("state") or "").upper()
+        if state not in {"OPEN", "CLOSED", "MERGED"}:
+            self._attempted[key] = None
+            return None
+        entry = _CacheEntry(
+            state=state,
+            sha=_merge_sha(payload),
+            merged_at=str(merged_at) if merged_at else None,
+            fetched_at=self._now,
+            terminal=state == "MERGED",
+        )
+        _CACHE[key] = entry
+        _prune_cache()
+        self._attempted[key] = entry
+        return entry
+
+
+# ---------------------------------------------------------------------------
+# Board reads
+# ---------------------------------------------------------------------------
+
+
+def _latest_block_reason(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[str]:
+    """Reason text of the most recent block-family event for a task."""
+    placeholders = ",".join("?" * len(_BLOCK_EVENT_KINDS))
+    row = conn.execute(
+        f"SELECT payload FROM task_events WHERE task_id = ? "
+        f"AND kind IN ({placeholders}) ORDER BY id DESC LIMIT 1",
+        (task_id, *_BLOCK_EVENT_KINDS),
+    ).fetchone()
+    if row is None or not row["payload"]:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    reason = payload.get("reason")
+    return reason if isinstance(reason, str) else None
+
+
+def _closed_ref_marker(refs: Iterable[PrRef]) -> str:
+    names = sorted({str(ref).lower() for ref in refs})
+    return "<!-- gate-pr-set:" + "|".join(names) + " -->"
+
+
+def _already_flagged_closed(
+    conn: sqlite3.Connection, task_id: str, refs: Iterable[PrRef]
+) -> bool:
+    """True when the closed-unmerged advisory was already posted for these PRs.
+
+    Without this the advisory would be re-posted on every 60-second tick, which
+    is the exact "automation spams the card" failure mode the board already has
+    enough of. The marker includes the PR set so a later re-block on a different
+    closed PR still gets the required human advisory.
+    """
+    marker = _closed_ref_marker(refs)
+    row = conn.execute(
+        "SELECT 1 FROM task_comments "
+        "WHERE task_id = ? AND instr(body, ?) > 0 LIMIT 1",
+        (task_id, marker),
+    ).fetchone()
+    return row is not None
+
+
+_CLOSED_MARKER = "gate object closed without merge"
+_SATISFIED_PREFIX = "gate satisfied"
+_AUTHOR = "kanban-pr-gate"
+
+
+def _satisfied_sentence(entries: list[tuple[PrRef, _CacheEntry]]) -> str:
+    parts = []
+    for ref, entry in entries:
+        sha8 = (entry.sha or "")[:8] or "unknown"
+        when = entry.merged_at or "unknown"
+        parts.append(f"{ref} merged {sha8} at {when}")
+    return f"{_SATISFIED_PREFIX}: " + "; ".join(parts)
+
+
+def _closed_sentence(entries: list[tuple[PrRef, _CacheEntry]]) -> str:
+    refs = [ref for ref, _ in entries]
+    names = ", ".join(str(ref) for ref in refs)
+    return (
+        f"{_CLOSED_MARKER}: {names} — needs a human. "
+        "The card stays blocked; re-point it at the live PR or unblock it "
+        f"explicitly once the work has landed some other way.\n{_closed_ref_marker(refs)}"
+    )
+
+
+_PREFETCH_WORKERS = 6
+
+
+def _blocked_gate_refs(conn: sqlite3.Connection) -> list[tuple[str, list[PrRef]]]:
+    """Snapshot in-scope blocked cards and their currently resolvable PR refs."""
+    placeholders = ",".join("?" * len(GATE_BLOCK_KINDS))
+    rows = conn.execute(
+        f"SELECT id, body, workspace_path FROM tasks "
+        f"WHERE status = 'blocked' AND block_kind IN ({placeholders}) "
+        f"ORDER BY id",
+        tuple(sorted(GATE_BLOCK_KINDS)),
+    ).fetchall()
+    candidates: list[tuple[str, list[PrRef]]] = []
+    for row in rows:
+        reason = _latest_block_reason(conn, row["id"])
+        if not reason or ("#" not in reason and "pull/" not in reason):
+            continue
+        default_repo = repo_context(
+            workspace_path=row["workspace_path"], body=row["body"],
+        )
+        refs = parse_pr_refs(reason, default_repo=default_repo)
+        if refs:
+            candidates.append((row["id"], refs))
+    return candidates
+
+
+def prefetch_pr_gate_states(
+    conn: sqlite3.Connection,
+    *,
+    query_fn: Optional[Callable[[str, int], Optional[dict]]] = None,
+    max_lookups: int = MAX_LOOKUPS_PER_TICK,
+    now: Optional[float] = None,
+) -> _PrefetchResult:
+    """Fetch stale PR states concurrently before the dispatch writer lock.
+
+    The returned snapshot is reapplied only after the card's live blocked state
+    and reason are parsed again under the lock. A changed/new reference is absent
+    from the snapshot and therefore causes a fail-safe no-op, never lock-held I/O.
+    Six workers bound 30 five-second lookups to roughly 25 seconds worst case.
+    """
+    query_fn = query_fn or query_pr
+    now = time.time() if now is None else now
+    unique: dict[tuple[str, int], PrRef] = {}
+    for _, refs in _blocked_gate_refs(conn):
+        for ref in refs:
+            key = (ref.repo.lower(), ref.number)
+            entry = _CACHE.get(key)
+            if entry is not None and (
+                entry.terminal or now - entry.fetched_at < CACHE_TTL_SECONDS
+            ):
+                continue
+            unique.setdefault(key, ref)
+
+    keys = list(unique)
+    selected = keys[:max(0, max_lookups)]
+    capped = frozenset(keys[len(selected):])
+    payloads: dict[tuple[str, int], Optional[dict]] = {}
+    if not selected:
+        return _PrefetchResult(payloads=payloads, capped=capped, now=now)
+
+    workers = min(_PREFETCH_WORKERS, len(selected))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(query_fn, unique[key].repo, unique[key].number): key
+            for key in selected
+        }
+        for future in concurrent.futures.as_completed(futures):
+            key = futures[future]
+            try:
+                payloads[key] = future.result()
+            except Exception as exc:  # pragma: no cover - defensive provider seam
+                payloads[key] = None
+                _log.warning(
+                    "kanban PR-gate: lookup raised for %s#%s (%s: %s)",
+                    key[0], key[1], type(exc).__name__, exc,
+                )
+    return _PrefetchResult(payloads=payloads, capped=capped, now=now)
+
+
+# ---------------------------------------------------------------------------
+# The tick pass
+# ---------------------------------------------------------------------------
+
+
+def reevaluate_pr_gates(
+    conn: sqlite3.Connection,
+    *,
+    query_fn: Optional[Callable[[str, int], Optional[dict]]] = None,
+    max_lookups: int = MAX_LOOKUPS_PER_TICK,
+    now: Optional[float] = None,
+    prefetched: Optional[_PrefetchResult] = None,
+) -> list[GateOutcome]:
+    """Re-evaluate every in-scope blocked card against its referenced PRs.
+
+    Returns one :class:`GateOutcome` per card that actually named a PR — cards
+    whose block reason mentions none are skipped entirely and never appear in
+    the result (nor consume any lookup budget).
+
+    Safe to call on every dispatcher tick: bounded lookups, cached results, and
+    every uncertain path degrades to no action.
+    """
+    query_fn = query_fn or query_pr
+    if prefetched is not None:
+        now = prefetched.now
+    now = time.time() if now is None else now
+    resolver = _Resolver(
+        query_fn=query_fn,
+        max_lookups=max_lookups,
+        now=now,
+        prefetched=prefetched,
+    )
+
+    outcomes: list[GateOutcome] = []
+    warned_failures: set[tuple[str, int]] = set()
+    # Re-read and re-parse under the caller's dispatch lock. This is the state
+    # revalidation seam for an unlocked prefetch: if the card changed in the
+    # interim, its new key is absent and resolution safely returns None.
+    for task_id, refs in _blocked_gate_refs(conn):
+
+        resolved: list[tuple[PrRef, _CacheEntry]] = []
+        unresolved = False
+        unresolved_ref: Optional[PrRef] = None
+        for ref in refs:
+            entry = resolver.resolve(ref)
+            if entry is None:
+                unresolved = True
+                unresolved_ref = ref
+                break
+            resolved.append((ref, entry))
+
+        names = tuple(str(r) for r in refs)
+        if unresolved:
+            if resolver.budget_exhausted:
+                outcomes.append(GateOutcome(
+                    task_id=task_id, action="budget_exhausted", prs=names,
+                    detail="lookup budget spent this tick; deferred",
+                ))
+            else:
+                failure_key = (
+                    (unresolved_ref.repo.lower(), unresolved_ref.number)
+                    if unresolved_ref is not None else None
+                )
+                if failure_key not in warned_failures:
+                    _log.warning(
+                        "kanban PR-gate: could not resolve PR state for %s (%s); "
+                        "taking no action",
+                        task_id, ", ".join(names),
+                    )
+                    if failure_key is not None:
+                        warned_failures.add(failure_key)
+                outcomes.append(GateOutcome(
+                    task_id=task_id, action="lookup_failed", prs=names,
+                    detail="PR state lookup failed",
+                ))
+            continue
+
+        closed = [(r, e) for r, e in resolved if e.state == "CLOSED"]
+        if closed:
+            detail = _closed_sentence(closed)
+            if not _already_flagged_closed(conn, task_id, (r for r, _ in closed)):
+                _safe_comment(conn, task_id, detail)
+            outcomes.append(GateOutcome(
+                task_id=task_id, action="closed_unmerged", prs=names,
+                detail=detail,
+            ))
+            continue
+
+        if any(e.state != "MERGED" for _, e in resolved):
+            outcomes.append(GateOutcome(
+                task_id=task_id, action="held", prs=names,
+                detail="at least one referenced PR is still open",
+            ))
+            continue
+
+        detail = _satisfied_sentence(resolved)
+        outcomes.append(_apply_satisfied(conn, task_id, names, detail))
+
+    return outcomes
+
+
+def _safe_comment(conn: sqlite3.Connection, task_id: str, body: str) -> None:
+    """Post a board comment; a comment failure must never abort the tick."""
+    try:
+        from hermes_cli import kanban_db as kb
+
+        kb.add_comment(conn, task_id, _AUTHOR, body)
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.warning(
+            "kanban PR-gate: could not comment on %s: %s", task_id, exc,
+        )
+
+
+def _apply_satisfied(
+    conn: sqlite3.Connection,
+    task_id: str,
+    names: tuple[str, ...],
+    detail: str,
+) -> GateOutcome:
+    """Unblock a card whose every referenced PR has merged."""
+    from hermes_cli import kanban_db as kb
+
+    try:
+        unblocked = kb.unblock_task(conn, task_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.warning(
+            "kanban PR-gate: unblock of %s failed: %s", task_id, exc,
+        )
+        return GateOutcome(
+            task_id=task_id, action="lookup_failed", prs=names,
+            detail=f"unblock failed: {exc}",
+        )
+    if not unblocked:
+        # Raced with a concurrent writer; the next tick re-evaluates.
+        return GateOutcome(
+            task_id=task_id, action="held", prs=names,
+            detail="card left the blocked state before the unblock landed",
+        )
+    _safe_comment(conn, task_id, detail)
+    with kb.write_txn(conn, allow_nested=True):
+        kb._append_event(
+            conn, task_id, "gate_auto_resolved",
+            {"prs": list(names), "detail": detail},
+        )
+    _log.info("kanban PR-gate: %s auto-resolved — %s", task_id, detail)
+    return GateOutcome(
+        task_id=task_id, action="unblocked", prs=names, detail=detail,
+    )
