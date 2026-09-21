@@ -394,8 +394,9 @@ class ProcessSession:
     started_at: float = 0.0                     # time.time() of spawn (wall clock)
     host_start_time: Optional[int] = None       # kernel start ticks (/proc/<pid>/stat f22) — PID-reuse guard
     exited: bool = False                        # Whether the process has finished
+    stdout_closed: bool = False                 # Reader ended; not evidence of process exit
     exit_code: Optional[int] = None             # Exit code (None if still running)
-    completion_reason: str = "exited"           # exited|killed|lost|failed_start|already_exited
+    completion_reason: str = "exited"           # exited|killed|lost|handle-lost|failed_start|already_exited
     termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start
     output_buffer: str = ""                     # Rolling output (last MAX_OUTPUT_CHARS)
     max_output_chars: int = MAX_OUTPUT_CHARS
@@ -1516,15 +1517,28 @@ class ProcessRegistry:
                     _append_chunk(tail)
             except Exception:
                 pass
-            # Always reap the child to prevent zombie processes.
+            # EOF/read failure is not exit. Retain ownership until the direct
+            # child exits, while allowing kill/reset to finish this session.
+            session.stdout_closed = True
             try:
-                session.process.wait(timeout=5)
+                while not session.exited:
+                    if session.process is None:
+                        raise RuntimeError("Popen handle is missing")
+                    rc = session.process.poll()
+                    if rc is not None:
+                        break
+                    try:
+                        session.process.wait(timeout=0.2)
+                    except subprocess.TimeoutExpired:
+                        continue
             except Exception as e:
-                logger.debug("Process wait timed out or failed: %s", e)
+                logger.warning("Process handle lost for %s: %s", session.id, e)
             session.exited = True
             if session.completion_reason != "killed":
-                session.exit_code = session.process.returncode
-                session.completion_reason = "exited"
+                session.exit_code = getattr(session.process, "returncode", None)
+                session.completion_reason = (
+                    "exited" if session.exit_code is not None else "handle-lost"
+                )
             self._move_to_finished(session)
 
     def _env_poller_loop(
@@ -1625,15 +1639,21 @@ class ProcessRegistry:
         except Exception:
             pass
 
-        # Process exited
+        # As with pipes, a PTY read failure is not an exit indication.
         try:
             pty.wait()
         except Exception as e:
             logger.debug("PTY wait timed out or failed: %s", e)
         session.exited = True
         if session.completion_reason != "killed":
-            session.exit_code = pty.exitstatus if hasattr(pty, 'exitstatus') else -1
-            session.completion_reason = "exited"
+            session.exit_code = getattr(pty, "exitstatus", None)
+            if session.exit_code is None:
+                signalstatus = getattr(pty, "signalstatus", None)
+                if signalstatus is not None:
+                    session.exit_code = -signalstatus
+            session.completion_reason = (
+                "exited" if session.exit_code is not None else "handle-lost"
+            )
         self._move_to_finished(session)
 
     def _move_to_finished(self, session: ProcessSession):
@@ -1643,6 +1663,9 @@ class ProcessRegistry:
         with the reader thread), the second call is a no-op — no duplicate
         completion notification is enqueued.
         """
+        if session.completion_reason == "exited" and session.exit_code is None:
+            logger.error("Refusing unknown exit status for %s; process handle lost", session.id)
+            session.completion_reason = "handle-lost"
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
@@ -3266,6 +3289,8 @@ def format_process_notification(evt: dict) -> "str | None":
         _status = f"terminated by {_source or 'Hermes'}"
     elif _reason == "lost":
         _status = "marked lost because the process backend disappeared"
+    elif _reason == "handle-lost":
+        _status = "lost its process handle; actual exit is unknown"
     elif _reason == "failed_start":
         _status = "failed to start"
     elif _exit == 0:
