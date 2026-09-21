@@ -54,6 +54,7 @@ from agent.message_sanitization import (
 from agent.fork_ext.relay_headers import _pool_affinity_headers, _pool_lane, _pool_lane_src
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.shared_transport_guard import _TAILSCALE_RELAY_PROVIDERS
 from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
@@ -62,6 +63,197 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error", "error_finish"}
 _PROVIDER_STREAM_SSE_FIELDS = {"event", "data", "id", "retry"}
 _PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
+_POOL_HEADER_NAMES = (
+    "x-pool-served-by",
+    "x-pool-route-id",
+    "x-pool-unreachable",
+)
+_POOLED_PROVIDERS = _TAILSCALE_RELAY_PROVIDERS
+_PINNED_PROVIDER_KEYS = {
+    "xai-oauth": "supergrok",
+    "gemini-bridge": "gemini",
+}
+_PINNED_CLAUDE_PROVIDER_RE = re.compile(r"^claude-[ab]px-\d+$")
+_POOL_SUB_KEY_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_API_CALL_SEQ_INIT_LOCK = threading.Lock()
+_API_CALL_FAILURE_LOCK = threading.Lock()
+
+
+
+def _snapshot_pool_headers(response: Any) -> dict[str, str]:
+    """Copy only relay-minted attribution headers from an httpx response."""
+    source = getattr(response, "headers", None)
+    if source is None:
+        return {}
+    snapshot: dict[str, str] = {}
+    for name in _POOL_HEADER_NAMES:
+        try:
+            value = source.get(name)
+        except Exception:
+            value = None
+        if value is not None:
+            snapshot[name] = str(value)
+    return snapshot
+
+
+
+def _stamp_pool_headers(message: Any, headers: dict[str, str]) -> Any:
+    """Keep one call's identity carrier beside that call's native usage."""
+    if message is not None:
+        setattr(message, "pool_headers", dict(headers))
+    return message
+
+
+
+def _next_api_call_seq(agent: Any, turn_id: str) -> int:
+    """Allocate a per-turn call sequence under the accumulator's lock."""
+    lock = getattr(agent, "_api_call_seq_lock", None)
+    if lock is None:
+        # Agent setup is single-threaded, but two first calls can still race in
+        # tests or unusual embeddings. A module lock makes lazy installation
+        # deterministic without retaining the agent in global state.
+        with _API_CALL_SEQ_INIT_LOCK:
+            lock = getattr(agent, "_api_call_seq_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                agent._api_call_seq_lock = lock
+    with lock:
+        counters = getattr(agent, "_api_call_seq_by_turn", None)
+        if not isinstance(counters, dict):
+            counters = {}
+            agent._api_call_seq_by_turn = counters
+        seq = int(counters.get(turn_id, 0))
+        counters[turn_id] = seq + 1
+        return seq
+
+
+
+def _codex_sub_key(agent: Any) -> Optional[str]:
+    pool = getattr(agent, "_credential_pool", None)
+    if pool is None:
+        return None
+    try:
+        current = pool.current()
+        if current is None:
+            return None
+        from hermes_cli.auth import get_codex_account_id
+
+        account_id = get_codex_account_id(current.access_token)
+        return f"codex:{account_id[:8]}" if account_id else None
+    except Exception:
+        return None
+
+
+
+def _api_call_identity(agent: Any, headers: dict[str, str]) -> tuple[Optional[str], str]:
+    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    served_by = headers.get("x-pool-served-by")
+    if served_by:
+        if _POOL_SUB_KEY_RE.fullmatch(served_by):
+            return served_by, "wire"
+        _note_api_call_recording_failure(agent)
+        logger.warning("invalid x-pool-served-by value; recording NULL identity")
+    if _PINNED_CLAUDE_PROVIDER_RE.fullmatch(provider):
+        return provider, "pinned"
+    if provider in _PINNED_PROVIDER_KEYS:
+        return _PINNED_PROVIDER_KEYS[provider], "pinned"
+    if provider == "openai-codex":
+        return _codex_sub_key(agent), "wire"
+    return None, "wire"
+
+
+
+def _note_api_call_recording_failure(agent: Any) -> None:
+    """Expose fail-open ledger loss to in-process health/status probes."""
+    try:
+        with _API_CALL_FAILURE_LOCK:
+            agent._api_call_recording_failures = int(
+                getattr(agent, "_api_call_recording_failures", 0) or 0
+            ) + 1
+    except Exception:
+        pass
+
+
+
+def _emit_api_call_record(
+    agent: Any,
+    *,
+    usage: Any,
+    headers: Optional[dict[str, str]] = None,
+    http_status: Optional[int] = None,
+) -> None:
+    """Fail-open bridge from the inference chokepoint to Blackbox.
+
+    An empty turn id means no conversation turn is in progress (startup probes
+    and provider health checks); those calls intentionally have no parent
+    ``turns`` row and are outside the per-turn ledger contract.
+    """
+    try:
+        turn_id = str(getattr(agent, "_current_turn_id", "") or "")
+        if not turn_id:
+            return
+        provider = str(getattr(agent, "provider", "") or "")
+        model = str(getattr(agent, "model", "") or "")
+        pool_headers = dict(headers or {})
+        sub_key, attribution = _api_call_identity(agent, pool_headers)
+        seq = _next_api_call_seq(agent, turn_id)
+        from plugins.blackbox import record_api_call
+
+        record_api_call(
+            turn_id=turn_id,
+            seq=seq,
+            ts=time.time(),
+            provider=provider,
+            model=model,
+            usage=usage,
+            api_mode=str(getattr(agent, "api_mode", "") or ""),
+            sub_key=sub_key,
+            attribution=attribution,
+            http_status=http_status,
+            relay_synthetic="x-pool-unreachable" in pool_headers,
+            route_id=pool_headers.get("x-pool-route-id"),
+        )
+    except Exception:
+        _note_api_call_recording_failure(agent)
+        logger.warning("blackbox API-call attribution insert failed", exc_info=True)
+
+
+
+def _record_successful_api_call(agent: Any, response: Any) -> None:
+    if response is None or getattr(response, "_api_call_failure_recorded", False):
+        return
+    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    if provider in _POOLED_PROVIDERS and not hasattr(response, "pool_headers"):
+        _note_api_call_recording_failure(agent)
+        logger.warning(
+            "pooled provider response lost pool_headers stamp; skipping "
+            "per-call attribution (provider=%s api_mode=%s)",
+            provider,
+            getattr(agent, "api_mode", ""),
+        )
+        return
+    headers = getattr(response, "pool_headers", None)
+    _emit_api_call_record(
+        agent,
+        usage=getattr(response, "usage", None),
+        headers=headers if isinstance(headers, dict) else {},
+        http_status=200,
+    )
+
+
+
+def _record_failed_api_call(agent: Any, error: BaseException) -> None:
+    response = getattr(error, "response", None)
+    status = getattr(error, "status_code", None)
+    if status is None:
+        status = getattr(response, "status_code", None)
+    _emit_api_call_record(
+        agent,
+        usage=None,
+        headers=_snapshot_pool_headers(response),
+        http_status=int(status) if isinstance(status, int) else None,
+    )
+
 
 # When the fallback chain is fully exhausted on a non-rate-limit failure
 # (e.g. every provider returns a non-retryable client error like HTTP 400),
@@ -996,7 +1188,25 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         request_client = make_client(
             "anthropic_messages_request", kind="anthropic_messages"
         )
-        return agent._anthropic_messages_create(api_kwargs, client=request_client)
+        pool_headers: dict[str, str] = {}
+
+        def _capture_with_pool_headers(http_response: Any) -> None:
+            pool_headers.update(_snapshot_pool_headers(http_response))
+            agent._capture_anthropic_response_headers(http_response)
+
+        # Use the same adapter as AIAgent._anthropic_messages_create, but pass a
+        # call-scoped response callback. Swapping a callback on the shared agent
+        # races interrupt-abandoned workers and can transpose two calls' headers.
+        from agent.anthropic_adapter import create_anthropic_message
+
+        message = create_anthropic_message(
+            request_client,
+            api_kwargs,
+            log_prefix=getattr(agent, "log_prefix", ""),
+            prefer_stream=not bool(getattr(agent, "_disable_streaming", False)),
+            on_response=_capture_with_pool_headers,
+        )
+        return _stamp_pool_headers(message, pool_headers)
     if agent.api_mode == "bedrock_converse":
         # Bedrock uses boto3 directly — no OpenAI client needed.
         # normalize_converse_response produces an OpenAI-compatible
@@ -1049,6 +1259,13 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
             api_kwargs.pop("_moa_prepared_request", None)
         return agent.client.chat.completions.create(**api_kwargs)
     request_client = make_client("chat_completion_request")
+    if str(getattr(agent, "provider", "") or "").strip().lower() in _POOLED_PROVIDERS:
+        # _create_request_openai_client is the sole make_client supplied here;
+        # it returns the OpenAI SDK client (or a test Mock, which never routes a
+        # real pooled call). The SDK guarantees with_raw_response + parse().
+        raw_response = request_client.chat.completions.with_raw_response.create(**api_kwargs)
+        response = raw_response.parse()
+        return _stamp_pool_headers(response, _snapshot_pool_headers(raw_response))
     return request_client.chat.completions.create(**api_kwargs)
 
 
@@ -1403,7 +1620,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # interrupt worker — it wedges before the socket opens on the 2nd+ call
     # (#62151). Run inline instead. See should_use_direct_api_call.
     if should_use_direct_api_call(agent):
-        return direct_api_call(agent, api_kwargs)
+        try:
+            response = direct_api_call(agent, api_kwargs)
+        except Exception as exc:
+            _record_failed_api_call(agent, exc)
+            raise
+        _record_successful_api_call(agent, response)
+        return response
 
     result = {"response": None, "error": None}
 
@@ -1990,11 +2213,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
             _join_worker_for_relay_teardown(t, label="Non-streaming")
             raise InterruptedError("Agent interrupted during API call")
     if result["error"] is not None:
+        _record_failed_api_call(agent, result["error"])
         raise result["error"]
     # Success — clear the circuit breaker (#58962): the provider proved
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
+        _record_successful_api_call(agent, result["response"])
     return result["response"]
 
 
@@ -5020,6 +5245,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         role = "assistant"
         reasoning_parts: list = []
         usage_obj = None
+        pool_headers: dict[str, str] = {}
         # Out-of-band confab notice (see agent/confab_notice.py). Rides the
         # final usage chunk; at most one is accepted per provider response.
         confab_notice_acc: dict = {"value": None, "seen": 0}
@@ -5056,6 +5282,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         def _stream_created(raw_stream: Any) -> None:
             response = getattr(raw_stream, "response", None)
+            pool_headers.update(_snapshot_pool_headers(response))
             attempt_stream_response["value"] = response
             agent._capture_rate_limits(response)
             agent._capture_credits(response)
@@ -5660,7 +5887,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # clean turn's response object is byte-identical to before.
         if confab_notice_acc["value"] is not None:
             setattr(_mock_response, CONFAB_NOTICE_FIELD, confab_notice_acc["value"])
-        return _mock_response
+        return _stamp_pool_headers(_mock_response, pool_headers)
 
     def _call_anthropic(request_client):
         """Stream an Anthropic Messages API response.
@@ -5694,7 +5921,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
         _writer_token = {"value": None}
-        _stream_context = {"manager": None, "stream": None}
+        _stream_context = {"manager": None, "stream": None, "pool_headers": {}}
         base_final_message = None
 
         from agent import relay_llm
@@ -5726,6 +5953,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         def _anthropic_stream_created(raw_stream: Any) -> None:
             _stream_context["stream"] = raw_stream
+            _stream_context["pool_headers"] = _snapshot_pool_headers(
+                getattr(raw_stream, "response", None)
+            )
             # The Anthropic SDK exposes the raw httpx response on
             # ``stream.response``. Snapshot diagnostics immediately so they
             # survive a stream that dies before the first event.
@@ -5918,7 +6148,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     "block was still incomplete; treating as a "
                     "mid-tool-call stream drop (#80498)."
                 )
-            return _repair_anthropic_message_surrogates(base_final_message)
+            return _stamp_pool_headers(
+                _repair_anthropic_message_surrogates(base_final_message),
+                _stream_context["pool_headers"],
+            )
         final_message = accumulator.response(base_final_message)
         if (
             not getattr(final_message, "content", None)
@@ -5934,7 +6167,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 "block was still incomplete; treating as a "
                 "mid-tool-call stream drop (#80498)."
             )
-        return _repair_anthropic_message_surrogates(final_message)
+        return _stamp_pool_headers(
+            _repair_anthropic_message_surrogates(final_message),
+            _stream_context["pool_headers"],
+        )
 
     def _call():
         import httpx as _httpx
@@ -5943,6 +6179,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         try:
             for _stream_attempt in range(_max_stream_retries + 1):
+                result["failure_recorded"] = False
                 stream_attempt_id = _start_stream_attempt()
                 # Check for interrupt before each retry attempt.  Without
                 # this, /stop closes the HTTP connection (outer poll loop),
@@ -5992,6 +6229,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             type(e).__name__,
                         )
                         return
+                    # The transport made a real attempt. Append its zero-token
+                    # row before retry/failover classification; interrupt-forced
+                    # closes returned above are deliberately excluded.
+                    _record_failed_api_call(agent, e)
+                    result["failure_recorded"] = True
                     _is_timeout = isinstance(
                         e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout)
                     )
@@ -6612,6 +6854,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 )],
                 usage=None,
                 _dropped_tool_names=_partial_names or None,
+                _api_call_failure_recorded=bool(result.get("failure_recorded")),
             )
             if _content_filter_terminated:
                 _stub._content_filter_terminated = True
@@ -6640,6 +6883,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # pending stream-error reason so it can't leak a stale "(connection
         # dropped)" rider onto an unrelated later failover.
         agent._pending_stream_error_reason = None
+        _record_successful_api_call(agent, result["response"])
     return result["response"]
 
 # ── Provider fallback ──────────────────────────────────────────────────

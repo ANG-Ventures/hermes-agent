@@ -1,9 +1,11 @@
 """Per-call ledger: additive migration, exact usage, and parent retention."""
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
 from agent.usage_pricing import CanonicalUsage
+from plugins import blackbox
 from plugins.blackbox import store
 from plugins.blackbox.record import TurnRecord
 
@@ -144,3 +146,78 @@ def test_reinsert_turn_preserves_rollup_columns(db):
             "SELECT model, served_subs_json, attribution FROM turns WHERE turn_id = ?",
             ("t",),
         ).fetchall() == [("second", '{"sub-vps-7": 3}', "wire")]
+
+
+def test_plugin_boundary_normalizes_success_and_zero_token_failure(db, monkeypatch):
+    monkeypatch.setattr(blackbox, "_config", lambda: {"enabled": True})
+    usage = SimpleNamespace(
+        input_tokens=1000,
+        output_tokens=50,
+        cache_read_input_tokens=300,
+        cache_creation_input_tokens=20,
+    )
+    blackbox.record_api_call(
+        turn_id="t",
+        seq=0,
+        ts=100.0,
+        provider="claude-apr",
+        model="test-model",
+        usage=None,
+        api_mode="anthropic_messages",
+        sub_key="sub-vps-2",
+        attribution="wire",
+        http_status=429,
+        relay_synthetic=True,
+        route_id="route-0",
+    )
+    blackbox.record_api_call(
+        turn_id="t",
+        seq=1,
+        ts=101.0,
+        provider="claude-apr",
+        model="test-model",
+        usage=usage,
+        api_mode="anthropic_messages",
+        sub_key="sub-vps-7",
+        attribution="wire",
+        http_status=200,
+        relay_synthetic=False,
+        route_id="route-1",
+    )
+    store.insert_turn(
+        TurnRecord(
+            turn_id="t",
+            input_tokens=1000,
+            output_tokens=50,
+            cache_read_tokens=300,
+            cache_write_tokens=20,
+        )
+    )
+
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute(
+            """
+            SELECT seq, sub_key, input_tokens, output_tokens, cache_read,
+                   cache_write, reasoning, http_status, relay_synthetic
+            FROM turn_api_calls ORDER BY seq
+            """
+        ).fetchall()
+        assert rows == [
+            (0, "sub-vps-2", 0, 0, 0, 0, 0, 429, 1),
+            (1, "sub-vps-7", 1000, 50, 300, 20, 0, 200, 0),
+        ]
+        mismatch_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM (
+                SELECT t.turn_id
+                FROM turns t JOIN turn_api_calls c ON c.turn_id = t.turn_id
+                GROUP BY t.turn_id
+                HAVING SUM(c.input_tokens) != t.input_tokens
+                    OR SUM(c.output_tokens) != t.output_tokens
+                    OR SUM(c.cache_read) != t.cache_read
+                    OR SUM(c.cache_write) != t.cache_write
+                    OR SUM(c.reasoning) != t.reasoning
+            )
+            """
+        ).fetchone()[0]
+        assert mismatch_count == 0
