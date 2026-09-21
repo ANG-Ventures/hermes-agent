@@ -824,6 +824,10 @@ async def test_rich_reply_records_and_recovers_text(monkeypatch, tmp_path):
     )
     assert send_result is not None and send_result.success is True
     assert send_result.message_id == "678"
+    for _ in range(100):
+        if rich_sent_store.lookup("12345", "678"):
+            break
+        await asyncio.sleep(0.01)
     assert rich_sent_store.lookup("12345", "678") == "Your morning briefing: CI is green."
 
     # Inbound reply carries NO text/caption (the rich-message blind spot).
@@ -832,3 +836,23 @@ async def test_rich_reply_records_and_recovers_text(monkeypatch, tmp_path):
     )
     assert event.reply_to_message_id == "678"
     assert event.reply_to_text == "Your morning briefing: CI is green."
+
+
+@pytest.mark.asyncio
+async def test_rich_send_success_survives_index_persistence_failure(monkeypatch):
+    """The best-effort reply index cannot turn a delivered send into failure."""
+    from gateway import rich_sent_store
+
+    def fail_enqueue(*args, **kwargs):
+        raise OSError("index unavailable")
+
+    monkeypatch.setattr(rich_sent_store, "_enqueue_write", fail_enqueue)
+    adapter = _make_adapter()
+    adapter._bot.do_api_request = AsyncMock(
+        return_value=SimpleNamespace(message_id=679)
+    )
+
+    result = await adapter._try_send_rich("12345", "delivered", None, None)
+
+    assert result is not None and result.success is True
+    assert result.message_id == "679"

@@ -10677,8 +10677,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _update_runtime_status(self, gateway_state: Optional[str] = None, exit_reason: Optional[str] = None) -> None:
         try:
-            from gateway.status import write_runtime_status
-            write_runtime_status(
+            self._dispatch_runtime_status_write(
                 gateway_state=gateway_state,
                 exit_reason=exit_reason,
                 restart_requested=self._restart_requested,
@@ -10686,6 +10685,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             pass
+
+    # Terminal writes must not be offloaded: the process can exit immediately
+    # after them, and a detached executor job would be dropped before it lands
+    # (test_signal_initiated_shutdown_persists_running_not_stopped depends on
+    # the final gateway_state actually reaching the file).  Shutdown is also
+    # exactly when a stalled loop costs nothing.
+    _TERMINAL_GATEWAY_STATES = frozenset({"stopped", "startup_failed"})
+
+    def _dispatch_runtime_status_write(self, **kwargs) -> None:  # noqa: atomic-write-on-loop loop-conditional guard: ordered worker lane whenever a loop is running
+        """Serialize runtime-status writes without blocking the active loop.
+
+        Non-terminal loop callers enter the ordered lane owned by
+        ``gateway.status``. Terminal and synchronous callers go through the
+        public writer, which fences that same lane before writing, so an older
+        deferred lifecycle update cannot overtake ``stopped`` at shutdown.
+
+        The lane deliberately lives in ``gateway.status``, not here: the three
+        direct ``startup_failed`` writers below (and the platform adapters'
+        ``_write_runtime_status_safe``) call the public writer directly, and a
+        runner-owned lane would leave all of them unordered.
+        """
+        def _write() -> None:
+            try:
+                from gateway.status import write_runtime_status
+
+                write_runtime_status(**kwargs)
+            except Exception:
+                pass
+
+        terminal = kwargs.get("gateway_state") in self._TERMINAL_GATEWAY_STATES
+        try:
+            asyncio.get_running_loop()
+            on_loop = True
+        except RuntimeError:
+            on_loop = False
+
+        if on_loop and not terminal:
+            try:
+                from gateway.status import submit_runtime_status_write
+
+                submit_runtime_status_write(**kwargs)
+                return
+            except Exception:
+                _write()
+                return
+
+        # Sync and terminal callers keep the established inline contract; the
+        # public writer fences the lane for them.
+        _write()
 
     def _persist_active_agents(self) -> None:
         """Persist the live in-flight agent count to ``gateway_state.json``.
@@ -10715,8 +10763,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         it runs inline exactly as before.
         """
         try:
-            from gateway.status import write_runtime_status
-
             payload = {
                 "active_agents": self._active_work_count(),
                 # The live running-session keys (excl. the pending sentinel) so the
@@ -10724,31 +10770,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # rather than waiting for the whole fleet to go idle.
                 "active_agent_keys": list(self._snapshot_running_agents().keys()),
             }
+            self._dispatch_runtime_status_write(**payload)
         except Exception:
             return
-
-        def _write() -> None:
-            try:
-                from gateway.status import write_runtime_status as _w
-
-                _w(**payload)
-            except Exception:
-                pass
-
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # No running loop: nothing to protect, run inline (previous behavior).
-            _write()
-            return
-
-        # Fire-and-forget on the default executor. Deliberately not awaited —
-        # callers are turn-boundary hooks in synchronous code paths, and a
-        # status write is best-effort telemetry, never a turn dependency.
-        try:
-            loop.run_in_executor(None, _write)
-        except Exception:
-            _write()
 
     # ------------------------------------------------------------------
     # Task-liveness reaper (busy-gateway-quiescence, spec §5 D-3/D-4).
@@ -10950,13 +10974,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         retrying_since: Any = _UNSET,
     ) -> None:
         try:
-            from gateway.status import write_runtime_status
             extra: Dict[str, Any] = {}
             if needs_attention is not None:
                 extra["needs_attention"] = needs_attention
             if retrying_since is not _UNSET:
                 extra["retrying_since"] = retrying_since
-            write_runtime_status(
+            self._dispatch_runtime_status_write(
                 platform=platform,
                 platform_state=platform_state,
                 error_code=error_code,
@@ -17086,8 +17109,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
         try:
-            from gateway.status import write_runtime_status
-            write_runtime_status(
+            self._dispatch_runtime_status_write(
                 gateway_state="starting",
                 exit_reason=None,
                 clear_profile_platforms=True,
@@ -17735,8 +17757,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         len(self._failed_platforms), reason,
                     )
                     try:
-                        from gateway.status import write_runtime_status
-                        write_runtime_status(
+                        self._dispatch_runtime_status_write(
                             gateway_state="degraded",
                             exit_reason=None,
                         )
@@ -20395,7 +20416,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # profile runtime scope; it is intentionally broader than profiles with a
         # successfully connected secondary adapter (or any adapter configured).
         try:
-            from gateway.status import write_runtime_status
             from gateway.pairing import PairingStore
             served = [active] + sorted(
                 name for name, _home in profile_homes if name != active
@@ -20411,7 +20431,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if name == active
                         else PairingStore(profile=name)
                     )
-            write_runtime_status(served_profiles=served)
+            self._dispatch_runtime_status_write(served_profiles=served)
         except Exception:
             logger.debug("could not record served_profiles", exc_info=True)
 
