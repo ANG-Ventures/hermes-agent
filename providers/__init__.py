@@ -52,6 +52,19 @@ _PROVIDER_LIST_CACHE: list[ProviderProfile] | None = None
 _discovered = False
 _discovering = False
 
+
+def discovery_in_progress() -> bool:
+    """True while :func:`_discover_providers` is importing plugin modules.
+
+    ``_discovered`` is set at the TOP of ``_discover_providers()`` so a
+    re-entrant ``list_providers()`` does not recurse — which means a plugin
+    imported by that very pass observes a HALF-POPULATED registry. Lazy
+    readers of provider-derived state (``CANONICAL_PROVIDERS``,
+    ``_PROVIDER_PREFIXES``, ``_URL_TO_PROVIDER``) consult this so they serve
+    the current value without caching it as final.
+    """
+    return _discovering
+
 # Repo-root ``plugins/model-providers/`` — populated at discovery time.
 _BUNDLED_PLUGINS_DIR = (
     Path(__file__).resolve().parent.parent / "plugins" / "model-providers"
