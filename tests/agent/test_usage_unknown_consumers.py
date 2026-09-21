@@ -160,3 +160,56 @@ def test_verbose_log_and_thin_fallback(wire):
         assert "Tokens out: unknown" in text
     if usage.total_tokens_unknown:
         assert "Total (billed in+out): unknown" in text
+
+
+def test_verbose_log_measured_values_keep_comma_formatting():
+    """MEASURED control for the sibling site: the verbose token log formatted
+    measured counts with commas before the UNKNOWN routing, and must still."""
+    from unittest.mock import Mock
+
+    usage = normalize_usage({"prompt_tokens": 120_000, "completion_tokens": 8_000,
+                             "total_tokens": 128_000}, api_mode="chat_completions")
+    assert not prompt_tokens_unknown(usage) and not usage.total_tokens_unknown
+    log = Mock()
+    ns = {"agent": SimpleNamespace(verbose_logging=True), "logging": log,
+          "canonical_usage": usage, "prompt_tokens_unknown": prompt_tokens_unknown,
+          "prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.output_tokens,
+          "total_tokens": usage.total_tokens, "output_unknown": usage.output_tokens_unknown}
+    _execute_statements("agent/conversation_loop.py", lambda n: isinstance(n, ast.If)
+                        and ast.unparse(n.test) == "agent.verbose_logging"
+                        and "Token usage: prompt=" in ast.unparse(n), ns)
+    fmt, *args = log.debug.call_args.args
+    text = fmt % tuple(args)
+
+    assert "prompt=120,000" in text      # not "120k"
+    assert "completion=8,000" in text
+    assert "total=128,000" in text
+    assert "unknown" not in text
+
+
+def test_thin_fallback_measured_values_keep_comma_formatting():
+    """MEASURED control: routing the unknown case through the shared rule must
+    not change how a measured count renders on this card. The card's vocabulary
+    is comma-grouped (``241,500``), not magnitude-abbreviated (``241.5k``)."""
+    snap = {"input_tokens": 120_000, "output_tokens": 8_000, "cache_read_tokens": 110_000,
+            "cache_write_tokens": 2_000, "reasoning_tokens": 1_500}
+
+    tree = ast.parse((ROOT / "gateway/slash_commands.py").read_text())
+    functions = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                 and any(isinstance(c, ast.Assign) and any(isinstance(t, ast.Name)
+                         and t.id == "lt_in" for t in c.targets) for c in n.body)]
+    assert len(functions) == 1
+    body = functions[0].body
+    start = next(i for i, n in enumerate(body) if isinstance(n, ast.FunctionDef) and n.name == "_as_int")
+    lifted = ast.FunctionDef(name="render", args=ast.arguments(posonlyargs=[], args=[],
+                            kwonlyargs=[], kw_defaults=[], defaults=[]),
+                            body=body[start:], decorator_list=[])
+    module = ast.fix_missing_locations(ast.Module(body=[lifted], type_ignores=[]))
+    ns = {"thin_snap": snap, "fallback_label": "test"}
+    exec(compile(module, "thin-fallback", "exec"), ns)
+    text = "\n".join(ns["render"]())
+
+    assert "232,000" in text                              # in billed, comma-grouped
+    assert "9,500" in text                                # out billed (8,000 + 1,500 reasoning)
+    assert "Total (billed in+out): 241,500" in text       # not "241.5k"
+    assert "unknown" not in text                          # nothing measured reads as unknown

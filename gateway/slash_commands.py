@@ -8091,18 +8091,27 @@ class GatewaySlashCommandsMixin:
         out_label = fallback_label or "persisted; agent not resident"
         out_lines = [f"📊 **Last turn** ({out_label})"]
         from agent.usage_pricing import format_token_count, prompt_tokens_unknown
+
+        # Route only the UNKNOWN case through the shared rule; keep this card's
+        # own comma formatting for measured values via ``formatter``.
+        def _tok(value: int, *, unknown: bool) -> str:
+            return format_token_count(value, unknown=unknown, formatter=lambda v: f"{v:,}")
+
         input_unknown = prompt_tokens_unknown(thin_snap)
         output_unknown = bool(thin_snap.get("output_tokens_unknown") or thin_snap.get("usage_unknown"))
         if input_unknown:
-            out_lines.append(f"• Tokens in: {format_token_count(in_billed, unknown=True)}")
+            out_lines.append(f"• Tokens in: {_tok(in_billed, unknown=True)}")
         elif in_billed:
             out_lines.append(
                 f"• Tokens in: {in_billed:,} billed "
                 f"({lt_cr:,} cache-read + {lt_cw:,} cache-write + {lt_in:,} uncached)"
             )
         if out_billed or output_unknown:
-            out_lines.append(f"• Tokens out: {format_token_count(out_billed, unknown=output_unknown)} billed")
-        out_lines.append(f"• Total (billed in+out): {format_token_count(in_billed + out_billed, unknown=input_unknown or output_unknown)}")
+            out_lines.append(f"• Tokens out: {_tok(out_billed, unknown=output_unknown)} billed")
+        out_lines.append(
+            f"• Total (billed in+out): "
+            f"{_tok(in_billed + out_billed, unknown=input_unknown or output_unknown)}"
+        )
         return out_lines
 
     async def _handle_usage_command(self, event: MessageEvent) -> str:

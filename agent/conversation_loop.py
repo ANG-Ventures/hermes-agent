@@ -5004,11 +5004,12 @@ def run_conversation(
                     
                     if agent.verbose_logging:
                         from agent.usage_pricing import format_token_count
+                        _comma = lambda v: f"{int(v or 0):,}"  # noqa: E731 - preserve this log's existing formatting
                         logging.debug(
                             "Token usage: prompt=%s, completion=%s, total=%s",
-                            format_token_count(prompt_tokens, unknown=prompt_tokens_unknown(canonical_usage)),
-                            format_token_count(completion_tokens, unknown=output_unknown or canonical_usage.usage_unknown),
-                            format_token_count(total_tokens, unknown=canonical_usage.total_tokens_unknown),
+                            format_token_count(prompt_tokens, unknown=prompt_tokens_unknown(canonical_usage), formatter=_comma),
+                            format_token_count(completion_tokens, unknown=output_unknown or canonical_usage.usage_unknown, formatter=_comma),
+                            format_token_count(total_tokens, unknown=canonical_usage.total_tokens_unknown, formatter=_comma),
                         )
                     
                     # Surface cache hit stats for any provider that reports
