@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import subprocess
 import threading
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -212,15 +213,13 @@ def test_teardown_reserve_fits_before_the_watchdog_that_actually_fires(
     """
     from gateway.restart import (
         LAUNCHD_STOP_CLEANUP_RESERVE_S,
-        resolve_launchd_shutdown_watchdog_delay,
+        resolve_armed_shutdown_watchdog_delay,
     )
 
     drain = resolve_launchd_capped_drain(
         configured, clamp, last_teardown_s=last_teardown
     )
-    armed = resolve_launchd_shutdown_watchdog_delay(
-        resolve_shutdown_watchdog_delay(drain), clamp, signal_driven=True
-    )
+    armed = resolve_armed_shutdown_watchdog_delay(drain, clamp, signal_driven=True)
     promised_reserve = max(LAUNCHD_STOP_CLEANUP_RESERVE_S, last_teardown or 0.0)
     assert armed - drain >= promised_reserve, (
         f"clamp={clamp} drain={drain} watchdog={armed}: only "
@@ -365,11 +364,18 @@ def test_cron_leash_under_launchd_cannot_exceed_exit_timeout():
     """The cron drain floor (#82161) is clamped to the launchd budget too.
 
     Without the clamp the cron ceiling is watchdog(drain+grace) - reserve,
-    which for a capped 45s drain is 95s — past launchd's 60s SIGKILL.
+    which for a capped 35s drain is 95s — past launchd's 60s SIGKILL.
+
+    NOTE: the cron leash itself is sized against the 60s SIGKILL wall
+    rather than the clamp-10 hard exit, so the cron floor can still
+    stretch over the chat drain's teardown window. That is a real but
+    SEPARATE defect, carved off to card t_f753b2b5 / PR #835; it is
+    deliberately not fixed here to keep this branch's diff to the
+    reserve arithmetic it owns.
     """
     from gateway.restart import CRON_DRAIN_CLEANUP_RESERVE_S, resolve_cron_drain_budget
 
-    drain = resolve_launchd_capped_drain(180.0, 60.0)  # 45
+    drain = resolve_launchd_capped_drain(180.0, 60.0)  # 35
     leash = min(resolve_shutdown_watchdog_delay(drain), 60.0)
     budget = resolve_cron_drain_budget(drain, 600.0, watchdog_delay=leash, elapsed=0.0)
     assert budget == max(drain, 60.0 - CRON_DRAIN_CLEANUP_RESERVE_S)
@@ -399,6 +405,169 @@ def test_launchd_shutdown_watchdog_hard_exits_before_supervisor_sigkill():
         )
         == 95.0
     )
+
+
+@pytest.mark.parametrize(
+    "clamp, configured, last_teardown",
+    [
+        (60.0, 50.0, 22.0),   # FleetReview's worked example
+        (60.0, 50.0, None),   # unmeasured teardown
+        (60.0, 180.0, None),  # the 2026-09-21 incident shape
+        (50.0, 50.0, None),
+        (30.0, 50.0, None),
+    ],
+)
+def test_armed_watchdog_lands_after_drain_plus_reserve(clamp, configured, last_teardown):
+    """The armed deadline must clear ``drain + reserve``, measured end-to-end.
+
+    FleetReview read the arming as "``effective_stop_drain_timeout()``
+    (already reserve-subtracted) plus a small grace", concluding a 35s cap
+    arms a ~40s watchdog and leaves persistence ~5s again. The grace is
+    not small — it is ``DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S`` (60s) — so
+    under launchd the inner leash always loses the ``min()`` and the armed
+    deadline is ``clamp - LAUNCHD_HARD_EXIT_RESERVE_S``.
+
+    This asserts the wall-clock deadline against the *production* helper
+    ``gateway.run`` arms with, so a regression toward FleetReview's reading
+    (arming from the reserve-subtracted delay) goes red here.
+    """
+    from gateway.restart import (
+        LAUNCHD_HARD_EXIT_RESERVE_S,
+        LAUNCHD_STOP_CLEANUP_RESERVE_S,
+        resolve_armed_shutdown_watchdog_delay,
+    )
+
+    drain = resolve_launchd_capped_drain(
+        configured, clamp, last_teardown_s=last_teardown
+    )
+    armed = resolve_armed_shutdown_watchdog_delay(drain, clamp, signal_driven=True)
+    reserve = max(LAUNCHD_STOP_CLEANUP_RESERVE_S, last_teardown or 0.0)
+
+    assert armed >= drain + reserve, (
+        f"clamp={clamp} drain={drain} armed={armed}: only {armed - drain}s "
+        f"before os._exit for a {reserve}s teardown"
+    )
+    # The armed deadline is the hard-exit line itself, not drain+grace.
+    assert armed == clamp - LAUNCHD_HARD_EXIT_RESERVE_S
+    # ...and it still lands before launchd's uncatchable SIGKILL.
+    assert armed < clamp
+
+
+def test_armed_watchdog_is_not_the_reserve_subtracted_delay():
+    """Pin the refutation: arming from the capped drain is NOT drain+grace.
+
+    This is the mutation FleetReview's finding describes. If the stop path
+    ever armed the inner leash directly (``drain + grace``) without the
+    launchd pull-back, the deadline would sit past SIGKILL; if it armed
+    ``drain + small_grace``, persistence would get that small grace. Both
+    shapes are excluded here by measurement.
+    """
+    from gateway.restart import resolve_armed_shutdown_watchdog_delay
+    from gateway.shutdown_watchdog import resolve_shutdown_watchdog_delay
+
+    drain = resolve_launchd_capped_drain(50.0, 60.0)  # 35.0
+    armed = resolve_armed_shutdown_watchdog_delay(drain, 60.0, signal_driven=True)
+
+    # FleetReview's predicted ~40s (drain + a small grace) would starve the
+    # 15s reserve down to ~5s. The real deadline is 50.0.
+    assert armed == 50.0
+    assert armed - drain == 15.0
+    # The un-clamped inner leash is way past the wall; the min() is load-bearing.
+    assert resolve_shutdown_watchdog_delay(drain) == 95.0
+    assert armed < resolve_shutdown_watchdog_delay(drain)
+
+
+def test_grace_branch_binds_only_on_a_clamp_far_above_the_drain():
+    """Document where ``drain + grace`` actually wins the ``min()``.
+
+    The armed deadline is ``min(drain + grace, clamp - hard_exit_reserve)``.
+    The inner term binds only when ``drain + grace < clamp - reserve``,
+    i.e. on a clamp well above the drain — never at the production clamp
+    (60, gui-domain-clamped). Pinning both sides means a later change to
+    ``DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S`` cannot silently flip the
+    production case with nothing going red: if the grace shrank to the
+    "small grace" FleetReview assumed, the clamp-60 row below would start
+    arming at ``drain + grace`` and fail.
+    """
+    from gateway.restart import (
+        LAUNCHD_HARD_EXIT_RESERVE_S,
+        resolve_armed_shutdown_watchdog_delay,
+    )
+    from gateway.shutdown_watchdog import (
+        DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S as GRACE,
+    )
+
+    # Production geometry: the hard-exit line binds, so the full teardown
+    # reserve survives.
+    drain_60 = resolve_launchd_capped_drain(50.0, 60.0)
+    assert drain_60 == 35.0
+    assert (
+        resolve_armed_shutdown_watchdog_delay(drain_60, 60.0, signal_driven=True)
+        == 60.0 - LAUNCHD_HARD_EXIT_RESERVE_S
+    )
+    assert drain_60 + GRACE > 60.0 - LAUNCHD_HARD_EXIT_RESERVE_S
+
+    # A clamp far above the drain: the inner leash binds instead, and the
+    # deadline is still strictly inside the SIGKILL wall.
+    drain_300 = resolve_launchd_capped_drain(50.0, 300.0)
+    armed_300 = resolve_armed_shutdown_watchdog_delay(
+        drain_300, 300.0, signal_driven=True
+    )
+    assert drain_300 == 50.0  # configured drain fits whole
+    assert armed_300 == drain_300 + GRACE
+    assert armed_300 < 300.0 - LAUNCHD_HARD_EXIT_RESERVE_S
+
+
+def test_stop_arms_the_watchdog_at_the_hard_exit_deadline(monkeypatch, tmp_path):
+    """Drive the real ``stop()`` and read the deadline it actually arms.
+
+    The invariant above is only meaningful if ``gateway.run`` arms with the
+    same expression. This measures the wall-clock delay passed at the
+    production arming call site — not a call count, and not arithmetic
+    re-derived in the test — so a refactor that re-inlines the old
+    reserve-subtracted arming (``drain + grace`` with no launchd pull-back,
+    which FleetReview read as leaving persistence ~5s) goes red here.
+    """
+    import asyncio
+
+    from gateway import run as run_mod
+    from gateway.restart import LAUNCHD_HARD_EXIT_RESERVE_S
+    from tests.gateway.restart_test_helpers import make_restart_runner
+
+    monkeypatch.setattr(run_mod, "_hermes_home", tmp_path)
+
+    runner, adapter = make_restart_runner()
+    runner._restart_drain_timeout = 50.0
+    runner._cron_drain_timeout = 0.01
+    runner._launchd_exit_timeout_s = 60.0
+    runner._stop_requested_by_signal = True
+    runner._last_shutdown_teardown_s = 22.0
+    adapter.disconnect = AsyncMock()
+
+    armed: list[float] = []
+    snapshots: list[dict] = []
+
+    def _capture(delay, *, done_event=None, snapshot_fn=None, exit_code=None):
+        armed.append(delay)
+        if snapshot_fn is not None:
+            snapshots.append(snapshot_fn())
+
+    monkeypatch.setattr(run_mod, "arm_shutdown_watchdog", _capture)
+    # stop() skips arming under pytest so unit tests don't inherit a
+    # delayed hard-exit; clear the marker so the real arming path runs.
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    with patch("gateway.status.remove_pid_file"), \
+         patch("gateway.status.write_runtime_status"):
+        asyncio.run(runner.stop())
+
+    # drain = 60 - 10 (hard exit) - 22 (measured teardown) = 28
+    assert runner._effective_stop_drain_timeout() == 28.0
+    assert armed == [60.0 - LAUNCHD_HARD_EXIT_RESERVE_S]
+    # The full measured teardown fits between the drain and the hard exit.
+    assert armed[0] - 28.0 >= 22.0
+    # The diagnostic snapshot reports the same deadline it armed with.
+    assert snapshots and snapshots[0]["watchdog_delay_s"] == armed[0]
 
 
 def test_hard_exit_backstop_ignores_blocked_daemon_threads(monkeypatch, tmp_path):

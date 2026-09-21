@@ -94,24 +94,53 @@ def get_teardown_timing_path(home: Optional[Path] = None) -> Path:
     return base.joinpath(*_TEARDOWN_TIMING_RELATIVE)
 
 
-def read_last_teardown_seconds(home: Optional[Path] = None) -> Optional[float]:
-    """Read the last completed post-drain teardown duration, if valid."""
-    data = _read_json(get_teardown_timing_path(home))
-    raw = (data or {}).get("teardown_seconds")
+def read_last_teardown_seconds(
+    home: Optional[Path] = None,
+    *,
+    max_seconds: Optional[float] = None,
+) -> Optional[float]:
+    """Read the last completed post-drain teardown duration, if valid.
+
+    Two bounds keep a single anomalous sample from starving the next
+    shutdown's drain to zero — the reserve is an input to a time budget,
+    so it must never be unbounded:
+
+    * Only samples recorded by a *budgeted* (signal-driven, launchd-timed)
+      stop are representative of the next SIGTERM. An unconstrained stop —
+      ``hermes gateway stop``, Ctrl+C, a foreground run — has no supervisor
+      deadline, so its post-drain work can legitimately run far longer
+      than any launchd budget. Records written before this field existed
+      are treated as unbudgeted for the same reason.
+    * ``max_seconds`` rejects a sample too large to be *actionable* under
+      the live budget. A teardown that already exceeds the whole usable
+      window cannot be reserved for; honouring it would zero the drain and
+      drop in-flight sessions while still not making the teardown fit.
+
+    ``inf``/``nan`` are rejected outright: no completed teardown can
+    produce them, so they only arrive from a corrupt or hand-edited file.
+    """
+    data = _read_json(get_teardown_timing_path(home)) or {}
+    raw = data.get("teardown_seconds")
     if raw is None:
+        return None
+    if not bool(data.get("budgeted")):
         return None
     try:
         value = float(raw)
     except (TypeError, ValueError):
         return None
-    # ``inf`` survives a bare ``>= 0.0`` check and is not a measurement any
-    # completed teardown can produce — it only arrives from a corrupt or
-    # hand-edited file. Letting it through makes the teardown reserve
-    # unbounded, which silently drives the next shutdown's drain budget to
-    # zero. ``nan`` already fails the comparison; reject both explicitly.
     if not math.isfinite(value):
         return None
-    return value if value >= 0.0 else None
+    if value < 0.0:
+        return None
+    if max_seconds is not None:
+        try:
+            ceiling = float(max_seconds)
+        except (TypeError, ValueError):
+            return value
+        if math.isfinite(ceiling) and value > ceiling:
+            return None
+    return value
 
 
 def record_teardown_timing(
@@ -119,9 +148,16 @@ def record_teardown_timing(
     *,
     total_shutdown_seconds: float,
     drain_seconds: float,
+    budgeted: bool = False,
     home: Optional[Path] = None,
 ) -> None:
-    """Persist and diagnose one completed post-drain teardown measurement."""
+    """Persist and diagnose one completed post-drain teardown measurement.
+
+    ``budgeted`` marks a stop that ran under a supervisor deadline, i.e.
+    the only kind whose duration predicts the next SIGTERM. Unbudgeted
+    samples are still written for diagnostics but are never read back as
+    the teardown reserve (see :func:`read_last_teardown_seconds`).
+    """
     try:
         teardown = max(float(teardown_seconds), 0.0)
         total = max(float(total_shutdown_seconds), 0.0)
@@ -135,6 +171,7 @@ def record_teardown_timing(
         "teardown_seconds": teardown,
         "total_shutdown_seconds": total,
         "drain_seconds": drain,
+        "budgeted": bool(budgeted),
     }
     path = get_teardown_timing_path(home)
     try:

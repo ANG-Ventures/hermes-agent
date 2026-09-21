@@ -237,6 +237,79 @@ def resolve_launchd_shutdown_watchdog_delay(
     return min(watchdog, max(launchd_budget - reserve, 0.0))
 
 
+def resolve_max_actionable_teardown_reserve_s(
+    launchd_exit_timeout_s: float | None,
+    *,
+    hard_exit_reserve_s: float = LAUNCHD_HARD_EXIT_RESERVE_S,
+) -> float | None:
+    """Largest teardown sample worth reserving for under a live budget.
+
+    The teardown reserve is carved out of the drain, so it is bounded by
+    the window that exists between the start of the stop and the hard
+    exit: ``exit_timeout - hard_exit_reserve_s``. A recorded sample at or
+    above that ceiling cannot be honoured — the drain is already zero at
+    the ceiling — so treating it as the reserve buys nothing and costs
+    every in-flight session its drain. Such a sample is rejected at the
+    read boundary instead (see
+    :func:`gateway.lifecycle_ledger.read_last_teardown_seconds`).
+
+    Returns ``None`` when no launchd budget applies, meaning "no ceiling":
+    an unsupervised stop is not racing a SIGKILL.
+    """
+    if launchd_exit_timeout_s is None:
+        return None
+    try:
+        budget = float(launchd_exit_timeout_s)
+    except (TypeError, ValueError):
+        return None
+    if not (budget > 0.0):
+        return None
+    return resolve_launchd_shutdown_watchdog_delay(
+        budget,
+        budget,
+        signal_driven=True,
+        hard_exit_reserve_s=hard_exit_reserve_s,
+    )
+
+
+def resolve_armed_shutdown_watchdog_delay(
+    drain_timeout: float,
+    launchd_exit_timeout_s: float | None,
+    *,
+    signal_driven: bool,
+    grace_s: float | None = None,
+    hard_exit_reserve_s: float = LAUNCHD_HARD_EXIT_RESERVE_S,
+) -> float:
+    """Wall-clock deadline the shutdown watchdog is actually armed with.
+
+    The single source of truth for the two-step arming the stop path
+    performs: an inner leash of ``drain + grace`` (see
+    :func:`gateway.shutdown_watchdog.resolve_shutdown_watchdog_delay`),
+    then :func:`resolve_launchd_shutdown_watchdog_delay` to pull it back
+    inside launchd's budget.
+
+    Extracted so the reserve invariant can be measured against the
+    expression ``gateway.run`` really arms, rather than a copy of it
+    re-derived in a test. The grace is large (60s by default), so under
+    launchd the inner leash always loses the ``min()`` and the armed
+    deadline is ``exit_timeout - hard_exit_reserve_s`` — which is exactly
+    what :func:`resolve_launchd_capped_drain` sizes the teardown window
+    against.
+    """
+    from gateway.shutdown_watchdog import (
+        DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S,
+        resolve_shutdown_watchdog_delay,
+    )
+
+    grace = DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S if grace_s is None else grace_s
+    return resolve_launchd_shutdown_watchdog_delay(
+        resolve_shutdown_watchdog_delay(drain_timeout, grace_s=grace),
+        launchd_exit_timeout_s,
+        signal_driven=signal_driven,
+        hard_exit_reserve_s=hard_exit_reserve_s,
+    )
+
+
 def effective_stop_drain_timeout(runner: object) -> float:
     """Drain budget for the stop in progress on ``runner``.
 

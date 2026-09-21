@@ -3307,9 +3307,11 @@ from gateway.restart import (
     parse_restart_drain_timeout,
     effective_stop_drain_timeout,
     read_launchd_exit_timeout_s,
+    resolve_armed_shutdown_watchdog_delay,
     resolve_cron_drain_budget,
     resolve_launchd_capped_drain,
     resolve_launchd_shutdown_watchdog_delay,
+    resolve_max_actionable_teardown_reserve_s,
     resolve_replace_takeover_grace_s,
 )
 
@@ -7983,7 +7985,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from gateway.lifecycle_ledger import read_last_teardown_seconds
 
-            self._last_shutdown_teardown_s = read_last_teardown_seconds()
+            # Bounded against the live budget: a sample larger than the
+            # usable window cannot be reserved for, and honouring it would
+            # zero the next drain instead (see read_last_teardown_seconds).
+            self._last_shutdown_teardown_s = read_last_teardown_seconds(
+                max_seconds=resolve_max_actionable_teardown_reserve_s(
+                    self._launchd_exit_timeout_s
+                ),
+            )
         except Exception:
             self._last_shutdown_teardown_s = None
         self._provider_routing = self._load_provider_routing()
@@ -19676,10 +19685,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "restart_drain_timeout": self._restart_drain_timeout,
                     "effective_drain_timeout": effective_stop_drain_timeout(self),
                     "launchd_exit_timeout_s": getattr(self, "_launchd_exit_timeout_s", None),
-                    "watchdog_delay_s": resolve_launchd_shutdown_watchdog_delay(
-                        resolve_shutdown_watchdog_delay(
-                            effective_stop_drain_timeout(self)
-                        ),
+                    "watchdog_delay_s": resolve_armed_shutdown_watchdog_delay(
+                        effective_stop_drain_timeout(self),
                         getattr(self, "_launchd_exit_timeout_s", None),
                         signal_driven=getattr(
                             self, "_stop_requested_by_signal", False
@@ -19692,13 +19699,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 }
 
             if not os.environ.get("PYTEST_CURRENT_TEST"):
-                _watchdog_delay = resolve_shutdown_watchdog_delay(
-                    effective_stop_drain_timeout(self)
-                )
-                _launchd_budget = getattr(self, "_launchd_exit_timeout_s", None)
-                _watchdog_delay = resolve_launchd_shutdown_watchdog_delay(
-                    _watchdog_delay,
-                    _launchd_budget,
+                _watchdog_delay = resolve_armed_shutdown_watchdog_delay(
+                    effective_stop_drain_timeout(self),
+                    getattr(self, "_launchd_exit_timeout_s", None),
                     signal_driven=getattr(self, "_stop_requested_by_signal", False),
                 )
                 arm_shutdown_watchdog(
@@ -20373,6 +20376,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _teardown_elapsed,
                     total_shutdown_seconds=_phase_elapsed(),
                     drain_seconds=_drain_elapsed,
+                    # Only a stop that actually ran under the supervisor's
+                    # deadline predicts the next SIGTERM. An unconstrained
+                    # stop (`hermes gateway stop`, Ctrl+C, foreground) can
+                    # legitimately take far longer; reading that back as the
+                    # teardown reserve would zero the next drain.
+                    budgeted=bool(
+                        getattr(self, "_stop_requested_by_signal", False)
+                        and getattr(self, "_launchd_exit_timeout_s", None) is not None
+                    ),
                 )
             except Exception as _e:
                 logger.debug("Failed to record shutdown teardown timing: %s", _e)
