@@ -412,8 +412,12 @@ class DeferredRestartCoordinator:
                 if request.intent_ts <= commit_ts:
                     await _maybe_await(record_replay(request))
                     await _maybe_await(mark_self(request))
-                    current = DeferredRestartRequest.load(request.path)
-                    self.transition(current, "coalesce_pending")
+                    current = await asyncio.to_thread(
+                        DeferredRestartRequest.load, request.path
+                    )
+                    await asyncio.to_thread(
+                        self.transition, current, "coalesce_pending"
+                    )
                     return "coalesced"
                 return "pending_next_boot"
 
@@ -434,11 +438,13 @@ class DeferredRestartCoordinator:
         committed = False
         current = request
         try:
-            self._publish_leader_meta(current, committed=False)
+            await asyncio.to_thread(
+                self._publish_leader_meta, current, committed=False
+            )
             if checkpoint:
                 checkpoint("after_meta_publish", current)
 
-            current = self.transition(current, "claimed")
+            current = await asyncio.to_thread(self.transition, current, "claimed")
             if checkpoint:
                 checkpoint("after_claim", current)
 
@@ -469,7 +475,12 @@ class DeferredRestartCoordinator:
             if checkpoint:
                 checkpoint("before_commit_publish", current)
             commit_ts = time.time()
-            self._publish_leader_meta(current, committed=True, commit_ts=commit_ts)
+            await asyncio.to_thread(
+                self._publish_leader_meta,
+                current,
+                committed=True,
+                commit_ts=commit_ts,
+            )
             committed = True
             signal_restart()
             return "signaled"
