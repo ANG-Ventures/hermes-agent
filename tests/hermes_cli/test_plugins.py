@@ -1300,11 +1300,11 @@ class TestForceReloadSymmetry:
             "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
         )
 
-        secret = "hunter2PRODSup3rSecret"
+        planted = "hunter2PRODSup3rSecret"
         callback = shell_hooks._make_callback(
             shell_hooks.ShellHookSpec(
                 event="pre_tool_call",
-                command=f"/bin/sh -c 'export TOK={secret}; sleep 30'",
+                command=f"/bin/sh -c 'export TOK={planted}; sleep 30'",
                 fail_closed=True,
             )
         )
@@ -1323,8 +1323,8 @@ class TestForceReloadSymmetry:
         assert timeout_msg is not None
         assert suppressed_msg is not None
         # ... and neither discloses the command that produced them.
-        assert secret not in timeout_msg
-        assert secret not in suppressed_msg
+        assert planted not in timeout_msg
+        assert planted not in suppressed_msg
         # The hook is still identifiable in each refusal.
         assert "shell_hook[pre_tool_call:" in timeout_msg
         assert "shell_hook[pre_tool_call:" in suppressed_msg

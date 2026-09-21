@@ -226,33 +226,33 @@ class TestCallbackSubprocess:
         pre_tool_call block message returned to the model, so a command with
         an inline credential must not be reconstructible from it.
         """
-        secret = "hunter2PRODSup3rSecret"
+        planted = "hunter2PRODSup3rSecret"
         cb = shell_hooks._make_callback(
             shell_hooks.ShellHookSpec(
                 event="pre_tool_call",
-                command=f"/bin/sh -c 'export TOK={secret}; sleep 30'",
+                command=f"/bin/sh -c 'export TOK={planted}; sleep 30'",
                 fail_closed=True,
             )
         )
 
-        assert secret not in cb.__name__
-        assert secret not in cb.__qualname__
+        assert planted not in cb.__name__
+        assert planted not in cb.__qualname__
         # Still identifies the hook and its event.
         assert cb.__name__.startswith("shell_hook[pre_tool_call:")
 
     def test_fail_closed_block_message_omits_the_raw_command(self):
         """The fail_closed refusal is returned to the model — no secrets."""
-        secret = "hunter2PRODSup3rSecret"
+        planted = "hunter2PRODSup3rSecret"
         spec = shell_hooks.ShellHookSpec(
             event="pre_tool_call",
-            command=f"/bin/sh -c 'export TOK={secret}; exit 3'",
+            command=f"/bin/sh -c 'export TOK={planted}; exit 3'",
             fail_closed=True,
         )
 
         block = shell_hooks._fail_closed_block(spec, "hook exited 3")
 
         assert block["action"] == "block"
-        assert secret not in block["message"]
+        assert planted not in block["message"]
         assert "failed closed" in block["message"]
         assert "hook exited 3" in block["message"]
 
