@@ -7418,6 +7418,12 @@ def block_task(
 
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
+
+    ``review`` is a blockable state: a card whose implementation is landed but
+    whose completion is refused must be parkable, or the review dispatcher
+    keeps respawning reviewers on it. Such a block records
+    ``source_status='review'`` so :func:`unblock_task` restores the review
+    phase instead of handing the card back to an implementer.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
@@ -7434,7 +7440,7 @@ def block_task(
         source_status = (
             _retry_status_for_run(conn, task_id)
             if cur_row["status"] == "running"
-            else "ready"
+            else ("review" if cur_row["status"] == "review" else "ready")
         )
         prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
@@ -7460,7 +7466,7 @@ def block_task(
                        worker_pid    = NULL,
                        block_kind    = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'review')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
                 (kind, task_id) if expected_run_id is None
                 else (kind, task_id, int(expected_run_id)),
@@ -7518,7 +7524,7 @@ def block_task(
                        block_kind    = ?,
                        block_recurrences = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'review')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
                 (kind, recurrences, task_id) if expected_run_id is None
                 else (kind, recurrences, task_id, int(expected_run_id)),
@@ -7588,7 +7594,7 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN ('running', 'ready', 'review')
                     """,
                     (kind, recurrences, task_id),
                 )
@@ -7603,7 +7609,7 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN ('running', 'ready', 'review')
                        AND current_run_id = ?
                     """,
                     (kind, recurrences, task_id, int(expected_run_id)),
@@ -8644,9 +8650,22 @@ def triage_resolve_task(
         if row is None:
             return False, f"task {task_id} not found"
         if row["status"] != "triage":
+            hint = {
+                "blocked": "use 'hermes kanban unblock' instead",
+                "scheduled": "use 'hermes kanban unblock' instead",
+                "todo": "use 'hermes kanban promote' instead",
+                "review": (
+                    "use 'hermes kanban complete' / 'request-changes' instead"
+                ),
+                "running": "use 'hermes kanban complete' instead",
+                "ready": "use 'hermes kanban complete' instead",
+            }.get(
+                str(row["status"]),
+                "use unblock/promote/complete instead",
+            )
             return False, (
                 f"task {task_id} is {row['status']!r}; triage-resolve only "
-                f"applies to 'triage' (use unblock/promote/complete instead)"
+                f"applies to 'triage' ({hint})"
             )
         # A triaged card should have no live run (block_task closes it), but a
         # crash between the two writes could leave the pointer dangling. Close
