@@ -165,9 +165,11 @@ def test_read_exit_timeout_fails_open_on_nonzero_rc():
 @pytest.mark.parametrize(
     ("configured", "last_teardown", "expected"),
     [
-        (50.0, None, 45.0),
+        # clamp 60 - hard-exit reserve 10 - teardown reserve 15 = 35
+        (50.0, None, 35.0),
         (30.0, None, 30.0),
-        (50.0, 22.0, 38.0),
+        # clamp 60 - hard-exit reserve 10 - measured teardown 22 = 28
+        (50.0, 22.0, 28.0),
     ],
 )
 def test_capped_drain_preserves_teardown_headroom(configured, last_teardown, expected):
@@ -184,6 +186,84 @@ def test_capped_drain_preserves_teardown_headroom(configured, last_teardown, exp
 def test_capped_drain_never_extends_a_short_drain():
     assert resolve_launchd_capped_drain(20.0, 60.0) == 20.0
     assert resolve_launchd_capped_drain(0.0, 60.0) == 0.0
+
+
+@pytest.mark.parametrize(
+    ("clamp", "configured", "last_teardown"),
+    [
+        (60.0, 50.0, None),
+        (60.0, 50.0, 22.0),
+        (60.0, 180.0, None),
+        (50.0, 50.0, None),
+        (30.0, 50.0, None),
+        (60.0, 50.0, 35.0),
+    ],
+)
+def test_teardown_reserve_fits_before_the_watchdog_that_actually_fires(
+    clamp, configured, last_teardown
+):
+    """The two reserves are additive, not overlapping.
+
+    The drain cap protects a teardown window ending at launchd's SIGKILL,
+    but the process hard-exits ``LAUNCHD_HARD_EXIT_RESERVE_S`` earlier. The
+    reserve must therefore fit between the end of the drain and the *armed
+    watchdog*, otherwise os._exit lands mid-persistence — the state.db
+    corruption class this card exists to close.
+    """
+    from gateway.restart import (
+        LAUNCHD_STOP_CLEANUP_RESERVE_S,
+        resolve_launchd_shutdown_watchdog_delay,
+    )
+
+    drain = resolve_launchd_capped_drain(
+        configured, clamp, last_teardown_s=last_teardown
+    )
+    armed = resolve_launchd_shutdown_watchdog_delay(
+        resolve_shutdown_watchdog_delay(drain), clamp, signal_driven=True
+    )
+    promised_reserve = max(LAUNCHD_STOP_CLEANUP_RESERVE_S, last_teardown or 0.0)
+    assert armed - drain >= promised_reserve, (
+        f"clamp={clamp} drain={drain} watchdog={armed}: only "
+        f"{armed - drain}s before hard exit for a {promised_reserve}s teardown"
+    )
+    # The reserve is carved out of the drain, never borrowed past the wall.
+    assert drain + promised_reserve <= clamp
+
+
+def test_budget_too_small_for_the_reserve_saturates_the_drain_to_zero():
+    """When the clamp cannot hold the teardown, persistence wins, not the drain.
+
+    This is honest degradation rather than a satisfiable window: an 8s
+    ``ExitTimeOut`` has no 15s teardown to protect, so the drain goes to
+    zero and the whole (short) budget is left for persistence. The property
+    that must survive is that the hard exit still lands before SIGKILL.
+    """
+    from gateway.restart import resolve_launchd_shutdown_watchdog_delay
+
+    for clamp in (8.0, 10.0, 4.0):
+        drain = resolve_launchd_capped_drain(50.0, clamp)
+        armed = resolve_launchd_shutdown_watchdog_delay(
+            resolve_shutdown_watchdog_delay(drain), clamp, signal_driven=True
+        )
+        assert drain == 0.0
+        assert 0.0 < armed < clamp
+
+
+def test_short_launchd_budget_still_drains_and_persists():
+    """A clamp at/below the hard-exit reserve must not mean 'exit immediately'.
+
+    Returning a zero-second watchdog skips all drain and persistence work
+    instead of using the little time that genuinely exists.
+    """
+    from gateway.restart import resolve_launchd_shutdown_watchdog_delay
+
+    for clamp in (8.0, 10.0, 4.0):
+        armed = resolve_launchd_shutdown_watchdog_delay(
+            95.0, clamp, signal_driven=True
+        )
+        assert 0.0 < armed < clamp, (
+            f"clamp={clamp}: watchdog {armed} leaves no time to persist"
+        )
 
 
 def test_capped_drain_no_launchd_budget_returns_configured():
@@ -217,7 +297,7 @@ def _runner(*, drain: float, launchd: float | None, by_signal: bool):
 
 
 def test_effective_drain_capped_only_for_signal_stops_under_launchd():
-    assert _runner(drain=180.0, launchd=60.0, by_signal=True)._effective_stop_drain_timeout() == 45.0
+    assert _runner(drain=180.0, launchd=60.0, by_signal=True)._effective_stop_drain_timeout() == 35.0
     # In-band restart (SIGUSR1 → after-turn → stop()) is not launchd-timed.
     assert _runner(drain=180.0, launchd=60.0, by_signal=False)._effective_stop_drain_timeout() == 180.0
     # Not launchd-owned (systemd, s6, foreground): configured drain stands.
@@ -244,7 +324,7 @@ def test_effective_drain_getattr_guarded_for_bare_doubles():
                 _launchd_exit_timeout_s=60.0,
             )
         )
-        == 45.0
+        == 35.0
     )
 
 
