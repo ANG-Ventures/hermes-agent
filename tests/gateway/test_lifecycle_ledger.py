@@ -99,6 +99,34 @@ def test_teardown_timing_round_trips_and_reaches_exit_diag(tmp_path: Path) -> No
     assert records[-1]["total_shutdown_seconds"] == 48.5
 
 
+@pytest.mark.parametrize("bad", ["Infinity", "-Infinity", "NaN"])
+def test_non_finite_persisted_teardown_is_rejected(tmp_path: Path, bad: str) -> None:
+    """A corrupt file must not become an unbounded teardown reserve.
+
+    ``inf`` passes a bare ``>= 0.0`` check, and the reserve flows straight
+    into the next shutdown's drain budget — an unbounded reserve silently
+    drives that budget to zero. Exercised through the real file path, not
+    the parameter, because the file is what feeds the live value.
+    """
+    from gateway.lifecycle_ledger import get_teardown_timing_path
+
+    path = get_teardown_timing_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"teardown_seconds": float(bad)}))
+
+    assert read_last_teardown_seconds(tmp_path) is None
+
+
+def test_finite_persisted_teardown_still_survives_the_guard(tmp_path: Path) -> None:
+    from gateway.lifecycle_ledger import get_teardown_timing_path
+
+    path = get_teardown_timing_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"teardown_seconds": 22.0}))
+
+    assert read_last_teardown_seconds(tmp_path) == 22.0
+
+
 # ---------------------------------------------------------------------------
 # First boot / clean lifecycle
 # ---------------------------------------------------------------------------
