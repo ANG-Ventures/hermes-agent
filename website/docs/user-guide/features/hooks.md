@@ -1696,7 +1696,7 @@ hooks:
       fail_closed: true
 ```
 
-With `fail_closed: true`, each of these now **blocks** the tool call with `hook <command> failed closed: <reason>`:
+With `fail_closed: true`, each of these now **blocks** the tool call with `hook <name>#<digest> failed closed: <reason>`:
 
 | Failure | Fail-open (default) | `fail_closed: true` |
 |---------|--------------------|--------------------|
