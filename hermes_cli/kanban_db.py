@@ -10729,6 +10729,18 @@ class DispatchResult:
     """Task ids whose warning-only collision check raised unexpectedly. The
     failure is logged loudly and dispatch continues (fail-open), preserving
     the rule that this diagnostic must never become an approval gate."""
+    gate_auto_resolved: list[str] = field(default_factory=list)
+    """Task ids the PR-gate re-evaluator unblocked this tick because every
+    GitHub PR named in their block reason had merged (see
+    :mod:`hermes_cli.kanban_pr_gate`). Before this, a card blocked on "merge
+    PR #N then unblock me" stayed blocked until a human board sweep noticed —
+    six cards sat up to 12 h that way on 2026-09-21. Surfaced here so the
+    dispatch report and sweep tooling can COUNT the automation rather than
+    infer it from card history."""
+    gate_closed_unmerged: list[str] = field(default_factory=list)
+    """Task ids whose gate PR is CLOSED WITHOUT MERGING. Deliberately NOT
+    unblocked — the premise died rather than being satisfied, so a human has
+    to re-point or retire the card. One advisory comment is posted once."""
     memory_pressure: Optional[str] = None
     """System memory pressure observed at spawn time when the memory guard
     restricted this tick (OOF-30/OOF-77): ``"critical"`` — no new workers
@@ -13066,6 +13078,37 @@ def dispatch_once(
     return result
 
 
+def _reevaluate_pr_gates_for_tick(
+    conn: sqlite3.Connection,
+    result: "DispatchResult",
+    *,
+    dry_run: bool = False,
+) -> None:
+    """Resolve blocked cards whose external PR gate has already been satisfied.
+
+    Fail-open by construction: any exception is logged and dispatch continues.
+    A diagnostic that can brick the dispatcher is worse than the stale-block
+    class it exists to close. ``dry_run`` skips it entirely — a dry run must
+    not mutate the board.
+    """
+    if dry_run:
+        return
+    try:
+        from hermes_cli import kanban_pr_gate
+
+        for outcome in kanban_pr_gate.reevaluate_pr_gates(conn):
+            if outcome.action == "unblocked":
+                result.gate_auto_resolved.append(outcome.task_id)
+            elif outcome.action == "closed_unmerged":
+                result.gate_closed_unmerged.append(outcome.task_id)
+    except Exception as exc:
+        _log.warning(
+            "kanban dispatch: PR-gate re-evaluation failed (%s: %s); "
+            "continuing this tick",
+            type(exc).__name__, exc,
+        )
+
+
 def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
@@ -13159,6 +13202,11 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    # PR-gate re-evaluation BEFORE recompute_ready so a card whose external
+    # gate is already satisfied becomes spawnable in the SAME tick rather
+    # than waiting for the next one. Bounded + cached + fail-safe: see
+    # hermes_cli.kanban_pr_gate for why every uncertain path is a no-op.
+    _reevaluate_pr_gates_for_tick(conn, result, dry_run=dry_run)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
     # Children held in ``todo`` behind a parent only a human can clear.
     # Computed AFTER recompute_ready so anything promotable this tick has
