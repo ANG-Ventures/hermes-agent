@@ -3509,6 +3509,21 @@ def try_activate_fallback(
     # so the explicit-wins / backfill / consume-once invariant is unit-testable
     # without driving the whole provider-resolution path.
     reason = _resolve_failover_reason(agent, reason)
+    # ── Registry-driven pruning (2026-09-21 cascade) ────────────────────
+    # A quota failure means the chain is about to be walked for quota
+    # reasons, and the usage-tracking system has already recorded which subs
+    # are exhausted. Drop those entries in ONE pass — before any client is
+    # constructed — so the walk costs one request instead of N, and the user
+    # sees one "skipping N exhausted subs" line instead of N "switching..."
+    # lines. Fails open on any registry problem; see agent.quota_registry_gate.
+    if reason in {FailoverReason.rate_limit, FailoverReason.billing,
+                  FailoverReason.upstream_rate_limit}:
+        try:
+            from agent.quota_registry_gate import apply_quota_gate
+
+            apply_quota_gate(agent)
+        except Exception:
+            logger.debug("quota registry gate failed open", exc_info=True)
     # A safety refusal (content_policy_blocked) is deterministic for the
     # unchanged prompt, exactly like a rate-limit is deterministic for its
     # window: restoring the primary next turn just reproduces the refusal and

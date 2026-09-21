@@ -6876,7 +6876,16 @@ def run_conversation(
                                 "⚠️ Provider unreachable — switching to fallback provider..."
                             )
                         else:
-                            agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
+                            from agent.quota_registry_gate import (
+                                rate_limited_status_line,
+                            )
+
+                            # One line for the whole quota cascade: when the
+                            # usage registry already knows N subs are
+                            # exhausted, this names the count instead of the
+                            # walker emitting N "switching..." lines (the
+                            # 2026-09-21 ×10 spam). See quota_registry_gate.
+                            agent._buffer_status(rate_limited_status_line(agent))
                         if agent._try_activate_fallback(
                             reason=classified.reason,
                             display_reason=classified.display_reason,
