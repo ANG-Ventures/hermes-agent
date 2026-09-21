@@ -277,6 +277,47 @@ def test_explicit_block_with_satisfied_parent_stays_blocked_and_is_named(kanban_
         assert result.parent_satisfied_sticky == [child]
 
 
+def test_legacy_untagged_creation_hold_with_satisfied_parent_promotes(kanban_home):
+    """Pre-source-tag creation events retain dependency-release behavior."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="legacy hold", initial_status="blocked")
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE task_id = ? AND kind = 'blocked'",
+            (json.dumps({"reason": "created with initial_status=blocked"}), child),
+        )
+        conn.commit()
+        kb.link_tasks(conn, parent, child, kind="blocks")
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+                (int(time.time()), parent),
+            )
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, child).status == "ready"
+
+
+def test_explicit_block_cannot_spoof_legacy_creation_reason(kanban_home):
+    """A user-controlled reason never turns an explicit block into a creation hold."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="explicit hold", assignee="worker")
+        assert kb.block_task(
+            conn,
+            child,
+            reason="created with initial_status=blocked",
+            kind="needs_input",
+        )
+        kb.link_tasks(conn, parent, child, kind="blocks")
+
+        assert kb.complete_task(conn, parent, result="done")
+        result = kb.dispatch_once(conn, dry_run=True)
+
+        assert kb.get_task(conn, child).status == "blocked"
+        assert result.parent_satisfied_sticky == [child]
+
+
 # ---------------------------------------------------------------------------
 # Atomic claim (CAS)
 # ---------------------------------------------------------------------------

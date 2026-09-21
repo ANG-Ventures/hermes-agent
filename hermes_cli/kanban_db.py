@@ -5652,11 +5652,21 @@ def _latest_block_source(conn: sqlite3.Connection, task_id: str) -> Optional[str
         payload = json.loads(row["payload"]) if row["payload"] else {}
     except (json.JSONDecodeError, TypeError):
         payload = {}
-    if isinstance(payload, dict) and (
-        payload.get("source") == "initial_status"
-        or payload.get("reason") == "created with initial_status=blocked"
-    ):
-        return "initial_status"
+    if isinstance(payload, dict):
+        if payload.get("source") == "initial_status":
+            return "initial_status"
+        explicit_fields = {
+            "kind", "source_status", "recurrences", "classified_in_place",
+            "requested_kind", "rekind_reason",
+        }
+        if (
+            payload.get("reason") == "created with initial_status=blocked"
+            and explicit_fields.isdisjoint(payload)
+        ):
+            # Compatibility for genuine pre-tag creation events. ``reason`` is
+            # caller-controlled on block_task, so it is only a legacy marker
+            # when no explicit-block provenance fields are present.
+            return "initial_status"
     return "explicit"
 
 
