@@ -71,3 +71,57 @@ def test_sweep_cascades_only_selected_parents(db, monkeypatch):
         assert conn.execute("SELECT turn_id FROM turns").fetchall() == [("keep",)]
         assert conn.execute("SELECT turn_id, seq FROM turn_api_calls ORDER BY seq").fetchall() == [
             ("keep", 0), ("keep", 1)]
+
+
+def test_null_key_parts_rejected(db):
+    """NULL PK parts never collide in SQLite, so they must be refused outright."""
+    with pytest.raises(ValueError):
+        append(None, 0)
+    with pytest.raises(ValueError):
+        append("t", None)
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM turn_api_calls").fetchone()[0] == 0
+        # The DDL enforces it too, independent of the Python guard.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO turn_api_calls (turn_id, seq) VALUES (NULL, 0)")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO turn_api_calls (turn_id, seq) VALUES ('t', NULL)")
+
+
+def test_duplicate_key_raises_integrity_error(db):
+    append("t", 0)
+    with pytest.raises(sqlite3.IntegrityError):
+        append("t", 0)
+
+
+def test_sweep_deletes_old_orphans_but_keeps_young_ones(db, monkeypatch):
+    """A call whose parent turn never landed must still age out of retention."""
+    monkeypatch.setattr(store.time, "time", lambda: 200000)
+    cutoff = 200000 - 86400
+    append("orphan-old", 0, ts=1.0)
+    append("orphan-young", 0, ts=cutoff + 10)
+    store.insert_turn(TurnRecord(turn_id="parented-young", ts_end=200000))
+    append("parented-young", 0, ts=1.0)
+    store.sweep(retention_days=1)
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT turn_id FROM turn_api_calls ORDER BY turn_id"
+        ).fetchall() == [("orphan-young",), ("parented-young",)]
+
+
+def test_reinsert_turn_preserves_rollup_columns(db):
+    """insert_turn must refresh its own columns without erasing the C2 rollup."""
+    store.insert_turn(TurnRecord(turn_id="t", model="first"))
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE turns SET served_subs_json = ?, attribution = ? WHERE turn_id = ?",
+            ('{"sub-vps-7": 3}', "wire", "t"),
+        )
+    store.insert_turn(TurnRecord(turn_id="t", model="second"))
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT model, served_subs_json, attribution FROM turns WHERE turn_id = ?",
+            ("t",),
+        ).fetchall() == [("second", '{"sub-vps-7": 3}', "wire")]
