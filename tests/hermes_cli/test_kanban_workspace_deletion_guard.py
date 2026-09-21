@@ -21,6 +21,7 @@ import argparse
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -1060,3 +1061,181 @@ def test_every_deletion_lane_still_removes_an_idle_cards_workspace(
     DELETION_LANES[lane](owner_id, owner_id, ws)
 
     assert not ws.exists(), f"lane {lane!r} became a no-op"
+
+
+# ---------------------------------------------------------------------------
+# 9. The deletion audit is not reapable by routine log maintenance
+#    (card t_63fb42f9, review round 7)
+#
+# `workspace_deletion_log_path` puts the audit in `worker_logs_dir(board)` --
+# the same directory as the disposable per-task `t_*.log` worker logs.
+# `gc_worker_logs` swept that directory with a bare `iterdir()` and no name
+# filter, so the audit was reaped at --log-retention-days (default 30). And it
+# is the SAME command: `_cmd_gc` deletes archived workspaces and then calls
+# gc_worker_logs, so the lane that performs deletions destroyed the record of
+# them. Measured through the real CLI on a sealed temp HERMES_HOME:
+# "GC complete: 0 workspace(s), 0 event row(s), 1 log file(s) removed" with
+# the audit gone afterwards.
+#
+# The failure is quiet in the obvious test: a gc run that DOES reap a
+# workspace writes to the audit first, refreshing its mtime, so the log
+# survives. It only dies on a run with nothing to reap -- the steady state.
+# Every test below therefore ages the audit past retention with no concurrent
+# deletion, and each pairs with an ALLOW control proving the reaper still
+# reaps ordinary worker logs.
+# ---------------------------------------------------------------------------
+
+
+_YEAR_AGO = 400 * 24 * 3600
+
+
+def _age(path: Path, seconds: int = _YEAR_AGO) -> None:
+    old = time.time() - seconds
+    os.utime(path, (old, old))
+
+
+def _seed_aged_logs(board=None):
+    """Audit log + an ordinary worker log, both aged past any retention."""
+    log_dir = kb.worker_logs_dir(board=board)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    audit = kb.workspace_deletion_log_path(board=board)
+    audit.write_text(
+        "2026-09-20T13:52:00\tDELETE\ttask=t_4e750964\tpath=/w\n"
+        "2026-09-20T13:54:00\tDELETE\ttask=t_4e750964\tpath=/w\n",
+        encoding="utf-8",
+    )
+    ordinary = log_dir / "t_deadbeef.log"
+    ordinary.write_text("worker noise\n", encoding="utf-8")
+    _age(audit)
+    _age(ordinary)
+    return audit, ordinary
+
+
+def test_gc_worker_logs_does_not_reap_the_deletion_audit(kanban_home):
+    """The helper: an aged audit survives, an aged worker log does not."""
+    audit, ordinary = _seed_aged_logs()
+
+    removed = kb.gc_worker_logs(older_than_seconds=30 * 24 * 3600)
+
+    assert audit.is_file(), "routine log GC deleted the deletion audit"
+    assert len(audit.read_text(encoding="utf-8").splitlines()) == 2, (
+        "audit history was truncated"
+    )
+    # ALLOW control -- the reaper must not be neutered into a no-op.
+    assert not ordinary.exists(), "gc_worker_logs stopped reaping worker logs"
+    assert removed == 1, f"expected exactly the worker log to be removed, got {removed}"
+
+
+def test_real_kanban_gc_cli_does_not_reap_the_deletion_audit(kanban_home):
+    """The REPORTED surface: `hermes kanban gc` as a real subprocess.
+
+    The helper alone is not what an operator runs. This drives the actual
+    CLI entry point in a child process against the same temp HERMES_HOME,
+    which is the shape that printed "1 log file(s) removed" for the audit.
+    """
+    audit, ordinary = _seed_aged_logs()
+
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(kanban_home)
+    env.pop("HERMES_KANBAN_BOARD", None)
+    repo_root = Path(kb.__file__).resolve().parents[1]
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(repo_root), env.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+    res = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "kanban", "gc"],
+        cwd=str(repo_root), env=env, capture_output=True, text=True, timeout=300,
+    )
+
+    assert res.returncode == 0, res.stderr[-2000:]
+    assert audit.is_file(), (
+        "`hermes kanban gc` deleted the deletion audit; stdout=%r" % res.stdout
+    )
+    assert len(audit.read_text(encoding="utf-8").splitlines()) == 2
+    # ALLOW control -- ordinary worker logs past retention are still reaped.
+    assert not ordinary.exists(), "gc stopped reaping ordinary worker logs"
+    assert "1 log file(s) removed" in res.stdout, res.stdout
+
+
+def test_gc_spares_the_audit_on_a_named_board_too(kanban_home):
+    """Both audit destinations: the named board's logs/ dir, not just default."""
+    kb.create_board("auditboard", name="Audit board")
+    audit, ordinary = _seed_aged_logs(board="auditboard")
+    assert audit.parent == kb.worker_logs_dir(board="auditboard")
+
+    removed = kb.gc_worker_logs(
+        older_than_seconds=30 * 24 * 3600, board="auditboard",
+    )
+
+    assert audit.is_file(), "named-board audit was reaped by log GC"
+    assert not ordinary.exists()
+    assert removed == 1
+
+
+def test_gc_spares_rotated_generations_of_the_audit(kanban_home):
+    """A rotated audit is still audit history, not a disposable worker log."""
+    audit, ordinary = _seed_aged_logs()
+    rotated = audit.with_name(audit.name + ".1")
+    rotated.write_text("older history\n", encoding="utf-8")
+    _age(rotated)
+
+    kb.gc_worker_logs(older_than_seconds=30 * 24 * 3600)
+
+    assert audit.is_file()
+    assert rotated.is_file(), "a rotated audit generation was reaped"
+    assert not ordinary.exists()
+
+
+def test_rotate_worker_log_refuses_the_audit_even_with_backup_count_zero(
+    kanban_home,
+):
+    """The second site in the class: rotation must not unlink the audit.
+
+    `_rotate_worker_log` is currently only ever called on `<task>.log`, so
+    this is unreachable today -- but with backup_count=0 it does a bare
+    `unlink()`, which would destroy the audit silently if a future caller
+    ever pointed it there. The guard lives in the function, not in the call
+    sites, so the site cannot become reachable later.
+    """
+    audit, _ordinary = _seed_aged_logs()
+    audit.write_text("x" * 5000, encoding="utf-8")
+
+    kb._rotate_worker_log(audit, max_bytes=10, backup_count=0)
+    assert audit.is_file(), "rotation with backup_count=0 unlinked the audit"
+
+    kb._rotate_worker_log(audit, max_bytes=10, backup_count=3)
+    assert audit.is_file(), "rotation renamed the audit out from under readers"
+    assert not audit.with_name(audit.name + ".1").exists()
+
+    # ALLOW control -- an ordinary oversized worker log still rotates.
+    plain = kb.worker_logs_dir() / "t_rotateme.log"
+    plain.write_text("y" * 5000, encoding="utf-8")
+    kb._rotate_worker_log(plain, max_bytes=10, backup_count=1)
+    assert not plain.exists(), "rotation stopped rotating ordinary worker logs"
+    assert plain.with_name(plain.name + ".1").is_file()
+
+
+def test_is_deletion_audit_path_recognises_every_durable_destination(kanban_home):
+    """The predicate must cover all four _durable_audit_log_path fallbacks.
+
+    An audit that lands in a fallback location is still an audit; a
+    name-based guard that only knew the default-board basename would leave
+    the outward fallbacks reapable by any future sweep of their directory.
+    """
+    for name in (
+        "workspace-deletions.log",
+        "workspace-deletions.log.1",
+        "workspace-deletions.log.7",
+        "kanban-workspace-deletions.log",
+        "hermes-workspace-deletions.log",
+    ):
+        assert kb.is_deletion_audit_path(Path("/any/dir") / name), name
+
+    for name in (
+        "t_deadbeef.log",
+        "t_deadbeef.log.1",
+        "dispatcher.log",
+        "workspace-deletions.log.bak",
+        "workspace-deletions.txt",
+    ):
+        assert not kb.is_deletion_audit_path(Path("/any/dir") / name), name

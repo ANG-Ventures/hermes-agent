@@ -7222,6 +7222,13 @@ def _live_owners_of_path(
     return sorted(found)
 
 
+#: Basename of the append-only workspace-deletion audit log. Named here
+#: rather than inlined because the log reapers have to recognise it: it
+#: shares a directory with the disposable per-task worker logs, and a
+#: routine log GC must never be able to delete it.
+WORKSPACE_DELETION_LOG_NAME = "workspace-deletions.log"
+
+
 def workspace_deletion_log_path(board: Optional[str] = None) -> Path:
     """Return the append-only audit log for workspace deletions.
 
@@ -7230,7 +7237,35 @@ def workspace_deletion_log_path(board: Optional[str] = None) -> Path:
     deletion history is scoped the same way everything else about that
     board is.
     """
-    return worker_logs_dir(board=board) / "workspace-deletions.log"
+    return worker_logs_dir(board=board) / WORKSPACE_DELETION_LOG_NAME
+
+
+def is_deletion_audit_path(path: Path) -> bool:
+    """True when *path* is the deletion audit log, or a rotation of it.
+
+    The audit lives in the same directory as the per-task worker logs, so
+    every consumer that reaps or rotates files in that directory would
+    otherwise treat it as disposable (card t_63fb42f9, review round 7:
+    ``hermes kanban gc`` reported ``1 log file(s) removed`` and that file
+    was the audit — the lane that performs deletions destroying the record
+    of them). The invariant this predicate exists to enforce is: **an
+    append-only deletion audit is never removed by a routine GC or
+    rotation.**
+
+    Matching is on the basename so it holds regardless of which board's
+    ``logs/`` directory, or which of ``_durable_audit_log_path``'s outward
+    fallbacks, the line actually landed in — those fallbacks are suffixed
+    forms (``kanban-workspace-deletions.log``,
+    ``hermes-workspace-deletions.log``) and are covered too. Rotated
+    generations (``workspace-deletions.log.1``) count as well, since
+    rotation is exactly how a long audit would be split.
+    """
+    name = path.name
+    if name.endswith(WORKSPACE_DELETION_LOG_NAME):
+        return True
+    # A rotated generation: "<name>.<n>".
+    stem, _, suffix = name.rpartition(".")
+    return stem.endswith(WORKSPACE_DELETION_LOG_NAME) and suffix.isdigit()
 
 
 #: Audit outcomes. ``ATTEMPT`` is written *before* an irreversible removal
@@ -13775,6 +13810,15 @@ def _rotate_worker_log(
     try:
         if not log_path.exists():
             return
+        # Same invariant as gc_worker_logs: the deletion audit is never
+        # removed by routine log maintenance. Today this function is only
+        # ever called on `<logs>/<task_id>.log` (kanban_db.py:14287), so
+        # this is unreachable -- but with backup_count=0 it does a bare
+        # unlink(), so if a future caller ever points it at the audit the
+        # record dies silently. Guarding the function is cheaper than
+        # trusting every future call site (card t_63fb42f9, round 7).
+        if is_deletion_audit_path(log_path):
+            return
         if log_path.stat().st_size <= max_bytes:
             return
         backup_count = _positive_int(
@@ -15614,6 +15658,13 @@ def gc_worker_logs(
     cutoff = time.time() - older_than_seconds
     removed = 0
     for p in log_dir.iterdir():
+        # The workspace-deletion audit shares this directory with the
+        # disposable per-task worker logs. It is append-only forensic
+        # history, not a worker log, and `hermes kanban gc` is the SAME
+        # command that performs workspace deletions -- reaping it here let
+        # the deleting lane destroy its own record (card t_63fb42f9).
+        if is_deletion_audit_path(p):
+            continue
         try:
             if p.is_file() and p.stat().st_mtime < cutoff:
                 p.unlink()
