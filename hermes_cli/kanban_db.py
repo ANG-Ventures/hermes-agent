@@ -6563,14 +6563,27 @@ def complete_task(
     survivor = preserve(conn, task_id, metadata)
     if survivor:
         metadata = dict(metadata or {}, survivor=survivor)
-        survivor_note = (
-            f"survivor=patch {survivor['path']} {survivor['sha256']} {survivor['bytes']} NOT PUSHED"
-            if survivor['kind'] == 'patch' else
-            f"survivor=bundle {survivor['sidecar']} NOT PUSHED"
-            if survivor['kind'] == 'bundle' else "survivor=ref " + " ".join(
-                f"{ref['remote']}/{ref['branch']}@{ref['sha']}" for ref in survivor["refs"]
+        if survivor['kind'] == 'patch':
+            survivor_note = (
+                f"survivor=patch {survivor['path']} {survivor['sha256']} {survivor['bytes']} NOT PUSHED"
             )
-        )
+        elif survivor['kind'] == 'bundle':
+            survivor_note = f"survivor=bundle {survivor['sidecar']} NOT PUSHED"
+        elif survivor['kind'] == 'landed':
+            # Verified published elsewhere: name the repo and the commit that
+            # actually carries the content on the durable remote.
+            survivor_note = "survivor=landed " + " ".join(
+                f"{entry['repository']}@{entry['sha']}"
+                f"->{entry['remote']}/{entry['branch']}@{entry['published_sha']}"
+                f" ({entry['matched_by']})"
+                for entry in survivor["landed"]
+            )
+        else:  # ref / ref-by-content
+            survivor_note = f"survivor={survivor['kind']} " + " ".join(
+                f"{ref['remote']}/{ref['branch']}@{ref['sha']}"
+                + (f" (patch-id of {ref['head']})" if ref.get("matched_by") == "patch-id" else "")
+                for ref in survivor["refs"]
+            )
         result = '\n'.join(filter(None, [result, survivor_note]))
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,

@@ -27,10 +27,10 @@ class SurvivorUnavailable(ValueError):
 
 log = logging.getLogger(__name__)
 
-def _git(repo, *args, env=None, check=True):
+def _git(repo, *args, env=None, check=True, timeout=30):
     result = subprocess.run(
         ["git", "-C", str(repo), *args], stdin=subprocess.DEVNULL,
-        capture_output=True, timeout=30, env=env,
+        capture_output=True, timeout=timeout, env=env,
     )
     if check and result.returncode:
         # Git stderr can contain credential-bearing remote URLs. Do not persist it.
@@ -178,6 +178,110 @@ def _remote_survivor(repo, head, published):
     return None
 
 
+# A rewriting mirror (hermes-home's "isolated remote sync") republishes every
+# commit under a NEW sha, so `_remote_survivor` can never match a clone of it and
+# the capture falls through to a bundle of a 94 MB home tree, which always
+# exceeds KANBAN_ATTACHMENT_MAX_BYTES (2026-09-20, t_e69d693a). `git patch-id`
+# is the content identity that survives the rewrite: same diff, same id, any sha.
+_CONTENT_SCAN_DEPTH = 25
+_CONTENT_SCAN_BUDGET = 100
+
+
+def _patch_id(repo, sha, env=None):
+    """Content identity of one commit's diff. None when it cannot be computed."""
+    diff = _git(repo, "diff-tree", "-p", "--full-index", "--no-ext-diff",
+                "--no-textconv", "--no-renames", "--root", sha, env=env, check=False)
+    if diff.returncode or not diff.stdout:
+        return None
+    result = subprocess.run(
+        ["git", "-C", str(repo), "patch-id", "--stable"],
+        input=diff.stdout, capture_output=True, timeout=30,
+    )
+    if result.returncode or not result.stdout.strip():
+        return None
+    return result.stdout.split()[0].decode()
+
+
+def _content_survivor(repo, head, published, *, budget=_CONTENT_SCAN_BUDGET):
+    """Find a published commit whose diff is byte-identical to ``head``'s.
+
+    Fetches each durable remote head shallowly into a throwaway bare repo that
+    borrows ``repo``'s objects, then walks it looking for a matching patch-id.
+    The deepest fetched commit is a shallow boundary — Git would diff it against
+    the empty tree and invent a bogus patch-id — so it is never scanned.
+    """
+    target = _patch_id(repo, head)
+    if target is None:
+        return None
+    objects = _git(repo, "rev-parse", "--path-format=absolute", "--git-path", "objects").stdout.decode().strip()
+    env = dict(os.environ, GIT_ALTERNATE_OBJECT_DIRECTORIES=objects)
+    with tempfile.TemporaryDirectory(prefix="kanban-content-") as tmp:
+        probe = Path(tmp) / "probe.git"
+        _git(repo, "init", "--bare", str(probe))
+        for ref in published:
+            if budget <= 0:
+                return None
+            url = _git(repo, "remote", "get-url", ref["remote"]).stdout.decode().strip()
+            try:
+                fetched = _git(
+                    probe, "fetch", "--no-tags", "--depth", str(_CONTENT_SCAN_DEPTH + 1),
+                    url, f"+refs/heads/{ref['branch']}:refs/heads/candidate",
+                    env=env, check=False, timeout=120,
+                )
+            except subprocess.TimeoutExpired:
+                continue
+            if fetched.returncode:
+                continue
+            walk = _git(probe, "rev-list", "--max-count", str(_CONTENT_SCAN_DEPTH),
+                        "refs/heads/candidate", env=env, check=False)
+            if walk.returncode:
+                continue
+            for sha in walk.stdout.decode().split():
+                if budget <= 0:
+                    return None
+                budget -= 1
+                if _patch_id(probe, sha, env=env) == target:
+                    return dict(ref, sha=sha, head=head, matched_by="patch-id",
+                                patch_id=target)
+            _git(probe, "update-ref", "-d", "refs/heads/candidate", env=env, check=False)
+    return None
+
+
+def _verify_landed(entries, workspace):
+    """Verify an explicit `landed` claim: reachable from HEAD AND published.
+
+    The escape hatch for work that was committed into a repo the workspace only
+    mirrors. Every failure mode raises — an unverifiable claim must never be
+    accepted as a survivor, because accepting it authorises deleting the only
+    remaining copy of the code.
+    """
+    verified = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise SurvivorUnavailable("survivor_unavailable: landed entry is not an object")
+        repo_path, sha = entry.get("repo_path"), entry.get("sha")
+        if not repo_path or not sha:
+            raise SurvivorUnavailable("survivor_unavailable: landed entry needs repo_path and sha")
+        repo = Path(repo_path).expanduser()
+        if not repo.is_dir():
+            raise SurvivorUnavailable("survivor_unavailable: landed repository missing")
+        repo = repo.resolve(strict=True)
+        resolved = _git(repo, "rev-parse", "--verify", f"{sha}^{{commit}}", check=False)
+        if resolved.returncode:
+            raise SurvivorUnavailable("survivor_unavailable: landed commit not in repository")
+        sha = resolved.stdout.decode().strip()
+        if _git(repo, "merge-base", "--is-ancestor", sha, "HEAD", check=False).returncode:
+            raise SurvivorUnavailable("survivor_unavailable: landed commit not reachable from HEAD")
+        published = list(_published_refs(repo, workspace))
+        ref = _remote_survivor(repo, sha, published) or _content_survivor(repo, sha, published)
+        if not ref:
+            raise SurvivorUnavailable("survivor_unavailable: landed commit is not published on a durable remote")
+        verified.append({"repository": str(repo), "sha": sha, "remote": ref["remote"],
+                         "branch": ref["branch"], "published_sha": ref["sha"],
+                         "matched_by": ref.get("matched_by", "sha")})
+    return verified
+
+
 def _base(repo, published):
     candidates = []
     for ref in published:
@@ -234,6 +338,19 @@ def _hold(conn, task_id, reason):
     _log.warning("Workspace HELD for task %s: %s", task_id, reason)
 
 
+def _record(conn, task_id, survivor, previous):
+    """The single publication point for a captured survivor."""
+    with kb.write_txn(conn):
+        conn.execute(
+            "INSERT INTO task_workspace_survivors(task_id, survivor) VALUES (?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET survivor = excluded.survivor, held_reason = NULL",
+            (task_id, json.dumps(survivor)),
+        )
+        if survivor and survivor != previous:
+            kb._append_event(conn, task_id, "workspace_survivor", survivor)
+    return survivor
+
+
 def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None):
     """Return a verified survivor or None for non-code work; fail closed on doubt."""
     bases, held, previous = _state(conn, task_id)
@@ -262,6 +379,20 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None):
         keys = {str(r.relative_to(workspace)) for r in repos}
         if set(bases) - keys:
             raise SurvivorUnavailable("survivor_unavailable: recorded repository missing")
+        landed = (metadata or {}).get("landed")
+        if landed:
+            if not isinstance(landed, list):
+                raise SurvivorUnavailable("survivor_unavailable: landed must be a list")
+            # Explicit opt-in: the worker asserts the code already lives in a
+            # named repo, and we verify that claim against that repo's durable
+            # remote. Verified publication makes the workspace disposable, so we
+            # never pay for a snapshot of a 94 MB home clone.
+            survivor = {"kind": "landed", "landed": _verify_landed(landed, workspace)}
+            survivor["sidecar"] = _store(
+                conn, task_id, "implementation.json",
+                json.dumps(survivor, sort_keys=True).encode(), "application/json",
+            )["path"]
+            return _record(conn, task_id, survivor, previous)
         patches, refs, bundles, repositories = [], [], [], []
         for repo in repos:
             key = str(repo.relative_to(workspace))
@@ -270,7 +401,10 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None):
             dirty = _git(repo, "status", "--porcelain", "--untracked-files=all").stdout
             ref = None
             if not dirty and head.returncode == 0:
-                ref = _remote_survivor(repo, head.stdout.decode().strip(), published)
+                sha = head.stdout.decode().strip()
+                # A rewriting mirror republishes the same content under a new
+                # sha, so sha equality can never hold; fall back to content.
+                ref = _remote_survivor(repo, sha, published) or _content_survivor(repo, sha, published)
             if ref:
                 refs.append(dict(ref, repository=key))
                 continue
@@ -286,7 +420,15 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None):
                 patches.append(header + data)
             repositories.append({"repository": key, "base_sha": base})
         if repos and len(refs) == len(repos):
-            survivor = {"kind": "ref", "refs": refs}
+            by_content = any(ref.get("matched_by") == "patch-id" for ref in refs)
+            survivor = {"kind": "ref-by-content" if by_content else "ref", "refs": refs}
+            if by_content:
+                # The local sha exists nowhere durable; the manifest is the only
+                # record of which published commit carries the same content.
+                survivor["sidecar"] = _store(
+                    conn, task_id, "implementation.json",
+                    json.dumps(survivor, sort_keys=True).encode(), "application/json",
+                )["path"]
         elif patches or bundles:
             data = b"".join(patches)
             survivor = {"kind": "bundle" if bundles else "patch", "notice": "NOT PUSHED",
@@ -301,15 +443,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None):
             raise SurvivorUnavailable("survivor_unavailable: empty patch despite claimed code changes")
         else:
             survivor = None
-        with kb.write_txn(conn):
-            conn.execute(
-                "INSERT INTO task_workspace_survivors(task_id, survivor) VALUES (?, ?) "
-                "ON CONFLICT(task_id) DO UPDATE SET survivor = excluded.survivor, held_reason = NULL",
-                (task_id, json.dumps(survivor)),
-            )
-            if survivor and survivor != previous:
-                kb._append_event(conn, task_id, "workspace_survivor", survivor)
-        return survivor
+        return _record(conn, task_id, survivor, previous)
     except (OSError, sqlite3.Error, subprocess.SubprocessError, ValueError) as exc:
         reason = str(exc) if isinstance(exc, SurvivorUnavailable) else "survivor_unavailable: capture failed"
         _hold(conn, task_id, reason)
