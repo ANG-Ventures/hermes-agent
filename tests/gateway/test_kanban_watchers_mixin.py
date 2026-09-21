@@ -88,6 +88,7 @@ def test_gateway_logs_mount_refusal_reason_and_task(caplog):
     ])
     with caplog.at_level(logging.ERROR):
         assert not _log_spawn_results([("default", result)])
+        assert not _log_spawn_results([("default", result)])
 
     messages = [r.getMessage() for r in caplog.records]
     assert messages == [

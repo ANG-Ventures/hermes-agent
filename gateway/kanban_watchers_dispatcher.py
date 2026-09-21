@@ -28,6 +28,7 @@ def _kbd():
     return kanban_db_dispatch
 
 _CORRUPT_DB_MARKERS = ("file is not a database", "database disk image is malformed")
+_WORKSPACE_REFUSAL_LOGGED: dict[str, tuple[str, float]] = {}
 
 
 @dataclass
@@ -329,10 +330,12 @@ def _log_spawn_results(results: Optional[list]) -> bool:
                 f"{reason}: {', '.join(sorted(task_ids))}"
                 for reason, task_ids in sorted(grouped.items())
             )
-            logger.error(
-                "kanban dispatcher tick [%s]: workspace_refused=%d (%s)",
-                slug, len(refused), summary,
-            )
+            rendered = f"workspace_refused={len(refused)} ({summary})"
+            previous, previous_at = _WORKSPACE_REFUSAL_LOGGED.get(slug, ("", 0.0))
+            now = time.monotonic()
+            if rendered != previous or now - previous_at >= 300:
+                logger.error("kanban dispatcher tick [%s]: %s", slug, rendered)
+                _WORKSPACE_REFUSAL_LOGGED[slug] = (rendered, now)
         if res is not None and getattr(res, "spawned", None):
             any_spawned = True
             # Quiet by default: an idle gateway stays silent.

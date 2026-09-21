@@ -1004,7 +1004,8 @@ CREATE TABLE IF NOT EXISTS task_comments (
 
 -- Retained across config rollback so old volatile paths stay fenced.
 CREATE TABLE IF NOT EXISTS workspace_mount_roots (
-    root TEXT PRIMARY KEY
+    root       TEXT PRIMARY KEY,
+    mount_path TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS task_events (
