@@ -44,7 +44,15 @@ def _query(args):
         return None
 
 
-def verify_ref(claim):
+def verify_ref(claim, *, mined_for=None):
+    """Resolve a ``<url>#<sha>`` claim against the remote's branch and tag tips.
+
+    An operator flag (``mined_for`` unset) is authority once the SHA is a tip.
+    A ref mined from handoff text is only a hint: every SHA in a handoff is
+    cross-producted with every remote URL, and "branched from <sha>" names the
+    base, not the deliverable -- so a mined ref must sit on a branch that
+    names the task.
+    """
     url, sep, sha = claim.rpartition("#")
     if not sep or not re.fullmatch(_SHA, sha) or not _safe_url(url):
         return None
@@ -59,6 +67,8 @@ def verify_ref(claim):
     if len(matches) != 1:
         return None  # unknown or ambiguous abbreviation
     oid, ref = next(iter(matches.items()))
+    if mined_for and mined_for not in ref:
+        return None
     return {"remote": url, "branch": ref, "sha": oid, "external": True}
 
 
@@ -134,7 +144,8 @@ def discover(conn, task_id, metadata, evidence, urls):
             if len(seen) >= 6:
                 return None
             seen.add(key)
-            verified = verify_pr(claim, shas, mined_for=task_id) if kind == "pr" else verify_ref(claim)
+            verified = (verify_pr(claim, shas, mined_for=task_id) if kind == "pr"
+                        else verify_ref(claim, mined_for=task_id))
             if verified:
                 return verified
     return None
