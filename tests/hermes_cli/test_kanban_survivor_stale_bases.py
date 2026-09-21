@@ -46,12 +46,13 @@ def remote(monkeypatch):
     return state
 
 
-def stale_card(conn, *, title="review lane"):
+def stale_card(conn, *, title="review lane", loose=True):
     """A card whose recorded repo is gone but whose workspace dir survives."""
     tid = kb.create_task(conn, title=title)
     ws = kb.resolve_workspace(kb.get_task(conn, tid))
-    (ws / "qa-output").mkdir(parents=True, exist_ok=True)
-    (ws / "qa-output" / "verdict.md").write_text("APPROVED\n")
+    if loose:
+        (ws / "qa-output").mkdir(parents=True, exist_ok=True)
+        (ws / "qa-output" / "verdict.md").write_text("APPROVED\n")
     kb.set_workspace_path(conn, tid, ws)
     with kb.write_txn(conn):
         conn.execute(
@@ -209,3 +210,119 @@ def test_partial_loss_keeps_both_the_surviving_repo_and_the_operator_ref(board, 
     # under repository ".", which does not correspond to anything on disk.
     assert len(saved["refs"]) == 2, saved["refs"]
     assert set(by_repo) == {"gone", "kept"}, saved["refs"]
+
+
+# --- the SATISFIED claim must not be re-litigated during reclamation -------
+#
+# `bases` is never rewritten on a successful completion, so the stale-bases
+# check above re-ran on the cleanup pass (`remove_workspace_dir` ->
+# `preserve(cleanup=True)`). A reaper passes no `--survivor-pr`, so `explicit`
+# was None there and the check re-raised on a claim the operator had ALREADY
+# honoured -- and `_hold()` rewrote the `held_reason` that `_record()` had just
+# NULLed. The card ended `done`, permanently HELD, citing the very remedy that
+# had been used, and its workspace never reclaimed.
+
+
+def test_a_recorded_survivor_clears_the_hold_it_satisfied(board, remote):
+    """The bug: a SUCCESSFUL --survivor-pr completion left held_reason set."""
+    tid, ws = stale_card(board, loose=False)
+
+    assert kb.complete_task(board, tid, summary="approved", survivor_pr=PR)
+
+    row = board.execute(
+        "SELECT held_reason, survivor FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()
+    assert row["held_reason"] is None, (
+        "the cleanup re-check re-held a card whose survivor was already recorded"
+    )
+    assert json.loads(row["survivor"])["refs"][0]["pr"] == PR
+    assert kb.get_task(board, tid).status == "done"
+
+
+def test_the_satisfied_workspace_is_actually_reclaimed(board, remote):
+    """Teeth for the assertion above: a held workspace is never reclaimed."""
+    tid, ws = stale_card(board, loose=False)
+
+    assert kb.complete_task(board, tid, summary="approved", survivor_pr=PR)
+
+    assert not ws.exists(), "a card with a recorded survivor must not leak its dir"
+
+
+def test_reclamation_consults_the_recorded_survivor_not_the_dead_base(board, remote):
+    """The reaper's own call must succeed on its own, with no operator flag."""
+    from hermes_cli import kanban_survivor as survivor
+
+    tid, ws = stale_card(board, loose=False)
+    assert kb.complete_task(board, tid, summary="approved", survivor_pr=PR)
+    ws.mkdir(parents=True, exist_ok=True)  # a reaper re-examining a retained dir
+
+    # No survivor_pr: exactly what `remove_workspace_dir` passes.
+    out = survivor.preserve(board, tid, cleanup=True, workspace=ws)
+
+    assert out["refs"][0]["pr"] == PR, "cleanup must reuse the recorded survivor"
+    assert board.execute(
+        "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["held_reason"] is None
+
+
+def test_reclamation_still_holds_when_no_survivor_vouches_for_the_lost_repo(board, remote):
+    """REGRESSION: the relaxation is keyed on the RECORDED survivor, not on
+    `cleanup` itself. A card with no survivor for the vanished repo still holds.
+    """
+    from hermes_cli import kanban_survivor as survivor
+
+    tid, ws = stale_card(board, loose=False)
+    # A recorded survivor that vouches for a DIFFERENT repository than the one
+    # `bases` says vanished. Suppressing the check on `cleanup` alone would let
+    # this through; keying on coverage must not.
+    with kb.write_txn(board):
+        board.execute(
+            "INSERT INTO task_workspace_survivors(task_id, survivor) VALUES (?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET survivor = excluded.survivor",
+            (tid, json.dumps({"kind": "ref", "refs": [{"repository": "elsewhere", "sha": HEAD}]})),
+        )
+
+    with pytest.raises(ValueError) as excinfo:
+        survivor.preserve(board, tid, cleanup=True, workspace=ws)
+
+    assert "recorded repository missing" in str(excinfo.value)
+    assert board.execute(
+        "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["held_reason"] is not None
+
+
+def test_loose_evidence_is_still_not_reapable_on_a_satisfied_claim(board, remote):
+    """REGRESSION (PR #795's 4xP1): a ref vouches for repositories, never for
+    loose files beside them. Honouring the satisfied claim must not hand the
+    reaper evidence that no survivor covers -- the workspace still HOLDS.
+    """
+    tid, ws = stale_card(board)  # loose=True: qa-output/verdict.md
+    evidence = ws / "qa-output" / "verdict.md"
+
+    assert kb.complete_task(board, tid, summary="approved", survivor_pr=PR)
+
+    assert evidence.is_file(), "loose reviewer evidence must survive cleanup"
+    held = board.execute(
+        "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["held_reason"]
+    assert held is not None and "outside any repository" in held, (
+        "the hold must now name the loose files, not the already-honoured claim"
+    )
+
+
+def test_reclamation_does_not_mine_a_new_survivor_out_of_the_handoff(board, remote):
+    """REGRESSION: reclamation reuses a RECORDED survivor; it never discovers
+    one. Re-mining there would turn a fail-closed HOLD into a delete.
+    """
+    from hermes_cli import kanban_survivor as survivor
+
+    tid, ws = stale_card(board, loose=False)
+    kb.add_comment(board, tid, "reviewer", f"unrelated {PR} landed earlier")
+    with kb.write_txn(board):
+        board.execute("UPDATE tasks SET result = ? WHERE id = ?",
+                      (f"see {PR} at {HEAD}", tid))
+
+    with pytest.raises(ValueError) as excinfo:
+        survivor.preserve(board, tid, cleanup=True, workspace=ws)
+
+    assert "recorded repository missing" in str(excinfo.value)

@@ -288,6 +288,24 @@ def _external(conn, task_id, metadata, evidence, urls, explicit, *, discover, cl
     return {"kind": "ref", "refs": [dict(ref, repository=".")]} if ref else None
 
 
+def _vouched_repositories(survivor):
+    """Repository keys a RECORDED survivor actually accounts for.
+
+    A survivor vouches for a repository through a ref (remote-verified, or an
+    operator flag) or through a stored bundle. A patch is not included: it is
+    keyed by base SHA against a checkout, so it cannot stand in for a
+    repository that is no longer on disk.
+    """
+    keys = set()
+    for entry in ((survivor or {}).get("refs") or ()):
+        if isinstance(entry, dict) and isinstance(entry.get("repository"), str):
+            keys.add(entry["repository"])
+    for entry in ((survivor or {}).get("bundles") or ()):
+        if isinstance(entry, dict) and isinstance(entry.get("repository"), str):
+            keys.add(entry["repository"])
+    return keys
+
+
 def _record(conn, task_id, survivor, previous):
     with kb.write_txn(conn):
         conn.execute(
@@ -346,8 +364,34 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
             # A patch cannot add a gitlink and files below the same path.
             raise SurvivorUnavailable("survivor_unavailable: nested repository requires separate recovery")
         keys = {str(r.relative_to(workspace)) for r in repos}
-        recovered = None
-        if set(bases) - keys:
+        carried = []
+        missing = set(bases) - keys
+        if missing and cleanup:
+            # Reclamation is not a second chance to re-derive evidence. The
+            # survivor recorded at completion is NEWER and better than the
+            # checkout that has since vanished, and `bases` is never rewritten
+            # on success -- so re-running this check on the cleanup pass
+            # re-raised on a claim that had already been honoured, and `_hold()`
+            # overwrote the `held_reason` `_record()` had just cleared. A card
+            # completed via a verified `--survivor-pr` was left `done` and
+            # permanently HELD, citing the very remedy the operator had used.
+            vouched = _vouched_repositories(previous)
+            if missing <= vouched:
+                if repos:
+                    # Same reason as the explicit branch below: on a PARTIAL
+                    # loss the surviving repos would satisfy the completion on
+                    # their own and silently drop the recorded ref for the one
+                    # that is gone.
+                    carried = [ref for ref in (previous or {}).get("refs") or ()
+                               if isinstance(ref, dict) and ref.get("repository") in missing]
+                missing = set()
+                # `bases` still attests that code work was expected here. Keep
+                # the claim so an empty in-tree capture routes through the
+                # `_loose_files()` guard below rather than the silent
+                # no-survivor `else` -- which would both erase the recorded
+                # survivor and hand loose, unvouched evidence to the reaper.
+                claimed = True
+        if missing:
             # The repository recorded at dispatch is gone while the directory
             # survived (a reaped clone leaving evidence behind). Without an
             # operator survivor this must stay fail-closed: it is what protects
@@ -372,8 +416,8 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 # Only a PARTIAL loss needs this. With no repo left at all the
                 # external path below records `explicit` on its own; seeding it
                 # here too would duplicate the ref.
-                recovered = dict(explicit, repository=sorted(set(bases) - keys)[0])
-        patches, refs, bundles, repositories = [], [recovered] if recovered else [], [], []
+                carried = [dict(explicit, repository=sorted(missing)[0])]
+        patches, refs, bundles, repositories = [], list(carried), [], []
         for repo in repos:
             key = str(repo.relative_to(workspace))
             published = list(_published_refs(repo, workspace))
@@ -396,7 +440,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 header = f"# kanban repository={json.dumps(key)} base={base}\n".encode()
                 patches.append(header + data)
             repositories.append({"repository": key, "base_sha": base})
-        if repos and len(refs) == len(repos) + (1 if recovered else 0):
+        if repos and len(refs) == len(repos) + len(carried):
             survivor = {"kind": "ref", "refs": refs}
         elif patches or bundles:
             data = b"".join(patches)
