@@ -1557,6 +1557,13 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     ``<root>/kanban/boards/_archived/<slug>-<timestamp>/`` so the data
     is recoverable. ``archive=False`` deletes the directory outright.
 
+    **Both** modes are refused while any card on the board is running or
+    holds an unexpired claim lock: the board directory contains those
+    cards' ``workspaces/``, so either mode takes a live worker's cwd out
+    from under it. Both modes also write an audit trail (``ATTEMPT`` then
+    ``ARCHIVE`` / ``DELETE`` / ``FAILED``, or ``REFUSED`` for the liveness
+    gate) to a log outside the affected tree.
+
     The ``default`` board cannot be removed — raises :class:`ValueError`.
     Returns a summary dict describing what happened (``{"slug", "action",
     "new_path"}``).
@@ -1574,6 +1581,34 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     # If the user removed the currently-active board, revert to default.
     if get_current_board() == normed:
         clear_current_board()
+
+    # A board directory CONTAINS that board's workspaces/ -- retiring it
+    # takes every card's scratch dir at once, the same blast radius as the
+    # 2026-09-20 incident. BOTH branches do that: archive renames the tree
+    # away, delete removes it. Round 3 gated only the delete branch, which
+    # is the one a user has to opt into (`boards rm --delete`, dashboard
+    # `?delete=true`); the DEFAULT archive branch yanked a running worker's
+    # cwd with no refusal and no audit line anywhere (card t_63fb42f9,
+    # review round 6, measured). The gate is hoisted here so it covers the
+    # default path too.
+    #
+    # Checked BEFORE the cache invalidation below: it opens the board DB
+    # (which would re-populate _INITIALIZED_PATHS) and it can abort, so no
+    # state may be torn down ahead of it.
+    live = _board_has_live_cards(normed)
+    if live:
+        verb = "archive" if archive else "delete"
+        _audit_workspace_deletion(
+            d, task_id=live[0], reason="remove_board", outcome=AUDIT_REFUSED,
+            detail=f"board-has-live-cards:{','.join(live[:5])} action={verb}",
+            board=normed,
+        )
+        raise ValueError(
+            f"board {normed!r} has {len(live)} card(s) running or holding "
+            f"a live claim lock ({', '.join(live[:5])}); refusing to "
+            f"{verb} its directory, which contains their workspaces. "
+            "Wait for the cards to finish, or stop them first."
+        )
 
     # A concurrent connect(board=normed) after the rename/delete recreates
     # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
@@ -1596,12 +1631,104 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         while target.exists():
             target = archive_root / f"{normed}-{ts}-{suffix}"
             suffix += 1
-        d.rename(target)
+        # An archive is a relocation, not an rmtree -- the bytes survive
+        # under _archived/ -- but from the point of view of anything holding
+        # a path into this board (a worker's cwd, an open workspace) it is
+        # indistinguishable from a deletion, which is exactly the symptom
+        # the 2026-09-20 incident presented as. Deliverable 2b says log
+        # EVERY workspace deletion; round 6 measured `rglob` returning [] on
+        # this branch. ATTEMPT goes down before the rename so a process that
+        # dies mid-move still names itself, and both records are routed
+        # through _durable_audit_log_path, which keeps them OUTSIDE the tree
+        # being moved.
+        _audit_workspace_deletion(
+            d, task_id=None, reason="remove_board", outcome=AUDIT_ATTEMPT,
+            detail=f"board={normed} action=archive dest={target}",
+            board=normed,
+        )
+        try:
+            d.rename(target)
+        except OSError as exc:
+            _audit_workspace_deletion(
+                d, task_id=None, reason="remove_board", outcome=AUDIT_FAILED,
+                detail=f"board={normed} action=archive {type(exc).__name__}: {exc}"[:200],
+                board=normed,
+            )
+            raise
+        _audit_workspace_deletion(
+            d, task_id=None, reason="remove_board", outcome=AUDIT_ARCHIVE,
+            detail=f"board={normed} action=archive dest={target}",
+            board=normed,
+        )
         return {"slug": normed, "action": "archived", "new_path": str(target)}
     else:
         from hermes_cli.kanban_survivor import remove_workspace_dir
-        remove_workspace_dir(None, None, d, board=True)
+        # Two independent refusals now apply to a board hard-delete: the
+        # liveness gate above (no card on this board may be running or
+        # claim-locked) and their survivor gate inside remove_workspace_dir
+        # (the board may not still hold recoverable work). The audit records
+        # the ATTEMPT before the removal and the terminal outcome after, to
+        # an explicitly-pinned destination OUTSIDE the board being deleted
+        # -- card t_63fb42f9 / incident 2026-09-20. Writing DELETE up front
+        # to the board's own logs/ meant a success destroyed its own record
+        # and a survivor refusal left a DELETE line for a board that still
+        # exists (review round 4, measured).
+        _audit_workspace_deletion(
+            d, task_id=None, reason="remove_board", outcome=AUDIT_ATTEMPT,
+            detail=f"board={normed}", board=normed,
+        )
+        try:
+            removed = bool(remove_workspace_dir(None, None, d, board=True))
+        except Exception as exc:
+            _audit_workspace_deletion(
+                d, task_id=None, reason="remove_board", outcome=AUDIT_REFUSED,
+                detail=f"board={normed} {type(exc).__name__}: {exc}"[:200],
+                board=normed,
+            )
+            raise
+        if not removed:
+            _audit_workspace_deletion(
+                d, task_id=None, reason="remove_board", outcome=AUDIT_FAILED,
+                detail=f"board={normed} survivor-held-or-removal-failed",
+                board=normed,
+            )
+            raise ValueError(
+                f"board {normed!r} could not be deleted; it still holds "
+                "recoverable work. Archive it instead."
+            )
+        _audit_workspace_deletion(
+            d, task_id=None, reason="remove_board", outcome=AUDIT_DELETE,
+            detail=f"board={normed}", board=normed,
+        )
         return {"slug": normed, "action": "deleted", "new_path": ""}
+
+
+def _board_has_live_cards(slug: str) -> list:
+    """Return the ids of cards on *slug* that are running or claim-locked.
+
+    Fail-closed: if the board's DB cannot be read, return a sentinel so the
+    caller refuses rather than deleting a board whose state is unknown.
+    """
+    try:
+        with connect_closing(board=slug) as conn:
+            rows = conn.execute(
+                "SELECT id, status, claim_expires FROM tasks "
+                "WHERE status = 'running' OR claim_expires IS NOT NULL"
+            ).fetchall()
+    except Exception:
+        return ["<unreadable-board-db>"]
+    now = int(time.time())
+    live = []
+    for row in rows:
+        if row["status"] == "running":
+            live.append(row["id"])
+            continue
+        try:
+            if row["claim_expires"] and int(row["claim_expires"]) > now:
+                live.append(row["id"])
+        except (TypeError, ValueError):
+            live.append(row["id"])  # fail closed on an unparseable lock
+    return live
 
 
 # ---------------------------------------------------------------------------
@@ -6487,6 +6614,8 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    survivor_ref: Optional[str] = None,
+    survivor_pr: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -6560,7 +6689,11 @@ def complete_task(
     if expected_run_id is not None and candidate.current_run_id != expected_run_id:
         return False
     from hermes_cli.kanban_survivor import preserve
-    survivor = preserve(conn, task_id, metadata)
+    survivor = preserve(
+        conn, task_id, metadata,
+        survivor_ref=survivor_ref, survivor_pr=survivor_pr,
+        evidence=[t for t in (summary, result) if t],
+    )
     if survivor:
         metadata = dict(metadata or {}, survivor=survivor)
         if survivor['kind'] == 'patch':
@@ -7006,6 +7139,468 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
     return False, None
 
 
+#: A scratch workspace directory is named for the card that owns it
+#: (:func:`_gen_task_id` -> ``t_`` + 8 hex chars). Used to recover the owner
+#: of a directory whose row never stored an explicit ``workspace_path``.
+_TASK_DIR_NAME_RE = re.compile(r"^t_[0-9a-f]{4,}$")
+
+
+def _live_owners_of_path(
+    path: Path,
+    *,
+    conn: Optional[sqlite3.Connection] = None,
+    live_only: bool = True,
+) -> list:
+    """Return the ids of cards that OWN *path* (live ones, by default).
+
+    Liveness is a property of the DIRECTORY BEING DELETED, not of the
+    ``task_id`` the caller happened to pass. :func:`_task_has_live_run`
+    answers only "is the card the caller named live?", so a row whose
+    ``workspace_path`` points at *another* card's live workspace deletes it
+    while the audit names the wrong card (card t_63fb42f9, review round 5:
+    ``hermes kanban gc`` removed a ``running`` card's dir and its unretained
+    work, logging a clean ATTEMPT/DELETE pair against the archived caller).
+
+    Ownership is resolved two ways, because both exist in the schema:
+
+    * an explicit ``workspace_path`` row pointing at this directory, and
+    * the ``<workspaces_root>/t_<hex>`` naming convention, for rows that
+      never stored a path.
+
+    All ownership rows are inspected before checking liveness. Unknown or
+    ambiguous ownership and unreadable/unresolvable state fail closed. Path
+    overlap counts as ownership: deleting an ancestor or a nested checkout
+    can destroy a live card's work just as deleting its exact root can.
+
+    ``live_only=False`` returns every owner regardless of run state; the
+    executing lanes use it to name the OWNING card in the audit line, so a
+    post-incident log points at the directory's owner rather than at whoever
+    asked for the deletion.
+    """
+    try:
+        resolved = Path(path).expanduser().resolve(strict=False)
+    except OSError:
+        return ["<unresolvable-path>"] if live_only else []
+    try:
+        is_managed, board = _managed_scratch_path_info(resolved)
+    except Exception:
+        return ["<unresolvable-owner>"] if live_only else []
+
+    candidates: set = set()
+    if is_managed:
+        # A nested checkout belongs to the enclosing card too; testing only
+        # resolved.name would miss <root>/<live-card>/repo.
+        for parent in (resolved, *resolved.parents):
+            if _TASK_DIR_NAME_RE.fullmatch(parent.name) and _is_managed_scratch_path(parent):
+                candidates.add(parent.name)
+
+    found: set = set()
+    all_owners: set = set()
+    with contextlib.ExitStack() as stack:
+        conns = []
+        if conn is not None:
+            conns.append(conn)
+        try:
+            if is_managed and board:
+                # The directory's own board, which may not be the caller's.
+                conns.append(stack.enter_context(connect_closing(board=board)))
+            elif conn is None:
+                conns.append(stack.enter_context(connect_closing()))
+        except Exception:
+            return ["<unreadable-board-db>"] if live_only else []
+        sql = "SELECT id, workspace_path FROM tasks"
+        for c in conns:
+            try:
+                rows = c.execute(sql).fetchall()
+            except Exception:
+                return ["<unreadable-task-table>"] if live_only else []
+            ids = candidates.intersection(row["id"] for row in rows)
+            for row in rows:
+                if not row["workspace_path"]:
+                    continue
+                try:
+                    stored = Path(
+                        str(row["workspace_path"])
+                    ).expanduser().resolve(strict=False)
+                except Exception:
+                    return ["<unresolvable-owner-path>"] if live_only else []
+                if (stored == resolved or stored.is_relative_to(resolved)
+                        or resolved.is_relative_to(stored)):
+                    ids.add(row["id"])
+            all_owners.update(ids)
+            for tid in ids:
+                if not live_only or _task_has_live_run(c, tid):
+                    found.add(tid)
+    if live_only and not found:
+        if not all_owners:
+            return ["<unknown-owner>"]
+        if len(all_owners) != 1:
+            return ["<ambiguous-owner>", *sorted(all_owners)]
+    return sorted(found)
+
+
+#: Basename of the append-only workspace-deletion audit log. Named here
+#: rather than inlined because the log reapers have to recognise it: it
+#: shares a directory with the disposable per-task worker logs, and a
+#: routine log GC must never be able to delete it.
+WORKSPACE_DELETION_LOG_NAME = "workspace-deletions.log"
+
+
+def workspace_deletion_log_path(board: Optional[str] = None) -> Path:
+    """Return the append-only audit log for workspace deletions.
+
+    Lives beside the worker logs (``<root>/kanban/logs/`` for the default
+    board, ``<root>/kanban/boards/<slug>/logs/`` otherwise) so a board's
+    deletion history is scoped the same way everything else about that
+    board is.
+    """
+    return worker_logs_dir(board=board) / WORKSPACE_DELETION_LOG_NAME
+
+
+def is_deletion_audit_path(path: Path) -> bool:
+    """True when *path* is the deletion audit log, or a rotation of it.
+
+    The audit lives in the same directory as the per-task worker logs, so
+    every consumer that reaps or rotates files in that directory would
+    otherwise treat it as disposable (card t_63fb42f9, review round 7:
+    ``hermes kanban gc`` reported ``1 log file(s) removed`` and that file
+    was the audit — the lane that performs deletions destroying the record
+    of them). The invariant this predicate exists to enforce is: **an
+    append-only deletion audit is never removed by a routine GC or
+    rotation.**
+
+    Matching is on the basename so it holds regardless of which board's
+    ``logs/`` directory, or which of ``_durable_audit_log_path``'s outward
+    fallbacks, the line actually landed in — those fallbacks are suffixed
+    forms (``kanban-workspace-deletions.log``,
+    ``hermes-workspace-deletions.log``) and are covered too. Rotated
+    generations (``workspace-deletions.log.1``) count as well, since
+    rotation is exactly how a long audit would be split.
+    """
+    name = path.name
+    if name.endswith(WORKSPACE_DELETION_LOG_NAME):
+        return True
+    # A rotated generation: "<name>.<n>".
+    stem, _, suffix = name.rpartition(".")
+    return stem.endswith(WORKSPACE_DELETION_LOG_NAME) and suffix.isdigit()
+
+
+#: Audit outcomes. ``ATTEMPT`` is written *before* an irreversible removal
+#: so a process that dies mid-rmtree still names itself; ``DELETE`` is only
+#: ever written after the removal actually returned success. ``REFUSED`` is a
+#: gate saying no, ``FAILED`` is the executor saying no.
+AUDIT_ATTEMPT = "ATTEMPT"
+AUDIT_DELETE = "DELETE"
+AUDIT_REFUSED = "REFUSED"
+AUDIT_FAILED = "FAILED"
+#: ``ARCHIVE`` is the relocation counterpart of ``DELETE``: the tree is gone
+#: from its old path (a live process holding it is just as broken) but the
+#: bytes survive at the recorded destination. Distinct from ``DELETE`` so an
+#: operator reading the log knows whether recovery is possible.
+AUDIT_ARCHIVE = "ARCHIVE"
+
+
+def _durable_audit_log_path(target: Path, board: Optional[str]) -> Path:
+    """Pick an audit log that will still exist after *target* is removed.
+
+    A board hard-delete removes ``<root>/kanban/boards/<slug>/`` -- which
+    CONTAINS that board's own ``logs/``. Routing the audit there means a
+    successful deletion destroys its own record (card t_63fb42f9, review
+    round 4: ``action='deleted'``, remaining audit files ``[]``). This is
+    not a board-only hazard: any deletion whose target encloses the log
+    directory has it, so the containment check lives here, in front of
+    every call site, rather than at the one that happened to be reported.
+
+    Candidates are tried outermost-last; the first one not inside *target*
+    wins.
+    """
+    candidates: list[Path] = []
+    try:
+        candidates.append(workspace_deletion_log_path(board=board))
+    except Exception:
+        pass
+    try:
+        # The default board's log lives at <root>/kanban/logs/, which is a
+        # sibling of boards/ and of workspaces/ -- outside every per-board
+        # and per-card deletion target.
+        candidates.append(workspace_deletion_log_path(board=DEFAULT_BOARD))
+    except Exception:
+        pass
+    try:
+        # Last resort for the incident's own shape: the whole kanban home
+        # as the target. Nothing under it is durable, so step outside.
+        candidates.append(kanban_home() / "kanban-workspace-deletions.log")
+    except Exception:
+        pass
+    try:
+        import tempfile
+
+        # And if even the home is the target, leave the tree entirely. An
+        # audit line outside the blast radius beats no audit line at all --
+        # the whole point of deliverable 2b.
+        candidates.append(
+            Path(tempfile.gettempdir()) / "hermes-workspace-deletions.log"
+        )
+    except Exception:
+        pass
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=False)
+        except OSError:
+            continue
+        try:
+            if resolved == target or resolved.is_relative_to(target):
+                continue  # would be destroyed by the deletion it records
+        except (ValueError, OSError):
+            pass
+        return candidate
+    return candidates[-1] if candidates else Path("workspace-deletions.log")
+
+
+def _audit_workspace_deletion(
+    path: Path,
+    *,
+    task_id: Optional[str],
+    reason: str,
+    allowed: Optional[bool] = None,
+    detail: str = "",
+    outcome: Optional[str] = None,
+    board: Optional[str] = None,
+) -> None:
+    """Append one line to the workspace-deletion audit log. Best effort.
+
+    The 2026-09-20 incident was invisible after the fact: an entire
+    default-board scratch root vanished under a running worker and no log
+    named a deleter. Every attempted removal -- permitted or refused --
+    now leaves a record naming pid, ppid, task, path and outcome.
+
+    ``outcome`` is one of :data:`AUDIT_ATTEMPT` / :data:`AUDIT_DELETE` /
+    :data:`AUDIT_REFUSED` / :data:`AUDIT_FAILED`. ``allowed`` is the older
+    boolean spelling and maps to DELETE/REFUSED. A caller that is about to
+    perform an irreversible removal writes ATTEMPT first and DELETE only
+    once the executor has returned success -- writing DELETE up front makes
+    the log lie whenever the executor refuses (review round 4 measured
+    exactly that on a survivor-held board: a DELETE line for a board that
+    still exists).
+
+    ``board`` pins the log's board explicitly. Without it the destination is
+    inferred, and for a target that is not a scratch descendant (a board
+    root) the inference falls through to the ambient active board.
+    """
+    try:
+        if outcome is None:
+            outcome = AUDIT_DELETE if allowed else AUDIT_REFUSED
+        if board is None:
+            is_managed, matched_board = _managed_scratch_path_info(path)
+            if is_managed:
+                board = matched_board
+        try:
+            target = Path(path).resolve(strict=False)
+        except OSError:
+            target = Path(path)
+        log_path = _durable_audit_log_path(target, board)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        verdict = outcome
+        try:
+            argv = " ".join(sys.argv)[:300]
+        except Exception:
+            argv = "?"
+        line = (
+            f"{stamp}\t{verdict}\ttask={task_id or '-'}\tpid={os.getpid()}"
+            f"\tppid={os.getppid()}\treason={reason}\tpath={path}"
+            f"\tdetail={detail}\targv={argv}\n"
+        )
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:
+        pass  # auditing must never block or break cleanup
+
+
+def _task_has_live_run(
+    conn: Optional[sqlite3.Connection], task_id: Optional[str]
+) -> bool:
+    """Return True when *task_id* looks like it is being actively worked.
+
+    "Live" means the card is in a non-terminal working state (``running``)
+    **or** it still holds an unexpired dispatch claim lock. Either is
+    sufficient: a worker mid-run owns its workspace, and deleting it out
+    from under the process destroys unretained work (incident 2026-09-20,
+    run 1880 -- the worker recreated its dir plus a locked git worktree and
+    both vanished again within seconds).
+
+    Errors resolve to ``True`` (fail-closed): if we cannot prove the card
+    is idle, we do not delete its workspace.
+    """
+    if not task_id:
+        return False
+    if conn is None:
+        try:
+            with connect_closing() as own:
+                return _task_has_live_run(own, task_id)
+        except Exception:
+            return True
+    try:
+        row = conn.execute(
+            "SELECT status, claim_expires FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+    except Exception:
+        return True  # fail closed
+    if row is None:
+        return False
+    if row["status"] == "running":
+        return True
+    claim_expires = row["claim_expires"]
+    try:
+        if claim_expires and int(claim_expires) > int(time.time()):
+            return True
+    except (TypeError, ValueError):
+        return True
+    return False
+
+
+def safe_remove_workspace_dir(
+    path: Path,
+    *,
+    task_id: Optional[str] = None,
+    reason: str,
+    conn: Optional[sqlite3.Connection] = None,
+) -> bool:
+    """THE choke point for removing a kanban-managed scratch workspace.
+
+    Every workspace deletion in Hermes goes through here. Three gates, in
+    order, each of which independently refuses:
+
+    1. **Containment.** :func:`_is_managed_scratch_path` requires a
+       *strict* descendant of a ``workspaces/`` root. The root itself, the
+       kanban home, board roots and ``logs/`` are all refused -- deleting
+       the root wipes every card's scratch dir at once, which is exactly
+       what happened on 2026-09-20.
+    2. **Liveness.** A card that is ``running`` or holds an unexpired
+       claim lock owns its directory; refuse regardless of what the caller
+       believes. Fail-closed on any DB error.
+    3. **Audit.** Both outcomes are appended to the per-board deletion log
+       so the next incident names its deleter.
+
+    Returns True iff the directory was removed.
+    """
+    try:
+        resolved = Path(path).resolve(strict=False)
+    except OSError:
+        _audit_workspace_deletion(
+            Path(path), task_id=task_id, reason=reason, allowed=False,
+            detail="unresolvable-path",
+        )
+        return False
+
+    if not _is_managed_scratch_path(resolved):
+        _audit_workspace_deletion(
+            resolved, task_id=task_id, reason=reason, allowed=False,
+            detail="not-a-managed-scratch-descendant",
+        )
+        _log.warning(
+            "Refusing to remove workspace %s (task %s, reason %s): not a "
+            "strict descendant of a kanban-managed workspaces root",
+            resolved, task_id, reason,
+        )
+        return False
+
+    if _task_has_live_run(conn, task_id):
+        _audit_workspace_deletion(
+            resolved, task_id=task_id, reason=reason, allowed=False,
+            detail="task-has-live-run",
+        )
+        _log.warning(
+            "Refusing to remove workspace %s: task %s is running or holds a "
+            "live claim lock (reason %s)",
+            resolved, task_id, reason,
+        )
+        return False
+
+    # Liveness of the *caller* is not enough: the path is supplied separately
+    # from the task_id, so a row pointing at another card's live workspace
+    # sails through the check above. Ask who owns THIS directory and whether
+    # THAT card is live (review round 5).
+    owners = _live_owners_of_path(resolved, conn=conn)
+    if owners:
+        _audit_workspace_deletion(
+            resolved, task_id=task_id, reason=reason, allowed=False,
+            detail="owner-has-live-run owner=%s" % ",".join(owners),
+        )
+        _log.warning(
+            "Refusing to remove workspace %s (caller task %s, reason %s): it "
+            "is owned by live card(s) %s",
+            resolved, task_id, reason, ",".join(owners),
+        )
+        return False
+
+    if not resolved.is_dir():
+        _audit_workspace_deletion(
+            resolved, task_id=task_id, reason=reason, allowed=False,
+            detail="not-a-directory",
+        )
+        return False
+
+    # The audit must name the card that OWNS this directory, not just the
+    # caller -- round 5 measured a DELETE line attributing another card's
+    # workspace to the archived row that asked for it.
+    owner_detail = ""
+    owners_any = _live_owners_of_path(resolved, conn=conn, live_only=False)
+    if owners_any and owners_any != [task_id]:
+        owner_detail = "owner=%s" % ",".join(owners_any)
+
+    _audit_workspace_deletion(
+        resolved, task_id=task_id, reason=reason, outcome=AUDIT_ATTEMPT,
+        detail=owner_detail,
+    )
+    # The removal itself goes through kanban_survivor.remove_workspace_dir
+    # (#783), which captures recoverable implementation work before deleting
+    # and HOLDS the workspace if it cannot. This function owns the three
+    # gates in FRONT of it -- containment, liveness, audit -- so the two
+    # protections compose instead of competing, and there remains exactly ONE
+    # directory deleter in the package (asserted by
+    # test_workspace_deletion_has_one_choke_point).
+    from hermes_cli.kanban_survivor import remove_workspace_dir
+
+    # The survivor capture needs a task connection: without one it can only
+    # prove durability from an independently-pushed ref, and holds the
+    # workspace otherwise. Callers of this choke point may omit conn (gc
+    # does), so open one here rather than degrading into a hold -- the same
+    # self-connect _task_has_live_run performs.
+    try:
+        if conn is not None or not task_id:
+            removed = bool(remove_workspace_dir(conn, task_id, resolved))
+        else:
+            with connect_closing() as own:
+                removed = bool(remove_workspace_dir(own, task_id, resolved))
+    except Exception as exc:
+        # remove_workspace_dir raises sqlite3.IntegrityError for a task_id
+        # with no row (its capture writes an attachment FK). This choke point
+        # is called from best-effort cleanup paths and must degrade to a
+        # refusal, never propagate.
+        _log.warning(
+            "Survivor-backed removal of %s (task %s) failed: %s",
+            resolved, task_id, exc,
+        )
+        removed = False
+    if not removed:
+        _audit_workspace_deletion(
+            resolved, task_id=task_id, reason=reason, outcome=AUDIT_FAILED,
+            detail=("survivor-held-workspace " + owner_detail).strip(),
+        )
+        return False
+    _audit_workspace_deletion(
+        resolved, task_id=task_id, reason=reason, outcome=AUDIT_DELETE,
+        detail=owner_detail,
+    )
+    _log.debug(
+        "Removed scratch workspace %s (task %s, reason %s)",
+        resolved, task_id, reason,
+    )
+    return True
+
+
 def _is_managed_scratch_path(p: Path) -> bool:
     """Return True iff *p* is a strict descendant of a kanban-managed scratch root.
 
@@ -7082,26 +7677,25 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # worktree so a lingering worker never has its cwd deleted out
             # from under it. Both steps stay best-effort.
             _cleanup_worker_tmux(conn, task_id)
-            _cleanup_worktree_workspace(task_id, path, row["branch_name"], conn=conn)
+            _cleanup_worktree_workspace(
+                task_id, path, row["branch_name"],
+                conn=conn, reason="complete_task",
+            )
             _try_cleanup_parent_workspaces(conn, task_id)
             return
         wp = Path(path)
         if wp.is_dir():
-            # Containment guard (#28818): a board's ``default_workdir`` can
-            # pair ``workspace_kind='scratch'`` with a user-supplied path
-            # pointing at a real source tree. Without this check, task
-            # completion would unconditionally ``shutil.rmtree`` that path
-            # and silently delete the user's source data.
-            if _is_managed_scratch_path(wp):
-                if remove_workspace_dir(conn, task_id, wp):
-                    _log.debug("Removed scratch workspace: %s", wp)
-            else:
-                _log.warning(
-                    "Refusing to remove out-of-scratch workspace for task %s: %s "
-                    "(workspace_kind='scratch' but path is outside any "
-                    "kanban-managed workspaces root)",
-                    task_id, wp,
-                )
+            # Containment + liveness + audit all live in the choke point
+            # (#28818 for containment; incident 2026-09-20 for liveness and
+            # the audit trail). A board's ``default_workdir`` can pair
+            # ``workspace_kind='scratch'`` with a user-supplied path pointing
+            # at a real source tree, and a still-running card owns its dir.
+            # safe_remove_workspace_dir performs the removal through
+            # kanban_survivor.remove_workspace_dir, so survivor preservation
+            # still runs underneath these gates.
+            safe_remove_workspace_dir(
+                wp, task_id=task_id, reason="complete_task", conn=conn,
+            )
         # Also kill the tmux session for the worker that owned this task,
         # if the tmux session is now dead (worker process exited).
         _cleanup_worker_tmux(conn, task_id)
@@ -7114,7 +7708,12 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
 
 
 def _cleanup_worktree_workspace(
-    task_id: str, path: str, branch_name: Optional[str] = None, *, conn=None
+    task_id: str,
+    path: str,
+    branch_name: Optional[str] = None,
+    *,
+    conn: Optional[sqlite3.Connection] = None,
+    reason: str = "worktree_cleanup",
 ) -> None:
     """Remove a finished task's linked git worktree when it holds no work.
 
@@ -7124,6 +7723,15 @@ def _cleanup_worktree_workspace(
     files, unpushed commits, unresolvable repo, failing git — preserves the
     worktree. The task's auto-generated ``wt/<task-id>`` branch is deleted
     with it; custom branches are kept. Best-effort like the scratch path.
+
+    Carries the same LIVENESS gate and AUDIT trail as
+    :func:`safe_remove_workspace_dir`. Before this (card t_63fb42f9, review
+    round 3) the worktree lane returned before ever reaching the choke point:
+    it gated only on dirty/unpushed, so a ``running`` card with a clean,
+    pushed worktree — run 1880's exact situation, which held a
+    ``git worktree add --force --lock`` — was removed out from under the live
+    process, and nothing was logged. Measured on a temp ``HERMES_HOME``:
+    ``WT_STILL_EXISTS False / AUDIT_EXISTS False``.
     """
     try:
         from cli import _worktree_has_unpushed_commits, _worktree_is_dirty
@@ -7133,13 +7741,54 @@ def _cleanup_worktree_workspace(
         wp = Path(path).expanduser()
         if not wp.is_dir():
             return
+        # Liveness FIRST: a card mid-run owns its checkout regardless of how
+        # clean git thinks it is. Fail-closed on any DB error.
+        if _task_has_live_run(conn, task_id):
+            _audit_workspace_deletion(
+                wp, task_id=task_id, reason=reason, allowed=False,
+                detail="task-has-live-run",
+            )
+            _log.warning(
+                "Refusing to remove worktree %s: task %s is running or holds "
+                "a live claim lock (reason %s)",
+                wp, task_id, reason,
+            )
+            return
+        # ...and liveness of whoever OWNS this checkout, which need not be
+        # the caller. Before this, the worktree lane survived a cross-owner
+        # removal only because ``git worktree remove`` refused underneath;
+        # the guard did not hold, git did (review round 5).
+        owners = _live_owners_of_path(wp, conn=conn)
+        if owners:
+            _audit_workspace_deletion(
+                wp, task_id=task_id, reason=reason, allowed=False,
+                detail="owner-has-live-run owner=%s" % ",".join(owners),
+            )
+            _log.warning(
+                "Refusing to remove worktree %s (caller task %s, reason %s): "
+                "it is owned by live card(s) %s",
+                wp, task_id, reason, ",".join(owners),
+            )
+            return
         common = _git_common_dir(wp)
         if common is None or common.name != ".git":
+            _audit_workspace_deletion(
+                wp, task_id=task_id, reason=reason, allowed=False,
+                detail="not-a-linked-worktree",
+            )
             return  # not a linked worktree of a normal repo — never guess
         repo_root = common.parent
         if wp.resolve(strict=False) == repo_root.resolve(strict=False):
+            _audit_workspace_deletion(
+                wp, task_id=task_id, reason=reason, allowed=False,
+                detail="is-the-main-checkout",
+            )
             return  # never remove the main checkout
         if _worktree_is_dirty(str(wp)) or _worktree_has_unpushed_commits(str(wp)):
+            _audit_workspace_deletion(
+                wp, task_id=task_id, reason=reason, allowed=False,
+                detail="dirty-or-unpushed",
+            )
             _log.info(
                 "Preserving worktree for task %s: dirty or unpushed work at %s",
                 task_id, wp,
@@ -7150,8 +7799,28 @@ def _cleanup_worktree_workspace(
         # became dirty between our check and the removal (TOCTOU), removal
         # fails safe and the worktree is preserved.
         from hermes_cli.kanban_survivor import remove_workspace_dir
+        # Name the OWNING card, not just the caller (review round 5).
+        wt_owners = _live_owners_of_path(wp, conn=conn, live_only=False)
+        wt_detail = "git-worktree-remove"
+        if wt_owners and wt_owners != [task_id]:
+            wt_detail += " owner=%s" % ",".join(wt_owners)
+        _audit_workspace_deletion(
+            wp, task_id=task_id, reason=reason, outcome=AUDIT_ATTEMPT,
+            detail=wt_detail,
+        )
         if not remove_workspace_dir(conn, task_id, wp, worktree_root=repo_root):
+            _audit_workspace_deletion(
+                wp, task_id=task_id, reason=reason, outcome=AUDIT_FAILED,
+                detail="survivor-refused-or-git-remove-failed",
+            )
+            _log.warning(
+                "worktree removal refused for task %s at %s", task_id, wp,
+            )
             return
+        _audit_workspace_deletion(
+            wp, task_id=task_id, reason=reason, outcome=AUDIT_DELETE,
+            detail=wt_detail,
+        )
         _log.debug("Removed worktree workspace: %s", wp)
         branch = (branch_name or "").strip() or f"wt/{task_id}"
         if branch.startswith("wt/"):
@@ -7204,13 +7873,18 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             # All children done — safe to clean up parent workspace
             if row["workspace_kind"] == "worktree":
                 _cleanup_worktree_workspace(
-                    parent_id, row["workspace_path"], row["branch_name"], conn=conn
+                    parent_id, row["workspace_path"], row["branch_name"],
+                    conn=conn, reason="deferred_parent_cleanup",
                 )
                 continue
             wp = Path(row["workspace_path"])
-            if wp.is_dir() and _is_managed_scratch_path(wp):
-                if remove_workspace_dir(conn, parent_id, wp):
-                    _log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+            if wp.is_dir():
+                safe_remove_workspace_dir(
+                    wp,
+                    task_id=parent_id,
+                    reason="deferred_parent_cleanup",
+                    conn=conn,
+                )
     except Exception:
         pass  # best-effort
 
@@ -13157,6 +13831,15 @@ def _rotate_worker_log(
     try:
         if not log_path.exists():
             return
+        # Same invariant as gc_worker_logs: the deletion audit is never
+        # removed by routine log maintenance. Today this function is only
+        # ever called on `<logs>/<task_id>.log` (kanban_db.py:14287), so
+        # this is unreachable -- but with backup_count=0 it does a bare
+        # unlink(), so if a future caller ever points it at the audit the
+        # record dies silently. Guarding the function is cheaper than
+        # trusting every future call site (card t_63fb42f9, round 7).
+        if is_deletion_audit_path(log_path):
+            return
         if log_path.stat().st_size <= max_bytes:
             return
         backup_count = _positive_int(
@@ -14996,6 +15679,13 @@ def gc_worker_logs(
     cutoff = time.time() - older_than_seconds
     removed = 0
     for p in log_dir.iterdir():
+        # The workspace-deletion audit shares this directory with the
+        # disposable per-task worker logs. It is append-only forensic
+        # history, not a worker log, and `hermes kanban gc` is the SAME
+        # command that performs workspace deletions -- reaping it here let
+        # the deleting lane destroy its own record (card t_63fb42f9).
+        if is_deletion_audit_path(p):
+            continue
         try:
             if p.is_file() and p.stat().st_mtime < cutoff:
                 p.unlink()

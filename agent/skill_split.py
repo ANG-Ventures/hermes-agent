@@ -465,6 +465,9 @@ def join_split_skill(skill_dir: Path) -> bool:
             # Re-validate before unlink (defense in depth)
             carve_path = skill_dir / c["file"]
             carve_resolved = carve_path.resolve(strict=False)
+            # noqa: root-equality  carve_path is always skill_dir/<filename>, a
+            # FILE, and unlink() cannot remove a directory, so the
+            # path == skill_dir case is unreachable.
             carve_resolved.relative_to(skill_dir_resolved)
             carve_path.unlink()
         except (OSError, ValueError):

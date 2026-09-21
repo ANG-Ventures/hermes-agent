@@ -17,6 +17,7 @@ import tempfile
 from urllib.parse import unquote, urlsplit
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_external_survivor as _ext
 
 _log = logging.getLogger(__name__)
 
@@ -469,19 +470,71 @@ def _snapshot(repo, base, prefix):
         ).stdout
 
 
-def _hold(conn, task_id, reason):
-    with kb.write_txn(conn):
-        conn.execute(
-            "INSERT INTO task_workspace_survivors(task_id, held_reason) VALUES (?, ?) "
-            "ON CONFLICT(task_id) DO UPDATE SET held_reason = excluded.held_reason",
-            (task_id, reason),
-        )
-        kb._append_event(conn, task_id, "workspace_held", {"reason": reason})
-    _log.warning("Workspace HELD for task %s: %s", task_id, reason)
+def _verified_explicit(survivor_ref, survivor_pr):
+    """An operator-named survivor is a claim: verify it or refuse the completion."""
+    for claim, flag, verify in (
+        (survivor_ref, "--survivor-ref", _ext.verify_ref),
+        (survivor_pr, "--survivor-pr", _ext.verify_pr),
+    ):
+        if not claim:
+            continue
+        ref = verify(claim)
+        if ref is None:
+            # The claim is unverified and may carry a token: echo it redacted only.
+            raise SurvivorUnavailable(
+                f"survivor_unavailable: could not verify {flag} {_ext.redact(claim)} against the remote"
+            )
+        return ref
+    return None
+
+
+def _loose_files(workspace, repos):
+    """True when the workspace holds entries outside every repository.
+
+    A remote ref vouches only for the repositories it was resolved from; files
+    beside them (notes, scripts, a tarball) are captured by nothing, so an
+    inferred survivor must never trade them for a delete.
+    """
+    for root, dirs, files in os.walk(workspace, followlinks=False):
+        here = Path(root)
+        if here in repos:
+            dirs[:] = []
+            continue
+        if files or any((here / d).is_symlink() for d in dirs):
+            return True
+        dirs[:] = sorted(d for d in dirs if not (here / d).is_symlink())
+    return False
+
+
+def _remote_urls(repos):
+    urls = []
+    for repo in repos:
+        for remote in _git(repo, "remote", check=False).stdout.decode().splitlines():
+            url = _git(repo, "remote", "get-url", remote, check=False)
+            if url.returncode == 0:
+                urls.append(url.stdout.decode().strip())
+    return urls
+
+
+def _external(conn, task_id, metadata, evidence, urls, explicit, *, discover, cleanup, previous):
+    """Infer a survivor only for work that claims one.
+
+    An operator-named flag is authority and always applies. Text mining is a
+    guess: it stays behind the claim test that decides whether the absence of
+    a survivor is an error, and it never runs during reclamation -- cleanup
+    reuses the survivor recorded at completion or holds. Re-mining a hint
+    there would turn a fail-closed HOLD into a delete.
+    """
+    if explicit:
+        ref = explicit
+    elif cleanup:
+        return previous
+    else:
+        ref = _ext.discover(conn, task_id, metadata, evidence, urls) if discover else None
+    return {"kind": "ref", "refs": [dict(ref, repository=".")]} if ref else None
 
 
 def _record(conn, task_id, survivor, previous):
-    """The single publication point for a captured survivor."""
     with kb.write_txn(conn):
         conn.execute(
             "INSERT INTO task_workspace_survivors(task_id, survivor) VALUES (?, ?) "
@@ -493,7 +546,19 @@ def _record(conn, task_id, survivor, previous):
     return survivor
 
 
-def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None):
+def _hold(conn, task_id, reason):
+    with kb.write_txn(conn):
+        conn.execute(
+            "INSERT INTO task_workspace_survivors(task_id, held_reason) VALUES (?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET held_reason = excluded.held_reason",
+            (task_id, reason),
+        )
+        kb._append_event(conn, task_id, "workspace_held", {"reason": reason})
+    _log.warning("Workspace HELD for task %s: %s", task_id, reason)
+
+
+def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
+             survivor_ref=None, survivor_pr=None, evidence=()):
     """Return a verified survivor or None for non-code work; fail closed on doubt."""
     bases, held, previous = _state(conn, task_id)
     if cleanup and held:
@@ -502,6 +567,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None):
         task = kb.get_task(conn, task_id)
         if task is None:
             raise SurvivorUnavailable("survivor_unavailable: task missing")
+        explicit = _verified_explicit(survivor_ref, survivor_pr)
         claimed = bool((metadata or {}).get("changed_files"))
         # Review approval often has no new changed_files: inherit the implementer's claim.
         claimed = claimed or any(
@@ -510,8 +576,15 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None):
         )
         workspace = Path(workspace or task.workspace_path) if workspace or task.workspace_path else None
         if workspace is None or not workspace.is_dir():
+            external = _external(conn, task_id, metadata, evidence, (), explicit,
+                                 discover=bool(bases or claimed), cleanup=cleanup, previous=previous)
+            if external:
+                return _record(conn, task_id, external, previous)
             if cleanup or bases or claimed:
-                raise SurvivorUnavailable("survivor_unavailable: workspace missing")
+                raise SurvivorUnavailable(
+                    "survivor_unavailable: workspace missing and no verifiable external "
+                    f"survivor; {_ext.HINT}"
+                )
             return None
         workspace = workspace.resolve(strict=True)
         landed = (metadata or {}).get("landed")
@@ -599,7 +672,23 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None):
                              json.dumps(manifest, sort_keys=True).encode(), "application/json")
             survivor["sidecar"] = sidecar["path"]
         elif claimed:
-            raise SurvivorUnavailable("survivor_unavailable: empty patch despite claimed code changes")
+            # Nothing in-tree to capture: the survivor must live elsewhere. An
+            # inferred one vouches only for the repositories it came from, so
+            # files beside them make the inference worthless -- HOLD instead.
+            loose = _loose_files(workspace, repos)
+            external = _external(conn, task_id, metadata, evidence, _remote_urls(repos), explicit,
+                                 discover=not loose, cleanup=cleanup, previous=None if loose else previous)
+            if external:
+                return _record(conn, task_id, dict(external, refs=external["refs"] + refs), previous)
+            if loose:
+                raise SurvivorUnavailable(
+                    "survivor_unavailable: workspace holds files outside any repository that "
+                    f"no inferred survivor vouches for; {_ext.HINT}"
+                )
+            raise SurvivorUnavailable(
+                "survivor_unavailable: empty patch despite claimed code changes and no "
+                f"verifiable external survivor; {_ext.HINT}"
+            )
         else:
             survivor = None
         return _record(conn, task_id, survivor, previous)
