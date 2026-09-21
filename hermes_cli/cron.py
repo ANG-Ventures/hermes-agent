@@ -567,10 +567,10 @@ def _print_active_jobs_summary(jobs) -> None:
             print(f"  Next run: {min(next_runs)}")
     else:
         print("  No active jobs")
-    _print_vanished_job_warning(jobs)
+    _print_vanished_job_warning()
 
 
-def _print_vanished_job_warning(jobs) -> None:
+def _print_vanished_job_warning() -> None:
     """Surface jobs that were created, never removed, and are gone anyway.
 
     The store cannot answer this by itself — a lost job leaves no trace in
@@ -581,8 +581,9 @@ def _print_vanished_job_warning(jobs) -> None:
     try:
         from cron.lifecycle_journal import STATUS_OK, check_vanished_jobs
 
-        report = check_vanished_jobs(jobs=jobs)
+        report = check_vanished_jobs()
         if report.status == STATUS_OK:
+            print(color(f"  {report.summary()}", Colors.DIM))
             return
         print()
         print(color(f"  ⚠️  {report.summary()}", Colors.RED))

@@ -29,10 +29,12 @@ audit record must not be able to break a cron write.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -44,9 +46,8 @@ logger = logging.getLogger(__name__)
 
 JOURNAL_FILENAME = "lifecycle.jsonl"
 
-# How far back the guard looks. Matches the card's 24h window: a job created
-# and removed longer ago than this is not evidence of anything current, and
-# keeping the scan bounded keeps the journal from having to be read whole.
+# Reconciliation covers only journalled creates inside this lookback. Older
+# and unjournalled jobs are NOT certified, even when status is ok.
 DEFAULT_WINDOW_HOURS = 24.0
 
 # Entries older than this are pruned on write so the file cannot grow without
@@ -64,15 +65,60 @@ def _journal_path() -> Path:
     return _current_cron_store().cron_dir / JOURNAL_FILENAME
 
 
+@contextlib.contextmanager
+def _journal_lock(path: Path):
+    """Serialize append and prune on a stable inode, never the replaced file.
+
+    Unlike the jobs lock's availability-first fallback, audit writes must
+    fail closed on timeout: an unlocked prune can erase another writer.
+    """
+    from cron.jobs import _ensure_cron_dir
+
+    _ensure_cron_dir(path.parent)
+    with open(path.parent / ".lifecycle.lock", "a+b") as lock:
+        if os.name == "nt":
+            import msvcrt
+
+            def acquire():
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+
+            def release():
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            def acquire():
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            def release():
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                acquire()
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("cron lifecycle journal lock unavailable")
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            release()
+
+
 def _append(record: Dict[str, Any]) -> None:
     """Append one record. Best effort — never raises into a cron write."""
     try:
         path = _journal_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        with _journal_lock(path):
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
     except Exception:
         logger.debug("cron lifecycle journal append failed", exc_info=True)
 
@@ -164,6 +210,16 @@ def prune() -> int:
     path = _journal_path()
     if not path.exists():
         return 0
+    try:
+        with _journal_lock(path):
+            return _prune_locked(path)
+    except Exception:
+        logger.debug("cron lifecycle journal prune failed", exc_info=True)
+        return 0
+
+
+def _prune_locked(path: Path) -> int:
+    """Read and replace while holding the same mutex as every appender."""
     cutoff = _hermes_now() - timedelta(days=_RETENTION_DAYS)
     kept: List[str] = []
     dropped = 0
@@ -231,6 +287,7 @@ class VanishedJobReport:
     removed_count: int = 0
     present_count: int = 0
     detail: Optional[str] = None
+    window_hours: float = DEFAULT_WINDOW_HOURS
 
     @property
     def should_alert(self) -> bool:
@@ -241,9 +298,11 @@ class VanishedJobReport:
             return f"cron vanished-job guard UNAVAILABLE: {self.detail}"
         if self.status == STATUS_OK:
             return (
-                f"cron vanished-job guard ok: {self.created_count} created / "
-                f"{self.removed_count} removed in window, "
-                f"{self.present_count} present, 0 unaccounted"
+                f"cron vanished-job guard: {self.created_count} journalled creates / "
+                f"{self.removed_count} removals in last {self.window_hours:g}h; "
+                f"{self.present_count} present in store; "
+                "no losses detected among those creates (older jobs not checked; "
+                "unjournalled jobs not covered)"
             )
         names = ", ".join(
             f"{v['job_id']}({v.get('name') or '?'})" for v in self.vanished
@@ -257,7 +316,6 @@ class VanishedJobReport:
 def check_vanished_jobs(
     *,
     window_hours: float = DEFAULT_WINDOW_HOURS,
-    jobs: Optional[List[Dict[str, Any]]] = None,
 ) -> VanishedJobReport:
     """Reconcile journalled creates against what jobs.json actually holds.
 
@@ -268,8 +326,9 @@ def check_vanished_jobs(
     removal of the *same* id (a re-armed one-shot reusing its id) would
     wrongly excuse a real loss.
 
-    Pass *jobs* to reconcile against an already-loaded snapshot; otherwise
-    the live store is read.
+    Always read the unfiltered store. Caller snapshots may exclude disabled
+    jobs and cannot establish absence. This is a window-limited check, not
+    a lifetime integrity certificate.
     """
     try:
         entries = read_entries(window_hours=window_hours)
@@ -277,14 +336,13 @@ def check_vanished_jobs(
         return VanishedJobReport(status=STATUS_UNAVAILABLE,
                                  detail=f"journal unreadable: {e}")
 
-    if jobs is None:
-        try:
-            from cron.jobs import load_jobs
+    try:
+        from cron.jobs import load_jobs
 
-            jobs = load_jobs()
-        except Exception as e:
-            return VanishedJobReport(status=STATUS_UNAVAILABLE,
-                                     detail=f"jobs.json unreadable: {e}")
+        jobs = load_jobs()
+    except Exception as e:
+        return VanishedJobReport(status=STATUS_UNAVAILABLE,
+                                 detail=f"jobs.json unreadable: {e}")
 
     present = {
         str(j["id"]) for j in jobs
@@ -335,6 +393,7 @@ def check_vanished_jobs(
         created_count=len(created),
         removed_count=sum(len(v) for v in removed.values()),
         present_count=len(present),
+        window_hours=window_hours,
     )
 
 
