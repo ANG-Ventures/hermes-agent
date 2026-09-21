@@ -50,8 +50,8 @@ GATE_BLOCK_KINDS: frozenset[str] = frozenset(
 # 60-second tick into a rate-limit incident.
 MAX_LOOKUPS_PER_TICK = 30
 
-# How long a NONTERMINAL (open) state is reused before re-querying. MERGED and
-# CLOSED are terminal and cached for the process lifetime instead.
+# How long a reversible (OPEN/CLOSED) state is reused before re-querying.
+# MERGED is irreversible and is cached for the process lifetime instead.
 CACHE_TTL_SECONDS = 300
 
 _QUERY_TIMEOUT_SECONDS = 5
@@ -78,7 +78,46 @@ _QUALIFIED_RE = re.compile(rf"\b({_OWNER_REPO})#(\d+)\b")
 # Bare ``#123`` / ``pull/123`` — needs a repo context to be resolvable.
 _BARE_RE = re.compile(r"(?:(?<![\w/#])#|\bpull/)(\d+)\b")
 
-_REPO_MENTION_RE = re.compile(rf"\b({_OWNER_REPO})\b")
+# A naked body mention must be a complete two-segment token. The slash guards
+# reject prefixes of deeper paths (``tests/hermes_cli/test_x.py``); the owner
+# rule and suffix filter below reject two-segment source paths.
+_REPO_MENTION_RE = re.compile(
+    rf"(?<![A-Za-z0-9._/-])({_OWNER_REPO})(?![A-Za-z0-9._/-])"
+)
+# A GitHub *owner* (user or org) is alphanumerics and single hyphens only —
+# never ``_`` and never ``.``. This is a POSITIVE property of a real slug, so
+# it closes the class that a file-extension denylist cannot: ``hermes_cli/
+# kanban*.py`` truncates to ``hermes_cli/kanban`` (no suffix left to deny) and
+# ``hermes_cli/kanban_db`` never had one. Both are rejected on the owner.
+_OWNER_RE = re.compile(r"\A[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\Z")
+_SOURCE_PATH_SUFFIXES = frozenset(
+    {
+        ".c",
+        ".cc",
+        ".cpp",
+        ".css",
+        ".go",
+        ".h",
+        ".hpp",
+        ".html",
+        ".java",
+        ".js",
+        ".json",
+        ".jsx",
+        ".md",
+        ".py",
+        ".rb",
+        ".rs",
+        ".scss",
+        ".sh",
+        ".sql",
+        ".toml",
+        ".ts",
+        ".tsx",
+        ".yaml",
+        ".yml",
+    }
+)
 _GIT_REMOTE_RE = re.compile(
     rf"(?:git@github\.com:|https?://(?:[^@/\s]+@)?github\.com/)({_OWNER_REPO}?)"
     r"(?:\.git)?/?\s*$",
@@ -225,6 +264,62 @@ def _remotes_for(workspace_path: str) -> set[str]:
     return slugs
 
 
+def _body_repo_mentions(body: str) -> Iterable[str]:
+    """Yield plausible naked ``owner/repo`` mentions, excluding source paths.
+
+    Two filters, in increasing strength:
+
+    * the OWNER must look like a GitHub account (``_OWNER_RE``) — this is a
+      positive property, and is what rejects ``hermes_cli/kanban*.py`` and
+      ``hermes_cli/kanban_db``, neither of which a suffix denylist can catch;
+    * the repo segment must not carry a source-file extension.
+    """
+    seen: set[str] = set()
+    for match in _REPO_MENTION_RE.finditer(body):
+        slug = match.group(1).rstrip(".")
+        owner, _, repo_name = slug.partition("/")
+        if not _OWNER_RE.match(owner):
+            continue
+        if Path(repo_name).suffix.lower() in _SOURCE_PATH_SUFFIXES:
+            continue
+        if slug in seen:
+            continue
+        seen.add(slug)
+        yield slug
+
+
+def _corroborated_repos(body: str) -> list[str]:
+    """Repos named by a PR URL or a qualified ``owner/repo#N`` in the body.
+
+    A slug that is attached to an actual PR reference is evidence, not a
+    guess, so it outranks any number of bare mentions.
+    """
+    out: list[str] = []
+    for pattern in (_URL_RE, _QUALIFIED_RE):
+        for match in pattern.finditer(body):
+            slug = match.group(1)
+            if slug not in out:
+                out.append(slug)
+    return out
+
+
+def _body_repo_choice(body: str) -> Optional[str]:
+    """The single repo a bare ``#N`` in ``body`` may be resolved against.
+
+    ``src/utils`` is a *legal* repo slug, so a body naming both it and a real
+    repo has two candidates and no way to rank them. Rather than take the
+    first (a coin flip that queries the wrong repo), return None and let the
+    re-evaluator take no action — the same fail-safe as disagreeing remotes.
+    """
+    corroborated = _corroborated_repos(body)
+    if len(corroborated) == 1:
+        return corroborated[0]
+    if corroborated:
+        return None
+    candidates = list(_body_repo_mentions(body))
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def repo_context(
     *, workspace_path: Optional[str], body: Optional[str]
 ) -> Optional[str]:
@@ -247,17 +342,15 @@ def repo_context(
             if len(slugs) > 1 and isinstance(body, str):
                 # Ambiguous remotes: let an explicit body mention pick one.
                 lowered = {s.lower(): s for s in slugs}
-                for match in _REPO_MENTION_RE.finditer(body):
-                    hit = lowered.get(match.group(1).lower())
+                for mention in _body_repo_mentions(body):
+                    hit = lowered.get(mention.lower())
                     if hit:
                         return hit
                 return None
             if len(slugs) > 1:
                 return None
     if isinstance(body, str):
-        match = _REPO_MENTION_RE.search(body)
-        if match:
-            return match.group(1)
+        return _body_repo_choice(body)
     return None
 
 

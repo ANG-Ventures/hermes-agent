@@ -136,6 +136,78 @@ def test_repo_context_falls_back_to_body_mention(tmp_path: Path) -> None:
     ) == "ANG-Ventures/hermes-agent"
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        # Reviewer round-3 case 1: two-segment source path before the repo.
+        (
+            "BUILD: edit hermes_cli/kanban.py. "
+            "Fork-first ANG-Ventures/hermes-agent. Merge PR #808."
+        ),
+        # Reviewer round-3 case 2: nested test path before the repo.
+        (
+            "Tests in tests/hermes_cli/test_x.py; "
+            "repo ANG-Ventures/hermes-agent; merge #808."
+        ),
+        # THIS card's own body: a GLOB path, whose extension a suffix
+        # denylist never sees because ``*`` truncates the match.
+        (
+            "BUILD: in the kanban dispatcher tick (hermes-agent, "
+            "hermes_cli/kanban*.py - find the tick that runs "
+            "recompute_ready). Fork-first ANG-Ventures/hermes-agent."
+        ),
+        # Underscored module dir with no extension at all.
+        (
+            "patch hermes_cli/kanban_db then land on "
+            "ANG-Ventures/hermes-agent; merge #808."
+        ),
+    ],
+)
+def test_repo_context_ignores_source_paths_before_body_repo(
+    tmp_path: Path, body: str
+) -> None:
+    """A GitHub *owner* never contains ``_`` or ``.``; a module path does.
+
+    The discriminator must be a positive property of the slug, not a
+    denylist of file extensions: ``hermes_cli/kanban*.py`` truncates to
+    ``hermes_cli/kanban`` (no suffix to deny) and ``hermes_cli/kanban_db``
+    never had one.
+    """
+    assert prg.repo_context(
+        workspace_path=str(tmp_path / "missing"), body=body
+    ) == "ANG-Ventures/hermes-agent"
+
+
+def test_repo_context_is_none_when_body_has_two_plausible_slugs(
+    tmp_path: Path,
+) -> None:
+    """``src/utils`` is a *legal* repo slug, so it cannot be ruled out.
+
+    Two uncorroborated candidates is the same fail-safe as two disagreeing
+    remotes: take no action rather than query a coin-flip repo.
+    """
+    assert prg.repo_context(
+        workspace_path=str(tmp_path / "missing"),
+        body="see src/utils then repo ANG-Ventures/hermes-agent merge #5",
+    ) is None
+
+
+def test_repo_context_prefers_the_corroborated_slug(tmp_path: Path) -> None:
+    """A slug also seen in a PR URL / qualified ref wins over a bare one."""
+    assert prg.repo_context(
+        workspace_path=str(tmp_path / "missing"),
+        body=(
+            "see src/utils then merge "
+            "https://github.com/ANG-Ventures/hermes-agent/pull/808 "
+            "and also #809"
+        ),
+    ) == "ANG-Ventures/hermes-agent"
+    assert prg.repo_context(
+        workspace_path=str(tmp_path / "missing"),
+        body="see src/utils then merge ANG-Ventures/hermes-agent#808 and #809",
+    ) == "ANG-Ventures/hermes-agent"
+
+
 def test_repo_context_is_none_when_remotes_disagree_and_body_is_silent(
     tmp_path: Path,
 ) -> None:
