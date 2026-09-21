@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.redact import redact_sensitive_text
-from agent.usage_pricing import get_pricing_entry, resolve_billing_route
+from agent.usage_pricing import CanonicalUsage, get_pricing_entry, resolve_billing_route
 from hermes_constants import get_hermes_home
 from plugins.blackbox.record import TurnRecord, tools_summary
 
@@ -412,6 +412,36 @@ def insert_turn(record: TurnRecord) -> None:
         logger.warning("blackbox telemetry insert failed", exc_info=True)
 
 
+def insert_api_call(
+    turn_id: str, seq: int, *, ts: float, provider: str, model: str,
+    usage: CanonicalUsage, sub_key: str | None, attribution: str,
+    http_status: int | None = None, relay_synthetic: bool = False,
+    route_id: str | None = None,
+) -> None:
+    """Append one call, including zero-usage failures, without changing turn totals.
+
+    The accumulator owns sequence allocation. Duplicate keys and invalid
+    provenance raise rather than silently replacing or dropping ledger rows.
+    Calls may arrive before their parent turn is finalized.
+    """
+    if attribution not in ("wire", "pinned", "inferred", "external"):
+        raise ValueError(f"Invalid API-call attribution: {attribution!r}")
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO turn_api_calls (
+                turn_id, seq, ts, provider, sub_key, model, input_tokens,
+                output_tokens, cache_read, cache_write, reasoning, attribution,
+                http_status, relay_synthetic, route_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (turn_id, seq, ts, provider, sub_key, model, usage.input_tokens,
+             usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens,
+             usage.reasoning_tokens, attribution, http_status,
+             _bool_int(relay_synthetic), route_id),
+        )
+
+
 def mark_alerted(turn_id: str) -> bool:
     with _connect() as conn:
         cur = conn.execute(
@@ -781,6 +811,10 @@ def sweep(retention_days: int, max_deletes: int = 10000) -> int:
             placeholders = ",".join("?" for _ in turn_ids)
             conn.execute(
                 f"DELETE FROM turn_tool_calls WHERE turn_id IN ({placeholders})",
+                turn_ids,
+            )
+            conn.execute(
+                f"DELETE FROM turn_api_calls WHERE turn_id IN ({placeholders})",
                 turn_ids,
             )
             conn.execute(
