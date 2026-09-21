@@ -630,3 +630,327 @@ def test_audit_never_writes_inside_the_directory_it_is_recording(kanban_home):
         assert not resolved.is_relative_to(target.resolve()), (
             "%s would be destroyed by a deletion of %s" % (chosen, target)
         )
+
+
+# ---------------------------------------------------------------------------
+# 5. Liveness is a property of the PATH, not of the caller's argument
+#
+# Review round 5: `_task_has_live_run(conn, task_id)` only ever answered "is
+# the card the CALLER named live?". Both executing lanes take the path as a
+# separate argument, so any row whose `workspace_path` points at another
+# card's live workspace deleted it -- logging a clean ATTEMPT/DELETE pair
+# against the wrong card. That is the incident's own shape: a deleter
+# destroying directories it does not own, with no usable trail.
+# ---------------------------------------------------------------------------
+
+
+def test_scratch_lane_refuses_a_live_card_dir_named_by_a_non_owner(kanban_home):
+    """A caller that names an idle card cannot delete a live card's dir."""
+    root = _scratch_root()
+    live_id = _mktask("RUNNING card B")
+    idle_id = _mktask("idle card A")
+    victim = root / live_id
+    victim.mkdir()
+    (victim / "work.txt").write_text("B's unretained work\n", encoding="utf-8")
+
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_expires=?, "
+            "workspace_path=? WHERE id=?",
+            (int(time.time()) + 3600, str(victim), live_id),
+        )
+        # A is archived and its row points at B's directory -- the gc shape.
+        conn.execute(
+            "UPDATE tasks SET status='archived', workspace_path=? WHERE id=?",
+            (str(victim), idle_id),
+        )
+        conn.commit()
+
+    assert kb.safe_remove_workspace_dir(
+        victim, task_id=idle_id, reason="unit_crossowner",
+    ) is False
+    assert victim.is_dir()
+    assert (victim / "work.txt").exists()
+
+    refused = [
+        ln for ln in _audit_lines()
+        if "\tREFUSED\t" in ln and str(victim) in ln
+    ]
+    assert refused, "a cross-owner refusal left no audit trail"
+    assert "owner-has-live-run" in refused[-1], refused[-1]
+    # The log must name the OWNING card, not only the caller.
+    assert "owner=%s" % live_id in refused[-1], refused[-1]
+
+
+def test_scratch_lane_refuses_by_directory_name_when_no_path_row_exists(
+    kanban_home,
+):
+    """Ownership also follows the ``<root>/t_<hex>`` naming convention.
+
+    Rows created before ``workspace_path`` was stored have no path to match
+    on; the directory name is the only ownership evidence and must still be
+    honoured.
+    """
+    root = _scratch_root()
+    live_id = _mktask("RUNNING card, no stored path")
+    idle_id = _mktask("idle caller")
+    victim = root / live_id
+    victim.mkdir()
+
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status='running', workspace_path=NULL WHERE id=?",
+            (live_id,),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='archived' WHERE id=?", (idle_id,)
+        )
+        conn.commit()
+
+    assert kb.safe_remove_workspace_dir(
+        victim, task_id=idle_id, reason="unit_crossowner_byname",
+    ) is False
+    assert victim.is_dir()
+
+
+def test_idle_card_dir_named_by_another_card_is_still_removable(kanban_home):
+    """Control: owner-derived liveness must not freeze ordinary cleanup."""
+    root = _scratch_root()
+    owner_id = _mktask("finished owner")
+    caller_id = _mktask("archived caller")
+    ws = root / owner_id
+    ws.mkdir()
+
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status='done', workspace_path=? WHERE id=?",
+            (str(ws), owner_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='archived' WHERE id=?",
+            (caller_id,),
+        )
+        conn.commit()
+
+    assert kb.safe_remove_workspace_dir(
+        ws, task_id=caller_id, reason="unit_idle_owner",
+    ) is True
+    assert not ws.exists()
+    # ...and the successful line still names who actually owned the dir.
+    deleted = [ln for ln in _audit_lines() if "\tDELETE\t" in ln and str(ws) in ln]
+    assert deleted, _audit_lines()
+    assert "owner=%s" % owner_id in deleted[-1], deleted[-1]
+
+
+def test_worktree_lane_refuses_a_live_card_checkout_named_by_a_non_owner(
+    kanban_home, linked_worktree, monkeypatch,
+):
+    """The guard must return BEFORE the executor -- not lean on git's refusal.
+
+    Round 5 measured this lane surviving only because ``git worktree
+    remove`` said no underneath. That backstop disappears for a detached
+    directory, so the assertion here is that the survivor executor is never
+    reached at all.
+    """
+    _repo, wt = linked_worktree
+    live_id = _mktask("RUNNING worktree card")
+    idle_id = _mktask("idle caller")
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_expires=?, "
+            "workspace_path=?, workspace_kind='worktree' WHERE id=?",
+            (int(time.time()) + 3600, str(wt), live_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='archived' WHERE id=?", (idle_id,)
+        )
+        conn.commit()
+
+    called = []
+    from hermes_cli import kanban_survivor
+
+    def _tripwire(*args, **kwargs):
+        called.append(args)
+        raise AssertionError("executor reached for a live card's checkout")
+
+    monkeypatch.setattr(kanban_survivor, "remove_workspace_dir", _tripwire)
+
+    kb._cleanup_worktree_workspace(
+        idle_id, str(wt), None, reason="unit_crossowner_wt",
+    )
+
+    assert not called, "the guard did not refuse before the executor"
+    assert Path(wt).is_dir()
+    refused = [
+        ln for ln in _audit_lines()
+        if "\tREFUSED\t" in ln and "owner-has-live-run" in ln
+    ]
+    assert refused, _audit_lines()
+    assert "owner=%s" % live_id in refused[-1], refused[-1]
+
+
+def test_live_owner_lookup_fails_closed_on_an_unreadable_db(
+    kanban_home, monkeypatch,
+):
+    """Consistent with ``_task_has_live_run``: unknown owner => refuse."""
+    root = _scratch_root()
+    ws = root / _mktask("some card")
+    ws.mkdir()
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(kb, "connect_closing", _boom)
+    owners = kb._live_owners_of_path(ws)
+    assert owners and owners != [], "an unreadable DB must not read as idle"
+
+
+@pytest.mark.parametrize("ownership", ["unknown", "ambiguous", "nested", "ancestor"])
+def test_owner_resolution_refuses_unsafe_path_shapes(kanban_home, ownership):
+    root = _scratch_root()
+    caller = _mktask("idle caller")
+    owner = _mktask("workspace owner")
+    workspace = root / owner if ownership == "nested" else root / "custom"
+    victim = workspace / "repo" if ownership == "nested" else workspace
+    victim.mkdir(parents=True)
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET status='done' WHERE id IN (?, ?)", (caller, owner))
+        if ownership == "ambiguous":
+            conn.execute("UPDATE tasks SET workspace_path=? WHERE id IN (?, ?)",
+                         (str(workspace), caller, owner))
+        elif ownership == "nested":
+            conn.execute("UPDATE tasks SET status='running', workspace_path=NULL WHERE id=?", (owner,))
+        elif ownership == "ancestor":
+            nested = workspace / "live-checkout"
+            nested.mkdir()
+            conn.execute("UPDATE tasks SET status='running', workspace_path=? WHERE id=?",
+                         (str(nested), owner))
+        conn.commit()
+        assert not kb.safe_remove_workspace_dir(victim, task_id=caller, reason="shape", conn=conn)
+    assert victim.is_dir()
+    assert any("\tREFUSED\t" in line for line in _audit_lines())
+
+
+# ---------------------------------------------------------------------------
+# 6. CLASS LOCK -- every user-facing deletion lane, driven for real
+#
+# Rounds 1-5 each found the SAME defect in a lane that had not been checked
+# yet: gc (root-equality), the worktree lane (no liveness, no audit), the
+# board lane (audit died with its target), and finally cross-owner liveness
+# in both executing lanes. The pattern is that a per-site fix leaves the
+# next lane free to carry the bug, so the lock below enumerates the lanes
+# and drives each one for real against the same adversarial shape: a caller
+# that legitimately owns an idle card, pointed at a LIVE card's directory.
+#
+# This is deliberately NOT a source-reading/AST test (AGENTS.md bans those):
+# each lane is executed end-to-end and judged on the directory and the audit
+# log, so a lane that is rewired but still correct stays green, and a lane
+# that is refactored into a new code path is still covered.
+# ---------------------------------------------------------------------------
+
+
+def _crossowner_fixture():
+    """A LIVE card owning a real dir, plus an idle caller pointed at it."""
+    root = _scratch_root()
+    live_id = _mktask("RUNNING owner")
+    caller_id = _mktask("idle caller")
+    victim = root / live_id
+    victim.mkdir(parents=True, exist_ok=True)
+    (victim / "work.txt").write_text("unretained work\n", encoding="utf-8")
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_expires=?, "
+            "workspace_kind='scratch', workspace_path=? WHERE id=?",
+            (int(time.time()) + 3600, str(victim), live_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='archived', workspace_kind='scratch', "
+            "workspace_path=? WHERE id=?",
+            (str(victim), caller_id),
+        )
+        conn.commit()
+    return live_id, caller_id, victim
+
+
+def _lane_gc(live_id, caller_id, victim):
+    kanban_cli._cmd_gc(argparse.Namespace())
+
+
+def _lane_choke_point(live_id, caller_id, victim):
+    kb.safe_remove_workspace_dir(
+        victim, task_id=caller_id, reason="class_lock",
+    )
+
+
+def _lane_complete_task(live_id, caller_id, victim):
+    with kb.connect_closing() as conn:
+        kb._cleanup_workspace(conn, caller_id)
+
+
+def _lane_deferred_parent(live_id, caller_id, victim):
+    """The parent-cleanup lane: a done child releases the parent's dir."""
+    child_id = _mktask("done child")
+    with kb.connect_closing() as conn:
+        kb.link_tasks(conn, caller_id, child_id)
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (child_id,))
+        conn.commit()
+        kb._try_cleanup_parent_workspaces(conn, child_id)
+
+
+DELETION_LANES = {
+    "gc": _lane_gc,
+    "choke_point": _lane_choke_point,
+    "complete_task": _lane_complete_task,
+    "deferred_parent_cleanup": _lane_deferred_parent,
+}
+
+
+@pytest.mark.parametrize("lane", sorted(DELETION_LANES))
+def test_no_deletion_lane_removes_a_live_cards_workspace(kanban_home, lane):
+    """No lane may delete a directory whose OWNER is live.
+
+    Each round of review found this in one more lane. Adding a lane to the
+    product without adding it here is the regression this test exists to
+    make loud: the parametrisation is the contract.
+    """
+    live_id, caller_id, victim = _crossowner_fixture()
+
+    DELETION_LANES[lane](live_id, caller_id, victim)
+
+    assert victim.is_dir(), f"lane {lane!r} deleted a live card's workspace"
+    assert (victim / "work.txt").exists(), (
+        f"lane {lane!r} destroyed a live card's unretained work"
+    )
+    deleted = [
+        ln for ln in _audit_lines()
+        if "\tDELETE\t" in ln and str(victim) in ln
+    ]
+    assert not deleted, f"lane {lane!r} logged a DELETE it must not perform"
+
+
+@pytest.mark.parametrize("lane", ["gc", "choke_point", "complete_task"])
+def test_every_deletion_lane_still_removes_an_idle_cards_workspace(
+    kanban_home, lane,
+):
+    """Control: the class lock above must not be satisfied by a no-op.
+
+    A guard that refuses everything passes the cross-owner test and breaks
+    the product. Each lane must still delete a directory whose owner is
+    genuinely idle.
+    """
+    root = _scratch_root()
+    owner_id = _mktask("idle owner")
+    ws = root / owner_id
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "junk.txt").write_text("junk\n", encoding="utf-8")
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status='archived', workspace_kind='scratch', "
+            "workspace_path=? WHERE id=?",
+            (str(ws), owner_id),
+        )
+        conn.commit()
+
+    DELETION_LANES[lane](owner_id, owner_id, ws)
+
+    assert not ws.exists(), f"lane {lane!r} became a no-op"

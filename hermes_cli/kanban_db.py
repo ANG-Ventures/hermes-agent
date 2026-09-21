@@ -7081,6 +7081,106 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
     return False, None
 
 
+#: A scratch workspace directory is named for the card that owns it
+#: (:func:`_gen_task_id` -> ``t_`` + 8 hex chars). Used to recover the owner
+#: of a directory whose row never stored an explicit ``workspace_path``.
+_TASK_DIR_NAME_RE = re.compile(r"^t_[0-9a-f]{4,}$")
+
+
+def _live_owners_of_path(
+    path: Path,
+    *,
+    conn: Optional[sqlite3.Connection] = None,
+    live_only: bool = True,
+) -> list:
+    """Return the ids of cards that OWN *path* (live ones, by default).
+
+    Liveness is a property of the DIRECTORY BEING DELETED, not of the
+    ``task_id`` the caller happened to pass. :func:`_task_has_live_run`
+    answers only "is the card the caller named live?", so a row whose
+    ``workspace_path`` points at *another* card's live workspace deletes it
+    while the audit names the wrong card (card t_63fb42f9, review round 5:
+    ``hermes kanban gc`` removed a ``running`` card's dir and its unretained
+    work, logging a clean ATTEMPT/DELETE pair against the archived caller).
+
+    Ownership is resolved two ways, because both exist in the schema:
+
+    * an explicit ``workspace_path`` row pointing at this directory, and
+    * the ``<workspaces_root>/t_<hex>`` naming convention, for rows that
+      never stored a path.
+
+    All ownership rows are inspected before checking liveness. Unknown or
+    ambiguous ownership and unreadable/unresolvable state fail closed. Path
+    overlap counts as ownership: deleting an ancestor or a nested checkout
+    can destroy a live card's work just as deleting its exact root can.
+
+    ``live_only=False`` returns every owner regardless of run state; the
+    executing lanes use it to name the OWNING card in the audit line, so a
+    post-incident log points at the directory's owner rather than at whoever
+    asked for the deletion.
+    """
+    try:
+        resolved = Path(path).expanduser().resolve(strict=False)
+    except OSError:
+        return ["<unresolvable-path>"] if live_only else []
+    try:
+        is_managed, board = _managed_scratch_path_info(resolved)
+    except Exception:
+        return ["<unresolvable-owner>"] if live_only else []
+
+    candidates: set = set()
+    if is_managed:
+        # A nested checkout belongs to the enclosing card too; testing only
+        # resolved.name would miss <root>/<live-card>/repo.
+        for parent in (resolved, *resolved.parents):
+            if _TASK_DIR_NAME_RE.fullmatch(parent.name) and _is_managed_scratch_path(parent):
+                candidates.add(parent.name)
+
+    found: set = set()
+    all_owners: set = set()
+    with contextlib.ExitStack() as stack:
+        conns = []
+        if conn is not None:
+            conns.append(conn)
+        try:
+            if is_managed and board:
+                # The directory's own board, which may not be the caller's.
+                conns.append(stack.enter_context(connect_closing(board=board)))
+            elif conn is None:
+                conns.append(stack.enter_context(connect_closing()))
+        except Exception:
+            return ["<unreadable-board-db>"] if live_only else []
+        sql = "SELECT id, workspace_path FROM tasks"
+        for c in conns:
+            try:
+                rows = c.execute(sql).fetchall()
+            except Exception:
+                return ["<unreadable-task-table>"] if live_only else []
+            ids = candidates.intersection(row["id"] for row in rows)
+            for row in rows:
+                if not row["workspace_path"]:
+                    continue
+                try:
+                    stored = Path(
+                        str(row["workspace_path"])
+                    ).expanduser().resolve(strict=False)
+                except Exception:
+                    return ["<unresolvable-owner-path>"] if live_only else []
+                if (stored == resolved or stored.is_relative_to(resolved)
+                        or resolved.is_relative_to(stored)):
+                    ids.add(row["id"])
+            all_owners.update(ids)
+            for tid in ids:
+                if not live_only or _task_has_live_run(c, tid):
+                    found.add(tid)
+    if live_only and not found:
+        if not all_owners:
+            return ["<unknown-owner>"]
+        if len(all_owners) != 1:
+            return ["<ambiguous-owner>", *sorted(all_owners)]
+    return sorted(found)
+
+
 def workspace_deletion_log_path(board: Optional[str] = None) -> Path:
     """Return the append-only audit log for workspace deletions.
 
@@ -7320,6 +7420,23 @@ def safe_remove_workspace_dir(
         )
         return False
 
+    # Liveness of the *caller* is not enough: the path is supplied separately
+    # from the task_id, so a row pointing at another card's live workspace
+    # sails through the check above. Ask who owns THIS directory and whether
+    # THAT card is live (review round 5).
+    owners = _live_owners_of_path(resolved, conn=conn)
+    if owners:
+        _audit_workspace_deletion(
+            resolved, task_id=task_id, reason=reason, allowed=False,
+            detail="owner-has-live-run owner=%s" % ",".join(owners),
+        )
+        _log.warning(
+            "Refusing to remove workspace %s (caller task %s, reason %s): it "
+            "is owned by live card(s) %s",
+            resolved, task_id, reason, ",".join(owners),
+        )
+        return False
+
     if not resolved.is_dir():
         _audit_workspace_deletion(
             resolved, task_id=task_id, reason=reason, allowed=False,
@@ -7327,8 +7444,17 @@ def safe_remove_workspace_dir(
         )
         return False
 
+    # The audit must name the card that OWNS this directory, not just the
+    # caller -- round 5 measured a DELETE line attributing another card's
+    # workspace to the archived row that asked for it.
+    owner_detail = ""
+    owners_any = _live_owners_of_path(resolved, conn=conn, live_only=False)
+    if owners_any and owners_any != [task_id]:
+        owner_detail = "owner=%s" % ",".join(owners_any)
+
     _audit_workspace_deletion(
         resolved, task_id=task_id, reason=reason, outcome=AUDIT_ATTEMPT,
+        detail=owner_detail,
     )
     # The removal itself goes through kanban_survivor.remove_workspace_dir
     # (#783), which captures recoverable implementation work before deleting
@@ -7363,11 +7489,12 @@ def safe_remove_workspace_dir(
     if not removed:
         _audit_workspace_deletion(
             resolved, task_id=task_id, reason=reason, outcome=AUDIT_FAILED,
-            detail="survivor-held-workspace",
+            detail=("survivor-held-workspace " + owner_detail).strip(),
         )
         return False
     _audit_workspace_deletion(
         resolved, task_id=task_id, reason=reason, outcome=AUDIT_DELETE,
+        detail=owner_detail,
     )
     _log.debug(
         "Removed scratch workspace %s (task %s, reason %s)",
@@ -7529,6 +7656,22 @@ def _cleanup_worktree_workspace(
                 wp, task_id, reason,
             )
             return
+        # ...and liveness of whoever OWNS this checkout, which need not be
+        # the caller. Before this, the worktree lane survived a cross-owner
+        # removal only because ``git worktree remove`` refused underneath;
+        # the guard did not hold, git did (review round 5).
+        owners = _live_owners_of_path(wp, conn=conn)
+        if owners:
+            _audit_workspace_deletion(
+                wp, task_id=task_id, reason=reason, allowed=False,
+                detail="owner-has-live-run owner=%s" % ",".join(owners),
+            )
+            _log.warning(
+                "Refusing to remove worktree %s (caller task %s, reason %s): "
+                "it is owned by live card(s) %s",
+                wp, task_id, reason, ",".join(owners),
+            )
+            return
         common = _git_common_dir(wp)
         if common is None or common.name != ".git":
             _audit_workspace_deletion(
@@ -7558,9 +7701,14 @@ def _cleanup_worktree_workspace(
         # became dirty between our check and the removal (TOCTOU), removal
         # fails safe and the worktree is preserved.
         from hermes_cli.kanban_survivor import remove_workspace_dir
+        # Name the OWNING card, not just the caller (review round 5).
+        wt_owners = _live_owners_of_path(wp, conn=conn, live_only=False)
+        wt_detail = "git-worktree-remove"
+        if wt_owners and wt_owners != [task_id]:
+            wt_detail += " owner=%s" % ",".join(wt_owners)
         _audit_workspace_deletion(
             wp, task_id=task_id, reason=reason, outcome=AUDIT_ATTEMPT,
-            detail="git-worktree-remove",
+            detail=wt_detail,
         )
         if not remove_workspace_dir(conn, task_id, wp, worktree_root=repo_root):
             _audit_workspace_deletion(
@@ -7573,7 +7721,7 @@ def _cleanup_worktree_workspace(
             return
         _audit_workspace_deletion(
             wp, task_id=task_id, reason=reason, outcome=AUDIT_DELETE,
-            detail="git-worktree-remove",
+            detail=wt_detail,
         )
         _log.debug("Removed worktree workspace: %s", wp)
         branch = (branch_name or "").strip() or f"wt/{task_id}"
