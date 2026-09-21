@@ -810,6 +810,15 @@ def subagent_rollup(platform: str, chat_id: str, limit: int = 200) -> dict[str, 
     }
 
 
+# Minimum age a PARENTLESS turn_api_calls row must reach before the sweeper may
+# delete it, independent of the retention window. Call rows are written as the
+# API calls happen; the parent turns row only appears at finalize, so a row with
+# no parent is indistinguishable from an in-flight turn. 24h is far longer than
+# any turn can plausibly run, so the ledger of a live turn is never harvested
+# even when retention is configured aggressively short.
+_ORPHAN_GRACE_S = 86400
+
+
 def sweep(retention_days: int, max_deletes: int = 10000) -> int:
     today = time.strftime("%Y-%m-%d", time.gmtime())
     cutoff = time.time() - (int(retention_days) * 86400)
@@ -858,6 +867,14 @@ def sweep(retention_days: int, max_deletes: int = 10000) -> int:
         # an orphan that the parent-keyed cascade above can never reach, so it
         # would outlive retention forever. Sweep those on their own ts, in the
         # same transaction, bounded by the same max_deletes budget.
+        #
+        # The retention cutoff alone is NOT a safe predicate here: "no parent
+        # row yet" is the normal state of an in-flight turn, so a turn still
+        # running past retention — or any short retention setting — would have
+        # its call ledger deleted out from under it before finalize. Require the
+        # row to be past BOTH retention and an independent grace period, so a
+        # live turn is never harvested.
+        orphan_cutoff = time.time() - max(_ORPHAN_GRACE_S, int(retention_days) * 86400)
         conn.execute(
             """
             DELETE FROM turn_api_calls
@@ -869,7 +886,7 @@ def sweep(retention_days: int, max_deletes: int = 10000) -> int:
                 LIMIT ?
             )
             """,
-            (cutoff, max_deletes),
+            (orphan_cutoff, max_deletes),
         )
         deleted = len(turn_ids)
         # Atomic: deletes + sentinel commit together so a crash can't leave the

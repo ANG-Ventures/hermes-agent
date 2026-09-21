@@ -111,6 +111,25 @@ def test_sweep_deletes_old_orphans_but_keeps_young_ones(db, monkeypatch):
         ).fetchall() == [("orphan-young",), ("parented-young",)]
 
 
+def test_orphan_sweep_respects_grace_period_independent_of_retention(db, monkeypatch):
+    """A parentless row is the normal state of an IN-FLIGHT turn.
+
+    Retention alone is not a safe predicate: with a short retention window a
+    turn still running would have its call ledger deleted before finalize.
+    Deletion requires the row to be past retention AND past the grace period.
+    """
+    now = 10_000_000.0
+    monkeypatch.setattr(store.time, "time", lambda: now)
+    # retention_days=0 -> retention cutoff is "now"; both rows are past it.
+    append("in-flight", 0, ts=now - 2)
+    append("long-dead", 0, ts=now - store._ORPHAN_GRACE_S - 1)
+    store.sweep(retention_days=0)
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT turn_id FROM turn_api_calls"
+        ).fetchall() == [("in-flight",)]
+
+
 def test_reinsert_turn_preserves_rollup_columns(db):
     """insert_turn must refresh its own columns without erasing the C2 rollup."""
     store.insert_turn(TurnRecord(turn_id="t", model="first"))
