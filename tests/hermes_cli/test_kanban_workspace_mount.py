@@ -79,6 +79,32 @@ def test_recorded_mount_anchor_cannot_fall_back_to_mounted_parent(home, monkeypa
         policy.validate_mount(root, expected_mount=root)
 
 
+def test_create_scratch_keeps_admitted_mount_anchor(home, monkeypatch):
+    from hermes_cli import kanban_workspace_policy as policy
+
+    root = home / 'mounted-root'
+    root.mkdir()
+    configure(home, root)
+    mount_present = True
+    monkeypatch.setattr(
+        policy.os.path,
+        'ismount',
+        lambda p: Path(p) == (root if mount_present else root.parent),
+    )
+    real_validate_target = policy.validate_target
+
+    def vanish_after_admission(admitted_root, target):
+        nonlocal mount_present
+        real_validate_target(admitted_root, target)
+        mount_present = False
+
+    monkeypatch.setattr(policy, 'validate_target', vanish_after_admission)
+    target = root / 'default' / 't_probe'
+    with pytest.raises(ValueError, match='workspaces_root_unmounted'):
+        kb.resolve_workspace(scratch(), board='default')
+    assert not target.exists()
+
+
 def test_persisted_path_missing_after_config_rollback_is_not_recreated(home, monkeypatch):
     root = home / 'volume' / 'kanban-workspaces'
     root.mkdir(parents=True)
@@ -225,7 +251,7 @@ def test_post_claim_mount_race_requeues_without_failure_charge(home, monkeypatch
 
     from hermes_cli import kanban_workspace_policy as policy
 
-    def vanish_during_create(_root, _path):
+    def vanish_during_create(_root, _path, **_kwargs):
         raise policy.WorkspaceUnavailable(f'workspaces_root_unmounted: {root}')
 
     monkeypatch.setattr(policy, 'create_scratch', vanish_during_create)
@@ -263,7 +289,7 @@ def test_review_post_claim_mount_race_returns_to_review(home, monkeypatch):
             expected_run_id=claimed.current_run_id,
         )
 
-        def vanish_during_create(_root, _path):
+        def vanish_during_create(_root, _path, **_kwargs):
             raise policy.WorkspaceUnavailable(f'workspaces_root_unmounted: {root}')
 
         monkeypatch.setattr(policy, 'create_scratch', vanish_during_create)

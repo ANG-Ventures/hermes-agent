@@ -16,6 +16,8 @@ import math
 import os
 import re
 import sqlite3
+import subprocess
+import sys
 import time
 from contextvars import Context
 from pathlib import Path
@@ -340,6 +342,80 @@ def _format_workspace_refused_summary(refused) -> str:
         for reason, task_ids in sorted(grouped.items())
     )
     return f"workspace_refused={len(entries)} ({details})"
+
+
+class _WorkspaceRefusalOutageNotifier:
+    """Latch one successfully delivered page per board outage."""
+
+    def __init__(self) -> None:
+        self._delivered: set[str] = set()
+
+    def observe(self, board: str, refused, send: Callable[[str, str], bool]) -> bool:
+        entries = list(refused or [])
+        if not entries:
+            self._delivered.discard(board)
+            return False
+        if board in self._delivered:
+            return False
+        summary = _format_workspace_refused_summary(entries)
+        if not send(board, summary):
+            return False
+        self._delivered.add(board)
+        return True
+
+
+def _send_workspace_refusal_alert(board: str, summary: str) -> bool:
+    """Best-effort #alerts page through the fleet notify boundary."""
+    candidates = (
+        Path.home() / ".hermes" / "scripts" / "notify.py",
+        Path.home() / ".hermes" / "skills-shared" / "general" / "scheduler" / "scripts" / "notify.py",
+        Path.home() / ".hermes" / "skills" / "devops" / "scheduler" / "scripts" / "notify.py",
+    )
+    script = next((path for path in candidates if path.is_file()), None)
+    if script is None:
+        logger.error("kanban dispatcher: notify.py unavailable; workspace outage page not delivered")
+        return False
+    message = (
+        "🛑 **Kanban dispatcher** · Workspace admission refused\n"
+        f"Board: `{board}`\n{summary}\n"
+        "The dispatcher refused before spawn; inspect the configured workspace mount. "
+        "No durable-disk fallback was created."
+    )
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable, str(script), "--send", message,
+                "--channel", "discord", "--profile", "default", "--sev", "error",
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+    except Exception:
+        logger.exception("kanban dispatcher: workspace outage page failed")
+        return False
+    if proc.returncode != 0:
+        logger.error(
+            "kanban dispatcher: workspace outage page not delivered (rc=%d)",
+            proc.returncode,
+        )
+        return False
+    return True
+
+
+def _observe_workspace_refusal_outages(notifier, results) -> int:
+    """Process one full dispatcher tick; skipped boards do not imply recovery."""
+    delivered = 0
+    for board, result in results or []:
+        if result is None:
+            continue
+        refused = getattr(result, "workspace_refused", None) or []
+        delivered += int(
+            notifier.observe(board, refused, _send_workspace_refusal_alert)
+        )
+    return delivered
 
 
 def _stall_streak_is_bad(ready_pending, any_spawned, results) -> bool:
@@ -1973,6 +2049,7 @@ class GatewayKanbanWatchersMixin:
         # rather than every tick.
         last_stranded_warn_at: dict[str, int] = {}
         last_workspace_refusal_warn: dict[str, tuple[str, int]] = {}
+        workspace_refusal_notifier = _WorkspaceRefusalOutageNotifier()
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
@@ -2299,6 +2376,14 @@ class GatewayKanbanWatchersMixin:
                     if _ad_enabled:
                         await service(_auto_decompose_tick, _ad_per_tick)
                     results = await service(_tick_once)
+                    # Notification is off-loop. A failed delivery leaves the
+                    # outage unlatched so the next tick retries; an empty
+                    # successful board result rearms after recovery.
+                    await service(
+                        _observe_workspace_refusal_outages,
+                        workspace_refusal_notifier,
+                        results,
+                    )
                     any_spawned = False
                     for slug, res in (results or []):
                         spawned = getattr(res, "spawned", None) if res is not None else None

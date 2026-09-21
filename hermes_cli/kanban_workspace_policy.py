@@ -122,14 +122,14 @@ def validate_target(root, path):
         os.close(fd)
 
 
-def create_scratch(root, path):
-    """Create through a pinned directory FD, never through a vanished mount path."""
-    validate_mount(root)
+def create_scratch(root, path, *, expected_mount):
+    """Create through a pinned directory FD using the admitted mount anchor."""
+    validate_mount(root, expected_mount=expected_mount)
     validate_target(root, path)
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     fd = os.open(root, flags)
     try:
-        validate_mount(root)
+        validate_mount(root, expected_mount=expected_mount)
         opened = os.fstat(fd)
         current = root.stat()
         if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
@@ -146,6 +146,6 @@ def create_scratch(root, path):
             fd = child
             if os.fstat(fd).st_dev != opened.st_dev:
                 raise WorkspaceUnavailable("workspaces_root_invalid: nested filesystem")
-        validate_mount(root)
+        validate_mount(root, expected_mount=expected_mount)
     finally:
         os.close(fd)

@@ -10907,9 +10907,15 @@ def _resolve_worktree_workspace(
     return requested, branch_name
 
 
+@dataclass(frozen=True)
+class _WorkspaceAdmission:
+    root: Path
+    mount_path: Path
+
+
 def _validate_workspace_admission(
     task: Task, *, board: Optional[str] = None, conn=None, dry_run=False,
-) -> Optional[Path]:
+) -> Optional[_WorkspaceAdmission]:
     from hermes_cli.kanban_workspace_policy import (
         WorkspaceUnavailable, configured_root, validate_mount,
         validate_persisted, validate_target,
@@ -10957,12 +10963,13 @@ def _validate_workspace_admission(
                     raise WorkspaceUnavailable("workspaces_root_invalid: workspace symlink escape")
                 validate_target(protected, path)
                 validate_persisted(path)
-                return protected
+                return _WorkspaceAdmission(protected, mount_path)
     elif task.workspace_kind in (None, "scratch"):
         target = workspaces_root(board=board) / task.id
         if require_mount:
+            assert root is not None
             validate_target(root, target)
-            return root
+            return _WorkspaceAdmission(root, roots[root])
     return None
 
 
@@ -11083,7 +11090,9 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
             p = workspaces_root(board=board) / task.id
         if protected is not None and not task.workspace_path:
             from hermes_cli.kanban_workspace_policy import create_scratch
-            create_scratch(protected, p)
+            create_scratch(
+                protected.root, p, expected_mount=protected.mount_path,
+            )
         elif protected is None:
             p.mkdir(parents=True, exist_ok=True)
         return p
@@ -14886,7 +14895,7 @@ def _dispatch_once_locked(
         if claimed is None:
             continue
         from hermes_cli.kanban_workspace_policy import (
-            WorkspaceUnavailable, validate_persisted, validate_target,
+            WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
         )
         try:
             protected = _validate_workspace_admission(
@@ -14898,7 +14907,10 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
             if protected is not None:
-                validate_target(protected, workspace)
+                validate_mount(
+                    protected.root, expected_mount=protected.mount_path,
+                )
+                validate_target(protected.root, workspace)
                 validate_persisted(workspace)
         except WorkspaceUnavailable as exc:
             _release_claim_for_workspace_refusal(
@@ -15055,7 +15067,7 @@ def _dispatch_once_locked(
         if claimed is None:
             continue
         from hermes_cli.kanban_workspace_policy import (
-            WorkspaceUnavailable, validate_persisted, validate_target,
+            WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
         )
         try:
             protected = _validate_workspace_admission(
@@ -15067,7 +15079,10 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
             if protected is not None:
-                validate_target(protected, workspace)
+                validate_mount(
+                    protected.root, expected_mount=protected.mount_path,
+                )
+                validate_target(protected.root, workspace)
                 validate_persisted(workspace)
         except WorkspaceUnavailable as exc:
             _release_claim_for_workspace_refusal(
