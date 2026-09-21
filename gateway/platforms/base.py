@@ -3783,6 +3783,28 @@ class BasePlatformAdapter(ABC):
                     task.add_done_callback(_consume_detached_handler_exception)
                 raise
 
+    async def _acquire_platform_lock_async(
+        self, scope: str, identity: str, resource_desc: str
+    ) -> bool:
+        """Off-loop form of :meth:`_acquire_platform_lock`.
+
+        Every ``async def connect()``/``open()`` MUST use this form.  The sync
+        method's takeover path writes the takeover marker (``atomic_json_write``)
+        and then polls for the old owner's exit with ``time.sleep`` -- up to
+        20x0.5s graceful plus 20x0.25s forced, i.e. ~15s.  Executed inline on
+        the running loop that stalls the whole gateway: every other adapter's
+        polling, every in-flight turn, every heartbeat.
+
+        This is a pure transport: arguments, return value, raised exceptions and
+        every attribute the sync body mutates (``_platform_lock_*``, the
+        ``_set_fatal_error`` state the runner reads for retryability) pass
+        through unchanged.  The sync method keeps its exact contract for the
+        direct callers that are not on a loop.
+        """
+        return await asyncio.to_thread(
+            self._acquire_platform_lock, scope, identity, resource_desc
+        )
+
     def _acquire_platform_lock(self, scope: str, identity: str, resource_desc: str) -> bool:
         """Acquire a scoped lock for this adapter. Returns True on success.
 
@@ -3790,6 +3812,9 @@ class BasePlatformAdapter(ABC):
         explicitly arms this adapter for its initial ``--replace`` connect.
         The status module validates PID/start-time/home ownership, places the
         marker in the target's home, and performs the bounded termination.
+
+        BLOCKING.  On the takeover path this writes a marker and sleeps for up
+        to ~15s.  Coroutines must call :meth:`_acquire_platform_lock_async`.
         """
         from gateway.status import (
             acquire_scoped_lock,

@@ -4598,7 +4598,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         
         try:
-            if not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
+            if not await self._acquire_platform_lock_async('telegram-bot-token', self.config.token, 'Telegram bot token'):
                 return False
 
             # Build the application

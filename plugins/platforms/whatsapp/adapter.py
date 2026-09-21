@@ -558,7 +558,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # Acquire scoped lock to prevent duplicate sessions
         lock_acquired = False
         try:
-            if not self._acquire_platform_lock('whatsapp-session', str(self._session_path), 'WhatsApp session'):
+            if not await self._acquire_platform_lock_async('whatsapp-session', str(self._session_path), 'WhatsApp session'):
                 return False
             lock_acquired = True
         except Exception as e:

@@ -91,11 +91,8 @@ REACHABLE_BASELINE = frozenset({
     "gateway/lifecycle_ledger.py record_startup_async -> atomic_json_write",
     "gateway/platforms/api_server.py _handle_artifact_upload -> os.fsync",
     "gateway/platforms/base.py cancel_background_tasks -> atomic_json_write",
-    "gateway/platforms/signal.py connect -> atomic_json_write",
     "gateway/platforms/weixin.py _poll_loop -> atomic_json_write",
-    "gateway/platforms/weixin.py connect -> atomic_json_write",
     "gateway/platforms/weixin.py qr_login -> atomic_json_write",
-    "gateway/platforms/yuanbao.py open -> atomic_json_write",
     "gateway/run.py _execute_mcp_reload -> atomic_json_write",
     "gateway/run.py _finalize_shutdown_agents -> atomic_json_write",
     "gateway/run.py _handle_message -> atomic_replace",
@@ -118,7 +115,6 @@ REACHABLE_BASELINE = frozenset({
     "plugins/platforms/telegram/adapter.py _handle_media_message -> atomic_json_write",
     "plugins/platforms/telegram/adapter.py _handle_sticker -> os.fsync",
     "plugins/platforms/telegram/adapter.py _handle_text_message -> atomic_json_write",
-    "plugins/platforms/telegram/adapter.py connect -> atomic_json_write",
 })
 
 
