@@ -137,6 +137,30 @@ def _rowid_credits(tmp_path: Path) -> list:
 
 
 @pytest.mark.asyncio
+async def test_restart_loop_guard_records_at_most_once_per_gateway_boot(
+    tmp_path, monkeypatch
+):
+    from gateway import restart_loop_guard
+
+    runner, _adapter, db = _runner(tmp_path, monkeypatch)
+    entry = _entry(runner)
+    _mark_pending(runner, entry)
+    recorded = MagicMock(return_value=False)
+    inspected = MagicMock(return_value=False)
+    monkeypatch.setattr(restart_loop_guard, "check_and_record", recorded)
+    monkeypatch.setattr(restart_loop_guard, "is_restart_loop_tripped", inspected)
+
+    runner._schedule_resume_pending_sessions()
+    await asyncio.gather(*runner._background_tasks)
+    runner._schedule_resume_pending_sessions()
+    await asyncio.gather(*runner._background_tasks)
+
+    recorded.assert_called_once()
+    inspected.assert_called_once()
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_t1_prompt_default_keeps_note_bytes_and_adds_taxonomy_log(
     tmp_path, monkeypatch, caplog
 ):

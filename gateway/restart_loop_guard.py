@@ -200,14 +200,14 @@ def check_and_record(
     tripped = len(boots) >= max_restarts if max_restarts > 0 else False
     if tripped:
         logger.warning(
-            "Restart-loop breaker TRIPPED: %d chained restart-interrupted "
-            "gateway boots (no gap wider than %ds; threshold %d). The CALLER "
-            "decides what to skip — in the gateway the per-session replay "
-            "breaker and the per-session auto-resume cap own the break, so "
-            "healthy sessions keep resuming; grep the adjacent "
-            "'Restart-loop guard tripped at boot: deferred_to=' line for which "
-            "mechanism acted (#30719, #81642). If this is a false positive, "
-            "delete %s.",
+            "Restart-loop breaker TRIPPED: reason_class=restart_interrupted_boot_chain "
+            "%d chained restart-interrupted gateway boots (no gap wider than "
+            "%ds; threshold %d). The CALLER decides what to skip — in the "
+            "gateway the per-session replay breaker and the per-session "
+            "auto-resume cap own the break, so healthy sessions keep resuming; "
+            "grep the adjacent 'Restart-loop guard tripped at boot: "
+            "deferred_to=' line for which mechanism acted (#30719, #81642). "
+            "If this is a false positive, delete %s.",
             len(boots),
             int(_chain_gap(window_seconds, max_gap_seconds)),
             max_restarts,
