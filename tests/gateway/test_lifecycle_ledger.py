@@ -20,8 +20,10 @@ from gateway.lifecycle_ledger import (
     detect_unclean_exit,
     get_lifecycle_sentinel_path,
     mark_exited,
+    read_last_teardown_seconds,
     read_prior_exit_label,
     record_startup,
+    record_teardown_timing,
     sample_memory,
 )
 
@@ -73,6 +75,28 @@ def test_sample_memory_has_expected_keys_on_linux() -> None:
     assert sample.get("rss_kib", 0) > 0
     assert sample.get("mem_total_kib", 0) > 0
     assert "mem_available_kib" in sample
+
+
+# ---------------------------------------------------------------------------
+# Teardown timing
+# ---------------------------------------------------------------------------
+
+
+def test_teardown_timing_round_trips_and_reaches_exit_diag(tmp_path: Path) -> None:
+    assert read_last_teardown_seconds(tmp_path) is None
+
+    record_teardown_timing(
+        18.25,
+        total_shutdown_seconds=48.5,
+        drain_seconds=30.0,
+        home=tmp_path,
+    )
+
+    assert read_last_teardown_seconds(tmp_path) == 18.25
+    records = _exit_diag_records(tmp_path)
+    assert records[-1]["tag"] == "gateway.shutdown_teardown_timing"
+    assert records[-1]["teardown_seconds"] == 18.25
+    assert records[-1]["total_shutdown_seconds"] == 48.5
 
 
 # ---------------------------------------------------------------------------

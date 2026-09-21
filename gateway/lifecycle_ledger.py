@@ -53,6 +53,7 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 _LIFECYCLE_RELATIVE = ("state", "gateway.lifecycle.json")
+_TEARDOWN_TIMING_RELATIVE = ("state", "gateway.teardown.json")
 _EXIT_DIAG_RELATIVE = ("logs", "gateway-exit-diag.log")
 
 # Total wall-clock budget for the kill-attribution probe.  Boot must never
@@ -84,6 +85,58 @@ def get_lifecycle_sentinel_path(home: Optional[Path] = None) -> Path:
     """Return ``<HERMES_HOME>/state/gateway.lifecycle.json``."""
     base = home if home is not None else _process_hermes_home()
     return base.joinpath(*_LIFECYCLE_RELATIVE)
+
+
+def get_teardown_timing_path(home: Optional[Path] = None) -> Path:
+    """Return the last completed post-drain teardown timing path."""
+    base = home if home is not None else _process_hermes_home()
+    return base.joinpath(*_TEARDOWN_TIMING_RELATIVE)
+
+
+def read_last_teardown_seconds(home: Optional[Path] = None) -> Optional[float]:
+    """Read the last completed post-drain teardown duration, if valid."""
+    data = _read_json(get_teardown_timing_path(home))
+    raw = (data or {}).get("teardown_seconds")
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0.0 else None
+
+
+def record_teardown_timing(
+    teardown_seconds: float,
+    *,
+    total_shutdown_seconds: float,
+    drain_seconds: float,
+    home: Optional[Path] = None,
+) -> None:
+    """Persist and diagnose one completed post-drain teardown measurement."""
+    try:
+        teardown = max(float(teardown_seconds), 0.0)
+        total = max(float(total_shutdown_seconds), 0.0)
+        drain = max(float(drain_seconds), 0.0)
+    except (TypeError, ValueError):
+        return
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "tag": "gateway.shutdown_teardown_timing",
+        "pid": os.getpid(),
+        "teardown_seconds": teardown,
+        "total_shutdown_seconds": total,
+        "drain_seconds": drain,
+    }
+    path = get_teardown_timing_path(home)
+    try:
+        from utils import atomic_json_write
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_json_write(path, record, indent=None)
+    except Exception:
+        logger.debug("Failed to persist teardown timing", exc_info=True)
+    _append_exit_diag(record, home)
 
 
 def sample_memory() -> Dict[str, Any]:

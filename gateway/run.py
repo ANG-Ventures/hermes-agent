@@ -3309,6 +3309,7 @@ from gateway.restart import (
     read_launchd_exit_timeout_s,
     resolve_cron_drain_budget,
     resolve_launchd_capped_drain,
+    resolve_launchd_shutdown_watchdog_delay,
     resolve_replace_takeover_grace_s,
 )
 
@@ -7979,6 +7980,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._launchd_exit_timeout_s = self._load_launchd_exit_timeout(
             self._restart_drain_timeout
         )
+        try:
+            from gateway.lifecycle_ledger import read_last_teardown_seconds
+
+            self._last_shutdown_teardown_s = read_last_teardown_seconds()
+        except Exception:
+            self._last_shutdown_teardown_s = None
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
 
@@ -16417,9 +16424,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from gateway import restart_loop_guard as _rlg
 
                 _max_restarts, _window, _max_gap = self._restart_loop_guard_config()
-                _tripped = _rlg.check_and_record(
-                    _max_restarts, _window, max_gap_seconds=_max_gap
-                )
+                if not getattr(self, "_restart_loop_guard_recorded_this_boot", False):
+                    _tripped = _rlg.check_and_record(
+                        _max_restarts, _window, max_gap_seconds=_max_gap
+                    )
+                    self._restart_loop_guard_recorded_this_boot = True
+                else:
+                    _tripped = _rlg.is_restart_loop_tripped(
+                        _max_restarts, _window, max_gap_seconds=_max_gap
+                    )
                 if _tripped:
                     # F2 is armed whenever the per-session breaker is enabled,
                     # which (given the max(1, ...) clamp) it always is. The
@@ -19663,17 +19676,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "restart_drain_timeout": self._restart_drain_timeout,
                     "effective_drain_timeout": effective_stop_drain_timeout(self),
                     "launchd_exit_timeout_s": getattr(self, "_launchd_exit_timeout_s", None),
-                    "watchdog_delay_s": resolve_shutdown_watchdog_delay(
-                        effective_stop_drain_timeout(self)
+                    "watchdog_delay_s": resolve_launchd_shutdown_watchdog_delay(
+                        resolve_shutdown_watchdog_delay(
+                            effective_stop_drain_timeout(self)
+                        ),
+                        getattr(self, "_launchd_exit_timeout_s", None),
+                        signal_driven=getattr(
+                            self, "_stop_requested_by_signal", False
+                        ),
                     ),
+                    "persistence_complete": False,
                     "phase_elapsed_s": (
                         time.monotonic() - started if started is not None else None
                     ),
                 }
 
             if not os.environ.get("PYTEST_CURRENT_TEST"):
+                _watchdog_delay = resolve_shutdown_watchdog_delay(
+                    effective_stop_drain_timeout(self)
+                )
+                _launchd_budget = getattr(self, "_launchd_exit_timeout_s", None)
+                _watchdog_delay = resolve_launchd_shutdown_watchdog_delay(
+                    _watchdog_delay,
+                    _launchd_budget,
+                    signal_driven=getattr(self, "_stop_requested_by_signal", False),
+                )
                 arm_shutdown_watchdog(
-                    resolve_shutdown_watchdog_delay(effective_stop_drain_timeout(self)),
+                    _watchdog_delay,
                     done_event=_watchdog_done,
                     snapshot_fn=_shutdown_watchdog_snapshot,
                     exit_code=1,
@@ -19813,6 +19842,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 timeout, _cron_timeout
             )
             _drain_elapsed = time.monotonic() - _drain_started_at
+            _post_drain_started_at = time.monotonic()
             logger.info(
                 "Shutdown phase: drain done at +%.2fs (drain took %.2fs, "
                 "timed_out=%s, active_at_start=%d, active_now=%d, "
@@ -20335,6 +20365,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else:
                 self._update_runtime_status("stopped", self._exit_reason)
             _shutdown_gateway_health_export(self)
+            _teardown_elapsed = time.monotonic() - _post_drain_started_at
+            try:
+                from gateway.lifecycle_ledger import record_teardown_timing
+
+                record_teardown_timing(
+                    _teardown_elapsed,
+                    total_shutdown_seconds=_phase_elapsed(),
+                    drain_seconds=_drain_elapsed,
+                )
+            except Exception as _e:
+                logger.debug("Failed to record shutdown teardown timing: %s", _e)
+            logger.info(
+                "Shutdown phase: post-drain teardown completed in %.2fs "
+                "(persistence complete; total %.2fs)",
+                _teardown_elapsed,
+                _phase_elapsed(),
+            )
             logger.info("Gateway stopped (total teardown %.2fs)", _phase_elapsed())
 
         self._stop_task = asyncio.create_task(_stop_impl())

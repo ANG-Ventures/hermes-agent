@@ -12,6 +12,7 @@ takeovers are not launchd-timed and keep the configured drain).
 from __future__ import annotations
 
 import subprocess
+import threading
 
 import pytest
 
@@ -21,9 +22,11 @@ from gateway.restart import (
     parse_launchd_exit_timeout,
     read_launchd_exit_timeout_s,
     resolve_launchd_capped_drain,
+    resolve_launchd_shutdown_watchdog_delay,
 )
 from gateway.shutdown_watchdog import (
     DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S,
+    arm_shutdown_watchdog,
     resolve_shutdown_watchdog_delay,
 )
 
@@ -159,9 +162,23 @@ def test_read_exit_timeout_fails_open_on_nonzero_rc():
 # ---------------------------------------------------------------------------
 
 
-def test_capped_drain_fits_inside_launchd_budget_minus_reserve():
-    # The incident shape: configured 180s, launchd clamps to 60s.
-    assert resolve_launchd_capped_drain(180.0, 60.0) == 60.0 - LAUNCHD_STOP_CLEANUP_RESERVE_S
+@pytest.mark.parametrize(
+    ("configured", "last_teardown", "expected"),
+    [
+        (50.0, None, 45.0),
+        (30.0, None, 30.0),
+        (50.0, 22.0, 38.0),
+    ],
+)
+def test_capped_drain_preserves_teardown_headroom(configured, last_teardown, expected):
+    assert (
+        resolve_launchd_capped_drain(
+            configured,
+            60.0,
+            last_teardown_s=last_teardown,
+        )
+        == expected
+    )
 
 
 def test_capped_drain_never_extends_a_short_drain():
@@ -200,7 +217,7 @@ def _runner(*, drain: float, launchd: float | None, by_signal: bool):
 
 
 def test_effective_drain_capped_only_for_signal_stops_under_launchd():
-    assert _runner(drain=180.0, launchd=60.0, by_signal=True)._effective_stop_drain_timeout() == 50.0
+    assert _runner(drain=180.0, launchd=60.0, by_signal=True)._effective_stop_drain_timeout() == 45.0
     # In-band restart (SIGUSR1 → after-turn → stop()) is not launchd-timed.
     assert _runner(drain=180.0, launchd=60.0, by_signal=False)._effective_stop_drain_timeout() == 180.0
     # Not launchd-owned (systemd, s6, foreground): configured drain stands.
@@ -227,7 +244,7 @@ def test_effective_drain_getattr_guarded_for_bare_doubles():
                 _launchd_exit_timeout_s=60.0,
             )
         )
-        == 50.0
+        == 45.0
     )
 
 
@@ -268,11 +285,11 @@ def test_cron_leash_under_launchd_cannot_exceed_exit_timeout():
     """The cron drain floor (#82161) is clamped to the launchd budget too.
 
     Without the clamp the cron ceiling is watchdog(drain+grace) - reserve,
-    which for a capped 50s drain is 100s — past launchd's 60s SIGKILL.
+    which for a capped 45s drain is 95s — past launchd's 60s SIGKILL.
     """
     from gateway.restart import CRON_DRAIN_CLEANUP_RESERVE_S, resolve_cron_drain_budget
 
-    drain = resolve_launchd_capped_drain(180.0, 60.0)  # 50
+    drain = resolve_launchd_capped_drain(180.0, 60.0)  # 45
     leash = min(resolve_shutdown_watchdog_delay(drain), 60.0)
     budget = resolve_cron_drain_budget(drain, 600.0, watchdog_delay=leash, elapsed=0.0)
     assert budget == max(drain, 60.0 - CRON_DRAIN_CLEANUP_RESERVE_S)
@@ -283,6 +300,58 @@ def test_cron_leash_under_launchd_cannot_exceed_exit_timeout():
     )
     assert unclamped == drain + DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S - CRON_DRAIN_CLEANUP_RESERVE_S
     assert unclamped > 60.0
+
+
+def test_launchd_shutdown_watchdog_hard_exits_before_supervisor_sigkill():
+    assert (
+        resolve_launchd_shutdown_watchdog_delay(
+            95.0,
+            60.0,
+            signal_driven=True,
+        )
+        == 50.0
+    )
+    assert (
+        resolve_launchd_shutdown_watchdog_delay(
+            95.0,
+            60.0,
+            signal_driven=False,
+        )
+        == 95.0
+    )
+
+
+def test_hard_exit_backstop_ignores_blocked_daemon_threads(monkeypatch, tmp_path):
+    from gateway import shutdown_watchdog
+
+    release = threading.Event()
+    blockers = [
+        threading.Thread(target=release.wait, daemon=True, name=f"blocked-{i}")
+        for i in range(25)
+    ]
+    for thread in blockers:
+        thread.start()
+
+    exited = threading.Event()
+    codes: list[int] = []
+
+    def fake_exit(code):
+        codes.append(code)
+        exited.set()
+
+    monkeypatch.setattr(shutdown_watchdog.os, "_exit", fake_exit)
+    arm_shutdown_watchdog(
+        0.05,
+        exit_code=1,
+        dump_path=tmp_path / "watchdog.log",
+    )
+    try:
+        assert exited.wait(1.0), "hard exit was blocked by unrelated daemon threads"
+        assert codes == [1]
+    finally:
+        release.set()
+        for thread in blockers:
+            thread.join(timeout=1.0)
 
 
 def test_signal_handler_marks_stop_as_signal_driven():
