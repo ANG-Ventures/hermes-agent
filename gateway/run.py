@@ -10586,8 +10586,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _update_runtime_status(self, gateway_state: Optional[str] = None, exit_reason: Optional[str] = None) -> None:
         try:
-            from gateway.status import write_runtime_status
-            write_runtime_status(
+            self._dispatch_runtime_status_write(
                 gateway_state=gateway_state,
                 exit_reason=exit_reason,
                 restart_requested=self._restart_requested,
@@ -10595,6 +10594,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             pass
+
+    # Terminal writes must not be offloaded: the process can exit immediately
+    # after them, and a detached executor job would be dropped before it lands
+    # (test_signal_initiated_shutdown_persists_running_not_stopped depends on
+    # the final gateway_state actually reaching the file).  Shutdown is also
+    # exactly when a stalled loop costs nothing.
+    _TERMINAL_GATEWAY_STATES = frozenset({"stopped", "startup_failed"})
+
+    def _dispatch_runtime_status_write(self, **kwargs) -> None:  # noqa: atomic-write-on-loop loop-conditional guard: defers to an executor thread whenever a loop is running
+        """Run a ``write_runtime_status`` off the loop when there is one.
+
+        ``write_runtime_status`` is a read-merge-atomic-write of
+        gateway_state.json plus a realpath walk and a psutil ``create_time``
+        call (measured median 0.903ms / max 7.666ms on an IDLE box).  Nine
+        coroutines reach it, so on the loop it stalls every other session.
+
+        Mirrors :meth:`_persist_active_agents`: loop-conditional, so the
+        synchronous callers (``_enter_external_drain``, ``_maybe_update_status``,
+        ``_scale_to_zero_note_real_inbound``) keep running inline exactly as
+        before.  Callers and signatures are unchanged.
+        """
+        def _write() -> None:
+            try:
+                from gateway.status import write_runtime_status_locked
+                # Always via the locked form: the offloaded writes are genuinely
+                # concurrent and the read-merge-write would otherwise drop the
+                # loser's fields (a shutdown's exit_reason racing a platform
+                # state).  Harmless when we run inline.
+                write_runtime_status_locked(**kwargs)
+            except Exception:
+                pass
+
+        if kwargs.get("gateway_state") in self._TERMINAL_GATEWAY_STATES:
+            _write()
+            return
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _write()  # no loop to protect: previous behavior
+            return
+
+        try:
+            loop.run_in_executor(None, _write)
+        except Exception:
+            _write()
 
     def _persist_active_agents(self) -> None:
         """Persist the live in-flight agent count to ``gateway_state.json``.
@@ -10859,13 +10904,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         retrying_since: Any = _UNSET,
     ) -> None:
         try:
-            from gateway.status import write_runtime_status
             extra: Dict[str, Any] = {}
             if needs_attention is not None:
                 extra["needs_attention"] = needs_attention
             if retrying_since is not _UNSET:
                 extra["retrying_since"] = retrying_since
-            write_runtime_status(
+            self._dispatch_runtime_status_write(
                 platform=platform,
                 platform_state=platform_state,
                 error_code=error_code,
@@ -17005,8 +17049,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
         try:
-            from gateway.status import write_runtime_status
-            write_runtime_status(
+            self._dispatch_runtime_status_write(
                 gateway_state="starting",
                 exit_reason=None,
                 clear_profile_platforms=True,
@@ -17654,8 +17697,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         len(self._failed_platforms), reason,
                     )
                     try:
-                        from gateway.status import write_runtime_status
-                        write_runtime_status(
+                        self._dispatch_runtime_status_write(
                             gateway_state="degraded",
                             exit_reason=None,
                         )
@@ -20314,7 +20356,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # profile runtime scope; it is intentionally broader than profiles with a
         # successfully connected secondary adapter (or any adapter configured).
         try:
-            from gateway.status import write_runtime_status
             from gateway.pairing import PairingStore
             served = [active] + sorted(
                 name for name, _home in profile_homes if name != active
@@ -20330,7 +20371,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if name == active
                         else PairingStore(profile=name)
                     )
-            write_runtime_status(served_profiles=served)
+            self._dispatch_runtime_status_write(served_profiles=served)
         except Exception:
             logger.debug("could not record served_profiles", exc_info=True)
 
