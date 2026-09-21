@@ -15544,14 +15544,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # for the whole restore cycle after a transient loop hiccup).
             acked.discard(key)
 
-    async def _send_startup_restore_ack(self, adapter: Any, chat_id: Any) -> None:
+    async def _send_startup_restore_ack(
+        self, adapter: Any, chat_id: Any, *, turn_slot_wait: bool = False,
+        metadata: Optional[dict] = None,
+    ) -> None:
         # Greptile #258: the ack is fire-and-forget, so by the time this task
         # runs the restore gate may already have released and the queued message
         # answered — an ack AFTER the real response reads as confusing noise.
         # Only send while the restore is still actually in progress.
-        if not getattr(self, "_startup_restore_in_progress", False):
+        if not turn_slot_wait and not getattr(self, "_startup_restore_in_progress", False):
             return
         try:
+            if turn_slot_wait:
+                await adapter.send(
+                    chat_id,
+                    "⏳ Busy with other conversations — your message is queued "
+                    "and will run as soon as a turn slot is free.",
+                    metadata={**(metadata or {}), "_interim_send": True},
+                )
+                return
             await adapter.send(
                 chat_id,
                 "⏳ Still starting up — your message is queued and I'll get to it "
@@ -16719,13 +16730,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source,
                 internal=True,
             )
-            task = asyncio.create_task(
-                self._run_startup_resume_event(
-                    adapter,
-                    event,
-                    entry.session_key,
-                    getattr(entry, "resume_reason", None),
+            pool = getattr(self, "_startup_resume_pool", None)
+            if pool is None:
+                from gateway.turn_admission import StartupResumePool
+                pool = self._startup_resume_pool = StartupResumePool(
+                    getattr(self.config, "startup_resume_concurrency", 3) or 3
                 )
+            task = pool.submit(
+                self._run_startup_resume_event, adapter, event, entry.session_key,
+                getattr(entry, "resume_reason", None),
             )
             # Track this scheduled resume so shutdown can tell a resume whose
             # turn NEVER STARTED (cancel + re-mark) from one that is genuinely
@@ -16806,6 +16819,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._startup_restore_tasks = tasks
                 tasks.append(task)
             scheduled += 1
+        pool = getattr(self, "_startup_resume_pool", None)
+        if scheduled and pool is not None and pool.pending:
+            logger.warning(
+                "PHASE=boot_resume_throttled pending=%s concurrency=%s",
+                len(pool.pending), pool.concurrency,
+            )
         if skipped:
             logger.info(
                 "Skipped auto-resume for %d session(s) whose last turn had "
@@ -24449,6 +24468,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
+        # Claim admission BEFORE the transcript lease. Pending sentinels remain
+        # visible to inbound coalescing, but queued work cannot become a stale
+        # transcript-lease holder if /stop invalidates its generation.
+        async with self._get_turn_admission().slot(
+            _quick_key, internal=event.internal,
+            ack=lambda: self._ack_turn_slot_wait(source),
+        ):
+            if not self._is_session_run_current(_quick_key, run_generation):
+                return None
+            return await self._handle_message_with_agent_admitted(
+                event, source, _quick_key, run_generation,
+            )
+
+    async def _handle_message_with_agent_admitted(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         # Detector (2026-09-20): a turn STARTING while shutdown is already in
@@ -35723,7 +35756,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return get_hermes_home()
 
+    def _get_turn_admission(self):
+        from gateway.turn_admission import TurnAdmission
+        admission = getattr(self, "_turn_admission", None)
+        if admission is None:
+            cap = getattr(getattr(self, "config", None), "max_concurrent_turns", None)
+            admission = self._turn_admission = TurnAdmission(cap)
+        return admission
+
+    async def _ack_turn_slot_wait(self, source):
+        adapter = self._adapter_for_source(source)
+        if adapter is not None:
+            await self._send_startup_restore_ack(
+                adapter, source.chat_id, turn_slot_wait=True,
+                metadata=self._thread_metadata_for_source(source),
+            )
+
     async def _run_agent_inner(
+        self, message, context_prompt, history, source, session_id, **kwargs,
+    ):
+        # Direct/recursive callers also pass this seam; the handler's permit is
+        # reused only in its own task, never by an independently spawned child.
+        async with self._get_turn_admission().slot(
+            kwargs.get("session_key"),
+            ack=lambda: self._ack_turn_slot_wait(source),
+        ):
+            return await self._run_agent_admitted(
+                message, context_prompt, history, source, session_id, **kwargs,
+            )
+
+    async def _run_agent_admitted(
         self,
         message: str,
         context_prompt: str,
@@ -36735,6 +36797,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _executor_task = asyncio.ensure_future(
                 self._run_in_executor_with_context(_run_sync_with_timeout_lifecycle)
             )
+            self._get_turn_admission().retain_worker(_executor_task)
 
             _inactivity_timeout = False
 
