@@ -7560,7 +7560,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # Session token total (Σ) — opt-in only via an explicit fields
             # list, so default bars never widen.
             total_tokens = snapshot.get("session_total_tokens", 0)
-            if total_tokens and field_set is not None and "total_tokens" in field_set:
+            if (total_tokens or snapshot.get("session_total_tokens_unknown")) and field_set is not None and "total_tokens" in field_set:
                 from agent.usage_pricing import format_token_count
 
                 parts.append(
@@ -7734,7 +7734,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # Session token total (Σ) — opt-in only via an explicit
                     # fields list, so default bars never widen.
                     total_tokens = snapshot.get("session_total_tokens", 0)
-                    if total_tokens and field_set is not None and "total_tokens" in field_set:
+                    if (total_tokens or snapshot.get("session_total_tokens_unknown")) and field_set is not None and "total_tokens" in field_set:
                         from agent.usage_pricing import format_token_count
 
                         _append(frags, " │ ", ("class:status-bar-dim", "Σ" + format_token_count(
@@ -9790,6 +9790,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def _show_session_status(self):
         """Show gateway-style status for the current CLI session."""
+        from agent.usage_pricing import format_token_count, session_total_tokens_unknown
+
         session_meta = {}
         if self._session_db:
             try:
@@ -9886,7 +9888,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         lines.extend([
             f"Created: {created_at.strftime('%Y-%m-%d %H:%M')}",
             f"Last Activity: {updated_at.strftime('%Y-%m-%d %H:%M')}",
-            f"Tokens: {total_tokens:,}",
+            f"Tokens: {format_token_count(total_tokens, unknown=session_total_tokens_unknown(agent), formatter=lambda n: f'{n:,}')}",
             f"Agent Running: {'Yes' if is_running else 'No'}",
         ])
         self._console_print("\n".join(lines), highlight=False, markup=False)
