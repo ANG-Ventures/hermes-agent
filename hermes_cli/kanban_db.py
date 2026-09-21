@@ -1557,6 +1557,13 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     ``<root>/kanban/boards/_archived/<slug>-<timestamp>/`` so the data
     is recoverable. ``archive=False`` deletes the directory outright.
 
+    **Both** modes are refused while any card on the board is running or
+    holds an unexpired claim lock: the board directory contains those
+    cards' ``workspaces/``, so either mode takes a live worker's cwd out
+    from under it. Both modes also write an audit trail (``ATTEMPT`` then
+    ``ARCHIVE`` / ``DELETE`` / ``FAILED``, or ``REFUSED`` for the liveness
+    gate) to a log outside the affected tree.
+
     The ``default`` board cannot be removed — raises :class:`ValueError`.
     Returns a summary dict describing what happened (``{"slug", "action",
     "new_path"}``).
@@ -1575,27 +1582,33 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if get_current_board() == normed:
         clear_current_board()
 
-    if not archive:
-        # A board directory CONTAINS that board's workspaces/ -- deleting it
-        # destroys every card's scratch dir at once, the same blast radius as
-        # the 2026-09-20 incident, and the deletion below did it with no
-        # liveness check or audit (card t_63fb42f9, review round 3).
-        # Checked BEFORE the cache invalidation: it opens the board DB (which
-        # would re-populate _INITIALIZED_PATHS) and it can abort, so no state
-        # may be torn down ahead of it.
-        live = _board_has_live_cards(normed)
-        if live:
-            _audit_workspace_deletion(
-                d, task_id=live[0], reason="remove_board", outcome=AUDIT_REFUSED,
-                detail=f"board-has-live-cards:{','.join(live[:5])}",
-                board=normed,
-            )
-            raise ValueError(
-                f"board {normed!r} has {len(live)} card(s) running or holding "
-                f"a live claim lock ({', '.join(live[:5])}); refusing to "
-                "delete its directory, which contains their workspaces. "
-                "Archive it instead, or wait for the cards to finish."
-            )
+    # A board directory CONTAINS that board's workspaces/ -- retiring it
+    # takes every card's scratch dir at once, the same blast radius as the
+    # 2026-09-20 incident. BOTH branches do that: archive renames the tree
+    # away, delete removes it. Round 3 gated only the delete branch, which
+    # is the one a user has to opt into (`boards rm --delete`, dashboard
+    # `?delete=true`); the DEFAULT archive branch yanked a running worker's
+    # cwd with no refusal and no audit line anywhere (card t_63fb42f9,
+    # review round 6, measured). The gate is hoisted here so it covers the
+    # default path too.
+    #
+    # Checked BEFORE the cache invalidation below: it opens the board DB
+    # (which would re-populate _INITIALIZED_PATHS) and it can abort, so no
+    # state may be torn down ahead of it.
+    live = _board_has_live_cards(normed)
+    if live:
+        verb = "archive" if archive else "delete"
+        _audit_workspace_deletion(
+            d, task_id=live[0], reason="remove_board", outcome=AUDIT_REFUSED,
+            detail=f"board-has-live-cards:{','.join(live[:5])} action={verb}",
+            board=normed,
+        )
+        raise ValueError(
+            f"board {normed!r} has {len(live)} card(s) running or holding "
+            f"a live claim lock ({', '.join(live[:5])}); refusing to "
+            f"{verb} its directory, which contains their workspaces. "
+            "Wait for the cards to finish, or stop them first."
+        )
 
     # A concurrent connect(board=normed) after the rename/delete recreates
     # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
@@ -1618,7 +1631,35 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         while target.exists():
             target = archive_root / f"{normed}-{ts}-{suffix}"
             suffix += 1
-        d.rename(target)
+        # An archive is a relocation, not an rmtree -- the bytes survive
+        # under _archived/ -- but from the point of view of anything holding
+        # a path into this board (a worker's cwd, an open workspace) it is
+        # indistinguishable from a deletion, which is exactly the symptom
+        # the 2026-09-20 incident presented as. Deliverable 2b says log
+        # EVERY workspace deletion; round 6 measured `rglob` returning [] on
+        # this branch. ATTEMPT goes down before the rename so a process that
+        # dies mid-move still names itself, and both records are routed
+        # through _durable_audit_log_path, which keeps them OUTSIDE the tree
+        # being moved.
+        _audit_workspace_deletion(
+            d, task_id=None, reason="remove_board", outcome=AUDIT_ATTEMPT,
+            detail=f"board={normed} action=archive dest={target}",
+            board=normed,
+        )
+        try:
+            d.rename(target)
+        except OSError as exc:
+            _audit_workspace_deletion(
+                d, task_id=None, reason="remove_board", outcome=AUDIT_FAILED,
+                detail=f"board={normed} action=archive {type(exc).__name__}: {exc}"[:200],
+                board=normed,
+            )
+            raise
+        _audit_workspace_deletion(
+            d, task_id=None, reason="remove_board", outcome=AUDIT_ARCHIVE,
+            detail=f"board={normed} action=archive dest={target}",
+            board=normed,
+        )
         return {"slug": normed, "action": "archived", "new_path": str(target)}
     else:
         from hermes_cli.kanban_survivor import remove_workspace_dir
@@ -7200,6 +7241,11 @@ AUDIT_ATTEMPT = "ATTEMPT"
 AUDIT_DELETE = "DELETE"
 AUDIT_REFUSED = "REFUSED"
 AUDIT_FAILED = "FAILED"
+#: ``ARCHIVE`` is the relocation counterpart of ``DELETE``: the tree is gone
+#: from its old path (a live process holding it is just as broken) but the
+#: bytes survive at the recorded destination. Distinct from ``DELETE`` so an
+#: operator reading the log knows whether recovery is possible.
+AUDIT_ARCHIVE = "ARCHIVE"
 
 
 def _durable_audit_log_path(target: Path, board: Optional[str]) -> Path:

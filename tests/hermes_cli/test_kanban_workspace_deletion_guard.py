@@ -473,17 +473,123 @@ def test_remove_board_delete_allowed_when_idle_and_audited(kanban_home):
     ), _audit_lines()
 
 
-def test_remove_board_archive_is_unaffected(kanban_home):
-    """Archiving is a rename, not a deletion -- the guard must not block it."""
+# ---------------------------------------------------------------------------
+# 6b. remove_board(archive=True) -- the DEFAULT branch (review round 6).
+#
+# Round 3 gated `archive=False` only. That is the branch a user must opt
+# into (`boards rm --delete`, dashboard `?delete=true`); the default branch
+# renamed <root>/kanban/boards/<slug>/ -- which CONTAINS that board's
+# workspaces/t_* -- out from under a RUNNING card with no refusal and no
+# audit line anywhere under HERMES_HOME. A live worker's cwd vanishing is
+# the 2026-09-20 incident's literal symptom, and deliverable 2b says log
+# EVERY workspace deletion.
+#
+# An earlier revision of this file asserted the opposite ("archiving is a
+# rename, so the guard must not block it"). That reasoning is wrong for the
+# property being defended: recoverability of bytes is not liveness of the
+# process holding the path.
+# ---------------------------------------------------------------------------
+
+
+def test_remove_board_archive_refuses_while_a_card_is_running(kanban_home):
+    """Born red at PR head cba079babd: archived a live card's board silently."""
     kb.create_board("kept", name="Kept")
     with kb.connect_closing(board="kept") as conn:
         task_id = kb.create_task(conn, title="live", assignee="daedalus")
         conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
         conn.commit()
 
-    res = kb.remove_board("kept", archive=True)
+    bdir = kb.board_dir("kept")
+    ws = bdir / "workspaces" / task_id
+    ws.mkdir(parents=True)
+    (ws / "work.txt").write_text("hours\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="running or holding"):
+        kb.remove_board("kept", archive=True)
+
+    assert bdir.is_dir(), "archive moved a live card's board away"
+    assert (ws / "work.txt").exists(), "the live card's cwd was relocated"
+    assert any(
+        "reason=remove_board" in ln and "\tREFUSED\t" in ln and "action=archive" in ln
+        for ln in _audit_lines()
+    ), _audit_lines()
+
+
+def test_remove_board_archive_refuses_on_a_live_claim_lock(kanban_home):
+    """Liveness is status OR an unexpired claim lock, on this branch too."""
+    kb.create_board("locked", name="Locked")
+    with kb.connect_closing(board="locked") as conn:
+        task_id = kb.create_task(conn, title="claimed", assignee="daedalus")
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_expires=? WHERE id=?",
+            (int(time.time()) + 900, task_id),
+        )
+        conn.commit()
+
+    with pytest.raises(ValueError, match="running or holding"):
+        kb.remove_board("locked", archive=True)
+    assert kb.board_dir("locked").is_dir()
+
+
+def test_remove_board_archive_allowed_when_idle_and_audited(kanban_home):
+    """ALLOW control: the refusal is not bought by refusing every archive.
+
+    Also pins deliverable 2b on the happy path -- ATTEMPT before the move,
+    ARCHIVE after it, both naming the destination, both written OUTSIDE the
+    tree that moved.
+    """
+    kb.create_board("stale", name="Stale")
+    with kb.connect_closing(board="stale") as conn:
+        task_id = kb.create_task(conn, title="finished", assignee="daedalus")
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (task_id,))
+        conn.commit()
+
+    bdir = kb.board_dir("stale")
+    ws = bdir / "workspaces" / task_id
+    ws.mkdir(parents=True)
+    (ws / "work.txt").write_text("finished work\n", encoding="utf-8")
+
+    res = kb.remove_board("stale", archive=True)
+
     assert res["action"] == "archived"
-    assert Path(res["new_path"]).is_dir()
+    moved = Path(res["new_path"])
+    assert moved.is_dir()
+    assert not bdir.exists()
+    assert (moved / "workspaces" / task_id / "work.txt").is_file(), (
+        "archive must stay recoverable"
+    )
+
+    lines = _audit_lines()
+    attempts = [
+        ln for ln in lines
+        if "reason=remove_board" in ln and "\tATTEMPT\t" in ln and "action=archive" in ln
+    ]
+    archived = [
+        ln for ln in lines
+        if "reason=remove_board" in ln and "\tARCHIVE\t" in ln
+    ]
+    assert attempts, lines
+    assert archived, lines
+    assert lines.index(attempts[0]) < lines.index(archived[0]), (
+        "ATTEMPT must precede the move it records"
+    )
+    assert str(moved) in archived[0], archived[0]
+
+
+def test_remove_board_archive_audit_survives_the_move(kanban_home):
+    """The audit log must not be inside the tree that just got relocated."""
+    kb.create_board("movedaway", name="Moved")
+    res = kb.remove_board("movedaway", archive=True)
+
+    log = kb.workspace_deletion_log_path()
+    assert log.is_file(), "no audit log at all after an archive"
+    moved = Path(res["new_path"]).resolve()
+    assert not log.resolve().is_relative_to(moved), (
+        f"audit log {log} travelled with the archived board {moved}"
+    )
+    # And it is findable by the same whole-HOME sweep the reviewer ran.
+    found = list((kanban_home / "kanban").rglob("workspace-deletions.log"))
+    assert found, "rglob over HERMES_HOME found no audit file"
 
 
 # ---------------------------------------------------------------------------
