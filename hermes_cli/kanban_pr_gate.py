@@ -165,6 +165,13 @@ class _PrefetchResult:
     # Per-key cause text for lookups that raised. Carried rather than logged so
     # the locked pass owns the ONE warning a failed lookup is allowed to emit.
     errors: dict[tuple[str, int], str] = field(default_factory=dict)
+    # ``task_id -> (fingerprint, repo)`` repo-context snapshot. Resolving a
+    # bare ``#N`` shells out to ``git remote -v``; carrying the answer keeps
+    # that subprocess — not just the ``gh`` one — out of the writer lock. The
+    # fingerprint is the card state the answer was derived from, so a card
+    # re-pointed in between is detected and skipped rather than resolved
+    # against a stale repository.
+    contexts: dict[str, tuple[tuple, Optional[str]]] = field(default_factory=dict)
 
 
 # Process-lifetime cache keyed by ``(repo.lower(), number)``. MERGED is the
@@ -572,8 +579,15 @@ def _closed_sentence(entries: list[tuple[PrRef, _CacheEntry]]) -> str:
 _PREFETCH_WORKERS = 6
 
 
-def _blocked_gate_refs(conn: sqlite3.Connection) -> list[tuple[str, list[PrRef]]]:
-    """Snapshot in-scope blocked cards and their currently resolvable PR refs."""
+def _gate_candidates(
+    conn: sqlite3.Connection,
+) -> list[tuple[str, tuple, Optional[str], Optional[str], str]]:
+    """In-scope blocked cards whose reason could name a PR. Pure DB reads.
+
+    Returns ``(task_id, fingerprint, workspace_path, body, reason)``. The
+    fingerprint is every input ``repo_context`` depends on, so a cached
+    context can be proven still applicable without re-deriving it.
+    """
     placeholders = ",".join("?" * len(GATE_BLOCK_KINDS))
     rows = conn.execute(
         f"SELECT id, body, workspace_path FROM tasks "
@@ -581,17 +595,47 @@ def _blocked_gate_refs(conn: sqlite3.Connection) -> list[tuple[str, list[PrRef]]
         f"ORDER BY id",
         tuple(sorted(GATE_BLOCK_KINDS)),
     ).fetchall()
-    candidates: list[tuple[str, list[PrRef]]] = []
+    out: list[tuple[str, tuple, Optional[str], Optional[str], str]] = []
     for row in rows:
         reason = _latest_block_reason(conn, row["id"])
         if not reason or ("#" not in reason and "pull/" not in reason):
             continue
-        default_repo = repo_context(
-            workspace_path=row["workspace_path"], body=row["body"],
+        fingerprint = (row["workspace_path"], row["body"], reason)
+        out.append(
+            (row["id"], fingerprint, row["workspace_path"], row["body"], reason)
         )
+    return out
+
+
+def _blocked_gate_refs(
+    conn: sqlite3.Connection,
+    *,
+    contexts: Optional[dict[str, tuple[tuple, Optional[str]]]] = None,
+) -> list[tuple[str, list[PrRef]]]:
+    """Snapshot in-scope blocked cards and their currently resolvable PR refs.
+
+    ``contexts`` is a repo-context snapshot taken by the unlocked prefetch.
+    When supplied this function performs NO subprocess I/O: a card absent from
+    the snapshot, or whose fingerprint moved since it was taken, is dropped so
+    the locked pass takes no action on it (the next tick re-derives it). When
+    it is None the caller is the direct, unlocked path and contexts are
+    resolved inline.
+    """
+    candidates: list[tuple[str, list[PrRef]]] = []
+    for task_id, fingerprint, workspace_path, body, reason in _gate_candidates(conn):
+        if contexts is None:
+            default_repo = repo_context(workspace_path=workspace_path, body=body)
+        else:
+            cached = contexts.get(task_id)
+            if cached is None or cached[0] != fingerprint:
+                # Card is new or changed since the unlocked snapshot. Resolving
+                # it here would mean shelling out under the caller's lock, so
+                # fail safe instead — a deferred gate costs one tick.
+                continue
+            default_repo = cached[1]
         refs = parse_pr_refs(reason, default_repo=default_repo)
         if refs:
-            candidates.append((row["id"], refs))
+            candidates.append((task_id, refs))
     return candidates
 
 
@@ -612,8 +656,15 @@ def prefetch_pr_gate_states(
     query_fn = query_fn or query_pr
     now = time.time() if now is None else now
     unique: dict[tuple[str, int], PrRef] = {}
-    for _, refs in _blocked_gate_refs(conn):
-        for ref in refs:
+    contexts: dict[str, tuple[tuple, Optional[str]]] = {}
+    # Resolve repo context HERE, outside the writer lock: this is the seam that
+    # shells out to ``git remote -v`` (same 5 s timeout as ``gh``), and a
+    # degraded workspace would otherwise hold the board's single-writer lock
+    # for seconds per card.
+    for task_id, fingerprint, workspace_path, body, reason in _gate_candidates(conn):
+        default_repo = repo_context(workspace_path=workspace_path, body=body)
+        contexts[task_id] = (fingerprint, default_repo)
+        for ref in parse_pr_refs(reason, default_repo=default_repo):
             key = (ref.repo.lower(), ref.number)
             entry = _CACHE.get(key)
             if entry is not None and (
@@ -630,6 +681,7 @@ def prefetch_pr_gate_states(
     if not selected:
         return _PrefetchResult(
             payloads=payloads, capped=capped, now=now, errors=errors,
+            contexts=contexts,
         )
 
     workers = min(_PREFETCH_WORKERS, len(selected))
@@ -651,6 +703,7 @@ def prefetch_pr_gate_states(
                 errors[key] = f"{type(exc).__name__}: {exc}"
     return _PrefetchResult(
         payloads=payloads, capped=capped, now=now, errors=errors,
+        contexts=contexts,
     )
 
 
@@ -691,8 +744,11 @@ def reevaluate_pr_gates(
     warned_failures: set[tuple[str, int]] = set()
     # Re-read and re-parse under the caller's dispatch lock. This is the state
     # revalidation seam for an unlocked prefetch: if the card changed in the
-    # interim, its new key is absent and resolution safely returns None.
-    for task_id, refs in _blocked_gate_refs(conn):
+    # interim, its fingerprint no longer matches the snapshot and it is skipped
+    # (fail-safe), so this pass performs NO subprocess I/O of any kind.
+    for task_id, refs in _blocked_gate_refs(
+        conn, contexts=None if prefetched is None else prefetched.contexts,
+    ):
 
         resolved: list[tuple[PrRef, _CacheEntry]] = []
         unresolved = False

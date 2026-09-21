@@ -747,3 +747,112 @@ def test_raising_lookup_without_prefetch_is_a_noop_with_one_warning(
     ]
     assert len(warnings) == 1, [r.getMessage() for r in warnings]
     assert "RuntimeError" in warnings[0].getMessage()
+
+
+def test_dispatch_tick_runs_no_subprocess_under_dispatch_lock(
+    kanban_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ZERO subprocesses under the writer lock — the whole class, not just gh.
+
+    Round-1 finding 4 was "network latency must not extend the board's
+    single-writer lock". Moving ``query_pr`` into the unlocked prefetch closed
+    the ``gh`` seam but left its sibling: ``repo_context()`` ->
+    ``_remotes_for()`` shells out to ``git remote -v`` with the same 5 s
+    timeout, and the locked revalidation pass re-parses every blocked card. A
+    degraded workspace (stale NFS mount, reclaimed scratch dir, held
+    ``index.lock``) therefore still held the lock for seconds per card.
+
+    The guard is deliberately on the SUBPROCESS seam rather than on either
+    function, so any future shell-out added to the locked pass fails here.
+    """
+    repo = tmp_path / "wt"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:o/r.git"],
+        cwd=repo, check=True,
+    )
+
+    lock_held = False
+    under_lock: list[list[str]] = []
+    real_run = subprocess.run
+
+    @contextlib.contextmanager
+    def tracked_lock(_db_path):
+        nonlocal lock_held
+        lock_held = True
+        try:
+            yield True
+        finally:
+            lock_held = False
+
+    def watched_run(argv, *a, **k):
+        if lock_held:
+            under_lock.append(list(argv)[:3])
+        return real_run(argv, *a, **k)
+
+    monkeypatch.setattr(kb, "_dispatch_tick_lock", tracked_lock)
+    monkeypatch.setattr(prg.subprocess, "run", watched_run)
+    monkeypatch.setattr(prg, "query_pr", lambda repo_, number: _merged())
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="gated card", workspace_path=str(repo),
+        )
+        kb.claim_task(conn, tid)
+        assert kb.block_task(
+            conn, tid, reason="merge PR #7 then unblock me", kind="needs_input",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+
+    with kb.connect() as conn:
+        result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
+
+    assert under_lock == [], f"subprocess ran under the dispatch lock: {under_lock}"
+    # The bare #7 still resolved against the workspace remote, so the gate
+    # actually fired — this is not a vacuous green from a skipped card.
+    assert result.gate_auto_resolved == [tid]
+
+
+def test_prefetch_repo_context_is_not_reused_when_the_card_changes(
+    kanban_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A card re-pointed between prefetch and the locked pass fails safe.
+
+    The prefetch's repo-context snapshot is only valid for the workspace/body
+    it was taken from. If either moved, the locked pass must take NO action
+    rather than resolve a bare ``#N`` against a stale repository.
+    """
+    repo = tmp_path / "wt"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:o/r.git"],
+        cwd=repo, check=True,
+    )
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="gated card", workspace_path=str(repo),
+        )
+        kb.claim_task(conn, tid)
+        assert kb.block_task(
+            conn, tid, reason="merge PR #7 then unblock me", kind="needs_input",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        prefetched = prg.prefetch_pr_gate_states(
+            conn, query_fn=_stub({("o/r", 7): _merged()}),
+        )
+        # The card moves to a different repository after the snapshot.
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            (str(tmp_path / "elsewhere"), tid),
+        )
+        conn.commit()
+        outcomes = prg.reevaluate_pr_gates(
+            conn, query_fn=_stub({("o/r", 7): _merged()}), prefetched=prefetched,
+        )
+
+    assert [o.action for o in outcomes] == []
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
