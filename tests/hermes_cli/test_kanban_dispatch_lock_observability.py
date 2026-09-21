@@ -3,6 +3,8 @@ import argparse
 import json
 import logging
 import os
+import subprocess
+import sys
 
 import pytest
 
@@ -55,3 +57,30 @@ def test_legacy_or_malformed_stamp_does_not_hide_skip(conn, payload):
         result = kb.dispatch_once(conn, dry_run=True)
         assert result.skipped_locked
         assert result.lock_holder == {}
+
+
+def test_other_process_reports_parent_holder_in_one_tick(conn):
+    code = """
+import json
+from hermes_cli import kanban_db as kb
+with kb.connect() as conn:
+    result = kb.dispatch_once(conn, dry_run=True)
+print(json.dumps({'skipped': result.skipped_locked, 'holder': result.lock_holder}))
+"""
+    with kb._dispatch_tick_lock(kb.kanban_db_path()) as held:
+        assert held
+        child = subprocess.run(
+            [sys.executable, "-c", code], stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+    result = json.loads(child.stdout)
+    assert result["skipped"] is True
+    assert result["holder"]["pid"] == os.getpid()
+    assert result["holder"]["age_seconds"] >= 0
+    assert "_dispatch_tick_lock" in result["holder"]["acquire_site"]
+
+
+def test_unknown_holder_is_explicit():
+    assert kb.format_dispatch_lock_skip({}) == (
+        "skipped: board dispatcher lock held by pid unknown for unknown; acquire site=unknown"
+    )
