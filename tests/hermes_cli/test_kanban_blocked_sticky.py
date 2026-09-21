@@ -29,6 +29,7 @@ landed via #28754 / #28781 ahead of this fix.
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -192,6 +193,43 @@ def test_explicit_block_with_satisfied_parent_is_named_by_dispatch_tick(kanban_h
         parent_id = kb.create_task(conn, title="parent task")
         child_id = kb.create_task(conn, title="needs input")
         assert kb.block_task(conn, child_id, reason="choose an API")
+        kb.link_tasks(conn, parent_id, child_id)
+
+        kb.claim_task(conn, parent_id)
+        kb.complete_task(conn, parent_id, result="done")
+        result = kbd.dispatch_once(conn, dry_run=True)
+
+        assert kb.get_task(conn, child_id).status == "blocked"
+        assert result.parent_satisfied_sticky == [child_id]
+
+
+def test_legacy_untagged_creation_hold_with_satisfied_parent_promotes(kanban_home: Path) -> None:
+    """Pre-source-tag creation events retain dependency-release behavior."""
+    with kbc.connect() as conn:
+        parent_id = kb.create_task(conn, title="parent task")
+        child_id = kb.create_task(conn, title="legacy hold", initial_status="blocked")
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE task_id = ? AND kind = 'blocked'",
+            (json.dumps({"reason": "initial_status", "status": "blocked", "actor": "user"}), child_id),
+        )
+        conn.commit()
+        kb.link_tasks(conn, parent_id, child_id)
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+                (int(time.time()), parent_id),
+            )
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, child_id).status == "ready"
+
+
+def test_explicit_block_cannot_spoof_legacy_creation_reason(kanban_home: Path) -> None:
+    """A user-controlled reason never turns an explicit block into a creation hold."""
+    with kbc.connect() as conn:
+        parent_id = kb.create_task(conn, title="parent task")
+        child_id = kb.create_task(conn, title="explicit hold")
+        assert kb.block_task(conn, child_id, reason="initial_status", kind="needs_input")
         kb.link_tasks(conn, parent_id, child_id)
 
         kb.claim_task(conn, parent_id)

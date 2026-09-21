@@ -1399,7 +1399,12 @@ def create_task(
                         conn,
                         task_id,
                         "blocked",
-                        {"reason": "initial_status", "status": "blocked", "actor": created_by or "user"},
+                        {
+                            "reason": "initial_status",
+                            "status": "blocked",
+                            "actor": created_by or "user",
+                            "source": "initial_status",
+                        },
                     )
                 if task_status == "todo":
                     # Parked behind an open parent: record why, exactly as
@@ -2077,7 +2082,15 @@ def _active_block_source(conn: sqlite3.Connection, task_id: str) -> Optional[str
     if not row or row["kind"] != "blocked":
         return None
     payload = _json_dict(row["payload"])
-    if payload.get("reason") == "initial_status":
+    if payload.get("source") == "initial_status":
+        return "initial_status"
+    explicit_fields = {
+        "kind", "source_status", "recurrences", "classified_in_place",
+        "requested_kind", "rekind_reason",
+    }
+    if payload.get("reason") == "initial_status" and explicit_fields.isdisjoint(payload):
+        # Compatibility for genuine pre-tag creation events. ``reason`` is
+        # caller-controlled on block_task and cannot override explicit origin.
         return "initial_status"
     return "explicit"
 
