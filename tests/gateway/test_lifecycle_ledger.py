@@ -125,6 +125,48 @@ def test_unbudgeted_teardown_is_diagnosed_but_never_becomes_the_reserve(
     assert records[-1]["budgeted"] is False
 
 
+def test_unbudgeted_stop_does_not_clobber_the_last_actionable_sample(
+    tmp_path: Path,
+) -> None:
+    """A manual stop between two SIGTERMs must not erase the reserve.
+
+    The reserve file is a single slot. Writing an unbudgeted sample into
+    it makes ``read_last_teardown_seconds`` return None — so a recorded
+    40s launchd teardown is lost and the next SIGTERM reserves the 15s
+    default instead, leaving post-drain persistence to run past
+    ExitTimeOut and be SIGKILLed. Unbudgeted samples belong in the
+    exit-diag log only.
+    """
+    from gateway.lifecycle_ledger import get_teardown_timing_path
+
+    record_teardown_timing(
+        40.0,
+        total_shutdown_seconds=75.0,
+        drain_seconds=35.0,
+        budgeted=True,
+        home=tmp_path,
+    )
+    assert read_last_teardown_seconds(tmp_path) == 40.0
+
+    record_teardown_timing(
+        95.0,
+        total_shutdown_seconds=120.0,
+        drain_seconds=25.0,
+        budgeted=False,
+        home=tmp_path,
+    )
+
+    # The budgeted measurement survives the unbudgeted stop...
+    assert read_last_teardown_seconds(tmp_path) == 40.0
+    assert json.loads(get_teardown_timing_path(tmp_path).read_text())[
+        "teardown_seconds"
+    ] == 40.0
+    # ...and the unbudgeted sample is still diagnosed.
+    diag = _exit_diag_records(tmp_path)
+    assert [r["teardown_seconds"] for r in diag] == [40.0, 95.0]
+    assert diag[-1]["budgeted"] is False
+
+
 def test_oversized_budgeted_teardown_is_rejected_against_the_live_ceiling(
     tmp_path: Path,
 ) -> None:
@@ -152,9 +194,6 @@ def test_oversized_budgeted_teardown_is_rejected_against_the_live_ceiling(
 
     # Unbounded read still sees the poisoned value...
     assert read_last_teardown_seconds(tmp_path) == 55.0
-    # ...and it is exactly what zeroes the drain.
-    assert resolve_launchd_capped_drain(50.0, 60.0, last_teardown_s=55.0) == 0.0
-
     # Bounded read (what the gateway uses at boot) rejects it.
     assert read_last_teardown_seconds(tmp_path, max_seconds=ceiling) is None
     assert (
@@ -165,6 +204,42 @@ def test_oversized_budgeted_teardown_is_rejected_against_the_live_ceiling(
         )
         == 35.0
     )
+    # ...and the resolver bounds it too, so even an unfiltered sample
+    # reaching the arithmetic (e.g. off a runner attribute) cannot zero
+    # the drain. Both layers, because the read is not the only path in.
+    assert resolve_launchd_capped_drain(50.0, 60.0, last_teardown_s=55.0) == 35.0
+
+
+def test_sample_exactly_at_the_ceiling_is_rejected(tmp_path: Path) -> None:
+    """The bound is inclusive: at the ceiling the drain is exactly zero.
+
+    ``value > max_seconds`` let a sample equal to the ceiling through, and
+    that is precisely the value that drives the drain to 0.0 — a real 50s
+    budgeted teardown under the 60s clamp would drop every in-flight
+    session with no drain at all.
+    """
+    from gateway.lifecycle_ledger import get_teardown_timing_path
+    from gateway.restart import (
+        resolve_launchd_capped_drain,
+        resolve_max_actionable_teardown_reserve_s,
+    )
+
+    ceiling = resolve_max_actionable_teardown_reserve_s(60.0)
+    assert ceiling == 50.0
+    assert ceiling is not None
+
+    path = get_teardown_timing_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"teardown_seconds": ceiling, "budgeted": True}))
+
+    assert read_last_teardown_seconds(tmp_path, max_seconds=ceiling) is None
+    assert resolve_launchd_capped_drain(50.0, 60.0, last_teardown_s=ceiling) == 35.0
+    # Just below the ceiling is still honoured — the bound is not a blanket
+    # rejection of large samples.
+    path.write_text(
+        json.dumps({"teardown_seconds": ceiling - 1.0, "budgeted": True})
+    )
+    assert read_last_teardown_seconds(tmp_path, max_seconds=ceiling) == 49.0
 
 
 def test_poisoned_reserve_does_not_survive_the_next_successful_stop(

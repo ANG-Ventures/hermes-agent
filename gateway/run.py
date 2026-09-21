@@ -3309,8 +3309,8 @@ from gateway.restart import (
     read_launchd_exit_timeout_s,
     resolve_armed_shutdown_watchdog_delay,
     resolve_cron_drain_budget,
+    resolve_elapsed_adjusted_drain,
     resolve_launchd_capped_drain,
-    resolve_launchd_shutdown_watchdog_delay,
     resolve_max_actionable_teardown_reserve_s,
     resolve_replace_takeover_grace_s,
 )
@@ -19770,6 +19770,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
             timeout = effective_stop_drain_timeout(self)
+            # The watchdog was armed at the TOP of stop() with an ABSOLUTE
+            # deadline, but this drain is a RELATIVE budget starting only
+            # now — after the notify/mark/cancel phases logged above. Spend
+            # their elapsed time out of the drain, not out of the teardown
+            # reserve that sits between the drain and os._exit.
+            timeout = resolve_elapsed_adjusted_drain(
+                timeout,
+                getattr(self, "_launchd_exit_timeout_s", None),
+                signal_driven=getattr(self, "_stop_requested_by_signal", False),
+                elapsed_s=_phase_elapsed(),
+            )
             if timeout < self._restart_drain_timeout:
                 logger.warning(
                     "Shutdown drain capped to %.0fs (configured %.0fs) to fit "
