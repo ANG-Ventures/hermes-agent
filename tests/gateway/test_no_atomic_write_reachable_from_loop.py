@@ -88,8 +88,6 @@ def _repo_root() -> Path:
 # To fix one: move the call off-loop (or behind a loop-conditional dispatch,
 # annotated `# noqa: atomic-write-on-loop <reason>`), then DELETE its line here.
 REACHABLE_BASELINE = frozenset({
-    "gateway/deferred_restart.py _run_armed -> os.replace",
-    "gateway/deferred_restart.py _run_as_leader -> os.replace",
     "gateway/lifecycle_ledger.py record_startup_async -> atomic_json_write",
     "gateway/platforms/api_server.py _handle_artifact_upload -> os.fsync",
     "gateway/platforms/base.py cancel_background_tasks -> atomic_json_write",
@@ -98,33 +96,23 @@ REACHABLE_BASELINE = frozenset({
     "gateway/platforms/weixin.py connect -> atomic_json_write",
     "gateway/platforms/weixin.py qr_login -> atomic_json_write",
     "gateway/platforms/yuanbao.py open -> atomic_json_write",
-    "gateway/run.py _cancel_pending_boot_resumes_for_shutdown -> os.replace",
     "gateway/run.py _execute_mcp_reload -> atomic_json_write",
     "gateway/run.py _finalize_shutdown_agents -> atomic_json_write",
     "gateway/run.py _handle_message -> atomic_replace",
     "gateway/run.py _handle_message_with_agent -> atomic_json_write",
-    "gateway/run.py _interrupt_and_clear_session -> os.replace",
     "gateway/run.py _prepare_auto_resume_decisions -> os.replace",
     # Unmasked by the status-write fix, NOT introduced by it: the DFS reports
-    # only the FIRST sink per coroutine, so these two chains
-    # (_release_running_agent_state>..>transition and
-    # _schedule_resume_pending_sessions>..>_persist>_write) were shadowed by
-    # write_runtime_status.  Verified present on pristine fork/main by masking
-    # the status sink and re-running the walk.
+    # only the FIRST sink per coroutine, so the
+    # _schedule_resume_pending_sessions>..>_persist>_write chain was shadowed
+    # by write_runtime_status.  Verified present on pristine fork/main by
+    # masking the status sink and re-running the walk.
     "gateway/run.py _platform_reconnect_watcher -> os.fsync",
-    "gateway/run.py _run_agent_inner -> os.replace",
-    "gateway/run.py _process_handoff -> os.replace",
-    "gateway/run.py _reap_dead_running_agents_loop -> os.replace",
     "gateway/run.py _restore_resume_pending_sessions_at_startup -> os.fsync",
-    "gateway/run.py _run_startup_resume_event -> os.replace",
     "gateway/run.py _stop_impl -> atomic_json_write",
     "gateway/run.py _stop_impl_body -> atomic_json_write",
     "gateway/run.py start -> atomic_json_write",
     "gateway/run.py start_gateway -> atomic_json_write",
     "gateway/run.py stop -> atomic_json_write",
-    "gateway/slash_commands.py _handle_reset_command -> os.replace",
-    "gateway/slash_commands.py _handle_resume_command -> os.replace",
-    "gateway/slash_commands.py _try_discord_branch_thread -> os.replace",
     "plugins/platforms/matrix/adapter.py _resolve_message_context -> atomic_json_write",
     "plugins/platforms/telegram/adapter.py _handle_location_message -> atomic_json_write",
     "plugins/platforms/telegram/adapter.py _handle_media_message -> atomic_json_write",
