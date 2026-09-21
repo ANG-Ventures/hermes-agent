@@ -1158,6 +1158,67 @@ class TestForceReloadSymmetry:
         hold.set()
         assert blocker_returned.wait(10), "abandoned hook worker never drained"
 
+    def test_concurrent_pre_tool_call_callback_is_not_treated_as_timed_out(
+        self, monkeypatch
+    ):
+        """Normal overlap across gateway sessions must not fail closed."""
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 2.0
+        )
+
+        first_started = threading.Event()
+        release_first = threading.Event()
+        calls = []
+
+        def overlapping_policy(*, session_id="", **_kwargs):
+            calls.append(session_id)
+            if session_id == "session-a":
+                first_started.set()
+                release_first.wait(timeout=10.0)
+            return None
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [overlapping_policy]
+        first_results = []
+        first = threading.Thread(
+            target=lambda: first_results.extend(
+                mgr.invoke_hook("pre_tool_call", session_id="session-a")
+            )
+        )
+        first.start()
+        assert first_started.wait(timeout=10.0)
+
+        # This is a normal concurrent invocation, not a retry after timeout.
+        # It must execute the callback rather than synthesize a block.
+        assert mgr.invoke_hook("pre_tool_call", session_id="session-b") == []
+        assert calls == ["session-a", "session-b"]
+
+        release_first.set()
+        first.join(timeout=10.0)
+        assert not first.is_alive()
+        assert first_results == []
+
+    def test_advisory_pre_tool_call_timeout_fails_open(self, monkeypatch):
+        """An advisory callback timeout must not override its fail-open policy."""
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
+        )
+
+        hold = threading.Event()
+
+        def advisory_policy(**_kwargs):
+            hold.wait(timeout=10.0)
+            return None
+
+        setattr(advisory_policy, "_hermes_timeout_fail_closed", False)
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [advisory_policy]
+
+        # Both the original timeout and a follow-up during suppression fail open.
+        assert mgr.invoke_hook("pre_tool_call", session_id="session-a") == []
+        assert mgr.invoke_hook("pre_tool_call", session_id="session-a") == []
+        hold.set()
+
     def test_pre_tool_call_timeout_fail_closed(self, monkeypatch):
         """Timed-out pre_tool_call must return a block directive, not allow.
 

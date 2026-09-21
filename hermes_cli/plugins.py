@@ -3803,10 +3803,10 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
-        # In-flight / recently-timed-out hook callbacks. Keyed by
-        # (hook_name, id(cb)) so a stuck policy hook cannot spawn a new
-        # abandoned daemon thread on every subsequent fire.
-        self._hook_running_callbacks: Dict[tuple, object] = {}
+        # Recently timed-out hook callbacks. Keyed by (hook_name, id(cb));
+        # suppression starts only after an invocation actually exceeds its
+        # budget. Ordinary concurrent invocations are not timeouts and must
+        # not block one another in the multiplexed gateway.
         self._hook_timeout_suppressed_until: Dict[tuple, float] = {}
         self._hook_timeout_lock = threading.Lock()
         self._hook_timeout_suppression_seconds = _HOOK_TIMEOUT_SUPPRESSION_SECONDS
@@ -4200,7 +4200,6 @@ class PluginManager:
             self._platform_handler_factories.clear()
             self._context_engine = None
             with self._hook_timeout_lock:
-                self._hook_running_callbacks.clear()
                 self._hook_timeout_suppressed_until.clear()
             self._discovered = False
         else:
@@ -5590,8 +5589,10 @@ class PluginManager:
         policy hook ``pre_tool_call`` are bounded by
         ``plugins.hook_callback_timeout`` (default 30s). On timeout the worker
         is abandoned (not joined) so we do not reintroduce the #6622 hang.
-        Timed-out or still-running ``pre_tool_call`` callbacks fail closed
-        with a block directive; other bounded hooks fail open (skip).
+        Timed-out ``pre_tool_call`` callbacks fail closed by default; shell
+        hooks preserve their individual ``fail_closed`` setting. Other bounded
+        hooks fail open (skip). A timeout suppresses later invocations of that
+        callback briefly, but ordinary concurrent invocations remain independent.
 
         ``subagent_stop`` (and any hook in ``_HOOK_CALLER_THREAD_HOOKS``)
         always runs on the caller thread to preserve the documented parent-
@@ -5621,26 +5622,26 @@ class PluginManager:
         results: List[Any] = []
         timeout = _resolve_hook_callback_timeout()
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
-        fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
-
         for cb in callbacks:
             callback_name = getattr(cb, "__name__", repr(cb))
             callback_key = (hook_name, id(cb))
+            fail_closed = bool(
+                getattr(
+                    cb,
+                    "_hermes_timeout_fail_closed",
+                    hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS,
+                )
+            )
             try:
                 if use_timeout:
-                    token = object()
                     now = time.monotonic()
                     with self._hook_timeout_lock:
                         suppressed_until = self._hook_timeout_suppressed_until.get(
                             callback_key
                         )
-                        running = callback_key in self._hook_running_callbacks
-                        if (
-                            suppressed_until is not None and suppressed_until > now
-                        ) or running:
+                        if suppressed_until is not None and suppressed_until > now:
                             logger.warning(
-                                "Hook '%s' callback %s skipped after previous "
-                                "timeout or while still running",
+                                "Hook '%s' callback %s suppressed after callback timeout",
                                 hook_name,
                                 callback_name,
                             )
@@ -5649,7 +5650,6 @@ class PluginManager:
                             continue
                         if suppressed_until is not None:
                             self._hook_timeout_suppressed_until.pop(callback_key, None)
-                        self._hook_running_callbacks[callback_key] = token
 
                     context = contextvars.copy_context()
                     done = threading.Event()
@@ -5658,8 +5658,6 @@ class PluginManager:
 
                     def _runner(
                         _cb: Callable[..., Any] = cb,
-                        _key: tuple = callback_key,
-                        _token: object = token,
                     ) -> None:
                         try:
                             # Route through _invoke_hook_callback so the
@@ -5671,9 +5669,6 @@ class PluginManager:
                         except Exception as exc:
                             failure["exc"] = exc
                         finally:
-                            with self._hook_timeout_lock:
-                                if self._hook_running_callbacks.get(_key) is _token:
-                                    self._hook_running_callbacks.pop(_key, None)
                             done.set()
 
                     thread = threading.Thread(
@@ -5681,6 +5676,7 @@ class PluginManager:
                         name=f"hermes-hook-{callback_name}"[:40],
                         daemon=True,
                     )
+                    started_at = time.monotonic()
                     thread.start()
                     if not done.wait(timeout=timeout):
                         # Do not join — that would reintroduce the #6622 hang.
@@ -5689,10 +5685,13 @@ class PluginManager:
                                 time.monotonic()
                                 + self._hook_timeout_suppression_seconds
                             )
+                        elapsed = time.monotonic() - started_at
                         logger.warning(
-                            "Hook '%s' callback %s timed out after %gs — skipping",
+                            "Hook '%s' callback %s timed out after %.3fs "
+                            "(budget %gs) — skipping",
                             hook_name,
                             callback_name,
+                            elapsed,
                             timeout,
                         )
                         if fail_closed:

@@ -651,6 +651,10 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
 
     _callback.__name__ = f"shell_hook[{spec.event}:{spec.command}]"
     _callback.__qualname__ = _callback.__name__
+    # The outer plugin callback budget can expire before the shell hook's own
+    # subprocess timeout under severe scheduler contention. Preserve this
+    # individual hook's configured failure policy at that outer boundary.
+    setattr(_callback, "_hermes_timeout_fail_closed", spec.fail_closed)
     return _callback
 
 

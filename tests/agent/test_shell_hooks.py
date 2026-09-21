@@ -144,7 +144,18 @@ class TestMatcher:
 
 class TestCallbackSubprocess:
 
+    def test_callback_carries_timeout_failure_policy(self):
+        advisory = shell_hooks._make_callback(
+            shell_hooks.ShellHookSpec(event="pre_tool_call", command="true")
+        )
+        enforcing = shell_hooks._make_callback(
+            shell_hooks.ShellHookSpec(
+                event="pre_tool_call", command="true", fail_closed=True
+            )
+        )
 
+        assert getattr(advisory, "_hermes_timeout_fail_closed") is False
+        assert getattr(enforcing, "_hermes_timeout_fail_closed") is True
 
     def test_block_translation_end_to_end(self, tmp_path):
         """v1 schema-bug regression gate.
