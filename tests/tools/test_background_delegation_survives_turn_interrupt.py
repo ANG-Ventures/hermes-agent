@@ -217,6 +217,8 @@ def test_background_batch_runs_with_parent_interrupt_already_set(monkeypatch):
     batch honored the parent's flag it would fabricate ``interrupted`` entries
     for every still-pending child instead of waiting for real results.
     """
+    import concurrent.futures as _cf
+
     import run_agent
 
     started = threading.Event()
@@ -230,6 +232,30 @@ def test_background_batch_runs_with_parent_interrupt_already_set(monkeypatch):
             "summary": f"done-{task_index}", "api_calls": 1,
             "duration_seconds": 0.1, "model": "m", "exit_reason": "completed",
         }
+
+    # Handshake, not a sleep. The batch poll loop only reads the parent's
+    # interrupt flag at the TOP of each iteration (delegate_tool.py ~4566) and
+    # then blocks in concurrent.futures.wait(timeout=0.5). Releasing the
+    # children right after interrupt() usually lets them finish inside that
+    # wait, so the loop never re-checks the flag and the mutation
+    # honor_parent_interrupt=True escapes (~50% of runs, measured).
+    # delegate_tool re-imports `wait` from the module on every iteration, so
+    # counting entries here observes the loop directly: two entries after the
+    # interrupt means at least one flag check provably ran with the flag set
+    # and futures still pending.
+    _real_cf_wait = _cf.wait
+    interrupt_set = threading.Event()
+    loop_rechecked = threading.Event()
+    waits_after_interrupt = []
+
+    def _counting_wait(fs, timeout=None, return_when=_cf.ALL_COMPLETED):
+        if interrupt_set.is_set():
+            waits_after_interrupt.append(time.time())
+            if len(waits_after_interrupt) >= 2:
+                loop_rechecked.set()
+        return _real_cf_wait(fs, timeout=timeout, return_when=return_when)
+
+    monkeypatch.setattr(_cf, "wait", _counting_wait)
 
     dt = _patch_delegate(monkeypatch, slow_child)
     _bind_tui_session()
@@ -247,6 +273,12 @@ def test_background_batch_runs_with_parent_interrupt_already_set(monkeypatch):
     assert started.wait(timeout=10)
 
     run_agent.AIAgent.interrupt(parent, "another message")
+    interrupt_set.set()
+    # Hold the children until the poll loop has demonstrably gone round again
+    # with the flag set. Bounded: a mutant that honors the flag BREAKS out of
+    # the loop instead of re-waiting, so it never signals — that path falls
+    # through on the timeout and is then caught by the result assertions.
+    loop_rechecked.wait(timeout=3.0)
     release.set()
 
     evt = _drain_one()
