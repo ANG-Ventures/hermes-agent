@@ -61,20 +61,34 @@ DESTRUCTIVE = {
     "_remove_tree",
 }
 
-#: Attribute calls on a Path that relocate the whole node.
+#: Attribute calls on a Path that relocate the whole node. Matched only at
+#: arity 1: ``Path.rename(target)`` / ``Path.replace(target)`` take exactly
+#: one argument, while ``str.replace(old, new)`` always takes two or more --
+#: without that discriminator a string normalisation loop reads as a
+#: directory relocation (measured on ``_normalize_dispatch_file_path``).
 DESTRUCTIVE_METHODS = {"rename", "replace"}
 
 #: The gates that make such a call legitimate. Deliberately NOT including
 #: ``_assert_not_delegated_child_mutation``: that is an authority check on the
 #: CALLER, not a check on the target's liveness, and counting it satisfied the
 #: lint at the exact head that carried the round-6 defect (measured).
+#:
+#: ``_audit_workspace_deletion`` is deliberately NOT here either. An audit call
+#: RECORDS an event; it never refuses an operation, so a regression that keeps
+#: the logging while dropping the refusal would pass a lint that counted it --
+#: measured on PR #785 head 9b2d17ba, where an audit-then-``rename``/``rmtree``
+#: function linted clean. The audit is a separate invariant, asserted
+#: independently by the deletion-audit tests.
 GATES = {
     "_board_has_live_cards",
     "_live_owners_of_path",
     "_task_has_live_run",
-    "_audit_workspace_deletion",
     "safe_remove_workspace_dir",
 }
+
+#: Gates that refuse INTERNALLY: routing the destruction through one of these
+#: *is* the gate, so no separate refusal is owed at the call site.
+SELF_GATING = {"safe_remove_workspace_dir"}
 
 NOQA = "noqa: gate-dominance"
 
@@ -87,18 +101,51 @@ def _dotted(node: ast.AST) -> str:
     return ""
 
 
+def _names_in(node: ast.AST) -> set[str]:
+    """Every bare identifier appearing anywhere under *node*."""
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
 class _Collector(ast.NodeVisitor):
-    """Record every call with the chain of ``if`` tests enclosing it."""
+    """Record every call with the chain of ``if`` tests enclosing it.
+
+    Beyond the enclosing-branch chain, two more facts are recorded per gate,
+    because "a gate call appears earlier" is not the property that keeps a
+    workspace alive (measured on PR #785 head 9b2d17ba -- three distinct
+    shapes satisfied the round-6 lint while a live card's directory could
+    still be destroyed):
+
+    * ``checked`` -- the identifiers the gate was asked ABOUT, so a gate on
+      some other object cannot bless the destruction of this one; and
+    * ``refusing`` -- whether the gate's answer is actually consumed by a
+      conditional. A gate whose result nothing reads refuses nothing.
+    """
 
     def __init__(self) -> None:
         self.stack: list[int] = []
-        self.calls: list[tuple[str, int, tuple[int, ...], bool]] = []
+        # (short_name, lineno, ctx, is_gate, checked_names, refusing, bound_to)
+        self.calls: list[tuple] = []
+        #: Identifiers that appear in some ``if``/``while`` test in this
+        #: function -- i.e. names whose value can drive a refusal.
+        self.tested_names: set[str] = set()
+        #: ``name -> names it was derived from`` for single-target assignments,
+        #: so ``d = board_dir(slug)`` links ``d`` back to ``slug``.
+        self.provenance: dict[str, set[str]] = {}
+        #: Depth of ``if``/``while`` test expressions currently being visited.
+        self._in_test = 0
+        #: Name the current assignment binds to, if any.
+        self._assign_target: str | None = None
+
+    # -- structure ---------------------------------------------------------
 
     def visit_If(self, node: ast.If) -> None:
         # The test itself runs in the ENCLOSING context, not the branch it
         # guards -- `if _board_has_live_cards(d): raise` is a gate that
         # dominates both arms, so it must be recorded at the current depth.
+        self.tested_names |= _names_in(node.test)
+        self._in_test += 1
         self.visit(node.test)
+        self._in_test -= 1
         # Body and each orelse arm are distinct branch contexts; the test's
         # own line id distinguishes them, negated for the else arm.
         self.stack.append(node.lineno)
@@ -110,6 +157,29 @@ class _Collector(ast.NodeVisitor):
             self.visit(stmt)
         self.stack.pop()
 
+    def visit_While(self, node: ast.While) -> None:
+        self.tested_names |= _names_in(node.test)
+        self._in_test += 1
+        self.visit(node.test)
+        self._in_test -= 1
+        self.stack.append(node.lineno)
+        for stmt in node.body:
+            self.visit(stmt)
+        self.stack.pop()
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        derived = _names_in(node.value)
+        for t in targets:
+            self.provenance.setdefault(t, set()).update({t, *derived})
+        prev, self._assign_target = self._assign_target, (
+            targets[0] if len(targets) == 1 else None
+        )
+        self.visit(node.value)
+        self._assign_target = prev
+
+    # -- calls -------------------------------------------------------------
+
     def visit_Call(self, node: ast.Call) -> None:
         name = _dotted(node.func)
         short = name.rsplit(".", 1)[-1]
@@ -117,18 +187,57 @@ class _Collector(ast.NodeVisitor):
             name in DESTRUCTIVE
             or short in DESTRUCTIVE
             or (isinstance(node.func, ast.Attribute)
-                and node.func.attr in DESTRUCTIVE_METHODS)
+                and node.func.attr in DESTRUCTIVE_METHODS
+                and len(node.args) == 1 and not node.keywords)
         )
         is_gate = name in GATES or short in GATES
         if is_destructive or is_gate:
-            self.calls.append((short, node.lineno, tuple(self.stack), is_gate))
+            checked: set[str] = set()
+            for arg in node.args:
+                checked |= _names_in(arg)
+            for kw in node.keywords:
+                checked |= _names_in(kw.value)
+            if isinstance(node.func, ast.Attribute):
+                # `d.rename(dest)` destroys `d`, which is the receiver.
+                checked |= _names_in(node.func.value)
+            # Self-gating helpers refuse internally, so using one IS the gate.
+            refusing = bool(self._in_test) or short in SELF_GATING
+            self.calls.append((
+                short, node.lineno, tuple(self.stack), is_gate,
+                frozenset(checked), refusing, self._assign_target,
+            ))
+        prev, self._assign_target = self._assign_target, None
         self.generic_visit(node)
+        self._assign_target = prev
 
 
 def _functions(tree: ast.AST):
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             yield node
+
+
+def _related(names: frozenset, provenance: dict[str, set[str]]) -> set[str]:
+    """Close *names* over simple assignment provenance.
+
+    ``d = board_dir(slug)`` means a gate asked about ``slug`` is a gate about
+    ``d``; without this, the real ``remove_board`` shape would read as a gate
+    on a different target.
+    """
+    out = set(names)
+    changed = True
+    while changed:
+        changed = False
+        for name in list(out):
+            for src in provenance.get(name, ()):  # d -> {d, slug}
+                if src not in out:
+                    out.add(src)
+                    changed = True
+        for tgt, srcs in provenance.items():     # slug -> d, the other way
+            if tgt not in out and srcs & out:
+                out.add(tgt)
+                changed = True
+    return out
 
 
 def _violations(path: Path) -> list[str]:
@@ -141,6 +250,7 @@ def _violations(path: Path) -> list[str]:
         collector = _Collector()
         for stmt in func.body:
             collector.visit(stmt)
+        prov = collector.provenance
         gates = [c for c in collector.calls if c[3]]
         destructive = [c for c in collector.calls if not c[3]]
         if not destructive:
@@ -150,14 +260,29 @@ def _violations(path: Path) -> list[str]:
         branches = {d[2] for d in destructive}
         if len(branches) < 2:
             continue
-        for name, lineno, ctx, _ in destructive:
+        for name, lineno, ctx, _is_gate, target_names, _r, _b in destructive:
             line = lines[lineno - 1] if lineno - 1 < len(lines) else ""
             if NOQA in line:
                 continue
-            dominating = [
-                g for g in gates
-                if g[1] < lineno and set(g[2]).issubset(set(ctx))
-            ]
+            if name in SELF_GATING:
+                continue
+            targets = _related(target_names, prov)
+            dominating = []
+            for g in gates:
+                g_name, g_line, g_ctx, _, g_checked, g_refusing, g_bound = g
+                if g_line >= lineno or not set(g_ctx).issubset(set(ctx)):
+                    continue
+                # A gate nothing reads refuses nothing. Either the call sits
+                # in a conditional test, or its result is bound to a name that
+                # some later test reads (`live = _board_has_live_cards(slug)`
+                # ... `if live:`).
+                if not (g_refusing
+                        or (g_bound and g_bound in collector.tested_names)):
+                    continue
+                # ...and it has to be a gate about THIS target: asking whether
+                # some OTHER card is live is the cross-owner data-loss shape.
+                if g_name in SELF_GATING or (_related(g_checked, prov) & targets):
+                    dominating.append(g)
             if not dominating:
                 out.append(
                     f"{path.relative_to(REPO)}:{lineno} {func.name}(): "
@@ -224,4 +349,113 @@ def test_the_lint_accepts_a_hoisted_gate(tmp_path):
         found = _violations(sample)
     finally:
         REPO = original
+    assert not found, found
+
+
+def _lint(tmp_path, src: str) -> list[str]:
+    """Run the lint over an inline sample with ``REPO`` pointed at *tmp_path*."""
+    sample = tmp_path / "sample.py"
+    sample.write_text(src, encoding="utf-8")
+    global REPO
+    original, REPO = REPO, tmp_path
+    try:
+        return _violations(sample)
+    finally:
+        REPO = original
+
+
+# ---------------------------------------------------------------------------
+# The three fake-green shapes FleetReview measured on PR #785 (findings
+# "Audit logging is incorrectly treated as a deletion gate" and "Dominance is
+# accepted without verifying the gate protects the deletion target"). Each one
+# passed the round-6 lint while a live card's workspace could still be
+# destroyed -- a lint that blesses these is worse than no lint, because it
+# certifies the class it exists to catch.
+# ---------------------------------------------------------------------------
+
+def test_audit_logging_alone_is_not_a_gate(tmp_path):
+    """An audit call RECORDS; it never refuses. It cannot bless a deletion.
+
+    A regression that preserves auditing while dropping the liveness refusal
+    must still be caught: the audit line names the deleter of a running
+    worker's cwd, it does not prevent the deletion.
+    """
+    found = _lint(tmp_path, (
+        "import shutil\n"
+        "def retire(d, *, archive=True):\n"
+        "    _audit_workspace_deletion(d, reason='retire')\n"
+        "    if archive:\n"
+        "        d.rename(dest)\n"
+        "    else:\n"
+        "        shutil.rmtree(d)\n"
+    ))
+    assert any("rename" in v for v in found), found
+    assert any("rmtree" in v for v in found), found
+
+
+def test_a_gate_on_a_different_target_does_not_dominate(tmp_path):
+    """Checking that SOME other thing is idle says nothing about ``d``.
+
+    This is the cross-owner data-loss shape: ``_task_has_live_run(conn,
+    caller_id)`` is true of the CALLER, while the directory being removed
+    belongs to a different, live card.
+    """
+    found = _lint(tmp_path, (
+        "import shutil\n"
+        "def retire(d, other, *, archive=True):\n"
+        "    if _board_has_live_cards(other):\n"
+        "        raise ValueError('live')\n"
+        "    if archive:\n"
+        "        d.rename(dest)\n"
+        "    else:\n"
+        "        shutil.rmtree(d)\n"
+    ))
+    assert any("rename" in v for v in found), found
+
+
+def test_a_discarded_gate_result_does_not_dominate(tmp_path):
+    """A gate whose answer nothing reads cannot refuse anything."""
+    found = _lint(tmp_path, (
+        "import shutil\n"
+        "def retire(d, *, archive=True):\n"
+        "    _live_owners_of_path(d)\n"
+        "    if archive:\n"
+        "        d.rename(dest)\n"
+        "    else:\n"
+        "        shutil.rmtree(d)\n"
+    ))
+    assert any("rename" in v for v in found), found
+
+
+def test_a_gate_bound_to_a_name_and_then_refused_does_dominate(tmp_path):
+    """ALLOW control: the real ``remove_board`` shape must stay accepted.
+
+    The gate result is bound to a name and refused one statement later, and
+    the destructive target derives from the slug the gate was asked about.
+    Without this control the fix above would just be "reject everything".
+    """
+    found = _lint(tmp_path, (
+        "import shutil\n"
+        "def retire(slug, *, archive=True):\n"
+        "    d = board_dir(slug)\n"
+        "    live = _board_has_live_cards(slug)\n"
+        "    if live:\n"
+        "        raise ValueError('live')\n"
+        "    if archive:\n"
+        "        d.rename(dest)\n"
+        "    else:\n"
+        "        shutil.rmtree(d)\n"
+    ))
+    assert not found, found
+
+
+def test_routing_through_the_safe_choke_point_is_accepted(tmp_path):
+    """ALLOW control: the choke point gates internally, so using it is safe."""
+    found = _lint(tmp_path, (
+        "def reap(p, tid, *, archive=True):\n"
+        "    if archive:\n"
+        "        safe_remove_workspace_dir(p, task_id=tid, reason='a')\n"
+        "    else:\n"
+        "        safe_remove_workspace_dir(p, task_id=tid, reason='b')\n"
+    ))
     assert not found, found
