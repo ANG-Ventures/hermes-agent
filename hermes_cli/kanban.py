@@ -28,6 +28,7 @@ from typing import Any, Optional
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.kanban_identity import safe_comment_provenance
+from hermes_constants import get_default_hermes_root
 
 
 # ---------------------------------------------------------------------------
@@ -3336,7 +3337,15 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             except Exception:
                 pass
     if getattr(args, "json", False):
+        # The human-readable tick prints the awaiting-HUMAN detector below;
+        # without this key a JSON consumer is exactly as blind as it was
+        # before the detector existed. Same dry-run rule as the text path:
+        # report, but only arm/send on a real tick.
+        review_awaiting = _collect_review_awaiting_human(
+            alert=not args.dry_run
+        )
         print(json.dumps({
+            "review_awaiting_human": review_awaiting,
             "reclaimed": res.reclaimed,
             "crashed": res.crashed,
             "timed_out": res.timed_out,
@@ -3462,19 +3471,32 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — HUMAN review required): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
-    _print_review_awaiting_human()
+    # --dry-run is documented (and mandated by the incident runbook) as the
+    # SAFE probe, so it must not arm alerts or send: arming writes a durable
+    # review_stale_alerted event, and the send fires a real Discord message.
+    # The detector still PRINTS — that is the whole value of the line — it
+    # just stops mutating the board it is only supposed to observe.
+    _print_review_awaiting_human(alert=not args.dry_run)
     _print_stranded_by_triage(res.stranded_by_triage)
     return 0
 
 
 def _notify_script_path():
-    """Locate ``notify.py`` (the out-of-agent Discord/Telegram alert helper)."""
+    """Locate ``notify.py`` (the out-of-agent Discord/Telegram alert helper).
+
+    Resolved under the *running* Hermes root, never a hardcoded ``~/.hermes``.
+    These assets are root-level (shared across profiles), so
+    ``get_default_hermes_root()`` is the right resolver: it maps a profile home
+    ``<root>/profiles/<name>`` back to ``<root>`` while leaving a redirected
+    home (a sandbox, a hermetic test home, CI) pointing at itself. Hardcoding
+    the path made a sandboxed board fire a REAL alert to the live channel about
+    cards that do not exist on the real board.
+    """
+    root = get_default_hermes_root()
     candidates = [
-        os.path.expanduser("~/.hermes/scripts/notify.py"),
-        os.path.expanduser(
-            "~/.hermes/skills-shared/general/scheduler/scripts/notify.py"
-        ),
-        os.path.expanduser("~/.hermes/skills/devops/scheduler/scripts/notify.py"),
+        str(root / "scripts" / "notify.py"),
+        str(root / "skills-shared/general/scheduler/scripts/notify.py"),
+        str(root / "skills/devops/scheduler/scripts/notify.py"),
     ]
     for path in candidates:
         try:
@@ -3514,6 +3536,27 @@ def _send_review_stale_alert(entries) -> None:
         pass
 
 
+def _collect_review_awaiting_human(*, alert: bool = True) -> list:
+    """Return review cards nothing will ever spawn; arm+send only if ``alert``.
+
+    Single owner of this detector's side-effect policy. Both the text tick and
+    the ``--json`` tick go through here, so the two surfaces cannot drift into
+    reporting different things — or into one of them writing when the other
+    does not. ``alert=False`` makes the call strictly read-only: no
+    ``review_stale_alerted`` event, no Discord send.
+    """
+    try:
+        with kb.connect_closing() as conn:
+            entries = kb.review_awaiting_human(conn)
+            if entries and alert:
+                fresh = kb.arm_review_stale_alerts(conn, entries)
+                if fresh:
+                    _send_review_stale_alert(fresh)
+            return entries
+    except Exception:
+        return []
+
+
 def _print_review_awaiting_human(*, alert: bool = True) -> None:
     """Report review cards nothing will ever spawn, and alert once each.
 
@@ -3521,18 +3564,13 @@ def _print_review_awaiting_human(*, alert: bool = True) -> None:
     and there was no other signal — 10 cards sat in review (one 2h+) with
     nothing raised (incident 2026-09-21).
     """
+    entries = _collect_review_awaiting_human(alert=alert)
     try:
-        with kb.connect_closing() as conn:
-            entries = kb.review_awaiting_human(conn)
-            line = kb.format_review_awaiting_human(entries)
-            if line:
-                print(line)
-            if entries and alert:
-                fresh = kb.arm_review_stale_alerts(conn, entries)
-                if fresh:
-                    _send_review_stale_alert(fresh)
+        line = kb.format_review_awaiting_human(entries)
     except Exception:
         return
+    if line:
+        print(line)
 
 
 def _print_stranded_by_triage(stranded) -> None:

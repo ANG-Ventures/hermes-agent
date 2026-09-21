@@ -390,15 +390,157 @@ def test_is_human_reviewer_shapes() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_dry_run_wording_no_longer_calls_a_parked_card_OK() -> None:
-    """'terminal lane, OK' hid the incident; it must name the human need."""
-    import inspect
+def _parked_review_card(age_minutes: int = 480) -> str:
+    """Create a review card that has sat unclaimed past the stale threshold."""
+    import time
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="parked", assignee="daedalus")
+        conn.execute(
+            "UPDATE tasks SET status='review', assignee='reviewer', "
+            "claim_lock=NULL, started_at=? WHERE id=?",
+            (int(time.time()) - 60 * age_minutes, tid),
+        )
+        conn.commit()
+    return tid
+
+
+def _event_counts() -> dict:
+    with kb.connect() as conn:
+        return dict(
+            conn.execute(
+                "SELECT kind, COUNT(*) FROM task_events GROUP BY kind"
+            ).fetchall()
+        )
+
+
+def _dispatch_args(**over):
+    """A minimal argparse namespace accepted by ``_cmd_dispatch``."""
+    import argparse
 
     from hermes_cli import kanban as kc
 
-    src = inspect.getsource(kc._cmd_dispatch)
-    assert "terminal lane, OK" not in src
-    assert "HUMAN review required" in src
+    root = argparse.ArgumentParser()
+    kc.build_parser(root.add_subparsers(dest="cmd"))
+    argv = ["kanban", "dispatch"]
+    if over.pop("dry_run", False):
+        argv.append("--dry-run")
+    if over.pop("json", False):
+        argv.append("--json")
+    ns = root.parse_args(argv)
+    for k, v in over.items():
+        setattr(ns, k, v)
+    return ns
+
+
+def test_dry_run_prints_the_detector_but_writes_NOTHING(
+    kanban_home: Path, fleet_profiles, monkeypatch, capsys
+) -> None:
+    """``--dry-run`` is the documented SAFE probe — it must not mutate.
+
+    Regression: the detector called ``arm_review_stale_alerts`` on every
+    dispatch path including ``--dry-run``, so a read-only probe appended a
+    durable ``review_stale_alerted`` event (and attempted a real Discord
+    send). That is the same mechanism that wrote 17 events onto 16 production
+    cards during this card's own build.
+    """
+    from hermes_cli import kanban as kc
+
+    tid = _parked_review_card()
+    sends: list = []
+    monkeypatch.setattr(kc, "_send_review_stale_alert", lambda e: sends.append(e))
+
+    before = _event_counts()
+    rc = kc._cmd_dispatch(_dispatch_args(dry_run=True))
+    out = capsys.readouterr().out
+    after = _event_counts()
+
+    assert rc == 0
+    # The detector still SPEAKS — that is the whole point of the line.
+    assert "awaiting HUMAN" in out and tid in out
+    # ...but it wrote nothing and sent nothing.
+    assert after == before, f"dry-run mutated task_events: {before} -> {after}"
+    assert after.get("review_stale_alerted", 0) == 0
+    assert sends == []
+
+
+def test_real_tick_does_arm_and_send(
+    kanban_home: Path, fleet_profiles, monkeypatch, capsys
+) -> None:
+    """The dry-run guard must not disarm the real dispatcher tick."""
+    from hermes_cli import kanban as kc
+
+    tid = _parked_review_card()
+    sends: list = []
+    monkeypatch.setattr(kc, "_send_review_stale_alert", lambda e: sends.append(e))
+
+    rc = kc._cmd_dispatch(_dispatch_args(dry_run=False))
+    capsys.readouterr()
+
+    assert rc == 0
+    assert _event_counts().get("review_stale_alerted", 0) == 1
+    assert [e["task_id"] for e in sends[0]] == [tid]
+
+
+def test_dispatch_json_carries_the_detector(
+    kanban_home: Path, fleet_profiles, monkeypatch, capsys
+) -> None:
+    """A JSON consumer must not be blinder than the text tick."""
+    from hermes_cli import kanban as kc
+
+    tid = _parked_review_card()
+    monkeypatch.setattr(kc, "_send_review_stale_alert", lambda e: None)
+
+    rc = kc._cmd_dispatch(_dispatch_args(json=True, dry_run=True))
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert [e["task_id"] for e in payload["review_awaiting_human"]] == [tid]
+    # --json --dry-run obeys the same read-only rule as the text path.
+    assert _event_counts().get("review_stale_alerted", 0) == 0
+
+
+def test_notify_script_is_resolved_under_HERMES_HOME(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sandboxed/test/CI home must not reach the LIVE notify.py.
+
+    Regression: the path was hardcoded to ``~/.hermes/scripts/notify.py``, so
+    a hermetic run fired a real Discord alert to the live channel about cards
+    that do not exist on the real board.
+    """
+    from hermes_cli import kanban as kc
+
+    sandbox = tmp_path / "sandbox_home"
+    (sandbox / "scripts").mkdir(parents=True)
+    (sandbox / "scripts" / "notify.py").write_text("# sandbox\n")
+    monkeypatch.setenv("HERMES_HOME", str(sandbox))
+
+    resolved = kc._notify_script_path()
+    assert resolved is not None
+    assert Path(resolved).is_relative_to(sandbox), resolved
+
+    # An empty sandbox resolves to nothing rather than falling back to live.
+    empty = tmp_path / "empty_home"
+    empty.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(empty))
+    assert kc._notify_script_path() is None
+
+
+def test_dry_run_wording_no_longer_calls_a_parked_card_OK(
+    kanban_home: Path, fleet_profiles, monkeypatch, capsys
+) -> None:
+    """'terminal lane, OK' hid the incident; it must name the human need."""
+    from hermes_cli import kanban as kc
+
+    _parked_review_card()
+    monkeypatch.setattr(kc, "_send_review_stale_alert", lambda e: None)
+
+    kc._cmd_dispatch(_dispatch_args(dry_run=True))
+    out = capsys.readouterr().out
+
+    assert "terminal lane, OK" not in out
+    assert "HUMAN review required" in out
 
 
 def test_cli_exposes_allow_same_actor_and_reviewer_flags() -> None:
