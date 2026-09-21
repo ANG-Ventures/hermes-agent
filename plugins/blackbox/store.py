@@ -103,7 +103,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             alerted INT DEFAULT 0,
             user_text TEXT,
             final_text TEXT,
-            cli_invocation_id TEXT
+            cli_invocation_id TEXT,
+            served_subs_json TEXT,
+            attribution TEXT
         );
 
         CREATE TABLE IF NOT EXISTS turn_tool_calls (
@@ -141,10 +143,39 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY(model, provider)
         );
 
+        -- Per-API-call attribution ledger (PRD-subs-ace §5.2, card C1). One row
+        -- per upstream completion call inside a turn; `turns` keeps the totals.
+        -- Column set here IS the contract insert_api_call binds against (I3:
+        -- guarded-additive — this is a NEW table, no existing consumer sees it).
+        -- No FK pragma is enabled on the live store, so retention is the
+        -- explicit parent-turn cascade in sweep(), not ON DELETE CASCADE.
+        CREATE TABLE IF NOT EXISTS turn_api_calls (
+            turn_id TEXT,
+            seq INT,
+            ts REAL,
+            provider TEXT,
+            sub_key TEXT,
+            model TEXT,
+            input_tokens INT,
+            output_tokens INT,
+            cache_read INT,
+            cache_write INT,
+            reasoning INT,
+            attribution TEXT,
+            http_status INT,
+            relay_synthetic INT NOT NULL DEFAULT 0,
+            route_id TEXT,
+            PRIMARY KEY(turn_id, seq)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_blackbox_turns_chat_end
             ON turns(platform, chat_id, ts_end);
         CREATE INDEX IF NOT EXISTS idx_blackbox_turns_cost
             ON turns(cost_usd);
+        CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_ts
+            ON turn_api_calls(ts);
+        CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_sub
+            ON turn_api_calls(sub_key);
         """
     )
     # Additive migration for DBs created before the last-call cache split
@@ -209,6 +240,18 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError as e:
             if "duplicate column" not in str(e).lower():
                 raise
+    # Per-sub attribution rollup columns (PRD-subs-ace §5.2, card C1). Both
+    # nullable TEXT; old rows stay NULL and nothing backfills them (I3).
+    # `served_subs_json` is the cheap per-turn display rollup
+    # ({"sub-vps-7": 3, ...}); `attribution` is the turn's dominant provenance.
+    # ALTER is NOT idempotent, hence the PRAGMA-guarded per-column pattern.
+    for _col in ("served_subs_json", "attribution"):
+        if _col not in _existing:
+            try:
+                conn.execute(f"ALTER TABLE turns ADD COLUMN {_col} TEXT")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
     conn.commit()
 
 
