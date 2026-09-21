@@ -51,6 +51,85 @@ _SECRET_SOURCE_VALUES_BY_HOME: dict[str, dict[str, str]] = {}
 _APPLIED_HOMES: set[str] = set()
 _SECRET_SOURCE_CACHE_LOCK = threading.RLock()
 
+# Set once ``load_hermes_dotenv()`` has populated ``os.environ`` from a
+# ``.env`` file in this process.  Read by ``hermes_cli.config`` to tell a
+# genuinely-unset ``${env:VAR}`` config ref apart from one that is merely
+# being resolved too early — several entrypoints import
+# ``hermes_cli.config`` (and expand config refs as an import side effect)
+# BEFORE they call ``load_hermes_dotenv()``.
+#
+# Keyed per resolved home rather than a single bool:
+# ``load_hermes_dotenv(hermes_home=...)`` takes an explicit home, so one
+# home's load must not silence the predicate for a *different* home whose
+# ``.env`` is still unread (multiplex gateways and ``hermes -p <profile>``
+# both take that path).  Guarded because a gateway can load two profiles'
+# ``.env`` files concurrently.
+_DOTENV_LOADED_HOMES: set[str] = set()
+_DOTENV_LOADED_LOCK = threading.RLock()
+
+
+def _resolve_dotenv_home(hermes_home: str | os.PathLike | None = None) -> Path:
+    """The Hermes home whose ``.env`` ``load_hermes_dotenv()`` reads.
+
+    Single-sourced on purpose: :func:`load_hermes_dotenv` and
+    :func:`dotenv_pending` MUST agree on which ``.env`` is in question, and
+    they drift the moment each spells the resolution out for itself — the
+    predicate then reports on a different file than the loader reads, and the
+    warning gate either misfires or goes silent for the wrong home.
+    """
+    return Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+
+
+def _home_key(home: Path) -> str:
+    """Stable key for a Hermes home — resolved so ``/var`` vs ``/private/var``
+    (macOS) and relative paths can't make one home look like two."""
+    try:
+        return str(home.resolve())
+    except Exception:  # noqa: BLE001 — diagnostics must never raise
+        return str(home)
+
+
+def _mark_dotenv_loaded(home: Path) -> None:
+    """Record that ``home``'s ``.env`` has been read into ``os.environ``."""
+    with _DOTENV_LOADED_LOCK:
+        _DOTENV_LOADED_HOMES.add(_home_key(home))
+
+
+def dotenv_loaded() -> bool:
+    """True once a Hermes ``.env`` has been loaded into ``os.environ``."""
+    with _DOTENV_LOADED_LOCK:
+        return bool(_DOTENV_LOADED_HOMES)
+
+
+def dotenv_pending() -> bool:
+    """True when a ``.env`` exists on disk that this process has not read yet.
+
+    ``hermes_cli.config`` uses this to decide whether an unresolved
+    ``${env:VAR}`` config ref is worth warning about. Several entrypoints
+    import ``hermes_cli.config`` — which expands config refs as an import
+    side effect — strictly BEFORE they call :func:`load_hermes_dotenv`, so a
+    var that lives only in ``.env`` looks unset at that moment and produced a
+    false "is not set (check ~/.hermes/.env)" warning on every CLI
+    invocation. The value itself was always correct: ``load_config()``'s
+    env-ref snapshot re-expands once the environment changes (#58514).
+
+    Resolves the home through :func:`_resolve_dotenv_home`, the same helper
+    :func:`load_hermes_dotenv` uses, so the predicate and the loader cannot
+    disagree about which ``.env`` is in question.
+
+    Deliberately narrow: when no ``.env`` exists (or this home's ``.env`` has
+    already been loaded) this returns ``False`` and the warning fires as
+    before, so a genuinely-missing variable is still reported.
+    """
+    try:
+        home = _resolve_dotenv_home()
+        with _DOTENV_LOADED_LOCK:
+            if _home_key(home) in _DOTENV_LOADED_HOMES:
+                return False
+        return (home / ".env").exists()
+    except Exception:  # noqa: BLE001 — diagnostics must never raise
+        return False
+
 
 def _known_hermes_env_keys() -> set[str]:
     """Return the combined set of known Hermes env-var keys.
@@ -486,7 +565,7 @@ def load_hermes_dotenv(
     """
     loaded: list[Path] = []
 
-    home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+    home_path = _resolve_dotenv_home(hermes_home)
     user_env = home_path / ".env"
     project_env_path = Path(project_env) if project_env else None
 
@@ -499,6 +578,7 @@ def load_hermes_dotenv(
     if user_env.exists():
         _load_dotenv_with_fallback(user_env, override=True)
         loaded.append(user_env)
+        _mark_dotenv_loaded(home_path)
         # Mirror reload_env() known-key cleanup so inherited Hermes keys
         # absent from this profile's .env do not leak into the runtime.
         _clear_known_keys_missing_from_dotenv(user_env)
