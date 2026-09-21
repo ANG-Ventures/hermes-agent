@@ -485,6 +485,30 @@ def _resolve_self_hosted_slots(raw: str | None) -> int | None:
     return value
 
 
+def _route_arm_slices(matrix: dict, raw_count: str | None, repo_root: Path) -> None:
+    """Opt in the lightest non-core slices; invalid counts leave routing alone."""
+    try:
+        count = int(raw_count or 0)
+    except ValueError:
+        count = -1
+    if count < 0:
+        print("warning: --arm-hosted-slices must be non-negative; ARM disabled", file=sys.stderr)
+        return
+    if not count:
+        return
+    durations = _load_durations(repo_root)
+    core = set(_CORE_SMOKE_TESTS)
+    candidates = []
+    for slice_ in matrix["slice"]:
+        files = _split_pathspec(slice_["files"])
+        if not files or slice_["name"] == "core smoke" or core.intersection(files):
+            continue
+        weight = sum(durations.get(f, 2.0) for f in files)
+        candidates.append((weight, slice_["index"], slice_))
+    for _, _, slice_ in sorted(candidates, key=lambda item: item[:2])[:count]:
+        slice_["runs_on"] = '["ubuntu-24.04-arm"]'
+
+
 def _scoped_plugin_matrix(
     scope: str,
     repo_root: Path,
@@ -1327,6 +1351,12 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--arm-hosted-slices",
+        metavar="N",
+        default=None,
+        help="Route the N lightest non-core slices to ubuntu-24.04-arm (default 0).",
+    )
+    parser.add_argument(
         "--self-hosted-labels",
         metavar="JSON",
         default=_HOSTED_RUNNER_LABELS,
@@ -1418,7 +1448,7 @@ def main() -> int:
         "-j", "--jobs", "--paths", "--include-integration",
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
         "--changed-files-scope", "--test-scope",
-        "--self-hosted-slots", "--self-hosted-labels",
+        "--self-hosted-slots", "--self-hosted-labels", "--arm-hosted-slices",
         "--min-tests", "--strict-noop", "--no-strict-noop",
     }
     # pytest short flags that consume the NEXT token as their value.
@@ -1572,6 +1602,7 @@ def main() -> int:
             args.test_scope, repo_root, self_hosted_slots, self_hosted_labels
         )
         if scoped_matrix is not None:
+            _route_arm_slices(scoped_matrix, args.arm_hosted_slices, repo_root)
             print(
                 f"Test scope: {args.test_scope} + core smoke (2 slices)",
                 file=sys.stderr,
@@ -1649,6 +1680,7 @@ def main() -> int:
             f"Test scope: full ({args.generate_slices} slices)",
             file=sys.stderr,
         )
+        _route_arm_slices(matrix, args.arm_hosted_slices, repo_root)
         # Print to stdout so the CI step can capture it with $().
         print(json.dumps(matrix))
         return 0
