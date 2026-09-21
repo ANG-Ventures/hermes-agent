@@ -68,10 +68,15 @@ DRIVER = textwrap.dedent(
         "registry_has_late": any(
             p.name == "zz-late-registrant" for p in providers.list_providers()
         ),
+        "canonical_slugs": [p.slug for p in models.CANONICAL_PROVIDERS],
         "late_in_canonical": "zz-late-registrant" in [
             p.slug for p in models.CANONICAL_PROVIDERS
         ],
-        "n_canonical": len(models.CANONICAL_PROVIDERS),
+        # Every provider in the registry that the auto-extend is supposed to
+        # inject (api_key auth) must be present — an invariant, not a count.
+        "registry_api_key_names": [
+            p.name for p in providers.list_providers() if p.auth_type == "api_key"
+        ],
     }
     print("PROBE_JSON " + json.dumps(out))
     """
@@ -133,6 +138,13 @@ def test_mid_discovery_read_does_not_drop_later_plugins(tmp_path):
         "auto-extend to latch against a half-populated registry; the "
         "later-sorting plugin's provider was dropped permanently"
     )
-    assert out["n_canonical"] > 40, (
-        f"CANONICAL_PROVIDERS collapsed to {out['n_canonical']} entries"
+    # Generalised form of the same invariant: NO api_key provider in the
+    # registry may be missing from CANONICAL_PROVIDERS. A count assertion
+    # would pass while an arbitrary subset silently went missing.
+    missing = [
+        name for name in out["registry_api_key_names"]
+        if name not in out["canonical_slugs"]
+    ]
+    assert not missing, (
+        f"registered api_key providers absent from CANONICAL_PROVIDERS: {missing}"
     )

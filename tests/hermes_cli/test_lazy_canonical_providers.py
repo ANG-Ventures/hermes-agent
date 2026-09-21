@@ -15,7 +15,10 @@ partially initialised ``hermes_cli.models``:
 
 Both orders are exercised here against a real temp ``HERMES_HOME`` plugin root,
 in a subprocess (import order is a process-global property, so each case needs
-a fresh interpreter).
+a fresh interpreter). The driver does not merely import the picker — it calls
+``list_picker_providers()`` and ``provider_label()`` and asserts on their
+output, and a plugin-free baseline run is compared against the plugin run so
+"no behaviour change for existing providers" is measured rather than assumed.
 """
 
 from __future__ import annotations
@@ -32,14 +35,19 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 PLUGIN_NAME = "zz-lazy-canonical-probe"
+PROBE_KEY_ENV = "ZZ_LAZY_CANONICAL_PROBE_KEY"
+PROBE_MODELS = ["probe-model-a", "probe-model-b"]
 
 # The plugin does exactly what every claude-apx-N / claude-bpx-N clone does:
 # imports the two models.py surfaces at its own import time, then registers.
+# ``fallback_models`` is what lets the registered provider produce a real
+# picker row (rows with no models are filtered out by the picker), so the
+# picker assertions below have something to assert about.
 PLUGIN_INIT = textwrap.dedent(
-    """
+    f"""
     import builtins
 
-    _status = {}
+    _status = {{}}
     try:
         from hermes_cli.models import _PROVIDER_MODELS, CANONICAL_PROVIDERS
         _status["import_ok"] = True
@@ -53,21 +61,24 @@ PLUGIN_INIT = textwrap.dedent(
     from providers.base import ProviderProfile
 
     register_provider(ProviderProfile(
-        name="zz-lazy-canonical-probe",
+        name={PLUGIN_NAME!r},
         display_name="Lazy Canonical Probe",
         description="Lazy Canonical Probe (test fixture)",
         base_url="https://probe.invalid/v1",
-        env_vars=("ZZ_LAZY_CANONICAL_PROBE_KEY",),
+        env_vars=({PROBE_KEY_ENV!r},),
+        fallback_models={tuple(PROBE_MODELS)!r},
     ))
     """
 )
 
 DRIVER = textwrap.dedent(
-    """
+    f"""
     import builtins, json, sys
 
+    PROBE = {PLUGIN_NAME!r}
+
     order = sys.argv[1]
-    out = {"order": order}
+    out = {{"order": order}}
     if order == "models-first":
         import hermes_cli.models as models
         import providers
@@ -79,45 +90,70 @@ DRIVER = textwrap.dedent(
 
     out["plugin"] = getattr(
         builtins, "_LAZY_CANONICAL_PROBE_STATUS",
-        {"import_ok": None, "error": "plugin was never imported"},
+        {{"import_ok": None, "error": "plugin was never imported"}},
     )
     out["registry_has_probe"] = any(
-        p.name == "zz-lazy-canonical-probe" for p in __import__("providers").list_providers()
+        p.name == PROBE for p in __import__("providers").list_providers()
     )
-    slugs = [p.slug for p in models.CANONICAL_PROVIDERS]
-    out["probe_in_canonical"] = "zz-lazy-canonical-probe" in slugs
-    out["n_canonical"] = len(slugs)
-    out["label"] = models._PROVIDER_LABELS.get("zz-lazy-canonical-probe")
-    out["in_known_names"] = "zz-lazy-canonical-probe" in models._KNOWN_PROVIDER_NAMES
+    out["canonical_slugs"] = [p.slug for p in models.CANONICAL_PROVIDERS]
+    out["probe_in_canonical"] = PROBE in out["canonical_slugs"]
+    out["label"] = models._PROVIDER_LABELS.get(PROBE)
+    out["in_known_names"] = PROBE in models._KNOWN_PROVIDER_NAMES
 
-    # Picker + /model label resolution must still work and must still contain
-    # the bundled canonical providers (no behaviour change for existing rows).
-    from hermes_cli.model_switch import list_picker_providers  # noqa: F401
-    out["picker_ok"] = True
-    out["nous_label"] = models._PROVIDER_LABELS.get("nous")
-    out["custom_label"] = models._PROVIDER_LABELS.get("custom")
+    # Picker + /model label resolution: CALL them, don't just import them.
+    from hermes_cli.model_switch import list_picker_providers
+    from hermes_cli.models import provider_label
+
+    rows = list_picker_providers(max_models=50)
+    by_slug = {{str(r.get("slug", "")).lower(): r for r in rows}}
+    probe_row = by_slug.get(PROBE)
+    out["picker_slugs"] = sorted(by_slug)
+    out["probe_row_name"] = probe_row.get("name") if probe_row else None
+    out["probe_row_models"] = (
+        list(probe_row.get("models") or []) if probe_row else None
+    )
+
+    # /model label resolution: a canonical slug, an ALIAS, the 'custom'
+    # special case, and the plugin-registered provider.
+    out["probe_label"] = provider_label(PROBE)
+    out["nous_label"] = provider_label("nous")
+    out["alias_label"] = provider_label("claude")
+    out["custom_label"] = provider_label("custom")
 
     print("PROBE_JSON " + json.dumps(out))
     """
 )
 
 
-def _run_order(tmp_path: Path, order: str) -> dict:
-    home = tmp_path / "hermes_home"
-    plugin_dir = home / "plugins" / "model-providers" / PLUGIN_NAME
-    plugin_dir.mkdir(parents=True)
-    (plugin_dir / "__init__.py").write_text(PLUGIN_INIT)
-    (plugin_dir / "plugin.yaml").write_text(
-        f"name: {PLUGIN_NAME}\nkind: model-provider\nversion: 0.0.1\n"
-        "description: lazy-canonical regression fixture\n"
-    )
+def _run_order(tmp_path: Path, order: str, *, with_plugin: bool = True) -> dict:
+    """Run the driver in a fresh interpreter under a temp HERMES_HOME.
 
-    driver = tmp_path / f"driver_{order}.py"
+    ``with_plugin=False`` gives the baseline: identical environment, no
+    plugin installed. Comparing the two is what turns "the picker still
+    works" into "the picker is unchanged for every pre-existing provider".
+    """
+    tag = f"{order}{'' if with_plugin else '-baseline'}"
+    home = tmp_path / f"hermes_home_{tag}"
+    plugin_root = home / "plugins" / "model-providers"
+    plugin_root.mkdir(parents=True)
+    if with_plugin:
+        plugin_dir = plugin_root / PLUGIN_NAME
+        plugin_dir.mkdir()
+        (plugin_dir / "__init__.py").write_text(PLUGIN_INIT)
+        (plugin_dir / "plugin.yaml").write_text(
+            f"name: {PLUGIN_NAME}\nkind: model-provider\nversion: 0.0.1\n"
+            "description: lazy-canonical regression fixture\n"
+        )
+
+    driver = tmp_path / f"driver_{tag}.py"
     driver.write_text(DRIVER)
 
     env = dict(os.environ)
     env["HERMES_HOME"] = str(home)
     env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    # Credential for the fixture provider, so the picker emits its row.
+    # Set in BOTH arms so the only difference between them is the plugin.
+    env[PROBE_KEY_ENV] = "sk-lazy-canonical-probe"
 
     proc = subprocess.run(
         [sys.executable, str(driver), order],
@@ -159,7 +195,7 @@ def test_plugin_provider_reaches_canonical_providers(tmp_path, order):
     )
     assert result["probe_in_canonical"] is True, (
         f"[{order}] provider missing from CANONICAL_PROVIDERS "
-        f"(tail={result['n_canonical']} entries)"
+        f"(tail={result['canonical_slugs'][-5:]})"
     )
     assert result["label"] == "Lazy Canonical Probe", (
         f"[{order}] _PROVIDER_LABELS not extended: {result['label']!r}"
@@ -170,21 +206,92 @@ def test_plugin_provider_reaches_canonical_providers(tmp_path, order):
 
 
 @pytest.mark.parametrize("order", ["models-first", "discovery-first"])
-def test_picker_and_label_resolution_unchanged(tmp_path, order):
-    """No behaviour change for the picker or existing /model label resolution."""
+def test_picker_surfaces_the_plugin_provider(tmp_path, order):
+    """The picker must actually EMIT a row for the auto-extended provider.
+
+    ``list_picker_providers`` is called for real and its output inspected:
+    a plugin provider that reaches ``CANONICAL_PROVIDERS`` but never becomes
+    a picker row would satisfy the previous test and still be invisible to
+    every ``/model`` picker.
+    """
     result = _run_order(tmp_path, order)
-    assert result["picker_ok"] is True
-    assert result["nous_label"] == "Nous Portal", (
-        f"[{order}] canonical label regressed: {result['nous_label']!r}"
+    assert PLUGIN_NAME in result["picker_slugs"], (
+        f"[{order}] picker emitted no row for the plugin provider; "
+        f"rows={result['picker_slugs']}"
     )
-    assert result["custom_label"] == "Custom endpoint", (
-        f"[{order}] 'custom' special case regressed: {result['custom_label']!r}"
+    assert result["probe_row_name"] == "Lazy Canonical Probe", (
+        f"[{order}] picker row carries the wrong display name: "
+        f"{result['probe_row_name']!r}"
     )
-    # The bundled canonical list is ~50 rows; a collapse to near-zero means the
-    # lazy wrapper served an unextended/empty list.
-    assert result["n_canonical"] > 40, (
-        f"[{order}] CANONICAL_PROVIDERS collapsed to {result['n_canonical']} entries"
+    assert result["probe_row_models"] == PROBE_MODELS, (
+        f"[{order}] picker row carries the wrong models: "
+        f"{result['probe_row_models']!r}"
     )
+    # /model label resolution for the plugin provider.
+    assert result["probe_label"] == "Lazy Canonical Probe", (
+        f"[{order}] provider_label() did not resolve the plugin provider: "
+        f"{result['probe_label']!r}"
+    )
+
+
+@pytest.mark.parametrize("order", ["models-first", "discovery-first"])
+def test_no_behaviour_change_for_preexisting_providers(tmp_path, order):
+    """Measured A/B: installing the plugin must only ADD, never perturb.
+
+    Baseline = identical environment with no plugin installed. The plugin run
+    must differ from it by exactly one canonical entry (appended at the tail,
+    with every pre-existing slug in its original position) and exactly one
+    picker row, and ``/model`` label resolution for canonical slugs, aliases
+    and the ``custom`` special case must be byte-identical.
+    """
+    base = _run_order(tmp_path, order, with_plugin=False)
+    withp = _run_order(tmp_path, order, with_plugin=True)
+
+    # Non-vacuity: the baseline must genuinely lack the fixture, otherwise
+    # every "unchanged" assertion below is comparing two identical runs.
+    assert base["registry_has_probe"] is False, (
+        f"[{order}] baseline unexpectedly has the fixture provider registered"
+    )
+    assert withp["registry_has_probe"] is True, (
+        f"[{order}] plugin arm never registered the fixture — A/B is vacuous"
+    )
+
+    # Append-only: the baseline list is a strict PREFIX of the extended one.
+    # This is the order/identity invariant a count assertion cannot express —
+    # it catches reordering and dropped entries, not just a collapsed list.
+    n = len(base["canonical_slugs"])
+    assert withp["canonical_slugs"][:n] == base["canonical_slugs"], (
+        f"[{order}] auto-extend perturbed the canonical list instead of "
+        f"appending to it\nbaseline={base['canonical_slugs']}\n"
+        f"extended={withp['canonical_slugs'][:n]}"
+    )
+    assert withp["canonical_slugs"][n:] == [PLUGIN_NAME], (
+        f"[{order}] unexpected tail after auto-extend: "
+        f"{withp['canonical_slugs'][n:]}"
+    )
+
+    # Picker: same rows, plus exactly the plugin's.
+    assert (
+        sorted(set(withp["picker_slugs"]) - {PLUGIN_NAME})
+        == sorted(base["picker_slugs"])
+    ), (
+        f"[{order}] picker rows changed for pre-existing providers\n"
+        f"baseline={base['picker_slugs']}\nwith plugin={withp['picker_slugs']}"
+    )
+
+    # /model label resolution for non-plugin inputs is untouched.
+    for key, expected in (
+        ("nous_label", "Nous Portal"),
+        ("alias_label", "Anthropic"),
+        ("custom_label", "Custom endpoint"),
+    ):
+        assert base[key] == expected, (
+            f"[{order}] baseline label regressed for {key}: {base[key]!r}"
+        )
+        assert withp[key] == base[key], (
+            f"[{order}] installing a plugin changed {key}: "
+            f"{base[key]!r} -> {withp[key]!r}"
+        )
 
 
 def test_models_import_does_not_trigger_provider_discovery(tmp_path):
