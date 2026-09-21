@@ -2303,9 +2303,14 @@ def save_jobs(
     _guard_against_test_write_to_live_store(_current_cron_store().jobs_file)
     with _jobs_lock():
         _save_jobs_unlocked(jobs, removed_ids=removed_ids, replace=replace)
-    # Journal AFTER the write lands: a removal that raised never happened, and
-    # must not leave an audit record claiming it did.
-    _journal_removed(removed_ids)
+        # Journal INSIDE the lock, after the write lands. After, because a
+        # removal that raised never happened and must not leave an audit
+        # record claiming it did. Inside, because the journal's append order
+        # is what the vanished-job guard reads as causality: released first,
+        # a concurrent creator holding the same id could interleave its
+        # create AFTER our removal, and the guard would then report an
+        # intentionally-removed job as vanished.
+        _journal_removed(removed_ids)
 
 
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
@@ -2790,7 +2795,11 @@ def create_job(
         jobs = load_jobs()
         jobs.append(job)
         save_jobs(jobs)
-    _journal_created(job)
+        # Journal INSIDE the same lock the store write took — see the note in
+        # save_jobs. Journalled after release, a remover of this same id can
+        # append its removal FIRST, inverting the append order the guard reads
+        # as causality and turning an intentional removal into a false alarm.
+        _journal_created(job)
 
     return job
 

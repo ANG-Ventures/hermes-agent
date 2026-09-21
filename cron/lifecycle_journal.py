@@ -110,13 +110,37 @@ def _journal_lock(path: Path):
             release()
 
 
+def _ends_with_newline(path: Path) -> bool:
+    """True when the journal's last byte is a record terminator.
+
+    A process killed between ``write`` and its newline leaves a partial record
+    with no terminator. The next append would then FUSE onto it, producing one
+    malformed line — and losing BOTH the torn record and the new event, which
+    is the opposite of what an append-only audit log is for.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            if f.tell() == 0:
+                return True
+            f.seek(-1, os.SEEK_END)
+            return f.read(1) == b"\n"
+    except OSError:
+        return True  # unreadable: the append below will fail loudly enough
+
+
 def _append(record: Dict[str, Any]) -> None:
     """Append one record. Best effort — never raises into a cron write."""
     try:
         path = _journal_path()
         with _journal_lock(path):
+            # Separator-before-record, under the lock: heals a torn tail so the
+            # new event lands on its own parseable line. The torn remnant stays
+            # on disk as an unparseable line — deliberately: the guard reports
+            # it rather than silently swallowing evidence of a crash.
+            prefix = "" if _ends_with_newline(path) else "\n"
             with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                f.write(prefix + json.dumps(record, ensure_ascii=False) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
     except Exception:
@@ -157,35 +181,58 @@ def _default_actor() -> str:
 
 
 def read_entries(*, window_hours: float = DEFAULT_WINDOW_HOURS) -> List[Dict[str, Any]]:
-    """Return journal entries inside the window, oldest first.
+    """Return journal entries inside the window, oldest first (append order).
+
+    Each entry carries a ``_seq`` ordinal: its position in the file. The
+    journal is append-only under ``_journal_lock``, so file order IS append
+    order — a causally-correct sequence that does not depend on any writer's
+    wall clock.
 
     Malformed lines are skipped rather than failing the read: the journal is
     append-only from multiple processes, so a torn final line is expected
-    after a crash and must not blind the guard to everything before it.
+    after a crash and must not blind the guard to everything before it. The
+    count of skipped lines is reported by ``read_entries_with_health`` so the
+    guard can refuse to certify what it could not parse.
+    """
+    entries, _ = read_entries_with_health(window_hours=window_hours)
+    return entries
+
+
+def read_entries_with_health(
+    *, window_hours: float = DEFAULT_WINDOW_HOURS,
+) -> tuple[List[Dict[str, Any]], int]:
+    """``(entries, malformed_line_count)`` — see ``read_entries``.
+
+    ``malformed_line_count`` counts every non-empty line that could not be
+    parsed into a record with a usable timestamp, ANYWHERE in the file (not
+    only inside the window): a record we cannot read is a record whose
+    timestamp we cannot trust to place inside or outside the window.
     """
     path = _journal_path()
     if not path.exists():
-        return []
+        return [], 0
     cutoff = _hermes_now() - timedelta(hours=window_hours)
     entries: List[Dict[str, Any]] = []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                    at = _parse_at(rec.get("at"))
-                except Exception:
-                    continue
-                if at is None or at < cutoff:
-                    continue
-                entries.append(rec)
-    except OSError:
-        logger.debug("cron lifecycle journal unreadable", exc_info=True)
-        raise
-    return entries
+    malformed = 0
+    with open(path, "r", encoding="utf-8") as f:
+        for seq, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                at = _parse_at(rec.get("at"))
+            except Exception:
+                malformed += 1
+                continue
+            if at is None:
+                malformed += 1
+                continue
+            if at < cutoff:
+                continue
+            rec["_seq"] = seq
+            entries.append(rec)
+    return entries, malformed
 
 
 def _parse_at(raw: Any):
@@ -264,6 +311,11 @@ STATUS_OK = "ok"
 STATUS_VANISHED = "vanished"
 STATUS_UNAVAILABLE = "unavailable"
 
+# The largest window any caller may ask for. Beyond retention the journal has
+# already dropped entries, so a wider window would report `ok` over data that
+# was pruned rather than data that was reconciled.
+MAX_WINDOW_HOURS = _RETENTION_DAYS * 24.0
+
 
 @dataclass
 class VanishedJobReport:
@@ -320,69 +372,109 @@ def check_vanished_jobs(
     """Reconcile journalled creates against what jobs.json actually holds.
 
     A job counts as vanished when it was created inside the window, has no
-    removal record at or after that creation, and is not in the store. The
-    "at or after" ordering matters: a job can legitimately be created,
-    removed, and re-created under a fresh id — comparing against an older
-    removal of the *same* id (a re-armed one-shot reusing its id) would
-    wrongly excuse a real loss.
+    removal record **appended after** that creation, and is not in the store.
+    The "after" ordering is taken from the journal's own append sequence, not
+    from wall-clock timestamps: creates and removes are appended by different
+    processes (and, on a fleet, different hosts), so a skewed or non-monotonic
+    clock could otherwise invert causality and report an intentionally-removed
+    job as lost. Ordering by append position matters for the legitimate
+    create → remove → re-create-under-the-same-id sequence.
+
+    The reconciliation runs **inside the jobs lock**, so the journal read and
+    the store read observe one coherent snapshot. Reading them independently
+    lets a create that lands between the two reads look like a job that was
+    journalled and never stored.
+
+    Any unparseable journal line makes the result ``unavailable``: a record we
+    could not read may be the very create whose loss we exist to catch, so
+    ``ok`` would be a guess, not a finding.
 
     Always read the unfiltered store. Caller snapshots may exclude disabled
     jobs and cannot establish absence. This is a window-limited check, not
     a lifetime integrity certificate.
     """
-    try:
-        entries = read_entries(window_hours=window_hours)
-    except Exception as e:
-        return VanishedJobReport(status=STATUS_UNAVAILABLE,
-                                 detail=f"journal unreadable: {e}")
+    if window_hours > MAX_WINDOW_HOURS:
+        return VanishedJobReport(
+            status=STATUS_UNAVAILABLE,
+            window_hours=window_hours,
+            detail=(
+                f"window {window_hours:g}h exceeds journal retention "
+                f"{MAX_WINDOW_HOURS:g}h — entries older than retention have "
+                "already been pruned, so this window cannot be reconciled"
+            ),
+        )
 
     try:
-        from cron.jobs import load_jobs
+        import cron.jobs as jobs_module
+        from cron.jobs import _jobs_lock, load_jobs
 
-        jobs = load_jobs()
+        # One coherent snapshot: no create/remove can land between the two
+        # reads, because every intentional mutation takes this same lock.
+        # Save/restore the section's load stamp: _jobs_lock is reentrant, so
+        # if an outer mutation section ever calls the guard, our read_jobs
+        # must not overwrite the baseline that section's save-path merge
+        # depends on.
+        with _jobs_lock():
+            _state = jobs_module._jobs_lock_state
+            _saved = (getattr(_state, "load_stamp", None),
+                      getattr(_state, "load_baseline", None))
+            try:
+                entries, malformed = read_entries_with_health(
+                    window_hours=window_hours)
+                jobs = load_jobs()
+            finally:
+                _state.load_stamp, _state.load_baseline = _saved
     except Exception as e:
         return VanishedJobReport(status=STATUS_UNAVAILABLE,
-                                 detail=f"jobs.json unreadable: {e}")
+                                 window_hours=window_hours,
+                                 detail=f"snapshot unreadable: {e}")
+
+    if malformed:
+        return VanishedJobReport(
+            status=STATUS_UNAVAILABLE,
+            window_hours=window_hours,
+            detail=(
+                f"{malformed} unparseable journal record(s) — the guard cannot "
+                "certify a store it could not fully read"
+            ),
+        )
 
     present = {
         str(j["id"]) for j in jobs
         if isinstance(j, dict) and j.get("id")
     }
 
-    # Latest create, and every removal, per id.
+    # Latest create (by append sequence), and every removal's sequence, per id.
     created: Dict[str, Dict[str, Any]] = {}
-    removed: Dict[str, List[Any]] = {}
+    removed: Dict[str, List[int]] = {}
     for rec in entries:
         jid = rec.get("job_id")
-        at = _parse_at(rec.get("at"))
-        if not jid or at is None:
+        seq = rec.get("_seq")
+        if not jid or not isinstance(seq, int):
             continue
         jid = str(jid)
         if rec.get("event") == EVENT_CREATED:
             prior = created.get(jid)
-            prior_at = _parse_at(prior["at"]) if prior else None
-            if prior_at is None or at >= prior_at:
+            if prior is None or seq >= prior["_seq"]:
                 created[jid] = rec
         elif rec.get("event") == EVENT_REMOVED:
-            removed.setdefault(jid, []).append(at)
+            removed.setdefault(jid, []).append(seq)
 
     vanished: List[Dict[str, Any]] = []
     for jid, rec in created.items():
         if jid in present:
             continue
-        created_at = _parse_at(rec.get("at"))
-        if created_at is None:
-            continue
-        if any(r >= created_at for r in removed.get(jid, [])):
+        if any(r > rec["_seq"] for r in removed.get(jid, [])):
             continue  # removed on purpose after this create
         vanished.append({
             "job_id": jid,
             "name": rec.get("name"),
             "created_at": rec.get("at"),
             "actor": rec.get("actor"),
+            "seq": rec["_seq"],
         })
 
-    vanished.sort(key=lambda v: v["created_at"])
+    vanished.sort(key=lambda v: v["seq"])
     # Opportunistic retention: the guard is the one caller that has already
     # paid for a full journal read, so pruning here costs a rewrite only when
     # something is actually past retention, and never sits on a write path.
@@ -402,6 +494,7 @@ __all__ = [
     "EVENT_CREATED",
     "EVENT_REMOVED",
     "JOURNAL_FILENAME",
+    "MAX_WINDOW_HOURS",
     "STATUS_OK",
     "STATUS_UNAVAILABLE",
     "STATUS_VANISHED",
@@ -409,6 +502,7 @@ __all__ = [
     "check_vanished_jobs",
     "prune",
     "read_entries",
+    "read_entries_with_health",
     "record_created",
     "record_removed",
 ]

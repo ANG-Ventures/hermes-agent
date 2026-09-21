@@ -25,6 +25,7 @@ from cron.lifecycle_journal import (
     STATUS_VANISHED,
     check_vanished_jobs,
     read_entries,
+    read_entries_with_health,
     record_created,
     record_removed,
 )
@@ -231,15 +232,25 @@ class TestVanishedJobGuard:
         assert ("removed", job["id"]) in events
 
     def test_journal_survives_a_torn_line(self, tmp_cron_dir):
-        """A crash-torn final line must not blind the guard to earlier entries."""
+        """A crash-torn final line must not blind the guard to earlier entries.
+
+        It must also not be certified away: the guard still reads everything
+        before the tear, but refuses to report ``ok`` over a record it could
+        not parse — that record could be the very create whose loss the guard
+        exists to catch.
+        """
         create_job(prompt="a", schedule="in 10 hours", name="x")
         journal = tmp_cron_dir / "cron" / "lifecycle.jsonl"
         with open(journal, "a", encoding="utf-8") as f:
             f.write('{"event": "created", "job_id": "trunc')
 
         report = check_vanished_jobs()
-        assert report.status == STATUS_OK
-        assert report.created_count == 1
+        assert report.status == STATUS_UNAVAILABLE
+        assert "unparseable" in (report.detail or "")
+        # The earlier entry is still readable — the tear did not blind us.
+        entries, malformed = read_entries_with_health()
+        assert malformed == 1
+        assert len(entries) == 1
 
     def test_prune_drops_entries_past_retention_and_keeps_recent(self, tmp_cron_dir):
         """Retention must bound the journal without eating live evidence."""
