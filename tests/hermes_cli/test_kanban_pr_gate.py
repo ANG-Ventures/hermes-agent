@@ -616,3 +616,66 @@ def test_dispatch_tick_leaves_a_non_pr_block_alone(
     assert result.gate_auto_resolved == []
     with kanban_db_connect.connect() as conn:
         assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_raising_lookup_warns_once_through_prefetch_and_reevaluate(
+    kanban_home: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raising ``gh`` seam is one failed lookup, so it is exactly one WARN.
+
+    The prefetch pass and the locked re-evaluation pass are two halves of one
+    tick. Before this test each half logged its own warning for the same failed
+    unique PR, so a single unreachable PR paged the log twice per tick — the
+    card's contract is "lookup failure = no action + one WARN".
+    """
+    calls: list = []
+
+    def boom(repo: str, number: int):
+        calls.append((repo, number))
+        raise RuntimeError("gh exploded")
+
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, reason="merge o/r#7 then unblock me")
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            prefetched = prg.prefetch_pr_gate_states(conn, query_fn=boom)
+            outcomes = prg.reevaluate_pr_gates(
+                conn, query_fn=boom, prefetched=prefetched,
+            )
+
+    assert calls == [("o/r", 7)]
+    assert [o.action for o in outcomes] == ["lookup_failed"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
+    warnings = [
+        record for record in caplog.records
+        if record.levelname == "WARNING"
+        and "kanban PR-gate" in record.getMessage()
+    ]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+    assert "o/r#7" in warnings[0].getMessage()
+
+
+def test_raising_lookup_without_prefetch_is_a_noop_with_one_warning(
+    kanban_home: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Direct (no-prefetch) callers get the same single-warning no-op."""
+
+    def boom(repo: str, number: int):
+        raise RuntimeError("gh exploded")
+
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, reason="merge o/r#7 then unblock me")
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            outcomes = prg.reevaluate_pr_gates(conn, query_fn=boom)
+        assert [o.action for o in outcomes] == ["lookup_failed"]
+        assert kb.get_task(conn, tid).status == "blocked"
+
+    warnings = [
+        record for record in caplog.records
+        if record.levelname == "WARNING"
+        and "kanban PR-gate" in record.getMessage()
+    ]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+    assert "RuntimeError" in warnings[0].getMessage()

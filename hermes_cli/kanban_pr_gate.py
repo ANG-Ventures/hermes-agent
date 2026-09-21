@@ -123,6 +123,9 @@ class _PrefetchResult:
     payloads: dict[tuple[str, int], Optional[dict]]
     capped: frozenset[tuple[str, int]]
     now: float
+    # Per-key cause text for lookups that raised. Carried rather than logged so
+    # the locked pass owns the ONE warning a failed lookup is allowed to emit.
+    errors: dict[tuple[str, int], str] = field(default_factory=dict)
 
 
 # Process-lifetime cache keyed by ``(repo.lower(), number)``. MERGED is the
@@ -335,6 +338,9 @@ class _Resolver:
         # tick, but remains retryable on the next tick because it never enters
         # the process-lifetime cache.
         self._attempted: dict[tuple[str, int], Optional[_CacheEntry]] = {}
+        # Cause text for the keys that failed this tick, surfaced in the single
+        # warning the caller emits per failed unique PR.
+        self.failure_causes: dict[tuple[str, int], str] = {}
         self.budget_exhausted = False
 
     def resolve(self, ref: PrRef) -> Optional[_CacheEntry]:
@@ -357,13 +363,22 @@ class _Resolver:
             # A missing key means the card's block changed after the unlocked
             # snapshot. Never perform replacement network I/O under the lock.
             payload = self._prefetched.payloads.get(key)
+            cause = self._prefetched.errors.get(key)
+            if cause:
+                self.failure_causes[key] = cause
         else:
             if self._remaining <= 0:
                 self.budget_exhausted = True
                 self._attempted[key] = None
                 return None
             self._remaining -= 1
-            payload = self._query_fn(ref.repo, ref.number)
+            try:
+                payload = self._query_fn(ref.repo, ref.number)
+            except Exception as exc:  # defensive provider seam
+                # Same failure class as a None return: no action, and the
+                # caller emits the one permitted warning.
+                self.failure_causes[key] = f"{type(exc).__name__}: {exc}"
+                payload = None
 
         if payload is None:
             self._attempted[key] = None
@@ -518,8 +533,11 @@ def prefetch_pr_gate_states(
     selected = keys[:max(0, max_lookups)]
     capped = frozenset(keys[len(selected):])
     payloads: dict[tuple[str, int], Optional[dict]] = {}
+    errors: dict[tuple[str, int], str] = {}
     if not selected:
-        return _PrefetchResult(payloads=payloads, capped=capped, now=now)
+        return _PrefetchResult(
+            payloads=payloads, capped=capped, now=now, errors=errors,
+        )
 
     workers = min(_PREFETCH_WORKERS, len(selected))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
@@ -531,13 +549,16 @@ def prefetch_pr_gate_states(
             key = futures[future]
             try:
                 payloads[key] = future.result()
-            except Exception as exc:  # pragma: no cover - defensive provider seam
+            except Exception as exc:  # defensive provider seam
+                # Deliberately NOT logged here: a raised lookup and a None
+                # lookup are the same failure, and the contract allows ONE
+                # warning per failed unique PR per tick. The cause travels to
+                # reevaluate_pr_gates(), which owns that single warning.
                 payloads[key] = None
-                _log.warning(
-                    "kanban PR-gate: lookup raised for %s#%s (%s: %s)",
-                    key[0], key[1], type(exc).__name__, exc,
-                )
-    return _PrefetchResult(payloads=payloads, capped=capped, now=now)
+                errors[key] = f"{type(exc).__name__}: {exc}"
+    return _PrefetchResult(
+        payloads=payloads, capped=capped, now=now, errors=errors,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -604,10 +625,12 @@ def reevaluate_pr_gates(
                     if unresolved_ref is not None else None
                 )
                 if failure_key not in warned_failures:
+                    cause = resolver.failure_causes.get(failure_key or ("", 0))
                     _log.warning(
-                        "kanban PR-gate: could not resolve PR state for %s (%s); "
+                        "kanban PR-gate: could not resolve PR state for %s (%s)%s; "
                         "taking no action",
                         task_id, ", ".join(names),
+                        f" ({cause})" if cause else "",
                     )
                     if failure_key is not None:
                         warned_failures.add(failure_key)
