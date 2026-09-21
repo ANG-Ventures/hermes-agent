@@ -17,7 +17,9 @@ Covers three layers of the fix:
 """
 
 import asyncio
-from unittest.mock import MagicMock
+import logging
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -259,6 +261,55 @@ class TestRunnerSessionGenerationGuard:
         assert released is False
         assert runner._running_agents[sk] == "fresh_agent"
         assert runner._running_agents_ts[sk] == 2.0
+
+    @pytest.mark.asyncio
+    async def test_stopped_generation_drops_queued_followup_without_recursing(
+        self, caplog
+    ):
+        runner = _make_runner()
+        sk = _session_key()
+        stopped_gen = runner._begin_session_run_generation(sk)
+        runner._invalidate_session_run_generation(sk, reason="stop")
+        runner._run_agent = AsyncMock()
+        current = {"final_response": "stopped", "messages": []}
+
+        with caplog.at_level(logging.INFO, logger="gateway.run"):
+            result = await runner._run_queued_followup_if_current(
+                current_result=current,
+                message="queued after stop",
+                context_prompt="",
+                history=[],
+                source=_make_event().source,
+                session_id="session-1",
+                session_key=sk,
+                run_generation=stopped_gen,
+                interrupt_depth=1,
+                event_message_id=None,
+                channel_prompt=None,
+                message_type=MessageType.TEXT.value,
+            )
+
+        assert result is current
+        runner._run_agent.assert_not_awaited()
+        assert "Discarding queued follow-up" in caplog.text
+        assert "no longer current (stopped)" in caplog.text
+
+    def test_soft_eviction_refuses_agent_with_active_turn_lease(self, caplog):
+        runner = _make_runner()
+        agent = SimpleNamespace(
+            _active_session_turn_lease_holder="pid=123:turn=relay-turn-B:platform=discord",
+            release_clients=MagicMock(),
+            _session_messages=[{"role": "user", "content": "still running"}],
+            _db_flush_scan_prefix=[{"role": "user", "content": "still running"}],
+        )
+
+        with caplog.at_level(logging.ERROR, logger="gateway.run"):
+            runner._release_evicted_agent_soft(agent)
+
+        agent.release_clients.assert_not_called()
+        assert agent._session_messages
+        assert agent._db_flush_scan_prefix
+        assert "turn=relay-turn-B" in caplog.text
 
 
 # ===========================================================================

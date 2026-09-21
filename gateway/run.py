@@ -34236,6 +34236,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
         if adapter and hasattr(adapter, "get_pending_message"):
             adapter.get_pending_message(session_key)  # consume and discard
+        # An explicit stop consumes restart-recovery intent. Otherwise the next
+        # real user message re-enters _is_resume_pending and receives the same
+        # recovery note even though the user deliberately cancelled that turn.
+        try:
+            self.session_store.clear_resume_pending(session_key)
+        except Exception:
+            logger.debug(
+                "resume-pending clear skipped for stopped session %s",
+                session_key,
+                exc_info=True,
+            )
+        getattr(self, "_startup_resume_modes", {}).pop(session_key, None)
+        getattr(self, "_resumed_this_boot", set()).discard(session_key)
         if _iac_state is not None:
             _iac_state.persistent.pending_command_text = None
         # Cancel any pending clarify prompts NOW, not just in the turn's
@@ -34771,6 +34784,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         same task_id inherits them.
         """
         if agent is None:
+            return
+        # /stop force-clears the runner slot while its executor thread may still
+        # be unwinding. Cache-coherence eviction must not then tear down that
+        # live agent merely because _running_agents no longer names it. The
+        # durable turn-lease holder is authoritative across that gap.
+        active_lease_holder = getattr(
+            agent, "_active_session_turn_lease_holder", None
+        )
+        if isinstance(active_lease_holder, str) and active_lease_holder:
+            logger.error(
+                "Refusing soft eviction of agent with active durable turn lease "
+                "holder=%s",
+                active_lease_holder,
+            )
             return
         try:
             if hasattr(agent, "release_clients"):
@@ -35598,6 +35625,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 restore_session_vars(session_tokens)
             finally:
                 restore_session_vars(reset_tokens)
+
+    async def _run_queued_followup_if_current(
+        self,
+        *,
+        current_result: Any,
+        message: Any,
+        context_prompt: str,
+        history: List[Dict[str, Any]],
+        source: SessionSource,
+        session_id: str,
+        session_key: str,
+        run_generation: Optional[int],
+        interrupt_depth: int,
+        event_message_id: Optional[str],
+        channel_prompt: Optional[str],
+        message_type: Optional[str],
+    ) -> Any:
+        """Run an in-band follow-up only while its parent generation owns it."""
+        if (
+            run_generation is not None
+            and not self._is_session_run_current(session_key, run_generation)
+        ):
+            logger.info(
+                "Discarding queued follow-up for session %s — run generation "
+                "%s is no longer current (stopped)",
+                session_key or "?",
+                run_generation,
+            )
+            return current_result
+        followup_result = await self._run_agent(
+            message=message,
+            context_prompt=context_prompt,
+            history=history,
+            source=source,
+            session_id=session_id,
+            session_key=session_key,
+            run_generation=run_generation,
+            _interrupt_depth=interrupt_depth,
+            event_message_id=event_message_id,
+            channel_prompt=channel_prompt,
+            message_type=message_type,
+        )
+        return _preserve_queued_followup_history_offset(
+            current_result, followup_result
+        )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.
@@ -37046,6 +37118,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pending = None
 
             if pending_event or pending:
+                # /stop invalidates the generation before the executor-backed
+                # turn necessarily returns. A queued event can still be visible
+                # while that stopped coroutine unwinds. Never recurse under its
+                # stale generation: the recursive turn is not registered as a
+                # fresh top-level run, so it would run invisibly after /stop and
+                # contend with the next user turn's durable lease.
+                if (
+                    run_generation is not None
+                    and not self._is_session_run_current(session_key, run_generation)
+                ):
+                    logger.info(
+                        "Discarding queued follow-up for session %s — run generation "
+                        "%s is no longer current (stopped)",
+                        session_key or "?",
+                        run_generation,
+                    )
+                    return result
                 logger.debug("Processing pending message: '%s...'", pending[:40])
 
                 # Clear the adapter's interrupt event so the next _run_agent call
@@ -37273,7 +37362,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
-                followup_result = await self._run_agent(
+                return await self._run_queued_followup_if_current(
+                    current_result=result,
                     message=next_message,
                     context_prompt=context_prompt,
                     history=updated_history,
@@ -37281,12 +37371,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_id=session_id,
                     session_key=next_session_key,
                     run_generation=run_generation,
-                    _interrupt_depth=_interrupt_depth + 1,
+                    interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
                 )
-                return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task
             if progress_task:

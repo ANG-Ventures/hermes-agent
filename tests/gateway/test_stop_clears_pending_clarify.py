@@ -101,6 +101,27 @@ async def test_stop_without_pending_clarify_is_noop():
 
 
 @pytest.mark.asyncio
+async def test_stop_consumes_resume_pending_recovery_state():
+    """The next real message after /stop must not replay the restart note."""
+    runner = _bare_runner()
+    runner._startup_resume_modes = {SESSION_KEY: {"mode": "auto"}}
+    runner._resumed_this_boot = {SESSION_KEY}
+    clear_resume_pending = MagicMock()
+    runner.session_store.clear_resume_pending = clear_resume_pending
+
+    await runner._interrupt_and_clear_session(
+        SESSION_KEY,
+        _source(),
+        interrupt_reason="stop_command",
+        invalidation_reason="stop_command",
+    )
+
+    clear_resume_pending.assert_called_once_with(SESSION_KEY)
+    assert SESSION_KEY not in runner._startup_resume_modes
+    assert SESSION_KEY not in runner._resumed_this_boot
+
+
+@pytest.mark.asyncio
 async def test_stop_clears_clarify_even_when_release_state_false():
     """The clarify cancel runs before the release_running_state branch."""
     clarify_gateway.register(
