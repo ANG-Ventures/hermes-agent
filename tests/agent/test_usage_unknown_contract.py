@@ -29,7 +29,8 @@ The pins, mirroring the producer-side UUS-* numbering:
 
 MUTATION (card requirement 4): reinstating the `or 0` coercion — i.e. dropping
 the `output_tokens_unknown` discriminator from `normalize_usage` — turns UC-1,
-UC-5, UC-6, UC-7 and UC-8 RED.
+UC-1b, UC-5 and the two output-unknown bridge cases RED. UC-6/7/8 construct
+canonical records directly and test downstream gates, not normalization.
 """
 
 from __future__ import annotations
@@ -268,7 +269,7 @@ def test_uc7_the_turn_ledger_persists_the_discriminator(tmp_path, monkeypatch):
 @pytest.mark.parametrize("flag", ["output_tokens_unknown", "input_tokens_unknown",
                                   "cache_read_tokens_unknown", "cache_write_tokens_unknown",
                                   "usage_unknown"])
-def test_uc7b_the_turn_rollup_absorbs_an_unknown_call(monkeypatch, flag):
+def test_uc7b_the_turn_rollup_absorbs_an_unknown_call(flag):
     """The per-call -> per-turn roll-up in turn_finalizer is unknown-absorbing.
 
     A turn is several API calls. If ANY call's output was unmeasured, the turn's
@@ -293,7 +294,7 @@ def test_uc7b_the_turn_rollup_absorbs_an_unknown_call(monkeypatch, flag):
             if isinstance(key, ast.Constant) and key.value == flag:
                 found.append(value)
 
-    assert found, (
+    assert len(found) == 1, (
         "turn_finalizer must roll the UNKNOWN discriminator up from the "
         "per-call accumulator into the per-turn usage dict, or the blackbox "
         "ledger records the turn's 0 output as a measurement"
@@ -495,12 +496,21 @@ def test_sdk_absent_optional_fields_remain_legacy():
     assert usage.input_tokens == 150
 
 
-def test_explicit_null_cache_details_are_unknown():
+def test_explicit_null_cache_details_are_absent_not_unknown():
+    """FleetReview findings 1+8 on f78eae23; ruling on t_a17c6966.
+
+    A null CONTAINER means no cache breakdown, not an unknown COUNT.
+    Null counts inside a present container remain unknown (separate pins).
+    """
     usage = normalize_usage({"prompt_tokens": 150, "completion_tokens": 50,
                              "prompt_tokens_details": None})
-    assert usage.cache_read_tokens_unknown is True
-    assert usage.cache_write_tokens_unknown is True
-    assert usage.input_tokens_unknown is True
+    assert usage.cache_read_tokens == usage.cache_write_tokens == 0
+    assert usage.cache_read_tokens_unknown is False
+    assert usage.cache_write_tokens_unknown is False
+    assert usage.input_tokens_unknown is False
+    assert usage.input_tokens == 150
+    assert usage.total_tokens_unknown is False
+    assert estimate_usage_cost("claude-sonnet-4-5", usage, provider="anthropic").amount_usd is not None
 
 
 def test_sdk_null_cache_and_flag_only_input_are_unknown():
