@@ -15,8 +15,11 @@ Session counters live in a separate sessions-v2 ledger, migrated once from v1.
 Rollback to any legacy release is supported: legacy gateways do not enforce the
 v2 cap and never open its ledger. Rolling forward resumes from persisted v2
 counts (legacy-era attempts are not counted). Legacy repairs cannot erase v2;
-a reader seeing empty legacy counters alongside retained v2 counters warns once
-and trusts v2. The seven-day TTL still intentionally refills the cap.
+a reader whose ledger records that migration actually carried v1 counters, and
+then finds those legacy counters gone, warns once and trusts v2. Provenance is
+recorded at migration time rather than inferred from a missing legacy key, so a
+host that never had legacy counters is never reported as a rollback incident.
+The seven-day TTL still intentionally refills the cap.
 """
 
 from __future__ import annotations
@@ -422,6 +425,11 @@ class AutoResumeAttemptStore:
         self.path = Path(path)
         self.session_path = self.path.with_name(self.path.stem + ".sessions-v2.json")
         self._warned_legacy_reset = False
+        # Whether the one-time v1->v2 migration actually carried counters over.
+        # Provenance, not inference: an absent legacy key means "loss" only for
+        # a store that once HAD legacy counters. Every fresh install also has
+        # no legacy key, and must not be reported as a rollback incident.
+        self._migrated_v1_counters = False
         self._legacy_extra = {}
         self._now = now
         # Rowid credits were destroyed by a repair; has_attempt must not mint
@@ -589,7 +597,15 @@ class AutoResumeAttemptStore:
                 if "session_attempts" not in ledger:
                     raise ValueError("missing session_attempts")
                 counters = self._validate_session_attempts(ledger)
-                if counters and not raw.get("session_attempts") and not self._warned_legacy_reset:
+                # Provenance travels in the ledger, so the warning fires only
+                # for a store whose migration actually carried v1 counters.
+                self._migrated_v1_counters = bool(ledger.get("migrated_from_v1_counters"))
+                if (
+                    counters
+                    and self._migrated_v1_counters
+                    and not raw.get("session_attempts")
+                    and not self._warned_legacy_reset
+                ):
                     self._warned_legacy_reset = True
                     logger.warning(
                         "%s has no legacy counters alongside %s; legacy may have reset "
@@ -598,6 +614,10 @@ class AutoResumeAttemptStore:
                     )
             else:
                 counters = self._validate_session_attempts(raw)
+                # Record whether this one-time migration actually carried v1
+                # counters, so a later reader can tell a legacy reset apart
+                # from a fresh install that never had any.
+                self._migrated_v1_counters = bool(counters)
                 # Establish ownership even for an empty migration, so a later
                 # rollback cannot reintroduce obsolete v1 counters.
                 if not self._persist(attempts, counters):
@@ -628,7 +648,14 @@ class AutoResumeAttemptStore:
         session_attempts: dict[str, dict[str, Any]],
     ) -> None:
         # Write v2 first: a crash or legacy writer can never erase its counters.
-        self._write_json(self.session_path, {"version": 2, "session_attempts": session_attempts})
+        self._write_json(
+            self.session_path,
+            {
+                "version": 2,
+                "session_attempts": session_attempts,
+                "migrated_from_v1_counters": self._migrated_v1_counters,
+            },
+        )
         self._write_json(self.path, {**self._legacy_extra, "version": _STORE_VERSION, "attempts": attempts})
 
     def _persist_legacy(self, attempts: list[dict[str, Any]]) -> bool:

@@ -71,6 +71,28 @@ def test_v2_survives_legacy_repair_and_warns_once(tmp_path, caplog):
     assert path.name in warnings[0] and ledger.name in warnings[0]
 
 
+def test_never_migrated_store_warns_zero_times(tmp_path, caplog):
+    """A host that never had legacy counters is not a rollback incident.
+
+    Discriminates against ``test_v2_survives_legacy_repair_and_warns_once``:
+    an absent ``session_attempts`` key in v1 is equally true of a fresh
+    install, so inferring "legacy reset them" from that absence alone fires a
+    WARNING on every boot of a host that was never rolled back. The warning
+    must key off migration provenance recorded in the v2 ledger, not off a
+    missing legacy key.
+    """
+    path = tmp_path / "attempts.json"
+    store = AutoResumeAttemptStore(path, now=lambda: 1000.0)
+    assert store.record_session_attempt("s") == 1
+    ledger = path.with_name(path.stem + ".sessions-v2.json")
+    assert json.loads(ledger.read_text())["migrated_from_v1_counters"] is False
+    assert "session_attempts" not in json.loads(path.read_text())
+    caplog.clear()
+    for _ in range(3):
+        assert AutoResumeAttemptStore(path, now=lambda: 1000.0).session_attempt_count("s") == 1
+    assert [r.message for r in caplog.records if "trusting" in r.message] == []
+
+
 def test_v2_counter_updates_preserve_legacy_shape(tmp_path):
     path = tmp_path / "attempts.json"
     legacy = {"version": 1, "attempts": []}
