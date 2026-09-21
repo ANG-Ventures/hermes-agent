@@ -365,9 +365,16 @@ class GatewaySlashCommandsMixin:
                 _old_agent = _cached[0] if isinstance(_cached, tuple) else _cached if _cached else None
             if _old_agent is not None:
                 try:
+                    # Housekeeping pool, NOT the turn pool: this await is
+                    # abandoned on timeout (see below), and an abandoned
+                    # concurrent.futures work item keeps its slot until its
+                    # blocking call returns. On the shared turn pool N wedged
+                    # /new resets retire N turn slots — the 2026-09-20
+                    # boot-resume starvation. See
+                    # GatewayRunner._run_housekeeping_in_executor.
                     await asyncio.wait_for(
-                        self._run_in_executor_with_context(
-                            self._cleanup_agent_resources, _old_agent
+                        self._run_housekeeping_in_executor(
+                            "cleanup", self._cleanup_agent_resources, _old_agent
                         ),
                         timeout=_RESET_CLEANUP_TIMEOUT_S,
                     )
