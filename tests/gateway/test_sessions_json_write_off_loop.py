@@ -519,3 +519,225 @@ def test_writer_thread_retires_on_shutdown(tmp_path, monkeypatch):
     assert store.stop_sessions_json_writer(timeout=20.0)
     assert store._sessions_json_writer is None
     assert (store.sessions_dir / "sessions.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# The ALIAS-MIGRATION mirror writes (#773).
+#
+# Two call sites still reached ``_save_sessions_json`` DIRECTLY, bypassing
+# ``_dispatch_sessions_json_save``:
+#
+#   gateway/session.py::_redirect_legacy_alias_routes_locked   (startup)
+#   gateway/session.py::migrate_discord_session_keys           (adapter-driven)
+#
+# Both fire only when ongoing mirroring is DISABLED
+# (``gateway.write_sessions_json: false``) and a legacy sessions.json still
+# exists -- they retire alias keys from that file so they cannot resurrect.
+# That is a narrow condition, but the write is the same unbounded-tail
+# mkstemp + fsync + ``os.replace``, and ``migrate_discord_session_keys`` is
+# called from the Discord adapter's connect path on a live loop.
+#
+# These were invisible to the #782 ratchet only because
+# ``_persist_routing_data`` reached the same sink first; closing that chain
+# exposed them (the ratchet named ``_interrupt_and_clear_session`` and
+# ``_run_startup_resume_event``, whose route runs
+# ``_ensure_loaded_locked -> _redirect_legacy_alias_routes_locked``).
+# ---------------------------------------------------------------------------
+
+
+def _make_mirror_disabled_store(tmp_path, monkeypatch):
+    """A real store with ongoing mirroring OFF and a legacy sessions.json present.
+
+    That is exactly the condition under which the alias-retirement writes fire.
+    """
+    store = _make_store(tmp_path, monkeypatch)
+    store._write_sessions_json = False
+    # ``migrate_discord_session_keys`` rebuilds keys through
+    # ``build_session_key``, which reads these two from config.  The shared
+    # ``_Cfg`` stub above only carries ``write_sessions_json``.
+    store.config.group_sessions_per_user = False
+    store.config.thread_sessions_per_user = False
+    # A legacy file must exist, or the retirement branch is skipped entirely.
+    (store.sessions_dir / "sessions.json").write_text("{}", encoding="utf-8")
+    return store
+
+
+def _seed_discord_aliases(store, pairs: int = 20):
+    """Seed ``channel``-typed Discord keys that collapse onto ``group`` keys."""
+    from datetime import datetime
+
+    from gateway.session import SessionEntry
+
+    now = datetime(2026, 9, 20, 12, 26, 25)
+    chat_types = {}
+    for i in range(pairs):
+        chat_id = f"chan{i}"
+        key = f"agent:main:discord:channel:{chat_id}"
+        store._entries[key] = SessionEntry(
+            session_key=key,
+            session_id=f"2026_{i:08d}_aliasfeed",
+            created_at=now,
+            updated_at=now,
+        )
+        chat_types[chat_id] = "group"
+    store._loaded = True
+    store._routing_db_loaded = True
+    return chat_types
+
+
+@pytest.mark.timeout(120)
+def test_loop_lag_stays_bounded_across_discord_alias_migration(tmp_path, monkeypatch):
+    """``migrate_discord_session_keys`` must not rename sessions.json on the loop.
+
+    The Discord adapter calls this from its connect path, i.e. on the event
+    loop thread. With mirroring disabled and a legacy file present it retires
+    the alias keys with a full mkstemp + fsync + ``os.replace``. Before #773
+    that went straight to ``_save_sessions_json``; now it goes through
+    ``_dispatch_sessions_json_save`` like every other whole-index write.
+    """
+    import gateway.session as sessmod
+    import utils as utils_mod
+
+    store = _make_mirror_disabled_store(tmp_path, monkeypatch)
+    chat_types = _seed_discord_aliases(store)
+
+    slow, calls = _slow_atomic_replace(INJECTED_REPLACE_DELAY_S)
+    monkeypatch.setattr(utils_mod, "atomic_replace", slow)
+    monkeypatch.setattr(sessmod, "atomic_replace", slow, raising=False)
+
+    merged_holder: dict = {}
+
+    async def main() -> LoopLagMonitor:
+        monitor = LoopLagMonitor()
+        monitor.start()
+        await asyncio.sleep(0.05)
+        try:
+            merged_holder["n"] = store.migrate_discord_session_keys(chat_types)
+            for _ in range(200):
+                if calls:
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            await monitor.stop()
+        return monitor
+
+    monitor = asyncio.run(main())
+    _drain(store)
+
+    assert merged_holder.get("n"), (
+        "no aliases were merged -- the seam under test never ran, so a green "
+        "result here would be vacuous"
+    )
+    assert monitor.samples, "lag monitor never sampled -- the instrument is broken"
+    assert calls, "no sessions.json write happened at all -- the seam is not wired"
+
+    over_budget = [g for g in monitor.samples if g > MAX_LOOP_BLOCK_MS]
+    assert not over_budget, (
+        f"event loop blocked >{MAX_LOOP_BLOCK_MS:.0f}ms on {len(over_budget)} "
+        f"occasions (worst {monitor.max_gap_ms:.1f}ms) during the Discord "
+        "alias migration with a 500ms atomic_replace. The alias-retirement "
+        "mirror write must go through _dispatch_sessions_json_save. Samples: "
+        f"{[round(g, 1) for g in sorted(over_budget, reverse=True)[:5]]}"
+    )
+
+
+@pytest.mark.timeout(60)
+def test_discord_alias_migration_write_runs_off_the_loop_thread(tmp_path, monkeypatch):
+    """Mechanism arm: WHICH THREAD renames the file during alias migration."""
+    import gateway.session as sessmod
+    import utils as utils_mod
+
+    store = _make_mirror_disabled_store(tmp_path, monkeypatch)
+    chat_types = _seed_discord_aliases(store, pairs=5)
+
+    seen: dict = {}
+    done = threading.Event()
+    real = utils_mod.atomic_replace
+
+    def probe(tmp_p, target):
+        seen["thread"] = threading.current_thread()
+        done.set()
+        return real(tmp_p, target)
+
+    monkeypatch.setattr(utils_mod, "atomic_replace", probe)
+    monkeypatch.setattr(sessmod, "atomic_replace", probe, raising=False)
+
+    async def main():
+        seen["loop_thread"] = threading.current_thread()
+        assert store.migrate_discord_session_keys(chat_types)
+        for _ in range(200):
+            if done.is_set():
+                break
+            await asyncio.sleep(0.01)
+
+    asyncio.run(main())
+    _drain(store)
+
+    assert done.is_set(), "the alias migration never wrote sessions.json"
+    assert seen["thread"] is not seen["loop_thread"], (
+        "sessions.json was renamed ON the event loop thread during the "
+        "Discord alias migration; it must be handed to the writer thread."
+    )
+
+
+@pytest.mark.timeout(60)
+def test_startup_alias_redirect_write_runs_off_the_loop_thread(tmp_path, monkeypatch):
+    """The startup route (``_redirect_legacy_alias_routes_locked``) too.
+
+    This is the chain the #782 ratchet actually named: a coroutine reaching
+    ``_ensure_loaded_locked`` runs the one-time legacy alias redirect, which
+    retired keys with an inline rename.
+    """
+    from datetime import datetime
+
+    import gateway.session as sessmod
+    import utils as utils_mod
+
+    from gateway.session import SessionEntry
+
+    store = _make_mirror_disabled_store(tmp_path, monkeypatch)
+
+    # ``channel`` is a shape-only alias of ``group`` for discord, so the
+    # redirect rewrites it without needing the channel object.
+    now = datetime(2026, 9, 20, 12, 26, 25)
+    for i in range(5):
+        key = f"agent:main:discord:channel:chan{i}"
+        store._entries[key] = SessionEntry(
+            session_key=key,
+            session_id=f"2026_{i:08d}_startupal",
+            created_at=now,
+            updated_at=now,
+        )
+    store._loaded = True
+    store._routing_db_loaded = True
+
+    seen: dict = {}
+    done = threading.Event()
+    real = utils_mod.atomic_replace
+
+    def probe(tmp_p, target):
+        seen["thread"] = threading.current_thread()
+        done.set()
+        return real(tmp_p, target)
+
+    monkeypatch.setattr(utils_mod, "atomic_replace", probe)
+    monkeypatch.setattr(sessmod, "atomic_replace", probe, raising=False)
+
+    async def main():
+        seen["loop_thread"] = threading.current_thread()
+        with store._lock:
+            merged = store._redirect_legacy_alias_routes_locked()
+        assert merged, "the redirect merged nothing -- the arm is vacuous"
+        for _ in range(200):
+            if done.is_set():
+                break
+            await asyncio.sleep(0.01)
+
+    asyncio.run(main())
+    _drain(store)
+
+    assert done.is_set(), "the startup alias redirect never wrote sessions.json"
+    assert seen["thread"] is not seen["loop_thread"], (
+        "sessions.json was renamed ON the event loop thread during the "
+        "startup legacy-alias redirect; it must be handed to the writer thread."
+    )

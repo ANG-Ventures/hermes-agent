@@ -1875,7 +1875,15 @@ class SessionStore:
         if merged:
             self._save(retired_keys=retired_keys)
             if not self._write_sessions_json and (self.sessions_dir / "sessions.json").exists():
-                self._save_sessions_json({key: entry.to_dict() for key, entry in self._entries.items()}, retired_keys=retired_keys)
+                # Off the loop thread when there is one (#782): ``_save``
+                # above already committed state.db, so this legacy-mirror
+                # retirement is best-effort and must not sit an mkstemp +
+                # fsync + os.replace on the event loop.
+                self._dispatch_sessions_json_save(
+                    {key: entry.to_dict() for key, entry in self._entries.items()},
+                    self._next_routing_generation_locked(),
+                    retired_keys=retired_keys,
+                )
         return merged
 
     @staticmethod
@@ -1955,7 +1963,13 @@ class SessionStore:
                 # Even if ongoing JSON mirroring is disabled, retire aliases
                 # from an existing legacy import so they cannot resurrect.
                 if not self._write_sessions_json and (self.sessions_dir / "sessions.json").exists():
-                    self._save_sessions_json({key: entry.to_dict() for key, entry in self._entries.items()}, retired_keys=retired_keys)
+                    # Same off-loop dispatch as the startup alias redirect
+                    # above (#782): state.db is already committed by ``_save``.
+                    self._dispatch_sessions_json_save(
+                        {key: entry.to_dict() for key, entry in self._entries.items()},
+                        self._next_routing_generation_locked(),
+                        retired_keys=retired_keys,
+                    )
                 logger.info("Merged Discord session type aliases: %d canonical routes", merged)
             return merged
 

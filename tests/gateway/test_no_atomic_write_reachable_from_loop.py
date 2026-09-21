@@ -66,8 +66,16 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-# Frozen inventory of PRE-EXISTING reachable pairs, captured 2026-09-20 on the
-# commit that moved the sessions.json mirror write off the loop.
+# Frozen inventory of PRE-EXISTING reachable pairs.  Captured 2026-09-20 at 96
+# entries on the commit that moved the per-turn sessions.json mirror write off
+# the loop (#782), then SHRUNK to 51 by #773, which closed the last two
+# `_save_sessions_json` call sites that still bypassed
+# `_dispatch_sessions_json_save` (the startup/Discord alias-migration
+# retirements in `gateway/session.py`).  45 coroutines stopped reaching any
+# sink; ZERO new coroutines appeared.  The 14 entries whose *sink label*
+# changed in that pass (`atomic_replace` -> `os.replace`, ->
+# `atomic_json_write`) are the same coroutines with the session.py chain now
+# closed, so the DFS reports a different pre-existing sink first.
 #
 # This is an incident-to-lint ratchet, NOT an endorsement.  Each entry is a
 # real instance of the same class -- a coroutine that can reach a blocking
@@ -82,59 +90,35 @@ def _repo_root() -> Path:
 REACHABLE_BASELINE = frozenset({
     "gateway/deferred_restart.py _run_armed -> os.replace",
     "gateway/deferred_restart.py _run_as_leader -> os.replace",
-    "gateway/kanban_watchers.py _kanban_notifier_watcher -> atomic_replace",
-    "gateway/kanban_watchers.py _push_wake -> atomic_replace",
     "gateway/lifecycle_ledger.py record_startup_async -> atomic_json_write",
     "gateway/platforms/api_server.py _handle_artifact_upload -> os.fsync",
     "gateway/platforms/base.py cancel_background_tasks -> atomic_json_write",
     "gateway/platforms/signal.py connect -> atomic_json_write",
-    "gateway/platforms/webhook.py _end_webhook_session -> atomic_replace",
     "gateway/platforms/weixin.py _poll_loop -> atomic_json_write",
     "gateway/platforms/weixin.py connect -> atomic_json_write",
     "gateway/platforms/weixin.py qr_login -> atomic_json_write",
     "gateway/platforms/whatsapp_cloud.py _build_message_event_from_cloud -> os.replace",
     "gateway/platforms/whatsapp_cloud.py send -> os.replace",
-    "gateway/platforms/yuanbao.py _collect_observed_media -> atomic_replace",
-    "gateway/platforms/yuanbao.py _extract_media_refs_from_transcript -> atomic_replace",
-    "gateway/platforms/yuanbao.py _redact -> atomic_replace",
     "gateway/platforms/yuanbao.py open -> atomic_json_write",
     "gateway/run.py _await_active_work_before_restart -> atomic_json_write",
-    "gateway/run.py _cancel_pending_boot_resumes_for_shutdown -> atomic_replace",
-    "gateway/run.py _clear_durable_active_turn -> atomic_replace",
-    "gateway/run.py _clear_resume_pending_for_claimed_obligations -> atomic_replace",
-    "gateway/run.py _clear_stale_resume_pending_flags -> atomic_replace",
+    "gateway/run.py _cancel_pending_boot_resumes_for_shutdown -> os.replace",
     "gateway/run.py _connect_one_startup -> atomic_json_write",
-    "gateway/run.py _consume_clean_shutdown_marker -> atomic_replace",
-    "gateway/run.py _dispatch_plugin_message_injection -> atomic_replace",
     "gateway/run.py _drain_active_agents -> atomic_json_write",
     "gateway/run.py _drain_control_watcher -> atomic_json_write",
-    "gateway/run.py _execute_mcp_reload -> atomic_replace",
+    "gateway/run.py _execute_mcp_reload -> atomic_json_write",
     "gateway/run.py _finalize_shutdown_agents -> atomic_json_write",
-    "gateway/run.py _get_goal_manager_for_event -> atomic_replace",
-    "gateway/run.py _get_heartbeat_manager_for_event -> atomic_replace",
     "gateway/run.py _handle_adapter_fatal_error_impl -> atomic_json_write",
     "gateway/run.py _handle_message -> atomic_replace",
-    "gateway/run.py _handle_message_with_agent -> atomic_replace",
-    "gateway/run.py _inject_watch_notification -> atomic_replace",
-    "gateway/run.py _interrupt_and_clear_session -> atomic_json_write",
-    "gateway/run.py _loop_wakeup_watcher -> atomic_replace",
-    "gateway/run.py _mark_durable_active_turn -> atomic_replace",
-    "gateway/run.py _notify_active_sessions_of_shutdown -> atomic_replace",
+    "gateway/run.py _handle_message_with_agent -> atomic_json_write",
+    "gateway/run.py _interrupt_and_clear_session -> os.replace",
     "gateway/run.py _platform_reconnect_watcher -> atomic_json_write",
-    "gateway/run.py _prepare_auto_resume_decisions -> atomic_replace",
-    "gateway/run.py _prepare_boot_resume_work_check -> atomic_replace",
-    "gateway/run.py _prepare_inbound_message_text -> atomic_replace",
-    "gateway/run.py _process_handoff -> atomic_replace",
-    "gateway/run.py _reap_dead_running_agents_loop -> atomic_replace",
-    "gateway/run.py _recover_unclean_sessions -> atomic_replace",
-    "gateway/run.py _resolve_async_delegation_session -> atomic_replace",
+    "gateway/run.py _prepare_auto_resume_decisions -> os.replace",
+    "gateway/run.py _process_handoff -> os.replace",
+    "gateway/run.py _reap_dead_running_agents_loop -> os.replace",
     "gateway/run.py _restore_resume_pending_sessions_at_startup -> os.fsync",
     "gateway/run.py _run_agent_inner -> atomic_json_write",
-    "gateway/run.py _run_background_task_inner -> atomic_replace",
-    "gateway/run.py _run_post_turn_hooks -> atomic_replace",
-    "gateway/run.py _run_startup_resume_event -> atomic_json_write",
+    "gateway/run.py _run_startup_resume_event -> os.replace",
     "gateway/run.py _scale_to_zero_watcher -> atomic_json_write",
-    "gateway/run.py _session_expiry_watcher -> atomic_replace",
     "gateway/run.py _start_one_profile_adapters -> atomic_json_write",
     "gateway/run.py _start_secondary_profile_adapters -> atomic_json_write",
     "gateway/run.py _stop_impl -> atomic_json_write",
@@ -143,36 +127,15 @@ REACHABLE_BASELINE = frozenset({
     "gateway/run.py start_gateway -> atomic_json_write",
     "gateway/run.py stop -> atomic_json_write",
     "gateway/run.py track_agent -> atomic_json_write",
-    "gateway/slash_commands.py _finish_switch -> atomic_replace",
-    "gateway/slash_commands.py _get_loop_manager_for_event -> atomic_replace",
-    "gateway/slash_commands.py _handle_agents_command -> atomic_replace",
-    "gateway/slash_commands.py _handle_branch_command -> atomic_replace",
-    "gateway/slash_commands.py _handle_btw_command -> atomic_replace",
-    "gateway/slash_commands.py _handle_compress_command_inner -> atomic_replace",
-    "gateway/slash_commands.py _handle_context_command -> atomic_replace",
-    "gateway/slash_commands.py _handle_merge_command -> atomic_replace",
-    "gateway/slash_commands.py _handle_model_command -> atomic_replace",
     "gateway/slash_commands.py _handle_platform_command -> atomic_json_write",
-    "gateway/slash_commands.py _handle_redo_command -> atomic_replace",
-    "gateway/slash_commands.py _handle_reset_command -> atomic_replace",
-    "gateway/slash_commands.py _handle_resume_command -> atomic_replace",
-    "gateway/slash_commands.py _handle_retry_command -> atomic_replace",
-    "gateway/slash_commands.py _handle_save_command -> atomic_replace",
-    "gateway/slash_commands.py _handle_sessions_command -> atomic_replace",
-    "gateway/slash_commands.py _handle_status_command -> atomic_replace",
-    "gateway/slash_commands.py _handle_stop_command -> atomic_replace",
-    "gateway/slash_commands.py _handle_title_command -> atomic_replace",
-    "gateway/slash_commands.py _handle_undo_command -> atomic_replace",
-    "gateway/slash_commands.py _handle_usage_command -> atomic_replace",
-    "gateway/slash_commands.py _list_mergeable_sessions -> atomic_replace",
-    "gateway/slash_commands.py _on_model_selected -> atomic_replace",
-    "gateway/slash_commands.py _resolve_merge_target -> atomic_replace",
-    "gateway/slash_commands.py _try_discord_branch_thread -> atomic_replace",
+    "gateway/slash_commands.py _handle_reset_command -> os.replace",
+    "gateway/slash_commands.py _handle_resume_command -> os.replace",
+    "gateway/slash_commands.py _try_discord_branch_thread -> os.replace",
     "plugins/platforms/matrix/adapter.py _resolve_message_context -> atomic_json_write",
-    "plugins/platforms/telegram/adapter.py _handle_location_message -> atomic_replace",
-    "plugins/platforms/telegram/adapter.py _handle_media_message -> atomic_replace",
+    "plugins/platforms/telegram/adapter.py _handle_location_message -> atomic_json_write",
+    "plugins/platforms/telegram/adapter.py _handle_media_message -> atomic_json_write",
     "plugins/platforms/telegram/adapter.py _handle_sticker -> os.fsync",
-    "plugins/platforms/telegram/adapter.py _handle_text_message -> atomic_replace",
+    "plugins/platforms/telegram/adapter.py _handle_text_message -> atomic_json_write",
     "plugins/platforms/telegram/adapter.py _try_edit_rich -> os.replace",
     "plugins/platforms/telegram/adapter.py _try_send_rich -> os.replace",
     "plugins/platforms/telegram/adapter.py connect -> atomic_json_write",
@@ -305,33 +268,45 @@ def test_the_site_fixed_by_this_change_is_absent_from_tree_and_baseline():
     )
 
 
-def test_the_remaining_session_reach_is_the_startup_alias_path_not_the_turn_path():
-    """Pin WHICH session.py chain is still baselined, so it cannot drift.
+def test_no_session_persistence_chain_reaches_the_loop():
+    """Pin that BOTH session.py mirror-write chains are off the loop.
 
-    ``clear_resume_pending`` still reaches ``_save_sessions_json`` -- but by a
-    DIFFERENT route than the incident's: ``_ensure_loaded_locked`` ->
-    ``_redirect_legacy_alias_routes_locked``, the one-time startup alias
-    migration that runs behind ``_loaded`` and only when the legacy file
-    exists.  That is genuinely pre-existing and out of scope for this change.
+    Two routes reach ``_save_sessions_json``, and they were closed by two
+    different changes:
 
-    This test exists so the two chains are never confused.  If the per-turn
-    route (``_persist_routing_data``) reappears, the sibling test above fails;
-    if the startup route disappears, this one tells you the baseline can shrink.
+    * the PER-TURN route (``_persist_routing_data``) -- the 2026-09-20 Apollo
+      incident's own chain, routed through ``_dispatch_sessions_json_save`` by
+      #782;
+    * the STARTUP / Discord ALIAS-MIGRATION route
+      (``_redirect_legacy_alias_routes_locked`` and
+      ``migrate_discord_session_keys``), which still called
+      ``_save_sessions_json`` directly and was the last bypass.  #773 routed
+      both through the same loop-conditional dispatcher.
+
+    A regression on either route is a real defect: ``_save_sessions_json`` ends
+    in an mkstemp + fsync + ``os.replace`` whose tail is unbounded under
+    filesystem pressure, and both routes are reachable from a coroutine.
     """
     repo = _repo_root()
     sites = find_onloop_atomic_write_sites(repo, derive_scanned_modules(repo))
 
     startup_route = [s for s in sites if "_redirect_legacy_alias_routes_locked" in s]
+    discord_route = [s for s in sites if "migrate_discord_session_keys" in s]
     turn_route = [s for s in sites if "_persist_routing_data" in s]
 
     assert not turn_route, (
         "the per-turn routing-persistence route is reachable on the loop "
         "again:\n" + "\n".join(f"  {s}" for s in turn_route)
     )
-    assert startup_route, (
-        "the startup alias-migration route no longer reaches "
-        "_save_sessions_json. That is an improvement -- re-derive "
-        "REACHABLE_BASELINE and shrink it."
+    assert not startup_route, (
+        "the startup alias-migration route calls _save_sessions_json directly "
+        "again instead of _dispatch_sessions_json_save:\n"
+        + "\n".join(f"  {s}" for s in startup_route)
+    )
+    assert not discord_route, (
+        "the Discord alias-migration route calls _save_sessions_json directly "
+        "again instead of _dispatch_sessions_json_save:\n"
+        + "\n".join(f"  {s}" for s in discord_route)
     )
 
 
