@@ -1637,6 +1637,17 @@ class Mem0MemoryProvider(MemoryProvider):
             logger.debug("gbrain prefetch leg failed: %s", e)
             return []
 
+    def _retire_prefetch_executor(self, future: Future) -> None:
+        idle_executor = None
+        with self._prefetch_submit_lock:
+            if self._prefetch_future is future:
+                idle_executor = self._prefetch_executor
+                self._prefetch_executor = None
+        if idle_executor is not None:
+            # Future callbacks run on the worker itself. A non-waiting shutdown
+            # queues the sentinel and lets that worker exit after the callback.
+            idle_executor.shutdown(wait=False, cancel_futures=False)
+
     def _prefetch_executor_for_submit(self) -> ThreadPoolExecutor:
         if self._prefetch_executor is None:
             self._prefetch_executor = _DaemonThreadPoolExecutor(
@@ -1856,6 +1867,7 @@ class Mem0MemoryProvider(MemoryProvider):
                     run_query = self._prefetch_pending
                     self._prefetch_pending = None
 
+        submitted_future = None
         with self._prefetch_submit_lock:
             future = self._prefetch_future
             if future and not future.done():
@@ -1879,9 +1891,11 @@ class Mem0MemoryProvider(MemoryProvider):
             self._prefetch_pending = None
             self._prefetch_timed_out = False
             self._prefetch_thread = None
-            self._prefetch_future = self._prefetch_executor_for_submit().submit(
+            submitted_future = self._prefetch_executor_for_submit().submit(
                 _run_latest, query, self._prefetch_epoch
             )
+            self._prefetch_future = submitted_future
+        submitted_future.add_done_callback(self._retire_prefetch_executor)
 
     def _live_capture(self) -> str:
         """Re-resolve the capture flag from the LIVE source (env > mem0.json `capture` > default),
@@ -2740,6 +2754,12 @@ class Mem0MemoryProvider(MemoryProvider):
                            "irreversible": True})
 
     def shutdown(self) -> None:
+        capture_pipeline = getattr(self, "_capture_pipeline", None)
+        if capture_pipeline is not None:
+            try:
+                capture_pipeline.stop()
+            except Exception as e:
+                logger.debug("Mem0 capture pipeline failed during shutdown: %s", e)
         future = self._prefetch_future
         if future and not future.done():
             try:
