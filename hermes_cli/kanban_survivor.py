@@ -378,7 +378,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
             # A patch cannot add a gitlink and files below the same path.
             raise SurvivorUnavailable("survivor_unavailable: nested repository requires separate recovery")
         keys = {str(r.relative_to(workspace)) for r in repos}
-        carried = []
+        carried, carried_bundles = [], []
         missing = set(bases) - keys
         if missing and cleanup:
             # Reclamation is not a second chance to re-derive evidence. The
@@ -391,13 +391,30 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
             # permanently HELD, citing the very remedy the operator had used.
             vouched = _vouched_repositories(previous)
             if missing <= vouched:
+                if _loose_files(workspace, repos):
+                    # The relaxation may honour a satisfied claim; it may never
+                    # buy a delete for evidence no survivor covers. On a PARTIAL
+                    # loss the surviving repos resolve their own refs and the
+                    # capture returns before the `elif claimed:` arm below --
+                    # the one and only `_loose_files()` call site -- so the
+                    # guard has to be applied on THIS exit too, or reclamation
+                    # `rmtree`s loose files that previously forced a HOLD.
+                    raise SurvivorUnavailable(
+                        "survivor_unavailable: workspace holds files outside any repository "
+                        f"that no inferred survivor vouches for; {_ext.HINT}"
+                    )
                 if repos:
                     # Same reason as the explicit branch below: on a PARTIAL
                     # loss the surviving repos would satisfy the completion on
-                    # their own and silently drop the recorded ref for the one
-                    # that is gone.
+                    # their own and silently drop the recorded survivor for the
+                    # one that is gone. A bundle vouches just as a ref does
+                    # (see `_vouched_repositories`), so it must be carried too
+                    # -- otherwise `_record()` rewrites the row as `kind: ref`
+                    # for a repo whose only unpushed history is that bundle.
                     carried = [ref for ref in (previous or {}).get("refs") or ()
                                if isinstance(ref, dict) and ref.get("repository") in missing]
+                    carried_bundles = [b for b in (previous or {}).get("bundles") or ()
+                                       if isinstance(b, dict) and b.get("repository") in missing]
                 missing = set()
                 # `bases` still attests that code work was expected here. Keep
                 # the claim so an empty in-tree capture routes through the
@@ -431,7 +448,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 # external path below records `explicit` on its own; seeding it
                 # here too would duplicate the ref.
                 carried = [dict(explicit, repository=sorted(missing)[0])]
-        patches, refs, bundles, repositories = [], list(carried), [], []
+        patches, refs, bundles, repositories = [], list(carried), list(carried_bundles), []
         for repo in repos:
             key = str(repo.relative_to(workspace))
             published = list(_published_refs(repo, workspace))
@@ -454,7 +471,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 header = f"# kanban repository={json.dumps(key)} base={base}\n".encode()
                 patches.append(header + data)
             repositories.append({"repository": key, "base_sha": base})
-        if repos and len(refs) == len(repos) + len(carried):
+        if repos and not bundles and len(refs) == len(repos) + len(carried):
             survivor = {"kind": "ref", "refs": refs}
         elif patches or bundles:
             data = b"".join(patches)
