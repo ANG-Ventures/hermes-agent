@@ -5021,8 +5021,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         reasoning_parts: list = []
         usage_obj = None
         # Out-of-band confab notice (see agent/confab_notice.py). Rides the
-        # final usage chunk; at most one is accepted per provider response.
-        confab_notice_acc: dict = {"value": None, "seen": 0}
+        # final usage chunk. The validation contract is one notice per
+        # response: a SECOND valid notice invalidates the accumulator and the
+        # whole response extension is forwarded as absent.
+        confab_notice_acc: dict = {"value": None, "seen": 0, "invalid": False}
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
         _writer_token = {"value": None}
@@ -5219,20 +5221,31 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
             # Out-of-band confab notice. The contract puts it on the final
             # usage chunk (choices: []), but scan every chunk so a producer
-            # that attaches it slightly earlier is still consumed — at most
-            # ONE notice per response is accepted; a second is dropped and
-            # logged rather than overwriting the first.
+            # that attaches it slightly earlier is still consumed.
+            #
+            # EXACTLY ONE notice per response is the validation contract. A
+            # second valid notice means the stream carried two catch records
+            # for one response — the producer is misbehaving and we cannot
+            # know which one describes this reply. Keeping the first would
+            # publish potentially WRONG triage metadata to the user and to
+            # persisted history, so the accumulator is marked invalid and NO
+            # notice is forwarded for this response. Fail closed, as the
+            # module contract requires.
             _notice = extract_confab_notice(chunk)
             if _notice is not None:
                 confab_notice_acc["seen"] += 1
-                if confab_notice_acc["value"] is None:
-                    confab_notice_acc["value"] = _notice
+                if confab_notice_acc["seen"] > 1:
+                    if not confab_notice_acc["invalid"]:
+                        logger.warning(
+                            "Rejecting %s for this response: %d valid notices "
+                            "in one stream, contract allows exactly one",
+                            CONFAB_NOTICE_FIELD,
+                            confab_notice_acc["seen"],
+                        )
+                    confab_notice_acc["invalid"] = True
+                    confab_notice_acc["value"] = None
                 else:
-                    logger.debug(
-                        "Ignoring duplicate %s in stream (seen=%d)",
-                        CONFAB_NOTICE_FIELD,
-                        confab_notice_acc["seen"],
-                    )
+                    confab_notice_acc["value"] = _notice
 
             if not chunk.choices:
                 if hasattr(chunk, "model") and chunk.model:
