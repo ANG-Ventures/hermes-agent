@@ -167,6 +167,18 @@ def _independent_storage(repo, workspace):
 
         if not durable(repo):
             return False
+        partial = _git(repo, "config", "--get", "extensions.partialClone", check=False)
+        if partial.returncode == 0 and partial.stdout.strip():
+            return False
+        promisors = _git(
+            repo, "config", "--bool", "--get-regexp", r"^remote\..*\.promisor$",
+            check=False,
+        )
+        if promisors.returncode == 0 and any(
+            line.rsplit(maxsplit=1)[-1] == b"true"
+            for line in promisors.stdout.splitlines() if line.strip()
+        ):
+            return False
         directories = set()
         for args in (("--git-dir",), ("--git-common-dir",), ("--git-path", "objects")):
             result = _git(repo, "rev-parse", "--path-format=absolute", *args, check=False)
@@ -186,8 +198,17 @@ def _independent_storage(repo, workspace):
                     path = Path(root) / name
                     if path.is_symlink():
                         return False
+                    if name.endswith(".promisor"):
+                        return False
                     if name in {"alternates", "http-alternates"} and path.is_file() and path.stat().st_size:
                         return False
+        complete = _git(
+            repo, "rev-list", "--objects", "--missing=print", "HEAD", check=False,
+        )
+        if complete.returncode or any(
+            line.startswith(b"?") for line in complete.stdout.splitlines()
+        ):
+            return False
         return True
     except (OSError, RuntimeError, subprocess.TimeoutExpired):
         return False
@@ -311,6 +332,47 @@ def _patch_id(repo, sha, env=None):
     return result.stdout.split()[0].decode()
 
 
+def _landed_contains_history(workspace_repo, landed_repo, landed_sha):
+    """Return how ``landed_sha`` contains every committed workspace change."""
+    workspace_head = _git(
+        workspace_repo, "rev-parse", "--verify", "HEAD^{commit}", check=False,
+    )
+    if workspace_head.returncode:
+        return None
+    workspace_head = workspace_head.stdout.decode().strip()
+    if _git(
+        landed_repo, "merge-base", "--is-ancestor", workspace_head, landed_sha,
+        check=False,
+    ).returncode == 0:
+        return "ancestor"
+
+    workspace_history = _git(workspace_repo, "rev-list", "HEAD", check=False)
+    landed_history = _git(landed_repo, "rev-list", landed_sha, check=False)
+    if workspace_history.returncode or landed_history.returncode:
+        return None
+    landed_commits = set(landed_history.stdout.decode().split())
+    missing = [
+        commit for commit in workspace_history.stdout.decode().split()
+        if commit not in landed_commits
+    ]
+    if not missing:
+        return "ancestor"
+
+    needed = set()
+    for commit in missing:
+        patch_id = _patch_id(workspace_repo, commit)
+        if patch_id is None:
+            return None
+        needed.add(patch_id)
+    for commit in landed_commits:
+        patch_id = _patch_id(landed_repo, commit)
+        if patch_id in needed:
+            needed.remove(patch_id)
+            if not needed:
+                return "patch-id"
+    return None
+
+
 def _content_advisory(repo, head, published, *, budget=_CONTENT_SCAN_BUDGET):
     """ADVISORY ONLY: a published commit with the same normalized patch-id.
 
@@ -336,11 +398,13 @@ def _content_advisory(repo, head, published, *, budget=_CONTENT_SCAN_BUDGET):
             if budget <= 0:
                 return None
             url = _git(repo, "remote", "get-url", ref["remote"]).stdout.decode().strip()
+            fetch_env = dict(env, KANBAN_FETCH_URL=url)
             try:
                 fetched = _git(
-                    probe, "fetch", "--no-tags", "--depth", str(_CONTENT_SCAN_DEPTH + 1),
-                    url, f"+refs/heads/{ref['branch']}:refs/heads/candidate",
-                    env=env, check=False, timeout=120,
+                    probe, "--config-env=remote.candidate.url=KANBAN_FETCH_URL",
+                    "fetch", "--no-tags", "--depth", str(_CONTENT_SCAN_DEPTH + 1),
+                    "candidate", f"+refs/heads/{ref['branch']}:refs/heads/candidate",
+                    env=fetch_env, check=False, timeout=120,
                 )
             except subprocess.TimeoutExpired:
                 continue
@@ -372,13 +436,11 @@ def _verify_landed(entries, workspace):
     hermes-home mirror rewrites trees and is not a faithful copy; requiring it
     would make the claim unsatisfiable by construction.
 
-    A patch-id hit on a durable remote is attached as ADVISORY annotation only —
-    a recovery hint, never part of the accept decision.
-
-    Note: `landed` short-circuits the per-repo walk in ``preserve()`` and so also
-    bypasses the nested-repository guard. That is acceptable precisely because
-    nothing is being captured: no patch is built, so the guard's invariant (a
-    patch cannot add a gitlink and files below the same path) does not apply.
+    Every repository in the workspace must be clean and its committed history
+    must be represented by a named landed commit, either by exact ancestry or
+    commit-by-commit patch equivalence. Patch-id remains advisory for remote
+    mirrors; it can bind workspace commits only after a live canonical tree has
+    independently passed the durability and reachability checks above.
 
     Every failure mode raises — an unverifiable claim must never be accepted,
     because accepting it authorises deleting the only remaining copy of the code.
@@ -422,6 +484,37 @@ def _verify_landed(entries, workspace):
                                        "sha": hint["sha"], "matched_by": "patch-id",
                                        "advisory": True}
         verified.append(record)
+
+    workspace_repos = _repos(workspace)
+    if not workspace_repos or _loose_files(workspace, workspace_repos):
+        raise SurvivorUnavailable("survivor_unavailable: landed workspace has uncaptured files")
+    used_entries = set()
+    for repo in workspace_repos:
+        status = _git(repo, "status", "--porcelain", "--untracked-files=all", check=False)
+        if status.returncode or status.stdout:
+            raise SurvivorUnavailable("survivor_unavailable: landed workspace is not clean")
+        workspace_head = _git(repo, "rev-parse", "--verify", "HEAD^{commit}", check=False)
+        if workspace_head.returncode:
+            raise SurvivorUnavailable("survivor_unavailable: workspace repository has no commit")
+        binding = None
+        for index, record in enumerate(verified):
+            matched_by = _landed_contains_history(repo, Path(record["repository"]), record["sha"])
+            if matched_by:
+                binding = (index, record, matched_by)
+                break
+        if binding is None:
+            raise SurvivorUnavailable(
+                "survivor_unavailable: landed commit does not contain workspace history"
+            )
+        index, record, matched_by = binding
+        used_entries.add(index)
+        record.setdefault("workspace_repositories", []).append({
+            "repository": str(repo.relative_to(workspace)),
+            "head": workspace_head.stdout.decode().strip(),
+            "matched_by": matched_by,
+        })
+    if used_entries != set(range(len(verified))):
+        raise SurvivorUnavailable("survivor_unavailable: landed claim is unrelated to workspace")
     return verified
 
 

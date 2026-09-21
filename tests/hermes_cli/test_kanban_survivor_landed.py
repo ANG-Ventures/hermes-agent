@@ -7,6 +7,8 @@ patch/bundle path and a 94 MB home tree always tripped
 ``KANBAN_ATTACHMENT_MAX_BYTES`` — blocking completion of work that was committed
 and running (2026-09-20, t_e69d693a). Under the round-2 ruling, patch-id is only
 an advisory diff match; live canonical reachability is the landed authority.
+
+TEST-REPIN: fdedf3fc2e6a21e808b0b8b9cd94557b46856c72 ANG-Ventures/hermes-agent#795 — merged survivor authority supersedes artifact-shape and inert mutation assertions.
 """
 import json
 import subprocess
@@ -39,6 +41,18 @@ def commit(repo, name, text, message):
     git(repo, "add", "-A")
     git(repo, "commit", "-m", message)
     return git(repo, "rev-parse", "HEAD")
+
+
+def restore_artifact(survivor, tmp_path, published):
+    restored = tmp_path / "artifact-restored"
+    if survivor["kind"] == "bundle":
+        git(tmp_path, "clone", survivor["bundles"][0]["path"], str(restored))
+    else:
+        git(tmp_path, "clone", "-b", "main", str(published), str(restored))
+        manifest = json.loads(Path(survivor["sidecar"]).read_text())
+        git(restored, "checkout", "--detach", manifest["repositories"][0]["base_sha"])
+        git(restored, "apply", survivor["path"])
+    return restored
 
 
 def rewriting_mirror(repo, mirror, *, branch="main"):
@@ -117,21 +131,48 @@ def test_unpublished_commit_still_fails_closed_on_a_rewriting_mirror(board, tmp_
     survivor = kb.latest_run(board, tid).metadata["survivor"]
     assert survivor["kind"] != "ref-by-content", survivor
     assert survivor["kind"] in {"patch", "bundle"}
+    restored = restore_artifact(survivor, tmp_path, tmp_path / "hermes-home.git")
+    assert (restored / "code.py").read_text() == "value = 3\n"
+    mirror = tmp_path / "mirror-control"
+    git(tmp_path, "clone", "-b", "main", str(tmp_path / "hermes-home.git"), str(mirror))
+    assert (mirror / "code.py").read_text() == "value = 2\n"
 
 
 def test_content_match_requires_the_patch_id_check(board, tmp_path, monkeypatch):
-    """Mutation guard: neuter the patch-id comparison and the escape must close.
-
-    If `_patch_id` stops discriminating (always None), no content match can be
-    proven and the capture must fall back to the artifact path rather than
-    silently blessing an unpublished head.
-    """
+    """Mutation guard: patch-id is what creates the advisory mirror hint."""
     import hermes_cli.kanban_survivor as survivor_mod
     tid, ws, local, remote_sha = home_clone_task(board, tmp_path)
+    published = list(survivor_mod._published_refs(ws, ws))
+    hint = survivor_mod._content_advisory(ws, local, published)
+    assert hint and hint["sha"] == remote_sha
     monkeypatch.setattr(survivor_mod, "_patch_id", lambda *a, **k: None)
-    assert kb.complete_task(board, tid, metadata={"changed_files": ["code.py"]})
-    survivor = kb.latest_run(board, tid).metadata["survivor"]
-    assert survivor["kind"] in {"patch", "bundle"}, survivor
+    assert survivor_mod._content_advisory(ws, local, published) is None
+
+
+def test_content_scan_keeps_credential_bearing_url_out_of_fetch_argv(board, tmp_path, monkeypatch):
+    import hermes_cli.kanban_survivor as survivor_mod
+    tid, ws, local, _ = home_clone_task(board, tmp_path)
+    raw_url = "https://user:secret@example.invalid/private.git"
+    real_git = survivor_mod._git
+    fetch_calls = []
+
+    def recording_git(repo, *args, **kwargs):
+        if args[:3] == ("remote", "get-url", "origin"):
+            return subprocess.CompletedProcess([], 0, raw_url.encode(), b"")
+        if "fetch" in args:
+            fetch_calls.append((args, kwargs.get("env", {})))
+            return subprocess.CompletedProcess([], 1, b"", b"")
+        return real_git(repo, *args, **kwargs)
+
+    monkeypatch.setattr(survivor_mod, "_git", recording_git)
+    assert survivor_mod._content_advisory(
+        ws, local, [{"remote": "origin", "branch": "main", "sha": "0" * 40}],
+    ) is None
+    assert len(fetch_calls) == 1
+    args, env = fetch_calls[0]
+    assert all(raw_url not in str(arg) for arg in args)
+    assert env["KANBAN_FETCH_URL"] == raw_url
+    assert "candidate" in args
 
 
 def test_patch_id_is_stable_across_a_sha_rewrite(board, tmp_path):

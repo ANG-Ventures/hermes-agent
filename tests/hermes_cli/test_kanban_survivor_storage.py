@@ -1,4 +1,7 @@
-"""A durable checkout must not borrow Git storage from a disposable source."""
+"""A durable checkout must not borrow Git storage from a disposable source.
+
+TEST-REPIN: fdedf3fc2e6a21e808b0b8b9cd94557b46856c72 ANG-Ventures/hermes-agent#795 — merged survivor authority supersedes incomplete storage-independence coverage.
+"""
 import shutil
 import subprocess
 from pathlib import Path
@@ -28,6 +31,7 @@ def board(tmp_path, monkeypatch):
 def source(board):
     tid = kb.create_task(board, title="storage independence")
     ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws.mkdir(parents=True, exist_ok=True)
     git(ws, "init", "-b", "main")
     git(ws, "config", "user.name", "Test")
     git(ws, "config", "user.email", "test@example.invalid")
@@ -39,7 +43,10 @@ def source(board):
 
 
 @pytest.mark.parametrize("mode", ["live", "origin", "landed"])
-@pytest.mark.parametrize("storage", ["linked", "gitfile", "symlink", "alternates", "object-symlink"])
+@pytest.mark.parametrize("storage", [
+    "linked", "gitfile", "symlink", "alternates", "object-symlink",
+    "promisor-config", "partial-clone", "promisor-pack", "missing-object",
+])
 def test_disposable_git_storage_never_authorizes_cleanup(board, tmp_path, mode, storage):
     tid, ws, sha = source(board)
     live = tmp_path / "live"
@@ -51,11 +58,24 @@ def test_disposable_git_storage_never_authorizes_cleanup(board, tmp_path, mode, 
             (live / ".git").write_text(f"gitdir: {ws / '.git'}\n")
         else:
             (live / ".git").symlink_to(ws / ".git", target_is_directory=True)
-    else:
+    elif storage in {"alternates", "object-symlink"}:
         git(tmp_path, "clone", "--shared" if storage == "alternates" else "--no-local", ws, live)
         if storage == "object-symlink":
             shutil.rmtree(live / ".git" / "objects")
             (live / ".git" / "objects").symlink_to(ws / ".git" / "objects", target_is_directory=True)
+    else:
+        git(tmp_path, "clone", "--no-hardlinks" if storage == "missing-object" else "--no-local", ws, live)
+        if storage == "promisor-config":
+            git(live, "config", "remote.origin.promisor", "true")
+        elif storage == "partial-clone":
+            git(live, "config", "extensions.partialClone", "origin")
+        elif storage == "promisor-pack":
+            marker = live / ".git" / "objects" / "pack" / "fixture.promisor"
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch()
+        else:
+            blob = git(live, "rev-parse", "HEAD:implementation.py")
+            (live / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
     assert git(live, "rev-parse", "HEAD") == sha
     git(live, "cat-file", "-e", sha)
     metadata = {"changed_files": ["implementation.py"]}

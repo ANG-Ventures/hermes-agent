@@ -15,6 +15,8 @@ trees differ by 58 files. So:
 These tests pin that split: the live tree is the deletion authority, and the
 reviewer's collision reproducer (same diff, different base, an unpublished
 commit) must fail closed.
+
+TEST-REPIN: fdedf3fc2e6a21e808b0b8b9cd94557b46856c72 ANG-Ventures/hermes-agent#795 — merged survivor authority supersedes unconditional landed acceptance.
 """
 import json
 import os
@@ -48,6 +50,19 @@ def init(repo, *, bare=False):
         git(repo, "config", "user.name", "Test")
         git(repo, "config", "user.email", "test@example.invalid")
     return repo
+
+
+def restore_artifact(survivor, tmp_path, published):
+    """Restore either recovery shape and return its checkout."""
+    restored = tmp_path / "restored"
+    if survivor["kind"] == "bundle":
+        git(tmp_path, "clone", survivor["bundles"][0]["path"], str(restored))
+    else:
+        git(tmp_path, "clone", "-b", "main", str(published), str(restored))
+        manifest = json.loads(Path(survivor["sidecar"]).read_text())
+        git(restored, "checkout", "--detach", manifest["repositories"][0]["base_sha"])
+        git(restored, "apply", survivor["path"])
+    return restored
 
 
 @pytest.fixture
@@ -293,13 +308,7 @@ def test_same_diff_different_base_fails_closed(board, tmp_path):
     survivor = kb.latest_run(board, tid).metadata["survivor"]
     assert survivor["kind"] in {"patch", "bundle"}, survivor
     # The commit that exists nowhere else is still recoverable from the artifact.
-    restored = tmp_path / "divergent-restored"
-    git(tmp_path, "clone", "-b", "main", str(mirror), str(restored))
-    assert not (restored / "unpublished.py").exists()
-    assert "secret_work" in Path(survivor["path"]).read_text()
-    manifest = json.loads(Path(survivor["sidecar"]).read_text())
-    git(restored, "checkout", "--detach", manifest["repositories"][0]["base_sha"])
-    git(restored, "apply", survivor["path"])
+    restored = restore_artifact(survivor, tmp_path, mirror)
     assert (restored / "unpublished.py").read_text() == "secret_work = 1\n"
 
 
@@ -339,6 +348,84 @@ def test_landed_accepts_the_live_home_tree_without_any_mirror_claim(board, tmp_p
     assert not ws.exists()
 
 
+def test_landed_rejects_a_valid_but_unrelated_commit(board, tmp_path):
+    tid, ws, _, _, _ = home_clone(board, tmp_path)
+    unrelated = init(tmp_path / "unrelated-live")
+    unrelated_sha = commit(unrelated, "other.py", "other = True\n", "unrelated")
+
+    with pytest.raises(ValueError, match="survivor_unavailable"):
+        kb.complete_task(board, tid, metadata={
+            "changed_files": ["code.py"],
+            "landed": [{"repo_path": str(unrelated), "sha": unrelated_sha}],
+        })
+
+    assert ws.exists()
+    assert (ws / "code.py").read_text() == "value = 2\n"
+
+
+@pytest.mark.parametrize("dirty", ["tracked", "untracked"])
+def test_landed_rejects_a_dirty_workspace(board, tmp_path, dirty):
+    tid, ws, live, head, _ = home_clone(board, tmp_path)
+    if dirty == "tracked":
+        (ws / "code.py").write_text("value = 3\n")
+    else:
+        (ws / "untracked.py").write_text("only_here = True\n")
+
+    with pytest.raises(ValueError, match="survivor_unavailable"):
+        kb.complete_task(board, tid, metadata={
+            "changed_files": ["code.py"],
+            "landed": [{"repo_path": str(live), "sha": head}],
+        })
+
+    assert ws.exists()
+
+
+def test_landed_allows_ignored_workspace_files(board, tmp_path):
+    tid, ws, live, _, _ = home_clone(board, tmp_path)
+    (ws / ".gitignore").write_text("scratch.log\n")
+    git(ws, "add", ".gitignore")
+    git(ws, "commit", "-m", "ignore scratch output")
+    head = git(ws, "rev-parse", "HEAD")
+    git(live, "fetch", str(ws), "main")
+    git(live, "reset", "--hard", "FETCH_HEAD")
+    (ws / "scratch.log").write_text("ignored\n")
+
+    assert kb.complete_task(board, tid, metadata={
+        "changed_files": [".gitignore"],
+        "landed": [{"repo_path": str(live), "sha": head}],
+    })
+    assert not ws.exists()
+
+
+def test_landed_accepts_patch_equivalent_workspace_history(board, tmp_path):
+    source = init(tmp_path / "patch-source")
+    commit(source, "code.py", "value = 1\n", "base")
+    tid = kb.create_task(board, title="rewritten landed history")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    git(tmp_path, "clone", "--no-local", str(source), str(ws))
+    git(ws, "config", "user.name", "Workspace")
+    git(ws, "config", "user.email", "workspace@example.invalid")
+    workspace_head = commit(ws, "code.py", "value = 2\n", "workspace implementation")
+
+    live = tmp_path / "patch-live"
+    git(tmp_path, "clone", "--no-local", str(source), str(live))
+    git(live, "config", "user.name", "Live")
+    git(live, "config", "user.email", "live@example.invalid")
+    landed_head = commit(live, "code.py", "value = 2\n", "rewritten implementation")
+    assert landed_head != workspace_head
+    kb.set_workspace_path(board, tid, ws)
+
+    assert kb.complete_task(board, tid, metadata={
+        "changed_files": ["code.py"],
+        "landed": [{"repo_path": str(live), "sha": landed_head}],
+    })
+    entry = kb.latest_run(board, tid).metadata["survivor"]["landed"][0]
+    assert entry["workspace_repositories"] == [{
+        "repository": ".", "head": workspace_head, "matched_by": "patch-id",
+    }]
+    assert not ws.exists()
+
+
 def test_landed_rejects_a_disposable_repository(board, tmp_path):
     """Pointing `landed` at the workspace itself must not authorise its deletion."""
     tid, ws, live, head, _ = home_clone(board, tmp_path)
@@ -362,18 +449,26 @@ def test_landed_rejects_a_directory_that_is_not_a_repository(board, tmp_path):
     assert ws.exists()
 
 
-def test_landed_skips_nested_capture_and_survives_cleanup(board, tmp_path, monkeypatch):
-    """Explicit canonical proof works without a local remote or snapshot budget."""
+def test_landed_rejects_an_unbound_nested_repository(board, tmp_path):
+    """A root-repo receipt cannot discard a nested repo's independent objects."""
     tid, ws, live, head, _ = home_clone(board, tmp_path, live_remote=False)
     nested = init(ws / "nested")
-    commit(nested, "code.py", "value = 2\n", "mirror copy")
-    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 2048)
-    assert kb.complete_task(board, tid, metadata={
-        "changed_files": ["code.py"],
-        "landed": [{"repo_path": str(live), "sha": head}],
-    })
-    assert not ws.exists()
-    assert (live / "code.py").read_text() == "value = 2\n"
+    nested_head = commit(nested, "nested.py", "only_here = True\n", "nested implementation")
+    git(ws, "add", "nested")
+    git(ws, "commit", "-m", "record nested repository")
+    root_head = git(ws, "rev-parse", "HEAD")
+    git(live, "fetch", str(ws), "main")
+    git(live, "reset", "--hard", "FETCH_HEAD")
+
+    with pytest.raises(ValueError, match="survivor_unavailable"):
+        kb.complete_task(board, tid, metadata={
+            "changed_files": ["nested/nested.py"],
+            "landed": [{"repo_path": str(live), "sha": root_head}],
+        })
+
+    assert ws.exists()
+    assert git(nested, "rev-parse", "HEAD") == nested_head
+    assert (nested / "nested.py").read_text() == "only_here = True\n"
 
 
 def test_landed_cleanup_rechecks_live_reachability(board, tmp_path):
