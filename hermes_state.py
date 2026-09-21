@@ -8651,7 +8651,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         last_notice_at = None
         notice_every = max(0.0, float(wait_notice_interval_seconds))
         notice_backoff = max(1.0, float(wait_notice_backoff or 1.0))
-        notice_cap = max(notice_every, float(wait_notice_max_interval_seconds))
+        # The cap is a real ceiling: a caller passing a cap below the base
+        # interval gets the cap, not a silently widened interval.
+        notice_cap = max(0.0, float(wait_notice_max_interval_seconds))
+        if notice_cap > 0.0:
+            notice_every = min(notice_every, notice_cap)
         while True:
             if should_abort is not None:
                 try:

@@ -727,3 +727,11 @@ def test_turn_lease_wait_notice_backoff_one_keeps_fixed_cadence(monkeypatch):
     """backoff<=1 preserves the historical fixed-interval behavior."""
     notices = _notice_times(monkeypatch, wait_seconds=90.0, backoff=1.0)
     assert notices == [0, 15, 30, 45, 60, 75]
+
+
+def test_turn_lease_wait_notice_cap_below_interval_is_honored(monkeypatch):
+    """A cap smaller than the base interval is a ceiling, not ignored."""
+    notices = _notice_times(
+        monkeypatch, wait_seconds=60.0, backoff=2.0, cap=10.0, interval=15.0
+    )
+    assert notices == [0, 10, 20, 30, 40, 50]
