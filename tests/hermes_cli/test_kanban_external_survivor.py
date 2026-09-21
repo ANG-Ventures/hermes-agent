@@ -1,0 +1,146 @@
+"""Completion must verify remote evidence even without an implementation clone."""
+import json
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_survivor as survivor
+
+HEAD = "a1" * 20
+MERGE = "b2" * 20
+PR = "example/project#68"
+URL = "https://github.com/example/project.git"
+
+
+@pytest.fixture
+def board(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    with kb.connect_closing() as conn:
+        yield conn
+
+
+@pytest.fixture
+def remote(monkeypatch):
+    state = {"state": "MERGED", "headRefOid": HEAD, "mergeCommit": {"oid": MERGE}}
+    calls = []
+    real = subprocess.run
+
+    def run(args, **kwargs):
+        if args[0] == "gh":
+            calls.append(args)
+            assert args[:6] == ["gh", "pr", "view", "68", "--repo", "example/project"]
+            return subprocess.CompletedProcess(args, 0, json.dumps(state).encode(), b"")
+        if "ls-remote" in args:
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 0, f"{HEAD}\trefs/heads/feature\n".encode(), b"")
+        return real(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return state, calls
+
+
+@pytest.mark.parametrize("state,expected", [("MERGED", MERGE), ("OPEN", HEAD)])
+def test_result_pr_without_workspace_clone(board, remote, state, expected):
+    remote[0]["state"] = state
+    tid = kb.create_task(board, title="external implementation")
+    assert kb.complete_task(board, tid, result=f"Shipped {PR} at {HEAD}",
+                            metadata={"changed_files": ["code.py"]})
+    saved = kb.latest_run(board, tid).metadata["survivor"]
+    assert saved["kind"] == "ref"
+    assert saved["refs"][0]["sha"] == expected
+    assert remote[1], "must consult remote, not accept the text"
+
+
+@pytest.mark.parametrize("state", ["CLOSED", "UNKNOWN"])
+def test_unmerged_or_unknown_pr_refuses(board, remote, state):
+    remote[0]["state"] = state
+    tid = kb.create_task(board, title="external implementation")
+    with pytest.raises(ValueError, match="survivor-pr"):
+        kb.complete_task(board, tid, result=f"Shipped {PR}", metadata={"changed_files": ["code.py"]})
+    assert kb.get_task(board, tid).status != "done"
+
+
+def test_wrong_claimed_sha_refuses(board, remote):
+    tid = kb.create_task(board, title="external implementation")
+    with pytest.raises(ValueError, match="survivor-pr"):
+        kb.complete_task(board, tid, result=f"Shipped {PR} at {'c3' * 20}",
+                         metadata={"changed_files": ["code.py"]})
+    assert kb.get_task(board, tid).status != "done"
+
+
+def test_explicit_ref_missing_on_remote_refuses(board, remote):
+    tid = kb.create_task(board, title="external implementation")
+    with pytest.raises(ValueError, match="verify"):
+        kb.complete_task(board, tid, survivor_ref=f"{URL}#{'c3' * 20}")
+    assert kb.get_task(board, tid).status != "done"
+
+
+def test_explicit_ref_records_resolved_full_sha(board, remote):
+    tid = kb.create_task(board, title="external implementation")
+    assert kb.complete_task(board, tid, survivor_ref=f"{URL}#{HEAD[:7]}")
+    assert kb.latest_run(board, tid).metadata["survivor"]["refs"][0]["sha"] == HEAD
+    assert remote[1]
+
+
+def test_review_approval_discovers_comment_and_preserves_on_cleanup(board, remote):
+    tid = kb.create_task(board, title="external implementation")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    kb.set_workspace_path(board, tid, ws)
+    assert kb.request_review(board, tid, summary=f"Shipped {PR} at {HEAD}",
+                             metadata={"changed_files": ["code.py"]})
+    kb.add_comment(board, tid, "reviewer", f"Approved {PR} at {HEAD}")
+    assert kb.complete_task(board, tid, summary="Approved")
+    assert kb.latest_run(board, tid).metadata["survivor"]["kind"] == "ref"
+    assert not ws.exists()
+    assert not [e for e in kb.list_events(board, tid) if e.kind == "workspace_held"]
+
+
+def test_explicit_pr_keeps_dirty_workspace_capture(board, remote, tmp_path):
+    tid = kb.create_task(board, title="dirty implementation")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    kb.set_workspace_path(board, tid, ws)
+    def git(*args):
+        return subprocess.run(["git", "-C", str(ws), *args], check=True,
+                              stdin=subprocess.DEVNULL, capture_output=True)
+    git("init", "-b", "main")
+    (ws / "code.py").write_text("unpublished = True\n")
+    assert kb.complete_task(board, tid, survivor_pr=PR)
+    saved = kb.latest_run(board, tid).metadata["survivor"]
+    assert saved["kind"] == "bundle"
+    assert Path(saved["bundles"][0]["path"]).is_file()
+    assert not ws.exists()
+
+
+def _cli(board, monkeypatch, argv):
+    """Drive the real parser + handler so the flag->preserve() binding is gated."""
+    import argparse
+    import contextlib
+
+    from hermes_cli import kanban as cli
+
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    cli.build_parser(parser.add_subparsers(dest="command"))
+    # The CLI closes its connection; the fixture's must survive for assertions.
+    monkeypatch.setattr(kb, "connect_closing",
+                        lambda *a, **k: contextlib.nullcontext(board))
+    return cli.kanban_command(parser.parse_args(["kanban", *argv]))
+
+
+def test_cli_complete_forwards_survivor_pr(board, remote, monkeypatch):
+    tid = kb.create_task(board, title="external implementation")
+    assert _cli(board, monkeypatch,
+                ["complete", tid, "--result", "shipped", "--survivor-pr", PR]) == 0
+    assert kb.get_task(board, tid).status == "done"
+    assert kb.latest_run(board, tid).metadata["survivor"]["refs"][0]["sha"] == MERGE
+    assert remote[1], "must consult the remote, not accept the flag text"
+
+
+def test_cli_complete_refuses_unverifiable_survivor_ref(board, remote, monkeypatch, capsys):
+    tid = kb.create_task(board, title="external implementation")
+    assert _cli(board, monkeypatch,
+                ["complete", tid, "--survivor-ref", f"{URL}#{'c3' * 20}"]) != 0
+    assert "could not verify --survivor-ref" in capsys.readouterr().err
+    assert kb.get_task(board, tid).status != "done"

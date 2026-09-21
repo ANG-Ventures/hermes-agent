@@ -17,6 +17,7 @@ import tempfile
 from urllib.parse import unquote, urlsplit
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_external_survivor as _ext
 
 _log = logging.getLogger(__name__)
 
@@ -213,6 +214,50 @@ def _snapshot(repo, base, prefix):
         ).stdout
 
 
+def _verified_explicit(survivor_ref, survivor_pr):
+    """An operator-named survivor is a claim: verify it or refuse the completion."""
+    for claim, flag, verify in (
+        (survivor_ref, "--survivor-ref", _ext.verify_ref),
+        (survivor_pr, "--survivor-pr", _ext.verify_pr),
+    ):
+        if not claim:
+            continue
+        ref = verify(claim)
+        if ref is None:
+            raise SurvivorUnavailable(
+                f"survivor_unavailable: could not verify {flag} {claim} against the remote"
+            )
+        return ref
+    return None
+
+
+def _remote_urls(repos):
+    urls = []
+    for repo in repos:
+        for remote in _git(repo, "remote", check=False).stdout.decode().splitlines():
+            url = _git(repo, "remote", "get-url", remote, check=False)
+            if url.returncode == 0:
+                urls.append(url.stdout.decode().strip())
+    return urls
+
+
+def _external(conn, task_id, metadata, evidence, urls, explicit):
+    ref = explicit or _ext.discover(conn, task_id, metadata, evidence, urls)
+    return {"kind": "ref", "refs": [dict(ref, repository=".")]} if ref else None
+
+
+def _record(conn, task_id, survivor, previous):
+    with kb.write_txn(conn):
+        conn.execute(
+            "INSERT INTO task_workspace_survivors(task_id, survivor) VALUES (?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET survivor = excluded.survivor, held_reason = NULL",
+            (task_id, json.dumps(survivor)),
+        )
+        if survivor and survivor != previous:
+            kb._append_event(conn, task_id, "workspace_survivor", survivor)
+    return survivor
+
+
 def _hold(conn, task_id, reason):
     with kb.write_txn(conn):
         conn.execute(
@@ -224,7 +269,8 @@ def _hold(conn, task_id, reason):
     _log.warning("Workspace HELD for task %s: %s", task_id, reason)
 
 
-def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None):
+def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
+             survivor_ref=None, survivor_pr=None, evidence=()):
     """Return a verified survivor or None for non-code work; fail closed on doubt."""
     bases, held, previous = _state(conn, task_id)
     if cleanup and held:
@@ -233,6 +279,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None):
         task = kb.get_task(conn, task_id)
         if task is None:
             raise SurvivorUnavailable("survivor_unavailable: task missing")
+        explicit = _verified_explicit(survivor_ref, survivor_pr)
         claimed = bool((metadata or {}).get("changed_files"))
         # Review approval often has no new changed_files: inherit the implementer's claim.
         claimed = claimed or any(
@@ -241,8 +288,14 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None):
         )
         workspace = Path(workspace or task.workspace_path) if workspace or task.workspace_path else None
         if workspace is None or not workspace.is_dir():
+            external = _external(conn, task_id, metadata, evidence, (), explicit)
+            if external:
+                return _record(conn, task_id, external, previous)
             if cleanup or bases or claimed:
-                raise SurvivorUnavailable("survivor_unavailable: workspace missing")
+                raise SurvivorUnavailable(
+                    "survivor_unavailable: workspace missing and no verifiable external "
+                    f"survivor; {_ext.HINT}"
+                )
             return None
         workspace = workspace.resolve(strict=True)
         repos = _repos(workspace)
@@ -288,18 +341,16 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None):
                              json.dumps(manifest, sort_keys=True).encode(), "application/json")
             survivor["sidecar"] = sidecar["path"]
         elif claimed:
-            raise SurvivorUnavailable("survivor_unavailable: empty patch despite claimed code changes")
+            external = _external(conn, task_id, metadata, evidence, _remote_urls(repos), explicit)
+            if external:
+                return _record(conn, task_id, dict(external, refs=external["refs"] + refs), previous)
+            raise SurvivorUnavailable(
+                "survivor_unavailable: empty patch despite claimed code changes and no "
+                f"verifiable external survivor; {_ext.HINT}"
+            )
         else:
             survivor = None
-        with kb.write_txn(conn):
-            conn.execute(
-                "INSERT INTO task_workspace_survivors(task_id, survivor) VALUES (?, ?) "
-                "ON CONFLICT(task_id) DO UPDATE SET survivor = excluded.survivor, held_reason = NULL",
-                (task_id, json.dumps(survivor)),
-            )
-            if survivor and survivor != previous:
-                kb._append_event(conn, task_id, "workspace_survivor", survivor)
-        return survivor
+        return _record(conn, task_id, survivor, previous)
     except (OSError, sqlite3.Error, subprocess.SubprocessError, ValueError) as exc:
         reason = str(exc) if isinstance(exc, SurvivorUnavailable) else "survivor_unavailable: capture failed"
         _hold(conn, task_id, reason)
