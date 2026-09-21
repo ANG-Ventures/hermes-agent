@@ -464,6 +464,39 @@ def _emit_unclean_report(evidence: Dict[str, Any], home: Optional[Path]) -> None
     )
 
 
+def _carry_prior_exit_forward(claim: Dict[str, Any], home: Optional[Path]) -> None:
+    """Copy the PREVIOUS life's recorded exit onto the new sentinel.
+
+    ``detect_unclean_exit`` only fires when the previous life left a stale
+    ``phase=running`` sentinel — i.e. nothing ran on the way out at all. The
+    two watchdog ``os._exit`` sites DO run ``mark_exited`` first, so they leave
+    ``phase=exited exit_code=75 exit_reason=loop_liveness_watchdog`` and are
+    correctly *not* flagged as unattributed deaths. But from a user's point of
+    view an ``os._exit`` from a watchdog thread is exactly as abrupt as a
+    SIGKILL: no drain ran, so no session was ever told the gateway was going
+    down (incident 2026-09-20 16:01).
+
+    Claiming the sentinel for the new life is the moment that record would be
+    lost, so mirror it forward under ``prior_*`` keys. Consumers:
+    ``gateway.fork_ext.unclean_restart_notice.classify_prior_life`` (tells a
+    boot-resumed session why it went quiet) and ``hermes gateway status``.
+    Best-effort — never raises.
+    """
+    try:
+        previous = _read_json(get_lifecycle_sentinel_path(home))
+        if not previous or previous.get("phase") != "exited":
+            return
+        claim["prior_phase"] = "exited"
+        if previous.get("exit_code") is not None:
+            claim["prior_exit_code"] = previous.get("exit_code")
+        if previous.get("exit_reason"):
+            claim["prior_exit_reason"] = previous.get("exit_reason")
+        if previous.get("exited_at"):
+            claim["prior_exited_at"] = previous.get("exited_at")
+    except Exception:
+        logger.debug("Failed to carry prior exit record forward", exc_info=True)
+
+
 def _claim_sentinel(evidence: Optional[Dict[str, Any]], home: Optional[Path]) -> None:
     try:
         claim: Dict[str, Any] = {
@@ -472,6 +505,7 @@ def _claim_sentinel(evidence: Optional[Dict[str, Any]], home: Optional[Path]) ->
             "start_time": time.time(),
             "started_at": datetime.now(timezone.utc).isoformat(),
         }
+        _carry_prior_exit_forward(claim, home)
         # Carry the verdict on the PREVIOUS life forward on the new
         # sentinel: it is the only place the finding survives in
         # machine-readable form (the exit-diag log is append-only prose
