@@ -222,6 +222,35 @@ async def test_terminal_states_are_written_inline_not_offloaded(sandbox_home):
         gwstatus.write_runtime_status = real  # type: ignore[assignment]
 
 
+@pytest.mark.asyncio
+async def test_terminal_write_cannot_be_overtaken_by_older_deferred_write(
+    sandbox_home, monkeypatch,
+):
+    """A queued ``running`` write must never land after terminal ``stopped``."""
+    runner = _make_runner()
+    loop = asyncio.get_running_loop()
+    queued = []
+
+    def hold_executor_callback(executor, callback):
+        queued.append(callback)
+        return loop.create_future()
+
+    monkeypatch.setattr(loop, "run_in_executor", hold_executor_callback)
+    runner._update_runtime_status("running")
+    runner._update_runtime_status("stopped", "sigterm")
+    # Replaying callbacks held by the old default-executor shape simulates the
+    # delayed ``running`` write that used to overtake terminal state.
+    for callback in queued:
+        callback()
+
+    from gateway import status as gwstatus
+
+    record = gwstatus.read_runtime_status()
+    assert record is not None
+    assert record["gateway_state"] == "stopped"
+    assert record["exit_reason"] == "sigterm"
+
+
 # ---------------------------------------------------------------------------
 # Concurrency: going off-loop makes the read-merge-write genuinely racy
 # ---------------------------------------------------------------------------
@@ -232,10 +261,9 @@ async def test_status_write_is_a_merge_so_concurrency_must_not_drop_fields(
     sandbox_home,
 ):
     """Every caller passes a SUBSET of fields and relies on the on-disk payload
-    for the rest.  Two unserialized executor writers would each read the
-    pre-merge file and the loser's field would vanish.  Verified: without
-    ``_RUNTIME_STATUS_WRITE_LOCK`` this loses ``gateway_state`` and
-    ``exit_reason``."""
+    for the rest. Two unserialized public writers each read the pre-merge file
+    and the loser's field vanishes. The public API itself must serialize so a
+    direct caller cannot race the gateway's ordered lane."""
     from gateway import status as gwstatus
 
     real = gwstatus._write_json_file
@@ -249,14 +277,14 @@ async def test_status_write_is_a_merge_so_concurrency_must_not_drop_fields(
     try:
         await asyncio.gather(
             asyncio.to_thread(
-                gwstatus.write_runtime_status_locked, gateway_state="running",
+                gwstatus.write_runtime_status, gateway_state="running",
             ),
             asyncio.to_thread(
-                gwstatus.write_runtime_status_locked,
+                gwstatus.write_runtime_status,
                 platform="telegram", platform_state="connected",
             ),
             asyncio.to_thread(
-                gwstatus.write_runtime_status_locked, exit_reason="none",
+                gwstatus.write_runtime_status, exit_reason="none",
             ),
         )
     finally:

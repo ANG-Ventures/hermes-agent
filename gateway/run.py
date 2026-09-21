@@ -124,6 +124,11 @@ _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT = 180.0
 # 180s budget (is_reconnect=True preserves the offline update queue, #46621).
 _TELEGRAM_INITIAL_CONNECT_TIMEOUT_SECS_DEFAULT = 45.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+_RUNTIME_STATUS_WRITE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="gateway-runtime-status",
+)
+_RUNTIME_STATUS_SUBMIT_LOCK = threading.Lock()
 # How long the shutdown path waits for in-flight ThreadPoolExecutor workers
 # (agent turns) to finish before giving up and letting the CLI hard-exit
 # backstop finalize the process. Bounded so a wedged worker can't strand the
@@ -10602,42 +10607,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # exactly when a stalled loop costs nothing.
     _TERMINAL_GATEWAY_STATES = frozenset({"stopped", "startup_failed"})
 
-    def _dispatch_runtime_status_write(self, **kwargs) -> None:  # noqa: atomic-write-on-loop loop-conditional guard: defers to an executor thread whenever a loop is running
-        """Run a ``write_runtime_status`` off the loop when there is one.
+    def _dispatch_runtime_status_write(self, **kwargs) -> None:  # noqa: atomic-write-on-loop loop-conditional guard: ordered worker lane whenever a loop is running
+        """Serialize runtime-status writes without blocking the active loop.
 
-        ``write_runtime_status`` is a read-merge-atomic-write of
-        gateway_state.json plus a realpath walk and a psutil ``create_time``
-        call (measured median 0.903ms / max 7.666ms on an IDLE box).  Nine
-        coroutines reach it, so on the loop it stalls every other session.
-
-        Mirrors :meth:`_persist_active_agents`: loop-conditional, so the
-        synchronous callers (``_enter_external_drain``, ``_maybe_update_status``,
-        ``_scale_to_zero_note_real_inbound``) keep running inline exactly as
-        before.  Callers and signatures are unchanged.
+        Non-terminal loop callers enter one dedicated FIFO worker. Terminal and
+        synchronous callers fence that lane, then write inline, so an older
+        deferred lifecycle update cannot overtake ``stopped`` at shutdown.
         """
         def _write() -> None:
             try:
-                from gateway.status import write_runtime_status_locked
-                # Always via the locked form: the offloaded writes are genuinely
-                # concurrent and the read-merge-write would otherwise drop the
-                # loser's fields (a shutdown's exit_reason racing a platform
-                # state).  Harmless when we run inline.
-                write_runtime_status_locked(**kwargs)
+                from gateway.status import write_runtime_status
+
+                write_runtime_status(**kwargs)
             except Exception:
                 pass
 
-        if kwargs.get("gateway_state") in self._TERMINAL_GATEWAY_STATES:
-            _write()
-            return
-
+        terminal = kwargs.get("gateway_state") in self._TERMINAL_GATEWAY_STATES
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
+            on_loop = True
         except RuntimeError:
-            _write()  # no loop to protect: previous behavior
-            return
+            on_loop = False
 
+        if on_loop and not terminal:
+            try:
+                with _RUNTIME_STATUS_SUBMIT_LOCK:
+                    _RUNTIME_STATUS_WRITE_EXECUTOR.submit(_write)
+                return
+            except Exception:
+                _write()
+                return
+
+        # Preserve the established inline contract for sync and terminal
+        # callers, but only after every earlier queued write has drained.
         try:
-            loop.run_in_executor(None, _write)
+            with _RUNTIME_STATUS_SUBMIT_LOCK:
+                _RUNTIME_STATUS_WRITE_EXECUTOR.submit(lambda: None).result()
+                _write()
         except Exception:
             _write()
 
@@ -10669,8 +10675,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         it runs inline exactly as before.
         """
         try:
-            from gateway.status import write_runtime_status
-
             payload = {
                 "active_agents": self._active_work_count(),
                 # The live running-session keys (excl. the pending sentinel) so the
@@ -10678,31 +10682,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # rather than waiting for the whole fleet to go idle.
                 "active_agent_keys": list(self._snapshot_running_agents().keys()),
             }
+            self._dispatch_runtime_status_write(**payload)
         except Exception:
             return
-
-        def _write() -> None:
-            try:
-                from gateway.status import write_runtime_status as _w
-
-                _w(**payload)
-            except Exception:
-                pass
-
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # No running loop: nothing to protect, run inline (previous behavior).
-            _write()
-            return
-
-        # Fire-and-forget on the default executor. Deliberately not awaited —
-        # callers are turn-boundary hooks in synchronous code paths, and a
-        # status write is best-effort telemetry, never a turn dependency.
-        try:
-            loop.run_in_executor(None, _write)
-        except Exception:
-            _write()
 
     # ------------------------------------------------------------------
     # Task-liveness reaper (busy-gateway-quiescence, spec §5 D-3/D-4).

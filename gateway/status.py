@@ -1198,7 +1198,7 @@ def write_pid_file() -> None:
         raise
 
 
-def write_runtime_status(
+def _write_runtime_status_unlocked(
     *,
     gateway_state: Any = _UNSET,
     exit_reason: Any = _UNSET,
@@ -1325,30 +1325,52 @@ def write_runtime_status(
         pass
 
 
-# ``write_runtime_status`` is a read-modify-atomic-write of gateway_state.json
-# plus a realpath walk and a psutil ``create_time`` call.  Measured median
-# 0.903ms / max 7.666ms on an IDLE box with a small file.  Nine coroutines in
-# gateway/run.py reach it (startup, shutdown, the reconnect watcher, the
-# scale-to-zero watcher, per-turn ``track_agent`` / ``_run_agent_inner``), so
-# on the loop it stalls every other session for the duration of the rename.
-#
-# ``asyncio.to_thread`` serializes nothing, and the read-modify-write here is a
-# genuine merge (every caller passes a SUBSET of fields and relies on the
-# on-disk payload for the rest).  Two concurrent writers in the executor would
-# each read the pre-merge file and the loser's fields would vanish -- e.g. a
-# shutdown writing ``exit_reason`` racing the reconnect watcher writing a
-# platform state.  Serialize the whole read-merge-write.
+# Every writer, including callers outside GatewayRunner, must participate in
+# the same read-merge-write boundary. Locking only the executor-facing helper
+# leaves direct writers able to clobber fields.
 _RUNTIME_STATUS_WRITE_LOCK = threading.Lock()
 
 
-def write_runtime_status_locked(**kwargs: Any) -> None:
-    """``write_runtime_status`` under the cross-thread merge lock.
-
-    Callers that offload this to an executor must go through here, not
-    ``write_runtime_status`` directly.
-    """
+def write_runtime_status(
+    *,
+    gateway_state: Any = _UNSET,
+    exit_reason: Any = _UNSET,
+    restart_requested: Any = _UNSET,
+    active_agents: Any = _UNSET,
+    active_agent_keys: Any = _UNSET,
+    platform: Any = _UNSET,
+    platform_state: Any = _UNSET,
+    error_code: Any = _UNSET,
+    error_message: Any = _UNSET,
+    needs_attention: Any = _UNSET,
+    retrying_since: Any = _UNSET,
+    served_profiles: Any = _UNSET,
+    session_store: Any = _UNSET,
+    clear_profile_platforms: bool = False,
+) -> None:
+    """Persist runtime status under the process-wide merge lock."""
     with _RUNTIME_STATUS_WRITE_LOCK:
-        write_runtime_status(**kwargs)
+        _write_runtime_status_unlocked(
+            gateway_state=gateway_state,
+            exit_reason=exit_reason,
+            restart_requested=restart_requested,
+            active_agents=active_agents,
+            active_agent_keys=active_agent_keys,
+            platform=platform,
+            platform_state=platform_state,
+            error_code=error_code,
+            error_message=error_message,
+            needs_attention=needs_attention,
+            retrying_since=retrying_since,
+            served_profiles=served_profiles,
+            session_store=session_store,
+            clear_profile_platforms=clear_profile_platforms,
+        )
+
+
+def write_runtime_status_locked(**kwargs: Any) -> None:
+    """Backward-compatible alias for the now-serialized public writer."""
+    write_runtime_status(**kwargs)
 
 
 def read_runtime_status(path: Optional[Path] = None) -> Optional[dict[str, Any]]:
