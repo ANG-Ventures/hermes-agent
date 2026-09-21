@@ -3014,6 +3014,10 @@ DEFAULT_CONFIG = {
         "failure_limit": 2,
         # Quota releases are not task failures. Defer the next attempt this long.
         "rate_limit_cooldown_seconds": 300,
+        # Case-insensitive substrings that may not be used for Kanban workers
+        # without a logged flagship override. None uses model_policy's shared
+        # FLAGSHIP_MODEL_SUBSTRINGS; a non-empty list replaces that default.
+        "banned_worker_model_substrings": None,
         # Optional provider -> health URL admission probes; disabled by default.
         "provider_health_probes": {},
         # CPU scheduling priority for dispatcher-spawned worker gateways, and

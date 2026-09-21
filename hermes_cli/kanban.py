@@ -474,6 +474,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "--provider <name> to the worker). Requires "
                                "--model.")
     p_create.add_argument(
+        "--allow-flagship",
+        default=None,
+        metavar="REASON",
+        help="Allow an orchestrator-only flagship model for this task. "
+             "Requires a non-empty reason, recorded as a task comment.",
+    )
+    p_create.add_argument(
         "--reasoning",
         "--effort",
         default=None,
@@ -597,6 +604,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--provider", default=None,
         help="Provider the model belongs to (worker is spawned with "
              "--provider <name>). Cleared together with the model.",
+    )
+    p_set_model.add_argument(
+        "--allow-flagship",
+        default=None,
+        metavar="REASON",
+        help="Allow an orchestrator-only flagship model. Requires a non-empty "
+             "reason, recorded as a task comment.",
     )
     _effort_group = p_set_model.add_mutually_exclusive_group()
     _effort_group.add_argument(
@@ -1907,6 +1921,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    from hermes_cli.model_policy import validate_worker_model
+
+    try:
+        flagship_reason = validate_worker_model(
+            getattr(args, "model_override", None),
+            allow_flagship_reason=getattr(args, "allow_flagship", None),
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1929,6 +1953,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_retries=max_retries,
             model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
+            flagship_override_reason=flagship_reason,
+            flagship_override_author=args.created_by or _profile_author(),
             reasoning_effort=getattr(args, "reasoning_effort", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
@@ -2301,6 +2327,18 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     if provider and not touch_model:
         print("kanban: --provider requires a model", file=sys.stderr)
         return 2
+    flagship_reason = None
+    if touch_model:
+        from hermes_cli.model_policy import validate_worker_model
+
+        try:
+            flagship_reason = validate_worker_model(
+                model,
+                allow_flagship_reason=getattr(args, "allow_flagship", None),
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
     if effort is not None:
         # Validate BEFORE any write so `set-model <id> <model> --effort typo`
         # can't half-apply (model committed, effort rejected).
@@ -2319,7 +2357,12 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
         with kb.connect_closing() as conn:
             if touch_model:
                 ok = kb.set_model_override(
-                    conn, args.task_id, model, provider=provider,
+                    conn,
+                    args.task_id,
+                    model,
+                    provider=provider,
+                    flagship_override_reason=flagship_reason,
+                    flagship_override_author=_profile_author(),
                 )
                 if not ok:
                     print(f"no such task: {args.task_id}", file=sys.stderr)
@@ -3335,6 +3378,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "spawned_unwatched": spawned_unwatched,
             "skipped_unassigned": res.skipped_unassigned,
+            "flagship_refused": res.flagship_refused,
             "skipped_nonspawnable": res.skipped_nonspawnable,
             "stranded_by_triage": [
                 {"task_id": child, "parent_id": parent}
@@ -3378,6 +3422,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     print(f"Crashed:      {len(res.crashed)}")
     if res.crashed:
         print(f"  {', '.join(res.crashed)}")
+    print(f"Flagship refused: {len(res.flagship_refused)}")
+    if res.flagship_refused:
+        print(f"  {', '.join(res.flagship_refused)}")
     print(f"Timed out:    {len(res.timed_out)}")
     if res.timed_out:
         print(f"  {', '.join(res.timed_out)}")
