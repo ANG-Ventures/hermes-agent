@@ -484,3 +484,149 @@ def test_remove_board_archive_is_unaffected(kanban_home):
     res = kb.remove_board("kept", archive=True)
     assert res["action"] == "archived"
     assert Path(res["new_path"]).is_dir()
+
+
+# ---------------------------------------------------------------------------
+# 7. Audit DURABILITY and audit TRUTHFULNESS (card t_63fb42f9, review round 4)
+#
+# Two measured defects in the round-3 audit, both on the board lane:
+#
+# * The destination was inferred, and _managed_scratch_path_info cannot infer
+#   a board from a board ROOT (it only matches scratch descendants). With
+#   HERMES_KANBAN_BOARD pinned to the board being deleted, worker_logs_dir(None)
+#   resolved INTO the doomed directory, so a successful deletion destroyed its
+#   own audit: `action='deleted'`, remaining audit files `[]`.
+# * DELETE was written BEFORE the executor ran. A survivor-held board left a
+#   DELETE line for a board that still exists -- the log was simply false.
+#
+# The fix is a class fix, not a board patch: _durable_audit_log_path refuses
+# any destination inside the deletion target for EVERY call site, and all
+# irreversible lanes write ATTEMPT -> {DELETE|FAILED|REFUSED} around the
+# executor instead of a verdict in front of it.
+# ---------------------------------------------------------------------------
+
+
+def _all_audit_lines(home: Path) -> list:
+    """Every audit line anywhere under the temp HOME, wherever it landed."""
+    lines = []
+    for log in home.rglob("*workspace-deletions.log"):
+        lines += [
+            ln for ln in log.read_text(encoding="utf-8").splitlines() if ln.strip()
+        ]
+    return lines
+
+
+def test_board_delete_audit_survives_when_the_active_board_is_the_target(
+    kanban_home, monkeypatch
+):
+    """The env-pinned named-board case: the audit must outlive the board."""
+    kb.create_board("idle-audit", name="Idle audit")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "idle-audit")
+
+    bdir = kb.board_dir("idle-audit")
+    res = kb.remove_board("idle-audit", archive=False)
+    assert res["action"] == "deleted"
+    assert not bdir.exists()
+
+    lines = _all_audit_lines(kanban_home)
+    assert lines, "a successful board deletion destroyed its own audit"
+    survivors = [Path(p) for p in kanban_home.rglob("*workspace-deletions.log")]
+    assert survivors, "no audit file survived the deletion"
+    for log in survivors:
+        assert not log.resolve().is_relative_to(bdir.resolve()), (
+            "audit was written inside the directory being deleted: %s" % log
+        )
+    mine = [ln for ln in lines if "board=idle-audit" in ln]
+    assert any("\tATTEMPT\t" in ln for ln in mine), mine
+    assert any("\tDELETE\t" in ln for ln in mine), mine
+
+
+def test_board_delete_refusal_is_not_recorded_as_a_deletion(kanban_home):
+    """A survivor-held board must not leave a DELETE line; it still exists."""
+    from hermes_cli.kanban_survivor import SurvivorUnavailable
+
+    kb.create_board("retained-audit", name="Retained audit")
+    bdir = kb.board_dir("retained-audit")
+    ws = bdir / "workspaces" / "t_test"
+    ws.mkdir(parents=True)
+    (ws / "unretained.txt").write_text("keep", encoding="utf-8")
+
+    with pytest.raises(SurvivorUnavailable):
+        kb.remove_board("retained-audit", archive=False)
+
+    assert bdir.is_dir(), "the board was supposed to be held"
+    mine = [
+        ln for ln in _all_audit_lines(kanban_home)
+        if "board=retained-audit" in ln
+    ]
+    assert mine, "a refused board deletion left no audit trail"
+    assert any("\tATTEMPT\t" in ln for ln in mine), mine
+    assert not any("\tDELETE\t" in ln for ln in mine), (
+        "audit claims a DELETE for a board that still exists: %s" % mine
+    )
+    assert any(
+        "\tREFUSED\t" in ln or "\tFAILED\t" in ln for ln in mine
+    ), mine
+
+
+def test_scratch_lane_records_the_terminal_outcome_not_just_the_attempt(
+    kanban_home,
+):
+    """ATTEMPT before the rmtree, DELETE only after it actually returned."""
+    root = _scratch_root()
+    task_id = _mktask("done one")
+    ws = root / task_id
+    ws.mkdir()
+
+    assert kb.safe_remove_workspace_dir(ws, task_id=task_id, reason="unit") is True
+    assert not ws.exists()
+
+    mine = [ln for ln in _audit_lines() if "task=%s" % task_id in ln]
+    assert any("\tATTEMPT\t" in ln for ln in mine), mine
+    assert any("\tDELETE\t" in ln for ln in mine), mine
+    assert mine.index([ln for ln in mine if "\tATTEMPT\t" in ln][0]) < mine.index(
+        [ln for ln in mine if "\tDELETE\t" in ln][0]
+    ), "DELETE must follow the ATTEMPT, not precede the removal"
+
+
+def test_worktree_lane_records_attempt_then_delete(kanban_home, linked_worktree):
+    """Control: the worktree lane keeps the same ATTEMPT/DELETE semantics."""
+    _repo, wt = linked_worktree
+    task_id = _mktask("worktree control")
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status='done', workspace_kind='worktree', "
+            "workspace_path=? WHERE id=?",
+            (str(wt), task_id),
+        )
+        conn.commit()
+        kb._cleanup_worktree_workspace(
+            task_id, str(wt), None, conn=conn, reason="unit"
+        )
+
+    assert not wt.is_dir(), "clean pushed worktree should have been removed"
+    mine = [ln for ln in _audit_lines() if "task=%s" % task_id in ln]
+    assert any("\tATTEMPT\t" in ln for ln in mine), mine
+    assert any("\tDELETE\t" in ln for ln in mine), mine
+
+
+def test_audit_never_writes_inside_the_directory_it_is_recording(kanban_home):
+    """The class invariant, asserted directly on the helper.
+
+    Whatever the target, the chosen destination is never inside it -- this
+    is what makes the board case safe without a board-specific special case.
+    """
+    targets = [
+        kanban_home / "kanban",
+        kanban_home / "kanban" / "logs",
+        kanban_home / "kanban" / "workspaces",
+        kb.board_dir("some-board"),
+        kanban_home,
+    ]
+    for target in targets:
+        chosen = kb._durable_audit_log_path(target.resolve(), None)
+        resolved = chosen.resolve()
+        assert resolved != target.resolve(), target
+        assert not resolved.is_relative_to(target.resolve()), (
+            "%s would be destroyed by a deletion of %s" % (chosen, target)
+        )

@@ -1586,8 +1586,9 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         live = _board_has_live_cards(normed)
         if live:
             _audit_workspace_deletion(
-                d, task_id=live[0], reason="remove_board", allowed=False,
+                d, task_id=live[0], reason="remove_board", outcome=AUDIT_REFUSED,
                 detail=f"board-has-live-cards:{','.join(live[:5])}",
+                board=normed,
             )
             raise ValueError(
                 f"board {normed!r} has {len(live)} card(s) running or holding "
@@ -1624,14 +1625,40 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         # Two independent refusals now apply to a board hard-delete: the
         # liveness gate above (no card on this board may be running or
         # claim-locked) and their survivor gate inside remove_workspace_dir
-        # (the board may not still hold recoverable work). The audit line
-        # records the attempt either way -- card t_63fb42f9 / incident
-        # 2026-09-20, where a wholesale directory removal left no trail.
+        # (the board may not still hold recoverable work). The audit records
+        # the ATTEMPT before the removal and the terminal outcome after, to
+        # an explicitly-pinned destination OUTSIDE the board being deleted
+        # -- card t_63fb42f9 / incident 2026-09-20. Writing DELETE up front
+        # to the board's own logs/ meant a success destroyed its own record
+        # and a survivor refusal left a DELETE line for a board that still
+        # exists (review round 4, measured).
         _audit_workspace_deletion(
-            d, task_id=None, reason="remove_board", allowed=True,
-            detail=f"board={normed}",
+            d, task_id=None, reason="remove_board", outcome=AUDIT_ATTEMPT,
+            detail=f"board={normed}", board=normed,
         )
-        remove_workspace_dir(None, None, d, board=True)
+        try:
+            removed = bool(remove_workspace_dir(None, None, d, board=True))
+        except Exception as exc:
+            _audit_workspace_deletion(
+                d, task_id=None, reason="remove_board", outcome=AUDIT_REFUSED,
+                detail=f"board={normed} {type(exc).__name__}: {exc}"[:200],
+                board=normed,
+            )
+            raise
+        if not removed:
+            _audit_workspace_deletion(
+                d, task_id=None, reason="remove_board", outcome=AUDIT_FAILED,
+                detail=f"board={normed} survivor-held-or-removal-failed",
+                board=normed,
+            )
+            raise ValueError(
+                f"board {normed!r} could not be deleted; it still holds "
+                "recoverable work. Archive it instead."
+            )
+        _audit_workspace_deletion(
+            d, task_id=None, reason="remove_board", outcome=AUDIT_DELETE,
+            detail=f"board={normed}", board=normed,
+        )
         return {"slug": normed, "action": "deleted", "new_path": ""}
 
 
@@ -7065,13 +7092,82 @@ def workspace_deletion_log_path(board: Optional[str] = None) -> Path:
     return worker_logs_dir(board=board) / "workspace-deletions.log"
 
 
+#: Audit outcomes. ``ATTEMPT`` is written *before* an irreversible removal
+#: so a process that dies mid-rmtree still names itself; ``DELETE`` is only
+#: ever written after the removal actually returned success. ``REFUSED`` is a
+#: gate saying no, ``FAILED`` is the executor saying no.
+AUDIT_ATTEMPT = "ATTEMPT"
+AUDIT_DELETE = "DELETE"
+AUDIT_REFUSED = "REFUSED"
+AUDIT_FAILED = "FAILED"
+
+
+def _durable_audit_log_path(target: Path, board: Optional[str]) -> Path:
+    """Pick an audit log that will still exist after *target* is removed.
+
+    A board hard-delete removes ``<root>/kanban/boards/<slug>/`` -- which
+    CONTAINS that board's own ``logs/``. Routing the audit there means a
+    successful deletion destroys its own record (card t_63fb42f9, review
+    round 4: ``action='deleted'``, remaining audit files ``[]``). This is
+    not a board-only hazard: any deletion whose target encloses the log
+    directory has it, so the containment check lives here, in front of
+    every call site, rather than at the one that happened to be reported.
+
+    Candidates are tried outermost-last; the first one not inside *target*
+    wins.
+    """
+    candidates: list[Path] = []
+    try:
+        candidates.append(workspace_deletion_log_path(board=board))
+    except Exception:
+        pass
+    try:
+        # The default board's log lives at <root>/kanban/logs/, which is a
+        # sibling of boards/ and of workspaces/ -- outside every per-board
+        # and per-card deletion target.
+        candidates.append(workspace_deletion_log_path(board=DEFAULT_BOARD))
+    except Exception:
+        pass
+    try:
+        # Last resort for the incident's own shape: the whole kanban home
+        # as the target. Nothing under it is durable, so step outside.
+        candidates.append(kanban_home() / "kanban-workspace-deletions.log")
+    except Exception:
+        pass
+    try:
+        import tempfile
+
+        # And if even the home is the target, leave the tree entirely. An
+        # audit line outside the blast radius beats no audit line at all --
+        # the whole point of deliverable 2b.
+        candidates.append(
+            Path(tempfile.gettempdir()) / "hermes-workspace-deletions.log"
+        )
+    except Exception:
+        pass
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=False)
+        except OSError:
+            continue
+        try:
+            if resolved == target or resolved.is_relative_to(target):
+                continue  # would be destroyed by the deletion it records
+        except (ValueError, OSError):
+            pass
+        return candidate
+    return candidates[-1] if candidates else Path("workspace-deletions.log")
+
+
 def _audit_workspace_deletion(
     path: Path,
     *,
     task_id: Optional[str],
     reason: str,
-    allowed: bool,
+    allowed: Optional[bool] = None,
     detail: str = "",
+    outcome: Optional[str] = None,
+    board: Optional[str] = None,
 ) -> None:
     """Append one line to the workspace-deletion audit log. Best effort.
 
@@ -7079,16 +7175,35 @@ def _audit_workspace_deletion(
     default-board scratch root vanished under a running worker and no log
     named a deleter. Every attempted removal -- permitted or refused --
     now leaves a record naming pid, ppid, task, path and outcome.
+
+    ``outcome`` is one of :data:`AUDIT_ATTEMPT` / :data:`AUDIT_DELETE` /
+    :data:`AUDIT_REFUSED` / :data:`AUDIT_FAILED`. ``allowed`` is the older
+    boolean spelling and maps to DELETE/REFUSED. A caller that is about to
+    perform an irreversible removal writes ATTEMPT first and DELETE only
+    once the executor has returned success -- writing DELETE up front makes
+    the log lie whenever the executor refuses (review round 4 measured
+    exactly that on a survivor-held board: a DELETE line for a board that
+    still exists).
+
+    ``board`` pins the log's board explicitly. Without it the destination is
+    inferred, and for a target that is not a scratch descendant (a board
+    root) the inference falls through to the ambient active board.
     """
     try:
-        board = None
-        is_managed, matched_board = _managed_scratch_path_info(path)
-        if is_managed:
-            board = matched_board
-        log_path = workspace_deletion_log_path(board=board)
+        if outcome is None:
+            outcome = AUDIT_DELETE if allowed else AUDIT_REFUSED
+        if board is None:
+            is_managed, matched_board = _managed_scratch_path_info(path)
+            if is_managed:
+                board = matched_board
+        try:
+            target = Path(path).resolve(strict=False)
+        except OSError:
+            target = Path(path)
+        log_path = _durable_audit_log_path(target, board)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-        verdict = "DELETE" if allowed else "REFUSED"
+        verdict = outcome
         try:
             argv = " ".join(sys.argv)[:300]
         except Exception:
@@ -7213,7 +7328,7 @@ def safe_remove_workspace_dir(
         return False
 
     _audit_workspace_deletion(
-        resolved, task_id=task_id, reason=reason, allowed=True,
+        resolved, task_id=task_id, reason=reason, outcome=AUDIT_ATTEMPT,
     )
     # The removal itself goes through kanban_survivor.remove_workspace_dir
     # (#783), which captures recoverable implementation work before deleting
@@ -7247,10 +7362,13 @@ def safe_remove_workspace_dir(
         removed = False
     if not removed:
         _audit_workspace_deletion(
-            resolved, task_id=task_id, reason=reason, allowed=False,
+            resolved, task_id=task_id, reason=reason, outcome=AUDIT_FAILED,
             detail="survivor-held-workspace",
         )
         return False
+    _audit_workspace_deletion(
+        resolved, task_id=task_id, reason=reason, outcome=AUDIT_DELETE,
+    )
     _log.debug(
         "Removed scratch workspace %s (task %s, reason %s)",
         resolved, task_id, reason,
@@ -7440,9 +7558,13 @@ def _cleanup_worktree_workspace(
         # became dirty between our check and the removal (TOCTOU), removal
         # fails safe and the worktree is preserved.
         from hermes_cli.kanban_survivor import remove_workspace_dir
+        _audit_workspace_deletion(
+            wp, task_id=task_id, reason=reason, outcome=AUDIT_ATTEMPT,
+            detail="git-worktree-remove",
+        )
         if not remove_workspace_dir(conn, task_id, wp, worktree_root=repo_root):
             _audit_workspace_deletion(
-                wp, task_id=task_id, reason=reason, allowed=False,
+                wp, task_id=task_id, reason=reason, outcome=AUDIT_FAILED,
                 detail="survivor-refused-or-git-remove-failed",
             )
             _log.warning(
@@ -7450,7 +7572,7 @@ def _cleanup_worktree_workspace(
             )
             return
         _audit_workspace_deletion(
-            wp, task_id=task_id, reason=reason, allowed=True,
+            wp, task_id=task_id, reason=reason, outcome=AUDIT_DELETE,
             detail="git-worktree-remove",
         )
         _log.debug("Removed worktree workspace: %s", wp)
