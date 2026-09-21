@@ -14747,11 +14747,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not message:
                 return
             # Idempotent per (boot, session): a re-scheduled resume or a crash
-            # loop must not spam the channel.
-            if not claim_restart_notice(
-                verdict.boot_id,
-                session_key,
-                home=getattr(self, "_unclean_restart_home", None),
+            # loop must not spam the channel. The claim does an atomic rename,
+            # so it goes OFF-LOOP — a blocking os.replace on the loop thread is
+            # the exact class that caused the incident this notice explains
+            # (tests/gateway/test_no_atomic_write_reachable_from_loop.py).
+            _home = getattr(self, "_unclean_restart_home", None)
+            if not await asyncio.to_thread(
+                claim_restart_notice, verdict.boot_id, session_key, _home
             ):
                 return
         except Exception:
