@@ -25,6 +25,8 @@ class SurvivorUnavailable(ValueError):
     """Completion/reclamation must retain the workspace for recovery."""
 
 
+log = logging.getLogger(__name__)
+
 def _git(repo, *args, env=None, check=True):
     result = subprocess.run(
         ["git", "-C", str(repo), *args], stdin=subprocess.DEVNULL,
@@ -40,6 +42,14 @@ def _repos(workspace):
     """Find repos created inside scratch, including linked worktrees; no symlinks."""
     found = []
     def fail(exc):
+        # An unreadable directory (EACCES/EPERM) cannot hold a repo the worker
+        # could have written to, so skipping it loses no survivor. Raising here
+        # took down every dispatch tick for a `dir` workspace rooted at a real
+        # home (2026-09-20: `var/skills-portal/caddy`, root-owned 0700, made the
+        # whole default board unspawnable). Anything else is still fatal.
+        if isinstance(exc, PermissionError):
+            log.warning("kanban survivor: skipping unreadable dir %s (%s)", exc.filename, exc.strerror)
+            return
         raise exc
     for root, dirs, files in os.walk(workspace, followlinks=False, onerror=fail):
         if ".git" in dirs or ".git" in files:
