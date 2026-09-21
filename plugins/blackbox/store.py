@@ -221,6 +221,14 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError as e:
             if "duplicate column" not in str(e).lower():
                 raise
+    for column in ("input_tokens_unknown", "cache_read_tokens_unknown",
+                   "cache_write_tokens_unknown", "usage_unknown"):
+        if column not in _existing:
+            try:
+                conn.execute(f"ALTER TABLE turns ADD COLUMN {column} INT DEFAULT 0")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
     conn.commit()
 
 
@@ -301,8 +309,10 @@ def insert_turn(record: TurnRecord) -> None:
                     cost_uncached_usd, cost_cache_read_usd,
                     cost_cache_write_usd, cost_output_usd,
                     interrupted, alerted, user_text,
-                    final_text, cli_invocation_id, output_tokens_unknown
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    final_text, cli_invocation_id, output_tokens_unknown,
+                    input_tokens_unknown, cache_read_tokens_unknown,
+                    cache_write_tokens_unknown, usage_unknown
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.turn_id,
@@ -352,6 +362,10 @@ def insert_turn(record: TurnRecord) -> None:
                     scrub_and_truncate(record.final_text),
                     record.cli_invocation_id,
                     _bool_int(record.output_tokens_unknown),
+                    _bool_int(record.input_tokens_unknown),
+                    _bool_int(record.cache_read_tokens_unknown),
+                    _bool_int(record.cache_write_tokens_unknown),
+                    _bool_int(record.usage_unknown),
                 ),
             )
             conn.execute("DELETE FROM turn_tool_calls WHERE turn_id = ?", (record.turn_id,))
@@ -502,6 +516,10 @@ def reprice_unpriced(pricing_fn, *, apply: bool = False, limit: int | None = Non
             # no output term to price. Repricing it from its stored 0 would
             # manufacture a measured-looking figure short by the whole output.
             "AND COALESCE(output_tokens_unknown,0) = 0"
+            " AND COALESCE(input_tokens_unknown,0) = 0"
+            " AND COALESCE(cache_read_tokens_unknown,0) = 0"
+            " AND COALESCE(cache_write_tokens_unknown,0) = 0"
+            " AND COALESCE(usage_unknown,0) = 0"
         )
         if limit:
             sel += f" LIMIT {int(limit)}"

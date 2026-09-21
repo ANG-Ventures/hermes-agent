@@ -493,8 +493,11 @@ def _build_moa_pricing_calls(
     aggregator_base_url: str | None,
 ) -> list[dict[str, Any]]:
     """Return physical advisor + aggregator calls for Blackbox pricing."""
+    from agent.usage_pricing import USAGE_UNKNOWN_FIELDS
+
     calls = [dict(call) for call in advisor_calls if isinstance(call, dict)]
     calls.append({
+        **{key: bool(getattr(aggregator_usage, key, False)) for key in USAGE_UNKNOWN_FIELDS},
         "model": aggregator_model,
         "provider": aggregator_provider,
         "base_url": aggregator_base_url,
@@ -4685,11 +4688,14 @@ def run_conversation(
                     # working; this flag rides alongside so every persistence and
                     # display site can refuse to present the 0 as a measurement.
                     output_unknown = bool(canonical_usage.output_tokens_unknown)
+                    from agent.usage_pricing import USAGE_UNKNOWN_FIELDS, prompt_tokens_unknown
+                    usage_flags = {key: bool(getattr(canonical_usage, key)) for key in USAGE_UNKNOWN_FIELDS}
                     # Forward canonical token + cache buckets so context engines
                     # can make decisions on cache hit ratios / reasoning costs,
                     # not just legacy aggregate tokens. Legacy keys stay for
                     # back-compat with engines that only read prompt/completion/total.
                     usage_dict = {
+                        **usage_flags,
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
                         "total_tokens": total_tokens,
@@ -4808,6 +4814,7 @@ def run_conversation(
                     # above are cumulative; this snapshot preserves the last turn's
                     # cache split without provider-specific payload parsing later.
                     agent.last_turn_usage = {
+                        **usage_flags,
                         "input_tokens": canonical_usage.input_tokens,
                         "output_tokens": canonical_usage.output_tokens,
                         "cache_read_tokens": canonical_usage.cache_read_tokens,
@@ -4831,6 +4838,7 @@ def run_conversation(
                     _turn_call = None
                     try:
                         _turn_calls.append({
+                            **usage_flags,
                             "input_tokens": canonical_usage.input_tokens,
                             "output_tokens": canonical_usage.output_tokens,
                             "cache_read_tokens": canonical_usage.cache_read_tokens,
@@ -4859,16 +4867,16 @@ def run_conversation(
 
                     # Log API call details for debugging/observability
                     _cache_pct = ""
-                    if canonical_usage.cache_read_tokens and prompt_tokens:
+                    if canonical_usage.cache_read_tokens and prompt_tokens and not prompt_tokens_unknown(canonical_usage):
                         _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100*canonical_usage.cache_read_tokens/prompt_tokens:.0f}%)"
                     logger.info(
-                        "API call #%d: model=%s provider=%s in=%d out=%s total=%s latency=%.1fs%s",
+                        "API call #%d: model=%s provider=%s in=%s out=%s total=%s latency=%.1fs%s",
                         agent.session_api_calls, agent.model, agent.provider or "unknown",
-                        prompt_tokens,
+                        "unknown" if prompt_tokens_unknown(canonical_usage) else prompt_tokens,
                         # UNKNOWN != 0: an unmeasured output logged as `out=0`
                         # reads as a dead round-trip. Say `out=unknown` instead.
                         "unknown" if output_unknown else completion_tokens,
-                        "unknown" if output_unknown else total_tokens,
+                        "unknown" if canonical_usage.total_tokens_unknown else total_tokens,
                         api_duration, _cache_pct,
                     )
 
@@ -4995,7 +5003,13 @@ def run_conversation(
                             )
                     
                     if agent.verbose_logging:
-                        logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
+                        from agent.usage_pricing import format_token_count
+                        logging.debug(
+                            "Token usage: prompt=%s, completion=%s, total=%s",
+                            format_token_count(prompt_tokens, unknown=prompt_tokens_unknown(canonical_usage)),
+                            format_token_count(completion_tokens, unknown=output_unknown or canonical_usage.usage_unknown),
+                            format_token_count(total_tokens, unknown=canonical_usage.total_tokens_unknown),
+                        )
                     
                     # Surface cache hit stats for any provider that reports
                     # them — not just those where we inject cache_control
@@ -5011,7 +5025,10 @@ def run_conversation(
                     cached = canonical_usage.cache_read_tokens
                     written = canonical_usage.cache_write_tokens
                     prompt = usage_dict["prompt_tokens"]
-                    if (cached or written) and not agent.quiet_mode:
+                    if prompt_tokens_unknown(canonical_usage) and not agent.quiet_mode:
+                        from agent.usage_pricing import format_token_count
+                        agent._vprint(f"{agent.log_prefix}   💾 Cache: {format_token_count(None, unknown=True)}")
+                    elif (cached or written) and not agent.quiet_mode:
                         hit_pct = (cached / prompt * 100) if prompt > 0 else 0
                         agent._vprint(
                             f"{agent.log_prefix}   💾 Cache: "

@@ -275,6 +275,10 @@ class CanonicalUsage:
     # PERSISTENCE and DISPLAY site must branch on so an unmeasured turn is never
     # recorded or rendered as a measured zero.
     output_tokens_unknown: bool = False
+    input_tokens_unknown: bool = False
+    cache_read_tokens_unknown: bool = False
+    cache_write_tokens_unknown: bool = False
+    usage_unknown: bool = False
 
     @property
     def prompt_tokens(self) -> int:
@@ -286,8 +290,8 @@ class CanonicalUsage:
 
     @property
     def total_tokens_unknown(self) -> bool:
-        """A total that is missing its output term is not a measurement."""
-        return self.output_tokens_unknown
+        """A total missing any term is not a measurement."""
+        return any(getattr(self, key) for key in USAGE_UNKNOWN_FIELDS)
 
     def __add__(self, other: "CanonicalUsage") -> "CanonicalUsage":
         """Sum two usage buckets (e.g. MoA advisor fan-out + aggregator).
@@ -312,6 +316,10 @@ class CanonicalUsage:
             output_tokens_unknown=(
                 self.output_tokens_unknown or other.output_tokens_unknown
             ),
+            input_tokens_unknown=self.input_tokens_unknown or other.input_tokens_unknown,
+            cache_read_tokens_unknown=self.cache_read_tokens_unknown or other.cache_read_tokens_unknown,
+            cache_write_tokens_unknown=self.cache_write_tokens_unknown or other.cache_write_tokens_unknown,
+            usage_unknown=self.usage_unknown or other.usage_unknown,
         )
 
 
@@ -1511,6 +1519,30 @@ _OUTPUT_COUNT_KEYS = ("completion_tokens", "output_tokens")
 # The one spelling of "we don't know" every usage renderer must use. Single-
 # sourced so usage.ace, the MacBar and the chat cards cannot drift.
 UNKNOWN_TOKENS_LABEL = "unknown"
+USAGE_UNKNOWN_FIELDS = (
+    "input_tokens_unknown", "output_tokens_unknown", "cache_read_tokens_unknown",
+    "cache_write_tokens_unknown", "usage_unknown",
+)
+
+
+def _bucket_is_unknown(obj: Any, keys: tuple[str, ...], flags: tuple[str, ...] = ()) -> bool:
+    extra = _usage_get(obj, "model_extra", {}) or {}
+    if any(_usage_get(obj, key, False) or _usage_get(extra, key, False) for key in flags):
+        return True
+    # SDK optional defaults are not wire declarations. Explicit nulls are.
+    fields = getattr(obj, "model_fields_set", None)
+    return any(
+        _usage_has(obj, key) and (fields is None or key in fields)
+        and _usage_get(obj, key) is None for key in keys
+    )
+
+
+def prompt_tokens_unknown(usage: Any) -> bool:
+    """Shared display rule for an input total derived from three buckets."""
+    return any(bool(_usage_get(usage, key, False)) for key in (
+        "input_tokens_unknown", "cache_read_tokens_unknown",
+        "cache_write_tokens_unknown", "usage_unknown",
+    ))
 
 
 def _usage_has(obj: Any, name: str) -> bool:
@@ -2230,6 +2262,32 @@ def normalize_usage(
     # before the per-shape branches, because the discriminator is shape-agnostic:
     # it is a property of the usage object, not of which dialect it speaks.
     output_unknown = _output_is_unknown(response_usage)
+    input_unknown = _bucket_is_unknown(
+        response_usage, ("prompt_tokens", "input_tokens"),
+        ("prompt_tokens_unavailable", "input_tokens_unavailable"),
+    )
+    details_key = "input_tokens_details" if mode == "codex_responses" else "prompt_tokens_details"
+    details = _usage_get(response_usage, details_key, None)
+    details_unknown = _bucket_is_unknown(response_usage, (details_key,))
+    cache_read_unknown = (
+        details_unknown or _bucket_is_unknown(details, ("cached_tokens",))
+        or _bucket_is_unknown(response_usage, ("cache_read_input_tokens", "prompt_cache_hit_tokens", "cached_tokens"),
+                              ("cache_read_tokens_unavailable",))
+    )
+    cache_write_unknown = (
+        details_unknown or _bucket_is_unknown(details, ("cache_write_tokens", "cache_creation_tokens", "cache_creation_input_tokens"))
+        or _bucket_is_unknown(response_usage, ("cache_creation_input_tokens", "cache_write_tokens"),
+                              ("cache_write_tokens_unavailable",))
+    )
+    if mode != "anthropic_messages" and provider_name != "anthropic":
+        input_unknown = input_unknown or cache_read_unknown or cache_write_unknown
+    # Aggregate-only declarations must refuse pricing, but must not poison a
+    # measured input on an output-only miss (or vice versa).
+    usage_unknown = _bucket_is_unknown(response_usage, ("total_tokens",),
+                                       ("total_tokens_unavailable", "unavailable"))
+    usage_unknown = usage_unknown and not (
+        input_unknown or output_unknown or cache_read_unknown or cache_write_unknown
+    )
 
     if mode == "anthropic_messages" or provider_name == "anthropic":
         input_tokens = _usage_count(_usage_get(response_usage, "input_tokens", 0))
@@ -2305,6 +2363,10 @@ def normalize_usage(
         )
         if not cache_write_tokens:
             cache_write_tokens = _usage_count(
+                _usage_get(details, "cache_creation_tokens", 0) if details else 0
+            )
+        if not cache_write_tokens:
+            cache_write_tokens = _usage_count(
                 _usage_get(details, "cache_creation_input_tokens", 0)
                 if details else 0
             )
@@ -2361,6 +2423,10 @@ def normalize_usage(
         cache_write_tokens=cache_write_tokens,
         reasoning_tokens=reasoning_tokens,
         output_tokens_unknown=output_unknown,
+        input_tokens_unknown=input_unknown,
+        cache_read_tokens_unknown=cache_read_unknown,
+        cache_write_tokens_unknown=cache_write_unknown,
+        usage_unknown=usage_unknown,
     )
 
 
@@ -2372,6 +2438,9 @@ def estimate_usage_cost(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> CostResult:
+    if usage.total_tokens_unknown:
+        return CostResult(amount_usd=None, status="unknown", source="none", label="n/a",
+                          notes=("usage unavailable from provider; turn is unpriceable",))
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
     if route.billing_mode == "subscription_included":
         return CostResult(
@@ -2410,17 +2479,7 @@ def estimate_usage_cost(
 
     if usage.input_tokens and input_rate is None:
         return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a")
-    if usage.output_tokens_unknown:
-        # UNKNOWN != 0. Pricing an unmeasured output term as zero produces a
-        # dollar figure that is short by the whole output while LOOKING priced
-        # — strictly worse than declining. Refuse the whole turn.
-        return CostResult(
-            amount_usd=None,
-            status="unknown",
-            source=entry.source,
-            label="n/a",
-            notes=("output tokens unavailable from provider; turn is unpriceable",),
-        )
+
     if usage.output_tokens and output_rate is None:
         return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a")
     if usage.cache_read_tokens:

@@ -20,6 +20,7 @@ from typing import Any
 from agent.auxiliary_client import call_llm
 from agent.message_content import flatten_message_text
 from agent.transports import get_transport
+from agent.usage_pricing import USAGE_UNKNOWN_FIELDS
 
 logger = logging.getLogger(__name__)
 
@@ -2189,6 +2190,7 @@ class MoAChatCompletions:
                         # (advisors may be cheaper/pricier than the aggregator).
                         if _acct.model:
                             _ref_pricing_calls.append({
+                                **{key: bool(getattr(_acct.usage, key)) for key in USAGE_UNKNOWN_FIELDS},
                                 "model": _acct.model,
                                 "provider": _acct.provider,
                                 "base_url": _acct.base_url,

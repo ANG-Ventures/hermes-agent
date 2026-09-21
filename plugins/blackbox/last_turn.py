@@ -271,7 +271,11 @@ def render_last_turn_record(rec: Dict[str, Any], compressions: "int | None" = No
     # is just ~2 structural tokens/call). See Obsidian "Hermes Telemetry —
     # Token Terminology & Accounting".
     in_billed = cache_r + cache_w + in_tok
-    if in_billed > 0:
+    from agent.usage_pricing import prompt_tokens_unknown
+    input_unknown = prompt_tokens_unknown(rec)
+    if input_unknown:
+        lines.append(f"• Tokens in: {_humanize_tok(0, unknown=True)} billed")
+    elif in_billed > 0:
         lines.append(
             f"• Tokens in: {_humanize_tok(in_billed)} billed "
             f"({_humanize_tok(cache_r)} cache-read + "
@@ -285,7 +289,7 @@ def render_last_turn_record(rec: Dict[str, Any], compressions: "int | None" = No
     # broken out (Ace 2026-06-14: /context reports finished/unfinished only, not
     # final/reasoning). When the per-call split is unknown (old/NULL/blackbox-off
     # blob) show the bare billed total — NEVER fall back to final/reasoning.
-    if bool(rec.get("output_tokens_unknown")):
+    if bool(rec.get("output_tokens_unknown") or rec.get("usage_unknown")):
         # UNKNOWN != 0: the provider never measured this turn's output, so the
         # stored 0 is absence of data. Show it as unknown rather than omitting
         # the row (omission reads as "nothing generated") or splitting a 0.
@@ -322,7 +326,7 @@ def render_last_turn_record(rec: Dict[str, Any], compressions: "int | None" = No
     # same headline as the window line — two framings of one number. The
     # Context-window line keeps ONLY the occupancy (suffix removed). When the
     # split is absent (old rows / blackbox-off) the Last-call line is omitted.
-    if _have_split and used > 0:
+    if _have_split and used > 0 and not input_unknown:
         lines.append(
             f"• Last call: {_humanize_tok(used)} billed "
             f"({_humanize_tok(int(lc_read or 0))} cache-read + "
@@ -335,7 +339,7 @@ def render_last_turn_record(rec: Dict[str, Any], compressions: "int | None" = No
     cache_r = int(rec.get("cache_read", 0) or 0)
     cache_w = int(rec.get("cache_write", 0) or 0)
     prompt_total = in_tok + cache_r + cache_w
-    if prompt_total > 0 and cache_r:
+    if prompt_total > 0 and cache_r and not input_unknown:
         cpct = cache_r / prompt_total * 100
         lines.append(f"• Cached: {_humanize_tok(cache_r)}/{_humanize_tok(prompt_total)} {_cache_health(cpct)} {cpct:.0f}%")
 
