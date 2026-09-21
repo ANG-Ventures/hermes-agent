@@ -50,7 +50,6 @@ def _runner(cleanup=None, *, cleanup_timeout=1.0):
     if cleanup is not None:
         obj._cleanup_agent_resources = cleanup
     for name in (
-        "_get_pool",
         "_get_executor",
         "_get_housekeeping_executor",
         "_submit_with_context",
@@ -304,6 +303,29 @@ def test_shutdown_stops_the_housekeeping_pool():
     # And the closing latch must stop it being resurrected mid-shutdown.
     with pytest.raises(RuntimeError):
         runner._get_housekeeping_executor()
+
+
+def test_get_executor_works_on_a_bare_duck_typed_double():
+    """_get_executor is called UNBOUND against minimal doubles; keep it self-contained.
+
+    Existing suites do ``GatewayRunner._get_executor(fake)`` where ``fake`` implements only a
+    handful of attributes. Routing the body through a sibling METHOD broke those doubles with
+    AttributeError, so the get-or-create helper is a module-level function and this pins it.
+    """
+    double = types.SimpleNamespace(_executor=None, _executor_closing=False)
+    pool = GatewayRunner._get_executor(double)
+    try:
+        assert isinstance(pool, concurrent.futures.ThreadPoolExecutor)
+        assert double._executor is pool
+        # Same for the housekeeping pool, on a double that has never heard of it.
+        hk_double = types.SimpleNamespace(_executor_closing=False)
+        hk = GatewayRunner._get_housekeeping_executor(hk_double)
+        try:
+            assert hk is not pool
+        finally:
+            hk.shutdown(wait=False)
+    finally:
+        pool.shutdown(wait=False)
 
 
 def test_pool_sizes_are_configurable(monkeypatch):

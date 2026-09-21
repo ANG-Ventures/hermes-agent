@@ -222,6 +222,33 @@ def _housekeeping_executor_max_workers() -> int:
     )
 
 
+def _get_or_create_pool(
+    owner: Any, attr: str, prefix: str, max_workers: int
+) -> concurrent.futures.ThreadPoolExecutor:
+    """Get-or-create one of the gateway-owned pools under the owner's shared lock.
+
+    A module-level function, not a method: ``_get_executor`` is called unbound against
+    lightweight test doubles (``GatewayRunner._get_executor(fake)``), so it must not
+    depend on any sibling method those doubles do not implement.
+    """
+    lock = getattr(owner, "_executor_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        owner._executor_lock = lock
+
+    with lock:
+        if getattr(owner, "_executor_closing", False):
+            raise RuntimeError("Gateway is shutting down; executor unavailable")
+        executor = getattr(owner, attr, None)
+        if executor is None or getattr(executor, "_shutdown", False):
+            executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix=prefix,
+            )
+            setattr(owner, attr, executor)
+        return executor
+
+
 def _executor_wait_warn_secs() -> float:
     """Return the queue-latency threshold that triggers a PHASE=executor_wait log."""
     raw = os.getenv("HERMES_GATEWAY_EXECUTOR_WAIT_WARN", "").strip()
@@ -31046,40 +31073,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _get_executor(self) -> concurrent.futures.ThreadPoolExecutor:
         """Return the gateway-owned executor for blocking agent work."""
-        return self._get_pool(
-            "_executor", "hermes-gateway", _executor_max_workers()
+        return _get_or_create_pool(
+            self, "_executor", "hermes-gateway", _executor_max_workers()
         )
 
     def _get_housekeeping_executor(self) -> concurrent.futures.ThreadPoolExecutor:
         """Return the gateway-owned executor for best-effort housekeeping."""
         # Prefix stays under "hermes-gateway" so _shutdown_executor's
         # liveness scan keeps counting these workers.
-        return self._get_pool(
+        return _get_or_create_pool(
+            self,
             "_housekeeping_executor",
             "hermes-gateway-hk",
             _housekeeping_executor_max_workers(),
         )
-
-    def _get_pool(
-        self, attr: str, prefix: str, max_workers: int
-    ) -> concurrent.futures.ThreadPoolExecutor:
-        """Get-or-create one of the gateway-owned pools under the shared lock."""
-        lock = getattr(self, "_executor_lock", None)
-        if lock is None:
-            lock = threading.Lock()
-            self._executor_lock = lock
-
-        with lock:
-            if getattr(self, "_executor_closing", False):
-                raise RuntimeError("Gateway is shutting down; executor unavailable")
-            executor = getattr(self, attr, None)
-            if executor is None or getattr(executor, "_shutdown", False):
-                executor = concurrent.futures.ThreadPoolExecutor(
-                    max_workers=max_workers,
-                    thread_name_prefix=prefix,
-                )
-                setattr(self, attr, executor)
-            return executor
 
     def _shutdown_executor(self) -> None:
         """Stop the gateway-owned executor without touching the loop default.
