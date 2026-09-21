@@ -75,12 +75,15 @@ jobs:
           # to route everything hosted) still works unchanged.
           CI_SELF_HOSTED_SLOTS: ${{ vars.CI_SELF_HOSTED_SLOTS }}
           CI_RUNNER_LABELS: ${{ vars.CI_RUNNER_LABELS }}
+          # Optional trial: overrides routing for the N lightest non-core slices.
+          CI_ARM_HOSTED_SLICES: ${{ vars.CI_ARM_HOSTED_SLICES }}
         run: |
           MATRIX=$(python3 scripts/run_tests_parallel.py \
             --generate-slices ${{ inputs.slice_count }} \
             --test-scope '${{ inputs.test_scope }}' \
             --self-hosted-slots "$CI_SELF_HOSTED_SLOTS" \
-            --self-hosted-labels "$CI_RUNNER_LABELS")
+            --self-hosted-labels "$CI_RUNNER_LABELS" \
+            --arm-hosted-slices="$CI_ARM_HOSTED_SLICES")
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
 
   test:
