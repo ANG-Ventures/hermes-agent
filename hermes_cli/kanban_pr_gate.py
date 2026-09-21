@@ -21,6 +21,20 @@ Deliberate non-actions, each one a fail-safe:
 * a bare ``#N`` with no unambiguous repo context is dropped rather than guessed;
 * CLOSED-unmerged posts ONE advisory comment and never unblocks;
 * any lookup failure is a no-op plus one WARN — never a page, never an unblock.
+
+Harness safety
+--------------
+``gate_auto_resolved`` is a real state transition justified by real PR
+evidence. A test or probe that stubs :func:`query_pr` holds a FABRICATED
+oracle, and must therefore never be able to write that transition to a live
+board. ``HERMES_HOME`` alone does not sandbox kanban — ``HERMES_KANBAN_DB``
+outranks it (see :func:`hermes_cli.kanban_db.kanban_db_path`) — so a probe that
+redirects only ``HERMES_HOME`` still resolves to production. On 2026-09-21 a
+lock-timing probe did exactly that and wrote 20 ``gate_auto_resolved`` events
+to the live board, falsely unblocking seven real cards.
+:func:`assert_write_allowed` closes that: under a test context with a
+non-default ``query_fn``, a write to a DB outside the ``HERMES_HOME`` root
+raises :class:`SandboxEscape` instead of landing.
 """
 
 from __future__ import annotations
@@ -28,6 +42,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
+import os
 import re
 import subprocess
 import sqlite3
@@ -183,6 +198,79 @@ _CACHE: dict[tuple[str, int], _CacheEntry] = {}
 def clear_cache() -> None:
     """Drop all cached PR states (tests; operator repair)."""
     _CACHE.clear()
+
+
+# ---------------------------------------------------------------------------
+# Harness safety: a stubbed oracle may never write to a live board
+# ---------------------------------------------------------------------------
+
+
+class SandboxEscape(RuntimeError):
+    """A fabricated-oracle write was aimed at a board outside the sandbox."""
+
+
+def _in_test_context() -> bool:
+    """True when this process is a pytest run or an explicitly-marked harness.
+
+    ``PYTEST_CURRENT_TEST`` answers for the in-test phase; ``HERMES_IN_PYTEST``
+    is the opt-in a bare probe script sets for itself. Either is sufficient —
+    the guard is deliberately cheap to trip and cheap to satisfy.
+    """
+    return bool(
+        os.environ.get("PYTEST_CURRENT_TEST")
+        or os.environ.get("HERMES_IN_PYTEST")
+    )
+
+
+def _db_is_sandboxed() -> bool:
+    """True when the resolved board DB lives under the ``HERMES_HOME`` root.
+
+    Fail CLOSED: an unset ``HERMES_HOME``, or any resolution error, counts as
+    not-sandboxed. A guard that cannot prove isolation must not grant it.
+    """
+    if not os.environ.get("HERMES_HOME", "").strip():
+        return False
+    try:
+        from hermes_cli import kanban_db as kb
+
+        target = Path(kb.kanban_db_path()).resolve(strict=False)
+        root = Path(kb.kanban_home()).resolve(strict=False)
+    except Exception:
+        return False
+    return target.is_relative_to(root)
+
+
+def assert_write_allowed(query_fn: Optional[Callable] = None) -> None:
+    """Refuse a gate mutation driven by a fabricated oracle on a live board.
+
+    The dangerous combination is exactly two facts: (1) we are in a test or
+    probe context, and (2) ``query_fn`` is NOT the real :func:`query_pr`, so
+    whatever "MERGED" it reports is invented. Writing a ``gate_auto_resolved``
+    under those conditions unblocks real cards on evidence that does not exist.
+
+    Production is untouched: outside a test context this returns immediately,
+    and a real ``gh``-backed run passes even inside one.
+    """
+    if not _in_test_context():
+        return
+    if query_fn is None or query_fn is _REAL_QUERY_PR:
+        return  # real oracle: the verdict is evidence, not fabrication.
+    if _db_is_sandboxed():
+        return
+    try:
+        from hermes_cli import kanban_db as kb
+
+        resolved = str(kb.kanban_db_path())
+    except Exception:  # pragma: no cover - diagnostic only
+        resolved = "<unresolvable>"
+    raise SandboxEscape(
+        "kanban PR-gate: refusing to mutate a board with a STUBBED PR oracle. "
+        f"Resolved DB {resolved} is not inside the HERMES_HOME root "
+        f"({os.environ.get('HERMES_HOME') or '<unset>'}). HERMES_HOME alone "
+        "does NOT sandbox kanban — HERMES_KANBAN_DB outranks it. Set "
+        "HERMES_KANBAN_SANDBOX=1 (or unset the HERMES_KANBAN_* path pins) so "
+        "the board resolves inside the sandbox before running this harness."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +505,14 @@ def _merge_sha(payload: dict) -> Optional[str]:
 def _prune_cache() -> None:
     while len(_CACHE) > _CACHE_LIMIT:
         _CACHE.pop(next(iter(_CACHE)))
+
+
+# The genuine ``gh``-backed oracle, captured at import. ``assert_write_allowed``
+# compares against THIS, never against the module attribute: a harness that
+# monkeypatches ``kanban_pr_gate.query_pr`` would otherwise rebind the very name
+# the guard checks and vouch for its own stub. That is exactly how the
+# 2026-09-21 probe fabricated 20 gate_auto_resolved events.
+_REAL_QUERY_PR = query_pr
 
 
 class _Resolver:
@@ -655,6 +751,9 @@ def prefetch_pr_gate_states(
     """
     query_fn = query_fn or query_pr
     now = time.time() if now is None else now
+    # Same harness-safety gate as the locked pass: refuse a fabricated oracle
+    # aimed at a live board at the FIRST entry point of the tick.
+    assert_write_allowed(query_fn)
     unique: dict[tuple[str, int], PrRef] = {}
     contexts: dict[str, tuple[tuple, Optional[str]]] = {}
     # Resolve repo context HERE, outside the writer lock: this is the seam that
@@ -733,6 +832,10 @@ def reevaluate_pr_gates(
     if prefetched is not None:
         now = prefetched.now
     now = time.time() if now is None else now
+    # Harness safety gate, BEFORE any card is read or mutated: a stubbed oracle
+    # aimed at a live board is refused outright rather than allowed to write a
+    # fabricated gate_auto_resolved. See the module docstring.
+    assert_write_allowed(query_fn)
     resolver = _Resolver(
         query_fn=query_fn,
         max_lookups=max_lookups,

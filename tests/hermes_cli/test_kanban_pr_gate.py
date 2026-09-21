@@ -856,3 +856,157 @@ def test_prefetch_repo_context_is_not_reused_when_the_card_changes(
     assert [o.action for o in outcomes] == []
     with kb.connect() as conn:
         assert kb.get_task(conn, tid).status == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# Harness safety: a stubbed oracle may never write to a live board
+# ---------------------------------------------------------------------------
+
+
+def test_explicit_hermes_home_with_ambient_pin_is_not_treated_as_sandboxed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``HERMES_HOME`` alone does NOT sandbox kanban — prove it, don't assume.
+
+    ``HERMES_KANBAN_DB`` outranks ``HERMES_HOME`` in
+    :func:`kanban_db.kanban_db_path`, which is precisely why redirecting only
+    ``HERMES_HOME`` let a 2026-09-21 probe write to the production board. The
+    sandbox predicate must report False for that combination, and True once the
+    pin is neutralised.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    live = tmp_path / "live" / "kanban.db"
+    live.parent.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
+
+    # The pin wins, so the DB is NOT inside the sandbox home.
+    assert prg._db_is_sandboxed() is False
+
+    # Neutralising the pin is what actually sandboxes it.
+    monkeypatch.delenv("HERMES_KANBAN_DB")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    assert prg._db_is_sandboxed() is True
+
+
+def test_stubbed_oracle_against_a_non_sandbox_db_raises_instead_of_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact 2026-09-21 shape: stubbed ``query_pr`` + live board pin.
+
+    The probe redirected ``HERMES_HOME``, stubbed the oracle to return MERGED
+    unconditionally, and wrote 20 ``gate_auto_resolved`` events to production.
+    That combination must now fail closed and loudly, before any card is read.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    live = tmp_path / "live" / "kanban.db"
+    live.parent.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
+
+    with pytest.raises(prg.SandboxEscape) as excinfo:
+        prg.reevaluate_pr_gates(None, query_fn=_stub({("o/r", 7): _merged()}))
+
+    message = str(excinfo.value)
+    assert "STUBBED PR oracle" in message
+    assert "HERMES_KANBAN_SANDBOX=1" in message
+    # Nothing was created: the refusal precedes every read and every write.
+    assert not live.exists()
+
+
+def test_monkeypatching_the_module_attribute_does_not_vouch_for_the_stub(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rebinding ``prg.query_pr`` must not let a stub pass as the real oracle.
+
+    The guard compares against the oracle captured at import, so a harness that
+    monkeypatches the module attribute — which is what a probe calling
+    ``dispatch_once`` with no explicit ``query_fn`` does — is still caught.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    live = tmp_path / "live" / "kanban.db"
+    live.parent.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
+    monkeypatch.setattr(prg, "query_pr", lambda repo, number: _merged())
+
+    with pytest.raises(prg.SandboxEscape):
+        prg.reevaluate_pr_gates(None)
+
+    assert not live.exists()
+
+
+def test_the_real_oracle_is_allowed_even_in_a_test_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard gates FABRICATION, not test execution.
+
+    A genuine ``gh``-backed run carries real evidence, so it must pass even
+    under pytest against a non-sandbox board — otherwise the guard would break
+    the production dispatcher the moment anything set ``PYTEST_CURRENT_TEST``.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    live = tmp_path / "live" / "kanban.db"
+    live.parent.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
+
+    prg.assert_write_allowed(None)
+    prg.assert_write_allowed(prg._REAL_QUERY_PR)
+
+
+def test_a_sandboxed_board_allows_a_stubbed_oracle(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A correctly-sandboxed harness is unaffected — the guard is not a tax.
+
+    This is the negative control for the three tests above: the whole existing
+    suite runs stubbed oracles, and must keep running them.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    prg.assert_write_allowed(_stub({}))
+
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, reason="merge o/r#7 then unblock me")
+        outcomes = prg.reevaluate_pr_gates(
+            conn, query_fn=_stub({("o/r", 7): _merged()}),
+        )
+    assert [o.action for o in outcomes] == ["unblocked"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status in {"ready", "running"}
+
+
+def test_dispatch_once_propagates_a_sandbox_escape_instead_of_absorbing_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end replay of the 2026-09-21 incident, through ``dispatch_once``.
+
+    The dispatcher's PR-gate hooks are deliberately fail-open so a diagnostic
+    can never brick a tick. A sandbox escape is the one exception: absorbing it
+    would turn a loud, actionable refusal into a WARN the harness author never
+    reads — which is precisely how the original probe got to write 20 events.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    live = tmp_path / "pretend_production" / "kanban.db"
+    live.parent.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
+    # The incident shape exactly: the module attribute is rebound, so the
+    # dispatcher's own no-argument call picks up the fabricated oracle.
+    monkeypatch.setattr(prg, "query_pr", lambda repo, number: _merged())
+
+    kb.init_db()
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, reason="merge o/r#7 then unblock me")
+        with pytest.raises(prg.SandboxEscape):
+            kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
+        # The card is untouched: no fabricated unblock, no event.
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM task_events WHERE kind = 'gate_auto_resolved'"
+        ).fetchone()["c"] == 0
