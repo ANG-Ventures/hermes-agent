@@ -73,6 +73,14 @@ LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S = 60
 LAUNCHD_STOP_CLEANUP_RESERVE_S = 15.0
 LAUNCHD_HARD_EXIT_RESERVE_S = 10.0
 
+# Fallback reserve for a live ``ExitTimeOut`` at or below
+# ``LAUNCHD_HARD_EXIT_RESERVE_S``. Subtracting the fixed reserve from such a
+# budget yields a zero-second watchdog, i.e. hard-exit the instant shutdown
+# starts — no drain, no persistence, strictly worse than the SIGKILL it is
+# avoiding. A short budget keeps the same shape (most of it for work, a
+# slice held back for launchd) at proportional scale.
+LAUNCHD_SHORT_BUDGET_RESERVE_FRACTION = 0.25
+
 _LAUNCHD_EXIT_TIMEOUT_RE = re.compile(r"^\s*exit timeout\s*=\s*(\d+)\s*$", re.MULTILINE)
 
 
@@ -143,16 +151,25 @@ def resolve_launchd_capped_drain(
     *,
     cleanup_reserve_s: float = LAUNCHD_STOP_CLEANUP_RESERVE_S,
     last_teardown_s: float | None = None,
+    hard_exit_reserve_s: float = LAUNCHD_HARD_EXIT_RESERVE_S,
 ) -> float:
     """Clamp a SIGTERM-driven stop drain to what launchd will actually allow.
 
     ``launchd_exit_timeout_s`` is the live ``exit timeout`` for this job (see
     :func:`read_launchd_exit_timeout_s`); ``None`` means no launchd budget
-    applies and the configured drain is returned untouched. Otherwise the
-    drain may use at most ``exit_timeout - max(cleanup_reserve_s,
-    last_teardown_s)`` so the post-drain teardown still completes before
-    launchd escalates to SIGKILL. Never *extends* the drain — an operator who
-    configured a short one keeps it.
+    applies and the configured drain is returned untouched. Never *extends*
+    the drain — an operator who configured a short one keeps it.
+
+    The two reserves are ADDITIVE, not overlapping. The process does not run
+    until launchd's SIGKILL at ``exit_timeout``; the shutdown watchdog
+    hard-exits ``hard_exit_reserve_s`` earlier (see
+    :func:`resolve_launchd_shutdown_watchdog_delay`). Sizing the teardown
+    window against the SIGKILL wall therefore over-promises by exactly that
+    reserve — at clamp 60 a 45s drain left only 5s before os._exit for a
+    teardown allocated 15s, and a recorded 22s teardown got 12s. The drain
+    may use at most ``exit_timeout - hard_exit_reserve_s -
+    max(cleanup_reserve_s, last_teardown_s)`` so the teardown completes
+    before the hard exit that actually fires.
     """
 
     def _seconds(value: object) -> float:
@@ -170,8 +187,14 @@ def resolve_launchd_capped_drain(
         return drain
     if budget <= 0.0:
         return drain
+    hard_exit = resolve_launchd_shutdown_watchdog_delay(
+        budget,
+        budget,
+        signal_driven=True,
+        hard_exit_reserve_s=hard_exit_reserve_s,
+    )
     reserve = max(_seconds(cleanup_reserve_s), _seconds(last_teardown_s))
-    cap = max(budget - reserve, 0.0)
+    cap = max(hard_exit - reserve, 0.0)
     return min(drain, cap)
 
 
@@ -188,6 +211,13 @@ def resolve_launchd_shutdown_watchdog_delay(
     SIGKILL. The final reserve leaves launchd headroom even when persistence
     or adapter teardown wedges. Other shutdown paths keep their normal
     watchdog leash.
+
+    When the live budget is at or below the fixed reserve (a short but valid
+    ``ExitTimeOut`` such as 8s), subtracting it outright would return zero —
+    hard-exiting the instant shutdown starts, skipping all drain *and*
+    persistence rather than using the time that genuinely exists. Short
+    budgets therefore fall back to a proportional reserve, keeping a real
+    persistence window on the near side of SIGKILL.
     """
     try:
         watchdog = max(float(watchdog_delay_s), 0.0)
@@ -202,6 +232,8 @@ def resolve_launchd_shutdown_watchdog_delay(
         return watchdog
     if launchd_budget <= 0.0:
         return watchdog
+    if reserve >= launchd_budget:
+        reserve = launchd_budget * LAUNCHD_SHORT_BUDGET_RESERVE_FRACTION
     return min(watchdog, max(launchd_budget - reserve, 0.0))
 
 
