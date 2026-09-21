@@ -255,12 +255,23 @@ class _CoroutineCallVisitor(ast.NodeVisitor):
     coroutine are treated as non-coroutine context, matching the runtime: such
     a helper is only blocking when something calls it, and that call site is
     itself visited.
+
+    Also collects every call to the ASYNC form and whether it is awaited.  An
+    un-awaited ``_acquire_platform_lock_async(...)`` returns a coroutine
+    object, which is always truthy -- so the production shape
+    ``if not await self._acquire_platform_lock_async(...)`` silently becomes
+    ``if not <coroutine>``, i.e. never taken.  The adapter would then connect
+    with NO credential lock held and no error, which is worse than the
+    blocking call this gate replaced.
     """
 
     def __init__(self, rel: str) -> None:
         self.rel = rel
         self.hits: list[str] = []
+        self.async_calls: list[str] = []
+        self.unawaited_async_calls: list[str] = []
         self._depth = 0
+        self._awaited: set[int] = set()
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         self._depth += 1
@@ -272,6 +283,10 @@ class _CoroutineCallVisitor(ast.NodeVisitor):
         self.generic_visit(node)
         self._depth = saved
 
+    def visit_Await(self, node: ast.Await) -> None:
+        self._awaited.add(id(node.value))
+        self.generic_visit(node)
+
     def visit_Call(self, node: ast.Call) -> None:
         func = node.func
         if (
@@ -280,6 +295,11 @@ class _CoroutineCallVisitor(ast.NodeVisitor):
             and func.attr == "_acquire_platform_lock"
         ):
             self.hits.append(f"{self.rel}:{node.lineno}")
+        if isinstance(func, ast.Attribute) and func.attr == "_acquire_platform_lock_async":
+            where = f"{self.rel}:{node.lineno}"
+            self.async_calls.append(where)
+            if id(node) not in self._awaited:
+                self.unawaited_async_calls.append(where)
         self.generic_visit(node)
 
 
@@ -290,9 +310,19 @@ def test_no_coroutine_calls_the_blocking_platform_lock_acquire():
     sync form from its ``connect()`` fails here without anyone remembering to
     update an inventory.  The sync method itself stays public for the non-loop
     callers, so it cannot simply be deleted.
+
+    SCOPE, stated exactly.  This is a LEXICAL sweep: it flags a call written
+    inside an ``async def`` body.  A coroutine that reaches the blocking
+    acquire INDIRECTLY -- through a plain ``def`` helper that itself calls it
+    -- is not flagged here.  That transitive class is the job of the
+    reachability ratchet in
+    ``tests/gateway/test_no_atomic_write_reachable_from_loop.py``, which walks
+    the call graph; the two gates are complementary and neither subsumes the
+    other.
     """
     repo = _repo_root()
     hits: list[str] = []
+    unawaited: list[str] = []
     for path in _adapter_source_files():
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -301,6 +331,7 @@ def test_no_coroutine_calls_the_blocking_platform_lock_acquire():
         visitor = _CoroutineCallVisitor(str(path.relative_to(repo)))
         visitor.visit(tree)
         hits.extend(visitor.hits)
+        unawaited.extend(visitor.unawaited_async_calls)
 
     assert not hits, (
         "coroutine(s) call the BLOCKING _acquire_platform_lock directly. On "
@@ -308,6 +339,17 @@ def test_no_coroutine_calls_the_blocking_platform_lock_acquire():
         "up to ~15s inline on the event loop, stalling every adapter and every "
         "in-flight turn. Use `await self._acquire_platform_lock_async(...)`.\n"
         + "\n".join(f"  {h}" for h in hits)
+    )
+
+    assert not unawaited, (
+        "call(s) to _acquire_platform_lock_async are NOT awaited. The call "
+        "then evaluates to a coroutine object — always truthy — so the "
+        "production guard `if not await self._acquire...` becomes `if not "
+        "<coroutine>` and never fires: the adapter connects with NO credential "
+        "lock held, silently, and the acquire never even runs. That is worse "
+        "than the blocking call this gate replaced, and the sweep above cannot "
+        "see it because the blocking form is gone from the call site.\n"
+        + "\n".join(f"  {h}" for h in unawaited)
     )
 
 
@@ -371,11 +413,13 @@ async def test_cancelling_the_acquire_does_not_leak_the_scoped_lock(monkeypatch)
     held: set[tuple[str, str]] = set()
     entered = threading.Event()
     proceed = threading.Event()
+    worker_finished = threading.Event()
 
     def _fake_acquire(scope: str, identity: str, metadata=None):
         entered.set()
         proceed.wait(timeout=10)
         held.add((scope, identity))
+        worker_finished.set()
         return True, None
 
     def _fake_release(scope: str, identity: str) -> None:
@@ -400,6 +444,13 @@ async def test_cancelling_the_acquire_does_not_leak_the_scoped_lock(monkeypatch)
     proceed.set()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+    # Join the worker before asserting.  On the broken (abandoned-drain)
+    # shape the worker OUTLIVES the await, so a bare assertion here passes
+    # vacuously — the lock has simply not been taken yet.
+    assert await asyncio.get_running_loop().run_in_executor(
+        None, worker_finished.wait, 10
+    ), "the acquire worker never finished"
 
     assert held == set(), (
         "a cancelled acquire left the machine-global scoped lock held by an "
@@ -461,3 +512,159 @@ async def test_a_failing_worker_still_surfaces_as_cancellation(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await task
 
+
+
+@pytest.mark.asyncio
+async def test_the_orphan_drain_does_not_delete_a_retry_connects_live_lock(
+    monkeypatch,
+):
+    """The drain must not release a lock a RETRY connect already re-acquired.
+
+    The scoped lock is ONE machine-global file per ``(scope, identity)``, and
+    the cancel-path release goes by that pair -- so it deletes whoever holds
+    it, not "our" acquisition.  While the drain waits for the orphaned worker,
+    the reconnect supervisor routinely brings a fresh connect up for the same
+    credential; that connect is LIVE and using the lock.  Releasing it there
+    is the same orphaning failure this PR exists to prevent, pointed the other
+    way: a running adapter loses its credential lock and the next connect
+    anywhere on the machine can steal it.
+
+    Oracle is the resource.  Regression for the FleetReview P1 at
+    base.py:3832 on record ``7a21d08c3f`` ("Orphan-drain release can delete a
+    scoped lock that a concurrent retry connect already re-acquired").
+    """
+    held: set[tuple[str, str]] = set()
+    entered = threading.Event()
+    proceed = threading.Event()
+    slow_done = threading.Event()
+
+    def _fake_acquire(scope: str, identity: str, metadata=None):
+        # Only the first (soon-orphaned) acquire is slow; the retry connect
+        # that follows must be able to take the lock immediately.
+        if not slow_done.is_set():
+            slow_done.set()
+            entered.set()
+            proceed.wait(timeout=10)
+        held.add((scope, identity))
+        return True, None
+
+    monkeypatch.setattr(status, "acquire_scoped_lock", _fake_acquire)
+    monkeypatch.setattr(
+        status, "release_scoped_lock", lambda s, i: held.discard((s, i))
+    )
+
+    adapter = _adapter()
+    task = asyncio.ensure_future(
+        adapter._acquire_platform_lock_async("telegram-bot-token", "tok", "d")
+    )
+    await asyncio.get_running_loop().run_in_executor(None, entered.wait, 5)
+
+    adapter._release_platform_lock()
+    task.cancel()
+
+    # The reconnect supervisor's retry connect succeeds and now holds the lock.
+    retry = _adapter()
+    assert retry._acquire_platform_lock("telegram-bot-token", "tok", "d") is True
+    assert ("telegram-bot-token", "tok") in held
+
+    # Now let the orphaned worker finish and the drain run its release.
+    proceed.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert ("telegram-bot-token", "tok") in held, (
+        "the cancelled acquire's drain released the machine-global scoped "
+        "lock that a live retry connect had already re-acquired; that adapter "
+        "is now running without its credential lock."
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_second_cancel_during_the_drain_still_does_not_orphan_the_lock(
+    monkeypatch,
+):
+    """Repeat cancellations must not abandon the drain.
+
+    Teardown routinely cancels the same connect task more than once -- the
+    reconnect supervisor, the adapter's own teardown and gateway shutdown all
+    target it.  If the second cancel breaks the drain, the worker thread runs
+    on, takes the machine-global lock, and nobody is left to release it: the
+    exact orphan this drain exists to close, just one cancel later.
+
+    Regression for the FleetReview P1 at
+    ``tests/gateway/test_platform_lock_acquire_off_loop.py:344`` on record
+    ``0e350d48b7`` ("Cancellation test only covers a single cancel").
+    """
+    held: set[tuple[str, str]] = set()
+    entered = threading.Event()
+    proceed = threading.Event()
+    worker_finished = threading.Event()
+
+    def _fake_acquire(scope: str, identity: str, metadata=None):
+        entered.set()
+        proceed.wait(timeout=10)
+        held.add((scope, identity))
+        worker_finished.set()
+        return True, None
+
+    monkeypatch.setattr(status, "acquire_scoped_lock", _fake_acquire)
+    monkeypatch.setattr(
+        status, "release_scoped_lock", lambda s, i: held.discard((s, i))
+    )
+
+    adapter = _adapter()
+    task = asyncio.ensure_future(
+        adapter._acquire_platform_lock_async("telegram-bot-token", "tok", "d")
+    )
+    await asyncio.get_running_loop().run_in_executor(None, entered.wait, 5)
+
+    adapter._release_platform_lock()
+    task.cancel()
+    await asyncio.sleep(0)
+    # Second cancel, delivered while the drain is awaiting the worker.
+    task.cancel()
+    await asyncio.sleep(0)
+
+    proceed.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The worker thread OUTLIVES an abandoned drain, so asserting straight
+    # after the await would be vacuously green on the broken shape: the lock
+    # simply has not been taken yet.  Join the worker first, then assert.
+    assert await asyncio.get_running_loop().run_in_executor(
+        None, worker_finished.wait, 10
+    ), "the acquire worker never finished"
+
+    assert held == set(), (
+        "a second cancellation abandoned the drain, so the worker thread took "
+        f"the machine-global scoped lock with no owner left to release it: {held}"
+    )
+
+
+def test_the_generation_counter_is_bumped_by_the_sync_choke_point(monkeypatch):
+    """The generation guard must be driven by real acquisitions, not by the drain.
+
+    Non-vacuity floor for the two tests above: if
+    ``_note_platform_lock_acquired`` stopped being called from
+    :meth:`_acquire_platform_lock`, the generation would never move and the
+    guard would decide "someone else re-acquired" for every drain -- silently
+    turning the cancel-path release back into the no-op that orphans the lock.
+    """
+    from gateway.platforms import base as base_mod
+
+    monkeypatch.setattr(
+        status, "acquire_scoped_lock", lambda s, i, metadata=None: (True, None)
+    )
+
+    before = base_mod._platform_lock_generation("telegram-bot-token", "tok")
+    assert _adapter()._acquire_platform_lock(
+        "telegram-bot-token", "tok", "d"
+    ) is True
+    after = base_mod._platform_lock_generation("telegram-bot-token", "tok")
+
+    assert after == before + 1, (
+        "a successful acquire did not advance the scoped-lock generation; the "
+        "cancel-path release guard has nothing to distinguish our acquisition "
+        "from a retry connect's"
+    )

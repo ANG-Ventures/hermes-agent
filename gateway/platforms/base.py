@@ -27,6 +27,33 @@ from utils import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
 
+# Scoped-lock acquisition generations, keyed by (scope, identity).
+#
+# The scoped lock is ONE machine-global file per (scope, identity), so a
+# release by that pair deletes whoever currently holds it -- including a
+# different, live in-process holder.  The cancelled-acquire drain in
+# :meth:`BasePlatformAdapter._acquire_platform_lock_async` has to tell "the
+# lock my orphaned worker took, still held by nobody" apart from "the lock a
+# retry connect has since taken and is using".  A monotonic per-pair counter,
+# bumped on every successful acquire through the adapter choke point, is what
+# distinguishes them: the drain's acquire is still the live one only when the
+# generation advanced by exactly one while it ran.
+_PLATFORM_LOCK_GENERATIONS: "dict[tuple[str, str], int]" = {}
+_PLATFORM_LOCK_GENERATIONS_LOCK = threading.Lock()
+
+
+def _platform_lock_generation(scope: str, identity: str) -> int:
+    """Return the current acquisition generation for one scoped-lock pair."""
+    with _PLATFORM_LOCK_GENERATIONS_LOCK:
+        return _PLATFORM_LOCK_GENERATIONS.get((scope, identity), 0)
+
+
+def _note_platform_lock_acquired(scope: str, identity: str) -> None:
+    """Record that a scoped-lock pair was just acquired by this process."""
+    with _PLATFORM_LOCK_GENERATIONS_LOCK:
+        key = (scope, identity)
+        _PLATFORM_LOCK_GENERATIONS[key] = _PLATFORM_LOCK_GENERATIONS.get(key, 0) + 1
+
 
 def _consume_detached_handler_exception(task: "asyncio.Task") -> None:
     """Done-callback retrieving a detached fatal-error handler's exception.
@@ -3795,6 +3822,15 @@ class BasePlatformAdapter(ABC):
         the running loop that stalls the whole gateway: every other adapter's
         polling, every in-flight turn, every heartbeat.
 
+        BUDGET, measured from the code rather than asserted.  The sleeps are
+        ``_wait_for_scoped_lock_owner_exit(attempts=20, delay=0.5)`` then
+        ``(attempts=20, delay=0.25)`` in ``gateway/status.py``: 10s + 5s = 15s
+        of sleeping.  That is the sleep budget only -- it excludes the marker
+        write, the ``psutil`` owner-state probes on each attempt, and (on
+        Windows) ``terminate_pid``'s ``taskkill`` subprocess, which carries its
+        own ``timeout=10``.  So 15s is the floor of the stall, not a ceiling;
+        do not read it as a bound.
+
         This is a pure transport: arguments, return value, raised exceptions and
         every attribute the sync body mutates (``_platform_lock_*``, the
         ``_set_fatal_error`` state the runner reads for retryability) pass
@@ -3810,7 +3846,8 @@ class BasePlatformAdapter(ABC):
         connect then fails "already in use" and only a process restart clears
         it.  So on cancellation we do not abandon the thread: we wait for it to
         finish and release the lock if it did acquire one, then re-raise.  The
-        wait is bounded by the sync body's own bounded termination budget.
+        wait is bounded by the sync body's own termination budget (see BUDGET
+        above -- a floor of ~15s of sleeping, plus probe/subprocess time).
 
         The cancel-path release goes through
         :meth:`_release_platform_lock_identity` with the EXPLICIT arguments we
@@ -3821,10 +3858,24 @@ class BasePlatformAdapter(ABC):
         cancelled us -- which would turn the release into a silent no-op and
         orphan the lock anyway.
 
+        That release is GENERATION-GUARDED.  The scoped lock is one
+        machine-global file per ``(scope, identity)``, so releasing it deletes
+        whoever holds it; a retry connect that acquired the same pair while we
+        drained is a live holder, and deleting its lock is the same orphaning
+        failure pointed the other way.  We release only when the acquisition
+        generation advanced by exactly one while we ran -- i.e. our worker's
+        acquire is still the live one.
+
+        Repeat cancellations are ABSORBED, not obeyed.  Teardown commonly
+        cancels the same connect task more than once (supervisor, adapter
+        teardown, shutdown); giving up the drain on a second cancel re-opens
+        the orphan window this drain exists to close.
+
         Whatever the drained worker does, the caller asked to be cancelled, so
         this always surfaces as ``CancelledError``; a worker exception must not
         replace it and let ``connect()`` proceed after teardown.
         """
+        generation_before = _platform_lock_generation(scope, identity)
         task = asyncio.ensure_future(
             asyncio.to_thread(
                 self._acquire_platform_lock, scope, identity, resource_desc
@@ -3835,17 +3886,55 @@ class BasePlatformAdapter(ABC):
         except asyncio.CancelledError as cancelled:
             # Let the orphaned worker finish so the lock cannot outlive us.
             # `task` is shielded, so it is still running, not cancelled.
-            try:
-                acquired = await asyncio.shield(task)
-            except asyncio.CancelledError:
-                acquired = False
-            except Exception as exc:
-                # The acquire failed on its own; nothing was taken.
+            #
+            # FURTHER cancellations must not abandon it.  Teardown routinely
+            # cancels more than once (supervisor + adapter teardown + shutdown
+            # all target the same connect task), and giving up on the second
+            # one puts us back in the orphan case this drain exists to close:
+            # the worker runs on and takes the machine-global lock with nobody
+            # left to release it.  So absorb repeat cancels and keep draining;
+            # the wait is still bounded by the sync body's own termination
+            # budget.
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            acquired = False
+            if task.done() and not task.cancelled():
+                worker_error = task.exception()
+                if worker_error is not None:
+                    # The acquire failed on its own; nothing was taken.
+                    logger.debug(
+                        "[%s] acquire of %s failed while cancelled: %s",
+                        self.name,
+                        resource_desc,
+                        worker_error,
+                    )
+                else:
+                    acquired = bool(task.result())
+            # Release ONLY if our worker's acquire is still the live one.
+            #
+            # The release is by (scope, identity), and the scoped lock is a
+            # single machine-global file: releasing it deletes whoever holds
+            # it.  While we were draining, a retry connect (reconnect
+            # supervisor, a sibling adapter for the same credential) can have
+            # acquired that very pair for itself and be using it right now.
+            # An unconditional release would delete a LIVE holder's lock --
+            # the same orphaning failure, pointed the other way.  The
+            # acquisition generation tells the two apart: ours is still the
+            # live one only when nothing acquired after it.
+            generation_now = _platform_lock_generation(scope, identity)
+            if acquired and generation_now != generation_before + 1:
                 logger.debug(
-                    "[%s] acquire of %s failed while cancelled: %s",
+                    "[%s] not releasing %s taken by a cancelled acquire: it "
+                    "was re-acquired since (generation %d -> %d)",
                     self.name,
                     resource_desc,
-                    exc,
+                    generation_before,
+                    generation_now,
                 )
                 acquired = False
             if acquired:
@@ -3884,6 +3973,7 @@ class BasePlatformAdapter(ABC):
             scope, identity, metadata={'platform': self.platform.value}
         )
         if acquired:
+            _note_platform_lock_acquired(scope, identity)
             return True
 
         takeover_allowed = bool(
@@ -3913,6 +4003,7 @@ class BasePlatformAdapter(ABC):
                     metadata={"platform": self.platform.value},
                 )
                 if acquired:
+                    _note_platform_lock_acquired(scope, identity)
                     logger.info(
                         "[%s] Acquired %s after taking over PID %d",
                         self.name,
