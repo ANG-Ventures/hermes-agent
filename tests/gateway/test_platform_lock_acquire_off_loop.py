@@ -328,8 +328,10 @@ def test_the_sweep_is_not_vacuous():
             continue
         async_call_sites += src.count("_acquire_platform_lock_async(")
 
-    # 8 production call sites + the definition + the to_thread body reference.
-    assert async_call_sites >= 8, (
+    # 8 production call sites (one per adapter) + the `async def` declaration
+    # in base.py.  Measured, not assumed: the body of the wrapper calls the
+    # SYNC `_acquire_platform_lock`, so it does not carry this token.
+    assert async_call_sites >= 9, (
         f"found only {async_call_sites} references to the async acquire; the "
         "off-loop form is not actually in use, so the sweep above is green "
         "for the wrong reason"
