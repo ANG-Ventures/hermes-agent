@@ -326,3 +326,146 @@ def test_reclamation_does_not_mine_a_new_survivor_out_of_the_handoff(board, remo
         survivor.preserve(board, tid, cleanup=True, workspace=ws)
 
     assert "recorded repository missing" in str(excinfo.value)
+
+
+# --- the relaxation must not trade unvouched evidence for a reclaim --------
+#
+# FleetReview P1 (#842 @ 3ca4b600): `_loose_files()` has exactly ONE call site,
+# inside the `elif claimed:` arm -- i.e. only when the in-tree capture produced
+# nothing. On a PARTIAL loss `repos` is non-empty, the surviving repo resolves
+# its own ref, and `refs` was pre-seeded with `carried`, so the ref branch is
+# satisfied and control returns before that arm is ever reached. The relaxation
+# therefore cleared a hold that had been protecting loose reviewer evidence, and
+# `remove_workspace_dir` went on to `rmtree` it. Pre-diff the same call raised.
+
+
+def _seed_published_repo(path, bare, *, name="a.py"):
+    """A clean repo whose HEAD is published to a real bare remote."""
+    def git(*args):
+        return subprocess.run(["git", "-C", str(path), *args],
+                              capture_output=True, check=True).stdout.decode().strip()
+
+    path.mkdir(parents=True)
+    git("init", "-b", "main")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.invalid")
+    (path / name).write_text("value = 1\n")
+    git("add", ".")
+    git("commit", "-m", "base")
+    git("init", "--bare", str(bare))
+    git("remote", "add", "origin", str(bare))
+    git("push", "origin", "HEAD:main")
+    return git("rev-parse", "HEAD")
+
+
+def test_partial_loss_at_cleanup_still_holds_for_loose_unvouched_evidence(
+        board, remote, tmp_path, monkeypatch):
+    """REGRESSION: the relaxation must consult `_loose_files()` on EVERY exit
+    that can reach `rmtree`, not only on the total-loss `elif claimed:` arm.
+
+    `gone` is vouched for by the recorded operator ref, `kept` survives and
+    resolves its own ref -- but `qa-output/verdict.md` sits beside them and no
+    survivor covers it. The workspace must stay HELD.
+    """
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    tid = kb.create_task(board, title="partial loss with loose evidence")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws.mkdir(parents=True, exist_ok=True)
+    kept_head = _seed_published_repo(ws / "kept", tmp_path / "kept.git")
+    evidence = ws / "qa-output" / "verdict.md"
+    evidence.parent.mkdir(parents=True, exist_ok=True)
+    evidence.write_text("APPROVED\n")
+    kb.set_workspace_path(board, tid, ws)
+    with kb.write_txn(board):
+        board.execute(
+            "INSERT INTO task_workspace_survivors(task_id, bases, survivor) VALUES (?, ?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET bases = excluded.bases, survivor = excluded.survivor",
+            (tid, json.dumps({"kept": kept_head, "gone": STALE}),
+             json.dumps({"kind": "ref", "refs": [
+                 {"repository": "gone", "sha": HEAD, "pr": PR, "external": True}]})),
+        )
+
+    # Exactly what the reaper passes: cleanup, no operator flag.
+    with pytest.raises(ValueError) as excinfo:
+        survivor.preserve(board, tid, cleanup=True, workspace=ws)
+
+    assert "outside any repository" in str(excinfo.value), str(excinfo.value)
+    assert evidence.is_file(), "loose reviewer evidence must survive the relaxation"
+    assert board.execute(
+        "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["held_reason"] is not None
+
+
+def test_partial_loss_at_cleanup_still_reclaims_when_nothing_is_loose(
+        board, remote, tmp_path, monkeypatch):
+    """Teeth for the test above: the guard must key on LOOSE FILES, not on
+    partial loss itself. With no unvouched evidence the reclaim still succeeds
+    and still carries the recorded ref for the vanished repo.
+    """
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    tid = kb.create_task(board, title="partial loss, clean workspace")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws.mkdir(parents=True, exist_ok=True)
+    kept_head = _seed_published_repo(ws / "kept", tmp_path / "clean-kept.git")
+    kb.set_workspace_path(board, tid, ws)
+    with kb.write_txn(board):
+        board.execute(
+            "INSERT INTO task_workspace_survivors(task_id, bases, survivor) VALUES (?, ?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET bases = excluded.bases, survivor = excluded.survivor",
+            (tid, json.dumps({"kept": kept_head, "gone": STALE}),
+             json.dumps({"kind": "ref", "refs": [
+                 {"repository": "gone", "sha": HEAD, "pr": PR, "external": True}]})),
+        )
+
+    out = survivor.preserve(board, tid, cleanup=True, workspace=ws)
+
+    by_repo = {ref["repository"]: ref for ref in out["refs"]}
+    assert by_repo["gone"]["pr"] == PR
+    assert by_repo["kept"]["remote"] == "origin"
+    assert board.execute(
+        "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["held_reason"] is None
+
+
+def test_a_bundle_vouched_missing_repo_is_carried_into_the_rewritten_survivor(
+        board, remote, tmp_path, monkeypatch):
+    """REGRESSION: `_vouched_repositories()` counts bundles, but the
+    carry-forward copied only `refs`. A repo whose ONLY survivor is a stored
+    bundle satisfied `missing <= vouched`, then vanished from the survivor that
+    `_record()` rewrote -- leaving the recovery index claiming `kind: "ref"`
+    for a card whose unpushed history lives in an orphaned bundle attachment.
+    """
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    tid = kb.create_task(board, title="bundle-vouched loss")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws.mkdir(parents=True, exist_ok=True)
+    a_head = _seed_published_repo(ws / "a", tmp_path / "a.git")
+    kb.set_workspace_path(board, tid, ws)
+    bundle = {"repository": "b", "path": str(tmp_path / "implementation-0.bundle"),
+              "sha256": "f" * 64, "bytes": 42}
+    with kb.write_txn(board):
+        board.execute(
+            "INSERT INTO task_workspace_survivors(task_id, bases, survivor) VALUES (?, ?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET bases = excluded.bases, survivor = excluded.survivor",
+            (tid, json.dumps({"a": a_head, "b": STALE}),
+             json.dumps({"kind": "bundle", "notice": "NOT PUSHED", "bundles": [bundle],
+                         "refs": [{"repository": "a", "sha": a_head, "remote": "origin"}]})),
+        )
+
+    out = survivor.preserve(board, tid, cleanup=True, workspace=ws)
+
+    assert [b["repository"] for b in out.get("bundles") or ()] == ["b"], out
+    assert out["bundles"][0]["path"] == bundle["path"], "the stored bundle pointer must survive"
+    assert out["kind"] == "bundle", (
+        "a survivor still holding unpushed history must not be relabelled `ref`"
+    )
+    saved = json.loads(board.execute(
+        "SELECT survivor FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["survivor"])
+    assert [b["repository"] for b in saved["bundles"]] == ["b"], saved
