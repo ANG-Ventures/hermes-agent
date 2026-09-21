@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import time
 import unicodedata
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 from typing import TYPE_CHECKING
@@ -536,9 +537,15 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
     return requested, branch_name
 
 
+@dataclass(frozen=True)
+class _WorkspaceAdmission:
+    root: Path
+    mount_path: Path
+
+
 def _validate_workspace_admission(
     task: Task, *, board: Optional[str] = None, conn=None, dry_run: bool = False,
-) -> Optional[Path]:
+) -> Optional[_WorkspaceAdmission]:
     """Validate configured and historically volatile paths before claim/spawn."""
     from hermes_cli.kanban_workspace_policy import (
         WorkspaceUnavailable, configured_root, validate_mount,
@@ -594,12 +601,13 @@ def _validate_workspace_admission(
                     )
                 validate_target(protected, path)
                 validate_persisted(path)
-                return protected
+                return _WorkspaceAdmission(protected, mount_path)
     elif task.workspace_kind in (None, "scratch"):
         target = _kb.workspaces_root(board=board) / task.id
         if require_mount:
+            assert root is not None
             validate_target(root, target)
-            return root
+            return _WorkspaceAdmission(root, roots[root])
     return None
 
 
@@ -684,7 +692,9 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
         raise ValueError(f"unknown workspace_kind: {kind}")
     if protected is not None and not task.workspace_path:
         from hermes_cli.kanban_workspace_policy import create_scratch
-        create_scratch(protected, p)
+        create_scratch(
+            protected.root, p, expected_mount=protected.mount_path,
+        )
     elif protected is None:
         p.mkdir(parents=True, exist_ok=True)
     return p

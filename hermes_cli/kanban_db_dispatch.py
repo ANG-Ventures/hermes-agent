@@ -2099,7 +2099,7 @@ def _dispatch_lane_task(
     if claimed is None:
         return False
     from hermes_cli.kanban_workspace_policy import (
-        WorkspaceUnavailable, validate_persisted, validate_target,
+        WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
     )
     try:
         protected = _kbw._validate_workspace_admission(
@@ -2111,7 +2111,10 @@ def _dispatch_lane_task(
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
         if protected is not None:
-            validate_target(protected, workspace)
+            validate_mount(
+                protected.root, expected_mount=protected.mount_path,
+            )
+            validate_target(protected.root, workspace)
             validate_persisted(workspace)
     except WorkspaceUnavailable as exc:
         _release_claim_for_workspace_refusal(
