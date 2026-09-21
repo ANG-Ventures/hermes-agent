@@ -320,6 +320,19 @@ def _log_spawn_results(results: Optional[list]) -> bool:
     """Log per-board spawn summaries; returns whether any board spawned."""
     any_spawned = False
     for slug, res in (results or []):
+        refused = getattr(res, "workspace_refused", None) if res is not None else None
+        if refused:
+            grouped: dict[str, list[str]] = {}
+            for task_id, detail in refused:
+                grouped.setdefault(str(detail).split(":", 1)[0], []).append(str(task_id))
+            summary = "; ".join(
+                f"{reason}: {', '.join(sorted(task_ids))}"
+                for reason, task_ids in sorted(grouped.items())
+            )
+            logger.error(
+                "kanban dispatcher tick [%s]: workspace_refused=%d (%s)",
+                slug, len(refused), summary,
+            )
         if res is not None and getattr(res, "spawned", None):
             any_spawned = True
             # Quiet by default: an idle gateway stays silent.

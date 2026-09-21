@@ -152,6 +152,10 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    stranded_by_mount_loss: list[str] = field(default_factory=list)
+    """Persisted volatile workspaces missing at startup/admission."""
+    workspace_refused: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` mount-admission refusals before task claim."""
 
 
 def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
@@ -2038,6 +2042,11 @@ def _dispatch_lane_task(
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
 
+    if _kbw.workspace_admission_refused(
+        conn, task_id, result, board=board, dry_run=dry_run,
+    ):
+        return False
+
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
         # ticks re-query from the DB.
@@ -2299,6 +2308,15 @@ def _dispatch_once_locked(
     the PID so later ticks catch crashes before the TTL. Cap semantics:
     :func:`_tick_spawn_budget`."""
     result = DispatchResult()
+    # First-boot/startup fence: record vanished persisted volatile paths before
+    # any reclaim or spawn path can recreate them on durable storage.
+    for row in conn.execute(
+        "SELECT id FROM tasks WHERE workspace_path IS NOT NULL "
+        "AND status IN ('todo', 'ready', 'running', 'review')"
+    ).fetchall():
+        _kbw.workspace_admission_refused(
+            conn, row["id"], result, board=board, dry_run=dry_run,
+        )
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,

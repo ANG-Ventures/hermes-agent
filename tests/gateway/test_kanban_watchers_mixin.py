@@ -74,3 +74,23 @@ def test_gateway_dispatcher_stuck_warning_names_guard_reason(monkeypatch, caplog
     stuck = [r.getMessage() for r in caplog.records if "dispatcher stuck" in r.getMessage()]
     assert stuck, [r.getMessage() for r in caplog.records]
     assert "Last tick held back: active_pr=1." in stuck[0]
+
+
+def test_gateway_logs_mount_refusal_reason_and_task(caplog):
+    import logging
+
+    from gateway.kanban_watchers_dispatcher import _log_spawn_results
+    from hermes_cli.kanban_db_dispatch import DispatchResult
+
+    result = DispatchResult(workspace_refused=[
+        ("t2", "workspaces_root_unmounted: /Volumes/ramscratch"),
+        ("t1", "workspaces_root_unmounted: /Volumes/ramscratch"),
+    ])
+    with caplog.at_level(logging.ERROR):
+        assert not _log_spawn_results([("default", result)])
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert messages == [
+        "kanban dispatcher tick [default]: workspace_refused=2 "
+        "(workspaces_root_unmounted: t1, t2)"
+    ]
