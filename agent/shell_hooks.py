@@ -562,7 +562,15 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
 
         argv = split_command_line(os.path.expanduser(spec.command))
     except ValueError as exc:
-        result["error"] = f"command {spec.command!r} cannot be parsed: {exc}"
+        # `error` reaches the MODEL via _evaluate_result -> _fail_closed_block,
+        # so it must never carry the raw command or exception text derived from
+        # it: an unparseable command is exactly the shape that still holds an
+        # inline credential (`sh -c 'export TOK=…` with the quote left open).
+        # Name the hook by its digest and the failure by its exception CLASS.
+        # The raw command stays on the log channel only (_evaluate_result).
+        result["error"] = (
+            f"command cannot be parsed ({type(exc).__name__})"
+        )
         return result
     if not argv:
         result["error"] = "empty command"
@@ -596,7 +604,10 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
         result["error"] = "command not executable"
         return result
     except Exception as exc:  # pragma: no cover — defensive
-        result["error"] = str(exc)
+        # Same channel as the parse failure above: spawn exceptions routinely
+        # embed argv (OSError stringifies the program path), and argv[0] can be
+        # the credential itself. Exception CLASS only.
+        result["error"] = f"spawn failed ({type(exc).__name__})"
         return result
 
     try:
@@ -619,7 +630,9 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
             proc.communicate(timeout=1)
         except Exception:
             pass
-        result["error"] = str(exc)
+        # Model-facing via _fail_closed_block — exception CLASS only, never
+        # text that may carry argv or payload content.
+        result["error"] = f"communication failed ({type(exc).__name__})"
         return result
 
     result["returncode"] = proc.returncode

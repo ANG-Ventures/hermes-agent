@@ -1405,6 +1405,102 @@ class TestForceReloadSymmetry:
         assert "shell_hook[pre_tool_call:" in timeout_msg
         assert "shell_hook[pre_tool_call:" in suppressed_msg
 
+    def test_refusals_do_not_disclose_a_callback_without_a_name(self, monkeypatch):
+        """A callback with no ``__name__`` must not be named by ``repr()``.
+
+        The sibling test above covers callbacks that HAVE a ``__name__``.
+        This is the other half of the class: ``functools.partial`` (and any
+        callable object) has no ``__name__``, so the old
+        ``getattr(cb, "__name__", repr(cb))`` fell through to ``repr()`` —
+        which renders every bound argument, credentials included, into a
+        MODEL-facing refusal.
+        """
+        import functools
+
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
+        )
+
+        planted = "hunter2PRODSup3rSecret"
+        release = threading.Event()
+
+        def _policy(token, **kwargs):
+            release.wait(10)
+            return None
+
+        callback = functools.partial(_policy, planted)
+        # A partial has no __name__; repr() renders the bound token.
+        assert not hasattr(callback, "__name__")
+        assert planted in repr(callback)
+        setattr(callback, "_hermes_timeout_fail_closed", True)
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [callback]
+
+        import hermes_cli.plugins as plugins_mod
+
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+
+        try:
+            timeout_msg = resolve_pre_tool_block("web_search", {"query": "x"})
+            suppressed_msg = resolve_pre_tool_block("web_search", {"query": "y"})
+
+            # Both fail-closed paths still block (policy preserved) ...
+            assert timeout_msg is not None
+            assert suppressed_msg is not None
+            # ... and neither renders the callback's bound arguments.
+            assert planted not in timeout_msg, (
+                "the timeout refusal named the callback by repr(), "
+                "disclosing its bound credential to the model"
+            )
+            assert planted not in suppressed_msg, (
+                "the suppression refusal named the callback by repr(), "
+                "disclosing its bound credential to the model"
+            )
+            # The callback is still identifiable by its wrapped function.
+            assert "_policy" in timeout_msg
+            assert "_policy" in suppressed_msg
+        finally:
+            release.set()
+
+    def test_unparseable_hook_command_is_not_disclosed(self, monkeypatch):
+        """An unparseable hook command must not reach the fail-closed refusal.
+
+        ``_spawn`` cannot split a command with an unbalanced quote — and that
+        is precisely the shape that still holds an inline credential. The
+        parse failure previously went into ``result["error"]``, which
+        ``_evaluate_result`` hands to ``_fail_closed_block`` as the
+        model-facing reason.
+        """
+        from agent import shell_hooks
+
+        planted = "hunter2PRODSup3rSecret"
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call",
+            # Unbalanced quote — shlex cannot split this.
+            command=f"/bin/sh -c 'export TOK={planted}; echo hi",
+            fail_closed=True,
+        )
+
+        r = shell_hooks._spawn(spec, "{}")
+        assert r["error"], "the unbalanced quote should have failed the parse"
+        assert planted not in r["error"], (
+            "the parse failure carried the raw command, which flows to the "
+            "model-facing fail-closed refusal"
+        )
+
+        decision = shell_hooks._evaluate_result(spec, r)
+        assert decision is not None and decision["action"] == "block", (
+            "a fail_closed hook that cannot be parsed must still block"
+        )
+        assert planted not in decision["message"], (
+            "the fail-closed refusal disclosed the hook command to the model"
+        )
+        # The hook is still identifiable by its secret-free digest name.
+        assert shell_hooks.hook_display_name(spec.command) in decision["message"]
+
     def test_pre_tool_call_timeout_does_not_reach_tool_handler(self, monkeypatch):
         """E2E: timed-out pre_tool_call blocks handle_function_call before dispatch."""
         import json

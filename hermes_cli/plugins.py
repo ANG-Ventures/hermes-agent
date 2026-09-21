@@ -473,6 +473,37 @@ _PRE_TOOL_CALL_SUPPRESSED_BLOCK_MESSAGE = (
     "timeout (retry in {remaining:.0f}s)"
 )
 
+
+def _callback_label(callback: Any) -> str:
+    """Return a stable, secret-free identifier for a plugin *callback*.
+
+    Callback labels reach the MODEL through the fail-closed refusal messages
+    above, so this must never fall back to ``repr()``: a callback that carries
+    credentials in its state — the canonical case is
+    ``functools.partial(fn, api_token)``, whose repr renders every bound
+    argument — would interpolate them straight into a model-visible string.
+    ``__name__``/``__qualname__`` are developer-chosen identifiers and safe;
+    anything without one is named by TYPE and identity instead.
+
+    Mirrors :func:`agent.shell_hooks.hook_display_name`, which does the same
+    job for the other half of this class (shell-hook command lines).
+    """
+    for attr in ("__qualname__", "__name__"):
+        label = getattr(callback, attr, None)
+        if isinstance(label, str) and label:
+            return label
+    # functools.partial and friends: the WRAPPED function's name is a safe
+    # developer identifier, while the partial's bound args are exactly what
+    # must not be rendered. Name the wrapped callable, never the arguments.
+    wrapped = getattr(callback, "func", None)
+    if wrapped is not None:
+        for attr in ("__qualname__", "__name__"):
+            label = getattr(wrapped, attr, None)
+            if isinstance(label, str) and label:
+                return f"{type(callback).__name__}({label})"
+    return f"<{type(callback).__name__}@{id(callback):x}>"
+
+
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 ENTRY_POINT_CAPABILITIES_GROUP = "hermes_agent.plugin_capabilities"
 
@@ -5706,7 +5737,7 @@ class PluginManager:
         timeout = _resolve_hook_callback_timeout()
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         for cb in callbacks:
-            callback_name = getattr(cb, "__name__", repr(cb))
+            callback_name = _callback_label(cb)
             callback_key = (hook_name, id(cb))
             fail_closed = bool(
                 getattr(
@@ -5952,7 +5983,7 @@ class PluginManager:
                     logger.warning(
                         "Event '%s' subscriber %s raised: %s",
                         item.event,
-                        getattr(callback, "__name__", repr(callback)),
+                        _callback_label(callback),
                         exc,
                     )
         finally:
@@ -6138,7 +6169,7 @@ class PluginManager:
                 logger.warning(
                     "Middleware '%s' callback %s raised: %s",
                     kind,
-                    getattr(cb, "__name__", repr(cb)),
+                    _callback_label(cb),
                     exc,
                 )
         return results
