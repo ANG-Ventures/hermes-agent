@@ -472,6 +472,50 @@ def test_create_rejects_non_string_model_override(worker_env):
     assert json.loads(out).get("error")
 
 
+def test_create_schema_exposes_firepower_reason():
+    from tools.kanban_tools import KANBAN_CREATE_SCHEMA
+
+    prop = KANBAN_CREATE_SCHEMA["parameters"]["properties"]["firepower_reason"]
+    assert prop["type"] == "string"
+
+
+def test_native_create_refuses_firepower_without_reason(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = json.loads(kt._handle_create({
+        "title": "astra child",
+        "assignee": "peer",
+        "model": "gpt-6-astra-900k",
+        "provider": "openai-codex",
+    }))
+    assert "firepower_reason" in out["error"]
+    with kb.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
+
+
+def test_native_create_accepts_firepower_with_atomic_audit(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    reason = "hard cross-module diagnosis"
+    out = json.loads(kt._handle_create({
+        "title": "astra child",
+        "assignee": "peer",
+        "model": "gpt-6-astra-900k",
+        "provider": "openai-codex",
+        "firepower_reason": reason,
+    }))
+    assert out["ok"] is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, out["task_id"])
+        comments = kb.list_comments(conn, out["task_id"])
+    assert task is not None
+    assert task.model_override == "gpt-6-astra-900k"
+    assert len(comments) == 1
+    assert reason in comments[0].body
+
+
 def test_create_rejects_non_list_parents(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_create({"title": "t", "assignee": "a", "parents": 42})

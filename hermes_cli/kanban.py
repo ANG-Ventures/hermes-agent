@@ -779,6 +779,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
              "override untouched; use --clear-model to remove it.",
     )
     p_edit.add_argument(
+        "--firepower",
+        default=None,
+        metavar="REASON",
+        help="Required justification when --model resolves to a flagship model.",
+    )
+    p_edit.add_argument(
         "--clear-model",
         action="store_true",
         dest="clear_model",
@@ -1922,11 +1928,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
     model_override = getattr(args, "model_override", None)
     provider_override = getattr(args, "provider_override", None)
     firepower_reason = getattr(args, "firepower", None)
-    from hermes_cli.model_policy import (
-        firepower_guard_error,
-        format_firepower_audit,
-        is_firepower_model,
-    )
+    from hermes_cli.model_policy import firepower_guard_error
     guard_error = firepower_guard_error(model_override, firepower_reason)
     if guard_error:
         print(f"kanban: {guard_error}", file=sys.stderr)
@@ -1956,20 +1958,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 max_retries=max_retries,
                 model_override=model_override,
                 provider_override=provider_override,
+                firepower_reason=firepower_reason,
                 reasoning_effort=getattr(args, "reasoning_effort", None),
                 goal_mode=bool(getattr(args, "goal_mode", False)),
                 goal_max_turns=getattr(args, "goal_max_turns", None),
                 initial_status=getattr(args, "initial_status", "running"),
             )
-            if is_firepower_model(model_override):
-                kb.add_comment(
-                    conn,
-                    task_id,
-                    args.created_by or _profile_author(),
-                    format_firepower_audit(
-                        model_override, provider_override, firepower_reason
-                    ),
-                )
         task = kb.get_task(conn, task_id)
         auto_subscribed = _maybe_cli_auto_subscribe(conn, task_id)
     if getattr(args, "json", False):
@@ -2370,6 +2364,7 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                     args.task_id,
                     model,
                     provider=provider,
+                    firepower_reason=firepower_reason,
                     audit_comment_author=_profile_author() if firepower else None,
                     audit_comment_body=(
                         format_firepower_audit(model, provider, firepower_reason)
@@ -2893,6 +2888,7 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 
     model_override = getattr(args, "model_override", None)
     clear_model = bool(getattr(args, "clear_model", False))
+    firepower_reason = getattr(args, "firepower", None)
     if model_override is not None and clear_model:
         print(
             "kanban: --model and --clear-model are mutually exclusive",
@@ -2912,13 +2908,28 @@ def _cmd_edit(args: argparse.Namespace) -> int:
         )
         return 2
 
+    from hermes_cli.model_policy import firepower_guard_error, is_firepower_model
+
+    guard_error = firepower_guard_error(model_override, firepower_reason)
+    if do_model and not clear_model and guard_error:
+        print(f"kanban: {guard_error}", file=sys.stderr)
+        return 2
+
     rc = 0
     with kb.connect_closing() as conn:
         if do_model:
             # --clear-model writes NULL; --model X writes X literally. The
             # None sentinel ("--model omitted") never reaches here.
             new_model = None if clear_model else model_override
-            affected = kb.set_task_model(conn, args.task_id, new_model)
+            affected = kb.set_task_model(
+                conn,
+                args.task_id,
+                new_model,
+                firepower_reason=firepower_reason,
+                audit_comment_author=(
+                    _profile_author() if is_firepower_model(new_model) else None
+                ),
+            )
             if affected == 0:
                 print(
                     f"cannot set model on {args.task_id} (unknown id)",

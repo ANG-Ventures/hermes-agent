@@ -13,10 +13,26 @@ from typing import Optional
 FIREPOWER_MODEL_SUBSTRINGS = ("gpt-6-astra", "claude-fable")
 
 
-def is_firepower_model(model: Optional[str]) -> bool:
-    """Return whether *model* names a flagship/firepower-only family."""
+def canonical_model_pair(
+    model: Optional[str], provider: Optional[str] = None
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve config aliases before any policy, persistence, or audit decision."""
 
-    normalized = str(model or "").strip().lower()
+    if not model:
+        return model, provider
+    try:
+        from hermes_cli.model_switch import resolve_model_pair_for_storage
+
+        return resolve_model_pair_for_storage(model, provider)
+    except Exception:
+        return model, provider
+
+
+def is_firepower_model(model: Optional[str]) -> bool:
+    """Return whether *model* resolves to a flagship/firepower-only family."""
+
+    canonical_model, _ = canonical_model_pair(model)
+    normalized = str(canonical_model or "").strip().lower()
     return bool(normalized) and any(
         banned in normalized for banned in FIREPOWER_MODEL_SUBSTRINGS
     )
@@ -25,7 +41,7 @@ def is_firepower_model(model: Optional[str]) -> bool:
 def route_kind(route: Optional[str]) -> str:
     """Classify a route for dispatcher announcements."""
 
-    return "firepower-override" if is_firepower_model(route) else "standard"
+    return "firepower" if is_firepower_model(route) else "standard"
 
 
 def firepower_guard_error(
@@ -53,5 +69,10 @@ def format_firepower_audit(
 ) -> str:
     """Stable human-readable audit comment/log payload."""
 
-    route = f"{provider}/{model}" if provider else model
+    canonical_model, canonical_provider = canonical_model_pair(model, provider)
+    route = (
+        f"{canonical_provider}/{canonical_model}"
+        if canonical_provider
+        else canonical_model
+    )
     return f"firepower override: route={route}; reason={reason.strip()}"

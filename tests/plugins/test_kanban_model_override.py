@@ -174,6 +174,46 @@ def test_patch_sets_model_override(client):
     assert updated["provider_override"] == "openai"
 
 
+def test_dashboard_create_and_patch_require_firepower_reason(client):
+    refused_create = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "astra",
+            "assignee": "worker",
+            "model_override": "gpt-6-astra-900k",
+            "provider_override": "openai-codex",
+        },
+    )
+    assert refused_create.status_code == 400
+    assert "firepower_reason" in refused_create.text
+
+    task = _create(client)
+    refused_patch = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "model_override": "gpt-6-astra-900k",
+            "provider_override": "openai-codex",
+        },
+    )
+    assert refused_patch.status_code == 400
+    assert "firepower_reason" in refused_patch.text
+
+
+def test_dashboard_firepower_reason_is_audited(client):
+    reason = "hard architecture adjudication"
+    task = _create(
+        client,
+        model_override="gpt-6-astra-900k",
+        provider_override="openai-codex",
+        firepower_reason=reason,
+    )
+    detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}")
+    assert detail.status_code == 200
+    comments = detail.json()["comments"]
+    assert len(comments) == 1
+    assert reason in comments[0]["body"]
+
+
 def test_bulk_model_override(client):
     t1 = _create(client)
     t2 = _create(client)

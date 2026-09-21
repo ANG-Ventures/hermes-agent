@@ -32,6 +32,19 @@ def test_delegate_refuses_flagship_without_firepower_reason():
     assert "--firepower" in result or "firepower_reason" in result
 
 
+def test_delegate_refuses_alias_resolving_to_flagship_without_reason():
+    with patch(
+        "hermes_cli.model_switch.resolve_model_pair_for_storage",
+        return_value=("gpt-6-astra-900k", "openai-codex"),
+    ):
+        result = cast(Any, delegate_task)(
+            tasks=[{"goal": "Diagnose the concurrency failure"}],
+            model="astra",
+            parent_agent=_parent(),
+        )
+    assert "firepower_reason" in result
+
+
 def test_justified_route_reaches_child_credential_config_and_audit_log():
     captured = {}
 

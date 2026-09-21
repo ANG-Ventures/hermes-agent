@@ -4147,6 +4147,7 @@ def create_task(
     max_retries: Optional[int] = None,
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
+    firepower_reason: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
@@ -4208,6 +4209,24 @@ def create_task(
         raise ValueError("provider_override requires a model_override")
     model_override, provider_override = _resolve_stored_model_pair(
         model_override, provider_override
+    )
+    from hermes_cli.model_policy import (
+        firepower_guard_error,
+        format_firepower_audit,
+        is_firepower_model,
+    )
+
+    guard_error = firepower_guard_error(
+        model_override, firepower_reason, reason_field="firepower_reason"
+    )
+    if guard_error:
+        raise ValueError(guard_error)
+    firepower_audit = (
+        format_firepower_audit(
+            model_override or "", provider_override, firepower_reason or ""
+        )
+        if is_firepower_model(model_override)
+        else None
     )
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
@@ -4384,12 +4403,21 @@ def create_task(
     # insert, at which point both rows exist but the next lookup stabilises.
     if idempotency_key:
         row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "SELECT id, model_override, provider_override FROM tasks "
+            "WHERE idempotency_key = ? "
             "AND status != 'archived' "
             "ORDER BY created_at DESC LIMIT 1",
             (idempotency_key,),
         ).fetchone()
         if row:
+            existing_route = (row["model_override"], row["provider_override"])
+            requested_route = (model_override, provider_override)
+            if existing_route != requested_route:
+                raise ValueError(
+                    f"idempotency key {idempotency_key!r} conflicts with existing "
+                    f"task {row['id']} route {existing_route!r}; requested "
+                    f"{requested_route!r}"
+                )
             return row["id"]
 
     now = int(time.time())
@@ -4543,6 +4571,13 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if firepower_audit:
+                    add_comment(
+                        conn,
+                        task_id,
+                        created_by or "operator",
+                        firepower_audit,
+                    )
                 if task_status == "blocked":
                     # Tag the source so dependency resolution can distinguish
                     # this creation-time hold from a later explicit worker or
@@ -4745,6 +4780,7 @@ def set_model_override(
     model: Optional[str],
     provider: Optional[str] = None,
     *,
+    firepower_reason: Optional[str] = None,
     audit_comment_author: Optional[str] = None,
     audit_comment_body: Optional[str] = None,
 ) -> bool:
@@ -4766,15 +4802,36 @@ def set_model_override(
     """
     model = (model or "").strip() or None
     provider = (provider or "").strip() or None
-    if bool(audit_comment_author) != bool(audit_comment_body):
-        raise ValueError(
-            "audit_comment_author and audit_comment_body must be supplied together"
-        )
     if provider and not model:
         raise ValueError("provider_override requires a model_override")
     if not model:
         provider = None
     model, provider = _resolve_stored_model_pair(model, provider)
+    from hermes_cli.model_policy import (
+        firepower_guard_error,
+        format_firepower_audit,
+        is_firepower_model,
+    )
+
+    # A caller-supplied audit comment IS the written justification this guard
+    # exists to force, so it satisfies the requirement exactly like
+    # ``firepower_reason`` does. Callers that pass neither are refused.
+    guard_error = firepower_guard_error(
+        model,
+        firepower_reason or audit_comment_body,
+        reason_field="firepower_reason",
+    )
+    if guard_error:
+        raise ValueError(guard_error)
+    if is_firepower_model(model) and audit_comment_body is None:
+        audit_comment_body = format_firepower_audit(
+            model or "", provider, firepower_reason or ""
+        )
+        audit_comment_author = audit_comment_author or "operator"
+    if bool(audit_comment_author) != bool(audit_comment_body):
+        raise ValueError(
+            "audit_comment_author and audit_comment_body must be supplied together"
+        )
     with write_txn(conn):
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
@@ -10189,7 +10246,12 @@ def set_workspace_path(
 
 
 def set_task_model(
-    conn: sqlite3.Connection, task_id: str, model: Optional[str]
+    conn: sqlite3.Connection,
+    task_id: str,
+    model: Optional[str],
+    *,
+    firepower_reason: Optional[str] = None,
+    audit_comment_author: Optional[str] = None,
 ) -> int:
     """Set (or clear) a task's per-task model override.
 
@@ -10212,16 +10274,13 @@ def set_task_model(
     ``task_id`` returns ``0`` (never a silent success), so callers can tell
     a real write from a no-op.
     """
-    resolved_model, resolved_provider = _resolve_stored_model_pair(model, None)
-    if not resolved_model:
-        resolved_provider = None
-    with write_txn(conn):
-        cur = conn.execute(
-            "UPDATE tasks SET model_override = ?, provider_override = ? "
-            "WHERE id = ?",
-            (resolved_model, resolved_provider, task_id),
-        )
-    return int(cur.rowcount or 0)
+    return int(set_model_override(
+        conn,
+        task_id,
+        model,
+        firepower_reason=firepower_reason,
+        audit_comment_author=audit_comment_author,
+    ))
 
 
 def set_branch_name(

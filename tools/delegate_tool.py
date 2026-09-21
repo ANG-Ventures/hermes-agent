@@ -4216,10 +4216,12 @@ def delegate_task(
     if provider and not model:
         return tool_error("delegate_task provider requires a model override.")
     from hermes_cli.model_policy import (
+        canonical_model_pair,
         firepower_guard_error,
         format_firepower_audit,
         is_firepower_model,
     )
+    model, provider = canonical_model_pair(model, provider)
     guard_error = firepower_guard_error(
         model, firepower_reason, reason_field="firepower_reason"
     )

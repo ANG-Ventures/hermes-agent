@@ -9,6 +9,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import model_switch as ms
 from hermes_cli.model_policy import firepower_guard_error, route_kind
 
 
@@ -28,6 +29,32 @@ def _created_id(output: str) -> str:
     return match.group(1)
 
 
+@pytest.fixture
+def firepower_aliases(monkeypatch):
+    saved = dict(ms.DIRECT_ALIASES)
+    saved_degraded = ms._DIRECT_ALIASES_DEGRADED
+    ms.DIRECT_ALIASES.clear()
+    ms._DIRECT_ALIASES_DEGRADED = False
+
+    def _loader():
+        merged = dict(ms._BUILTIN_DIRECT_ALIASES)
+        merged.update({
+            "astra": ms.DirectAlias(
+                model="gpt-6-astra-900k", provider="openai-codex", base_url=""
+            ),
+            "gpt": ms.DirectAlias(
+                model="gpt-6-astra-900k", provider="openai-codex", base_url=""
+            ),
+        })
+        return merged, True
+
+    monkeypatch.setattr(ms, "_load_direct_aliases", _loader)
+    yield
+    ms.DIRECT_ALIASES.clear()
+    ms.DIRECT_ALIASES.update(saved)
+    ms._DIRECT_ALIASES_DEGRADED = saved_degraded
+
+
 @pytest.mark.parametrize("model", [
     "gpt-6-astra-900k",
     "openai-codex/gpt-6-astra-900k",
@@ -43,7 +70,20 @@ def test_guard_does_not_restrict_sub_flagship():
     assert firepower_guard_error("gpt-5.6-sol-900k", None) is None
     assert firepower_guard_error("claude-opus-5", None) is None
     assert route_kind("openai-codex/gpt-5.6-sol-900k") == "standard"
-    assert route_kind("openai-codex/gpt-6-astra-900k") == "firepower-override"
+    assert route_kind("openai-codex/gpt-6-astra-900k") == "firepower"
+
+
+def test_alias_is_canonicalized_before_guard_and_classification(firepower_aliases):
+    assert "--firepower" in firepower_guard_error("astra", None)
+    assert "--firepower" in firepower_guard_error("gpt", None)
+    assert route_kind("astra") == "firepower"
+
+
+def test_create_refuses_firepower_alias_without_reason(kanban_home, firepower_aliases):
+    output = kc.run_slash("create 'aliased' --assignee worker --model astra")
+    assert "--firepower" in output
+    with kb.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
 
 
 def test_create_refuses_flagship_without_firepower_reason(kanban_home):
@@ -72,6 +112,38 @@ def test_create_accepts_flagship_and_appends_audit_comment(kanban_home):
     assert len(comments) == 1
     assert reason in comments[0].body
     assert "openai-codex/gpt-6-astra-900k" in comments[0].body
+
+
+def test_idempotent_create_same_route_does_not_duplicate_audit(kanban_home):
+    command = (
+        "create 'expensive task' --assignee worker --idempotency-key same "
+        "--model gpt-6-astra-900k --provider openai-codex "
+        "--firepower 'hard recovery'"
+    )
+    first_id = _created_id(kc.run_slash(command))
+    second_id = _created_id(kc.run_slash(command))
+    assert second_id == first_id
+    with kb.connect() as conn:
+        comments = kb.list_comments(conn, first_id)
+    assert len(comments) == 1
+
+
+def test_idempotent_create_rejects_conflicting_route_without_false_audit(kanban_home):
+    first_id = _created_id(kc.run_slash(
+        "create 'plain task' --assignee worker --idempotency-key same "
+        "--model gpt-5.6-sol-900k --provider openai-codex"
+    ))
+    rejected = kc.run_slash(
+        "create 'different route' --assignee worker --idempotency-key same "
+        "--model gpt-6-astra-900k --provider openai-codex "
+        "--firepower 'hard recovery'"
+    )
+    assert "conflicts with existing task" in rejected
+    with kb.connect() as conn:
+        task = kb.get_task(conn, first_id)
+        comments = kb.list_comments(conn, first_id)
+    assert task.model_override == "gpt-5.6-sol-900k"
+    assert comments == []
 
 
 def test_create_rolls_back_if_firepower_audit_comment_fails(
@@ -124,6 +196,69 @@ def test_set_model_accepts_flagship_and_appends_audit_comment(kanban_home):
     assert task.model_override == "gpt-6-astra-900k"
     assert len(comments) == 1
     assert reason in comments[0].body
+
+
+@pytest.mark.parametrize(
+    "blank",
+    ["", "   "],
+    ids=["empty", "whitespace"],
+)
+def test_set_model_blank_justification_is_not_a_bypass(kanban_home, blank):
+    """A blank audit body must not satisfy the firepower requirement.
+
+    ``audit_comment_body`` counts as the written justification, so a blank one
+    would otherwise be a silent way past the guard.
+    """
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="blank justification",
+            assignee="worker",
+            model_override="gpt-5.6-sol-900k",
+        )
+        with pytest.raises(ValueError, match="firepower"):
+            kb.set_model_override(
+                conn,
+                task_id,
+                "gpt-6-astra-900k",
+                provider="openai-codex",
+                audit_comment_author="operator",
+                audit_comment_body=blank,
+            )
+        with pytest.raises(ValueError, match="firepower"):
+            kb.set_model_override(
+                conn,
+                task_id,
+                "gpt-6-astra-900k",
+                provider="openai-codex",
+                firepower_reason=blank,
+            )
+        task = kb.get_task(conn, task_id)
+    assert task.model_override == "gpt-5.6-sol-900k"
+
+
+def test_set_model_accepts_explicit_audit_comment_as_justification(kanban_home):
+    """An explicit audit comment is a written reason; it needs no duplicate flag."""
+    body = "firepower override: reason=hard recovery"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="explicit audit",
+            assignee="worker",
+            model_override="gpt-5.6-sol-900k",
+        )
+        assert kb.set_model_override(
+            conn,
+            task_id,
+            "gpt-6-astra-900k",
+            provider="openai-codex",
+            audit_comment_author="operator",
+            audit_comment_body=body,
+        )
+        task = kb.get_task(conn, task_id)
+        comments = kb.list_comments(conn, task_id)
+    assert task.model_override == "gpt-6-astra-900k"
+    assert [c.body for c in comments] == [body]
 
 
 def test_set_model_rolls_back_if_firepower_audit_comment_fails(

@@ -1995,6 +1995,7 @@ def cronjob(
     skills: Optional[List[str]] = None,
     model: Optional[str] = None,
     provider: Optional[str] = None,
+    firepower_reason: Optional[str] = None,
     base_url: Optional[str] = None,
     reason: Optional[str] = None,
     script: Optional[str] = None,
@@ -2152,6 +2153,7 @@ def cronjob(
                     skills=canonical_skills,
                     model=_normalize_optional_job_value(model),
                     provider=_normalize_optional_job_value(provider),
+                    firepower_reason=firepower_reason,
                     base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
                     script=_normalize_optional_job_value(script),
                     context_from=context_from,
@@ -2381,6 +2383,7 @@ def cronjob(
                 updates["skill"] = canonical_skills[0] if canonical_skills else None
             if model is not None:
                 updates["model"] = _normalize_optional_job_value(model)
+                updates["firepower_reason"] = firepower_reason
             if provider is not None:
                 updates["provider"] = _normalize_optional_job_value(provider)
             if reasoning_effort is not None:
@@ -2614,6 +2617,10 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 },
                 "required": ["model"]
             },
+            "firepower_reason": {
+                "type": "string",
+                "description": "Required nonblank justification when model resolves to a flagship/firepower-only family; persisted with the job for auditability."
+            },
             "script": {
                 "type": "string",
                 "description": f"Optional script run each tick; stdout is injected into the agent's prompt as context (with no_agent=True the script IS the job). Relative paths resolve under {display_hermes_home()}/scripts/; .sh/.bash via bash, else Python. On update, '' clears."
@@ -2722,6 +2729,7 @@ def _cronjob_tool_handler(args: Dict[str, Any], **kw: Any) -> str:
         skills=args.get("skills"),
         model=resolved_model,
         provider=resolved_provider or _fallback_provider,
+        firepower_reason=args.get("firepower_reason"),
         base_url=args.get("base_url"),
         reason=args.get("reason"),
         script=args.get("script"),

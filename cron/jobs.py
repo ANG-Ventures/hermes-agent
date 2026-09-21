@@ -2548,6 +2548,7 @@ def create_job(
     skills: Optional[List[str]] = None,
     model: Optional[str] = None,
     provider: Optional[str] = None,
+    firepower_reason: Optional[str] = None,
     base_url: Optional[str] = None,
     script: Optional[str] = None,
     context_from: Optional[Union[str, List[str]]] = None,
@@ -2654,6 +2655,18 @@ def create_job(
     normalized_model, normalized_provider = _resolve_stored_model_pair(
         normalized_model, normalized_provider
     )
+    from hermes_cli.model_policy import firepower_guard_error, is_firepower_model
+
+    guard_error = firepower_guard_error(
+        normalized_model, firepower_reason, reason_field="firepower_reason"
+    )
+    if guard_error:
+        raise ValueError(guard_error)
+    normalized_firepower_reason = (
+        str(firepower_reason or "").strip()
+        if is_firepower_model(normalized_model)
+        else None
+    )
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
@@ -2733,6 +2746,7 @@ def create_job(
         "skill": normalized_skills[0] if normalized_skills else None,
         "model": normalized_model,
         "provider": normalized_provider,
+        "firepower_reason": normalized_firepower_reason,
         # Provider/model resolution captured at creation for unpinned jobs
         # (#44585). None for pinned axes, no_agent jobs, resolution failures, and
         # any pre-existing job written before these fields existed (back-compat).
@@ -2946,6 +2960,22 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     )
                     updates["model"] = _m
                     updates["provider"] = _p
+                    from hermes_cli.model_policy import (
+                        firepower_guard_error,
+                        is_firepower_model,
+                    )
+
+                    _reason = updates.get("firepower_reason")
+                    _guard_error = firepower_guard_error(
+                        _m, _reason, reason_field="firepower_reason"
+                    )
+                    if _guard_error:
+                        raise ValueError(_guard_error)
+                    updates["firepower_reason"] = (
+                        str(_reason or "").strip()
+                        if is_firepower_model(_m)
+                        else None
+                    )
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})

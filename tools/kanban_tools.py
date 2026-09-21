@@ -1512,6 +1512,7 @@ def _handle_create(args: dict, **kw) -> str:
             f"{type(model_override).__name__}"
         )
     provider_override = args.get("provider")
+    firepower_reason = args.get("firepower_reason")
     reasoning_effort = args.get("reasoning_effort")
     if provider_override and not model_override:
         return tool_error("'provider' requires 'model' to be set as well")
@@ -1557,6 +1558,7 @@ def _handle_create(args: dict, **kw) -> str:
                 skills=skills,
                 model_override=model_override,
                 provider_override=provider_override,
+                firepower_reason=firepower_reason,
                 reasoning_effort=reasoning_effort,
                 goal_mode=goal_mode,
                 goal_max_turns=(
@@ -2496,6 +2498,13 @@ KANBAN_CREATE_SCHEMA = {
                     "provider — a model name alone is resolved against "
                     "the profile's provider and will fail if it belongs "
                     "to a different one. Requires 'model'."
+                ),
+            },
+            "firepower_reason": {
+                "type": "string",
+                "description": (
+                    "Required nonblank justification when model resolves to a "
+                    "flagship/firepower-only family; stored as an audit comment."
                 ),
             },
             "reasoning_effort": {

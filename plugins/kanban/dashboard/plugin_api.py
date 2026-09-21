@@ -622,6 +622,7 @@ class CreateTaskBody(BaseModel):
     goal_max_turns: Optional[int] = None
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
+    firepower_reason: Optional[str] = None
     # Per-task thinking depth (none|minimal|…|ultra). None = inherit the
     # assigned profile's own agent.reasoning_effort.
     reasoning_effort: Optional[str] = None
@@ -654,6 +655,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             goal_max_turns=payload.goal_max_turns,
             model_override=payload.model_override,
             provider_override=payload.provider_override,
+            firepower_reason=payload.firepower_reason,
             reasoning_effort=payload.reasoning_effort,
             project_id=payload.project_id,
             board=board,
@@ -854,6 +856,7 @@ class UpdateTaskBody(BaseModel):
     # "field not sent" in a PATCH, not "set to NULL".
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
+    firepower_reason: Optional[str] = None
     clear_model_override: bool = False
     # Per-task thinking depth. ``"none"`` is a VALUE (thinking off), not a
     # clear — use ``clear_reasoning_effort=True`` to fall back to the
@@ -991,6 +994,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 ok = kanban_db.set_model_override(
                     conn, task_id, new_model,
                     provider=payload.provider_override,
+                    firepower_reason=payload.firepower_reason,
                 )
             except (ValueError, RuntimeError) as e:
                 raise HTTPException(status_code=400, detail=str(e))
@@ -1339,6 +1343,7 @@ class BulkTaskBody(BaseModel):
     # Bulk model/provider override — same semantics as UpdateTaskBody.
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
+    firepower_reason: Optional[str] = None
     clear_model_override: bool = False
     # Bulk thinking-depth override — same semantics as UpdateTaskBody.
     reasoning_effort: Optional[str] = None
@@ -1462,6 +1467,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         ok = kanban_db.set_model_override(
                             conn, tid, new_model,
                             provider=payload.provider_override,
+                            firepower_reason=payload.firepower_reason,
                         )
                         if not ok:
                             entry.update(ok=False, error="model override refused")
