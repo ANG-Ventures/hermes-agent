@@ -14,6 +14,17 @@ _REPO_URL = re.compile(r"(?:https?|ssh|git)://[^\s\"'<>]+|git@github\.com:[^\s\"
 HINT = "use --survivor-pr <owner/repo#N> or --survivor-ref <repo-url>#<sha>; remote verification is required"
 
 
+def redact(claim):
+    """Strip URL userinfo and query strings before a claim is echoed or persisted.
+
+    An unverifiable ``--survivor-ref`` is rejected precisely because it may
+    carry a token; the rejection must not copy that token into errors, the
+    hold reason, the event log, or the logfile.
+    """
+    claim = re.sub(r"(?<=://)[^/@\s]+@", "", claim)
+    return re.sub(r"[?][^#\s]*", "", claim)
+
+
 def _safe_url(url):
     # Never execute remote helpers, accept local scratch as durable, or persist
     # credential-bearing URLs from handoffs. SSH usernames are not credentials.
@@ -51,13 +62,21 @@ def verify_ref(claim):
     return {"remote": url, "branch": ref, "sha": oid, "external": True}
 
 
-def verify_pr(claim, shas=()):
+def verify_pr(claim, shas=(), *, mined_for=None):
+    """Resolve a PR claim against GitHub.
+
+    An operator flag (``mined_for`` unset) is authority once the PR exists and
+    is open or merged. A PR mined from handoff text is only a hint: it must be
+    corroborated by a claimed SHA that is the PR head or squash merge, or --
+    with no SHA claimed -- by a PR branch that names the task. A bare
+    ``owner/repo#N`` mention proves nothing about THIS card's work.
+    """
     match = _PR.fullmatch(claim) or _PR_URL.fullmatch(claim)
     if not match:
         return None
     slug, number = match.groups()
     output = _query(["gh", "pr", "view", number, "--repo", slug,
-                     "--json", "state,headRefOid,mergeCommit"])
+                     "--json", "state,headRefOid,headRefName,mergeCommit"])
     if output is None:
         return None
     try:
@@ -67,7 +86,10 @@ def verify_pr(claim, shas=()):
         oid = merge if state == "MERGED" else head
         if state not in {"OPEN", "MERGED"} or not re.fullmatch(r"[0-9a-f]{40}", oid or ""):
             return None
-        if shas and not any(value and value.startswith(sha) for value in (head, merge) for sha in shas):
+        if shas:
+            if not any(value and value.startswith(sha) for value in (head, merge) for sha in shas):
+                return None
+        elif mined_for and mined_for not in str(view.get("headRefName") or ""):
             return None
     except (ValueError, TypeError, KeyError, AttributeError):
         return None
@@ -78,8 +100,10 @@ def verify_pr(claim, shas=()):
 def discover(conn, task_id, metadata, evidence, urls):
     """Text supplies candidates, never verification. Bound remote lookups to six.
 
-    Do not mine task bodies: their example/parent PRs are not deliverables.
-    Compare handoff SHA claims to the PR head or squash merge when supplied.
+    Only HANDOFF text is mined: the completion evidence and metadata, the task
+    result, and run summaries. Task bodies cite example/parent PRs and comments
+    are discussion that routinely cites other cards' PRs; neither is a
+    deliverable. A mined PR must still be corroborated (see ``verify_pr``).
     """
     sources = ["\n".join([*filter(None, evidence), json.dumps(metadata or {})])]
     task = kb.get_task(conn, task_id)
@@ -87,7 +111,6 @@ def discover(conn, task_id, metadata, evidence, urls):
         sources.append(task.result)
     sources.extend("\n".join(filter(None, row)) for row in conn.execute(
         "SELECT summary, metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC", (task_id,)))
-    sources.extend(c.body for c in reversed(kb.list_comments(conn, task_id)))
     seen = set()
     for text in sources:
         shas = re.findall(rf"(?<!\w)({_SHA})(?!\w)", text)
@@ -111,7 +134,7 @@ def discover(conn, task_id, metadata, evidence, urls):
             if len(seen) >= 6:
                 return None
             seen.add(key)
-            verified = verify_pr(claim, shas) if kind == "pr" else verify_ref(claim)
+            verified = verify_pr(claim, shas, mined_for=task_id) if kind == "pr" else verify_ref(claim)
             if verified:
                 return verified
     return None

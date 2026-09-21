@@ -85,13 +85,14 @@ def test_explicit_ref_records_resolved_full_sha(board, remote):
     assert remote[1]
 
 
-def test_review_approval_discovers_comment_and_preserves_on_cleanup(board, remote):
+def test_review_approval_discovers_handoff_summary_and_preserves_on_cleanup(board, remote):
+    """The implementer's review handoff (a run summary) is the mined source, not the approval comment."""
     tid = kb.create_task(board, title="external implementation")
     ws = kb.resolve_workspace(kb.get_task(board, tid))
     kb.set_workspace_path(board, tid, ws)
     assert kb.request_review(board, tid, summary=f"Shipped {PR} at {HEAD}",
                              metadata={"changed_files": ["code.py"]})
-    kb.add_comment(board, tid, "reviewer", f"Approved {PR} at {HEAD}")
+    kb.add_comment(board, tid, "reviewer", "Approved")
     assert kb.complete_task(board, tid, summary="Approved")
     assert kb.latest_run(board, tid).metadata["survivor"]["kind"] == "ref"
     assert not ws.exists()
@@ -121,8 +122,8 @@ def test_non_code_card_does_not_mine_an_incidental_pr(board, remote, source):
 def test_claimed_card_still_reaches_the_remote(board, remote):
     """Teeth for the tripwire above: a stub that can never record would pass it."""
     tid = kb.create_task(board, title="external implementation")
-    kb.add_comment(board, tid, "reviewer", f"Shipped {PR} at {HEAD}")
-    assert kb.complete_task(board, tid, result="done", metadata={"changed_files": ["code.py"]})
+    assert kb.complete_task(board, tid, result=f"Shipped {PR} at {HEAD}",
+                            metadata={"changed_files": ["code.py"]})
     assert kb.latest_run(board, tid).metadata["survivor"]["kind"] == "ref"
     assert len(remote[1]) == 1
 
@@ -173,3 +174,87 @@ def test_cli_complete_refuses_unverifiable_survivor_ref(board, remote, monkeypat
                 ["complete", tid, "--survivor-ref", f"{URL}#{'c3' * 20}"]) != 0
     assert "could not verify --survivor-ref" in capsys.readouterr().err
     assert kb.get_task(board, tid).status != "done"
+
+
+# --- FleetReview P1s on #795 (card t_8970f48e): text is a hint, never authority -------------
+
+def test_mined_pr_without_sha_or_task_branch_refuses(board, remote):
+    """A bare `owner/repo#N` mention proves nothing about THIS card's work.
+
+    Without a corroborating SHA in the handoff (or a PR branch named after the
+    task) the completion must fail closed and point at --survivor-pr.
+    """
+    tid = kb.create_task(board, title="external implementation")
+    with pytest.raises(ValueError, match="survivor-pr"):
+        kb.complete_task(board, tid, result=f"Shipped {PR}", metadata={"changed_files": ["code.py"]})
+    assert kb.get_task(board, tid).status != "done"
+
+
+def test_mined_pr_whose_branch_names_the_task_is_accepted(board, remote):
+    tid = kb.create_task(board, title="external implementation")
+    remote[0]["headRefName"] = f"kanban/{tid}-fix"
+    assert kb.complete_task(board, tid, result=f"Shipped {PR}", metadata={"changed_files": ["code.py"]})
+    assert kb.latest_run(board, tid).metadata["survivor"]["refs"][0]["sha"] == MERGE
+
+
+def test_comments_are_discussion_not_handoff(board, remote):
+    """Another card's PR cited (with its SHA) in a comment must not become this card's survivor."""
+    tid = kb.create_task(board, title="external implementation")
+    kb.add_comment(board, tid, "reviewer", f"context: t_other shipped {PR} at {HEAD}")
+    with pytest.raises(ValueError, match="survivor-pr"):
+        kb.complete_task(board, tid, result="done", metadata={"changed_files": ["code.py"]})
+    assert kb.get_task(board, tid).status != "done"
+    assert not board.execute(
+        "SELECT survivor FROM task_workspace_survivors WHERE task_id = ? AND survivor IS NOT NULL",
+        (tid,)).fetchall()
+
+
+def test_uncaptured_workspace_files_are_never_traded_for_a_mined_pr(board, remote):
+    """P1: a workspace holding un-versioned work must HOLD, not be deleted on a text hint."""
+    tid = kb.create_task(board, title="external implementation")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    kb.set_workspace_path(board, tid, ws)
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "notes.md").write_text("work that lives nowhere else\n")
+    with pytest.raises(ValueError, match="survivor_unavailable"):
+        kb.complete_task(board, tid, result=f"Shipped {PR} at {HEAD}",
+                         metadata={"changed_files": ["code.py"]})
+    assert ws.exists() and (ws / "notes.md").exists()
+    assert kb.get_task(board, tid).status != "done"
+
+
+def test_cleanup_reuses_the_recorded_survivor_and_never_mines(board, remote):
+    tid = kb.create_task(board, title="external implementation")
+    assert kb.complete_task(board, tid, result=f"Shipped {PR} at {HEAD}",
+                            metadata={"changed_files": ["code.py"]})
+    lookups = len(remote[1])
+    stray = kb.kanban_home() / "stray-ws"
+    stray.mkdir(parents=True)
+    (stray / "leftover.py").write_text("x = 1\n")
+    # A later GC pass over a directory with uncaptured files: the recorded
+    # survivor does not vouch for THESE bytes, and text must not be re-mined.
+    with pytest.raises(ValueError, match="survivor_unavailable"):
+        survivor.preserve(board, tid, cleanup=True, workspace=stray)
+    assert len(remote[1]) == lookups, "cleanup must not run remote lookups"
+    assert stray.exists()
+
+
+def test_cli_refuses_survivor_flags_with_multiple_ids(board, remote, monkeypatch, capsys):
+    t1 = kb.create_task(board, title="one")
+    t2 = kb.create_task(board, title="two")
+    assert _cli(board, monkeypatch, ["complete", t1, t2, "--survivor-pr", PR]) == 2
+    assert "per-task" in capsys.readouterr().err
+    assert kb.get_task(board, t1).status != "done" and kb.get_task(board, t2).status != "done"
+    assert remote[1] == []
+
+
+def test_unverifiable_ref_error_never_echoes_credentials(board, remote):
+    tid = kb.create_task(board, title="external implementation")
+    leaky = f"https://oauth2:ghp_SECRET123@github.com/example/project.git#{'c3' * 20}"
+    with pytest.raises(ValueError) as excinfo:
+        kb.complete_task(board, tid, survivor_ref=leaky)
+    assert "ghp_SECRET123" not in str(excinfo.value)
+    rows = board.execute("SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?", (tid,)).fetchall()
+    assert all("ghp_SECRET123" not in (r[0] or "") for r in rows)
+    assert not any("ghp_SECRET123" in json.dumps(e.payload if hasattr(e, "payload") else str(e))
+                   for e in kb.list_events(board, tid))

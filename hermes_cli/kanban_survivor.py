@@ -224,11 +224,30 @@ def _verified_explicit(survivor_ref, survivor_pr):
             continue
         ref = verify(claim)
         if ref is None:
+            # The claim is unverified and may carry a token: echo it redacted only.
             raise SurvivorUnavailable(
-                f"survivor_unavailable: could not verify {flag} {claim} against the remote"
+                f"survivor_unavailable: could not verify {flag} {_ext.redact(claim)} against the remote"
             )
         return ref
     return None
+
+
+def _loose_files(workspace, repos):
+    """True when the workspace holds entries outside every repository.
+
+    A remote ref vouches only for the repositories it was resolved from; files
+    beside them (notes, scripts, a tarball) are captured by nothing, so an
+    inferred survivor must never trade them for a delete.
+    """
+    for root, dirs, files in os.walk(workspace, followlinks=False):
+        here = Path(root)
+        if here in repos:
+            dirs[:] = []
+            continue
+        if files or any((here / d).is_symlink() for d in dirs):
+            return True
+        dirs[:] = sorted(d for d in dirs if not (here / d).is_symlink())
+    return False
 
 
 def _remote_urls(repos):
@@ -241,15 +260,21 @@ def _remote_urls(repos):
     return urls
 
 
-def _external(conn, task_id, metadata, evidence, urls, explicit, *, discover):
+def _external(conn, task_id, metadata, evidence, urls, explicit, *, discover, cleanup, previous):
     """Infer a survivor only for work that claims one.
 
-    An operator-named flag is authority and always applies; text mining is a
-    guess, so it must stay behind the same claim test that decides whether the
-    absence of a survivor is an error. Otherwise an incidental `owner/repo#N`
-    in a research card's comment is recorded as that card's deliverable.
+    An operator-named flag is authority and always applies. Text mining is a
+    guess: it stays behind the claim test that decides whether the absence of
+    a survivor is an error, and it never runs during reclamation -- cleanup
+    reuses the survivor recorded at completion or holds. Re-mining a hint
+    there would turn a fail-closed HOLD into a delete.
     """
-    ref = explicit or (_ext.discover(conn, task_id, metadata, evidence, urls) if discover else None)
+    if explicit:
+        ref = explicit
+    elif cleanup:
+        return previous
+    else:
+        ref = _ext.discover(conn, task_id, metadata, evidence, urls) if discover else None
     return {"kind": "ref", "refs": [dict(ref, repository=".")]} if ref else None
 
 
@@ -296,7 +321,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         workspace = Path(workspace or task.workspace_path) if workspace or task.workspace_path else None
         if workspace is None or not workspace.is_dir():
             external = _external(conn, task_id, metadata, evidence, (), explicit,
-                                 discover=bool(cleanup or bases or claimed))
+                                 discover=bool(bases or claimed), cleanup=cleanup, previous=previous)
             if external:
                 return _record(conn, task_id, external, previous)
             if cleanup or bases or claimed:
@@ -349,10 +374,19 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                              json.dumps(manifest, sort_keys=True).encode(), "application/json")
             survivor["sidecar"] = sidecar["path"]
         elif claimed:
+            # Nothing in-tree to capture: the survivor must live elsewhere. An
+            # inferred one vouches only for the repositories it came from, so
+            # files beside them make the inference worthless -- HOLD instead.
+            loose = _loose_files(workspace, repos)
             external = _external(conn, task_id, metadata, evidence, _remote_urls(repos), explicit,
-                                 discover=True)
+                                 discover=not loose, cleanup=cleanup, previous=None if loose else previous)
             if external:
                 return _record(conn, task_id, dict(external, refs=external["refs"] + refs), previous)
+            if loose:
+                raise SurvivorUnavailable(
+                    "survivor_unavailable: workspace holds files outside any repository that "
+                    f"no inferred survivor vouches for; {_ext.HINT}"
+                )
             raise SurvivorUnavailable(
                 "survivor_unavailable: empty patch despite claimed code changes and no "
                 f"verifiable external survivor; {_ext.HINT}"
