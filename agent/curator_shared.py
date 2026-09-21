@@ -62,6 +62,7 @@ def _git_toplevel(shared_root: Path) -> Optional[Path]:
         out = subprocess.run(
             ["git", "-C", str(shared_root), "rev-parse", "--show-toplevel"],
             capture_output=True, text=True, timeout=15,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -76,6 +77,7 @@ def _git(repo: Path, *args: str, timeout: int = 30) -> Tuple[int, str, str]:
         p = subprocess.run(
             ["git", "-C", str(repo), *args],
             capture_output=True, text=True, timeout=timeout,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
         )
         return p.returncode, p.stdout, p.stderr
     except (OSError, subprocess.SubprocessError) as e:
@@ -89,7 +91,7 @@ def _porcelain_shared(repo: Path, shared_root: Path) -> Optional[List[str]]:
     except ValueError:
         return None
     code, out, _err = _git(
-        repo, "status", "--porcelain", "--untracked-files=all", "--", str(rel)
+        repo, "--no-optional-locks", "status", "--porcelain", "--untracked-files=all", "--", str(rel)
     )
     if code != 0:
         return None

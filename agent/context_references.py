@@ -431,6 +431,7 @@ def _expand_git_reference(
             text=True, encoding='utf-8', errors='replace',
             timeout=30,
             stdin=subprocess.DEVNULL,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
             **_popen_kwargs,
         )
     except subprocess.TimeoutExpired:

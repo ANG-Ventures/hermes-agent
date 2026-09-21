@@ -478,6 +478,7 @@ def bounded_probe_run(
     *,
     timeout: float,
     errors: str = "replace",
+    env: "Mapping[str, str] | None" = None,
 ) -> "subprocess.CompletedProcess[str] | None":
     """Deadlock-safe ``subprocess.run(argv, capture_output=True, timeout=...)``
     for fail-open probe call sites. Returns a ``CompletedProcess`` when the
@@ -500,12 +501,15 @@ def bounded_probe_run(
 
     The spawn contract mirrors the ``run`` calls it replaces: PIPE/PIPE/DEVNULL,
     ``text`` with UTF-8 decoding (*errors* configurable — the process scans use
-    ``"ignore"``), and the hidden-window ``creationflags`` on Windows only. On
+    ``"ignore"``), an optional explicit environment, and the hidden-window
+    ``creationflags`` on Windows only. On
     POSIX the child is placed in its own process group (``process_group=0``,
     Python ≥3.11) so timeout cleanup can take down descendants with the
     launcher instead of orphaning them.
     """
     _popen_kwargs: dict = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {"process_group": 0}
+    if env is not None:
+        _popen_kwargs["env"] = env
     try:
         proc = subprocess.Popen(
             list(argv),
@@ -556,9 +560,10 @@ def bounded_git_probe(argv: Sequence[str], *, timeout: float) -> str:
     drain; if the pipes are still held after that, they're abandoned (the orphaned
     reader threads are daemonic and cost nothing).
 
-    The normal-path spawn contract mirrors the previous ``run`` call byte-for-byte:
-    PIPE/PIPE/DEVNULL, ``text`` with UTF-8 ``errors="replace"`` decoding, and the
-    hidden-window ``creationflags`` on Windows only. On POSIX the probe is
+    The normal-path spawn contract mirrors the previous ``run`` call except for
+    ``GIT_OPTIONAL_LOCKS=0``, which prevents read-only probes from refreshing the
+    index: PIPE/PIPE/DEVNULL, ``text`` with UTF-8 ``errors="replace"`` decoding,
+    and the hidden-window ``creationflags`` on Windows only. On POSIX the probe is
     additionally placed in its own process group (``process_group=0``,
     Python ≥3.11) so timeout cleanup can take down descendants — credential
     helpers, ``git-remote-https``, hook children — with the launcher instead of
@@ -566,7 +571,9 @@ def bounded_git_probe(argv: Sequence[str], *, timeout: float) -> str:
     openai/codex#36793). ``process_group`` only changes which group the child
     belongs to; it does not detach the terminal or alter the fast path.
     """
-    result = bounded_probe_run(argv, timeout=timeout)
+    env = dict(os.environ)
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    result = bounded_probe_run(argv, timeout=timeout, env=env)
     if result is None or result.returncode != 0:
         return ""
     return (result.stdout or "").strip()
