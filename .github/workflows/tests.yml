@@ -244,7 +244,7 @@ jobs:
 
   e2e:
     # Self-hosted e2e requires X64; hosted fallback keeps its standard label.
-    runs-on: ${{ contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && fromJSON(format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","'))) || fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    runs-on: ${{ contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && fromJSON(format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","'))) || fromJSON('["ubuntu-latest"]') }}
     timeout-minutes: 15
     steps:
       - name: Checkout code

@@ -41,7 +41,7 @@ def test_e2e_self_hosted_architecture_and_hosted_fallback_binding():
     assert job["runs-on"] == (
         "${{ contains(fromJSON(vars.CI_RUNNER_LABELS || '[\"ubuntu-latest\"]'), 'self-hosted') "
         "&& fromJSON(format('[\"{0}\",\"X64\"]', join(fromJSON(vars.CI_RUNNER_LABELS), '\",\"'))) "
-        "|| fromJSON(vars.CI_RUNNER_LABELS || '[\"ubuntu-latest\"]') }}"
+        "|| fromJSON('[\"ubuntu-latest\"]') }}"
     )
 
 
