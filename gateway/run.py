@@ -13984,10 +13984,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         alert = False
         if len(marks) >= threshold:
             try:
-                session_entry = self.session_store._entries.get(session_key)
-                if session_entry and not session_entry.suspended:
-                    session_entry.suspended = True
-                    self.session_store._save()
+                # ``_save`` is documented "while the caller holds ``_lock``" and
+                # this whole method now runs on a worker thread (the deferred
+                # SELF ``record_replay`` hands it to ``asyncio.to_thread``), so
+                # the single-threaded accident that made the bare call benign is
+                # gone: the read/mutate/persist must be one locked critical
+                # section or it can interleave with a loop-side store write and
+                # persist a torn snapshot. ``_lock`` is a plain, non-reentrant
+                # ``threading.Lock``, so this inlines ``suspend_session``'s body
+                # rather than calling it. Loading is deliberately NOT forced
+                # here: an unloaded store has no entry to suspend, which is the
+                # pre-existing behaviour of this branch.
+                with self.session_store._lock:  # noqa: SLF001 — locked RMW
+                    session_entry = self.session_store._entries.get(session_key)
+                    if session_entry and not session_entry.suspended:
+                        session_entry.suspended = True
+                        self.session_store._save()
             except Exception:
                 pass
             if not entry.get("armed", False):
@@ -33577,13 +33589,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._deferred_restart_coordinator = coordinator
         return coordinator
 
-    def _arm_deferred_restart_after_release(
+    def _arm_deferred_restart_after_release(  # noqa: atomic-write-on-loop loop-conditional dispatch: the durable arm runs on a worker thread whenever a loop is running
         self,
         session_key: str,
         *,
         generation: Optional[int],
     ) -> None:
-        """Arm one SELF request after ownership teardown, then await delivery."""
+        """Arm one SELF request after ownership teardown, then await delivery.
+
+        The durable arm (``arm_for_session``) ends in a CAS ``os.replace`` plus
+        an mkstemp+fsync payload refresh, whose tail is unbounded under
+        filesystem pressure.  Every caller of ``_release_running_agent_state``
+        is a coroutine (turn exit, /reset, /resume, the reaper loop), so doing
+        that inline pins the event loop for the duration of the rename.  When a
+        loop is running, the arm is therefore driven on a worker thread and the
+        post-arm scheduling is resumed back on the loop.
+        """
         coordinator = self._get_deferred_restart_coordinator()
         entry = self.session_store._entries.get(session_key)
         source = getattr(entry, "origin", None)
@@ -33599,13 +33620,113 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 resume_request_id=request.request_id,
             )
 
-        state = coordinator.arm_for_session(
-            session_key,
-            consume_breadcrumb=self._consume_restart_initiated_breadcrumb,
-        )
-        if state != "armed":
+        def _arm() -> str:
+            return coordinator.arm_for_session(
+                session_key,
+                consume_breadcrumb=self._consume_restart_initiated_breadcrumb,
+            )
+
+        def _after_arm(state: str, *, register_barrier: bool):
+            if state != "armed":
+                return None
+            return self._schedule_armed_deferred_restart(
+                coordinator,
+                session_key,
+                delivered=delivered,
+                adapter=adapter,
+                generation=generation,
+                mark_self=_mark_self,
+                register_barrier=register_barrier,
+            )
+
+        loop = self._running_event_loop()
+        if loop is None:
+            _after_arm(_arm(), register_barrier=True)
             return
 
+        # The delivery barrier must be registered BEFORE this method returns.
+        # The caller's final send can be acknowledged immediately afterwards,
+        # and ``acknowledge_response_delivery`` is a one-shot lookup: if the
+        # callback is not in place by then the ack is lost and the armed task
+        # sits on its 30s barrier for a delivery that already happened.
+        # Registering here keeps that ordering identical to the inline path
+        # while only the durable arm moves to the worker thread.
+        registered = self._register_deferred_restart_delivery_barrier(
+            session_key,
+            delivered=delivered,
+            adapter=adapter,
+            generation=generation,
+        )
+
+        # Off-loop arm.  The scheduling half must run back ON the loop
+        # (``schedule_armed`` creates a task), so it is re-entered through the
+        # awaiting wrapper rather than from the worker thread.
+        #
+        # This wrapper AWAITS the scheduled task rather than just spawning it,
+        # so it remains true that awaiting the task this method registers in
+        # ``_background_tasks`` drives the whole arm -> schedule -> delivery
+        # lifecycle to completion.  Callers (and the shutdown drain) rely on
+        # that: the armed task is created after this method returns, so it
+        # would otherwise be invisible to a caller that gathers the set.
+        async def _arm_off_loop() -> None:
+            try:
+                state = await asyncio.to_thread(_arm)
+            except Exception:
+                logger.warning(
+                    "Deferred SELF restart arm failed for %s",
+                    session_key,
+                    exc_info=True,
+                )
+                state = "failed"
+            armed_task = _after_arm(state, register_barrier=False)
+            if armed_task is None:
+                # Nothing was armed, so nothing will ever consume the barrier.
+                # Drop it rather than leaving a stale one-shot callback that
+                # would swallow a later turn's delivery ack.
+                if registered and adapter is not None:
+                    try:
+                        adapter.cancel_delivery_ack_callback(session_key)
+                    except Exception:
+                        logger.debug(
+                            "delivery barrier cleanup skipped for %s",
+                            session_key,
+                            exc_info=True,
+                        )
+                return
+            await asyncio.shield(armed_task)
+
+        task = loop.create_task(_arm_off_loop())
+        background = getattr(self, "_background_tasks", None)
+        if background is None:
+            background = set()
+            self._background_tasks = background
+        background.add(task)
+        task.add_done_callback(background.discard)
+
+    def _running_event_loop(self):
+        """The loop this thread is running on, or ``None`` when there is none."""
+        try:
+            return asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+
+    def _schedule_armed_deferred_restart(
+        self,
+        coordinator,
+        session_key: str,
+        *,
+        delivered,
+        adapter,
+        generation: Optional[int],
+        mark_self,
+        register_barrier: bool = True,
+    ):
+        """Own the armed request's task and (optionally) its delivery barrier.
+
+        ``register_barrier=False`` is used by the off-loop path, which must
+        register the barrier BEFORE the arm so a fast final-send ack is not
+        lost while the durable arm is still on the worker thread.
+        """
         # Establish task ownership immediately after the durable arm. Callback
         # registration is fallible; if it fails, the owned task proceeds with
         # UNKNOWN delivery instead of leaving an orphaned armed request.
@@ -33613,11 +33734,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key,
             delivery_event=delivered,
             delivery_timeout=30.0 if adapter is not None else 0.0,
-            record_replay=lambda request: self._record_restart_replay_mark(
+            record_replay=lambda request: asyncio.to_thread(
+                self._record_restart_replay_mark,
                 request.session_key,
                 request_id=request.request_id,
             ),
-            mark_self=_mark_self,
+            mark_self=mark_self,
             signal_restart=lambda: self.request_restart(via_service=True),
         )
         background = getattr(self, "_background_tasks", None)
@@ -33626,26 +33748,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._background_tasks = background
         background.add(task)
         task.add_done_callback(background.discard)
-        if adapter is not None:
-            try:
-                adapter.register_delivery_ack_callback(
-                    session_key,
-                    delivered.set,
-                    generation=generation,
-                )
-            except Exception:
-                logger.warning(
-                    "SELF restart delivery callback registration failed for %s; "
-                    "delivery state is UNKNOWN",
-                    session_key,
-                    exc_info=True,
-                )
-                delivered.set()
-        else:
+        if register_barrier:
+            self._register_deferred_restart_delivery_barrier(
+                session_key,
+                delivered=delivered,
+                adapter=adapter,
+                generation=generation,
+            )
+        return task
+
+    def _register_deferred_restart_delivery_barrier(
+        self,
+        session_key: str,
+        *,
+        delivered,
+        adapter,
+        generation: Optional[int],
+    ) -> bool:
+        """Arm the strong delivery barrier; return whether a callback landed.
+
+        Registration is fallible; on failure the barrier is released so the
+        armed task proceeds with UNKNOWN delivery instead of blocking on an
+        ack that can never arrive.
+        """
+        if adapter is None:
             logger.warning(
                 "SELF restart has no adapter delivery barrier for %s; delivery state is UNKNOWN",
                 session_key,
             )
+            delivered.set()
+            return False
+        try:
+            adapter.register_delivery_ack_callback(
+                session_key,
+                delivered.set,
+                generation=generation,
+            )
+            return True
+        except Exception:
+            logger.warning(
+                "SELF restart delivery callback registration failed for %s; "
+                "delivery state is UNKNOWN",
+                session_key,
+                exc_info=True,
+            )
+            delivered.set()
+            return False
 
     def _release_running_agent_state(
         self,

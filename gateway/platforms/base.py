@@ -5783,6 +5783,12 @@ class BasePlatformAdapter(ABC):
         else:
             self._delivery_ack_callbacks[session_key] = (int(generation), callback)
 
+    def cancel_delivery_ack_callback(self, session_key: str) -> bool:
+        """Drop a delivery barrier registered for a turn that never armed."""
+        if not session_key:
+            return False
+        return self._delivery_ack_callbacks.pop(session_key, None) is not None
+
     def acknowledge_response_delivery(
         self,
         session_key: str,
