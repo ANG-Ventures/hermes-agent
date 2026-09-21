@@ -371,7 +371,12 @@ def test_uc8b_last_turn_card_renders_unknown_not_a_silent_omission():
     assert "Tokens out" in block, (
         "omitting the row entirely reads as 'nothing generated' — say unknown"
     )
-    assert UNKNOWN_TOKENS_LABEL in block
+    # Pin the TOKEN ROW, not the block. `cost_status="unknown"` already emits
+    # `• Turn Cost: n/a (unknown)` above, so a bare substring check on the
+    # whole block passes even if the token row regresses to `Tokens out: 0`
+    # — precisely the defect this test exists to catch (r6 finding 11).
+    assert f"Tokens out: {UNKNOWN_TOKENS_LABEL}" in block
+    assert "Tokens out: 0" not in block
 
     measured = "\n".join(
         render_last_turn_record(dict(row, output_tokens=118, output_tokens_unknown=0))

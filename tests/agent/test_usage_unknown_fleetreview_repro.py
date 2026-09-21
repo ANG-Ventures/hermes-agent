@@ -1,7 +1,9 @@
-"""Untracked repro for the PR #787 FleetReview P1/P2 fixes (kanban t_a17c6966).
+"""Regression pins for the PR #787 FleetReview P1/P2 fixes (kanban t_a17c6966).
 
-Not a contract file — this exists to produce evidence for the handback while
-the committed contract tests that pin the OLD behaviour are edit-guarded.
+Originally written as a scratch repro to produce handback evidence. It is
+committed and runs in CI, so it is held to contract-file standards: every
+assertion here pins behaviour we want to KEEP, never a pre-fix artifact
+(r6 finding 10).
 """
 from types import SimpleNamespace
 
@@ -130,14 +132,34 @@ def test_f3_thin_fallback_renderer_is_callable_and_honors_unknown():
     assert "Total (billed in+out): 0" not in text
 
 
-def test_f3_before_the_fix_the_card_rendered_a_measured_looking_zero():
-    """The exact defect FleetReview named: the OLD producer shape renders 0."""
+def test_f3_a_flagless_all_zero_snapshot_is_not_pinned_as_a_measured_zero():
+    """r6 finding 10 — this used to ASSERT the defect as expected output.
+
+    The original form asserted ``"Total (billed in+out): 0" in text`` for a
+    flagless all-zero snapshot, to document the pre-fix rendering. But that is
+    the exact shape the resident ``/usage`` lane still produces (r6 finding 8),
+    so the assertion LOCKED IN the measured-looking zero: the conservative
+    rendering that finding 8 asks for would have turned this test red. A
+    pre-fix behaviour belongs in the PR description, not in a green pin.
+
+    What is worth pinning is the contract that made the fix necessary: the
+    renderer must key off the UNKNOWN discriminators, so the flagged shape and
+    the flagless shape must not render the same text.
+    """
     from gateway.slash_commands import render_thin_last_turn_lines
 
-    old_shape = {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0,
-                 "cache_write_tokens": 0, "reasoning_tokens": 0}
-    text = "\n".join(render_thin_last_turn_lines(old_shape, "test"))
-    assert "Total (billed in+out): 0" in text
+    zeros = {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0,
+             "cache_write_tokens": 0, "reasoning_tokens": 0}
+    flagless = "\n".join(render_thin_last_turn_lines(dict(zeros), "test"))
+    flagged = "\n".join(
+        render_thin_last_turn_lines(
+            dict(zeros, output_tokens_unknown=True, input_tokens_unknown=True), "test"
+        )
+    )
+    assert flagged != flagless, (
+        "the UNKNOWN discriminators must change what the card renders"
+    )
+    assert "Total (billed in+out): 0" not in flagged
 
 
 def test_f6_extracted_helpers_are_callable_without_parsing_source():

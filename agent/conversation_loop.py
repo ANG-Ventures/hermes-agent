@@ -4857,11 +4857,23 @@ def run_conversation(
                     # with a measured-looking 0 — which then propagates to the
                     # status-bar context meter, turn_finalizer's
                     # `last_prompt_tokens` / Blackbox `context_used`, and the
-                    # persisted session entry. Gate on a measured payload
-                    # exactly as the context-probe persistence below does, and
-                    # still consume the pending compaction verdict so preflight
+                    # persisted session entry. Gate on a MEASURED prompt
+                    # count, not on the mere presence of a usage object: a
+                    # payload that carries `prompt_tokens: null` (or an
+                    # explicit `*_unavailable` flag) passes a presence test and
+                    # then stamps the compressor's occupancy reading to 0 just
+                    # the same (r6 finding 7). `prompt_tokens_unknown` is the
+                    # right predicate here rather than `total_tokens_unknown`:
+                    # what this call feeds the compressor is the PROMPT
+                    # occupancy, so an unmeasured OUTPUT bucket must not
+                    # discard a perfectly good prompt reading. Still consume
+                    # the pending compaction verdict either way so preflight
                     # deferral cannot stay latched.
-                    if getattr(response, "usage", None):
+                    _usage_payload = getattr(response, "usage", None)
+                    _prompt_measured = bool(_usage_payload) and not prompt_tokens_unknown(
+                        canonical_usage
+                    )
+                    if _prompt_measured:
                         agent.context_compressor.update_from_response(usage_dict)
                     elif getattr(
                         agent.context_compressor,

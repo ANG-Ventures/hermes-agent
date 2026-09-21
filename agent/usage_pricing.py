@@ -1682,6 +1682,9 @@ def _cache_bucket_is_unknown(
     locations: tuple[tuple[Any, tuple[str, ...]], ...],
     flag_obj: Any,
     flags: tuple[str, ...],
+    *,
+    container: Any = None,
+    payload_measured: bool = False,
 ) -> bool:
     """Cross-location version of ``_bucket_is_unknown`` for the cache buckets.
 
@@ -1699,6 +1702,22 @@ def _cache_bucket_is_unknown(
     Same rule as ``_bucket_is_unknown``, one bucket spanning both locations:
     an explicit unavailable flag wins; otherwise a declared wire null means
     UNKNOWN only when NO location carries a measured value for this bucket.
+
+    One further narrowing (r6 finding 4). A top-level cache alias is an
+    OPTIONAL field: a request that used no caching has no cache bucket to
+    report, and a unified schema serialized without ``exclude_none`` writes
+    that absence as ``null``. ``{"input_tokens": 100, "output_tokens": 50,
+    "cache_read_input_tokens": null}`` — the exact shape this repo's own
+    Anthropic transport reads with ``... or 0`` — is therefore "no caching on
+    this request", not "the cache bucket was not measured", and treating it as
+    UNKNOWN escalated through ``total_tokens_unknown`` into an unpriceable
+    turn whose billable buckets were measured right beside it, which
+    ``reprice_unpriced`` then refused to heal. So when the rest of the payload
+    IS measured and the null sits only on a top-level alias — no present
+    details CONTAINER declaring a null count, no ``*_unavailable`` flag — the
+    bucket is a measured zero. A null inside a present container still means
+    UNKNOWN: there the provider is speaking the cache dialect and declined to
+    fill in the number.
     """
     extra = _usage_get(flag_obj, "model_extra", {}) or {}
     if any(_usage_get(flag_obj, key, False) or _usage_get(extra, key, False) for key in flags):
@@ -1707,11 +1726,27 @@ def _cache_bucket_is_unknown(
         _declared_null(obj, key) for obj, keys in locations for key in keys
     ):
         return False
-    return not any(
+    if any(
         _usage_has(obj, key) and _usage_get(obj, key) is not None
         for obj, keys in locations
         for key in keys
+    ):
+        return False
+    # r6 F4: the null is only on a top-level OPTIONAL alias, and the rest of
+    # the payload was measured -> "no caching on this request", a measured
+    # zero. A null inside a PRESENT details container keeps its UNKNOWN
+    # meaning (the provider is speaking the cache dialect and declined to
+    # supply the number), and so does any null when the payload itself is not
+    # measured.
+    if not payload_measured:
+        return True
+    container_declares_null = container is not None and any(
+        _declared_null(obj, key)
+        for obj, keys in locations
+        if obj is container
+        for key in keys
     )
+    return container_declares_null
 
 
 def prompt_tokens_unknown(usage: Any) -> bool:
@@ -2484,6 +2519,20 @@ def normalize_usage(
     )
     details_key = "input_tokens_details" if mode == "codex_responses" else "prompt_tokens_details"
     details = _usage_get(response_usage, details_key, None)
+    # Hoisted above the cache-bucket calls: a top-level cache alias that
+    # arrived as a wire null is only a "no caching on this request" zero when
+    # the rest of the payload really was measured (r6 F4).
+    input_measured = any(
+        _usage_has(response_usage, key) and _usage_get(response_usage, key) is not None
+        for key in ("prompt_tokens", "input_tokens")
+    )
+    output_measured = any(
+        _usage_has(response_usage, key) and _usage_get(response_usage, key) is not None
+        for key in _OUTPUT_COUNT_KEYS
+    )
+    _payload_measured = input_measured and output_measured and not (
+        input_unknown or output_unknown
+    )
     # A null details CONTAINER is not an unknown COUNT. ``"prompt_tokens_details":
     # null`` is the ordinary serialization of an OpenAI-compatible server that has
     # no cache breakdown to report (any encoder without ``exclude_none`` emits it,
@@ -2502,6 +2551,8 @@ def normalize_usage(
         ),
         response_usage,
         ("cache_read_tokens_unavailable",),
+        container=details,
+        payload_measured=_payload_measured,
     )
     cache_write_unknown = _cache_bucket_is_unknown(
         (
@@ -2510,6 +2561,8 @@ def normalize_usage(
         ),
         response_usage,
         ("cache_write_tokens_unavailable",),
+        container=details,
+        payload_measured=_payload_measured,
     )
     if mode != "anthropic_messages" and provider_name != "anthropic":
         input_unknown = input_unknown or cache_read_unknown or cache_write_unknown
@@ -2523,14 +2576,6 @@ def normalize_usage(
         for key in ("total_tokens_unavailable", "unavailable")
     )
     aggregate_null = _bucket_is_unknown(response_usage, ("total_tokens",))
-    input_measured = any(
-        _usage_has(response_usage, key) and _usage_get(response_usage, key) is not None
-        for key in ("prompt_tokens", "input_tokens")
-    )
-    output_measured = any(
-        _usage_has(response_usage, key) and _usage_get(response_usage, key) is not None
-        for key in _OUTPUT_COUNT_KEYS
-    )
     usage_unknown = aggregate_unavailable or (
         aggregate_null and not (input_measured and output_measured)
     )

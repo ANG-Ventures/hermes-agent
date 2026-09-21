@@ -349,7 +349,23 @@ def test_schema_migration_adds_columns_to_preexisting_table(tmp_path, monkeypatc
     )
     legacy.execute(
         "INSERT INTO turns (turn_id, input_tokens, output_tokens, cache_read, "
-        "cache_write, cost_usd) VALUES ('legacy-unpriced-empty', 0, 0, 0, 0, NULL)"
+        "cache_write, cost_usd, cost_status) "
+        "VALUES ('legacy-unpriced-empty', 0, 0, 0, 0, NULL, 'unknown')"
+    )
+    # TEST-REPIN (r6 finding 6): the genuinely-zero-token row. The old
+    # assertion required the latch to fire here too, on the premise that every
+    # unpriced all-zero row is ambiguous. It is not: a turn interrupted before
+    # any API call fired, a blackbox-off turn, or one whose first call failed
+    # really did consume zero tokens, and latching it was irreversible — it
+    # could never again heal to `priced_zero` through `reprice_unpriced` (which
+    # now short-circuits on any unknown flag) and rendered `unknown in +
+    # unknown out` on every card forever. `cost_status` is the discriminator
+    # the pre-UNKNOWN schema already carried, so the latch is now scoped to
+    # rows that code itself could not account ('unknown'). This row has no
+    # status at all.
+    legacy.execute(
+        "INSERT INTO turns (turn_id, input_tokens, output_tokens, cache_read, "
+        "cache_write, cost_usd) VALUES ('legacy-zero-token-measured', 0, 0, 0, 0, NULL)"
     )
     legacy.commit()
     legacy.close()
@@ -363,10 +379,20 @@ def test_schema_migration_adds_columns_to_preexisting_table(tmp_path, monkeypatc
         empty_unknown = conn.execute(
             "SELECT usage_unknown FROM turns WHERE turn_id = 'legacy-unpriced-empty'"
         ).fetchone()[0]
+        zero_token_unknown = conn.execute(
+            "SELECT usage_unknown FROM turns WHERE turn_id = 'legacy-zero-token-measured'"
+        ).fetchone()[0]
     assert {"last_cache_read", "last_cache_write", "last_uncached"} <= cols
     assert empty_unknown == 1, (
-        "a pre-discriminator unpriced row with NO token counts is genuinely "
-        "ambiguous and must not be repriced as though it had been measured"
+        "a pre-discriminator unpriced row with NO token counts that the old "
+        "code itself labelled cost_status='unknown' is genuinely ambiguous and "
+        "must not be repriced as though it had been measured"
+    )
+    assert zero_token_unknown == 0, (
+        "a zero-token row the old code never labelled unknown (interrupted "
+        "before any API call, blackbox-off, failed first call) really did "
+        "consume zero tokens; latching it is irreversible and strands it "
+        "outside reprice_unpriced forever (r6 finding 6)"
     )
     assert measured_unknown == 0, (
         "a row is routinely unpriced because pricing REFUSED the route, not "

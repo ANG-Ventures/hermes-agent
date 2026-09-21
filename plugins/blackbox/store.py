@@ -299,6 +299,23 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 if "duplicate column" not in str(e).lower():
                     raise
     if migrating_legacy_unknown_schema:
+        # Narrowed once more (r6 finding 6). "unpriced AND all counts zero" is
+        # still not a purely ambiguous population: a turn interrupted before
+        # any API call fired, a blackbox-off turn, or one whose first call
+        # failed genuinely consumed zero tokens and is a MEASURED zero. Latching
+        # those was irreversible and had two costs: `reprice_unpriced` now
+        # short-circuits on any unknown flag, so they could never again heal to
+        # `priced_zero` and were reported `still_unknown` on every future sweep;
+        # and every consumer that branches on `usage_unknown` rendered them
+        # `unknown in + unknown out` forever.
+        #
+        # `cost_status` is the discriminator the old schema DID carry: a row the
+        # pre-UNKNOWN code already labelled 'unknown' is one where that code
+        # could not account the call, which is exactly the ambiguous population.
+        # A row with any other status (including NULL, i.e. never accounted)
+        # keeps its measured zero. Already-priced history is untouched either
+        # way.
+        #
         # The all-zero-counts guard may only name token columns this DB actually
         # has. `turns` is created with them, but a table that already existed
         # never gains them (CREATE TABLE IF NOT EXISTS is a no-op and no ALTER
@@ -316,11 +333,15 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             if _count_cols
             else "1 = 1"
         )
+        _status_guard = (
+            " AND cost_status = 'unknown'" if "cost_status" in _existing else ""
+        )
         conn.execute(
             "UPDATE turns SET usage_unknown = 1 "
             "WHERE cost_usd IS NULL "
             "AND cost_uncached_usd IS NULL AND cost_cache_read_usd IS NULL "
-            "AND cost_cache_write_usd IS NULL AND cost_output_usd IS NULL "
+            "AND cost_cache_write_usd IS NULL AND cost_output_usd IS NULL"
+            f"{_status_guard} "
             f"AND {_all_zero}"
         )
     _ensure_turn_indexes(conn)

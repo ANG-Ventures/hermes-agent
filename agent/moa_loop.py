@@ -600,7 +600,16 @@ def _run_reference(
             extra_headers=extra_headers,
             **runtime,
         )
-        usage = CanonicalUsage()
+        # UNKNOWN != 0 on the advisor lane too. A successful advisor call that
+        # carried no usage payload (or whose payload failed to normalize) has
+        # every bucket unmeasured — exactly the case
+        # ``conversation_loop._canonical_usage_from_response`` routes through
+        # ``fully_unknown()``. A bare ``CanonicalUsage()`` sets no
+        # discriminator, so moa_loop's pricing-call dict rides out all-False,
+        # ``estimate_usage_cost`` prices the advisor at a confident $0 instead
+        # of refusing, and the advisor's real spend silently vanishes from the
+        # session total (r6 finding 5).
+        usage = CanonicalUsage.fully_unknown()
         raw_usage = getattr(response, "usage", None)
         if raw_usage:
             try:
@@ -610,7 +619,7 @@ def _run_reference(
                     api_mode=runtime.get("api_mode"),
                 )
             except Exception:  # pragma: no cover - defensive
-                usage = CanonicalUsage()
+                usage = CanonicalUsage.fully_unknown()
         # Price this advisor at ITS OWN model/provider rate (with correct
         # cache-read/cache-write split), not the aggregator's. This is why
         # advisor cost is summed as dollars rather than by folding tokens into

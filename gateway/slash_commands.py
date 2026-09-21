@@ -204,6 +204,55 @@ def _home_thread_from_source(source) -> Optional[str]:
     return str(thread_id)
 
 
+_RESIDENT_UNKNOWN_FLAGS = (
+    "input_tokens_unknown",
+    "output_tokens_unknown",
+    "cache_read_tokens_unknown",
+    "cache_write_tokens_unknown",
+    "usage_unknown",
+)
+
+
+def _resident_thin_snapshot(agent, as_int=None) -> dict:
+    """The resident ``/usage`` lane's thin snapshot, WITH its UNKNOWN flags.
+
+    The five ``session_*`` counters are plain ints with no companion
+    discriminators — they are incremented with the canonical ``0`` for an
+    unmeasured call and no ``session_*_unknown`` attribute exists anywhere in
+    the tree. Handing the renderer those five keys alone made every UNKNOWN
+    branch dead code on this lane, so a session whose provider returned no
+    usage payload rendered ``Total (billed in+out): 0`` — an unmeasured value
+    presented as a measurement, the exact defect class this work removes
+    (r6 finding 8).
+
+    ``agent.last_turn_usage`` DOES carry the flags, so propagate the most
+    recent turn's verdict: it is the only unknown signal this lane has, and a
+    session whose latest turn was unmeasured must not present its running
+    total as exact.
+    """
+    if as_int is None:
+        def _coerce(v):
+            try:
+                return int(v or 0)
+            except (TypeError, ValueError):
+                return 0
+        as_int = _coerce
+
+    snap = {
+        "input_tokens": as_int(getattr(agent, "session_input_tokens", 0)),
+        "output_tokens": as_int(getattr(agent, "session_output_tokens", 0)),
+        "cache_read_tokens": as_int(getattr(agent, "session_cache_read_tokens", 0)),
+        "cache_write_tokens": as_int(getattr(agent, "session_cache_write_tokens", 0)),
+        "reasoning_tokens": as_int(getattr(agent, "session_reasoning_tokens", 0)),
+    }
+    last_turn = getattr(agent, "last_turn_usage", None)
+    if isinstance(last_turn, dict):
+        for flag in _RESIDENT_UNKNOWN_FLAGS:
+            if last_turn.get(flag):
+                snap[flag] = True
+    return snap
+
+
 def render_thin_last_turn_lines(thin_snap, fallback_label=None) -> list:
     """Render the degraded /usage last-turn card from a thin usage snapshot.
 
@@ -8302,13 +8351,7 @@ class GatewaySlashCommandsMixin:
                     return int(v or 0)
                 except (TypeError, ValueError):
                     return 0
-            agent_thin = {
-                "input_tokens": _as_int(getattr(agent, "session_input_tokens", 0)),
-                "output_tokens": _as_int(getattr(agent, "session_output_tokens", 0)),
-                "cache_read_tokens": _as_int(getattr(agent, "session_cache_read_tokens", 0)),
-                "cache_write_tokens": _as_int(getattr(agent, "session_cache_write_tokens", 0)),
-                "reasoning_tokens": _as_int(getattr(agent, "session_reasoning_tokens", 0)),
-            }
+            agent_thin = _resident_thin_snapshot(agent, _as_int)
             ctx = agent.context_compressor
             _comp_count = _as_int(getattr(ctx, "compression_count", 0))
 

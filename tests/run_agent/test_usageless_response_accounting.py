@@ -231,6 +231,64 @@ def test_usageless_turn_does_not_zero_the_blackbox_context_used(
     )
 
 
+def test_a_present_payload_with_a_null_prompt_count_does_not_zero_the_compressor(
+    captured_turn_usage, real_session_db
+):
+    """r6 finding 7: the gate was a PRESENCE test, not a MEASUREMENT test.
+
+    The sibling tests above all omit ``usage`` entirely, so ``if
+    getattr(response, "usage", None):`` short-circuited and the compressor was
+    protected by accident. A provider that DOES send a usage object but nulls
+    the prompt count (``prompt_tokens: null``, or an explicit
+    ``prompt_tokens_unavailable``) sails through a presence test and stamps
+    ``last_prompt_tokens`` — and therefore the status-bar context meter, the
+    persisted session entry, and the Blackbox ``context_used`` — to 0, which is
+    the previous real occupancy reading destroyed.
+    """
+    agent = _make_agent(real_session_db, _response(usage=_MEASURED))
+    agent.run_conversation("turn one")
+    assert agent.context_compressor.last_prompt_tokens == 4000
+    assert captured_turn_usage["turn_usage"]["context_used"] == 4000
+
+    _set_response(
+        agent,
+        _response(usage={"prompt_tokens": None, "completion_tokens": 50,
+                         "total_tokens": None}),
+    )
+    agent.run_conversation("turn two")
+
+    assert agent.context_compressor.last_prompt_tokens == 4000, (
+        "a PRESENT usage object whose prompt count is null is still unmeasured "
+        "— it must not overwrite the real context reading with a zero"
+    )
+    assert captured_turn_usage["turn_usage"]["context_used"] == 4000
+
+
+def test_an_output_only_unknown_still_updates_the_compressor(real_session_db):
+    """Narrowness control for r6 finding 7.
+
+    The gate uses ``prompt_tokens_unknown``, not ``total_tokens_unknown``, so
+    an unmeasured OUTPUT bucket must NOT discard a perfectly good prompt
+    occupancy reading. Without this control the fix could be bought by simply
+    refusing more often.
+    """
+    agent = _make_agent(real_session_db, _response(usage=_MEASURED))
+    agent.run_conversation("turn one")
+    assert agent.context_compressor.last_prompt_tokens == 4000
+
+    _set_response(
+        agent,
+        _response(usage={"prompt_tokens": 7777, "completion_tokens": None,
+                         "total_tokens": None}),
+    )
+    agent.run_conversation("turn two")
+
+    assert agent.context_compressor.last_prompt_tokens == 7777, (
+        "the prompt count WAS measured; only the output bucket was unknown, so "
+        "the context meter must advance"
+    )
+
+
 def test_usageless_turn_does_not_drag_the_velocity_average(real_session_db):
     """An unmeasured output is not 0 tok/s — the deques carry no discriminator."""
     agent = _make_agent(real_session_db, _response(usage=_MEASURED))
