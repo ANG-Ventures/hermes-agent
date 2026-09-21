@@ -11,6 +11,8 @@ from __future__ import annotations
 import random
 from types import SimpleNamespace
 
+import pytest
+
 from agent.chat_completion_helpers import (
     _repair_anthropic_message_surrogates,
     interruptible_streaming_api_call,
@@ -234,9 +236,20 @@ class TestChatCompletionsStreamPath:
 
 
 class TestAnthropicMessagesStreamPath:
-    def test_streaming_call_recombines_text_thinking_and_final_message(self):
+    @pytest.mark.parametrize("mode", ["retry_success", "partial_stub"])
+    def test_streaming_call_recombines_text_thinking_and_final_message(self, monkeypatch, mode):
+        import httpx
+
+        recorded = []
+        monkeypatch.setattr(
+            "plugins.blackbox.record_api_call", lambda **row: recorded.append(row)
+        )
+
         class FakeAnthropicStream:
-            response = None
+            response = SimpleNamespace(headers={
+                "x-pool-served-by": "sub-vps-7",
+                "x-pool-route-id": "route-stream-7",
+            })
 
             def __enter__(self):
                 return self
@@ -265,10 +278,54 @@ class TestAnthropicMessagesStreamPath:
                 ])
 
             def get_final_message(self):
-                return SimpleNamespace(content=[
-                    SimpleNamespace(type="text", text="a\ud83d\ude00b"),
-                    SimpleNamespace(type="thinking", thinking="think \ud83e\uddd0"),
-                ])
+                return SimpleNamespace(
+                    content=[
+                        SimpleNamespace(type="text", text="a\ud83d\ude00b"),
+                        SimpleNamespace(type="thinking", thinking="think \ud83e\uddd0"),
+                    ],
+                    usage=SimpleNamespace(
+                        input_tokens=1000,
+                        output_tokens=50,
+                        cache_read_input_tokens=300,
+                        cache_creation_input_tokens=20,
+                    ),
+                )
+
+        class FailedAnthropicStream:
+            def __enter__(self):
+                raise httpx.ConnectError("first attempt dropped")
+
+            def __exit__(self, *_args):
+                return False
+
+        class PartialFailStream:
+            response = SimpleNamespace(headers={
+                "x-pool-served-by": "sub-vps-7",
+                "x-pool-route-id": "route-partial-7",
+            })
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                yield SimpleNamespace(
+                    type="content_block_delta",
+                    delta=SimpleNamespace(type="text_delta", text="partial"),
+                )
+                raise httpx.ConnectError("dropped after partial text")
+
+        stream_calls = {"count": 0}
+
+        def make_stream(**_kwargs):
+            stream_calls["count"] += 1
+            if mode == "partial_stub":
+                return PartialFailStream()
+            if stream_calls["count"] == 1:
+                return FailedAnthropicStream()
+            return FakeAnthropicStream()
 
         agent = AIAgent.__new__(AIAgent)
         streamed: list[str] = []
@@ -283,8 +340,9 @@ class TestAnthropicMessagesStreamPath:
             text.encode("utf-8")
 
         agent.api_mode = "anthropic_messages"
-        agent.provider = "unit-test-provider"
+        setattr(agent, "provider", "claude-apr")
         agent.model = "unit-test-model"
+        setattr(agent, "_current_turn_id", "turn-stream-retry")
         agent.base_url = None
         agent._interrupt_requested = False
         agent.stream_delta_callback = stream_cb
@@ -296,7 +354,7 @@ class TestAnthropicMessagesStreamPath:
         agent._stream_context_scrubber = None
         agent._try_refresh_anthropic_client_credentials = lambda: None
         agent._anthropic_client = SimpleNamespace(
-            messages=SimpleNamespace(stream=lambda **_kwargs: FakeAnthropicStream())
+            messages=SimpleNamespace(stream=make_stream)
         )
         # #67142: the streaming path now builds a per-request Anthropic client
         # (FD-ownership safety) via _create_request_anthropic_client instead of
@@ -322,10 +380,29 @@ class TestAnthropicMessagesStreamPath:
             {"model": "unit-test-model", "messages": []},
         )
 
+        if mode == "partial_stub":
+            assert streamed == ["partial"]
+            assert getattr(response, "_api_call_failure_recorded", False) is True
+            assert stream_calls["count"] == 1
+            assert [(row["seq"], row["usage"], row["http_status"]) for row in recorded] == [
+                (0, None, None),
+            ]
+            return
+
         assert streamed == ["a", "😀b"]
         assert reasoning == ["think ", "🧐"]
         assert response.content[0].text == "a😀b"
         assert response.content[1].thinking == "think 🧐"
+        assert getattr(response, "pool_headers", None) == {
+            "x-pool-served-by": "sub-vps-7",
+            "x-pool-route-id": "route-stream-7",
+        }
+        assert stream_calls["count"] == 2
+        assert [(row["seq"], row["usage"], row["http_status"]) for row in recorded] == [
+            (0, None, None),
+            (1, getattr(response, "usage", None), 200),
+        ]
+        assert recorded[1]["sub_key"] == "sub-vps-7"
         response.content[0].text.encode("utf-8")
         response.content[1].thinking.encode("utf-8")
 

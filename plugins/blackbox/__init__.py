@@ -57,6 +57,55 @@ _lock = Lock()
 _sessions: dict[str, dict[str, Any]] = {}
 
 
+def record_api_call(
+    *,
+    turn_id: str,
+    seq: int,
+    ts: float,
+    provider: str,
+    model: str,
+    usage: Any,
+    api_mode: str,
+    sub_key: str | None,
+    attribution: str,
+    http_status: int | None,
+    relay_synthetic: bool,
+    route_id: str | None,
+) -> None:
+    """Persist one completion attempt when Blackbox is enabled.
+
+    This is deliberately a thin, fail-loud plugin boundary. The transport
+    caller owns fail-open handling so sequence-allocation or schema errors are
+    visible in logs without changing inference behavior.
+    """
+    if _config() is None:
+        return
+    from agent.usage_pricing import CanonicalUsage, normalize_usage
+    from plugins.blackbox import store
+
+    canonical = (
+        usage
+        if isinstance(usage, CanonicalUsage)
+        else normalize_usage(usage, provider=provider, api_mode=api_mode)
+        if usage is not None
+        else CanonicalUsage(request_count=0)
+    )
+    store.insert_api_call(
+        turn_id,
+        seq,
+        ts=ts,
+        provider=provider,
+        model=model,
+        usage=canonical,
+        sub_key=sub_key,
+        attribution=attribution,
+        http_status=http_status,
+        relay_synthetic=relay_synthetic,
+        route_id=route_id,
+    )
+
+
+
 def _turn_id() -> str:
     return "turn_" + uuid.uuid4().hex
 
