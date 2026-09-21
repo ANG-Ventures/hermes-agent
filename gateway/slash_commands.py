@@ -6989,9 +6989,9 @@ class GatewaySlashCommandsMixin:
 
         The handoff was written by ``agent.turn_handoff.capture_turn_handoff``
         at the cut and is keyed by the same session key the gateway resolves
-        for every other session command. Consuming it here is equivalent to
-        the automatic next-turn injection; the command exists so the user can
-        pull the context back deliberately (and see what was captured).
+        for every other session command. The command previews what was captured
+        without consuming it; the next user turn injects the handoff into the
+        model context exactly once.
         """
         from gateway.turn_handoff_command import (
             NO_HANDOFF_REPLY,

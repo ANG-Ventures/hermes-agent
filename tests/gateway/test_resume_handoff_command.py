@@ -12,7 +12,9 @@ import types
 
 import pytest
 
-from agent.turn_handoff import capture_turn_handoff
+import agent.turn_handoff as turn_handoff
+from agent.turn_handoff import capture_turn_handoff, consume_handoff_context
+from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_handoff_command import render_resume_handoff_reply
 from hermes_cli.commands import (
     GATEWAY_KNOWN_COMMANDS,
@@ -84,12 +86,30 @@ class TestHandler:
         reply = render_resume_handoff_reply(_agent(), root=tmp_path)
         assert "no saved handoff" in reply.lower()
 
-    def test_the_handoff_is_consumed(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_command_arms_handoff_for_the_next_turn_then_consumes_once(
+        self, tmp_path, monkeypatch
+    ):
+        """Command dispatch must not steal context from the next model turn."""
+        monkeypatch.setattr(turn_handoff, "_default_root", lambda: tmp_path)
         capture_turn_handoff(_agent(), _messages(), turn_start_idx=0,
                              reason="x", root=tmp_path)
-        assert "audit" in render_resume_handoff_reply(_agent(), root=tmp_path)
-        second = render_resume_handoff_reply(_agent(), root=tmp_path)
-        assert "no saved handoff" in second.lower()
+
+        handler = GatewaySlashCommandsMixin.__new__(GatewaySlashCommandsMixin)
+        handler._normalize_source_for_session_key = lambda source: source
+        handler._session_key_for_source = lambda _source: "discord:chan-7"
+        event = types.SimpleNamespace(source=types.SimpleNamespace())
+        reply = await handler._handle_resume_handoff_command(event)
+        assert "audit the cron jobs" in reply
+        assert "terminal" in reply
+        assert "finish the audit" in reply
+
+        next_turn = consume_handoff_context(_agent(), root=tmp_path)
+        assert "audit the cron jobs" in next_turn
+        assert "Listing jobs." in next_turn
+        assert "terminal" in next_turn
+        assert "finish the audit" in next_turn
+        assert consume_handoff_context(_agent(), root=tmp_path) == ""
 
     def test_a_missing_session_key_is_handled(self, tmp_path):
         agent = _agent(session_key=None)

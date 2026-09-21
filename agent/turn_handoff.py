@@ -236,17 +236,13 @@ def write_turn_handoff(
         return False
 
 
-def consume_turn_handoff(
+def _load_turn_handoff(
     session_key: str,
     *,
     root: Optional[Path] = None,
+    consume: bool,
 ) -> Optional[Dict[str, Any]]:
-    """Read and DELETE the handoff for ``session_key``.
-
-    Returns ``None`` when absent, corrupt, or older than
-    :data:`HANDOFF_TTL_SECONDS`. Corrupt and expired files are removed so a
-    bad payload cannot be retried on every subsequent turn.
-    """
+    """Read a valid handoff, optionally deleting it after a successful read."""
     path = handoff_path_for(session_key, root=root)
     try:
         raw = path.read_text(encoding="utf-8")
@@ -277,8 +273,37 @@ def consume_turn_handoff(
     if (time.time() - float(created_at)) > HANDOFF_TTL_SECONDS:
         _drop()
         return None
-    _drop()
+    if consume:
+        _drop()
     return payload
+
+
+def peek_turn_handoff(
+    session_key: str,
+    *,
+    root: Optional[Path] = None,
+) -> Optional[Dict[str, Any]]:
+    """Read a valid handoff without consuming it.
+
+    Corrupt and expired files are still removed so they cannot be retried
+    forever. Used by ``/resume-handoff`` to preview what the next model turn
+    will receive.
+    """
+    return _load_turn_handoff(session_key, root=root, consume=False)
+
+
+def consume_turn_handoff(
+    session_key: str,
+    *,
+    root: Optional[Path] = None,
+) -> Optional[Dict[str, Any]]:
+    """Read and DELETE the handoff for ``session_key``.
+
+    Returns ``None`` when absent, corrupt, or older than
+    :data:`HANDOFF_TTL_SECONDS`. Corrupt and expired files are removed so a
+    bad payload cannot be retried on every subsequent turn.
+    """
+    return _load_turn_handoff(session_key, root=root, consume=True)
 
 
 def prune_expired_handoffs(*, root: Optional[Path] = None) -> int:
@@ -334,6 +359,19 @@ def capture_turn_handoff(
         return format_handoff_notice(handoff)
     except Exception:
         logger.debug("turn handoff capture failed", exc_info=True)
+        return ""
+
+
+def preview_handoff_context(agent, *, root: Optional[Path] = None) -> str:
+    """Return saved handoff context without consuming the next-turn injection."""
+    try:
+        session_key = str(getattr(agent, "_gateway_session_key", "") or "")
+        if not session_key:
+            return ""
+        handoff = peek_turn_handoff(session_key, root=root)
+        return render_handoff_context(handoff)
+    except Exception:
+        logger.debug("turn handoff preview failed", exc_info=True)
         return ""
 
 
