@@ -46,6 +46,16 @@ _REGISTRY: dict[str, ProviderProfile] = {}
 _ALIASES: dict[str, str] = {}
 _PROVIDER_LIST_CACHE: list[ProviderProfile] | None = None
 _discovered = False
+# True only while _discover_providers() is importing plugin modules. A plugin
+# imported by that pass can read provider-derived state (CANONICAL_PROVIDERS,
+# _PROVIDER_PREFIXES, ...) during its own import; those lazy readers consult
+# this flag so they do not cache a half-populated registry as final.
+_discovery_in_progress = False
+
+
+def discovery_in_progress() -> bool:
+    """True while plugin discovery is mid-flight (see ``_discovery_in_progress``)."""
+    return _discovery_in_progress
 
 # Repo-root ``plugins/model-providers/`` — populated at discovery time.
 _BUNDLED_PLUGINS_DIR = (
@@ -411,7 +421,15 @@ def _discover_providers() -> None:
     if _discovered:
         return
     _discovered = True
+    global _discovery_in_progress
+    _discovery_in_progress = True
+    try:
+        _discover_providers_inner()
+    finally:
+        _discovery_in_progress = False
 
+
+def _discover_providers_inner() -> None:
     # 0. Pip-installed plugins — entry points in the ``hermes_agent.plugins``
     #    group (the same group the general PluginManager uses). The manager
     #    records model-provider manifests for introspection but deliberately
