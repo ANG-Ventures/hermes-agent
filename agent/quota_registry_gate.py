@@ -314,11 +314,17 @@ def append_quota_exhaustion_message(agent, response: str) -> str:
 
 
 def default_snapshot_path() -> Path:
-    """Path to the usage system's published snapshot under the Hermes home."""
-    try:
-        from hermes_constants import get_hermes_home
+    """Path to the usage system's published snapshot.
 
-        return Path(get_hermes_home()) / _DEFAULT_SNAPSHOT_RELPATH
+    The snapshot is FLEET-SHARED: the usage system publishes exactly one copy,
+    at the top-level Hermes root. Specialist gateways run with
+    ``HERMES_HOME=<root>/profiles/<name>``, where no copy exists, so this must
+    resolve from the root rather than from the (possibly profile-scoped) home.
+    """
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        return Path(get_default_hermes_root()) / _DEFAULT_SNAPSHOT_RELPATH
     except Exception:  # pragma: no cover - defensive
         return Path.home() / ".hermes" / _DEFAULT_SNAPSHOT_RELPATH
 

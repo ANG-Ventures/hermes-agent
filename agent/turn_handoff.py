@@ -264,10 +264,17 @@ def write_turn_handoff(
             except OSError:
                 pass
             raise
-        return True
     except Exception:
         logger.debug("turn handoff write failed for %s", session_key, exc_info=True)
         return False
+    # The read path enforces the TTL for a session that COMES BACK; an
+    # abandoned session_key has no reader, so sweep here. Never let a failed
+    # sweep cost us a handoff we already wrote successfully.
+    try:
+        prune_expired_handoffs(root=root)
+    except Exception:
+        logger.debug("turn handoff sweep failed", exc_info=True)
+    return True
 
 
 def _load_turn_handoff(

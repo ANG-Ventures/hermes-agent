@@ -364,3 +364,45 @@ class TestRendering:
     def test_context_render_of_an_empty_handoff_is_empty(self):
         assert render_handoff_context(None) == ""
         assert render_handoff_context({}) == ""
+
+
+# ── the TTL must actually reclaim abandoned session keys ─────────────────
+
+
+class TestExpiredHandoffsAreReclaimed:
+    """A session that never comes back would otherwise leak its file forever.
+
+    ``consume_turn_handoff`` enforces the TTL on the READ path, which is
+    correct for a returning session but never runs for an abandoned
+    ``session_key``. Writing a new handoff sweeps the directory so the TTL is
+    enforced without a returning reader.
+    """
+
+    def test_writing_a_handoff_reclaims_an_abandoned_expired_one(self, tmp_path):
+        stale = tmp_path / "discord-abandoned.json"
+        stale.write_text(
+            json.dumps({"created_at": time.time() - HANDOFF_TTL_SECONDS - 60}),
+            encoding="utf-8",
+        )
+        fresh = tmp_path / "discord-recent.json"
+        fresh.write_text(json.dumps({"created_at": time.time()}), encoding="utf-8")
+
+        assert write_turn_handoff(
+            "discord:999", {"created_at": time.time()}, root=tmp_path
+        )
+
+        assert stale.exists() is False
+        assert fresh.exists() is True
+        assert handoff_path_for("discord:999", root=tmp_path).exists() is True
+
+    def test_a_failing_sweep_never_blocks_the_write(self, tmp_path, monkeypatch):
+        import agent.turn_handoff as mod
+
+        def _boom(**_kwargs):
+            raise RuntimeError("sweep exploded")
+
+        monkeypatch.setattr(mod, "prune_expired_handoffs", _boom)
+        assert write_turn_handoff(
+            "discord:999", {"created_at": time.time()}, root=tmp_path
+        )
+        assert handoff_path_for("discord:999", root=tmp_path).exists() is True

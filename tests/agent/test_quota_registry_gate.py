@@ -274,3 +274,102 @@ class TestQuotaStateShape:
     def test_eligible_state_carries_no_window(self):
         state = QuotaState(eligible=True)
         assert state.window is None and state.reset_at is None
+
+
+# ── snapshot path resolution (the snapshot is FLEET-SHARED, not per-profile) ──
+
+
+class TestDefaultSnapshotPath:
+    """The usage system publishes ONE snapshot, at the top-level Hermes root.
+
+    Every specialist gateway runs with ``HERMES_HOME=<root>/profiles/<name>``
+    (8 of the 9 live launchd plists), and no per-profile copy of that file
+    exists. Resolving the snapshot off ``HERMES_HOME`` therefore made the gate
+    silently inert exactly where the fallback chains live.
+    """
+
+    @staticmethod
+    def _reload(monkeypatch, home):
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        import hermes_constants
+
+        monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None)
+        from agent.quota_registry_gate import default_snapshot_path
+
+        return default_snapshot_path()
+
+    def test_profile_home_resolves_to_the_root_snapshot(self, tmp_path, monkeypatch):
+        root = tmp_path / "hermeshome"
+        (root / "profiles" / "aegis").mkdir(parents=True)
+        assert self._reload(monkeypatch, root / "profiles" / "aegis") == (
+            root / "var" / "usage-portal" / "site" / "usage.json"
+        )
+
+    def test_non_profile_home_resolves_under_that_home(self, tmp_path, monkeypatch):
+        root = tmp_path / "hermeshome"
+        root.mkdir()
+        assert self._reload(monkeypatch, root) == (
+            root / "var" / "usage-portal" / "site" / "usage.json"
+        )
+
+    def test_a_profile_gateway_loads_the_same_snapshot_as_the_root(
+        self, tmp_path, monkeypatch
+    ):
+        root = tmp_path / "hermeshome"
+        profile = root / "profiles" / "aegis"
+        profile.mkdir(parents=True)
+        published = root / "var" / "usage-portal" / "site" / "usage.json"
+        published.parent.mkdir(parents=True)
+        published.write_text(
+            json.dumps(
+                {
+                    "providers": [
+                        {
+                            "id": "claude",
+                            "accounts": [
+                                {
+                                    "key": "sub-vps-1",
+                                    "provider_slug": "claude-apx-1",
+                                    "observed_at": time.time(),
+                                    "windows": [
+                                        _win("five_hour", 100.0, "rejected", 7200)
+                                    ],
+                                },
+                                {
+                                    "key": "sub-vps-17",
+                                    "provider_slug": "claude-apx-17",
+                                    "observed_at": time.time(),
+                                    "windows": [_win("five_hour", 26.0, "allowed", 900)],
+                                },
+                            ],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        chain = [{"provider": "claude-apx-1"}, {"provider": "claude-apx-17"}]
+
+        from agent.quota_registry_gate import load_registry_snapshot
+
+        as_root = prune_exhausted_entries(
+            chain, snapshot=load_registry_snapshot(self._reload(monkeypatch, root))
+        )
+        as_profile = prune_exhausted_entries(
+            chain, snapshot=load_registry_snapshot(self._reload(monkeypatch, profile))
+        )
+
+        assert [e["provider"] for e in as_root.eligible] == ["claude-apx-17"]
+        assert [e["provider"] for e in as_profile.eligible] == [
+            e["provider"] for e in as_root.eligible
+        ]
+        assert len(as_profile.skipped) == len(as_root.skipped) == 1
+
+    def test_a_genuinely_missing_snapshot_still_fails_open(self, tmp_path, monkeypatch):
+        from agent.quota_registry_gate import load_registry_snapshot
+
+        profile = tmp_path / "hermeshome" / "profiles" / "aegis"
+        profile.mkdir(parents=True)
+        path = self._reload(monkeypatch, profile)
+        assert path.exists() is False
+        assert load_registry_snapshot(path) == {}
