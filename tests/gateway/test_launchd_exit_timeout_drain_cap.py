@@ -242,7 +242,13 @@ def test_teardown_reserve_fits_before_the_watchdog_that_actually_fires(
     drain = resolve_launchd_capped_drain(
         configured, clamp, last_teardown_s=effective_teardown
     )
-    armed = resolve_armed_shutdown_watchdog_delay(drain, clamp, signal_driven=True)
+    # Arm with the same reserve the production call site passes: the leash
+    # is max(grace, reserve), so a sample above the grace is only honoured
+    # when it reaches the arming site (see
+    # test_stop_arms_the_watchdog_with_the_measured_teardown_reserve).
+    armed = resolve_armed_shutdown_watchdog_delay(
+        drain, clamp, signal_driven=True, last_teardown_s=effective_teardown
+    )
     promised_reserve = max(
         LAUNCHD_STOP_CLEANUP_RESERVE_S, effective_teardown or 0.0
     )
@@ -254,15 +260,23 @@ def test_teardown_reserve_fits_before_the_watchdog_that_actually_fires(
     assert drain + promised_reserve <= clamp
 
 
-def test_teardown_ceiling_is_bounded_by_the_watchdog_grace():
-    """A sample above the grace can never be honoured, so reject it.
+def test_watchdog_leash_widens_to_the_reserve_instead_of_discarding_it():
+    """A measured teardown above the grace widens the leash, not the bin.
 
-    The armed deadline is ``min(drain + grace, hard_exit)``. When the inner
-    leash binds, the post-drain window is ``grace`` no matter how far the
-    drain shrinks — ``remaining()`` is maximized at drain 0 and still only
-    equals the grace. Bounding the ceiling by the span to the hard exit
-    alone therefore advertised an unhonourable reserve on any clamp above
-    ~70 (system-domain launchd is not gui-clamped to 60).
+    The armed deadline is ``min(drain + leash, hard_exit)``. Bounding the
+    teardown CEILING by the grace was the wrong lever: it discarded a valid
+    measurement and collapsed the promise to the fixed 15s cleanup reserve,
+    which is strictly worse than the sample it replaced — at clamp 120 /
+    configured 180 / measured 65 that yielded drain 95 and a 15s window for
+    a teardown known to take 65s. Widening the leash to ``max(grace,
+    reserve)`` honours the measurement, and the outer ``min()`` keeps the
+    deadline inside the hard exit.
+
+    Both regions are pinned deliberately: at the production clamp the
+    hard-exit line binds and this is inert, and at a high clamp the grace
+    branch binds and the widening is what does the work. A later change to
+    the grace therefore goes red here instead of silently flipping the
+    production case.
     """
     from gateway.restart import (
         LAUNCHD_HARD_EXIT_RESERVE_S,
@@ -273,25 +287,52 @@ def test_teardown_ceiling_is_bounded_by_the_watchdog_grace():
         DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S as GRACE,
     )
 
-    # Low clamp: the hard-exit span is the binding bound.
-    assert resolve_max_actionable_teardown_reserve_s(60.0) == (
-        60.0 - LAUNCHD_HARD_EXIT_RESERVE_S
-    )
-    # High clamp: the grace is the binding bound, NOT clamp - 10 (= 290).
-    assert resolve_max_actionable_teardown_reserve_s(300.0) == GRACE
+    # The ceiling is the hard-exit span at EVERY clamp: the grace is not a
+    # bound on the sample any more.
+    for clamp in (60.0, 300.0):
+        assert resolve_max_actionable_teardown_reserve_s(clamp) == (
+            clamp - LAUNCHD_HARD_EXIT_RESERVE_S
+        )
 
-    # The ceiling never advertises more than the window that can exist.
+    # Production clamp: the hard-exit line binds, so the leash never shows.
+    drain_60 = resolve_launchd_capped_drain(50.0, 60.0, last_teardown_s=22.0)
+    assert drain_60 == 28.0
+    assert (
+        resolve_armed_shutdown_watchdog_delay(
+            drain_60, 60.0, signal_driven=True, last_teardown_s=22.0
+        )
+        == 60.0 - LAUNCHD_HARD_EXIT_RESERVE_S
+    )
+
+    # High clamp, sample ABOVE the grace: the leash widens to the reserve.
+    drain_300 = resolve_launchd_capped_drain(180.0, 300.0, last_teardown_s=70.0)
+    armed_300 = resolve_armed_shutdown_watchdog_delay(
+        drain_300, 300.0, signal_driven=True, last_teardown_s=70.0
+    )
+    assert armed_300 - drain_300 >= 70.0
+    assert armed_300 == drain_300 + 70.0  # leash = reserve, not grace
+    assert armed_300 < 300.0 - LAUNCHD_HARD_EXIT_RESERVE_S
+
+    # High clamp, sample BELOW the grace: the grace still wins.
+    drain_g = resolve_launchd_capped_drain(180.0, 300.0, last_teardown_s=20.0)
+    assert (
+        resolve_armed_shutdown_watchdog_delay(
+            drain_g, 300.0, signal_driven=True, last_teardown_s=20.0
+        )
+        == drain_g + GRACE
+    )
+
+    # The window never under-promises the reserve, at any clamp.
     for clamp in (30.0, 60.0, 120.0, 300.0, 600.0):
         ceiling = resolve_max_actionable_teardown_reserve_s(clamp)
         assert ceiling is not None
-        drain = resolve_launchd_capped_drain(
-            600.0, clamp, last_teardown_s=ceiling - 0.5
-        )
+        sample = ceiling - 0.5
+        drain = resolve_launchd_capped_drain(600.0, clamp, last_teardown_s=sample)
         armed = resolve_armed_shutdown_watchdog_delay(
-            drain, clamp, signal_driven=True
+            drain, clamp, signal_driven=True, last_teardown_s=sample
         )
-        assert armed - drain >= ceiling - 0.5, (
-            f"clamp={clamp}: ceiling {ceiling} promises more than the "
+        assert armed - drain >= sample, (
+            f"clamp={clamp}: reserve {sample} promises more than the "
             f"{armed - drain}s window the watchdog leaves"
         )
 
@@ -840,6 +881,74 @@ def test_stop_spends_pre_drain_elapsed_out_of_the_drain(monkeypatch, tmp_path):
     )
 
 
+def test_stop_arms_the_watchdog_with_the_measured_teardown_reserve(
+    monkeypatch, tmp_path
+):
+    """The arming call site must hand the watchdog the measured reserve.
+
+    ``resolve_armed_shutdown_watchdog_delay`` widens its inner leash to
+    ``max(grace, reserve)`` so a teardown longer than the 60s grace is still
+    honoured. That widening is dead unless ``gateway.run`` actually passes
+    ``last_teardown_s`` — the resolver defaults it to ``None`` and silently
+    collapses back to the bare grace.
+
+    Measured on the unwired call site at clamp 300 with a recorded 70s
+    teardown: drain 180, armed 240 — a 60s window for a teardown known to
+    take 70s, so ``os._exit`` lands mid-persistence. This drives the real
+    ``stop()`` and reads the wall-clock delay handed to
+    ``arm_shutdown_watchdog``, so dropping the argument goes red here
+    rather than silently reverting to the grace.
+    """
+    import asyncio
+
+    from gateway import run as run_mod
+    from tests.gateway.restart_test_helpers import make_restart_runner
+
+    monkeypatch.setattr(run_mod, "_hermes_home", tmp_path)
+
+    # A clamp high enough that the inner leash binds (system-domain launchd
+    # is not gui-clamped to 60), with a teardown sample above the grace.
+    runner, adapter = make_restart_runner()
+    runner._restart_drain_timeout = 180.0
+    runner._cron_drain_timeout = 0.01
+    runner._launchd_exit_timeout_s = 300.0
+    runner._stop_requested_by_signal = True
+    runner._last_shutdown_teardown_s = 70.0
+    adapter.disconnect = AsyncMock()
+
+    armed: list[float] = []
+    snapshots: list[dict] = []
+
+    def _capture(delay, *, done_event=None, snapshot_fn=None, exit_code=None):
+        armed.append(delay)
+        if snapshot_fn is not None:
+            snapshots.append(snapshot_fn())
+
+    monkeypatch.setattr(run_mod, "arm_shutdown_watchdog", _capture)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    with patch("gateway.status.remove_pid_file"), \
+         patch("gateway.status.write_runtime_status"):
+        asyncio.run(runner.stop())
+
+    drain = runner._effective_stop_drain_timeout()
+    assert drain == 180.0  # configured drain fits inside the wide clamp
+    assert armed, "stop() never armed the shutdown watchdog"
+
+    # The measured teardown must fit between the end of the drain and the
+    # hard exit. With the bare grace this window is 60.0 for a 70s reserve.
+    window = armed[0] - drain
+    assert window >= 70.0, (
+        f"armed={armed[0]} drain={drain}: only {window}s before os._exit "
+        f"for a measured 70.0s teardown — the reserve is not wired into "
+        f"the arming call site"
+    )
+    # Still strictly inside launchd's SIGKILL wall.
+    assert armed[0] < 300.0
+    # The diagnostic snapshot reports the same deadline it armed with.
+    assert snapshots and snapshots[0]["watchdog_delay_s"] == armed[0]
+
+
 def test_hard_exit_backstop_ignores_blocked_daemon_threads(monkeypatch, tmp_path):
     from gateway import shutdown_watchdog
 
@@ -873,20 +982,59 @@ def test_hard_exit_backstop_ignores_blocked_daemon_threads(monkeypatch, tmp_path
             thread.join(timeout=1.0)
 
 
-def test_signal_handler_marks_stop_as_signal_driven():
-    """SIGTERM/SIGINT handler flags the runner before scheduling stop().
+def test_stop_consumes_the_signal_driven_flag_for_its_drain(monkeypatch, tmp_path):
+    """The stop path must honour the flag the signal handler sets.
 
-    The handler is a closure inside the gateway main; this is a structural
-    contract check that both halves of the cap exist — the producer in the
-    signal handler and the consumer in the stop path — so neither can be
-    dropped in a refactor without this test going red.
+    Both halves of the cap have to exist: the signal handler sets
+    ``_stop_requested_by_signal``, and the stop path must read it to decide
+    whether launchd's clamp applies. This drives the real ``stop()`` twice
+    with the flag off and on and reads the drain budget actually handed to
+    ``_drain_active_agents`` — behaviour, not source text, so a refactor
+    that moves or renames the wiring still passes while one that DROPS the
+    consumer goes red.
     """
-    import inspect
+    import asyncio
 
     from gateway import run as run_mod
+    from tests.gateway.restart_test_helpers import make_restart_runner
 
-    src = inspect.getsource(run_mod)
-    assert src.count("runner._stop_requested_by_signal = True") == 1
-    assert "effective_stop_drain_timeout(self)" in inspect.getsource(
-        run_mod.GatewayRunner.stop
+    monkeypatch.setattr(run_mod, "_hermes_home", tmp_path)
+
+    def _run(signal_driven: bool) -> float:
+        runner, adapter = make_restart_runner()
+        runner._restart_drain_timeout = 50.0
+        runner._cron_drain_timeout = 0.01
+        runner._launchd_exit_timeout_s = 60.0
+        runner._stop_requested_by_signal = signal_driven
+        runner._last_shutdown_teardown_s = 22.0
+        adapter.disconnect = AsyncMock()
+
+        budgets: list[float] = []
+
+        async def _fake_drain(_self, timeout, cron_timeout=None):
+            budgets.append(timeout)
+            return ({}, False)
+
+        monkeypatch.setattr(
+            run_mod.GatewayRunner, "_drain_active_agents", _fake_drain
+        )
+        with patch("gateway.status.remove_pid_file"), \
+             patch("gateway.status.write_runtime_status"):
+            asyncio.run(runner.stop())
+        assert budgets, "stop() never drained"
+        return budgets[0]
+
+    # Not signal-driven: launchd's clamp does not apply, the configured
+    # drain survives whole (modulo the pre-drain elapsed adjustment).
+    unsupervised = _run(False)
+    assert unsupervised > 28.0, (
+        f"drain {unsupervised} was capped on a non-signal stop; the stop "
+        f"path is applying the launchd clamp unconditionally"
+    )
+
+    # Signal-driven: capped to 60 - 10 (hard exit) - 22 (measured teardown).
+    supervised = _run(True)
+    assert supervised <= 28.0, (
+        f"drain {supervised} exceeds the launchd cap of 28.0; the stop path "
+        f"is not consuming _stop_requested_by_signal"
     )

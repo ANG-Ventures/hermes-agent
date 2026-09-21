@@ -280,29 +280,25 @@ def resolve_max_actionable_teardown_reserve_s(
     launchd_exit_timeout_s: float | None,
     *,
     hard_exit_reserve_s: float = LAUNCHD_HARD_EXIT_RESERVE_S,
-    grace_s: float | None = None,
 ) -> float | None:
     """Largest teardown sample worth reserving for under a live budget.
 
     The teardown reserve is carved out of the drain, so it is bounded by
-    the post-drain window the watchdog can actually leave. Two separate
-    bounds apply and the smaller one wins:
+    the span between the start of the stop and the hard exit:
+    ``exit_timeout - hard_exit_reserve_s``. A recorded sample at or above
+    that ceiling cannot be honoured — the drain is already zero there — so
+    treating it as the reserve buys nothing and costs every in-flight
+    session its drain.
 
-    * ``exit_timeout - hard_exit_reserve_s`` — the whole span between the
-      start of the stop and the hard exit. A sample at or above it cannot
-      be honoured (the drain is already zero there), so reserving for it
-      buys nothing and costs every in-flight session its drain.
-    * the watchdog grace — the armed deadline is
-      ``min(drain + grace, hard_exit)``, so when the inner leash binds the
-      post-drain window is ``grace``, no matter how far the drain shrinks.
-      A larger sample would promise a teardown ``os._exit`` cuts short:
-      measured at clamp 300 / configured 180 / sample 70, the old
-      span-only ceiling (290) accepted the sample, giving drain 180, armed
-      240 and a 60s window for a 70s reserve.
-
-    A sample AT the ceiling is rejected along with one above it: at the
-    ceiling the drain is exactly zero, which is the drain-starvation this
-    bound exists to prevent, not a usable reserve.
+    This is the ONLY bound applied to the sample. The watchdog grace is
+    deliberately NOT a ceiling here: when the grace is the tighter of the
+    two, the right response is to widen the leash to the reserve (see
+    :func:`resolve_armed_shutdown_watchdog_delay`), not to discard the
+    measurement. Discarding it collapses the promise to the fixed 15s
+    cleanup reserve, which is strictly worse than the measurement it
+    replaces — at clamp 120 / configured 180 / measured 65 a grace-bounded
+    ceiling rejected the sample, giving drain 95 and a 15s window for a
+    teardown known to take 65s.
 
     Returns ``None`` when no launchd budget applies, meaning "no ceiling":
     an unsupervised stop is not racing a SIGKILL.
@@ -315,20 +311,12 @@ def resolve_max_actionable_teardown_reserve_s(
         return None
     if not (budget > 0.0):
         return None
-    from gateway.shutdown_watchdog import DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S
-
-    grace = DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S if grace_s is None else grace_s
-    hard_exit = resolve_launchd_shutdown_watchdog_delay(
+    return resolve_launchd_shutdown_watchdog_delay(
         budget,
         budget,
         signal_driven=True,
         hard_exit_reserve_s=hard_exit_reserve_s,
     )
-    try:
-        grace_bound = max(float(grace), 0.0)
-    except (TypeError, ValueError):
-        return hard_exit
-    return min(hard_exit, grace_bound)
 
 
 def resolve_armed_shutdown_watchdog_delay(
@@ -336,33 +324,53 @@ def resolve_armed_shutdown_watchdog_delay(
     launchd_exit_timeout_s: float | None,
     *,
     signal_driven: bool,
+    last_teardown_s: float | None = None,
+    cleanup_reserve_s: float = LAUNCHD_STOP_CLEANUP_RESERVE_S,
     grace_s: float | None = None,
     hard_exit_reserve_s: float = LAUNCHD_HARD_EXIT_RESERVE_S,
 ) -> float:
     """Wall-clock deadline the shutdown watchdog is actually armed with.
 
     The single source of truth for the two-step arming the stop path
-    performs: an inner leash of ``drain + grace`` (see
+    performs: an inner leash of ``drain + leash`` (see
     :func:`gateway.shutdown_watchdog.resolve_shutdown_watchdog_delay`),
     then :func:`resolve_launchd_shutdown_watchdog_delay` to pull it back
     inside launchd's budget.
 
     Extracted so the reserve invariant can be measured against the
     expression ``gateway.run`` really arms, rather than a copy of it
-    re-derived in a test. The grace is large (60s by default), so under
-    launchd the inner leash always loses the ``min()`` and the armed
-    deadline is ``exit_timeout - hard_exit_reserve_s`` — which is exactly
-    what :func:`resolve_launchd_capped_drain` sizes the teardown window
-    against.
+    re-derived in a test. The grace is large (60s by default), so at the
+    production clamp (60, gui-domain-clamped) the inner leash loses the
+    ``min()`` and the armed deadline is
+    ``exit_timeout - hard_exit_reserve_s`` — exactly what
+    :func:`resolve_launchd_capped_drain` sizes the teardown window against.
+
+    The leash is ``max(grace, reserve)``, not the bare grace. On a clamp
+    high enough for the inner term to bind (system-domain launchd is not
+    gui-clamped to 60), a measured teardown ABOVE the grace would otherwise
+    be promised a window the watchdog cuts short: at clamp 300 /
+    configured 180 / measured 70 the grace-only leash armed at 240 for a
+    drain of 180 — a 60s window for a 70s reserve. Widening the leash to
+    the reserve honours the measurement instead of discarding it, and it
+    can never push the deadline past the hard exit because the outer
+    ``min()`` still binds.
     """
     from gateway.shutdown_watchdog import (
         DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S,
         resolve_shutdown_watchdog_delay,
     )
 
+    def _seconds(value: object) -> float:
+        try:
+            return max(float(value), 0.0)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0.0
+
     grace = DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S if grace_s is None else grace_s
+    reserve = max(_seconds(cleanup_reserve_s), _seconds(last_teardown_s))
+    leash = max(_seconds(grace), reserve)
     return resolve_launchd_shutdown_watchdog_delay(
-        resolve_shutdown_watchdog_delay(drain_timeout, grace_s=grace),
+        resolve_shutdown_watchdog_delay(drain_timeout, grace_s=leash),
         launchd_exit_timeout_s,
         signal_driven=signal_driven,
         hard_exit_reserve_s=hard_exit_reserve_s,

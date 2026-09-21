@@ -19691,6 +19691,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         signal_driven=getattr(
                             self, "_stop_requested_by_signal", False
                         ),
+                        last_teardown_s=getattr(
+                            self, "_last_shutdown_teardown_s", None
+                        ),
                     ),
                     "persistence_complete": False,
                     "phase_elapsed_s": (
@@ -19699,10 +19702,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 }
 
             if not os.environ.get("PYTEST_CURRENT_TEST"):
+                # The measured teardown must reach the arming site, not just
+                # the drain cap: the leash is max(grace, reserve), so without
+                # it a sample above the 60s grace silently collapses back to
+                # the grace (clamp 300 / measured 70 armed at 240 for a drain
+                # of 180 — a 60s window for a 70s teardown).
                 _watchdog_delay = resolve_armed_shutdown_watchdog_delay(
                     effective_stop_drain_timeout(self),
                     getattr(self, "_launchd_exit_timeout_s", None),
                     signal_driven=getattr(self, "_stop_requested_by_signal", False),
+                    last_teardown_s=getattr(self, "_last_shutdown_teardown_s", None),
                 )
                 arm_shutdown_watchdog(
                     _watchdog_delay,
