@@ -50,8 +50,8 @@ JOURNAL_FILENAME = "lifecycle.jsonl"
 # and unjournalled jobs are NOT certified, even when status is ok.
 DEFAULT_WINDOW_HOURS = 24.0
 
-# Entries older than this are pruned on write so the file cannot grow without
-# bound. Deliberately several times the guard window: an entry must stay
+# Entries older than this are pruned during guard checks to limit growth.
+# Deliberately several times the default guard window: an entry must stay
 # readable for the whole window even if nothing writes for days afterwards.
 _RETENTION_DAYS = 14.0
 

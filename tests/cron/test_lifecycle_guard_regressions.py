@@ -43,7 +43,7 @@ def test_status_reports_actual_loss(store, status_path, capsys):
     assert job["id"] in output
 
 
-def test_old_loss_is_not_certified_as_zero_unaccounted(store):
+def test_old_loss_is_not_certified_as_zero_unaccounted(store, status_path, capsys):
     jobs.create_job(prompt="x", schedule="in 10 hours")
     path = store / "cron/lifecycle.jsonl"
     record = json.loads(path.read_text())
@@ -54,6 +54,36 @@ def test_old_loss_is_not_certified_as_zero_unaccounted(store):
     assert "0 unaccounted" not in summary
     assert "older jobs not checked" in summary
     assert "24" in summary
+    cli.cron_status()
+    output = capsys.readouterr().out
+    assert "older jobs not checked" in output
+    assert "0 unaccounted" not in output
+
+
+def test_guard_rejects_caller_filtered_snapshot(store):
+    jobs.create_job(prompt="x", schedule="in 10 hours")
+    with pytest.raises(TypeError):
+        journal.check_vanished_jobs(jobs=[])
+
+
+def test_append_and_prune_fail_closed_on_lock_timeout(store, monkeypatch):
+    journal.record_created("recent")
+    path = store / "cron/lifecycle.jsonl"
+    with path.open("a") as f:
+        f.write(json.dumps({"event": "created", "job_id": "old",
+                            "at": "2020-01-01T00:00:00+00:00"}) + "\n")
+    before = path.read_bytes()
+    with journal._journal_lock(path):
+        # Real second file-lock acquisition fails. Advance only its deadline,
+        # not the host/platform or the lock implementation.
+        clock = iter([0.0, 10.0, 20.0, 30.0])
+        monkeypatch.setattr(journal.time, "monotonic", lambda: next(clock))
+        journal.record_created("must-not-write-unlocked")
+        assert journal.prune() == 0
+        assert path.read_bytes() == before
+    monkeypatch.undo()
+    journal.record_created("after-release")
+    assert "after-release" in path.read_text()
 
 
 def test_append_does_not_resurrect_deleted_profile(tmp_path):
@@ -63,8 +93,9 @@ def test_append_does_not_resurrect_deleted_profile(tmp_path):
     assert not home.exists()
 
 
-def _append_in_process(home, start, done):
+def _append_in_process(home, ready, start, done):
     with jobs.use_cron_store(home):
+        ready.set()
         if start.wait(15):
             journal.record_created("CONCURRENT")
             done.set()
@@ -79,8 +110,8 @@ def test_prune_preserves_concurrent_process_append(store, monkeypatch):
         f.write(json.dumps({"event": "created", "job_id": "old",
                             "at": "2020-01-01T00:00:00+00:00"}) + "\n")
     ctx = multiprocessing.get_context("spawn")
-    start, done = ctx.Event(), ctx.Event()
-    writer = ctx.Process(target=_append_in_process, args=(store, start, done))
+    ready, start, done = ctx.Event(), ctx.Event(), ctx.Event()
+    writer = ctx.Process(target=_append_in_process, args=(store, ready, start, done))
     replace = utils.atomic_replace
 
     def pause_before_replace(src, dst):
@@ -94,6 +125,7 @@ def test_prune_preserves_concurrent_process_append(store, monkeypatch):
     monkeypatch.setattr(utils, "atomic_replace", pause_before_replace)
     writer.start()
     try:
+        assert ready.wait(15)
         assert journal.prune() == 1
         assert done.wait(15)
         writer.join(15)
