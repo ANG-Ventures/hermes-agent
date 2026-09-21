@@ -118,7 +118,9 @@ def test_ac7_populated_migration_preserves_five_consumers(legacy_copy):
 def test_insert_turn_placeholder_probe_detects_malformed_insert(legacy_copy, monkeypatch):
     class BadInsert(sqlite3.Connection):
         def execute(self, sql, parameters=()):
-            if "INSERT OR REPLACE INTO turns" in sql:
+            # Matches the turns INSERT regardless of its conflict strategy, so
+            # the probe survives an OR REPLACE -> ON CONFLICT rewrite.
+            if sql.lstrip().startswith("INSERT") and "INTO turns (" in sql:
                 sql = sql.replace("?, ?", "?", 1)
             return super().execute(sql, parameters)
 
