@@ -37,10 +37,17 @@ from hermes_cli import kanban_pr_gate as prg
 
 @pytest.fixture
 def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Isolated HERMES_HOME with an empty kanban DB."""
+    """Isolated HERMES_HOME with an empty kanban DB.
+
+    ``HERMES_KANBAN_SANDBOX=1`` is the POSITIVE opt-in :func:`prg._db_is_sandboxed`
+    requires: containment alone is not proof of isolation (the fleet's own
+    ``HERMES_HOME=~/.hermes`` contains the live board), so a harness running a
+    stubbed oracle has to declare itself.
+    """
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home
@@ -878,9 +885,15 @@ def test_explicit_hermes_home_with_ambient_pin_is_not_treated_as_sandboxed(
 
     ``HERMES_KANBAN_DB`` outranks ``HERMES_HOME`` in
     :func:`kanban_db.kanban_db_path`, which is precisely why redirecting only
-    ``HERMES_HOME`` let a 2026-09-21 probe write to the production board. The
-    sandbox predicate must report False for that combination, and True once the
-    pin is neutralised.
+    ``HERMES_HOME`` let a 2026-09-21 probe write to the production board.
+
+    Three arms, because BOTH conditions are load-bearing and neither is
+    sufficient alone:
+
+    * pin set, no opt-in  -> False (the original incident shape)
+    * pin cleared, still no opt-in -> False (containment alone is not proof —
+      the fleet's own env satisfies containment against the live board)
+    * opt-in declared, pin neutralised by it -> True
     """
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -888,13 +901,19 @@ def test_explicit_hermes_home_with_ambient_pin_is_not_treated_as_sandboxed(
     live.parent.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
     # The pin wins, so the DB is NOT inside the sandbox home.
     assert prg._db_is_sandboxed() is False
 
-    # Neutralising the pin is what actually sandboxes it.
+    # Dropping the pin makes the DB land inside HERMES_HOME — containment now
+    # holds, and it is STILL not sandboxed, because nothing declared isolation.
     monkeypatch.delenv("HERMES_KANBAN_DB")
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    assert prg._db_is_sandboxed() is False
+
+    # The positive opt-in is what actually sandboxes it. The pin is cleared
+    # here so the assertion is about the FLAG and nothing else.
+    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")
     assert prg._db_is_sandboxed() is True
 
 
@@ -1154,6 +1173,123 @@ def test_a_board_outside_the_declared_hermes_home_is_not_sandboxed(
     # So isolation is not proven, and the fabricated oracle is refused.
     assert observed["sandboxed"] is False
     assert observed["refused"] is True
+
+
+_FLEET_ROOT_PROBE = '''
+import json, os, sys
+sys.path.insert(0, {repo!r})
+# The FLEET shape: the declared HERMES_HOME IS the board's own root, which is
+# exactly what ~20 installed launchd jobs export. No pins, no pytest marker.
+for marker in ("PYTEST_CURRENT_TEST", "HERMES_IN_PYTEST"):
+    os.environ.pop(marker, None)
+for pin in ("HERMES_KANBAN_DB", "HERMES_KANBAN_HOME",
+            "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_ATTACHMENTS_ROOT",
+            "HERMES_KANBAN_SANDBOX"):
+    os.environ.pop(pin, None)
+os.environ["HERMES_HOME"] = {home!r}
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_pr_gate as prg
+
+prg.query_pr = lambda repo, number: {{
+    "state": "MERGED", "mergedAt": "2026-09-21T07:32:50Z",
+    "mergeCommitSha": "deadbeefcafe1234",
+}}
+
+kb.init_db()
+refused = False
+with kb.connect() as conn:
+    tid = kb.create_task(conn, title="gated", assignee="daedalus-opus")
+    kb.claim_task(conn, tid)
+    kb.block_task(
+        conn, tid, reason="merge o/r#7 then unblock me", kind="needs_input",
+        expected_run_id=kb.get_task(conn, tid).current_run_id,
+    )
+    try:
+        kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
+    except prg.SandboxEscape:
+        refused = True
+    status = kb.get_task(conn, tid).status
+    events = conn.execute(
+        "SELECT COUNT(*) c FROM task_events WHERE kind = 'gate_auto_resolved'"
+    ).fetchone()["c"]
+
+# The production control: the in-gateway dispatcher runs under exactly this
+# env, so the real oracle and the no-argument call must still be allowed.
+real_allowed = stub_allowed = None
+try:
+    prg.assert_write_allowed(None)
+    prg.assert_write_allowed(prg._REAL_QUERY_PR)
+    real_allowed = True
+except prg.SandboxEscape:
+    real_allowed = False
+try:
+    prg.assert_write_allowed(lambda repo, number: {{"state": "MERGED"}})
+    stub_allowed = True
+except prg.SandboxEscape:
+    stub_allowed = False
+
+print(json.dumps({{
+    "db": str(kb.kanban_db_path()),
+    "declared_home": os.environ["HERMES_HOME"],
+    "sandboxed": prg._db_is_sandboxed(),
+    "in_test_context": prg._in_test_context(),
+    "refused": refused, "status": status, "gate_auto_resolved": events,
+    "real_allowed": real_allowed, "stub_allowed": stub_allowed,
+}}))
+'''
+
+
+def test_a_board_inside_the_declared_hermes_home_is_still_not_sandboxed(
+    tmp_path: Path,
+) -> None:
+    """The FLEET-DEFAULT env must not prove itself sandboxed.
+
+    Round-6 anchored :func:`_db_is_sandboxed` on containment under the DECLARED
+    ``HERMES_HOME``. That closes the OUTSIDE case (the sibling test above) but
+    the fleet's own environment satisfies the INSIDE case: ~20 installed launchd
+    jobs export ``HERMES_HOME=~/.hermes`` and the live ``kanban.db`` sits
+    directly inside it. Measured at head ``108e50da6c`` with no pins and no
+    pytest marker: ``sandboxed=True``, stub ``ALLOWED`` — i.e. the 2026-09-21
+    incident still writes, from the most ordinary env on the box.
+
+    Containment is therefore not evidence. Isolation must require a POSITIVE
+    opt-in that no production process sets (``HERMES_KANBAN_SANDBOX=1``, the
+    very flag the refusal message already prescribes).
+
+    Runs in a child interpreter because the env has to be real process state
+    and no pytest marker may be present.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    home = tmp_path / "hermes-live"
+    home.mkdir()
+    script = tmp_path / "fleet_root_probe.py"
+    script.write_text(_FLEET_ROOT_PROBE.format(repo=str(repo_root), home=str(home)))
+
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("PYTEST_", "HERMES_"))}
+    env["PATH"] = os.environ.get("PATH", "")
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True, text=True, timeout=120, env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    observed = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    # Precondition: this IS the fleet shape — the board resolves inside the
+    # home this process declared, which is what the old predicate rewarded.
+    assert observed["db"].startswith(observed["declared_home"])
+    assert observed["in_test_context"] is False
+
+    # Containment alone must no longer grant isolation.
+    assert observed["sandboxed"] is False
+    assert observed["stub_allowed"] is False
+    assert observed["refused"] is True
+    assert observed["gate_auto_resolved"] == 0
+    assert observed["status"] == "blocked"
+
+    # Production control: the real oracle is untouched in this same env.
+    assert observed["real_allowed"] is True
 
 
 def test_dispatch_once_propagates_a_sandbox_escape_instead_of_absorbing_it(
