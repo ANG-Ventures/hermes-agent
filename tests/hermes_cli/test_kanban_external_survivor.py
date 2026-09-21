@@ -24,7 +24,8 @@ def board(tmp_path, monkeypatch):
 
 @pytest.fixture
 def remote(monkeypatch):
-    state = {"state": "MERGED", "headRefOid": HEAD, "mergeCommit": {"oid": MERGE}}
+    state = {"state": "MERGED", "headRefOid": HEAD, "mergeCommit": {"oid": MERGE},
+             "ref": "refs/heads/feature"}
     calls = []
     real = subprocess.run
 
@@ -32,14 +33,27 @@ def remote(monkeypatch):
         if args[0] == "gh":
             calls.append(args)
             assert args[:6] == ["gh", "pr", "view", "68", "--repo", "example/project"]
-            return subprocess.CompletedProcess(args, 0, json.dumps(state).encode(), b"")
+            view = {k: v for k, v in state.items() if k != "ref"}
+            return subprocess.CompletedProcess(args, 0, json.dumps(view).encode(), b"")
         if "ls-remote" in args:
             calls.append(args)
-            return subprocess.CompletedProcess(args, 0, f"{HEAD}\trefs/heads/feature\n".encode(), b"")
+            return subprocess.CompletedProcess(
+                args, 0, f"{HEAD}\t{state['ref']}\n".encode(), b"")
         return real(args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", run)
     return state, calls
+
+
+def _bind(remote, tid):
+    """Make the fixture's PR/ref corroborate THIS card, as a real one would.
+
+    RE-PIN (this card): an explicit --survivor-pr/--survivor-ref is no longer
+    accepted on existence alone, so the tests that exercise the happy path have
+    to name the task the way the branch of real work does.
+    """
+    remote[0]["headRefName"] = f"kanban/{tid}-fix"
+    remote[0]["ref"] = f"refs/heads/kanban/{tid}-fix"
 
 
 @pytest.mark.parametrize("state,expected", [("MERGED", MERGE), ("OPEN", HEAD)])
@@ -80,6 +94,7 @@ def test_explicit_ref_missing_on_remote_refuses(board, remote):
 
 def test_explicit_ref_records_resolved_full_sha(board, remote):
     tid = kb.create_task(board, title="external implementation")
+    _bind(remote, tid)
     assert kb.complete_task(board, tid, survivor_ref=f"{URL}#{HEAD[:7]}")
     assert kb.latest_run(board, tid).metadata["survivor"]["refs"][0]["sha"] == HEAD
     assert remote[1]
@@ -130,6 +145,7 @@ def test_claimed_card_still_reaches_the_remote(board, remote):
 
 def test_explicit_pr_keeps_dirty_workspace_capture(board, remote, tmp_path):
     tid = kb.create_task(board, title="dirty implementation")
+    _bind(remote, tid)
     ws = kb.resolve_workspace(kb.get_task(board, tid))
     kb.set_workspace_path(board, tid, ws)
     def git(*args):
@@ -161,6 +177,7 @@ def _cli(board, monkeypatch, argv):
 
 def test_cli_complete_forwards_survivor_pr(board, remote, monkeypatch):
     tid = kb.create_task(board, title="external implementation")
+    _bind(remote, tid)
     assert _cli(board, monkeypatch,
                 ["complete", tid, "--result", "shipped", "--survivor-pr", PR]) == 0
     assert kb.get_task(board, tid).status == "done"

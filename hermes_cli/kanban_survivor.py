@@ -5,6 +5,7 @@ against a published ancestor, or a self-contained bundle when none survives.
 """
 from __future__ import annotations
 
+import getpass
 import hashlib
 import json
 import logging
@@ -224,22 +225,58 @@ def _snapshot(repo, base, prefix):
         ).stdout
 
 
-def _verified_explicit(survivor_ref, survivor_pr):
-    """An operator-named survivor is a claim: verify it or refuse the completion."""
-    for claim, flag, verify in (
-        (survivor_ref, "--survivor-ref", _ext.verify_ref),
-        (survivor_pr, "--survivor-pr", _ext.verify_pr),
+def _verified_explicit(task_id, survivor_ref, survivor_pr, *, unbound=False):
+    """An operator-named survivor is a claim: verify it is real AND is THIS card's work.
+
+    "Live on GitHub" is not evidence about this card. Any unrelated OPEN or
+    MERGED PR satisfies existence, and ``preserve`` treats a verified explicit
+    survivor as authority for the branch that protects UNPUSHED implementation
+    work -- so an unbound claim authorises deleting a workspace whose bytes may
+    exist nowhere else. The claim therefore carries the same task-id binding
+    the text-mined path carries: the PR branch (or the remote ref) must name
+    the task.
+
+    The legitimate operator case -- a human who knows the work landed on a
+    differently-named branch -- keeps a path: ``--survivor-unbound`` accepts
+    the claim without the binding and records the override on the survivor, so
+    the authorisation is auditable rather than invisible. It is a CLI flag, so
+    a worker calling the ``kanban_complete`` tool cannot self-certify an
+    unrelated survivor.
+    """
+    for claim, flag, verify, extra in (
+        (survivor_ref, "--survivor-ref", _ext.verify_ref, {}),
+        (survivor_pr, "--survivor-pr", _ext.verify_pr,
+         {"corroborate": ("headRefName", "title", "body")}),
     ):
         if not claim:
             continue
-        ref = verify(claim)
+        ref = verify(claim, mined_for=None if unbound else task_id, **extra)
         if ref is None:
             # The claim is unverified and may carry a token: echo it redacted only.
+            if not unbound and verify(claim, **extra) is not None:
+                raise SurvivorUnavailable(
+                    f"survivor_unavailable: {flag} {_ext.redact(claim)} is live but does not "
+                    f"name {task_id}, so it is not evidence of THIS card's work; re-run with "
+                    f"--survivor-unbound if the work really did land on an unrelated-looking branch"
+                )
             raise SurvivorUnavailable(
                 f"survivor_unavailable: could not verify {flag} {_ext.redact(claim)} against the remote"
             )
+        if unbound:
+            # Record WHO authorised an unbound claim: _record replays the
+            # survivor into the task's event log, so the override is auditable.
+            ref = dict(ref, unbound=True, claimed_by=_claimant())
+            _log.warning("Unbound survivor accepted for task %s by %s: %s",
+                         task_id, ref["claimed_by"], _ext.redact(claim))
         return ref
     return None
+
+
+def _claimant():
+    try:
+        return getpass.getuser()
+    except (KeyError, OSError):  # no passwd entry (containers, CI)
+        return "unknown"
 
 
 def _loose_files(workspace, repos):
@@ -312,7 +349,7 @@ def _hold(conn, task_id, reason):
 
 
 def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
-             survivor_ref=None, survivor_pr=None, evidence=()):
+             survivor_ref=None, survivor_pr=None, survivor_unbound=False, evidence=()):
     """Return a verified survivor or None for non-code work; fail closed on doubt."""
     bases, held, previous = _state(conn, task_id)
     if cleanup and held:
@@ -321,7 +358,8 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         task = kb.get_task(conn, task_id)
         if task is None:
             raise SurvivorUnavailable("survivor_unavailable: task missing")
-        explicit = _verified_explicit(survivor_ref, survivor_pr)
+        explicit = _verified_explicit(task_id, survivor_ref, survivor_pr,
+                                      unbound=survivor_unbound)
         claimed = bool((metadata or {}).get("changed_files"))
         # Review approval often has no new changed_files: inherit the implementer's claim.
         claimed = claimed or any(
