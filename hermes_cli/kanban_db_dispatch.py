@@ -2014,8 +2014,8 @@ def _release_claim_for_workspace_refusal(conn, task_id, result, reason):
         retry_status = _kb._retry_status_for_run(conn, task_id, run_id)
         conn.execute(
             "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, "
-            "worker_pid=NULL WHERE id=? AND status='running'",
-            (retry_status, task_id),
+            "worker_pid=NULL WHERE id=? AND current_run_id=?",
+            (retry_status, task_id, run_id),
         )
         closed_run_id = _kb._end_run(
             conn, task_id, outcome="workspace_refused",
