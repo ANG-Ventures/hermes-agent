@@ -14832,6 +14832,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             await adapter.handle_message(event)
             dispatched_ok = True
+            # Scheduling is not dispatch: cancelled wrappers cost no credit.
+            # Charge all resume modes only after the adapter accepts the turn.
+            if _auto_resume_max_attempts() > 0:
+                try:
+                    self._get_auto_resume_attempt_store().record_session_attempt(session_key)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Auto-resume attempt accounting failed for %s: %s", session_key, exc)
             session_tasks = getattr(adapter, "_session_tasks", {})
             turn_task = (
                 session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
@@ -16592,26 +16599,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "mode": resume_mode,
                         "reason": fallback_reason,
                     }
-
-            # Charge the per-session cap for EVERY scheduled boot resume, not
-            # just the ``auto``-mode ones that consume a rowid credit above. A
-            # ``prompt``-mode resume and a ``kind=self`` handoff each replay the
-            # full transcript into a fresh agent turn — the exact cost this cap
-            # exists to bound — and ``kind=self`` skips the rowid credit
-            # entirely, which is why the incident session was never counted.
-            # Recorded after create_task for the same reason the credit is: a
-            # scheduling failure must not burn the session's budget.
-            if _max_attempts > 0:
-                try:
-                    self._get_auto_resume_attempt_store().record_session_attempt(
-                        entry.session_key
-                    )
-                except Exception as exc:  # noqa: BLE001 — accounting is best-effort
-                    logger.debug(
-                        "Auto-resume attempt accounting failed for %s: %s",
-                        entry.session_key,
-                        exc,
-                    )
 
             # PHASE observability (spec 2026-07-01): a session PROACTIVELY resumed
             # at boot — reason + origin platform, no content. In auto mode, the

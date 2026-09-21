@@ -206,3 +206,24 @@ def test_a_quiet_period_still_breaks_the_chain(tmp_path, monkeypatch):
     assert rlg.check_and_record(3, 60, now=2000.0, max_gap_seconds=14400) is False
     # A gap wider than max_gap_seconds ends the episode.
     assert rlg.check_and_record(3, 60, now=2000.0 + 14401, max_gap_seconds=14400) is False
+
+
+@pytest.mark.asyncio
+async def test_operator_gap_reaches_scheduler_guard(tmp_path, monkeypatch):
+    import gateway.run as gateway_run
+    from tests.gateway.test_boot_resume_attempt_cap import _runner, _source, _remark
+    runner, _adapter, db = _runner(tmp_path, monkeypatch)
+    _remark(runner, runner.session_store.get_or_create_session(_source()))
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {
+        "gateway": {"restart_loop_guard": {"max_gap_seconds": 14400}}})
+    calls = []
+    def guard(*args, **kwargs):
+        calls.append(kwargs)
+        return False
+    monkeypatch.setattr(rlg, "check_and_record", guard)
+    try:
+        runner._schedule_resume_pending_sessions()
+        assert len(calls) == 1
+        assert calls[0]["max_gap_seconds"] == 14400
+    finally:
+        db.close()

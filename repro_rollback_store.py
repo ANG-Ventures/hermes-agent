@@ -1,4 +1,4 @@
-"""Disposable proof of the task's proposed version-bump premise."""
+"""Exercise the exact shipped legacy writer against the separate v2 ledger."""
 import importlib.util
 import json
 from pathlib import Path
@@ -20,12 +20,18 @@ with tempfile.TemporaryDirectory() as directory:
     sys.modules[spec.name] = old
     spec.loader.exec_module(old)
     path = root / 'attempts.json'
-    original = {'version': 2, 'attempts': [], 'session_attempts': {'fixture-session': {'count': 3, 'attempted_at': 1000.0}}}
-    path.write_text(json.dumps(original))
-    store = old.AutoResumeAttemptStore(path, now=lambda: 1000.0)
+    from gateway.auto_resume import AutoResumeAttemptStore
+    current = AutoResumeAttemptStore(path, now=lambda: 1000.0)
+    for _ in range(3):
+        current.record_session_attempt('fixture-session')
+    ledger_before = current.session_path.read_bytes()
+    legacy = old.AutoResumeAttemptStore(path, now=lambda: 1000.0)
     print('old_writer_commit=cea2ef75e0 old_version=', old._STORE_VERSION)
-    print('before=', original)
-    print('old_session_resume_verdict=', store.session_resume_verdict('fixture-session', 3))
-    after = json.loads(path.read_text())
-    print('after=', after)
-    assert after == original, 'Version bump does NOT protect against the shipped v1 repair writer'
+    print('legacy_verdict=', legacy.session_resume_verdict('fixture-session', 3))
+    # Exercise the actual repair, not just its validator or a fabricated writer.
+    legacy._repair(ValueError('simulated torn legacy file'))
+    assert current.session_path.read_bytes() == ledger_before
+    forward = AutoResumeAttemptStore(path, now=lambda: 1000.0)
+    print('roll_forward_verdict=', forward.session_resume_verdict('fixture-session', 3))
+    assert forward.session_resume_verdict('fixture-session', 3) == (False, 3)
+    print('PASS: legacy writer and repair leave v2 count=3 intact')

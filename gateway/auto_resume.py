@@ -10,6 +10,13 @@ There are two distinct resume kinds:
 This module supports the existing boot-resume scheduler in ``gateway.run``. It
 classifies persisted tool-call tails, names the taxonomy, and stores the
 once-ever SIBLING auto-resume credit; it does not schedule turns itself.
+
+Session counters live in a separate sessions-v2 ledger, migrated once from v1.
+Rollback to any legacy release is supported: legacy gateways do not enforce the
+v2 cap and never open its ledger. Rolling forward resumes from persisted v2
+counts (legacy-era attempts are not counted). Legacy repairs cannot erase v2;
+a reader seeing empty legacy counters alongside retained v2 counters warns once
+and trusts v2. The seven-day TTL still intentionally refills the cap.
 """
 
 from __future__ import annotations
@@ -401,6 +408,9 @@ class AutoResumeAttemptStore:
         now: Callable[[], float] = time.time,
     ) -> None:
         self.path = Path(path)
+        self.session_path = self.path.with_name(self.path.stem + ".sessions-v2.json")
+        self._warned_legacy_reset = False
+        self._legacy_extra = {}
         self._now = now
         # Rowid credits were destroyed by a repair; has_attempt must not mint
         # fresh ones off the emptied file for the remainder of this process.
@@ -471,7 +481,12 @@ class AutoResumeAttemptStore:
         """Reset an unreadable store to empty. True when the reset landed."""
         self._credits_lost = True
         self._warn_unreadable(exc)
-        return self._persist([], {})
+        try:
+            self._write_json(self.session_path, {"version": 2, "session_attempts": {}})
+        except Exception as write_exc:
+            self._degrade(write_exc)
+            return False
+        return True
 
     def _validate(self, raw: Any) -> list[dict[str, Any]]:
         if not isinstance(raw, dict) or raw.get("version") != _STORE_VERSION:
@@ -504,10 +519,8 @@ class AutoResumeAttemptStore:
     def _validate_session_attempts(self, raw: Any) -> dict[str, dict[str, Any]]:
         """Validate the per-session boot-resume counters.
 
-        Absent is valid and means zero: the key was added after the rowid
-        credits, so a file written by an older gateway has no counters and must
-        keep loading (and vice versa — an older gateway ignores this key, which
-        is why adding it needs no ``_STORE_VERSION`` bump).
+        Absent in legacy v1 is valid and means zero for one-time migration.
+        Once a v2 ledger exists, legacy counters are never imported again.
         """
         counters = raw.get("session_attempts") if isinstance(raw, dict) else None
         if counters is None:
@@ -542,14 +555,43 @@ class AutoResumeAttemptStore:
         """
         if self._degraded:
             return None
-        if not self.path.exists():
-            return [], {}
+        raw = {"version": _STORE_VERSION, "attempts": []}
+        attempts = []
+        if self.path.exists():
+            try:
+                raw = json.loads(self.path.read_text(encoding="utf-8"))
+                attempts = self._validate(raw)
+            except Exception as exc:
+                self._credits_lost = True
+                self._warn_unreadable(exc)
+                raw = {"version": _STORE_VERSION, "attempts": []}
+                if not self._persist_legacy([]):
+                    return None
+        # Preserve the legacy shape (including frozen v1 counters, if present).
+        self._legacy_extra = {k: v for k, v in raw.items() if k not in {"version", "attempts"}}
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-            attempts = self._validate(raw)
-            counters = self._validate_session_attempts(raw)
+            if self.session_path.exists():
+                ledger = json.loads(self.session_path.read_text(encoding="utf-8"))
+                if not isinstance(ledger, dict) or ledger.get("version") != 2:
+                    raise ValueError("unsupported session ledger version")
+                if "session_attempts" not in ledger:
+                    raise ValueError("missing session_attempts")
+                counters = self._validate_session_attempts(ledger)
+                if counters and not raw.get("session_attempts") and not self._warned_legacy_reset:
+                    self._warned_legacy_reset = True
+                    logger.warning(
+                        "%s has no legacy counters alongside %s; legacy may have reset "
+                        "them; trusting the v2 ledger, not reimporting v1.",
+                        self.path.name, self.session_path.name,
+                    )
+            else:
+                counters = self._validate_session_attempts(raw)
+                # Establish ownership even for an empty migration, so a later
+                # rollback cannot reintroduce obsolete v1 counters.
+                if not self._persist(attempts, counters):
+                    return None
         except Exception as exc:
-            return ([], {}) if self._repair(exc) else None
+            return (attempts, {}) if self._repair(exc) else None
         cutoff = self._now() - AUTO_RESUME_ATTEMPT_TTL_SECONDS
         current = [item for item in attempts if item["attempted_at"] >= cutoff]
         fresh = {
@@ -573,13 +615,23 @@ class AutoResumeAttemptStore:
         attempts: list[dict[str, Any]],
         session_attempts: dict[str, dict[str, Any]],
     ) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Write v2 first: a crash or legacy writer can never erase its counters.
+        self._write_json(self.session_path, {"version": 2, "session_attempts": session_attempts})
+        self._write_json(self.path, {**self._legacy_extra, "version": _STORE_VERSION, "attempts": attempts})
+
+    def _persist_legacy(self, attempts: list[dict[str, Any]]) -> bool:
+        try:
+            self._write_json(self.path, {"version": _STORE_VERSION, "attempts": attempts})
+        except Exception as exc:
+            self._degrade(exc)
+            return False
+        return True
+
+    @staticmethod
+    def _write_json(path: Path, data: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(
-            {
-                "version": _STORE_VERSION,
-                "attempts": attempts,
-                "session_attempts": session_attempts,
-            },
+            data,
             ensure_ascii=False,
             indent=2,
             sort_keys=True,
@@ -589,8 +641,8 @@ class AutoResumeAttemptStore:
             with tempfile.NamedTemporaryFile(
                 mode="w",
                 encoding="utf-8",
-                dir=self.path.parent,
-                prefix=f".{self.path.name}.",
+                dir=path.parent,
+                prefix=f".{path.name}.",
                 suffix=".tmp",
                 delete=False,
             ) as handle:
@@ -599,11 +651,11 @@ class AutoResumeAttemptStore:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.chmod(temp_path, 0o600)
-            os.replace(temp_path, self.path)
+            os.replace(temp_path, path)
             if os.name == "posix":
                 # The file fsync above protects contents; the directory fsync
                 # makes the renamed entry itself survive a kernel/power crash.
-                directory_fd = os.open(self.path.parent, os.O_RDONLY)
+                directory_fd = os.open(path.parent, os.O_RDONLY)
                 try:
                     try:
                         os.fsync(directory_fd)
@@ -618,7 +670,7 @@ class AutoResumeAttemptStore:
                         logger.warning(
                             "Directory fsync is unsupported for %s; atomic rename "
                             "completed without a directory durability barrier: %s",
-                            self.path.parent,
+                            path.parent,
                             exc,
                         )
                 finally:
