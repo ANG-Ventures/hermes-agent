@@ -4270,7 +4270,6 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             "WHERE status = 'archived'"
         ).fetchall()
     for row in rows:
-        from hermes_cli.kanban_survivor import remove_workspace_dir
         if row["workspace_kind"] == "worktree":
             # Backstop for worktrees that escaped the completion/archive hook
             # (e.g. tasks archived before that hook existed). Same safety
@@ -4278,26 +4277,32 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             wt_path = row["workspace_path"]
             if wt_path and Path(wt_path).is_dir():
                 with kb.connect_closing() as conn:
-                    kb._cleanup_worktree_workspace(row["id"], wt_path, row["branch_name"], conn=conn)
+                    # Liveness + audit now live inside the worktree lane too
+                    # (card t_63fb42f9).
+                    kb._cleanup_worktree_workspace(
+                        row["id"], wt_path, row["branch_name"],
+                        conn=conn, reason="gc_archived",
+                    )
                 if not Path(wt_path).is_dir():
                     removed_ws += 1
             continue
         if row["workspace_kind"] != "scratch":
             continue
         path = Path(row["workspace_path"] or (scratch_root / row["id"]))
-        try:
-            path = path.resolve()
-        except OSError:
-            continue
-        try:
-            path.relative_to(scratch_root.resolve())
-        except ValueError:
-            # Safety: never delete outside the scratch root.
-            continue
-        if path.exists() and path.is_dir():
-            with kb.connect_closing() as conn:
-                if remove_workspace_dir(conn, row["id"], path):
-                    removed_ws += 1
+        # The old guard here was a bare ``path.relative_to(scratch_root)``.
+        # ``Path.relative_to`` SUCCEEDS on an equal path (it returns '.'), so an
+        # archived row whose workspace_path was the workspaces ROOT itself would
+        # pass the containment check and rmtree every live card's scratch dir in
+        # one call -- the 2026-09-20 incident. safe_remove_workspace_dir requires
+        # STRICT descendancy, refuses any card with a live run, audits both
+        # outcomes, and performs the removal through
+        # kanban_survivor.remove_workspace_dir so survivor preservation (#783)
+        # still runs underneath.
+        with kb.connect_closing() as conn:
+            if kb.safe_remove_workspace_dir(
+                path, task_id=row["id"], reason="gc_archived", conn=conn,
+            ):
+                removed_ws += 1
 
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)

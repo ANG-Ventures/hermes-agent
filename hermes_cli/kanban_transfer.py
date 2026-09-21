@@ -430,11 +430,15 @@ def import_board(
 
         board_root = kb.board_dir(target)
         board_root.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(staged_db), str(board_root / "kanban.db"))
+        # noqa: gate-dominance -- target comes from _available_slug(), which
+        # returns a slug no board currently occupies, so board_root was just
+        # created empty and cannot enclose any card's workspaces/ (measured:
+        # card t_63fb42f9 round-6 class sweep). No liveness gate is owed.
+        shutil.move(str(staged_db), str(board_root / "kanban.db"))  # noqa: gate-dominance -- fresh slug, see above
         for tree in ("attachments", "logs"):
             src = extracted / tree
             if src.is_dir():
-                shutil.move(str(src), str(board_root / tree))
+                shutil.move(str(src), str(board_root / tree))  # noqa: gate-dominance -- fresh slug, see above
 
     # Rewritten rather than moved across: the archive's copy names a slug
     # and a workdir that belong to the exporting machine.

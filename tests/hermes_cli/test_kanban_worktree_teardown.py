@@ -69,6 +69,17 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def _make_worktree(repo: Path, task_id: str, branch: str | None = None) -> Path:
     target = repo / ".worktrees" / task_id
     kb._ensure_git_worktree(repo, target, branch or f"wt/{task_id}")
+    # Teardown now requires a known owner. Unit-only callers previously made
+    # anonymous worktrees; register one so dirty/git checks are still exercised
+    # rather than passing vacuously at the unknown-owner refusal.
+    with kb.connect_closing() as conn:
+        if conn.execute("SELECT id FROM tasks WHERE id=?", (task_id,)).fetchone() is None:
+            owner = kb.create_task(
+                conn, title="worktree owner", workspace_kind="worktree",
+                workspace_path=str(target),
+            )
+            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (owner,))
+            conn.commit()
     return target
 
 
