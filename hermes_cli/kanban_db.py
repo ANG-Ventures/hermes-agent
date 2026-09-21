@@ -4205,17 +4205,17 @@ def create_task(
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
-    from hermes_cli.model_policy import validate_worker_model
-
-    flagship_override_reason = validate_worker_model(
-        model_override,
-        allow_flagship_reason=flagship_override_reason,
-    )
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     model_override, provider_override = _resolve_stored_model_pair(
         model_override, provider_override
+    )
+    from hermes_cli.model_policy import validate_worker_model
+
+    flagship_override_reason = validate_worker_model(
+        model_override,
+        allow_flagship_reason=flagship_override_reason,
     )
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
@@ -4781,17 +4781,17 @@ def set_model_override(
     """
     model = (model or "").strip() or None
     provider = (provider or "").strip() or None
+    if provider and not model:
+        raise ValueError("provider_override requires a model_override")
+    if not model:
+        provider = None
+    model, provider = _resolve_stored_model_pair(model, provider)
     from hermes_cli.model_policy import validate_worker_model
 
     flagship_override_reason = validate_worker_model(
         model,
         allow_flagship_reason=flagship_override_reason,
     )
-    if provider and not model:
-        raise ValueError("provider_override requires a model_override")
-    if not model:
-        provider = None
-    model, provider = _resolve_stored_model_pair(model, provider)
     with write_txn(conn):
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
@@ -10198,6 +10198,9 @@ def set_task_model(
     a real write from a no-op.
     """
     resolved_model, resolved_provider = _resolve_stored_model_pair(model, None)
+    from hermes_cli.model_policy import validate_worker_model
+
+    validate_worker_model(resolved_model)
     if not resolved_model:
         resolved_provider = None
     with write_txn(conn):
