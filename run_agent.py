@@ -9007,6 +9007,12 @@ class AIAgent:
             action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"),
             message=function_args.get("message"),
+            # Per-call route object (card t_55547259). This is the LIVE dispatch
+            # path — the registry lambda in delegate_tool.py is only the fallback
+            # for a bypassed intercept, so omitting `model` here would leave the
+            # per-call override inert in production while unit tests that call
+            # the lambda still passed.
+            model=function_args.get("model"),
             parent_agent=self,
         )
 

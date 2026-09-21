@@ -3977,6 +3977,25 @@ def _build_durable_background_spec(
     execution = {
         "model": creds.get("model") or getattr(effective_agent, "model", None),
         "provider": effective_provider,
+        # ANNOUNCE (card t_55547259): persist the route AND who chose it, so a
+        # recovered/inspected child record answers "what did this run on?"
+        # without re-deriving config state from spawn time.
+        "route": next(
+            (
+                t.get("_route_line")
+                for t in (persisted_tasks or [])
+                if isinstance(t, dict) and t.get("_route_line")
+            ),
+            None,
+        ),
+        "route_source": next(
+            (
+                t.get("_route_source")
+                for t in (persisted_tasks or [])
+                if isinstance(t, dict) and t.get("_route_source")
+            ),
+            None,
+        ),
         "base_url": creds.get("base_url") or getattr(effective_agent, "base_url", None),
         "api_mode": creds.get("api_mode") or getattr(effective_agent, "api_mode", None),
         "acp_command": creds.get("command") or getattr(
@@ -4154,6 +4173,69 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
     return None
 
 
+def _resolve_task_route(
+    task: Dict[str, Any],
+    batch_override,
+    config_creds: Dict[str, Any],
+    parent_agent,
+):
+    """Resolve ONE child's route and say where it came from.
+
+    Precedence (card t_55547259): per-task ``model`` object > top-level call
+    ``model`` object > ``delegation:`` config > parent agent.  The source is
+    returned alongside the route because an unattributed route is the thing
+    that made the config edit tempting in the first place — an operator must
+    be able to read a log line and know whether to fix a call or a config.
+
+    Returns ``(creds_dict, source, override_or_None)``.  ``creds_dict`` is
+    always a full credential bundle so the caller can pass it straight to
+    ``_build_child_agent`` without re-deriving anything.
+    """
+    from hermes_cli.model_override import parse_model_override
+
+    per_task_raw = task.get("model") if isinstance(task, dict) else None
+    per_task = parse_model_override(per_task_raw, field="tasks[].model")
+
+    # Per-task layers OVER the batch object rather than replacing it, so a task
+    # that pins only `provider` keeps the batch's model (and its firepower
+    # justification) instead of silently falling back to the config default.
+    effective = (
+        per_task.merged_over(batch_override) if per_task else batch_override
+    )
+    source = "call"
+
+    if not effective:
+        # Nothing supplied at the call site: the config pin (if any) decides,
+        # otherwise the child inherits the parent. Both are pre-existing
+        # behaviour and stay byte-identical.
+        cfg_source = "config" if (
+            config_creds.get("model") or config_creds.get("provider")
+        ) else "parent"
+        return dict(config_creds), cfg_source, None
+
+    # An explicit per-call route resolves through the SAME credential path the
+    # config pin uses, so a call-routed child cannot end up with a differently
+    # resolved provider bundle than a config-routed one.
+    call_cfg = effective.as_delegation_cfg()
+    resolved = _resolve_delegation_credentials(call_cfg, parent_agent)
+
+    # Only the keys the caller actually pinned override the config bundle;
+    # everything else (base_url/api_key/api_mode for an unpinned provider)
+    # keeps whatever the config resolution produced.
+    merged = dict(config_creds)
+    for key in ("model", "provider", "base_url", "api_key", "api_mode"):
+        if resolved.get(key):
+            merged[key] = resolved[key]
+    for key in ("request_overrides", "max_output_tokens", "command", "args"):
+        if resolved.get(key):
+            merged[key] = resolved[key]
+    if not merged.get("model") and effective.model:
+        merged["model"] = effective.model
+    if not merged.get("provider") and effective.provider:
+        merged["provider"] = effective.provider
+    return merged, source, effective
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -4167,6 +4249,7 @@ def delegate_task(
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
+    model: Optional[Dict[str, Any]] = None,
     parent_agent=None,
     _recovery_spec: Optional[Dict[str, Any]] = None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
@@ -4294,6 +4377,22 @@ def delegate_task(
             credentials_cfg if credentials_cfg else cfg, parent_agent
         )
     except ValueError as exc:
+        return tool_error(str(exc))
+
+    # Per-call route (card t_55547259): the batch-level ``model`` object.
+    # Parsed HERE — before any child is constructed — so a malformed object or
+    # an unjustified flagship route refuses the whole call instead of spawning
+    # half a batch and then failing. This is the knob that replaces editing
+    # `delegation:` in config.yaml to move one batch.
+    from hermes_cli.model_override import (
+        ModelOverrideError,
+        format_route,
+        parse_model_override,
+    )
+
+    try:
+        batch_override = parse_model_override(model, field="model")
+    except ModelOverrideError as exc:
         return tool_error(str(exc))
 
     # Normalize to task list
@@ -4443,6 +4542,33 @@ def delegate_task(
             from tools.delegation_output_schema import append_output_contract
 
             _child_context = append_output_contract(_child_context, _task_schema)
+        # Resolve THIS child's route: per-task object > batch object > config
+        # > parent. Done per task (not once per batch) so one task in a batch
+        # can ride a different model without a second delegate_task call.
+        try:
+            _task_creds, _route_source, _task_override = _resolve_task_route(
+                t, batch_override, creds, parent_agent
+            )
+        except ModelOverrideError as exc:
+            return tool_error(str(exc))
+        except ValueError as exc:
+            return tool_error(str(exc))
+
+        # ANNOUNCE (card t_55547259): every spawn states the route it actually
+        # got and who chose it, so "what did this run on?" is answerable from
+        # the log without reconstructing config state at spawn time.
+        _route_line = format_route(
+            _task_creds.get("provider") or getattr(parent_agent, "provider", None),
+            _task_creds.get("model") or getattr(parent_agent, "model", None),
+            _route_source,
+        )
+        logger.info("delegate_task child %d: %s", i, _route_line)
+        try:
+            t["_route_line"] = _route_line
+            t["_route_source"] = _route_source
+        except Exception:
+            logger.debug("Could not stamp route onto task %d", i)
+
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i,
@@ -4451,18 +4577,18 @@ def delegate_task(
                 # Subagents always inherit the parent's toolsets; the model
                 # cannot choose or narrow them (no model-facing toolsets arg).
                 toolsets=None,
-                model=creds["model"],
+                model=_task_creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_request_overrides=creds.get("request_overrides"),
-                override_max_tokens=creds.get("max_output_tokens"),
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
+                override_provider=_task_creds["provider"],
+                override_base_url=_task_creds["base_url"],
+                override_api_key=_task_creds["api_key"],
+                override_api_mode=_task_creds["api_mode"],
+                override_request_overrides=_task_creds.get("request_overrides"),
+                override_max_tokens=_task_creds.get("max_output_tokens"),
+                override_acp_command=_task_creds.get("command"),
+                override_acp_args=_task_creds.get("args"),
                 role=effective_role,
                 inherit_context=bool(
                     t.get("inherit_context")
@@ -5646,6 +5772,21 @@ DELEGATE_TASK_SCHEMA = {
                             "items": {"type": "string"},
                             "description": "Per-task skill promotion override. See top-level 'skills'.",
                         },
+                        "model": {
+                            "type": "object",
+                            "properties": {
+                                "model": {"type": "string"},
+                                "provider": {"type": "string"},
+                                "reasoning_effort": {"type": "string"},
+                                "firepower": {"type": "string"},
+                            },
+                            "description": (
+                                "Per-task route override, same object as the "
+                                "top-level 'model'. Wins over it. Use when ONE "
+                                "task in the batch needs a different model or "
+                                "provider than the rest."
+                            ),
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -5710,6 +5851,27 @@ DELEGATE_TASK_SCHEMA = {
                     "can still browse/load ANY skill via skills_list/skill_view."
                 ),
             },
+            "model": {
+                "type": "object",
+                "properties": {
+                    "model": {"type": "string"},
+                    "provider": {"type": "string"},
+                    "reasoning_effort": {"type": "string"},
+                    "firepower": {"type": "string"},
+                },
+                "description": (
+                    "Route THIS batch's children to a specific model/provider, "
+                    "e.g. {\"provider\": \"claude-bpx-19\"} to move one batch off a "
+                    "capacity-limited pool, or {\"model\": \"gpt-5.6-sol-900k\", "
+                    "\"provider\": \"openai-codex\"}. All keys optional — pass only "
+                    "what you want to change; the rest falls through to the "
+                    "delegation config. Must be an OBJECT: a bare string is "
+                    "refused. NEVER edit `delegation:` in config.yaml to route a "
+                    "batch — that changes the standing default for every future "
+                    "subagent in every session. Flagship models (gpt-6-astra*, "
+                    "claude-fable*) additionally require firepower:\"<reason>\"."
+                ),
+            },
         },
         "required": [],
     },
@@ -5763,9 +5925,13 @@ registry.register(
     name="delegate_task",
     toolset="delegation",
     schema=DELEGATE_TASK_SCHEMA,
-    # Reject undeclared args (e.g. an imaginary per-call `model=`): the handler below
-    # reads args by name, so anything not in the schema would be silently dropped
-    # and the children would run on the config default (2026-09-09).
+    # Reject undeclared args: the handler below reads args by name, so anything
+    # not in the schema would be silently dropped and the children would run on
+    # the config default (2026-09-09). NOTE: a per-call `model=` is no longer
+    # imaginary — it is a declared OBJECT arg (card t_55547259) and is threaded
+    # to delegate_task below. A flat `model="id"` string is still refused, but
+    # now by model_override.parse_model_override with a message naming the
+    # object shape, rather than by silent omission.
     strict_args=True,
     # The legacy single-goal shape is accepted by the handler but deliberately kept off
     # the model-facing schema (see the NOTE on DELEGATE_TASK_SCHEMA); list it here so
@@ -5784,6 +5950,7 @@ registry.register(
         action=args.get("action"),
         subagent_id=args.get("subagent_id"),
         message=args.get("message"),
+        model=args.get("model"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

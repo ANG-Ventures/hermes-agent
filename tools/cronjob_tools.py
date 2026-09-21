@@ -2611,6 +2611,15 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                         "type": "string",
                         "description": "Model name (e.g. 'anthropic/claude-sonnet-4', 'claude-sonnet-4')"
                     }
+                    # parity pin 2026-08-30 (see the note at the end of this
+                    # properties block): reasoning_effort is DELIBERATELY absent
+                    # from the model-facing cron schema — models never choose
+                    # model config on this fork. The unified override object
+                    # (model/provider/reasoning_effort, card t_55547259) is
+                    # therefore advertised on delegate_task and kanban only; the
+                    # cron HANDLER still accepts a nested reasoning_effort so a
+                    # CLI/internal caller using the unified shape is honoured
+                    # rather than silently dropped.
                 },
                 "required": ["model"]
             },
@@ -2701,6 +2710,16 @@ def _cronjob_tool_handler(args: Dict[str, Any], **kw: Any) -> str:
         args.get("model"), args.get("provider")
     )
     resolved_provider, resolved_model = _resolve_model_override(model_obj)
+    # Unified override object (Ace 2026-09-21): {model, provider, reasoning_effort}
+    # is one shape across cronjob / delegate_task / kanban. Cron already took a
+    # sibling top-level ``reasoning_effort``; accept it INSIDE the object too so
+    # a caller using the unified shape is not silently ignored. The explicit
+    # top-level arg still wins — it is the more specific statement of intent.
+    _effort_arg = args.get("reasoning_effort")
+    if not _effort_arg and isinstance(model_obj, dict):
+        _nested_effort = model_obj.get("reasoning_effort")
+        if _nested_effort is not None and str(_nested_effort).strip():
+            _effort_arg = str(_nested_effort).strip()
     # When the model spec was uninterpretable (spec_warning set), the intent is
     # to leave the job auto-pinned — so DON'T let a stray sibling ``provider``
     # arg leak through as a provider-without-model half-pin (Greptile #411 P2).
@@ -2722,6 +2741,7 @@ def _cronjob_tool_handler(args: Dict[str, Any], **kw: Any) -> str:
         skills=args.get("skills"),
         model=resolved_model,
         provider=resolved_provider or _fallback_provider,
+        reasoning_effort=_effort_arg,
         base_url=args.get("base_url"),
         reason=args.get("reason"),
         script=args.get("script"),
