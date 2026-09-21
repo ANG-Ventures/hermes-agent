@@ -1,12 +1,11 @@
 """Prove the slot-LEAK class behind the 2026-09-20 boot-resume starvation.
 
-The census of shared-pool callers (gateway/run.py) shows three of them wrap
-their submission in ``asyncio.wait_for(...)`` and, on timeout, log
-"proceeding without blocking the event loop (the worker thread is left to
-finish on its own)":
+The repository-wide census found three gateway paths that wrap executor
+housekeeping in ``asyncio.wait_for(...)`` and proceed after timeout:
 
-  :13345  _finalize_session_off_loop        _FINALIZE_TIMEOUT_S = 10.0
-  :13385  _cleanup_agent_resources_off_loop _CLEANUP_TIMEOUT_S  = 30.0
+  gateway/run.py            _finalize_session_off_loop
+  gateway/run.py            _cleanup_agent_resources_off_loop
+  gateway/slash_commands.py _handle_reset_command cleanup
 
 ``asyncio.wait_for`` bounds the AWAIT. It does not bound the OCCUPANCY: a
 ``concurrent.futures`` work item that has already begun executing cannot be
@@ -17,15 +16,17 @@ blocking call inside it runs. N such abandonments permanently retire N of the
 This drives the REAL _cleanup_agent_resources_off_loop against a wedged agent
 and measures pool slots still held AFTER every caller has given up waiting.
 
-Exit 0 = leak reproduced.
+Exit 0 = housekeeping saturation reproduced and turn-pool isolation verified.
 """
 import asyncio
+from pathlib import Path
 import sys
 import threading
 import time
 import types
 
-sys.path.insert(0, "/tmp/kb-t_76215201")
+REPO_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO_ROOT))
 
 from gateway.run import GatewayRunner  # noqa: E402
 
@@ -39,7 +40,6 @@ def _bare_runner(wedge: threading.Event, entered: threading.Semaphore):
     # Shorten the real constant so the test is fast; the MECHANISM under test
     # is the abandonment, not the specific budget.
     obj._CLEANUP_TIMEOUT_S = 1.0
-    obj._get_pool = types.MethodType(GatewayRunner._get_pool, obj)
     obj._get_executor = types.MethodType(GatewayRunner._get_executor, obj)
     obj._get_housekeeping_executor = types.MethodType(
         GatewayRunner._get_housekeeping_executor, obj
