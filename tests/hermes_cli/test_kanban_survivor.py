@@ -1,6 +1,7 @@
 """Real Git/SQLite regressions for code surviving task completion and GC."""
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -511,3 +512,44 @@ def test_bundle_write_failure_holds_workspace(board, monkeypatch):
         kb.complete_task(board, tid)
     kb._cleanup_workspace(board, tid)
     assert ws.exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory modes")
+def test_record_baseline_skips_unreadable_dirs_instead_of_failing_dispatch(board):
+    """A 0700 dir owned by someone else inside a `dir` workspace must not take
+    down the dispatch tick (2026-09-20: root-owned var/skills-portal/caddy under
+    ~/.hermes made every card on the default board unspawnable). Unreadable dirs
+    hold no repo the worker could write to, so skipping them loses no survivor;
+    any OTHER walk error is still fatal."""
+    import hermes_cli.kanban_survivor as survivor
+    conn = board
+    tid, ws, repo = fixture_repo(conn)
+    # fixture_repo already recorded a baseline via set_workspace_path — start over
+    conn.execute("DELETE FROM task_workspace_survivors WHERE task_id = ?", (tid,))
+    conn.commit()
+    locked = ws / "locked"
+    locked.mkdir()
+    (locked / "secret").write_text("x")
+    locked.chmod(0o000)
+    try:
+        survivor.record_baseline(conn, tid, ws)           # must not raise
+        bases = json.loads(conn.execute(
+            "SELECT bases FROM task_workspace_survivors WHERE task_id = ?", (tid,)).fetchone()[0])
+        assert bases.get(".") == git(repo, "rev-parse", "HEAD"), bases
+    finally:
+        locked.chmod(0o700)
+    # negative control: a non-permission walk error still propagates
+    class Boom(OSError):
+        pass
+    def exploding_walk(*a, **k):
+        k["onerror"](Boom("disk on fire"))
+        return iter(())
+    conn.execute("DELETE FROM task_workspace_survivors WHERE task_id = ?", (tid,))
+    conn.commit()
+    orig = survivor.os.walk
+    survivor.os.walk = exploding_walk
+    try:
+        with pytest.raises(Boom):
+            survivor.record_baseline(conn, tid, ws)
+    finally:
+        survivor.os.walk = orig
