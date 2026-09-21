@@ -189,6 +189,16 @@ def _zero_output(agent: Any, response: Any) -> tuple:
     output = getattr(canonical, "output_tokens", None)
     if output is None:
         return (False, False)
+    # UNKNOWN != 0. A provider that declared its output unmeasured (the bridge's
+    # ``completion_tokens: null`` + ``output_tokens_unavailable``) normalizes to
+    # output_tokens=0 with the discriminator set — that is MISSING usage, not
+    # evidence the model generated nothing. Reading it as a measured zero would
+    # let two such attempts satisfy ``deterministic_empty()`` and cut the retry
+    # budget on a transient, contradicting this module's own fail-open rule.
+    if getattr(canonical, "output_tokens_unknown", False) or getattr(
+        canonical, "usage_unknown", False
+    ):
+        return (False, False)
     # A present-but-empty usage object (some proxies emit usage with no
     # fields) normalizes to all zeros. A genuine completion always has
     # input tokens — without them the usage is not evidence, fail open.

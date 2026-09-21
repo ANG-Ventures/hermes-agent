@@ -204,6 +204,60 @@ def _home_thread_from_source(source) -> Optional[str]:
     return str(thread_id)
 
 
+def render_thin_last_turn_lines(thin_snap, fallback_label=None) -> list:
+    """Render the degraded /usage last-turn card from a thin usage snapshot.
+
+    Module-level and callable so tests drive the SHIPPED renderer directly
+    instead of AST-lifting it out of the mixin method below (a source-text
+    anchor that both breaks on benign refactors and can go green against a
+    fixture no producer emits).
+
+    ``thin_snap`` is whatever the two real producers hand over:
+    ``HermesState.get_last_turn_usage`` (persisted, agent evicted) or the
+    resident agent's session counters. BOTH now carry the UNKNOWN
+    discriminators, so an unmeasured bucket renders ``unknown`` here rather
+    than presenting the stored 0 as a measurement.
+    """
+    from agent.usage_pricing import format_token_count, prompt_tokens_unknown
+
+    def _as_int(v):
+        try:
+            return int(v or 0)
+        except (TypeError, ValueError):
+            return 0
+    lt_in = _as_int(thin_snap.get("input_tokens"))
+    lt_out = _as_int(thin_snap.get("output_tokens"))
+    lt_cr = _as_int(thin_snap.get("cache_read_tokens"))
+    lt_cw = _as_int(thin_snap.get("cache_write_tokens"))
+    lt_rsn = _as_int(thin_snap.get("reasoning_tokens"))
+    in_billed = lt_in + lt_cr + lt_cw
+    out_billed = lt_out + lt_rsn  # fold reasoning into the output total
+    out_label = fallback_label or "persisted; agent not resident"
+    out_lines = [f"📊 **Last turn** ({out_label})"]
+
+    # Route only the UNKNOWN case through the shared rule; keep this card's
+    # own comma formatting for measured values via ``formatter``.
+    def _tok(value: int, *, unknown: bool) -> str:
+        return format_token_count(value, unknown=unknown, formatter=lambda v: f"{v:,}")
+
+    input_unknown = prompt_tokens_unknown(thin_snap)
+    output_unknown = bool(thin_snap.get("output_tokens_unknown") or thin_snap.get("usage_unknown"))
+    if input_unknown:
+        out_lines.append(f"• Tokens in: {_tok(in_billed, unknown=True)}")
+    elif in_billed:
+        out_lines.append(
+            f"• Tokens in: {in_billed:,} billed "
+            f"({lt_cr:,} cache-read + {lt_cw:,} cache-write + {lt_in:,} uncached)"
+        )
+    if out_billed or output_unknown:
+        out_lines.append(f"• Tokens out: {_tok(out_billed, unknown=output_unknown)} billed")
+    out_lines.append(
+        f"• Total (billed in+out): "
+        f"{_tok(in_billed + out_billed, unknown=input_unknown or output_unknown)}"
+    )
+    return out_lines
+
+
 class GatewaySlashCommandsMixin:
     """In-session slash-command handlers for GatewayRunner."""
 
@@ -8082,44 +8136,7 @@ class GatewaySlashCommandsMixin:
         if not thin_snap:
             return []
         logger.warning("usage last-turn card: degraded to thin get_last_turn_usage snapshot")
-
-        def _as_int(v):
-            try:
-                return int(v or 0)
-            except (TypeError, ValueError):
-                return 0
-        lt_in = _as_int(thin_snap.get("input_tokens"))
-        lt_out = _as_int(thin_snap.get("output_tokens"))
-        lt_cr = _as_int(thin_snap.get("cache_read_tokens"))
-        lt_cw = _as_int(thin_snap.get("cache_write_tokens"))
-        lt_rsn = _as_int(thin_snap.get("reasoning_tokens"))
-        in_billed = lt_in + lt_cr + lt_cw
-        out_billed = lt_out + lt_rsn  # fold reasoning into the output total
-        out_label = fallback_label or "persisted; agent not resident"
-        out_lines = [f"📊 **Last turn** ({out_label})"]
-        from agent.usage_pricing import format_token_count, prompt_tokens_unknown
-
-        # Route only the UNKNOWN case through the shared rule; keep this card's
-        # own comma formatting for measured values via ``formatter``.
-        def _tok(value: int, *, unknown: bool) -> str:
-            return format_token_count(value, unknown=unknown, formatter=lambda v: f"{v:,}")
-
-        input_unknown = prompt_tokens_unknown(thin_snap)
-        output_unknown = bool(thin_snap.get("output_tokens_unknown") or thin_snap.get("usage_unknown"))
-        if input_unknown:
-            out_lines.append(f"• Tokens in: {_tok(in_billed, unknown=True)}")
-        elif in_billed:
-            out_lines.append(
-                f"• Tokens in: {in_billed:,} billed "
-                f"({lt_cr:,} cache-read + {lt_cw:,} cache-write + {lt_in:,} uncached)"
-            )
-        if out_billed or output_unknown:
-            out_lines.append(f"• Tokens out: {_tok(out_billed, unknown=output_unknown)} billed")
-        out_lines.append(
-            f"• Total (billed in+out): "
-            f"{_tok(in_billed + out_billed, unknown=input_unknown or output_unknown)}"
-        )
-        return out_lines
+        return render_thin_last_turn_lines(thin_snap, fallback_label)
 
     async def _handle_usage_command(self, event: MessageEvent) -> str:
         """Handle /usage command -- show token usage for the current session.

@@ -1715,6 +1715,56 @@ def format_token_count(
     return str(n)
 
 
+def verbose_token_usage_log_args(
+    canonical_usage: Any, prompt_tokens: Any, completion_tokens: Any, total_tokens: Any
+) -> tuple[str, str, str]:
+    """(prompt, completion, total) as rendered for the verbose token-usage log.
+
+    Extracted from ``agent/conversation_loop.py``'s ``verbose_logging`` block so
+    the UNKNOWN routing is callable — and therefore testable — instead of only
+    reachable by re-parsing an 8k-line module's source. This log's own
+    comma-grouped vocabulary is preserved via ``formatter``; only the unknown
+    case goes through the shared rule.
+    """
+    comma = lambda v: f"{int(v or 0):,}"  # noqa: E731 - this log's existing formatting
+    return (
+        format_token_count(
+            prompt_tokens, unknown=prompt_tokens_unknown(canonical_usage), formatter=comma
+        ),
+        format_token_count(
+            completion_tokens,
+            unknown=bool(canonical_usage.output_tokens_unknown)
+            or bool(canonical_usage.usage_unknown),
+            formatter=comma,
+        ),
+        format_token_count(
+            total_tokens, unknown=canonical_usage.total_tokens_unknown, formatter=comma
+        ),
+    )
+
+
+def cache_stats_line(canonical_usage: Any, prompt_tokens: Any) -> Optional[str]:
+    """The console cache-hit line for a turn, or None when there is nothing to say.
+
+    Extracted from ``agent/conversation_loop.py``'s post-call console block.
+    UNKNOWN wins over the hit-rate render: a hit percentage computed from an
+    unmeasured prompt total is a fabricated measurement, so an unknown input
+    reports ``unknown`` and suppresses both the ``% hit`` and ``written`` terms.
+    """
+    cached = canonical_usage.cache_read_tokens
+    written = canonical_usage.cache_write_tokens
+    if prompt_tokens_unknown(canonical_usage):
+        return f"💾 Cache: {format_token_count(None, unknown=True)}"
+    if not (cached or written):
+        return None
+    prompt = int(prompt_tokens or 0)
+    hit_pct = (cached / prompt * 100) if prompt > 0 else 0
+    return (
+        f"💾 Cache: {cached:,}/{prompt:,} tokens "
+        f"({hit_pct:.0f}% hit, {written:,} written)"
+    )
+
+
 
 def resolve_billing_route(
     model_name: str,
@@ -2365,14 +2415,24 @@ def normalize_usage(
     )
     details_key = "input_tokens_details" if mode == "codex_responses" else "prompt_tokens_details"
     details = _usage_get(response_usage, details_key, None)
-    details_unknown = _bucket_is_unknown(response_usage, (details_key,))
+    # A null details CONTAINER is not an unknown COUNT. ``"prompt_tokens_details":
+    # null`` is the ordinary serialization of an OpenAI-compatible server that has
+    # no cache breakdown to report (any encoder without ``exclude_none`` emits it,
+    # and pydantic puts the explicitly-null wire field in ``model_fields_set``), so
+    # reading it as "both cache buckets were unmeasured" escalated into
+    # ``input_tokens_unknown`` and made every such turn permanently unpriceable —
+    # with ``prompt_tokens`` measured right beside it. Absent cache detail means
+    # zero cache, exactly as it did before the UNKNOWN work. Only a null on a
+    # counter the provider actually uses (``cached_tokens: null`` inside a PRESENT
+    # container, a null top-level cache field) or an explicit ``cache_*_unavailable``
+    # discriminator is a declaration that the bucket was not measured.
     cache_read_unknown = (
-        details_unknown or _bucket_is_unknown(details, ("cached_tokens",))
+        _bucket_is_unknown(details, ("cached_tokens",))
         or _bucket_is_unknown(response_usage, ("cache_read_input_tokens", "prompt_cache_hit_tokens", "cached_tokens"),
                               ("cache_read_tokens_unavailable",))
     )
     cache_write_unknown = (
-        details_unknown or _bucket_is_unknown(details, ("cache_write_tokens", "cache_creation_tokens", "cache_creation_input_tokens"))
+        _bucket_is_unknown(details, ("cache_write_tokens", "cache_creation_tokens", "cache_creation_input_tokens"))
         or _bucket_is_unknown(response_usage, ("cache_creation_input_tokens", "cache_write_tokens"),
                               ("cache_write_tokens_unavailable",))
     )
@@ -2535,11 +2595,15 @@ def estimate_usage_cost(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> CostResult:
-    if usage.total_tokens_unknown:
-        return CostResult(amount_usd=None, status="unknown", source="none", label="n/a",
-                          notes=("usage unavailable from provider; turn is unpriceable",))
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
     if route.billing_mode == "subscription_included":
+        # A subscription route's marginal cost is $0 BY DEFINITION OF THE ROUTE —
+        # it does not depend on token counts, so an unmeasured usage cannot make
+        # it unpriceable. This branch is deliberately ABOVE the unknown-usage
+        # refusal below: refusing here would persist cost_usd NULL for a turn we
+        # already know was free, and ``store.reprice_unpriced`` filters unknown
+        # rows out forever, so the NULL would never heal. Mirrors the ordering
+        # plugins/observability/langfuse/__init__.py already uses.
         return CostResult(
             amount_usd=_ZERO,
             status="included",
@@ -2548,6 +2612,9 @@ def estimate_usage_cost(
             pricing_version="included-route",
             notes=(_INCLUDED_NOTE,),
         )
+    if usage.total_tokens_unknown:
+        return CostResult(amount_usd=None, status="unknown", source="none", label="n/a",
+                          notes=("usage unavailable from provider; turn is unpriceable",))
 
     entry = get_pricing_entry(model_name, provider=provider, base_url=base_url, api_key=api_key)
     if not entry:
