@@ -4855,11 +4855,23 @@ def run_conversation(
                     # does not remain latched indefinitely.
                     agent.context_compressor.update_from_response({})
 
-                if hasattr(response, 'usage') and response.usage:
+                # Commit per-call accounting for EVERY successful provider
+                # response, including one that carried no usage payload. The
+                # old `response.usage` truthiness guard silently dropped such a
+                # call out of session counters, the last-turn snapshot, the
+                # Blackbox `_turn_calls` accumulator, pricing and persistence —
+                # so an unpriceable call was reported as if it had never
+                # happened. `canonical_usage` is already an aggregate UNKNOWN
+                # in that case (see `_canonical_usage_from_response`), so every
+                # consumer below refuses to present its zeros as measurements.
+                if response is not None:
                     # Cache discovered context length after successful call.
                     # Only persist limits confirmed by the provider (parsed
                     # from the error message), not guessed probe tiers.
-                    if getattr(agent.context_compressor, "_context_probed", False):
+                    if (
+                        getattr(response, "usage", None)
+                        and getattr(agent.context_compressor, "_context_probed", False)
+                    ):
                         ctx = agent.context_compressor.context_length
                         if getattr(agent.context_compressor, "_context_probe_persistable", False):
                             save_context_length(agent.model, agent.base_url, ctx)
