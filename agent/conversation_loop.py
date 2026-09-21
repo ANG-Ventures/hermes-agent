@@ -4688,7 +4688,9 @@ def run_conversation(
                     # working; this flag rides alongside so every persistence and
                     # display site can refuse to present the 0 as a measurement.
                     output_unknown = bool(canonical_usage.output_tokens_unknown)
-                    from agent.usage_pricing import USAGE_UNKNOWN_FIELDS, prompt_tokens_unknown
+                    from agent.usage_pricing import (
+                        USAGE_UNKNOWN_FIELDS, cache_stats_line, prompt_tokens_unknown,
+                    )
                     usage_flags = {key: bool(getattr(canonical_usage, key)) for key in USAGE_UNKNOWN_FIELDS}
                     # Forward canonical token + cache buckets so context engines
                     # can make decisions on cache hit ratios / reasoning costs,
@@ -5003,13 +5005,12 @@ def run_conversation(
                             )
                     
                     if agent.verbose_logging:
-                        from agent.usage_pricing import format_token_count
-                        _comma = lambda v: f"{int(v or 0):,}"  # noqa: E731 - preserve this log's existing formatting
+                        from agent.usage_pricing import verbose_token_usage_log_args
                         logging.debug(
                             "Token usage: prompt=%s, completion=%s, total=%s",
-                            format_token_count(prompt_tokens, unknown=prompt_tokens_unknown(canonical_usage), formatter=_comma),
-                            format_token_count(completion_tokens, unknown=output_unknown or canonical_usage.usage_unknown, formatter=_comma),
-                            format_token_count(total_tokens, unknown=canonical_usage.total_tokens_unknown, formatter=_comma),
+                            *verbose_token_usage_log_args(
+                                canonical_usage, prompt_tokens, completion_tokens, total_tokens
+                            ),
                         )
                     
                     # Surface cache hit stats for any provider that reports
@@ -5023,19 +5024,11 @@ def run_conversation(
                     # ``canonical_usage`` is already normalised from all
                     # three API shapes (Anthropic / Codex / OpenAI-chat)
                     # so we can rely on its values directly.
-                    cached = canonical_usage.cache_read_tokens
-                    written = canonical_usage.cache_write_tokens
-                    prompt = usage_dict["prompt_tokens"]
-                    if prompt_tokens_unknown(canonical_usage) and not agent.quiet_mode:
-                        from agent.usage_pricing import format_token_count
-                        agent._vprint(f"{agent.log_prefix}   💾 Cache: {format_token_count(None, unknown=True)}")
-                    elif (cached or written) and not agent.quiet_mode:
-                        hit_pct = (cached / prompt * 100) if prompt > 0 else 0
-                        agent._vprint(
-                            f"{agent.log_prefix}   💾 Cache: "
-                            f"{cached:,}/{prompt:,} tokens "
-                            f"({hit_pct:.0f}% hit, {written:,} written)"
-                        )
+                    cache_line = cache_stats_line(
+                        canonical_usage, usage_dict["prompt_tokens"]
+                    )
+                    if cache_line and not agent.quiet_mode:
+                        agent._vprint(f"{agent.log_prefix}   {cache_line}")
                 
                 _retry.has_retried_429 = False  # Reset on success
                 # Note: don't clear the retry buffer here — an "API call
