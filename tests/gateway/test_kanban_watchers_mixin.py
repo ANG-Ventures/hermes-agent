@@ -39,6 +39,7 @@ def test_mixin_defines_kanban_methods():
 from dataclasses import dataclass, field  # noqa: E402
 
 from gateway.kanban_watchers import (  # noqa: E402
+    _format_parent_satisfied_sticky_summary,
     _format_respawn_guarded_summary,
     _stall_streak_is_bad,
 )
@@ -95,6 +96,12 @@ def test_gateway_respawn_guard_summary_groups_reasons():
     assert summary == (
         "respawn_guarded=3 (active_pr: t_open1, t_open2; "
         "recent_success: t_recent)"
+    )
+
+
+def test_gateway_tick_summary_counts_and_names_parent_satisfied_sticky_cards():
+    assert _format_parent_satisfied_sticky_summary(["t_beta", "t_alpha"]) == (
+        "parents_done_sticky=2 (t_alpha, t_beta)"
     )
 
 

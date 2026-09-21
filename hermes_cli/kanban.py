@@ -3579,14 +3579,20 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         did_work = (
             res.reclaimed or res.crashed or res.timed_out or res.promoted
             or res.spawned or res.auto_blocked or res.stale
+            or res.parent_satisfied_sticky
         )
         if did_work:
+            sticky_ids = sorted(res.parent_satisfied_sticky)
+            sticky_summary = (
+                f"parents_done_sticky={len(sticky_ids)}"
+                + (f" ({', '.join(sticky_ids)})" if sticky_ids else "")
+            )
             print(
                 f"[{_fmt_ts(int(time.time()))}] "
                 f"reclaimed={res.reclaimed} crashed={len(res.crashed)} "
                 f"timed_out={len(res.timed_out)} stale={len(res.stale)} "
                 f"promoted={res.promoted} spawned={len(res.spawned)} "
-                f"auto_blocked={len(res.auto_blocked)}",
+                f"auto_blocked={len(res.auto_blocked)} {sticky_summary}",
                 flush=True,
             )
 
