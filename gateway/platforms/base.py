@@ -3800,10 +3800,48 @@ class BasePlatformAdapter(ABC):
         ``_set_fatal_error`` state the runner reads for retryability) pass
         through unchanged.  The sync method keeps its exact contract for the
         direct callers that are not on a loop.
+
+        CANCELLATION.  Moving the body to a worker thread introduces an await
+        point where the blocking call had none, so ``connect()`` can now be
+        cancelled (shutdown, reconnect supervisor, adapter teardown) WHILE the
+        acquire is still in flight.  ``asyncio.to_thread`` cannot interrupt the
+        thread: it keeps running and may take the scoped lock after its awaiter
+        is gone, leaving a machine-global lock held by nobody -- the next
+        connect then fails "already in use" and only a process restart clears
+        it.  So on cancellation we do not abandon the thread: we wait for it to
+        finish and release the lock if it did acquire one, then re-raise.  The
+        wait is bounded by the sync body's own bounded termination budget.
         """
-        return await asyncio.to_thread(
-            self._acquire_platform_lock, scope, identity, resource_desc
+        task = asyncio.ensure_future(
+            asyncio.to_thread(
+                self._acquire_platform_lock, scope, identity, resource_desc
+            )
         )
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Let the orphaned worker finish so the lock cannot outlive us.
+            # `task` is shielded, so it is still running, not cancelled.
+            try:
+                acquired = await task
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The acquire failed on its own; nothing was taken.
+                raise
+            else:
+                if acquired:
+                    try:
+                        self._release_platform_lock()
+                    except Exception as exc:  # pragma: no cover - defensive
+                        logger.warning(
+                            "[%s] could not release %s taken by a cancelled "
+                            "acquire: %s",
+                            self.name,
+                            resource_desc,
+                            exc,
+                        )
+            raise
 
     def _acquire_platform_lock(self, scope: str, identity: str, resource_desc: str) -> bool:
         """Acquire a scoped lock for this adapter. Returns True on success.

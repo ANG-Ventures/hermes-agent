@@ -17,10 +17,11 @@ whatever thread calls it.  Eight ``async def connect``/``open`` coroutines call
 it directly, so on the running loop it is a hard stall of the entire gateway --
 every other adapter's polling, every in-flight turn, every heartbeat.
 
-The reachability ratchet froze three of those coroutines
+The reachability ratchet froze four of those coroutines
 (``gateway/platforms/signal.py connect``, ``gateway/platforms/weixin.py
-connect``, ``gateway/platforms/yuanbao.py open``) because they are the ones
-whose DFS reports the takeover-marker sink first.  The other five reach the
+connect``, ``gateway/platforms/yuanbao.py open`` and
+``plugins/platforms/telegram/adapter.py connect``) because they are the ones
+whose DFS reports the takeover-marker sink first.  The other four reach the
 same blocking body; they are simply shadowed by a different first sink.
 
 The fix is a choke-point one: ``_acquire_platform_lock_async`` offloads the
@@ -333,3 +334,90 @@ def test_the_sweep_is_not_vacuous():
         "off-loop form is not actually in use, so the sweep above is green "
         "for the wrong reason"
     )
+
+
+# ---------------------------------------------------------------------------
+# Cancellation: the await point this change INTRODUCES must not leak the lock.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_acquire_does_not_leak_the_scoped_lock():
+    """A cancelled connect() must not leave the scoped lock held by nobody.
+
+    Moving the body to a worker thread adds an await point where the blocking
+    call had none, so ``connect()`` is now cancellable (shutdown, reconnect
+    supervisor, adapter teardown) WHILE the acquire is in flight.
+    ``asyncio.to_thread`` cannot interrupt the thread -- it runs on and can take
+    the lock after its awaiter is gone.  The scoped lock is machine-global, so
+    an orphaned acquire makes every later connect fail "already in use" until
+    the process restarts.
+
+    This asserts on the RESOURCE (is the lock held?), not on which API was
+    called, and it is the regression for FleetReview P1 "Orphaned lock on
+    cancel" on this PR.  On a naked ``return await asyncio.to_thread(...)`` it
+    fails with the lock still held.
+    """
+    adapter = _adapter()
+    held: set[tuple[str, str]] = set()
+    entered = threading.Event()
+    proceed = threading.Event()
+
+    def _slow_acquire(scope: str, identity: str, resource_desc: str) -> bool:
+        # Mirror the real body: commit the lock identity, do the slow takeover
+        # I/O, then actually hold the lock.
+        adapter._platform_lock_scope = scope
+        adapter._platform_lock_identity = identity
+        entered.set()
+        proceed.wait(timeout=10)
+        held.add((scope, identity))
+        return True
+
+    def _release() -> None:
+        identity = getattr(adapter, "_platform_lock_identity", None)
+        if not identity:
+            return
+        held.discard((adapter._platform_lock_scope, identity))
+        adapter._platform_lock_identity = None
+
+    adapter._acquire_platform_lock = _slow_acquire
+    adapter._release_platform_lock = _release
+
+    task = asyncio.ensure_future(
+        adapter._acquire_platform_lock_async("telegram-bot-token", "tok", "d")
+    )
+    await asyncio.get_running_loop().run_in_executor(None, entered.wait, 5)
+
+    task.cancel()
+    # Release the worker so it completes its acquire during the cancellation.
+    proceed.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert held == set(), (
+        "a cancelled acquire left the machine-global scoped lock held by an "
+        f"orphaned worker thread: {held}. Every later connect will fail "
+        "'already in use' until the process restarts."
+    )
+    assert adapter._platform_lock_identity is None
+
+
+@pytest.mark.asyncio
+async def test_cancellation_still_propagates(adapter, monkeypatch):
+    """Draining the orphaned worker must not swallow the cancellation.
+
+    The caller asked to be cancelled; holding the lock correctly is not a
+    licence to return normally and let connect() proceed.
+    """
+    def _acquire(scope: str, identity: str, resource_desc: str) -> bool:
+        return False
+
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", _acquire)
+
+    task = asyncio.ensure_future(
+        adapter._acquire_platform_lock_async("s", "i", "d")
+    )
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
