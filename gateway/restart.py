@@ -145,6 +145,53 @@ def read_launchd_exit_timeout_s(
     return parse_launchd_exit_timeout(getattr(proc, "stdout", ""))
 
 
+def resolve_launchd_drain_deadline_s(
+    launchd_exit_timeout_s: float | None,
+    *,
+    cleanup_reserve_s: float = LAUNCHD_STOP_CLEANUP_RESERVE_S,
+    last_teardown_s: float | None = None,
+    hard_exit_reserve_s: float = LAUNCHD_HARD_EXIT_RESERVE_S,
+) -> float | None:
+    """Seconds from shutdown start by which EVERY drain must have returned.
+
+    The single absolute deadline the stop path is timed against under
+    launchd: the armed hard-exit wall (``exit_timeout -
+    hard_exit_reserve_s``) minus the teardown reserve this host has
+    actually measured (``max(cleanup_reserve_s, last_teardown_s)``).
+
+    Both drain allowances — the chat drain and the cron floor — are
+    derived from this one value, so no drain can consume time the
+    teardown after it has already been promised. ``None`` means no
+    launchd budget applies and no deadline is imposed; callers must treat
+    that as fail-open. The value may be ``0.0`` when the measured
+    teardown already saturates the budget: that is a real zero-drain
+    answer, not a floor to be raised.
+    """
+
+    def _seconds(value: object) -> float:
+        try:
+            return max(float(value), 0.0)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0.0
+
+    if launchd_exit_timeout_s is None:
+        return None
+    try:
+        budget = float(launchd_exit_timeout_s)
+    except (TypeError, ValueError):
+        return None
+    if budget <= 0.0:
+        return None
+    hard_exit = resolve_launchd_shutdown_watchdog_delay(
+        budget,
+        budget,
+        signal_driven=True,
+        hard_exit_reserve_s=hard_exit_reserve_s,
+    )
+    reserve = max(_seconds(cleanup_reserve_s), _seconds(last_teardown_s))
+    return max(hard_exit - reserve, 0.0)
+
+
 def resolve_launchd_capped_drain(
     drain_timeout: float,
     launchd_exit_timeout_s: float | None,
@@ -179,23 +226,15 @@ def resolve_launchd_capped_drain(
             return 0.0
 
     drain = _seconds(drain_timeout)
-    if launchd_exit_timeout_s is None:
-        return drain
-    try:
-        budget = float(launchd_exit_timeout_s)
-    except (TypeError, ValueError):
-        return drain
-    if budget <= 0.0:
-        return drain
-    hard_exit = resolve_launchd_shutdown_watchdog_delay(
-        budget,
-        budget,
-        signal_driven=True,
+    deadline = resolve_launchd_drain_deadline_s(
+        launchd_exit_timeout_s,
+        cleanup_reserve_s=cleanup_reserve_s,
+        last_teardown_s=last_teardown_s,
         hard_exit_reserve_s=hard_exit_reserve_s,
     )
-    reserve = max(_seconds(cleanup_reserve_s), _seconds(last_teardown_s))
-    cap = max(hard_exit - reserve, 0.0)
-    return min(drain, cap)
+    if deadline is None:
+        return drain
+    return min(drain, deadline)
 
 
 def resolve_launchd_shutdown_watchdog_delay(
@@ -340,6 +379,7 @@ def resolve_cron_drain_budget(
     watchdog_delay: float,
     elapsed: float = 0.0,
     cleanup_reserve_s: float = CRON_DRAIN_CLEANUP_RESERVE_S,
+    deadline_s: float | None = None,
 ) -> float:
     """Seconds the shutdown drain may spend waiting on in-flight cron work.
 
@@ -352,9 +392,23 @@ def resolve_cron_drain_budget(
     would swap a cleanly-interrupted job for a SIGKILL that leaves it
     wedged mid-run — strictly worse than the bug being fixed.
 
-    Never returns less than ``drain_timeout``: the cron floor only ever
-    extends the wait, so an operator who deliberately configured a long
-    ``restart_drain_timeout`` keeps it.
+    ``deadline_s`` is the absolute stop-path deadline from
+    :func:`resolve_launchd_drain_deadline_s` — the hard-exit wall less the
+    teardown reserve this host has MEASURED. It is the same value the chat
+    drain is derived from, so both allowances come off one budget.
+    ``cleanup_reserve_s`` is a fixed 10s guess; a host whose recorded
+    teardown is longer needs the longer reserve, and without this input
+    in-flight cron work held the drain open to the fixed-reserve ceiling
+    regardless (chat 45→2s as the measurement grew, cron pinned at 50s).
+    ``None`` means no launchd budget applies and only the leash ceiling
+    governs.
+
+    Never returns less than ``drain_timeout`` *within the deadline*: the
+    cron floor only ever extends the wait, so an operator who deliberately
+    configured a long ``restart_drain_timeout`` keeps it — but it cannot
+    extend past time the teardown has already been promised. No minimum
+    floor is imposed; a deadline already consumed by the reserve yields a
+    real zero-second answer.
     """
 
     def _seconds(value: object, fallback: float = 0.0) -> float:
@@ -365,14 +419,17 @@ def resolve_cron_drain_budget(
 
     drain = _seconds(drain_timeout)
     floor = _seconds(cron_drain_timeout)
-    if floor <= 0.0:
-        return drain
-    ceiling = (
-        _seconds(watchdog_delay)
-        - _seconds(elapsed)
-        - _seconds(cleanup_reserve_s, CRON_DRAIN_CLEANUP_RESERVE_S)
-    )
-    return max(drain, min(floor, ceiling))
+    budget = drain
+    if floor > 0.0:
+        ceiling = (
+            _seconds(watchdog_delay)
+            - _seconds(elapsed)
+            - _seconds(cleanup_reserve_s, CRON_DRAIN_CLEANUP_RESERVE_S)
+        )
+        budget = max(drain, min(floor, ceiling))
+    if deadline_s is None:
+        return budget
+    return min(budget, max(_seconds(deadline_s) - _seconds(elapsed), 0.0))
 
 
 def resolve_systemd_timeout_stop_sec(

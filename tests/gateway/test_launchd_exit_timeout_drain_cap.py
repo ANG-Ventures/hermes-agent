@@ -365,11 +365,22 @@ def test_cron_leash_under_launchd_cannot_exceed_exit_timeout():
     """The cron drain floor (#82161) is clamped to the launchd budget too.
 
     Without the clamp the cron ceiling is watchdog(drain+grace) - reserve,
-    which for a capped 45s drain is 95s — past launchd's 60s SIGKILL.
-    """
-    from gateway.restart import CRON_DRAIN_CLEANUP_RESERVE_S, resolve_cron_drain_budget
+    which for a capped drain is 95s — past launchd's 60s SIGKILL.
 
-    drain = resolve_launchd_capped_drain(180.0, 60.0)  # 45
+    SCOPE: this covers the LEASH term only, and ``<= 60.0`` is not the safety
+    property. The leash composition leaves exactly ``CRON_DRAIN_CLEANUP_RESERVE_S``
+    (10s) before the clamp regardless of the teardown this host has measured,
+    so it is green while in-flight cron work can still be SIGKILLed mid-teardown.
+    The binding term on the real stop path is the shared absolute deadline —
+    see tests/gateway/test_cron_drain_teardown_reserve.py.
+    """
+    from gateway.restart import (
+        CRON_DRAIN_CLEANUP_RESERVE_S,
+        resolve_cron_drain_budget,
+        resolve_launchd_drain_deadline_s,
+    )
+
+    drain = resolve_launchd_capped_drain(180.0, 60.0)
     leash = min(resolve_shutdown_watchdog_delay(drain), 60.0)
     budget = resolve_cron_drain_budget(drain, 600.0, watchdog_delay=leash, elapsed=0.0)
     assert budget == max(drain, 60.0 - CRON_DRAIN_CLEANUP_RESERVE_S)
@@ -380,6 +391,20 @@ def test_cron_leash_under_launchd_cannot_exceed_exit_timeout():
     )
     assert unclamped == drain + DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S - CRON_DRAIN_CLEANUP_RESERVE_S
     assert unclamped > 60.0
+    # Reconciliation: the leash-only budget above is NOT the stop path's answer.
+    # Threading the shared deadline in is strictly tighter, and that is the
+    # term the teardown reserve rides on.
+    deadline = resolve_launchd_drain_deadline_s(60.0, last_teardown_s=22.0)
+    assert deadline is not None
+    composed = resolve_cron_drain_budget(
+        resolve_launchd_capped_drain(180.0, 60.0, last_teardown_s=22.0),
+        600.0,
+        watchdog_delay=leash,
+        elapsed=0.0,
+        deadline_s=deadline,
+    )
+    assert composed < budget
+    assert composed <= deadline
 
 
 def test_launchd_shutdown_watchdog_hard_exits_before_supervisor_sigkill():

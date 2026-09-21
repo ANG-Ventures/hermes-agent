@@ -3309,6 +3309,7 @@ from gateway.restart import (
     read_launchd_exit_timeout_s,
     resolve_cron_drain_budget,
     resolve_launchd_capped_drain,
+    resolve_launchd_drain_deadline_s,
     resolve_launchd_shutdown_watchdog_delay,
     resolve_replace_takeover_grace_s,
 )
@@ -19788,15 +19789,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Under launchd the real leash is launchd's own exit timeout, not
             # our watchdog (drain + grace): a signal-driven stop that lets
             # cron work push past it is SIGKILLed before cleanup runs.
+            # One absolute deadline governs BOTH allowances. ``timeout``
+            # above is already ``exit_timeout - hard_exit_reserve - measured
+            # teardown``; deriving cron's ceiling from the same value is what
+            # stops in-flight cron work from holding the drain open past the
+            # teardown reserve this host has measured. A raw-clamp min() here
+            # would be the un-reserved wall (60s, not 60-10-teardown) and is
+            # never the binding term once the deadline is threaded through.
             _cron_leash = resolve_shutdown_watchdog_delay(timeout)
             _launchd_budget = getattr(self, "_launchd_exit_timeout_s", None)
-            if getattr(self, "_stop_requested_by_signal", False) and _launchd_budget:
-                _cron_leash = min(_cron_leash, float(_launchd_budget))
+            _drain_deadline = (
+                resolve_launchd_drain_deadline_s(
+                    _launchd_budget,
+                    last_teardown_s=getattr(self, "_last_shutdown_teardown_s", None),
+                )
+                if getattr(self, "_stop_requested_by_signal", False)
+                else None
+            )
             _cron_timeout = resolve_cron_drain_budget(
                 timeout,
                 _cron_drain_cfg,
                 watchdog_delay=_cron_leash,
                 elapsed=_phase_elapsed(),
+                deadline_s=_drain_deadline,
             )
             if _cron_at_start and _cron_timeout > timeout:
                 logger.info(
