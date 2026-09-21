@@ -47,8 +47,11 @@ def _query(args):
 def verify_ref(claim, *, mined_for=None):
     """Resolve a ``<url>#<sha>`` claim against the remote's branch and tag tips.
 
-    An operator flag (``mined_for`` unset) is authority once the SHA is a tip.
-    A ref mined from handoff text is only a hint: every SHA in a handoff is
+    An operator flag is authority for the *identity* of the claim, never for
+    its relevance: ``mined_for`` is set on both the explicit and the mined path
+    so a SHA that is merely a tip somewhere is not accepted as THIS card's
+    work. Only the ``--survivor-unbound`` override passes ``mined_for=None``.
+    A mined ref is additionally only a hint: every SHA in a handoff is
     cross-producted with every remote URL, and "branched from <sha>" names the
     base, not the deliverable -- so a mined ref must sit on a branch that
     names the task.
@@ -72,21 +75,34 @@ def verify_ref(claim, *, mined_for=None):
     return {"remote": url, "branch": ref, "sha": oid, "external": True}
 
 
-def verify_pr(claim, shas=(), *, mined_for=None):
+def verify_pr(claim, shas=(), *, mined_for=None, corroborate=("headRefName",)):
     """Resolve a PR claim against GitHub.
 
-    An operator flag (``mined_for`` unset) is authority once the PR exists and
-    is open or merged. A PR mined from handoff text is only a hint: it must be
+    Existence is not relevance. An OPEN/MERGED PR proves only that somebody
+    shipped something somewhere, so ``mined_for`` is applied on the explicit
+    operator/worker path too: the PR must corroborate the card by naming it.
+    Only the ``--survivor-unbound`` operator override passes ``mined_for=None``.
+
+    ``corroborate`` names the fields that may carry that naming, and the
+    default is deliberately the narrow one the mined path has always used --
+    the branch. The explicit path widens it to title and body, because those
+    are the PR's own claim about which card it implements and an operator
+    typing the number has already vouched for the PR's identity. Text on the
+    *card* is what cannot be trusted, and that is mined separately in
+    :func:`discover`; widening the mined path here would let a PR body that
+    merely mentions a card id verify itself.
+
+    A PR mined from handoff text is additionally only a hint: it must be
     corroborated by a claimed SHA that is the PR head or squash merge, or --
-    with no SHA claimed -- by a PR branch that names the task. A bare
-    ``owner/repo#N`` mention proves nothing about THIS card's work.
+    with no SHA claimed -- by the same naming test. A bare ``owner/repo#N``
+    mention proves nothing about THIS card's work.
     """
     match = _PR.fullmatch(claim) or _PR_URL.fullmatch(claim)
     if not match:
         return None
     slug, number = match.groups()
     output = _query(["gh", "pr", "view", number, "--repo", slug,
-                     "--json", "state,headRefOid,headRefName,mergeCommit"])
+                     "--json", "state,headRefOid,headRefName,mergeCommit,title,body"])
     if output is None:
         return None
     try:
@@ -99,7 +115,9 @@ def verify_pr(claim, shas=(), *, mined_for=None):
         if shas:
             if not any(value and value.startswith(sha) for value in (head, merge) for sha in shas):
                 return None
-        elif mined_for and mined_for not in str(view.get("headRefName") or ""):
+        elif mined_for and not any(
+            mined_for in str(view.get(field) or "") for field in corroborate
+        ):
             return None
     except (ValueError, TypeError, KeyError, AttributeError):
         return None

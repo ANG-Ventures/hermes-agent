@@ -750,8 +750,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                  "an unverifiable claim refuses the completion.")
     p_complete.add_argument("--survivor-pr", default=None, metavar="OWNER/REPO#N",
                             help="Name an external survivor by pull request. Verified with "
-                                 "gh pr view (state OPEN or MERGED); an unverifiable claim "
-                                 "refuses the completion.")
+                                 "gh pr view (state OPEN or MERGED) AND required to name this "
+                                 "task in its branch; an unverifiable claim refuses the completion.")
+    p_complete.add_argument("--survivor-unbound", action="store_true",
+                            help="Operator override: accept a --survivor-ref/--survivor-pr that "
+                                 "is live but does NOT name this task, for the case where the "
+                                 "work really did land on an unrelated-looking branch. The claim "
+                                 "is still remote-verified; the override and the OS user who made "
+                                 "it are recorded on the survivor and in the task event log.")
 
     p_edit = sub.add_parser(
         "edit",
@@ -2809,12 +2815,21 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     # Refuse instead of silently doing the wrong thing.
     survivor_ref = getattr(args, "survivor_ref", None)
     survivor_pr = getattr(args, "survivor_pr", None)
-    if len(ids) > 1 and (summary or raw_meta or survivor_ref or survivor_pr):
+    survivor_unbound = bool(getattr(args, "survivor_unbound", False))
+    if len(ids) > 1 and (summary or raw_meta or survivor_ref or survivor_pr or survivor_unbound):
         print(
-            "kanban: --summary / --metadata / --survivor-ref / --survivor-pr are per-task "
+            "kanban: --summary / --metadata / --survivor-ref / --survivor-pr / "
+            "--survivor-unbound are per-task "
             "and can't be used with multiple ids (would apply the same handoff, and record "
             "the same survivor, for every task). "
             "Complete tasks one at a time, or drop the flags for the bulk close.",
+            file=sys.stderr,
+        )
+        return 2
+    if survivor_unbound and not (survivor_ref or survivor_pr):
+        print(
+            "kanban: --survivor-unbound only relaxes the task-id binding on an explicit "
+            "--survivor-ref/--survivor-pr claim; pass one, or drop the flag.",
             file=sys.stderr,
         )
         return 2
@@ -2855,6 +2870,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 expected_run_id=_worker_run_id_for(tid),
                 survivor_ref=survivor_ref,
                 survivor_pr=survivor_pr,
+                survivor_unbound=survivor_unbound,
             ):
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)

@@ -6820,6 +6820,7 @@ def complete_task(
     fire_lifecycle_hook: bool = True,
     survivor_ref: Optional[str] = None,
     survivor_pr: Optional[str] = None,
+    survivor_unbound: bool = False,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -6896,6 +6897,7 @@ def complete_task(
     survivor = preserve(
         conn, task_id, metadata,
         survivor_ref=survivor_ref, survivor_pr=survivor_pr,
+        survivor_unbound=survivor_unbound,
         evidence=[t for t in (summary, result) if t],
     )
     if survivor:
