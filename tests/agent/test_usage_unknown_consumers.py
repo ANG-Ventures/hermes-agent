@@ -1,16 +1,18 @@
-"""Execute physical-call serialization and console blocks from shipped consumers."""
-import ast
-from pathlib import Path
+"""Execute physical-call serializers and callable display consumers.
+
+Thin snapshot renderer pins are unit contracts. Producer flag propagation is
+covered by stacked PR #797, not claimed by constructing CanonicalUsage here.
+"""
 from types import SimpleNamespace
 
 import pytest
 
 from agent.usage_pricing import (
     USAGE_UNKNOWN_FIELDS, normalize_usage, prompt_tokens_unknown,
-    format_token_count,
+    cache_stats_line, verbose_token_usage_log_args,
 )
 
-ROOT = Path(__file__).resolve().parents[2]
+from gateway.slash_commands import render_thin_last_turn_lines
 WIRES = [
     {"prompt_tokens": None, "completion_tokens": 50, "total_tokens": None,
      "prompt_tokens_unavailable": True, "unavailable": True},
@@ -27,39 +29,13 @@ WIRES = [
 ]
 
 
-def _execute_statements(path, anchor, namespace, count=1):
-    tree = ast.parse((ROOT / path).read_text())
-    matches = [n for n in ast.walk(tree) if anchor(n)]
-    assert len(matches) == 1, "shipped execution seam moved"
-    node = matches[0]
-    parents = [n for n in ast.walk(tree)
-               if isinstance(getattr(n, "body", None), list) and node in n.body]
-    assert len(parents) == 1
-    body = parents[0].body
-    start = body.index(node)
-    block = body[start:start + count]
-    exec(compile(ast.Module(body=block, type_ignores=[]), str(path), "exec"), namespace)
-
-
 @pytest.mark.parametrize("wire", WIRES)
-@pytest.mark.parametrize("role", ["aggregator", "advisor"])
-def test_moa_physical_calls_preserve_unknown_into_blackbox(wire, role):
+def test_moa_physical_calls_preserve_unknown_into_blackbox(wire):
     from agent.conversation_loop import _build_moa_pricing_calls
     from plugins.blackbox.cost import compute_turn_cost
     usage = normalize_usage(wire)
-    if role == "aggregator":
-        calls = _build_moa_pricing_calls([], usage, aggregator_model="claude-sonnet-4-5",
-                                        aggregator_provider="anthropic", aggregator_base_url=None)
-    else:
-        namespace = {
-            "_acct": SimpleNamespace(usage=usage, model="claude-sonnet-4-5",
-                                     provider="anthropic", base_url=None),
-            "_ref_pricing_calls": [], "USAGE_UNKNOWN_FIELDS": USAGE_UNKNOWN_FIELDS,
-        }
-        _execute_statements("agent/moa_loop.py", lambda n: isinstance(n, ast.Expr)
-                            and isinstance(n.value, ast.Call)
-                            and ast.unparse(n.value.func) == "_ref_pricing_calls.append", namespace)
-        calls = namespace["_ref_pricing_calls"]
+    calls = _build_moa_pricing_calls([], usage, aggregator_model="claude-sonnet-4-5",
+                                    aggregator_provider="anthropic", aggregator_base_url=None)
     for key in USAGE_UNKNOWN_FIELDS:
         assert calls[0].get(key, False) == getattr(usage, key)
     cost, status, _ = compute_turn_cost("default", "moa", None, [{"pricing_calls": calls}])
@@ -77,14 +53,7 @@ def test_moa_physical_calls_preserve_unknown_into_blackbox(wire, role):
 ])
 def test_console_cache_block_honors_unknown(wire):
     usage = normalize_usage(wire)
-    lines = []
-    namespace = {"canonical_usage": usage, "usage_dict": {"prompt_tokens": usage.prompt_tokens},
-                 "prompt_tokens_unknown": prompt_tokens_unknown, "format_token_count": format_token_count,
-                 "agent": SimpleNamespace(quiet_mode=False, log_prefix="", _vprint=lines.append)}
-    _execute_statements("agent/conversation_loop.py", lambda n: isinstance(n, ast.Assign)
-                        and any(isinstance(t, ast.Name) and t.id == "cached" for t in n.targets)
-                        and ast.unparse(n.value) == "canonical_usage.cache_read_tokens", namespace, count=4)
-    text = "\n".join(lines)
+    text = cache_stats_line(usage, usage.prompt_tokens)
     if prompt_tokens_unknown(usage):
         assert "unknown" in text
         assert "% hit" not in text
@@ -92,7 +61,7 @@ def test_console_cache_block_honors_unknown(wire):
     elif usage.cache_read_tokens:
         assert "100/100 tokens (100% hit, 0 written)" in text
     else:
-        assert not lines
+        assert text is None
 
 
 @pytest.mark.parametrize("wire", WIRES)
@@ -114,72 +83,50 @@ def test_real_moa_advisor_execution(wire, monkeypatch, tmp_path):
     client.chat.completions.create(model="default", messages=[{"role": "user", "content": "test"}])
     calls = client.consume_reference_pricing_calls()
     assert len(calls) == 1
+    usage = normalize_usage(wire)
+    for key in USAGE_UNKNOWN_FIELDS:
+        assert calls[0].get(key, False) == getattr(usage, key)
     cost, status, _ = compute_turn_cost("default", "moa", None, [{"pricing_calls": calls}])
     assert (cost is None) == normalize_usage(wire).total_tokens_unknown
     assert status == ("unknown" if cost is None else "priced_zero")
 
 
 @pytest.mark.parametrize("wire", WIRES)
-def test_verbose_log_and_thin_fallback(wire):
-    from dataclasses import asdict
-    from unittest.mock import Mock
-
+def test_verbose_log_honors_unknown(wire):
     usage = normalize_usage(wire)
-    log = Mock()
-    ns = {"agent": SimpleNamespace(verbose_logging=True), "logging": log,
-          "canonical_usage": usage, "prompt_tokens_unknown": prompt_tokens_unknown,
-          "prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.output_tokens,
-          "total_tokens": usage.total_tokens, "output_unknown": usage.output_tokens_unknown}
-    _execute_statements("agent/conversation_loop.py", lambda n: isinstance(n, ast.If)
-                        and ast.unparse(n.test) == "agent.verbose_logging"
-                        and "Token usage: prompt=" in ast.unparse(n), ns)
-    fmt, *args = log.debug.call_args.args
-    text = fmt % tuple(args)
+    prompt, completion, total = verbose_token_usage_log_args(
+        usage, usage.prompt_tokens, usage.output_tokens, usage.total_tokens)
     if prompt_tokens_unknown(usage):
-        assert "prompt=unknown" in text
-    if usage.total_tokens_unknown:
-        assert "total=unknown" in text
-
-    tree = ast.parse((ROOT / "gateway/slash_commands.py").read_text())
-    functions = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
-                 and any(isinstance(c, ast.Assign) and any(isinstance(t, ast.Name)
-                         and t.id == "lt_in" for t in c.targets) for c in n.body)]
-    assert len(functions) == 1
-    body = functions[0].body
-    start = next(i for i, n in enumerate(body) if isinstance(n, ast.FunctionDef) and n.name == "_as_int")
-    lifted = ast.FunctionDef(name="render", args=ast.arguments(posonlyargs=[], args=[],
-                            kwonlyargs=[], kw_defaults=[], defaults=[]),
-                            body=body[start:], decorator_list=[])
-    module = ast.fix_missing_locations(ast.Module(body=[lifted], type_ignores=[]))
-    ns = {"thin_snap": asdict(usage), "fallback_label": "test"}
-    exec(compile(module, "thin-fallback", "exec"), ns)
-    text = "\n".join(ns["render"]())
-    if prompt_tokens_unknown(usage):
-        assert "Tokens in: unknown" in text
+        assert prompt == "unknown"
     if usage.output_tokens_unknown:
-        assert "Tokens out: unknown" in text
+        assert completion == "unknown"
     if usage.total_tokens_unknown:
-        assert "Total (billed in+out): unknown" in text
+        assert total == "unknown"
+
+
+@pytest.mark.parametrize("flag", USAGE_UNKNOWN_FIELDS)
+def test_thin_fallback_renderer_honors_unknown_flag(flag):
+    # Renderer-only contract; #797 owns the real producer -> snapshot path.
+    snap = {"input_tokens": 150, "output_tokens": 0, "cache_read_tokens": 0,
+            "cache_write_tokens": 0, "reasoning_tokens": 0, flag: True}
+    text = "\n".join(render_thin_last_turn_lines(snap, "test"))
+    if flag in ("input_tokens_unknown", "cache_read_tokens_unknown",
+                "cache_write_tokens_unknown", "usage_unknown"):
+        assert "Tokens in: unknown" in text
+    if flag in ("output_tokens_unknown", "usage_unknown"):
+        assert "Tokens out: unknown" in text
+    assert "Total (billed in+out): unknown" in text
 
 
 def test_verbose_log_measured_values_keep_comma_formatting():
     """MEASURED control for the sibling site: the verbose token log formatted
     measured counts with commas before the UNKNOWN routing, and must still."""
-    from unittest.mock import Mock
-
     usage = normalize_usage({"prompt_tokens": 120_000, "completion_tokens": 8_000,
                              "total_tokens": 128_000}, api_mode="chat_completions")
     assert not prompt_tokens_unknown(usage) and not usage.total_tokens_unknown
-    log = Mock()
-    ns = {"agent": SimpleNamespace(verbose_logging=True), "logging": log,
-          "canonical_usage": usage, "prompt_tokens_unknown": prompt_tokens_unknown,
-          "prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.output_tokens,
-          "total_tokens": usage.total_tokens, "output_unknown": usage.output_tokens_unknown}
-    _execute_statements("agent/conversation_loop.py", lambda n: isinstance(n, ast.If)
-                        and ast.unparse(n.test) == "agent.verbose_logging"
-                        and "Token usage: prompt=" in ast.unparse(n), ns)
-    fmt, *args = log.debug.call_args.args
-    text = fmt % tuple(args)
+    args = verbose_token_usage_log_args(
+        usage, usage.prompt_tokens, usage.output_tokens, usage.total_tokens)
+    text = "Token usage: prompt=%s, completion=%s, total=%s" % args
 
     assert "prompt=120,000" in text      # not "120k"
     assert "completion=8,000" in text
@@ -194,20 +141,7 @@ def test_thin_fallback_measured_values_keep_comma_formatting():
     snap = {"input_tokens": 120_000, "output_tokens": 8_000, "cache_read_tokens": 110_000,
             "cache_write_tokens": 2_000, "reasoning_tokens": 1_500}
 
-    tree = ast.parse((ROOT / "gateway/slash_commands.py").read_text())
-    functions = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
-                 and any(isinstance(c, ast.Assign) and any(isinstance(t, ast.Name)
-                         and t.id == "lt_in" for t in c.targets) for c in n.body)]
-    assert len(functions) == 1
-    body = functions[0].body
-    start = next(i for i, n in enumerate(body) if isinstance(n, ast.FunctionDef) and n.name == "_as_int")
-    lifted = ast.FunctionDef(name="render", args=ast.arguments(posonlyargs=[], args=[],
-                            kwonlyargs=[], kw_defaults=[], defaults=[]),
-                            body=body[start:], decorator_list=[])
-    module = ast.fix_missing_locations(ast.Module(body=[lifted], type_ignores=[]))
-    ns = {"thin_snap": snap, "fallback_label": "test"}
-    exec(compile(module, "thin-fallback", "exec"), ns)
-    text = "\n".join(ns["render"]())
+    text = "\n".join(render_thin_last_turn_lines(snap, "test"))
 
     assert "232,000" in text                              # in billed, comma-grouped
     assert "9,500" in text                                # out billed (8,000 + 1,500 reasoning)
