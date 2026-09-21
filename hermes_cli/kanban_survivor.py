@@ -145,6 +145,53 @@ def _excluded_roots(workspace):
             kb.kanban_home() / "kanban" / "boards", *_temporary_roots()]
 
 
+def _independent_storage(repo, workspace):
+    """Require local ref authority to retain its Git storage after disposal.
+
+    Gitfiles and linked worktrees are fine when BOTH their private and common
+    directories are durable. Reject alternates and internal storage symlinks
+    conservatively: proving a checkout path alone says nothing about the objects
+    it borrows. Ordinary hardlinked clones remain independent on unlink.
+    """
+    if any(os.environ.get(key) for key in (
+        "GIT_DIR", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    )):
+        return False
+    try:
+        excluded = [root.resolve() for root in _excluded_roots(workspace)]
+
+        def durable(path):
+            return not any(path.resolve(strict=True).is_relative_to(root) for root in excluded)
+
+        if not durable(repo):
+            return False
+        directories = set()
+        for args in (("--git-dir",), ("--git-common-dir",), ("--git-path", "objects")):
+            result = _git(repo, "rev-parse", "--path-format=absolute", *args, check=False)
+            if result.returncode or not result.stdout.strip():
+                return False
+            path = Path(os.fsdecode(result.stdout).strip())
+            if not path.is_dir() or not durable(path):
+                return False
+            directories.add(path.resolve(strict=True))
+
+        def fail(exc):
+            raise exc
+
+        for directory in directories:
+            for root, dirs, files in os.walk(directory, followlinks=False, onerror=fail):
+                for name in dirs + files:
+                    path = Path(root) / name
+                    if path.is_symlink():
+                        return False
+                    if name in {"alternates", "http-alternates"} and path.is_file() and path.stat().st_size:
+                        return False
+        return True
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        return False
+
+
 def _durable_remote(repo, remote, workspace):
     # Expand insteadOf aliases, then resolve symlinks before checking scope.
     url = _git(repo, "remote", "get-url", remote).stdout.decode().strip()
@@ -157,7 +204,7 @@ def _durable_remote(repo, remote, workspace):
         return False
     path = Path(unquote(parsed.path) if parsed.scheme else url).expanduser()
     path = (repo / path).resolve()
-    return remote == "origin" and not any(path.is_relative_to(root.resolve()) for root in _excluded_roots(workspace))
+    return remote == "origin" and _independent_storage(path, workspace)
 
 
 def _published_refs(repo, workspace):
@@ -211,7 +258,6 @@ def _canonical_repos(repo, workspace):
     cloned from, and it is what the fleet-backup tier covers. Remotes inside a
     kanban workspace, board, or temp root are disposable and never canonical.
     """
-    excluded = [root.resolve() for root in _excluded_roots(workspace)]
     for remote in _git(repo, "remote").stdout.decode().splitlines():
         url = _git(repo, "remote", "get-url", remote, check=False)
         if url.returncode:
@@ -227,9 +273,7 @@ def _canonical_repos(repo, workspace):
             path = (repo / path).resolve(strict=True)
         except OSError:
             continue
-        if any(path.is_relative_to(root) for root in excluded):
-            continue
-        if _git(path, "rev-parse", "--git-dir", check=False).returncode:
+        if not _independent_storage(path, workspace):
             continue
         yield {"remote": remote, "repository_path": str(path)}
 
@@ -351,7 +395,7 @@ def _verify_landed(entries, workspace):
         repo = repo.resolve(strict=True)
         if _git(repo, "rev-parse", "--git-dir", check=False).returncode:
             raise SurvivorUnavailable("survivor_unavailable: landed path is not a repository")
-        if any(repo.is_relative_to(root.resolve()) for root in _excluded_roots(workspace)):
+        if not _independent_storage(repo, workspace):
             # A workspace/board/temp tree is itself disposable: pointing `landed`
             # at one would let the capture authorise deleting its own only copy.
             raise SurvivorUnavailable("survivor_unavailable: landed repository is not a durable tree")
