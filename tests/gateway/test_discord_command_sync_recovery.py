@@ -336,7 +336,7 @@ async def test_reconnect_inside_backoff_window_skips_the_sync(adapter, monkeypat
     with caplog.at_level("INFO"):
         await adapter._run_post_connect_initialization()
 
-    sync.assert_not_awaited(), "a reconnect inside the backoff window must not sync"
+    sync.assert_not_awaited()
     assert any(
         "backoff" in record.getMessage().lower() for record in caplog.records
     ), f"the skip must log WHY; got {[r.getMessage() for r in caplog.records]}"
