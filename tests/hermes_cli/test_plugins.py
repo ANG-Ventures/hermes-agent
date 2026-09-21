@@ -1228,10 +1228,7 @@ class TestForceReloadSymmetry:
         flip under load. The fail-closed message is the primary fact; the
         clock stood in for "we blocked without joining the hung policy".
         """
-        from hermes_cli.plugins import (
-            _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE,
-            resolve_pre_tool_block,
-        )
+        from hermes_cli.plugins import resolve_pre_tool_block
 
         monkeypatch.setattr(
             "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
@@ -1256,15 +1253,31 @@ class TestForceReloadSymmetry:
 
         msg = resolve_pre_tool_block("web_search", {"query": "x"})
 
-        assert msg == _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
+        # The timeout refusal names the callback and reports measured elapsed
+        # against the configured budget.
+        assert msg is not None
+        assert "hung_policy" in msg
+        assert "timed out" in msg
+        assert "budget 0.1s" in msg
         assert not policy_returned.is_set(), (
             "resolve_pre_tool_block returned only AFTER the hung policy "
             "finished — the timed-out worker was joined instead of abandoned"
         )
 
-        # Still-running / suppression window must also fail closed.
+        # The suppression window must also fail closed — but it is NOT a
+        # timeout of THIS call, and must not claim to be one.
         msg2 = resolve_pre_tool_block("web_search", {"query": "y"})
-        assert msg2 == _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
+        assert msg2 is not None
+        assert "hung_policy" in msg2
+        assert "suppressed after an earlier timeout" in msg2
+        assert "timed out after" not in msg2, (
+            "the suppression refusal claims THIS callback timed out; an "
+            "earlier one did and the cooldown window is still open"
+        )
+        assert msg2 != msg, (
+            "timeout and suppression refusals are different events and must "
+            "not share one conflated message (#819)"
+        )
         assert not policy_returned.is_set(), (
             "the suppressed second call joined the still-running policy worker"
         )
@@ -1274,8 +1287,6 @@ class TestForceReloadSymmetry:
     def test_pre_tool_call_timeout_does_not_reach_tool_handler(self, monkeypatch):
         """E2E: timed-out pre_tool_call blocks handle_function_call before dispatch."""
         import json
-
-        from hermes_cli.plugins import _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
 
         monkeypatch.setattr(
             "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
@@ -1314,7 +1325,8 @@ class TestForceReloadSymmetry:
             )
 
         assert dispatch_calls == []
-        assert _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE in result
+        assert "hung_policy" in result
+        assert "timed out" in result
         hold.set()
 
 

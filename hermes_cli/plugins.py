@@ -445,8 +445,9 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: Set[str] = {
     "on_session_end",
 }
 
-# Policy hooks: timeout / still-running must fail closed (block the tool).
-# Skipping would let the tool run without a completed policy decision.
+# Policy hooks: a timeout, or a refusal inside the post-timeout suppression
+# window, must fail closed (block the tool). Skipping would let the tool run
+# without a completed policy decision.
 _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call"}
 
 # Documented parent-thread serialization contract — never move the callback
@@ -457,8 +458,19 @@ _HOOK_CALLER_THREAD_HOOKS: Set[str] = {"subagent_stop"}
 # repeatedly invoked hung hook cannot accumulate abandoned daemon threads.
 _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
 
+# Distinct user-facing reasons for the two fail-closed refusal paths. Do NOT
+# collapse these back into one string: they describe different events, and
+# conflating them is what sent #819's investigation down a phantom
+# "callback is still running" concurrency hypothesis. The suppression refusal
+# is NOT a timeout of the call being refused — an EARLIER call timed out and
+# the cooldown window is still open.
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = (
-    "pre_tool_call plugin callback timed out or is still running"
+    "pre_tool_call plugin callback {callback} timed out after {elapsed:.3f}s "
+    "(budget {budget:g}s)"
+)
+_PRE_TOOL_CALL_SUPPRESSED_BLOCK_MESSAGE = (
+    "pre_tool_call plugin callback {callback} is suppressed after an earlier "
+    "timeout (retry in {remaining:.0f}s)"
 )
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
@@ -3739,11 +3751,29 @@ def _hook_uses_callback_timeout(hook_name: str, timeout: float) -> bool:
     )
 
 
-def _pre_tool_call_timeout_block() -> Dict[str, str]:
-    """Fail-closed directive when a policy callback times out or is still running."""
+def _pre_tool_call_timeout_block(
+    callback: str, elapsed: float, budget: float
+) -> Dict[str, str]:
+    """Fail-closed directive for a policy callback that exceeded its budget."""
     return {
         "action": "block",
-        "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE,
+        "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE.format(
+            callback=callback, elapsed=elapsed, budget=budget
+        ),
+    }
+
+
+def _pre_tool_call_suppressed_block(callback: str, remaining: float) -> Dict[str, str]:
+    """Fail-closed directive for a refusal inside the post-timeout cooldown.
+
+    This is NOT a timeout of the call being refused: an EARLIER invocation of
+    *callback* timed out and its suppression window has not yet elapsed.
+    """
+    return {
+        "action": "block",
+        "message": _PRE_TOOL_CALL_SUPPRESSED_BLOCK_MESSAGE.format(
+            callback=callback, remaining=max(0.0, remaining)
+        ),
     }
 
 
@@ -5640,13 +5670,20 @@ class PluginManager:
                             callback_key
                         )
                         if suppressed_until is not None and suppressed_until > now:
+                            remaining = suppressed_until - now
                             logger.warning(
-                                "Hook '%s' callback %s suppressed after callback timeout",
+                                "Hook '%s' callback %s suppressed after callback "
+                                "timeout (%.1fs remaining)",
                                 hook_name,
                                 callback_name,
+                                remaining,
                             )
                             if fail_closed:
-                                results.append(_pre_tool_call_timeout_block())
+                                results.append(
+                                    _pre_tool_call_suppressed_block(
+                                        callback_name, remaining
+                                    )
+                                )
                             continue
                         if suppressed_until is not None:
                             self._hook_timeout_suppressed_until.pop(callback_key, None)
@@ -5695,7 +5732,11 @@ class PluginManager:
                             timeout,
                         )
                         if fail_closed:
-                            results.append(_pre_tool_call_timeout_block())
+                            results.append(
+                                _pre_tool_call_timeout_block(
+                                    callback_name, elapsed, timeout
+                                )
+                            )
                         continue
                     if "exc" in failure:
                         raise failure["exc"]
