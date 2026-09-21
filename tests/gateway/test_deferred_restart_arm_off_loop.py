@@ -258,3 +258,75 @@ async def test_runner_arm_dispatch_does_not_pin_the_loop(tmp_path, stalled_repla
     assert not loop_thread_calls, (
         f"a lifecycle CAS rename ran on the loop thread: {loop_thread_calls}"
     )
+
+
+@pytest.mark.asyncio
+async def test_delivery_barrier_is_registered_before_the_arm_returns(tmp_path):
+    """Moving the arm off-loop must not move the barrier registration with it.
+
+    ``acknowledge_response_delivery`` is a ONE-SHOT lookup fired right after
+    the turn's final send.  If the callback is only registered once the
+    worker-thread arm completes, a fast ack finds no callback, is dropped, and
+    the armed task then sits on its 30s delivery barrier waiting for a
+    delivery that already happened.  This regression pins that the barrier is
+    in place by the time ``_arm_deferred_restart_after_release`` RETURNS --
+    i.e. before the caller can send and ack.
+    """
+    import gateway.run as run
+
+    submit_deferred_restart(
+        tmp_path, session_key=SESSION_KEY, handoff="h", boot_id=BOOT_ID
+    )
+    coordinator = DeferredRestartCoordinator(tmp_path, boot_id=BOOT_ID)
+
+    registered: list[str] = []
+    slow_arm_entered = threading.Event()
+    release_arm = threading.Event()
+
+    class _Adapter:
+        def register_delivery_ack_callback(self, session_key, _cb, *, generation=None):
+            registered.append(session_key)
+
+        def cancel_delivery_ack_callback(self, session_key):
+            return False
+
+    real_arm = coordinator.arm_for_session
+
+    def _slow_arm(*args, **kwargs):
+        slow_arm_entered.set()
+        release_arm.wait(timeout=10.0)
+        return real_arm(*args, **kwargs)
+
+    coordinator.arm_for_session = _slow_arm  # type: ignore[method-assign]
+
+    runner = object.__new__(run.GatewayRunner)
+    runner._background_tasks = set()
+    runner._consume_restart_initiated_breadcrumb = lambda _key: True
+    runner._get_deferred_restart_coordinator = lambda: coordinator
+    runner._adapter_for_source = lambda _source: _Adapter()
+    runner._record_restart_replay_mark = lambda *a, **k: False
+    runner.request_restart = lambda **k: None
+
+    class _Entry:
+        origin = object()
+
+    class _Store:
+        _entries = {SESSION_KEY: _Entry()}
+
+        def mark_resume_pending(self, *a, **k):
+            return True
+
+    runner.session_store = _Store()
+
+    runner._arm_deferred_restart_after_release(SESSION_KEY, generation=None)
+
+    # The arm has NOT completed yet (it is parked on release_arm), but the
+    # barrier must already be registered.
+    assert registered == [SESSION_KEY], (
+        "the delivery barrier was not registered before the arm returned -- a "
+        "final-send ack fired now would be dropped and the armed task would "
+        "block on its 30s barrier"
+    )
+
+    release_arm.set()
+    await asyncio.gather(*runner._background_tasks, return_exceptions=True)

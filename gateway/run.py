@@ -33555,26 +33555,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 consume_breadcrumb=self._consume_restart_initiated_breadcrumb,
             )
 
-        def _after_arm(state: str) -> None:
+        def _after_arm(state: str, *, register_barrier: bool):
             if state != "armed":
-                return
-            self._schedule_armed_deferred_restart(
+                return None
+            return self._schedule_armed_deferred_restart(
                 coordinator,
                 session_key,
                 delivered=delivered,
                 adapter=adapter,
                 generation=generation,
                 mark_self=_mark_self,
+                register_barrier=register_barrier,
             )
 
         loop = self._running_event_loop()
         if loop is None:
-            _after_arm(_arm())
+            _after_arm(_arm(), register_barrier=True)
             return
+
+        # The delivery barrier must be registered BEFORE this method returns.
+        # The caller's final send can be acknowledged immediately afterwards,
+        # and ``acknowledge_response_delivery`` is a one-shot lookup: if the
+        # callback is not in place by then the ack is lost and the armed task
+        # sits on its 30s barrier for a delivery that already happened.
+        # Registering here keeps that ordering identical to the inline path
+        # while only the durable arm moves to the worker thread.
+        registered = self._register_deferred_restart_delivery_barrier(
+            session_key,
+            delivered=delivered,
+            adapter=adapter,
+            generation=generation,
+        )
 
         # Off-loop arm.  The scheduling half must run back ON the loop
         # (``schedule_armed`` creates a task), so it is re-entered through the
         # awaiting wrapper rather than from the worker thread.
+        #
+        # This wrapper AWAITS the scheduled task rather than just spawning it,
+        # so it remains true that awaiting the task this method registers in
+        # ``_background_tasks`` drives the whole arm -> schedule -> delivery
+        # lifecycle to completion.  Callers (and the shutdown drain) rely on
+        # that: the armed task is created after this method returns, so it
+        # would otherwise be invisible to a caller that gathers the set.
         async def _arm_off_loop() -> None:
             try:
                 state = await asyncio.to_thread(_arm)
@@ -33584,8 +33606,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key,
                     exc_info=True,
                 )
+                state = "failed"
+            armed_task = _after_arm(state, register_barrier=False)
+            if armed_task is None:
+                # Nothing was armed, so nothing will ever consume the barrier.
+                # Drop it rather than leaving a stale one-shot callback that
+                # would swallow a later turn's delivery ack.
+                if registered and adapter is not None:
+                    try:
+                        adapter.cancel_delivery_ack_callback(session_key)
+                    except Exception:
+                        logger.debug(
+                            "delivery barrier cleanup skipped for %s",
+                            session_key,
+                            exc_info=True,
+                        )
                 return
-            _after_arm(state)
+            await asyncio.shield(armed_task)
 
         task = loop.create_task(_arm_off_loop())
         background = getattr(self, "_background_tasks", None)
@@ -33611,8 +33648,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter,
         generation: Optional[int],
         mark_self,
-    ) -> None:
-        """Own the armed request's task and its delivery barrier."""
+        register_barrier: bool = True,
+    ):
+        """Own the armed request's task and (optionally) its delivery barrier.
+
+        ``register_barrier=False`` is used by the off-loop path, which must
+        register the barrier BEFORE the arm so a fast final-send ack is not
+        lost while the durable arm is still on the worker thread.
+        """
         # Establish task ownership immediately after the durable arm. Callback
         # registration is fallible; if it fails, the owned task proceeds with
         # UNKNOWN delivery instead of leaving an orphaned armed request.
@@ -33634,26 +33677,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._background_tasks = background
         background.add(task)
         task.add_done_callback(background.discard)
-        if adapter is not None:
-            try:
-                adapter.register_delivery_ack_callback(
-                    session_key,
-                    delivered.set,
-                    generation=generation,
-                )
-            except Exception:
-                logger.warning(
-                    "SELF restart delivery callback registration failed for %s; "
-                    "delivery state is UNKNOWN",
-                    session_key,
-                    exc_info=True,
-                )
-                delivered.set()
-        else:
+        if register_barrier:
+            self._register_deferred_restart_delivery_barrier(
+                session_key,
+                delivered=delivered,
+                adapter=adapter,
+                generation=generation,
+            )
+        return task
+
+    def _register_deferred_restart_delivery_barrier(
+        self,
+        session_key: str,
+        *,
+        delivered,
+        adapter,
+        generation: Optional[int],
+    ) -> bool:
+        """Arm the strong delivery barrier; return whether a callback landed.
+
+        Registration is fallible; on failure the barrier is released so the
+        armed task proceeds with UNKNOWN delivery instead of blocking on an
+        ack that can never arrive.
+        """
+        if adapter is None:
             logger.warning(
                 "SELF restart has no adapter delivery barrier for %s; delivery state is UNKNOWN",
                 session_key,
             )
+            delivered.set()
+            return False
+        try:
+            adapter.register_delivery_ack_callback(
+                session_key,
+                delivered.set,
+                generation=generation,
+            )
+            return True
+        except Exception:
+            logger.warning(
+                "SELF restart delivery callback registration failed for %s; "
+                "delivery state is UNKNOWN",
+                session_key,
+                exc_info=True,
+            )
+            delivered.set()
+            return False
 
     def _release_running_agent_state(
         self,
