@@ -21,6 +21,25 @@ Deliberate non-actions, each one a fail-safe:
 * a bare ``#N`` with no unambiguous repo context is dropped rather than guessed;
 * CLOSED-unmerged posts ONE advisory comment and never unblocks;
 * any lookup failure is a no-op plus one WARN — never a page, never an unblock.
+
+Harness safety
+--------------
+``gate_auto_resolved`` is a real state transition justified by real PR
+evidence. A test or probe that stubs :func:`query_pr` holds a FABRICATED
+oracle, and must therefore never be able to write that transition to a live
+board. ``HERMES_HOME`` alone does not sandbox kanban — ``HERMES_KANBAN_DB``
+outranks it (see :func:`hermes_cli.kanban_db.kanban_db_path`) — so a probe that
+redirects only ``HERMES_HOME`` still resolves to production. On 2026-09-21 a
+lock-timing probe did exactly that and wrote 20 ``gate_auto_resolved`` events
+to the live board, falsely unblocking seven real cards.
+:func:`assert_write_allowed` closes that: a non-default ``query_fn`` raises
+:class:`SandboxEscape` instead of landing, unless isolation has been declared
+POSITIVELY via ``HERMES_KANBAN_SANDBOX=1``. Containment is deliberately not the
+test — the fleet exports ``HERMES_HOME=~/.hermes`` and the live board sits
+inside it, so "the DB is under the declared home" is a relation production
+already satisfies. It gates on ORACLE IDENTITY alone, never on a test-context
+marker: the incident probe was a bare script that set no marker, so a
+marker-gated guard would return before ever examining the oracle.
 """
 
 from __future__ import annotations
@@ -28,6 +47,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
+import os
 import re
 import subprocess
 import sqlite3
@@ -165,6 +185,13 @@ class _PrefetchResult:
     # Per-key cause text for lookups that raised. Carried rather than logged so
     # the locked pass owns the ONE warning a failed lookup is allowed to emit.
     errors: dict[tuple[str, int], str] = field(default_factory=dict)
+    # ``task_id -> (fingerprint, repo)`` repo-context snapshot. Resolving a
+    # bare ``#N`` shells out to ``git remote -v``; carrying the answer keeps
+    # that subprocess — not just the ``gh`` one — out of the writer lock. The
+    # fingerprint is the card state the answer was derived from, so a card
+    # re-pointed in between is detected and skipped rather than resolved
+    # against a stale repository.
+    contexts: dict[str, tuple[tuple, Optional[str]]] = field(default_factory=dict)
 
 
 # Process-lifetime cache keyed by ``(repo.lower(), number)``. MERGED is the
@@ -176,6 +203,131 @@ _CACHE: dict[tuple[str, int], _CacheEntry] = {}
 def clear_cache() -> None:
     """Drop all cached PR states (tests; operator repair)."""
     _CACHE.clear()
+
+
+# ---------------------------------------------------------------------------
+# Harness safety: a stubbed oracle may never write to a live board
+# ---------------------------------------------------------------------------
+
+
+class SandboxEscape(RuntimeError):
+    """A fabricated-oracle write was aimed at a board outside the sandbox."""
+
+
+def _in_test_context() -> bool:
+    """True when this process is a pytest run or an explicitly-marked harness.
+
+    ``PYTEST_CURRENT_TEST`` answers for the in-test phase; ``HERMES_IN_PYTEST``
+    is the opt-in a bare probe script sets for itself. Either is sufficient —
+    the guard is deliberately cheap to trip and cheap to satisfy.
+    """
+    return bool(
+        os.environ.get("PYTEST_CURRENT_TEST")
+        or os.environ.get("HERMES_IN_PYTEST")
+    )
+
+
+def _db_is_sandboxed() -> bool:
+    """True only when isolation is POSITIVELY declared, never merely observed.
+
+    Isolation has to be proven by a property a production process cannot
+    satisfy. Two containment-based anchors were tried and both were satisfiable
+    by the live board:
+
+    * :func:`hermes_cli.kanban_db.kanban_home` — the SHARED kanban root, so the
+      production DB sits under it by construction ("is this board internally
+      consistent with its own root?" is always yes).
+    * the DECLARED ``HERMES_HOME`` — the fleet exports
+      ``HERMES_HOME=~/.hermes`` from ~20 installed launchd jobs and shell
+      helpers, and the live ``kanban.db`` sits directly inside it. Measured
+      2026-09-21 with no pins and no pytest marker: ``sandboxed=True``, a
+      fabricated oracle ALLOWED on the real board.
+
+    So containment is not evidence — any relation the live layout already
+    satisfies can be reached by inheriting the ordinary fleet env. The predicate
+    is instead the explicit opt-in the refusal message already prescribes,
+    ``HERMES_KANBAN_SANDBOX=1`` (:func:`kanban_db.kanban_sandbox_enabled`),
+    which no fleet component sets and which additionally makes every kanban path
+    resolve from ``HERMES_HOME`` and ignore the ``HERMES_KANBAN_*`` pins.
+
+    Containment under the declared ``HERMES_HOME`` is retained as a SECOND
+    condition, not a substitute: the flag says "I intend to be isolated", the
+    containment check confirms the resolution actually landed there.
+
+    Fail CLOSED: a missing flag, an unset ``HERMES_HOME``, or any resolution
+    error counts as not-sandboxed. A guard that cannot prove isolation must not
+    grant it.
+    """
+    try:
+        from hermes_cli import kanban_db as kb
+
+        if not kb.kanban_sandbox_enabled():
+            return False
+        declared = os.environ.get("HERMES_HOME", "").strip()
+        if not declared:
+            return False
+        target = Path(kb.kanban_db_path()).resolve(strict=False)
+        root = Path(declared).expanduser().resolve(strict=False)
+    except Exception:
+        return False
+    return target.is_relative_to(root)
+
+
+def assert_write_allowed(query_fn: Optional[Callable] = None) -> None:
+    """Refuse a gate mutation driven by a fabricated oracle on a live board.
+
+    The one fact that matters is ORACLE IDENTITY: if ``query_fn`` is not the
+    real :func:`query_pr`, whatever "MERGED" it reports is invented, and writing
+    a ``gate_auto_resolved`` from it unblocks real cards on evidence that does
+    not exist. That is provable without any cooperation from the harness.
+
+    It is deliberately NOT preconditioned on a test marker. The 2026-09-21
+    incident probe was a bare ``python probe.py`` that set neither
+    ``PYTEST_CURRENT_TEST`` nor ``HERMES_IN_PYTEST``, so a guard gated behind
+    :func:`_in_test_context` returns before it ever examines the oracle — i.e.
+    it cannot stop the one shape it was written for. The marker survives only to
+    enrich the refusal message.
+
+    Production is untouched: the dispatcher passes ``None`` or the real
+    ``gh``-backed oracle, both of which return immediately.
+    """
+    if query_fn is None or query_fn is _REAL_QUERY_PR:
+        return  # real oracle: the verdict is evidence, not fabrication.
+    if _db_is_sandboxed():
+        return
+    try:
+        from hermes_cli import kanban_db as kb
+
+        resolved = str(kb.kanban_db_path())
+    except Exception:  # pragma: no cover - diagnostic only
+        resolved = "<unresolvable>"
+    marker = (
+        "this process IS marked as a test context"
+        if _in_test_context()
+        else "this process carries NO test marker (a bare probe script)"
+    )
+    try:
+        from hermes_cli import kanban_db as kb
+
+        opted_in = kb.kanban_sandbox_enabled()
+    except Exception:  # pragma: no cover - diagnostic only
+        opted_in = False
+    why = (
+        f"HERMES_KANBAN_SANDBOX is not set, so isolation was never declared "
+        f"(resolved DB {resolved})"
+        if not opted_in
+        else f"resolved DB {resolved} is not inside the declared HERMES_HOME "
+        f"root ({os.environ.get('HERMES_HOME') or '<unset>'})"
+    )
+    raise SandboxEscape(
+        "kanban PR-gate: refusing to mutate a board with a STUBBED PR oracle. "
+        f"{why}; {marker}. Containment alone is NOT proof of isolation — the "
+        "fleet exports HERMES_HOME=~/.hermes and the live board sits inside "
+        "it, so isolation must be declared positively. Set "
+        "HERMES_KANBAN_SANDBOX=1 with HERMES_HOME pointed at a throwaway root "
+        "(the flag also neutralises the HERMES_KANBAN_* path pins) before "
+        "running this harness."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +564,14 @@ def _prune_cache() -> None:
         _CACHE.pop(next(iter(_CACHE)))
 
 
+# The genuine ``gh``-backed oracle, captured at import. ``assert_write_allowed``
+# compares against THIS, never against the module attribute: a harness that
+# monkeypatches ``kanban_pr_gate.query_pr`` would otherwise rebind the very name
+# the guard checks and vouch for its own stub. That is exactly how the
+# 2026-09-21 probe fabricated 20 gate_auto_resolved events.
+_REAL_QUERY_PR = query_pr
+
+
 class _Resolver:
     """Bounded, cached PR-state resolution for one tick."""
 
@@ -572,8 +732,15 @@ def _closed_sentence(entries: list[tuple[PrRef, _CacheEntry]]) -> str:
 _PREFETCH_WORKERS = 6
 
 
-def _blocked_gate_refs(conn: sqlite3.Connection) -> list[tuple[str, list[PrRef]]]:
-    """Snapshot in-scope blocked cards and their currently resolvable PR refs."""
+def _gate_candidates(
+    conn: sqlite3.Connection,
+) -> list[tuple[str, tuple, Optional[str], Optional[str], str]]:
+    """In-scope blocked cards whose reason could name a PR. Pure DB reads.
+
+    Returns ``(task_id, fingerprint, workspace_path, body, reason)``. The
+    fingerprint is every input ``repo_context`` depends on, so a cached
+    context can be proven still applicable without re-deriving it.
+    """
     placeholders = ",".join("?" * len(GATE_BLOCK_KINDS))
     rows = conn.execute(
         f"SELECT id, body, workspace_path FROM tasks "
@@ -581,17 +748,47 @@ def _blocked_gate_refs(conn: sqlite3.Connection) -> list[tuple[str, list[PrRef]]
         f"ORDER BY id",
         tuple(sorted(GATE_BLOCK_KINDS)),
     ).fetchall()
-    candidates: list[tuple[str, list[PrRef]]] = []
+    out: list[tuple[str, tuple, Optional[str], Optional[str], str]] = []
     for row in rows:
         reason = _latest_block_reason(conn, row["id"])
         if not reason or ("#" not in reason and "pull/" not in reason):
             continue
-        default_repo = repo_context(
-            workspace_path=row["workspace_path"], body=row["body"],
+        fingerprint = (row["workspace_path"], row["body"], reason)
+        out.append(
+            (row["id"], fingerprint, row["workspace_path"], row["body"], reason)
         )
+    return out
+
+
+def _blocked_gate_refs(
+    conn: sqlite3.Connection,
+    *,
+    contexts: Optional[dict[str, tuple[tuple, Optional[str]]]] = None,
+) -> list[tuple[str, list[PrRef]]]:
+    """Snapshot in-scope blocked cards and their currently resolvable PR refs.
+
+    ``contexts`` is a repo-context snapshot taken by the unlocked prefetch.
+    When supplied this function performs NO subprocess I/O: a card absent from
+    the snapshot, or whose fingerprint moved since it was taken, is dropped so
+    the locked pass takes no action on it (the next tick re-derives it). When
+    it is None the caller is the direct, unlocked path and contexts are
+    resolved inline.
+    """
+    candidates: list[tuple[str, list[PrRef]]] = []
+    for task_id, fingerprint, workspace_path, body, reason in _gate_candidates(conn):
+        if contexts is None:
+            default_repo = repo_context(workspace_path=workspace_path, body=body)
+        else:
+            cached = contexts.get(task_id)
+            if cached is None or cached[0] != fingerprint:
+                # Card is new or changed since the unlocked snapshot. Resolving
+                # it here would mean shelling out under the caller's lock, so
+                # fail safe instead — a deferred gate costs one tick.
+                continue
+            default_repo = cached[1]
         refs = parse_pr_refs(reason, default_repo=default_repo)
         if refs:
-            candidates.append((row["id"], refs))
+            candidates.append((task_id, refs))
     return candidates
 
 
@@ -611,9 +808,19 @@ def prefetch_pr_gate_states(
     """
     query_fn = query_fn or query_pr
     now = time.time() if now is None else now
+    # Same harness-safety gate as the locked pass: refuse a fabricated oracle
+    # aimed at a live board at the FIRST entry point of the tick.
+    assert_write_allowed(query_fn)
     unique: dict[tuple[str, int], PrRef] = {}
-    for _, refs in _blocked_gate_refs(conn):
-        for ref in refs:
+    contexts: dict[str, tuple[tuple, Optional[str]]] = {}
+    # Resolve repo context HERE, outside the writer lock: this is the seam that
+    # shells out to ``git remote -v`` (same 5 s timeout as ``gh``), and a
+    # degraded workspace would otherwise hold the board's single-writer lock
+    # for seconds per card.
+    for task_id, fingerprint, workspace_path, body, reason in _gate_candidates(conn):
+        default_repo = repo_context(workspace_path=workspace_path, body=body)
+        contexts[task_id] = (fingerprint, default_repo)
+        for ref in parse_pr_refs(reason, default_repo=default_repo):
             key = (ref.repo.lower(), ref.number)
             entry = _CACHE.get(key)
             if entry is not None and (
@@ -630,6 +837,7 @@ def prefetch_pr_gate_states(
     if not selected:
         return _PrefetchResult(
             payloads=payloads, capped=capped, now=now, errors=errors,
+            contexts=contexts,
         )
 
     workers = min(_PREFETCH_WORKERS, len(selected))
@@ -651,6 +859,7 @@ def prefetch_pr_gate_states(
                 errors[key] = f"{type(exc).__name__}: {exc}"
     return _PrefetchResult(
         payloads=payloads, capped=capped, now=now, errors=errors,
+        contexts=contexts,
     )
 
 
@@ -680,6 +889,10 @@ def reevaluate_pr_gates(
     if prefetched is not None:
         now = prefetched.now
     now = time.time() if now is None else now
+    # Harness safety gate, BEFORE any card is read or mutated: a stubbed oracle
+    # aimed at a live board is refused outright rather than allowed to write a
+    # fabricated gate_auto_resolved. See the module docstring.
+    assert_write_allowed(query_fn)
     resolver = _Resolver(
         query_fn=query_fn,
         max_lookups=max_lookups,
@@ -691,8 +904,11 @@ def reevaluate_pr_gates(
     warned_failures: set[tuple[str, int]] = set()
     # Re-read and re-parse under the caller's dispatch lock. This is the state
     # revalidation seam for an unlocked prefetch: if the card changed in the
-    # interim, its new key is absent and resolution safely returns None.
-    for task_id, refs in _blocked_gate_refs(conn):
+    # interim, its fingerprint no longer matches the snapshot and it is skipped
+    # (fail-safe), so this pass performs NO subprocess I/O of any kind.
+    for task_id, refs in _blocked_gate_refs(
+        conn, contexts=None if prefetched is None else prefetched.contexts,
+    ):
 
         resolved: list[tuple[PrRef, _CacheEntry]] = []
         unresolved = False
