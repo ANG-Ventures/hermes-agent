@@ -567,6 +567,35 @@ def _print_active_jobs_summary(jobs) -> None:
             print(f"  Next run: {min(next_runs)}")
     else:
         print("  No active jobs")
+    _print_vanished_job_warning(jobs)
+
+
+def _print_vanished_job_warning(jobs) -> None:
+    """Surface jobs that were created, never removed, and are gone anyway.
+
+    The store cannot answer this by itself — a lost job leaves no trace in
+    ``jobs.json``, only an absence. The lifecycle journal records intent, so
+    reconciling the two turns a silent loss into a visible one. Best effort:
+    a guard failure must never break `hermes cron status`.
+    """
+    try:
+        from cron.lifecycle_journal import STATUS_OK, check_vanished_jobs
+
+        report = check_vanished_jobs(jobs=jobs)
+        if report.status == STATUS_OK:
+            return
+        print()
+        print(color(f"  ⚠️  {report.summary()}", Colors.RED))
+        for entry in report.vanished:
+            print(color(
+                f"     - {entry['job_id']} ({entry.get('name') or 'unnamed'}) "
+                f"created {entry.get('created_at')} by {entry.get('actor')}",
+                Colors.DIM,
+            ))
+    except Exception:
+        # This module has no logger and the guard is advisory — a failure
+        # here must never break `hermes cron status`.
+        pass
 
 
 def cron_create(args):
