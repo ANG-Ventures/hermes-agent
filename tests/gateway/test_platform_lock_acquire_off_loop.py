@@ -44,6 +44,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from gateway import status
 from gateway.platforms.base import BasePlatformAdapter
 
 
@@ -344,7 +345,7 @@ def test_the_sweep_is_not_vacuous():
 
 
 @pytest.mark.asyncio
-async def test_cancelling_the_acquire_does_not_leak_the_scoped_lock():
+async def test_cancelling_the_acquire_does_not_leak_the_scoped_lock(monkeypatch):
     """A cancelled connect() must not leave the scoped lock held by nobody.
 
     Moving the body to a worker thread adds an await point where the blocking
@@ -355,40 +356,44 @@ async def test_cancelling_the_acquire_does_not_leak_the_scoped_lock():
     an orphaned acquire makes every later connect fail "already in use" until
     the process restarts.
 
-    This asserts on the RESOURCE (is the lock held?), not on which API was
-    called, and it is the regression for FleetReview P1 "Orphaned lock on
-    cancel" on this PR.  On a naked ``return await asyncio.to_thread(...)`` it
-    fails with the lock still held.
+    THE TEARDOWN CASE.  The cancellation almost always comes FROM adapter
+    teardown, and teardown calls ``_release_platform_lock()`` -- 18 sites across
+    signal/yuanbao/qqbot/weixin/discord/telegram/slack/whatsapp -- which clears
+    ``_platform_lock_identity``.  Any cancel-path release that re-derives the
+    identity from the adapter is therefore a silent no-op exactly when it
+    matters.  This test runs that teardown between the worker taking the lock
+    and the cancellation landing.
+
+    The oracle is the RESOURCE -- ``gateway.status``'s scoped-lock registry --
+    not which adapter method was called.  Regression for FleetReview P1
+    "Orphaned lock on cancel" (round 2) and its round-4 teardown variant.
     """
-    adapter = _adapter()
     held: set[tuple[str, str]] = set()
     entered = threading.Event()
     proceed = threading.Event()
 
-    def _slow_acquire(scope: str, identity: str, resource_desc: str) -> bool:
-        # Mirror the real body: commit the lock identity, do the slow takeover
-        # I/O, then actually hold the lock.
-        adapter._platform_lock_scope = scope
-        adapter._platform_lock_identity = identity
+    def _fake_acquire(scope: str, identity: str, metadata=None):
         entered.set()
         proceed.wait(timeout=10)
         held.add((scope, identity))
-        return True
+        return True, None
 
-    def _release() -> None:
-        identity = getattr(adapter, "_platform_lock_identity", None)
-        if not identity:
-            return
-        held.discard((adapter._platform_lock_scope, identity))
-        adapter._platform_lock_identity = None
+    def _fake_release(scope: str, identity: str) -> None:
+        held.discard((scope, identity))
 
-    adapter._acquire_platform_lock = _slow_acquire
-    adapter._release_platform_lock = _release
+    monkeypatch.setattr(status, "acquire_scoped_lock", _fake_acquire)
+    monkeypatch.setattr(status, "release_scoped_lock", _fake_release)
 
+    adapter = _adapter()
     task = asyncio.ensure_future(
         adapter._acquire_platform_lock_async("telegram-bot-token", "tok", "d")
     )
     await asyncio.get_running_loop().run_in_executor(None, entered.wait, 5)
+
+    # Adapter teardown, exactly as the production sites do it: this clears
+    # _platform_lock_identity while the acquire is still in flight.
+    adapter._release_platform_lock()
+    assert adapter._platform_lock_identity is None
 
     task.cancel()
     # Release the worker so it completes its acquire during the cancellation.
@@ -401,7 +406,6 @@ async def test_cancelling_the_acquire_does_not_leak_the_scoped_lock():
         f"orphaned worker thread: {held}. Every later connect will fail "
         "'already in use' until the process restarts."
     )
-    assert adapter._platform_lock_identity is None
 
 
 @pytest.mark.asyncio
@@ -423,3 +427,37 @@ async def test_cancellation_still_propagates(adapter, monkeypatch):
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.asyncio
+async def test_a_failing_worker_still_surfaces_as_cancellation(monkeypatch):
+    """A worker exception must not REPLACE the caller's CancelledError.
+
+    The drain re-raises whatever the worker thread produced if it is written
+    as ``except Exception: raise``.  A takeover-marker write failure would then
+    reach ``connect()``'s caller as a ``RuntimeError`` instead of
+    ``CancelledError``, so the caller treats the task as "failed, keep going"
+    rather than "unwinding" -- and proceeds after teardown has already run.
+
+    Regression for FleetReview P1 at base.py:3822 (round 4).
+    """
+    entered = threading.Event()
+    proceed = threading.Event()
+
+    def _fake_acquire(scope: str, identity: str, metadata=None):
+        entered.set()
+        proceed.wait(timeout=10)
+        raise RuntimeError("takeover marker write failed")
+
+    monkeypatch.setattr(status, "acquire_scoped_lock", _fake_acquire)
+    monkeypatch.setattr(status, "release_scoped_lock", lambda scope, identity: None)
+
+    adapter = _adapter()
+    task = asyncio.ensure_future(adapter._acquire_platform_lock_async("s", "i", "d"))
+    await asyncio.get_running_loop().run_in_executor(None, entered.wait, 5)
+    task.cancel()
+    proceed.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+

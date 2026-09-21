@@ -3811,6 +3811,19 @@ class BasePlatformAdapter(ABC):
         it.  So on cancellation we do not abandon the thread: we wait for it to
         finish and release the lock if it did acquire one, then re-raise.  The
         wait is bounded by the sync body's own bounded termination budget.
+
+        The cancel-path release goes through
+        :meth:`_release_platform_lock_identity` with the EXPLICIT arguments we
+        were called with, never through :meth:`_release_platform_lock`: the
+        latter reads ``_platform_lock_identity``, and adapter teardown (18 call
+        sites across signal/yuanbao/qqbot/weixin/discord/telegram/slack/
+        whatsapp) clears that attribute -- typically in the very teardown that
+        cancelled us -- which would turn the release into a silent no-op and
+        orphan the lock anyway.
+
+        Whatever the drained worker does, the caller asked to be cancelled, so
+        this always surfaces as ``CancelledError``; a worker exception must not
+        replace it and let ``connect()`` proceed after teardown.
         """
         task = asyncio.ensure_future(
             asyncio.to_thread(
@@ -3819,29 +3832,34 @@ class BasePlatformAdapter(ABC):
         )
         try:
             return await asyncio.shield(task)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancelled:
             # Let the orphaned worker finish so the lock cannot outlive us.
             # `task` is shielded, so it is still running, not cancelled.
             try:
-                acquired = await task
+                acquired = await asyncio.shield(task)
             except asyncio.CancelledError:
-                raise
-            except Exception:
+                acquired = False
+            except Exception as exc:
                 # The acquire failed on its own; nothing was taken.
-                raise
-            else:
-                if acquired:
-                    try:
-                        self._release_platform_lock()
-                    except Exception as exc:  # pragma: no cover - defensive
-                        logger.warning(
-                            "[%s] could not release %s taken by a cancelled "
-                            "acquire: %s",
-                            self.name,
-                            resource_desc,
-                            exc,
-                        )
-            raise
+                logger.debug(
+                    "[%s] acquire of %s failed while cancelled: %s",
+                    self.name,
+                    resource_desc,
+                    exc,
+                )
+                acquired = False
+            if acquired:
+                try:
+                    self._release_platform_lock_identity(scope, identity)
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning(
+                        "[%s] could not release %s taken by a cancelled "
+                        "acquire: %s",
+                        self.name,
+                        resource_desc,
+                        exc,
+                    )
+            raise cancelled
 
     def _acquire_platform_lock(self, scope: str, identity: str, resource_desc: str) -> bool:
         """Acquire a scoped lock for this adapter. Returns True on success.
@@ -3928,9 +3946,20 @@ class BasePlatformAdapter(ABC):
         identity = getattr(self, '_platform_lock_identity', None)
         if not identity:
             return
-        from gateway.status import release_scoped_lock
-        release_scoped_lock(self._platform_lock_scope, identity)
+        self._release_platform_lock_identity(self._platform_lock_scope, identity)
         self._platform_lock_identity = None
+
+    def _release_platform_lock_identity(self, scope: str, identity: str) -> None:
+        """Release one EXPLICIT (scope, identity) scoped lock.
+
+        :meth:`_release_platform_lock` is identity-derived and therefore
+        no-ops once teardown has cleared ``_platform_lock_identity``.  The
+        cancelled-acquire drain in :meth:`_acquire_platform_lock_async` knows
+        exactly which lock the worker thread took and must release THAT one
+        regardless of adapter state, so it comes through here.
+        """
+        from gateway.status import release_scoped_lock
+        release_scoped_lock(scope, identity)
 
     def _wire_plugin_handlers(self, native: Any = None) -> None:
         """Invoke plugin-registered native handler factories for this platform.
