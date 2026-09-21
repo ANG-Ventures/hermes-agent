@@ -11866,6 +11866,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    block_kind: Optional[str] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -11941,14 +11942,20 @@ def _record_task_failure(
 
         if force_trip or failures >= effective_limit:
             # Trip the breaker.
+            # ``block_kind`` types the resulting block when the caller knows
+            # WHY it is unrecoverable (e.g. an unusable workspace anchor is a
+            # ``capability`` wall a human must re-point). None keeps the legacy
+            # untyped block.
+            _bk = block_kind if block_kind in VALID_BLOCK_KINDS else None
             if release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "block_kind = COALESCE(?, block_kind) "
                     "WHERE id = ? AND status IN ('running', 'ready', 'review')",
-                    (failures, error[:500], task_id),
+                    (failures, error[:500], _bk, task_id),
                 )
             else:
                 # Timeout/crash path: source phase already restored with claim
@@ -11983,6 +11990,8 @@ def _record_task_failure(
                 "trigger_outcome": outcome,
                 "retry_status": retry_status,
             }
+            if _bk:
+                payload["block_kind"] = _bk
             if event_payload_extra:
                 payload.update(event_payload_extra)
             _append_event(
@@ -12039,6 +12048,8 @@ def _record_spawn_failure(
     error: str,
     *,
     failure_limit: int = None,
+    force_trip: bool = False,
+    block_kind: Optional[str] = None,
 ) -> bool:
     return _record_task_failure(
         conn, task_id, error,
@@ -12046,6 +12057,44 @@ def _record_spawn_failure(
         failure_limit=failure_limit,
         release_claim=True,
         end_run=True,
+        force_trip=force_trip,
+        block_kind=block_kind,
+    )
+
+
+# Workspace-resolution errors that NO retry can clear: the anchor path is
+# missing, is not a repo, or is a BARE repo with no checkout to hang a linked
+# worktree on. The repo's shape does not change between dispatcher ticks, so
+# spending the retry budget on it is pure waste.
+#
+# 2026-09-20: ~/dev/fleetreview-router was converted to a bare repo at 21:32;
+# seven cards created 23:29-23:31 anchored there each burned 3 spawns (21
+# total) before gave_up parked them in an untyped ``blocked`` with no
+# actionable reason. These are capability walls — only a human re-pointing the
+# card fixes them — so they block on failure #1.
+_UNUSABLE_WORKSPACE_MARKERS = (
+    "is not inside a git repo and does not point at a git repo root",
+    "workspace path must be absolute",
+    "has no default_workdir",
+)
+
+
+def _unusable_workspace_reason(exc: BaseException) -> Optional[str]:
+    """Return an operator-actionable reason when *exc* is a permanent wall.
+
+    ``None`` means "treat as an ordinary, possibly-transient spawn failure and
+    let the normal retry budget apply".
+    """
+    text = str(exc)
+    if not any(marker in text for marker in _UNUSABLE_WORKSPACE_MARKERS):
+        return None
+    return (
+        f"workspace: {text} — this cannot succeed on retry, so the card is "
+        "blocked on the FIRST failure instead of burning the retry budget. "
+        "Fix: re-create the card with --workspace worktree:/abs/path/to/a/"
+        "NON-BARE checkout (a bare repo has no work tree to anchor on), or "
+        "--workspace scratch for a read-only probe. There is no "
+        "'edit --workspace', so the card must be archived and re-created."
     )
 
 
@@ -13494,9 +13543,18 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
+            # A workspace anchor that can never resolve (bare repo, non-repo
+            # path, missing default_workdir) is a capability wall: retrying it
+            # re-runs the identical git probe against the identical path. Block
+            # it on failure #1 with a reason that names the operator fix,
+            # instead of burning the whole retry budget (7 cards x 3 spawns,
+            # 2026-09-20).
+            permanent = _unusable_workspace_reason(exc)
             auto = _record_spawn_failure(
-                conn, claimed.id, f"workspace: {exc}",
+                conn, claimed.id, permanent or f"workspace: {exc}",
                 failure_limit=failure_limit,
+                force_trip=permanent is not None,
+                block_kind="capability" if permanent else None,
             )
             # Record EVERY spawn failure (not just breaker trips) so a
             # pre-circuit-breaker stall is visible to health telemetry.
@@ -13636,9 +13694,18 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
+            # A workspace anchor that can never resolve (bare repo, non-repo
+            # path, missing default_workdir) is a capability wall: retrying it
+            # re-runs the identical git probe against the identical path. Block
+            # it on failure #1 with a reason that names the operator fix,
+            # instead of burning the whole retry budget (7 cards x 3 spawns,
+            # 2026-09-20).
+            permanent = _unusable_workspace_reason(exc)
             auto = _record_spawn_failure(
-                conn, claimed.id, f"workspace: {exc}",
+                conn, claimed.id, permanent or f"workspace: {exc}",
                 failure_limit=failure_limit,
+                force_trip=permanent is not None,
+                block_kind="capability" if permanent else None,
             )
             # Record EVERY spawn failure (not just breaker trips) so a
             # pre-circuit-breaker stall is visible to health telemetry.
