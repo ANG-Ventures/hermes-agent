@@ -205,6 +205,20 @@ class TestMemoryManager:
         assert p1.queued_prefetches == ["next turn"]
         assert p2.queued_prefetches == ["next turn"]
 
+    def test_completed_background_work_retires_idle_sync_executor(self):
+        mgr = MemoryManager()
+        provider = FakeMemoryProvider("external")
+        mgr.add_provider(provider)
+
+        mgr.sync_all("user", "assistant")
+        deadline = time.monotonic() + 5.0
+        while mgr._sync_executor is not None and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert provider.synced_turns == [("user", "assistant")]
+        assert mgr._sync_executor is None
+        mgr.shutdown_all()
+
 
 
 
