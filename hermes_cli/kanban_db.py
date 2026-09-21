@@ -906,6 +906,68 @@ def enumerating_boards():
         _ENUMERATION_DEPTH.value = max(0, _enumeration_depth() - 1)
 
 
+class EnumeratedBoardSlug(str):
+    """A board slug DISCOVERED by sweeping ``boards/``, not named by a caller.
+
+    The pin-contradiction guard exists to catch a caller that *names* one board
+    and silently gets another. An enumerator never names a board — it reports
+    what is on disk — so its slugs must not trip the guard.
+
+    :func:`enumerating_boards` expresses that as a DYNAMIC EXTENT, and an extent
+    is the wrong shape for this data. It is bound to one thread and to one
+    moment, but an enumerated slug is a VALUE that outlives both: the notifier
+    sweeps boards in ``_collect()``, stores ``{"board": slug}`` in a delivery
+    dict, returns it (extent exits), then addresses that slug from a worker
+    thread via ``asyncio.to_thread``. Both axes were measured on this branch:
+
+        collect-then-address, SAME thread   -> REFUSED   (extent exited in TIME)
+        extent held, asyncio.to_thread      -> REFUSED   (extent lost by THREAD)
+
+    Marking the VALUE fixes both, because the value is what travels. Note that
+    a ``ContextVar`` would NOT have been enough for the second axis:
+    ``gateway/kanban_watchers.py::_run_in_fresh_context`` runs the offloaded
+    call in an empty ``Context()`` precisely to drop inherited ContextVars.
+
+    Verified to survive every hop on the real path: a ``dict`` entry, an
+    ``asyncio.to_thread`` argument, a list/queue, sqlite parameter binding,
+    f-strings, equality and dict-key use against plain ``str``.
+
+    This is deliberately structural. The alternative — re-entering the extent
+    at each point of use — works (measured: ALLOWED) but has to be *remembered*
+    at all ten board-scoped offload sites in ``gateway/kanban_watchers.py``, and
+    silently re-arms the outage the moment an eleventh is added. Marking at the
+    enumerator is one choke point that no call site can forget.
+
+    A ``str`` subclass, so every existing consumer keeps working unchanged.
+    Provenance deliberately does NOT survive serialization: a slug that
+    round-trips through JSON comes back a plain ``str`` and re-arms the guard,
+    which is the fail-CLOSED direction.
+    """
+
+    __slots__ = ()
+
+
+def _is_enumerated(board: Optional[str]) -> bool:
+    """True when this slug came from an enumerator rather than a caller."""
+    return isinstance(board, EnumeratedBoardSlug)
+
+
+def enumerated_slug(board):
+    """Stamp ``board`` as enumerator-produced, preserving ``None``.
+
+    Idempotent, and never raises on an odd value — provenance marking must not
+    become its own failure mode on a path whose whole job is not to fail open.
+    """
+    if board is None:
+        return None
+    if isinstance(board, EnumeratedBoardSlug):
+        return board
+    try:
+        return EnumeratedBoardSlug(board)
+    except Exception:  # pragma: no cover - defensive
+        return board
+
+
 def enumerating_each(boards):
     """Iterate ``boards`` with :func:`enumerating_boards` held for each BODY.
 
@@ -922,10 +984,36 @@ def enumerating_each(boards):
     The generator is suspended inside the context manager while the consumer
     runs the body, so ``continue``, ``break``, ``return`` and exceptions all
     unwind it correctly.
+
+    The yielded board also carries its ENUMERATED PROVENANCE on the slug value
+    itself (:class:`EnumeratedBoardSlug`), which is what covers the consumer
+    that stores the slug and addresses it later — after this extent has exited,
+    possibly from another thread. The extent alone could not: it is scoped to
+    one thread and one moment, and the notifier's slugs outlive both.
     """
     for board in boards:
         with enumerating_boards():
-            yield board
+            yield _mark_board_meta(board)
+
+
+def _mark_board_meta(board: Any) -> Any:
+    """Stamp an enumerated board's ``slug`` (and any mapping copy) in place.
+
+    Board entries are ``dict``s from :func:`read_board_metadata`; consumers do
+    ``board_meta.get("slug")`` and carry that value onward. Stamping here means
+    every one of them inherits the provenance without changing a line — which
+    also covers the degraded ``except: boards = [read_board_metadata(DEFAULT)]``
+    fallback that never went through :func:`list_boards` at all.
+    """
+    try:
+        if isinstance(board, dict) and board.get("slug") is not None:
+            board["slug"] = enumerated_slug(board["slug"])
+            return board
+        if isinstance(board, str):
+            return enumerated_slug(board)
+    except Exception:  # pragma: no cover - defensive
+        pass
+    return board
 
 
 def _refuse_if_pin_contradicts_board_arg(board: Optional[str], override: Path) -> None:
@@ -955,6 +1043,12 @@ def _refuse_if_pin_contradicts_board_arg(board: Optional[str], override: Path) -
     """
     if board is None:
         return
+    if _is_enumerated(board):
+        # Provenance travels with the VALUE, so this holds in any thread and at
+        # any later time — including the notifier's collect-in-the-loop,
+        # deliver-from-a-worker-thread shape, which the dynamic extent alone
+        # could not reach.
+        return  # sweeping every board, not addressing the one named.
     if _enumeration_depth() > 0:
         return  # sweeping every board, not addressing the one named.
     try:
@@ -1477,6 +1571,29 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
     synthesised entry so the dashboard always has something to render.
     Includes the canonical ``slug`` and ``db_path`` so the caller
     doesn't need to reconstruct them.
+
+    The ``db_path`` resolve is REPORTING where a board's DB would live, not a
+    claim to be addressing that board, so it runs inside
+    :func:`enumerating_boards`. Without that it trips the pin-contradiction
+    refusal and breaks the "never raises" contract above — which matters most
+    exactly where it is least expected: this function IS the discovery
+    fallback for every board sweep in the fleet::
+
+        try:
+            boards = _kb.list_boards(include_archived=False)
+        except Exception:
+            boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+
+    (``gateway/kanban_watchers.py`` x4, ``tui_gateway/server.py``,
+    ``plugins/kanban/dashboard/plugin_api.py``). That branch runs when
+    ``list_boards()`` itself failed — i.e. already degraded — and it is
+    evaluated BEFORE ``enumerating_each()`` can stamp anything, so neither the
+    extent nor the value-provenance mark reached it.
+
+    Note what is deliberately NOT done here: the returned ``slug`` is left
+    unstamped. Only an enumerator (:func:`list_boards`, :func:`enumerating_each`)
+    marks provenance, so a caller that NAMES a board still refuses when it goes
+    on to open it.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     meta: dict[str, Any] = {
@@ -1505,7 +1622,8 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
                 meta.update(raw)
     except (OSError, json.JSONDecodeError):
         pass
-    meta["db_path"] = str(kanban_db_path(slug))
+    with enumerating_boards():
+        meta["db_path"] = str(kanban_db_path(slug))
     return meta
 
 
@@ -1692,7 +1810,12 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
                     continue
                 entries.append(meta)
                 seen.add(normed)
-    return entries
+    # Stamp provenance at the SOURCE. Every entry here was discovered by
+    # scanning ``boards/``, never named by a caller, so no consumer of this
+    # list should ever trip the pin-contradiction guard — including the ones
+    # that skip ``enumerating_each`` and the ones that carry a slug out of this
+    # frame into another thread or a later tick.
+    return [_mark_board_meta(m) for m in entries]
 
 
 def remove_board(slug: str, *, archive: bool = True) -> dict:
