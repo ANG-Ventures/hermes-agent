@@ -3,8 +3,9 @@
 This is admission, not recovery: a vanished persisted workspace needs operator
 recovery rather than creation of an empty replacement.
 """
-from pathlib import Path
 import os
+import secrets
+from pathlib import Path
 
 
 class WorkspaceUnavailable(ValueError):
@@ -33,12 +34,65 @@ def validate_mount(root):
     # the mount itself. Never walk upwards to / and call the SSD a valid mount.
     if not root.is_dir() or root.is_symlink():
         raise WorkspaceUnavailable(f"workspaces_root_unmounted: {root}")
-    if not (os.path.ismount(root) or os.path.ismount(root.parent)):
+    filesystem_root = Path(root.anchor)
+    if root == filesystem_root:
+        raise WorkspaceUnavailable("workspaces_root_invalid: filesystem root is not scratch")
+    parent_is_mount = root.parent != filesystem_root and os.path.ismount(root.parent)
+    if not (os.path.ismount(root) or parent_is_mount):
         raise WorkspaceUnavailable(f"workspaces_root_unmounted: {root}")
     if root.resolve() != root.absolute():
         raise WorkspaceUnavailable(f"workspaces_root_invalid: symlink ancestor: {root}")
 
+    # Reject a read-only or wedged mount before a task is claimed. Permission
+    # bits are not authoritative on ACL/noowners mounts, so exercise the actual
+    # write path through a no-follow directory descriptor.
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    probe_name = f".hermes-write-probe-{os.getpid()}-{secrets.token_hex(8)}"
+    try:
+        root_fd = os.open(root, flags)
+        try:
+            probe_fd = os.open(
+                probe_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=root_fd,
+            )
+            os.close(probe_fd)
+            os.unlink(probe_name, dir_fd=root_fd)
+        finally:
+            os.close(root_fd)
+    except OSError as exc:
+        raise WorkspaceUnavailable(f"workspaces_root_unwritable: {root}") from exc
+
 
 def validate_persisted(path):
     if not path.is_dir():
-        raise WorkspaceUnavailable(f"workspace_missing: stranded_by_mount_loss: {path}")
+        raise WorkspaceUnavailable(f"stranded_by_mount_loss: {path}")
+
+
+def create_scratch(root, path):
+    """Create through a pinned directory FD, never through a vanished mount path."""
+    validate_mount(root)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(root, flags)
+    try:
+        validate_mount(root)
+        opened = os.fstat(fd)
+        current = root.stat()
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise WorkspaceUnavailable(f"workspaces_root_unmounted: changed during admission: {root}")
+        for part in path.relative_to(root).parts:
+            if part in (".", ".."):
+                raise WorkspaceUnavailable("workspaces_root_invalid: traversal")
+            try:
+                os.mkdir(part, mode=0o700, dir_fd=fd)
+            except FileExistsError:
+                pass
+            child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            if os.fstat(fd).st_dev != opened.st_dev:
+                raise WorkspaceUnavailable("workspaces_root_invalid: nested filesystem")
+        validate_mount(root)
+    finally:
+        os.close(fd)

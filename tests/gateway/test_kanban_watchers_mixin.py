@@ -41,6 +41,7 @@ from dataclasses import dataclass, field  # noqa: E402
 from gateway.kanban_watchers import (  # noqa: E402
     _format_parent_satisfied_sticky_summary,
     _format_respawn_guarded_summary,
+    _format_workspace_refused_summary,
     _stall_streak_is_bad,
 )
 
@@ -57,6 +58,7 @@ class _FakeResult:
     skipped_locked: bool = False
     spawn_failed: list = field(default_factory=list)
     auto_blocked: list = field(default_factory=list)
+    workspace_refused: list = field(default_factory=list)
 
 
 def test_stall_idle_queue_is_not_bad():
@@ -102,6 +104,17 @@ def test_gateway_respawn_guard_summary_groups_reasons():
 def test_gateway_tick_summary_counts_and_names_parent_satisfied_sticky_cards():
     assert _format_parent_satisfied_sticky_summary(["t_beta", "t_alpha"]) == (
         "parents_done_sticky=2 (t_alpha, t_beta)"
+    )
+
+
+def test_gateway_workspace_refused_summary_names_reason_and_tasks():
+    summary = _format_workspace_refused_summary([
+        ("t_missing", "workspaces_root_unmounted: /Volumes/ramscratch/kanban-workspaces"),
+        ("t_stranded", "stranded_by_mount_loss: /Volumes/ramscratch/kanban-workspaces/t_stranded"),
+    ])
+    assert summary == (
+        "workspace_refused=2 (stranded_by_mount_loss: t_stranded; "
+        "workspaces_root_unmounted: t_missing)"
     )
 
 

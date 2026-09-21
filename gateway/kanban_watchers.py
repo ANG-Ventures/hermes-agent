@@ -297,6 +297,7 @@ _BENIGN_DECLINE_FIELDS = (
 # that additionally tripped the circuit breaker (broken venv / PATH / credential
 # loss → repeated spawn_failed). Either forces the tick to count.
 _FAULT_FIELDS = (
+    "workspace_refused",
     "spawn_failed",
     "auto_blocked",
 )
@@ -323,6 +324,22 @@ def _format_respawn_guarded_summary(guarded) -> str:
         for reason, task_ids in grouped.items()
     )
     return f"respawn_guarded={len(entries)} ({details})"
+
+
+def _format_workspace_refused_summary(refused) -> str:
+    """Format mount-admission refusals by stable reason for the tick log."""
+    entries = list(refused or [])
+    if not entries:
+        return "workspace_refused=0"
+    grouped: dict[str, list[str]] = {}
+    for task_id, detail in entries:
+        reason = str(detail).split(":", 1)[0]
+        grouped.setdefault(reason, []).append(str(task_id))
+    details = "; ".join(
+        f"{reason}: {', '.join(sorted(task_ids))}"
+        for reason, task_ids in sorted(grouped.items())
+    )
+    return f"workspace_refused={len(entries)} ({details})"
 
 
 def _stall_streak_is_bad(ready_pending, any_spawned, results) -> bool:
@@ -2289,8 +2306,15 @@ class GatewayKanbanWatchersMixin:
                             getattr(res, "parent_satisfied_sticky", None)
                             if res is not None else None
                         )
+                        refused = getattr(res, "workspace_refused", None) if res is not None else None
                         if spawned:
                             any_spawned = True
+                        if refused:
+                            logger.error(
+                                "kanban dispatcher tick [%s]: %s",
+                                slug,
+                                _format_workspace_refused_summary(refused),
+                            )
                         if res is not None and (spawned or guarded or parent_satisfied_sticky):
                             # Quiet by default — log only actionable tick activity,
                             # including guarded tasks and satisfied dependency graphs
