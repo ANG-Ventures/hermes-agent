@@ -746,12 +746,28 @@ def test_attempt_store_prunes_ttl_and_corruption_fails_closed_once(tmp_path, cap
 
 
 def test_attempt_store_fsyncs_parent_directory_after_replace(tmp_path, monkeypatch):
-    calls: list[int] = []
-    monkeypatch.setattr(os, "fsync", lambda fd: calls.append(fd))
+    import stat
+
+    events = []
+    destinations = []
+    replace = os.replace
+
+    def record_fsync(fd):
+        events.append("directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file")
+
+    def record_replace(source, destination):
+        destinations.append(destination)
+        events.append("replace")
+        return replace(source, destination)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    monkeypatch.setattr(os, "replace", record_replace)
     store = AutoResumeAttemptStore(tmp_path / "state" / "auto_resume_attempts.json")
 
     assert store.consume("agent:main:telegram:dm:123", 2) is True
-    assert len(calls) == (2 if os.name == "posix" else 1)
+    assert set(destinations) == {store.path, store.session_path}
+    per_write = ["file", "replace", "directory"] if os.name == "posix" else ["file", "replace"]
+    assert events == per_write * len(destinations)
 
 
 def test_attempt_store_tolerates_unsupported_directory_fsync(

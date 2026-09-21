@@ -25,7 +25,9 @@ its fixtures so both gates are exercised through the real scheduler.
 
 from __future__ import annotations
 
+import asyncio
 import json
+from unittest.mock import AsyncMock
 import logging
 from pathlib import Path
 
@@ -66,10 +68,8 @@ def _runner(tmp_path: Path, monkeypatch):
     runner._session_db = AsyncSessionDB(db)
     runner.adapters = {Platform.TELEGRAM: adapter}
 
-    async def _scheduled_resume_stub(_adapter, _event, _session_key, *_rest):
-        return None
-
-    monkeypatch.setattr(runner, "_run_startup_resume_event", _scheduled_resume_stub)
+    adapter.handle_message = AsyncMock()
+    monkeypatch.setattr(runner, "_maybe_notify_unclean_restart", AsyncMock())
     return runner, adapter, db
 
 
@@ -117,6 +117,12 @@ def _boot(runner) -> int:
     runner._running_agents = {}
     runner._running_agents_ts = {}
     return runner._schedule_resume_pending_sessions()
+
+
+async def _dispatched_boot(runner) -> int:
+    scheduled = _boot(runner)
+    await asyncio.gather(*list(runner._background_tasks))
+    return scheduled
 
 
 # --------------------------------------------------------------------------
@@ -327,14 +333,14 @@ async def test_repeated_boots_stop_resuming_the_same_session_at_the_cap(
     for boot in range(3):
         _remark(runner, entry)
         await runner._prepare_boot_resume_work_check()
-        assert _boot(runner) == 1, f"boot {boot} should still resume"
+        assert await _dispatched_boot(runner) == 1, f"boot {boot} should still resume"
 
     # Fourth boot: budget exhausted.
     _remark(runner, entry)
     await runner._prepare_boot_resume_work_check()
     caplog.clear()  # earlier boots legitimately logged "scheduled"
     with caplog.at_level(logging.WARNING, logger="gateway.run"):
-        assert _boot(runner) == 0
+        assert await _dispatched_boot(runner) == 0
 
     messages = [record.getMessage() for record in caplog.records]
     assert any("cause=attempt_cap" in m for m in messages)
@@ -370,14 +376,14 @@ async def test_kind_self_resumes_are_counted_too(tmp_path, monkeypatch, caplog):
             entry.session_key, "restart_interrupted", resume_kind="self"
         )
         await runner._prepare_auto_resume_decisions()
-        assert _boot(runner) == 1
+        assert await _dispatched_boot(runner) == 1
 
     assert runner.session_store.mark_resume_pending(
         entry.session_key, "restart_interrupted", resume_kind="self"
     )
     await runner._prepare_auto_resume_decisions()
     with caplog.at_level(logging.WARNING, logger="gateway.run"):
-        assert _boot(runner) == 0
+        assert await _dispatched_boot(runner) == 0
     assert any(
         "cause=attempt_cap" in r.getMessage() and "kind=self" in r.getMessage()
         for r in caplog.records
@@ -398,12 +404,12 @@ async def test_sibling_shutdown_timeout_resumes_are_counted(tmp_path, monkeypatc
     for expected in (1, 2):
         _remark(runner, entry)
         await runner._prepare_boot_resume_work_check()
-        assert _boot(runner) == 1
+        assert await _dispatched_boot(runner) == 1
         assert store.session_attempt_count(entry.session_key) == expected
 
     _remark(runner, entry)
     await runner._prepare_boot_resume_work_check()
-    assert _boot(runner) == 0
+    assert await _dispatched_boot(runner) == 0
     db.close()
 
 
@@ -420,13 +426,13 @@ async def test_the_cap_is_per_session_not_global(tmp_path, monkeypatch):
 
     _remark(runner, noisy)
     await runner._prepare_boot_resume_work_check()
-    assert _boot(runner) == 1
+    assert await _dispatched_boot(runner) == 1
 
     # Next boot: noisy is capped, quiet has never resumed.
     _remark(runner, noisy)
     _remark(runner, quiet)
     await runner._prepare_boot_resume_work_check()
-    assert _boot(runner) == 1
+    assert await _dispatched_boot(runner) == 1
     assert quiet.session_key in runner._resumed_this_boot
     assert noisy.session_key not in runner._resumed_this_boot
     # Both keep their markers: the capped one because the marker is recovery
@@ -455,7 +461,7 @@ async def test_forward_progress_releases_the_budget(tmp_path, monkeypatch):
     for _ in range(2):
         _remark(runner, entry)
         await runner._prepare_boot_resume_work_check()
-        assert _boot(runner) == 1
+        assert await _dispatched_boot(runner) == 1
     assert store.session_cap_reached(entry.session_key, 2) is True
 
     # The resumed turn finally completes real work (no restart initiated).
@@ -464,7 +470,7 @@ async def test_forward_progress_releases_the_budget(tmp_path, monkeypatch):
 
     _remark(runner, entry)
     await runner._prepare_boot_resume_work_check()
-    assert _boot(runner) == 1
+    assert await _dispatched_boot(runner) == 1
     db.close()
 
 
@@ -486,7 +492,7 @@ async def test_a_self_restarting_turn_does_not_refresh_its_own_budget(
 
     _remark(runner, entry)
     await runner._prepare_boot_resume_work_check()
-    assert _boot(runner) == 1
+    assert await _dispatched_boot(runner) == 1
     assert store.session_attempt_count(entry.session_key) == 1
 
     runner._session_initiated_restart[entry.session_key] = True
@@ -511,5 +517,5 @@ async def test_cap_of_zero_restores_unbounded_resume(tmp_path, monkeypatch):
     for _ in range(6):
         _remark(runner, entry)
         await runner._prepare_boot_resume_work_check()
-        assert _boot(runner) == 1
+        assert await _dispatched_boot(runner) == 1
     db.close()

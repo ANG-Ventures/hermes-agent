@@ -39,7 +39,7 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.session import SessionSource
 from tests.gateway.test_boot_resume_attempt_cap import (
     _INTERRUPTED_TAIL,
-    _boot,
+    _dispatched_boot,
     _runner,
     _seed,
     _source,
@@ -89,7 +89,7 @@ async def test_marker_and_handoff_survive_every_boot_past_the_cap(
         for _ in range(10):
             _remark_with_handoff(runner, entry)
             await runner._prepare_auto_resume_decisions()
-            scheduled.append(_boot(runner))
+            scheduled.append(await _dispatched_boot(runner))
             markers.append(_marker(runner, entry))
 
     assert scheduled == [1] * _CAP + [0] * (10 - _CAP), scheduled
@@ -119,11 +119,11 @@ async def test_capped_session_is_still_resume_pending_for_the_inbound_path(
 
     _remark_with_handoff(runner, entry)
     await runner._prepare_auto_resume_decisions()
-    assert _boot(runner) == 1
+    assert await _dispatched_boot(runner) == 1
 
     _remark_with_handoff(runner, entry)
     await runner._prepare_auto_resume_decisions()
-    assert _boot(runner) == 0, "budget spent"
+    assert await _dispatched_boot(runner) == 0, "budget spent"
 
     refreshed = runner.session_store._entries[entry.session_key]
     from gateway.run import _auto_continue_freshness_window, _is_fresh_gateway_interruption
@@ -201,7 +201,7 @@ async def test_next_inbound_turn_after_the_cap_still_carries_the_recovery_note(
     for expected in (1, 0):
         _remark_with_handoff(runner, entry)
         await runner._prepare_auto_resume_decisions()
-        assert _boot(runner) == expected
+        assert await _dispatched_boot(runner) == expected
     assert runner.session_store._entries[entry.session_key].resume_pending is True
 
     seen: list[str] = []
@@ -282,7 +282,7 @@ async def test_a_crash_between_the_two_resets_never_grants_an_extra_budget(
     for _ in range(2):
         _remark_with_handoff(runner, entry)
         await runner._prepare_auto_resume_decisions()
-        assert _boot(runner) == 1
+        assert await _dispatched_boot(runner) == 1
     assert store.session_cap_reached(entry.session_key, 2) is True
 
     def _die(*_args, **_kwargs):
@@ -301,5 +301,5 @@ async def test_a_crash_between_the_two_resets_never_grants_an_extra_budget(
     # consequence the ordering exists to protect.
     _remark_with_handoff(runner, entry)
     await runner._prepare_auto_resume_decisions()
-    assert _boot(runner) == 0
+    assert await _dispatched_boot(runner) == 0
     db.close()

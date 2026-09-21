@@ -39,7 +39,17 @@ def _golden() -> dict:
 def test_golden_corpus_is_not_empty():
     """Guard the guard: an emptied corpus must fail loudly, not pass vacuously."""
     golden = _golden()
-    assert len(golden) >= 31, f"golden corpus shrank to {len(golden)} cases"
+    corpus = json.loads((_HERE / "corpus.json").read_text())["cases"]
+    assert corpus, "input corpus is empty"
+    assert len(golden) >= len(corpus), f"golden corpus shrank to {len(golden)} of {len(corpus)} cases"
+
+
+def test_floor_detects_missing_golden_cases(monkeypatch):
+    golden = _golden()
+    monkeypatch.setattr(__import__(__name__, fromlist=["_golden"]), "_golden",
+                        lambda: dict(list(golden.items())[:-1]))
+    with pytest.raises(AssertionError):
+        test_golden_corpus_is_not_empty()
 
 
 @pytest.mark.parametrize("case_hash", sorted(_golden().keys()))
