@@ -8624,15 +8624,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         poll_interval_seconds: float = 1.0,
         on_wait=None,
         wait_notice_interval_seconds: float = 15.0,
+        wait_notice_backoff: float = 2.0,
+        wait_notice_max_interval_seconds: float = 300.0,
         should_abort=None,
         acquire_patience_s: float = 0.5,
     ) -> bool:
         """Wait for a cross-process turn lease without holding a SQLite lock.
 
         ``on_wait(elapsed_seconds)`` is best-effort: invoked when the first
-        attempt fails (elapsed ~0) and again about every
-        ``wait_notice_interval_seconds`` while still waiting, so UIs can show
-        that another process holds the conversation.
+        attempt fails (elapsed ~0), again after ``wait_notice_interval_seconds``,
+        and then at geometrically growing gaps (``wait_notice_backoff`` x,
+        capped at ``wait_notice_max_interval_seconds``) while still waiting, so
+        UIs can show that another process holds the conversation WITHOUT
+        flooding the chat. Messaging surfaces post every notice as a fresh
+        message; a fixed 15s cadence produced 24 "Still waiting" posts in one
+        6-minute wait (2026-09-21, #apollo). With the defaults a 10-minute
+        wait now emits ~6 notices (0s, 15s, 45s, 105s, 225s, 465s).
+        ``wait_notice_backoff <= 1`` restores the fixed cadence.
 
         When ``should_abort()`` returns True (for example the agent received
         ``/stop`` while waiting), acquisition stops immediately and returns
@@ -8642,6 +8650,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         wait_started = None
         last_notice_at = None
         notice_every = max(0.0, float(wait_notice_interval_seconds))
+        notice_backoff = max(1.0, float(wait_notice_backoff or 1.0))
+        # The cap is a real ceiling: a caller passing a cap below the base
+        # interval gets the cap, not a silently widened interval.
+        notice_cap = max(0.0, float(wait_notice_max_interval_seconds))
+        if notice_cap > 0.0:
+            notice_every = min(notice_every, notice_cap)
         while True:
             if should_abort is not None:
                 try:
@@ -8684,6 +8698,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "session turn lease on_wait callback failed",
                         exc_info=True,
                     )
+                # Grow the gap only after a notice that followed a full
+                # interval (not the immediate first-failure notice), so the
+                # cadence is 0, +I, +I*b, +I*b^2 ... capped.
+                if last_notice_at is not None and notice_every > 0.0:
+                    notice_every = min(notice_cap, notice_every * notice_backoff)
                 last_notice_at = now
             time.sleep(min(max(0.01, float(poll_interval_seconds)), remaining))
 
