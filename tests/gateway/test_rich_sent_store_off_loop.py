@@ -16,6 +16,7 @@ loop kept running, rather than asserting on the shape of the source.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 import pytest
@@ -33,6 +34,12 @@ def store_home(tmp_path, monkeypatch):
 async def test_record_async_persists_and_is_readable(store_home):
     """The off-loop path must still actually write the entry."""
     await rich_sent_store.record_async("12345", "678", "morning briefing")
+    stored = store_home / "state" / "rich_sent_index.json"
+    for _ in range(200):
+        if stored.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert stored.exists()
     assert rich_sent_store.lookup("12345", "678") == "morning briefing"
 
 
@@ -46,56 +53,65 @@ async def test_record_async_ignores_empty_inputs(store_home):
 
 
 @pytest.mark.asyncio
-async def test_record_async_keeps_the_loop_responsive(store_home, monkeypatch):
-    """A SLOW write must not stall a concurrent coroutine.
-
-    This is the assertion that fails without the fix: with a blocking
-    ``record`` the heartbeat cannot tick while ``os.replace`` sleeps, so it
-    records one tick.  Off-loop it keeps ticking throughout.
-    """
+async def test_record_async_does_not_wait_for_a_stalled_write(store_home, monkeypatch):
+    """Adapter progress must not wait for best-effort index persistence."""
     real_replace = rich_sent_store.os.replace
+    write_started = asyncio.Event()
+    release_write = asyncio.Event()
+    loop = asyncio.get_running_loop()
 
-    def slow_replace(src, dst):
-        time.sleep(0.5)
+    def stalled_replace(src, dst):
+        loop.call_soon_threadsafe(write_started.set)
+        asyncio.run_coroutine_threadsafe(release_write.wait(), loop).result()
         return real_replace(src, dst)
 
-    monkeypatch.setattr(rich_sent_store.os, "replace", slow_replace)
+    monkeypatch.setattr(rich_sent_store.os, "replace", stalled_replace)
 
-    ticks = 0
-    stop = False
-
-    async def heartbeat():
-        nonlocal ticks
-        while not stop:
-            ticks += 1
-            await asyncio.sleep(0.01)
-
-    hb = asyncio.create_task(heartbeat())
-    await asyncio.sleep(0.05)  # let the heartbeat get going
-    before = ticks
+    loop.call_later(0.2, release_write.set)
+    started = time.monotonic()
     await rich_sent_store.record_async("12345", "678", "slow write")
-    after = ticks
-    stop = True
-    await hb
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.1, f"adapter waited {elapsed:.3f}s for best-effort persistence"
+    await asyncio.wait_for(write_started.wait(), timeout=1)
+    stored = store_home / "state" / "rich_sent_index.json"
+    for _ in range(100):
+        if stored.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert stored.exists()
 
-    # 0.5s of blocking write / 0.01s tick interval: an off-loop write leaves
-    # room for dozens of ticks, a blocking one allows at most a couple.
-    assert after - before > 10, (
-        f"loop stalled during the write: only {after - before} heartbeat ticks "
-        "elapsed across a 0.5s record_async"
-    )
-    assert rich_sent_store.lookup("12345", "678") == "slow write"
+
+@pytest.mark.asyncio
+async def test_record_async_ignores_default_executor_saturation(store_home, monkeypatch):
+    """Unrelated default-executor work cannot hold adapter progress."""
+    loop = asyncio.get_running_loop()
+    release = loop.create_future()
+
+    def saturated_run_in_executor(executor, func, *args):
+        return release
+
+    monkeypatch.setattr(loop, "run_in_executor", saturated_run_in_executor)
+    started = time.monotonic()
+    try:
+        await asyncio.wait_for(
+            rich_sent_store.record_async("12345", "saturated", "still returns"),
+            timeout=0.1,
+        )
+    finally:
+        if not release.done():
+            release.cancel()
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.1
 
 
 @pytest.mark.asyncio
 async def test_record_async_honors_the_profile_override(tmp_path, monkeypatch):
-    """Moving the write off-loop resolves the store path in a WORKER THREAD.
+    """The caller resolves the active profile before handing work to the thread.
 
     In the single-process multi-profile runtime the profile boundary is the
-    ``_HERMES_HOME_OVERRIDE`` ContextVar, so a write that resolves its path on
-    another thread could land in the launch profile's tree -- one profile's
-    message text leaking into another's index.  ``asyncio.to_thread`` copies
-    the context, which is exactly what makes this move safe; pin it.
+    ``_HERMES_HOME_OVERRIDE`` ContextVar. The dedicated worker does not inherit
+    each enqueueing caller's context, so ``record_async`` must capture the path
+    while the caller's override is active.
     """
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
@@ -106,10 +122,15 @@ async def test_record_async_honors_the_profile_override(tmp_path, monkeypatch):
     token = set_hermes_home_override(str(prof_b))
     try:
         await rich_sent_store.record_async("12345", "678", "profile B text")
+        stored = prof_b / "state" / "rich_sent_index.json"
+        for _ in range(200):
+            if stored.exists():
+                break
+            await asyncio.sleep(0.01)
     finally:
         reset_hermes_home_override(token)
 
-    assert (prof_b / "state" / "rich_sent_index.json").exists(), (
+    assert stored.exists(), (
         "record_async wrote outside the active profile's tree"
     )
 
@@ -126,5 +147,14 @@ async def test_concurrent_record_async_does_not_lose_entries(store_home):
         rich_sent_store.record_async("12345", str(i), f"msg {i}")
         for i in range(25)
     ])
-    for i in range(25):
-        assert rich_sent_store.lookup("12345", str(i)) == f"msg {i}"
+    path = store_home / "state" / "rich_sent_index.json"
+    data = {}
+    for _ in range(300):
+        try:
+            data = json.loads(path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+        if all(data.get(f"12345:{i}", {}).get("t") == f"msg {i}" for i in range(25)):
+            break
+        await asyncio.sleep(0.01)
+    assert all(data.get(f"12345:{i}", {}).get("t") == f"msg {i}" for i in range(25))

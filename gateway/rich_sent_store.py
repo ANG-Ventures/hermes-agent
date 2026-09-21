@@ -15,7 +15,7 @@ to a no-op / ``None`` so it can never break a send or an inbound message.
 
 from __future__ import annotations
 
-import asyncio
+from collections import OrderedDict
 import json
 import os
 import threading
@@ -23,13 +23,17 @@ import time
 from typing import Optional
 
 _MAX_ENTRIES = 1000
+_MAX_PENDING_WRITES = 1000
 _MAX_TEXT_CHARS = 2000
 
-# ``record`` is a read-modify-write of one JSON file.  On the event loop it was
-# implicitly serialized by the loop itself; ``record_async`` runs it in the
-# default executor, so two concurrent sends can now genuinely interleave and
-# lose an entry.  Serialize the critical section instead of relying on that.
+# The synchronous API and the dedicated writer both touch the same file.
 _WRITE_LOCK = threading.Lock()
+_PENDING_CONDITION = threading.Condition()
+_PENDING_WRITES: OrderedDict[
+    tuple[str, str], tuple[str, object, object, str]
+] = OrderedDict()
+_RECENT_WRITES: OrderedDict[tuple[str, str], str] = OrderedDict()
+_WRITER_STARTED = False
 
 
 def _store_path() -> str:
@@ -57,19 +61,55 @@ def record(chat_id, message_id, text: Optional[str]) -> None:
 
 
 async def record_async(chat_id, message_id, text: Optional[str]) -> None:
-    """Off-loop :func:`record`.
+    """Queue a best-effort write without holding adapter progress.
 
-    The write is a read-modify-write plus an ``os.replace``: on a network
-    filesystem or a stalled disk that blocks the calling thread for as long as
-    the rename takes, and on the event loop that stalls EVERY session.  Callers
-    on a coroutine must use this; ``record`` stays for synchronous callers.
+    A dedicated daemon thread isolates the index from the event loop and from
+    unrelated work in asyncio's shared default executor. Repeated writes for
+    the same message coalesce while the writer is busy.
     """
     if not text or message_id is None or chat_id is None:
         return
     try:
-        await asyncio.to_thread(record, chat_id, message_id, text)
+        _enqueue_write(_store_path(), chat_id, message_id, text)
     except Exception:
         return
+
+
+def _enqueue_write(path: str, chat_id, message_id, text: str) -> None:
+    global _WRITER_STARTED
+
+    pending_key = (path, _key(chat_id, message_id))
+    with _PENDING_CONDITION:
+        _PENDING_WRITES[pending_key] = (path, chat_id, message_id, text)
+        _PENDING_WRITES.move_to_end(pending_key)
+        _RECENT_WRITES[pending_key] = text[:_MAX_TEXT_CHARS]
+        _RECENT_WRITES.move_to_end(pending_key)
+        while len(_PENDING_WRITES) > _MAX_PENDING_WRITES:
+            _PENDING_WRITES.popitem(last=False)
+        while len(_RECENT_WRITES) > _MAX_ENTRIES:
+            _RECENT_WRITES.popitem(last=False)
+        if not _WRITER_STARTED:
+            threading.Thread(
+                target=_writer_loop,
+                name="rich-sent-store-writer",
+                daemon=True,
+            ).start()
+            _WRITER_STARTED = True
+        _PENDING_CONDITION.notify()
+
+
+def _writer_loop() -> None:
+    while True:
+        with _PENDING_CONDITION:
+            while not _PENDING_WRITES:
+                _PENDING_CONDITION.wait()
+            _, item = _PENDING_WRITES.popitem(last=False)
+        path, chat_id, message_id, text = item
+        try:
+            with _WRITE_LOCK:
+                _record_locked(path, chat_id, message_id, text)
+        except Exception:
+            pass
 
 
 def _record_locked(path: str, chat_id, message_id, text: str) -> None:
@@ -103,7 +143,13 @@ def lookup(chat_id, message_id) -> Optional[str]:
     if message_id is None or chat_id is None:
         return None
     try:
-        with open(_store_path(), "r", encoding="utf-8") as fh:
+        path = _store_path()
+        cache_key = (path, _key(chat_id, message_id))
+        with _PENDING_CONDITION:
+            recent = _RECENT_WRITES.get(cache_key)
+        if recent:
+            return recent
+        with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
         entry = data.get(_key(chat_id, message_id))
         if isinstance(entry, dict):
