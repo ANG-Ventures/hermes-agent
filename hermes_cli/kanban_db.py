@@ -1578,8 +1578,8 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if not archive:
         # A board directory CONTAINS that board's workspaces/ -- deleting it
         # destroys every card's scratch dir at once, the same blast radius as
-        # the 2026-09-20 incident, and the bare rmtree below did it with no
-        # containment, liveness or audit (card t_63fb42f9, review round 3).
+        # the 2026-09-20 incident, and the deletion below did it with no
+        # liveness check or audit (card t_63fb42f9, review round 3).
         # Checked BEFORE the cache invalidation: it opens the board DB (which
         # would re-populate _INITIALIZED_PATHS) and it can abort, so no state
         # may be torn down ahead of it.
@@ -1620,12 +1620,18 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         d.rename(target)
         return {"slug": normed, "action": "archived", "new_path": str(target)}
     else:
-        import shutil
+        from hermes_cli.kanban_survivor import remove_workspace_dir
+        # Two independent refusals now apply to a board hard-delete: the
+        # liveness gate above (no card on this board may be running or
+        # claim-locked) and their survivor gate inside remove_workspace_dir
+        # (the board may not still hold recoverable work). The audit line
+        # records the attempt either way -- card t_63fb42f9 / incident
+        # 2026-09-20, where a wholesale directory removal left no trail.
         _audit_workspace_deletion(
             d, task_id=None, reason="remove_board", allowed=True,
             detail=f"board={normed}",
         )
-        shutil.rmtree(d)
+        remove_workspace_dir(None, None, d, board=True)
         return {"slug": normed, "action": "deleted", "new_path": ""}
 
 
@@ -2119,6 +2125,13 @@ CREATE TABLE IF NOT EXISTS task_runs (
 -- dashboard can list/download and ``build_worker_context`` can surface
 -- the absolute path to the worker (which has full file-tool access). See
 -- #35338.
+CREATE TABLE IF NOT EXISTS task_workspace_survivors (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    bases TEXT NOT NULL DEFAULT '{}',
+    held_reason TEXT,
+    survivor TEXT
+);
+
 CREATE TABLE IF NOT EXISTS task_attachments (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id      TEXT NOT NULL,
@@ -6599,6 +6612,25 @@ def complete_task(
     else:
         verified_cards = []
 
+    # Reject stale workers before doing filesystem work or recording a hold.
+    candidate = get_task(conn, task_id)
+    if candidate is None or candidate.status not in ('running', 'ready', 'blocked', 'review'):
+        return False
+    if expected_run_id is not None and candidate.current_run_id != expected_run_id:
+        return False
+    from hermes_cli.kanban_survivor import preserve
+    survivor = preserve(conn, task_id, metadata)
+    if survivor:
+        metadata = dict(metadata or {}, survivor=survivor)
+        survivor_note = (
+            f"survivor=patch {survivor['path']} {survivor['sha256']} {survivor['bytes']} NOT PUSHED"
+            if survivor['kind'] == 'patch' else
+            f"survivor=bundle {survivor['sidecar']} NOT PUSHED"
+            if survivor['kind'] == 'bundle' else "survivor=ref " + " ".join(
+                f"{ref['remote']}/{ref['branch']}@{ref['sha']}" for ref in survivor["refs"]
+            )
+        )
+        result = '\n'.join(filter(None, [result, survivor_note]))
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
@@ -6702,6 +6734,8 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
+        if survivor:
+            completed_payload["survivor"] = survivor
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -7138,8 +7172,6 @@ def safe_remove_workspace_dir(
 
     Returns True iff the directory was removed.
     """
-    import shutil
-
     try:
         resolved = Path(path).resolve(strict=False)
     except OSError:
@@ -7183,7 +7215,42 @@ def safe_remove_workspace_dir(
     _audit_workspace_deletion(
         resolved, task_id=task_id, reason=reason, allowed=True,
     )
-    shutil.rmtree(resolved, ignore_errors=True)
+    # The removal itself goes through kanban_survivor.remove_workspace_dir
+    # (#783), which captures recoverable implementation work before deleting
+    # and HOLDS the workspace if it cannot. This function owns the three
+    # gates in FRONT of it -- containment, liveness, audit -- so the two
+    # protections compose instead of competing, and there remains exactly ONE
+    # directory deleter in the package (asserted by
+    # test_workspace_deletion_has_one_choke_point).
+    from hermes_cli.kanban_survivor import remove_workspace_dir
+
+    # The survivor capture needs a task connection: without one it can only
+    # prove durability from an independently-pushed ref, and holds the
+    # workspace otherwise. Callers of this choke point may omit conn (gc
+    # does), so open one here rather than degrading into a hold -- the same
+    # self-connect _task_has_live_run performs.
+    try:
+        if conn is not None or not task_id:
+            removed = bool(remove_workspace_dir(conn, task_id, resolved))
+        else:
+            with connect_closing() as own:
+                removed = bool(remove_workspace_dir(own, task_id, resolved))
+    except Exception as exc:
+        # remove_workspace_dir raises sqlite3.IntegrityError for a task_id
+        # with no row (its capture writes an attachment FK). This choke point
+        # is called from best-effort cleanup paths and must degrade to a
+        # refusal, never propagate.
+        _log.warning(
+            "Survivor-backed removal of %s (task %s) failed: %s",
+            resolved, task_id, exc,
+        )
+        removed = False
+    if not removed:
+        _audit_workspace_deletion(
+            resolved, task_id=task_id, reason=reason, allowed=False,
+            detail="survivor-held-workspace",
+        )
+        return False
     _log.debug(
         "Removed scratch workspace %s (task %s, reason %s)",
         resolved, task_id, reason,
@@ -7238,6 +7305,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             return
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
+        from hermes_cli.kanban_survivor import remove_workspace_dir
         if kind not in ("scratch", "worktree") or not path:
             # This task's own workspace isn't a removable scratch dir, but its
             # completion may still unblock a deferred parent scratch cleanup
@@ -7279,6 +7347,9 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # the audit trail). A board's ``default_workdir`` can pair
             # ``workspace_kind='scratch'`` with a user-supplied path pointing
             # at a real source tree, and a still-running card owns its dir.
+            # safe_remove_workspace_dir performs the removal through
+            # kanban_survivor.remove_workspace_dir, so survivor preservation
+            # still runs underneath these gates.
             safe_remove_workspace_dir(
                 wp, task_id=task_id, reason="complete_task", conn=conn,
             )
@@ -7368,21 +7439,14 @@ def _cleanup_worktree_workspace(
         # git's own dirty guard re-verifies at removal time. If the tree
         # became dirty between our check and the removal (TOCTOU), removal
         # fails safe and the worktree is preserved.
-        result = subprocess.run(
-            ["git", "-C", str(repo_root), "worktree", "remove", str(wp)],
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            timeout=60,
-            check=False,
-        )
-        if result.returncode != 0:
+        from hermes_cli.kanban_survivor import remove_workspace_dir
+        if not remove_workspace_dir(conn, task_id, wp, worktree_root=repo_root):
             _audit_workspace_deletion(
                 wp, task_id=task_id, reason=reason, allowed=False,
-                detail="git-worktree-remove-failed",
+                detail="survivor-refused-or-git-remove-failed",
             )
             _log.warning(
-                "git worktree remove failed for task %s at %s: %s",
-                task_id, wp, (result.stderr or result.stdout or "").strip(),
+                "worktree removal refused for task %s at %s", task_id, wp,
             )
             return
         _audit_workspace_deletion(
@@ -7437,6 +7501,7 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             ).fetchone()
             if active:
                 continue  # still has active children
+            from hermes_cli.kanban_survivor import remove_workspace_dir
             # All children done — safe to clean up parent workspace
             if row["workspace_kind"] == "worktree":
                 _cleanup_worktree_workspace(
@@ -9708,6 +9773,8 @@ def set_workspace_path(
             "UPDATE tasks SET workspace_path = ? WHERE id = ?",
             (str(path), task_id),
         )
+    from hermes_cli.kanban_survivor import record_baseline
+    record_baseline(conn, task_id, path)
 
 
 def set_task_model(

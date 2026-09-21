@@ -3202,6 +3202,8 @@ from gateway.platforms.base import (
 )
 from gateway.shutdown_watchdog import (
     DEFAULT_HEARTBEAT_INTERVAL_S,
+    DEFAULT_LIVENESS_STARVATION_LOAD_FACTOR,
+    DEFAULT_LIVENESS_STARVATION_MAX_HOLD_S,
     DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
     DEFAULT_LOOP_WATCHDOG_MAX_STRIKES,
     DEFAULT_LOOP_WATCHDOG_TIMEOUT_S,
@@ -10609,18 +10611,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         read-merge-write preserves the current lifecycle state (``running`` /
         ``draining`` / …).  Passing ``gateway_state=None`` here would clobber it.
         Best-effort: a failed status write must never disrupt a turn.
+
+        🔴 The write itself is OFF-LOOP.  ``write_runtime_status`` does a
+        read-modify-atomic-write of ``gateway_state.json`` plus a realpath walk
+        and a psutil ``create_time`` call (``_build_pid_record``).  Measured on
+        this box: median 0.903ms, max 7.666ms — on an IDLE machine with a small
+        file.  py-spy caught all three frames as the MainThread top frame on
+        the live Apollo gateway (2026-09-20, episode 10:33:34 dumps 9/10/11)
+        reached from ``_handle_message`` at ``run.py:22749``, i.e. once per
+        inbound message.  When a loop is running we hand the whole thing to a
+        worker thread; with no running loop (startup, shutdown, sync callers)
+        it runs inline exactly as before.
         """
         try:
             from gateway.status import write_runtime_status
-            write_runtime_status(
-                active_agents=self._active_work_count(),
+
+            payload = {
+                "active_agents": self._active_work_count(),
                 # The live running-session keys (excl. the pending sentinel) so the
                 # safe-restart watcher can do per-session quiescence (is MY session idle?)
                 # rather than waiting for the whole fleet to go idle.
-                active_agent_keys=list(self._snapshot_running_agents().keys()),
-            )
+                "active_agent_keys": list(self._snapshot_running_agents().keys()),
+            }
         except Exception:
-            pass
+            return
+
+        def _write() -> None:
+            try:
+                from gateway.status import write_runtime_status as _w
+
+                _w(**payload)
+            except Exception:
+                pass
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop: nothing to protect, run inline (previous behavior).
+            _write()
+            return
+
+        # Fire-and-forget on the default executor. Deliberately not awaited —
+        # callers are turn-boundary hooks in synchronous code paths, and a
+        # status write is best-effort telemetry, never a turn dependency.
+        try:
+            loop.run_in_executor(None, _write)
+        except Exception:
+            _write()
 
     # ------------------------------------------------------------------
     # Task-liveness reaper (busy-gateway-quiescence, spec §5 D-3/D-4).
@@ -16586,11 +16623,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "loop_watchdog_max_strikes",
                     DEFAULT_LOOP_WATCHDOG_MAX_STRIKES,
                 )
+                starvation_factor = getattr(
+                    config,
+                    "liveness_starvation_load_factor",
+                    DEFAULT_LIVENESS_STARVATION_LOAD_FACTOR,
+                )
+                starvation_max_hold = getattr(
+                    config,
+                    "liveness_starvation_max_hold_s",
+                    DEFAULT_LIVENESS_STARVATION_MAX_HOLD_S,
+                )
                 self._loop_liveness_watchdog = start_loop_liveness_watchdog(
                     loop,
                     probe_interval=float(interval),
                     probe_timeout=float(timeout),
                     max_strikes=int(strikes),
+                    starvation_load_factor=float(starvation_factor),
+                    starvation_max_hold_s=float(starvation_max_hold),
                 )
             except Exception:
                 logger.debug("Failed to start gateway loop liveness watchdog", exc_info=True)

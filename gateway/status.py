@@ -131,6 +131,21 @@ def record_start_and_check_storm(
         return None
 
 
+# Per-process identity caches. Both values are IMMUTABLE for the life of the
+# process (a pid's kernel create_time; a resolved HERMES_HOME path), but both
+# were being recomputed on the event loop at every turn boundary via
+# ``_build_pid_record`` -> ``write_runtime_status``. See the docstrings on
+# ``_compute_boot_id`` / ``_canonical_hermes_home`` for the py-spy evidence.
+_BOOT_ID_CACHE: dict[int, str] = {}
+_CANONICAL_HOME_CACHE: dict[str, Path] = {}
+
+
+def _reset_identity_caches() -> None:
+    """Drop the per-process identity caches. For tests only."""
+    _BOOT_ID_CACHE.clear()
+    _CANONICAL_HOME_CACHE.clear()
+
+
 def _get_process_hermes_home() -> Path:
     """Return the process-level HERMES_HOME, skipping context-local overrides.
 
@@ -148,8 +163,24 @@ def _get_process_hermes_home() -> Path:
 
 
 def _canonical_hermes_home(path: Path | str) -> Path:
-    """Return a stable absolute HERMES_HOME path for persisted identity data."""
-    return Path(path).expanduser().resolve(strict=False)
+    """Return a stable absolute HERMES_HOME path for persisted identity data.
+
+    **Cached per input path.** ``Path.resolve()`` walks every component with
+    ``realpath(2)``, and this is reached from ``_build_pid_record`` ->
+    ``write_runtime_status`` on every turn boundary. py-spy caught
+    ``posixpath._joinrealpath`` as the MainThread top frame on the live Apollo
+    gateway (2026-09-20, episode 10:33:34 dump 9) via
+    ``_handle_message -> _persist_active_agents -> write_runtime_status``.
+    HERMES_HOME does not move under a running process, so the walk is done
+    once per distinct path.
+    """
+    key = str(path)
+    cached = _CANONICAL_HOME_CACHE.get(key)
+    if cached is not None:
+        return cached
+    resolved = Path(path).expanduser().resolve(strict=False)
+    _CANONICAL_HOME_CACHE[key] = resolved
+    return resolved
 
 
 def _same_hermes_home(left: Path | str, right: Path | str) -> bool:
@@ -662,11 +693,21 @@ def _compute_boot_id(pid: int) -> str:
     degraded (pid-only) id makes the F2 restart-initiator breadcrumb fail CLOSED
     (every crumb rejected as degraded → silent fall back to C1/F1), so we log a
     WARNING to make that otherwise-silent inert state observable.
+
+    **Cached per pid.** A process's kernel create_time is immutable for the
+    life of that process, but this is reached from ``_build_pid_record`` ->
+    ``write_runtime_status`` on EVERY turn boundary. py-spy caught
+    ``psutil._psosx._get_kinfo_proc`` as the MainThread top frame on the live
+    Apollo gateway (2026-09-20, episode 10:33:34 dump 11) via exactly that
+    path. Recomputing an immutable value on the event loop is pure waste.
     """
+    cached = _BOOT_ID_CACHE.get(pid)
+    if cached is not None:
+        return cached
     try:
         import psutil
 
-        return f"{pid}:{psutil.Process(pid).create_time()}"
+        boot_id = f"{pid}:{psutil.Process(pid).create_time()}"
     except Exception as exc:
         logger.warning(
             "boot_id degraded to pid-only for pid %s (psutil failed: %s) — the F2 "
@@ -674,7 +715,11 @@ def _compute_boot_id(pid: int) -> str:
             pid,
             exc,
         )
+        # Deliberately NOT cached: a degraded id is a transient failure we want
+        # to retry (and keep warning about), not a value to pin for the process.
         return f"{pid}:"
+    _BOOT_ID_CACHE[pid] = boot_id
+    return boot_id
 
 
 def _build_pid_record() -> dict:

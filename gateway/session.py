@@ -15,6 +15,7 @@ import os
 import json
 import sqlite3
 import threading
+import time
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -1424,6 +1425,23 @@ class SessionStore:
         # from _routing_generation, so fast and full snapshots are totally
         # ordered; guarded by _save_lock (see _save_entry).
         self._fast_persisted_entries: Dict[str, tuple[int, str]] = {}
+        # --- sessions.json mirror writer (off the event loop) --------------
+        # The legacy mirror is written with mkstemp + fsync + os.replace.  On
+        # the live Apollo gateway (2026-09-20) that rename blocked the event
+        # loop for >=30s, reached per turn from clear_resume_pending -> _save.
+        # When a running loop is on the calling thread the write is handed to
+        # this single writer thread, which COALESCES: N back-to-back saves
+        # collapse into one rename of the newest snapshot.
+        self._sessions_json_cv = threading.Condition(threading.Lock())
+        self._sessions_json_pending: Optional[
+            tuple[int, int, Dict[str, Any], frozenset]
+        ] = None
+        self._sessions_json_writer: Optional[threading.Thread] = None
+        self._sessions_json_writer_stop = False
+        # Bumped every time the writer finishes a pending snapshot; lets
+        # flush() wait for durability without polling the filesystem.
+        self._sessions_json_written_seq = 0
+        self._sessions_json_queued_seq = 0
         self._inflight_lock = threading.Lock()
         self._inflight_sessions: Dict[str, _SessionFlight] = {}
         # An unscoped pre-migration Slack key can represent at most one
@@ -1567,6 +1585,18 @@ class SessionStore:
                 db.close()
             except Exception as exc:
                 logger.debug("SessionDB close error during handle sweep: %s", exc)
+
+        # Retire the deferred sessions.json mirror writer first: a queued
+        # snapshot must land (or time out loudly) before the process tears
+        # down, or a turn's routing update is lost from the legacy mirror.
+        try:
+            if not self.stop_sessions_json_writer(timeout=10.0):
+                logger.warning(
+                    "gateway.session: sessions.json mirror writer did not "
+                    "drain within 10s at shutdown"
+                )
+        except Exception as exc:  # noqa: BLE001 - shutdown must continue
+            logger.debug("sessions.json writer shutdown error: %s", exc)
 
         self._db_handle_cache.close_all(_close)
 
@@ -1845,7 +1875,15 @@ class SessionStore:
         if merged:
             self._save(retired_keys=retired_keys)
             if not self._write_sessions_json and (self.sessions_dir / "sessions.json").exists():
-                self._save_sessions_json({key: entry.to_dict() for key, entry in self._entries.items()}, retired_keys=retired_keys)
+                # Off the loop thread when there is one (#782): ``_save``
+                # above already committed state.db, so this legacy-mirror
+                # retirement is best-effort and must not sit an mkstemp +
+                # fsync + os.replace on the event loop.
+                self._dispatch_sessions_json_save(
+                    {key: entry.to_dict() for key, entry in self._entries.items()},
+                    self._next_routing_generation_locked(),
+                    retired_keys=retired_keys,
+                )
         return merged
 
     @staticmethod
@@ -1925,7 +1963,13 @@ class SessionStore:
                 # Even if ongoing JSON mirroring is disabled, retire aliases
                 # from an existing legacy import so they cannot resurrect.
                 if not self._write_sessions_json and (self.sessions_dir / "sessions.json").exists():
-                    self._save_sessions_json({key: entry.to_dict() for key, entry in self._entries.items()}, retired_keys=retired_keys)
+                    # Same off-loop dispatch as the startup alias redirect
+                    # above (#782): state.db is already committed by ``_save``.
+                    self._dispatch_sessions_json_save(
+                        {key: entry.to_dict() for key, entry in self._entries.items()},
+                        self._next_routing_generation_locked(),
+                        retired_keys=retired_keys,
+                    )
                 logger.info("Merged Discord session type aliases: %d canonical routes", merged)
             return merged
 
@@ -2273,7 +2317,12 @@ class SessionStore:
                             raise
             if getattr(self, "_write_sessions_json", True) or not db_saved:
                 try:
-                    self._save_sessions_json(data, **({"retired_keys": retired_keys} if retired_keys else {}))
+                    self._dispatch_sessions_json_save(
+                        data,
+                        generation,
+                        retired_keys=retired_keys,
+                        must_be_synchronous=not db_saved,
+                    )
                 except SessionKeyConflict as exc:
                     self._reject_session_key_conflict(exc)
                 except Exception as exc:
@@ -2296,6 +2345,179 @@ class SessionStore:
                     if rev <= generation
                 ]:
                     del fast_persisted[key]
+
+    # ------------------------------------------------------------------
+    # sessions.json mirror: dispatch / coalescing writer thread
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _loop_is_running() -> bool:
+        """True when the CALLING thread is running an asyncio event loop.
+
+        ``get_running_loop`` is thread-local by construction, which is exactly
+        the question: is the blocking write about to happen on a loop thread?
+        Synchronous callers (CLI, tests, shutdown) get ``False`` and keep the
+        old inline behavior.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        return True
+
+    def _dispatch_sessions_json_save(  # noqa: atomic-write-on-loop loop-conditional guard: defers to the writer thread whenever a loop is running
+        self,
+        data: Dict[str, Any],
+        generation: int,
+        *,
+        retired_keys=(),
+        must_be_synchronous: bool = False,
+    ) -> None:
+        """Write the legacy mirror, off the loop thread when there is one.
+
+        ``must_be_synchronous`` is set when state.db did NOT commit, i.e. the
+        mirror is the PRIMARY copy for this write and its failure must
+        propagate to the caller.  In that case the write stays inline even on
+        a loop thread: correctness outranks latency, and it is the rare path.
+        """
+        if must_be_synchronous or not self._loop_is_running():
+            self._save_sessions_json(
+                data, **({"retired_keys": retired_keys} if retired_keys else {})
+            )
+            return
+        self._queue_sessions_json_save(data, generation, retired_keys=retired_keys)
+
+    def _queue_sessions_json_save(
+        self,
+        data: Dict[str, Any],
+        generation: int,
+        *,
+        retired_keys=(),
+    ) -> None:
+        """Hand the newest snapshot to the single writer thread.
+
+        Coalescing: only ONE pending snapshot is kept.  A newer generation
+        replaces an older one that has not been written yet, so N back-to-back
+        saves collapse into one mkstemp+fsync+rename.  Retired keys accumulate
+        across coalesced snapshots -- dropping them would let a superseded
+        write resurrect a key the newer snapshot deliberately retired.
+        """
+        with self._sessions_json_cv:
+            pending = self._sessions_json_pending
+            merged_retired = frozenset(retired_keys)
+            if pending is not None:
+                prev_seq, prev_gen, prev_data, prev_retired = pending
+                merged_retired = prev_retired | merged_retired
+                if prev_gen > generation:
+                    # A newer snapshot is already queued; keep it, but carry
+                    # this one's retired keys forward.
+                    self._sessions_json_pending = (
+                        prev_seq,
+                        prev_gen,
+                        prev_data,
+                        merged_retired,
+                    )
+                    return
+            self._sessions_json_queued_seq += 1
+            self._sessions_json_pending = (
+                self._sessions_json_queued_seq,
+                generation,
+                data,
+                merged_retired,
+            )
+            self._ensure_sessions_json_writer_locked()
+            self._sessions_json_cv.notify_all()
+
+    def _ensure_sessions_json_writer_locked(self) -> None:
+        """Start the writer thread on first use. Caller holds the condition."""
+        thread = self._sessions_json_writer
+        if thread is not None and thread.is_alive():
+            return
+        self._sessions_json_writer_stop = False
+        thread = threading.Thread(
+            target=self._sessions_json_writer_loop,
+            name="sessions-json-writer",
+            daemon=True,
+        )
+        self._sessions_json_writer = thread
+        thread.start()
+
+    def _sessions_json_writer_loop(self) -> None:
+        """Drain the pending snapshot until stopped. One rename per wakeup."""
+        from gateway.routing_identity import SessionKeyConflict
+
+        while True:
+            with self._sessions_json_cv:
+                while (
+                    self._sessions_json_pending is None
+                    and not self._sessions_json_writer_stop
+                ):
+                    self._sessions_json_cv.wait()
+                if (
+                    self._sessions_json_pending is None
+                    and self._sessions_json_writer_stop
+                ):
+                    return
+                pending = self._sessions_json_pending
+                assert pending is not None  # loop invariant from the wait above
+                seq, _generation, data, retired = pending
+                self._sessions_json_pending = None
+            try:
+                self._save_sessions_json(
+                    data, **({"retired_keys": tuple(retired)} if retired else {})
+                )
+            except SessionKeyConflict as exc:
+                self._reject_session_key_conflict(exc)
+            except Exception as exc:  # noqa: BLE001 - mirror is best-effort here
+                # state.db already committed (see _dispatch_sessions_json_save:
+                # the mirror only runs off-thread when db_saved was True), so a
+                # mirror failure must not take the process down.
+                logger.warning(
+                    "gateway.session: deferred sessions.json mirror save "
+                    "failed after state.db commit: %s",
+                    exc,
+                )
+            finally:
+                with self._sessions_json_cv:
+                    # ``seq`` is the queue position of the snapshot just
+                    # written.  Coalescing means one write can satisfy several
+                    # queued positions, so the watermark jumps to seq rather
+                    # than incrementing -- that is what lets a waiter that
+                    # queued at position N return as soon as a write numbered
+                    # >= N lands.
+                    if seq > self._sessions_json_written_seq:
+                        self._sessions_json_written_seq = seq
+                    self._sessions_json_cv.notify_all()
+
+    def drain_sessions_json_writes(self, timeout: float = 10.0) -> bool:
+        """Block until every queued mirror write has been attempted.
+
+        For shutdown and for tests that need the on-disk file to be current.
+        Returns False on timeout.
+        """
+        deadline = time.monotonic() + timeout
+        with self._sessions_json_cv:
+            target = self._sessions_json_queued_seq
+            while self._sessions_json_written_seq < target:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                if not self._sessions_json_cv.wait(remaining):
+                    return False
+        return True
+
+    def stop_sessions_json_writer(self, timeout: float = 10.0) -> bool:
+        """Drain, then retire the writer thread."""
+        drained = self.drain_sessions_json_writes(timeout=timeout)
+        with self._sessions_json_cv:
+            self._sessions_json_writer_stop = True
+            thread = self._sessions_json_writer
+            self._sessions_json_cv.notify_all()
+        if thread is not None:
+            thread.join(timeout=timeout)
+        with self._sessions_json_cv:
+            self._sessions_json_writer = None
+        return drained
 
     def _save_sessions_json(self, data: Dict[str, Any], *, retired_keys=()) -> None:
         """Guard the fallback/mirror under a cross-process lock, before replace."""
@@ -4039,6 +4261,10 @@ class SessionStore:
         with self._lock:
             self._ensure_loaded_locked()
             self._save()
+        # ``_save`` may have handed the legacy mirror to the writer thread (it
+        # does whenever the caller is on an event loop).  ``flush`` promises a
+        # durable write, so wait for the queue to drain before returning.
+        self.drain_sessions_json_writes()
 
     def clear_resume_pending(self, session_key: str) -> bool:
         """Clear the resume-pending flag after a successful resumed turn.

@@ -3685,14 +3685,67 @@ class PluginContext:
 _HOOK_CALLBACK_TIMEOUT_SECS = 30.0
 _MAX_HOOK_CALLBACK_TIMEOUT_SECS = 600.0
 
+# Memoized resolution of the above, keyed on the config cache signature.
+#
+# ``invoke_hook`` calls the resolver once per hook invocation, and the gateway
+# fires ``pre_gateway_dispatch`` on EVERY inbound message -- so this ran a full
+# config read per message, on the event loop. py-spy caught exactly that on the
+# live Apollo gateway (2026-09-20): MainThread in ``_load_config_impl`` for
+# >=6s across 3 consecutive samples via
+# ``_handle_message -> invoke_hook -> _resolve_hook_callback_timeout``.
+#
+# The value only changes when config.yaml changes, so resolve once and reuse
+# until the config's (mtime, size) signature moves.
+_HOOK_TIMEOUT_CACHE_LOCK = threading.Lock()
+# Sentinel distinct from every real signature AND from ``None`` (which
+# _config_cache_signature returns for "no config file to key on").
+_UNRESOLVED_HOOK_TIMEOUT_SIG = object()
+_HOOK_TIMEOUT_CACHE: Dict[str, Any] = {"sig": _UNRESOLVED_HOOK_TIMEOUT_SIG, "value": None}
+
+
+def _reset_hook_callback_timeout_cache() -> None:
+    """Drop the memoized hook-callback timeout. For tests and config reloads."""
+    with _HOOK_TIMEOUT_CACHE_LOCK:
+        _HOOK_TIMEOUT_CACHE["sig"] = _UNRESOLVED_HOOK_TIMEOUT_SIG
+        _HOOK_TIMEOUT_CACHE["value"] = None
+
 
 def _resolve_hook_callback_timeout() -> float:
     """Return the effective hook-callback timeout in seconds.
 
-    Reads ``plugins.hook_callback_timeout`` via the cached readonly config
-    loader. Falls back to ``_HOOK_CALLBACK_TIMEOUT_SECS``. Values ``<= 0``
-    disable the threaded timeout (sync call). Values above
-    ``_MAX_HOOK_CALLBACK_TIMEOUT_SECS`` are clamped.
+    Memoized against the config cache signature: the config is read only when
+    ``config.yaml`` (or the managed overlay) has actually changed. Every other
+    call is a dict lookup, so the per-message hook path does no config work at
+    all -- see the module-level note on ``_HOOK_TIMEOUT_CACHE``.
+    """
+    try:
+        from hermes_cli.config import _config_cache_signature, get_config_path
+
+        sig: Any = _config_cache_signature(get_config_path())
+    except Exception:
+        sig = None
+
+    cached_sig = _HOOK_TIMEOUT_CACHE["sig"]
+    if sig is not None and cached_sig == sig:
+        value = _HOOK_TIMEOUT_CACHE["value"]
+        if isinstance(value, float):
+            return value
+
+    resolved = _resolve_hook_callback_timeout_uncached()
+    if sig is not None:
+        with _HOOK_TIMEOUT_CACHE_LOCK:
+            _HOOK_TIMEOUT_CACHE["sig"] = sig
+            _HOOK_TIMEOUT_CACHE["value"] = resolved
+    return resolved
+
+
+def _resolve_hook_callback_timeout_uncached() -> float:
+    """Read + validate ``plugins.hook_callback_timeout`` from config.
+
+    Reads via the cached readonly config loader. Falls back to
+    ``_HOOK_CALLBACK_TIMEOUT_SECS``. Values ``<= 0`` disable the threaded
+    timeout (sync call). Values above ``_MAX_HOOK_CALLBACK_TIMEOUT_SECS`` are
+    clamped.
     """
     timeout = _HOOK_CALLBACK_TIMEOUT_SECS
     try:

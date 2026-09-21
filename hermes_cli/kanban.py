@@ -4261,6 +4261,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 def _cmd_gc(args: argparse.Namespace) -> int:
     """Remove scratch workspaces of archived tasks, prune old events, and
     delete old worker logs."""
+
     scratch_root = kb.workspaces_root()
     removed_ws = 0
     with kb.connect_closing() as conn:
@@ -4275,13 +4276,13 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             # predicate: only clean, fully-pushed worktrees are removed.
             wt_path = row["workspace_path"]
             if wt_path and Path(wt_path).is_dir():
-                # Liveness + audit now live inside the worktree lane too
-                # (card t_63fb42f9): passing no conn makes _task_has_live_run
-                # open its own, which fail-closes on any DB error.
-                kb._cleanup_worktree_workspace(
-                    row["id"], wt_path, row["branch_name"],
-                    reason="gc_archived",
-                )
+                with kb.connect_closing() as conn:
+                    # Liveness + audit now live inside the worktree lane too
+                    # (card t_63fb42f9).
+                    kb._cleanup_worktree_workspace(
+                        row["id"], wt_path, row["branch_name"],
+                        conn=conn, reason="gc_archived",
+                    )
                 if not Path(wt_path).is_dir():
                     removed_ws += 1
             continue
@@ -4292,12 +4293,16 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         # ``Path.relative_to`` SUCCEEDS on an equal path (it returns '.'), so an
         # archived row whose workspace_path was the workspaces ROOT itself would
         # pass the containment check and rmtree every live card's scratch dir in
-        # one call. safe_remove_workspace_dir requires STRICT descendancy, also
-        # refuses any card with a live run, and audits both outcomes.
-        if kb.safe_remove_workspace_dir(
-            path, task_id=row["id"], reason="gc_archived",
-        ):
-            removed_ws += 1
+        # one call -- the 2026-09-20 incident. safe_remove_workspace_dir requires
+        # STRICT descendancy, refuses any card with a live run, audits both
+        # outcomes, and performs the removal through
+        # kanban_survivor.remove_workspace_dir so survivor preservation (#783)
+        # still runs underneath.
+        with kb.connect_closing() as conn:
+            if kb.safe_remove_workspace_dir(
+                path, task_id=row["id"], reason="gc_archived", conn=conn,
+            ):
+                removed_ws += 1
 
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)

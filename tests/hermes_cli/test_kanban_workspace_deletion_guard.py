@@ -84,11 +84,15 @@ def test_safe_remove_refuses_the_workspaces_root_itself(kanban_home):
 
 def test_safe_remove_allows_a_task_dir_under_the_root(kanban_home):
     root = _scratch_root()
-    ws = root / "t_done"
+    # A REAL task row: the removal runs through
+    # kanban_survivor.remove_workspace_dir, which records the capture against
+    # the card and needs the row to exist.
+    task_id = _mktask("finished one")
+    ws = root / task_id
     ws.mkdir()
     (ws / "artifact.txt").write_text("x\n", encoding="utf-8")
 
-    assert kb.safe_remove_workspace_dir(ws, task_id="t_done", reason="test") is True
+    assert kb.safe_remove_workspace_dir(ws, task_id=task_id, reason="test") is True
     assert not ws.exists()
     assert root.is_dir()
 
@@ -165,7 +169,8 @@ def test_safe_remove_allows_a_card_whose_claim_lock_expired(kanban_home):
 
 def test_deletion_audit_log_records_both_outcomes(kanban_home):
     root = _scratch_root()
-    gone = root / "t_gone"
+    gone_id = _mktask("finished")
+    gone = root / gone_id
     gone.mkdir()
 
     task_id = _mktask("live")
@@ -175,7 +180,7 @@ def test_deletion_audit_log_records_both_outcomes(kanban_home):
     kept = root / task_id
     kept.mkdir()
 
-    assert kb.safe_remove_workspace_dir(gone, task_id="t_gone", reason="gc_archived")
+    assert kb.safe_remove_workspace_dir(gone, task_id=gone_id, reason="gc_archived")
     assert not kb.safe_remove_workspace_dir(
         kept, task_id=task_id, reason="gc_archived"
     )
@@ -185,7 +190,7 @@ def test_deletion_audit_log_records_both_outcomes(kanban_home):
     refused = [ln for ln in lines if "\tREFUSED\t" in ln]
     assert len(deleted) == 1, lines
     assert len(refused) == 1, lines
-    assert "task=t_gone" in deleted[0]
+    assert "task=%s" % gone_id in deleted[0]
     assert "reason=gc_archived" in deleted[0]
     assert "pid=%d" % os.getpid() in deleted[0]
     assert "detail=task-has-live-run" in refused[0]

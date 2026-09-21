@@ -3402,6 +3402,20 @@ DEFAULT_CONFIG = {
         "loop_watchdog_probe_timeout_s": 10.0,
         "loop_watchdog_max_strikes": 3,
 
+        # Host-starvation classification for the loop watchdog's missed-probe
+        # escalation (gateway/shutdown_watchdog.py). Exit 75 assumes a WEDGED
+        # loop that a supervised restart recovers; a CPU-starved host is not a
+        # wedge, and the restart contends for the same CPU — measured
+        # 2026-09-20, when load 538 on 32 cores made the watchdog self-exit
+        # twice and launchd relaunched into a 12-minute boot. When
+        # load1 > max(liveness_starvation_load_factor * ncpu, an absolute
+        # floor), the watchdog logs PHASE=liveness_starved and HOLDS instead of
+        # exiting. The hold is bounded: after liveness_starvation_max_hold_s of
+        # continuous starvation with no successful probe it exits 75 anyway with
+        # PHASE=liveness_starved_giveup.
+        "liveness_starvation_load_factor": 2.0,
+        "liveness_starvation_max_hold_s": 900.0,
+
         # Whether the gateway keeps writing the legacy sessions.json mirror of
         # its routing index. The primary copy lives in state.db (the
         # gateway_routing table). Default True for backward compatibility with
