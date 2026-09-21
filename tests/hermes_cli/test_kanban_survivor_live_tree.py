@@ -231,6 +231,7 @@ def test_a_disposable_repo_is_never_canonical(board, tmp_path):
     sibling = init(tmp_path / "temporary" / "sibling")
     commit(sibling, "code.py", "value = 1\n", "base")
     git(ws, "remote", "set-url", "origin", str(sibling))
+    git(ws, "remote", "remove", "live")
     assert list(_canonical_repos(ws, ws)) == []
 
 
@@ -275,8 +276,8 @@ def test_same_diff_different_base_fails_closed(board, tmp_path):
     local, head, published_fix, mirror = divergent_history(tmp_path)
     # `cp -R src dst` NESTS when dst exists, which silently produced a
     # workspace with no `.git` at all (and a vacuously-passing test).
-    assert not ws.exists()
-    shutil.copytree(local, ws, symlinks=True)
+    assert not any(ws.iterdir())
+    shutil.copytree(local, ws, symlinks=True, dirs_exist_ok=True)
     assert (ws / ".git").exists()
     kb.set_workspace_path(board, tid, ws)
 
@@ -354,4 +355,28 @@ def test_landed_rejects_a_directory_that_is_not_a_repository(board, tmp_path):
             "changed_files": ["code.py"],
             "landed": [{"repo_path": str(plain), "sha": head}],
         })
+    assert ws.exists()
+
+
+def test_landed_skips_nested_capture_and_survives_cleanup(board, tmp_path, monkeypatch):
+    """Explicit canonical proof works without a local remote or snapshot budget."""
+    tid, ws, live, head, _ = home_clone(board, tmp_path, live_remote=False)
+    nested = init(ws / "nested")
+    commit(nested, "code.py", "value = 2\n", "mirror copy")
+    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 2048)
+    assert kb.complete_task(board, tid, metadata={
+        "changed_files": ["code.py"],
+        "landed": [{"repo_path": str(live), "sha": head}],
+    })
+    assert not ws.exists()
+    assert (live / "code.py").read_text() == "value = 2\n"
+
+
+def test_landed_cleanup_rechecks_live_reachability(board, tmp_path):
+    """A stored receipt cannot authorize deletion after its live ref disappears."""
+    from hermes_cli.kanban_survivor import preserve, remove_workspace_dir
+    tid, ws, live, head, _ = home_clone(board, tmp_path, live_remote=False)
+    preserve(board, tid, {"landed": [{"repo_path": str(live), "sha": head}]})
+    git(live, "reset", "--hard", "HEAD~1")
+    assert not remove_workspace_dir(board, tid, ws)
     assert ws.exists()

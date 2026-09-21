@@ -5,8 +5,8 @@ remote sync") can never match `_remote_survivor`: the mirror republishes every
 commit under a new sha. Before this, such a workspace fell through to the
 patch/bundle path and a 94 MB home tree always tripped
 ``KANBAN_ATTACHMENT_MAX_BYTES`` — blocking completion of work that was committed
-and running (2026-09-20, t_e69d693a). Content identity (`git patch-id`) is what
-survives the rewrite; these tests pin that it is verified, not assumed.
+and running (2026-09-20, t_e69d693a). Under the round-2 ruling, patch-id is only
+an advisory diff match; live canonical reachability is the landed authority.
 """
 import json
 import subprocess
@@ -44,8 +44,8 @@ def commit(repo, name, text, message):
 def rewriting_mirror(repo, mirror, *, branch="main"):
     """Publish repo's history to `mirror` under DIFFERENT shas, same content.
 
-    This is what the isolated remote sync does: identical trees and identical
-    diffs, but rewritten committer identity/dates, so every sha differs.
+    This fixture rewrites identity only. The live sync also changes trees;
+    test_kanban_survivor_live_tree.py covers that stricter case.
     """
     git(repo, "init", "--bare", str(mirror))
     staging = mirror.parent / f"{mirror.stem}-staging"
@@ -94,18 +94,14 @@ def home_clone_task(conn, tmp_path, *, publish=True):
     return tid, ws, local, remote_sha
 
 
-def test_rewritten_mirror_completes_by_content_instead_of_oversized_bundle(board, tmp_path):
+def test_rewritten_mirror_alone_requires_a_recovery_bundle(board, tmp_path):
     tid, ws, local, remote_sha = home_clone_task(board, tmp_path)
     assert kb.complete_task(board, tid, metadata={"changed_files": ["code.py"]})
     survivor = kb.latest_run(board, tid).metadata["survivor"]
-    assert survivor["kind"] == "ref-by-content", survivor
-    ref = survivor["refs"][0]
-    assert ref["matched_by"] == "patch-id"
-    assert ref["head"] == local
-    assert ref["sha"] == remote_sha != local
-    # The manifest is the only record tying the local sha to the published one.
+    # Round-2 ruling: a rewritten diff is only an advisory, not a survivor.
+    assert survivor["kind"] == "bundle", survivor
     manifest = json.loads(Path(survivor["sidecar"]).read_text())
-    assert manifest["refs"][0]["sha"] == remote_sha
+    assert manifest["bundles"]
     assert not ws.exists()
     # The published content really is the implementation.
     restored = tmp_path / "restored"
@@ -139,7 +135,7 @@ def test_content_match_requires_the_patch_id_check(board, tmp_path, monkeypatch)
 
 
 def test_patch_id_is_stable_across_a_sha_rewrite(board, tmp_path):
-    """The property the whole escape rests on, asserted directly."""
+    """The advisory signal survives an identity-only rewrite."""
     from hermes_cli.kanban_survivor import _patch_id
     tid, ws, local, remote_sha = home_clone_task(board, tmp_path)
     mirror_work = tmp_path / "mirror-work"
@@ -163,8 +159,8 @@ def test_landed_escape_accepts_a_verified_published_commit(board, tmp_path):
     assert survivor["kind"] == "landed", survivor
     entry = survivor["landed"][0]
     assert entry["sha"] == landed_sha
-    assert entry["published_sha"] == landed_sha
-    assert entry["matched_by"] == "sha"
+    assert entry["published"]["sha"] == landed_sha
+    assert entry["matched_by"] == "canonical"
     assert json.loads(Path(survivor["sidecar"]).read_text())["landed"][0]["sha"] == landed_sha
     assert not ws.exists()
 
@@ -182,12 +178,13 @@ def test_landed_escape_accepts_a_content_match_on_a_rewriting_mirror(board, tmp_
         "landed": [{"repo_path": str(live), "sha": local}],
     })
     entry = kb.latest_run(board, tid).metadata["survivor"]["landed"][0]
-    assert entry["matched_by"] == "patch-id"
+    assert entry["matched_by"] == "canonical"
     assert entry["sha"] == local
-    assert entry["published_sha"] == remote_sha
+    assert entry["published"]["sha"] == remote_sha
+    assert entry["published"]["advisory"] is True
 
 
-@pytest.mark.parametrize("break_it", ["unpublished", "unreachable", "missing_repo", "no_such_sha"])
+@pytest.mark.parametrize("break_it", ["disposable", "unreachable", "missing_repo", "no_such_sha"])
 def test_landed_escape_fails_closed_on_every_unverifiable_claim(board, tmp_path, break_it):
     """A `landed` claim authorises deleting the code; it must never be taken on trust."""
     tid, ws, local, remote_sha = home_clone_task(board, tmp_path)
@@ -195,9 +192,9 @@ def test_landed_escape_fails_closed_on_every_unverifiable_claim(board, tmp_path,
     git(tmp_path, "clone", "-b", "main", str(tmp_path / "hermes-home.git"), str(live))
     git(live, "config", "user.name", "Live")
     git(live, "config", "user.email", "live@example.invalid")
-    if break_it == "unpublished":
-        sha = commit(live, "code.py", "value = 99\n", "landed but never pushed")
-        repo_path = str(live)
+    if break_it == "disposable":
+        sha = local
+        repo_path = str(ws)
     elif break_it == "unreachable":
         # PUBLISHED but on an abandoned branch HEAD cannot reach: not this line
         # of work. Publication alone must not satisfy the claim, so this commit
@@ -241,7 +238,7 @@ def test_content_scan_does_not_match_the_shallow_boundary_commit(board, tmp_path
     """
     import shutil
     from hermes_cli.kanban_survivor import (
-        _content_survivor, _published_refs, _CONTENT_SCAN_DEPTH,
+        _content_advisory, _published_refs, _CONTENT_SCAN_DEPTH,
     )
     source = tmp_path / "deep-source"
     source.mkdir()
@@ -274,4 +271,4 @@ def test_content_scan_does_not_match_the_shallow_boundary_commit(board, tmp_path
     assert head != boundary
 
     # The verdict that matters: this content is NOT published, so no survivor.
-    assert _content_survivor(local, head, list(_published_refs(local, local))) is None
+    assert _content_advisory(local, head, list(_published_refs(local, local))) is None

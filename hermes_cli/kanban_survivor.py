@@ -267,7 +267,7 @@ def _patch_id(repo, sha, env=None):
 
 
 def _content_advisory(repo, head, published, *, budget=_CONTENT_SCAN_BUDGET):
-    """ADVISORY ONLY: a published commit whose diff is byte-identical to ``head``'s.
+    """ADVISORY ONLY: a published commit with the same normalized patch-id.
 
     Recorded in the sidecar as a recovery hint ("the mirror's <sha> looks like
     this work"), NEVER as authority to delete a workspace: patch-id is diff
@@ -470,14 +470,12 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None):
                 raise SurvivorUnavailable("survivor_unavailable: workspace missing")
             return None
         workspace = workspace.resolve(strict=True)
-        repos = _repos(workspace)
-        if any(a != b and a.is_relative_to(b) for a in repos for b in repos):
-            # A patch cannot add a gitlink and files below the same path.
-            raise SurvivorUnavailable("survivor_unavailable: nested repository requires separate recovery")
-        keys = {str(r.relative_to(workspace)) for r in repos}
-        if set(bases) - keys:
-            raise SurvivorUnavailable("survivor_unavailable: recorded repository missing")
         landed = (metadata or {}).get("landed")
+        if cleanup and not landed and previous and previous.get("kind") == "landed":
+            # Completion and deletion are separate calls. Revalidate the named
+            # live commits rather than falling back to a home-clone snapshot.
+            landed = [{"repo_path": entry["repository"], "sha": entry["sha"]}
+                      for entry in previous["landed"]]
         if landed:
             if not isinstance(landed, list):
                 raise SurvivorUnavailable("survivor_unavailable: landed must be a list")
@@ -492,6 +490,13 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None):
                 json.dumps(survivor, sort_keys=True).encode(), "application/json",
             )["path"]
             return _record(conn, task_id, survivor, previous)
+        repos = _repos(workspace)
+        if any(a != b and a.is_relative_to(b) for a in repos for b in repos):
+            # A patch cannot add a gitlink and files below the same path.
+            raise SurvivorUnavailable("survivor_unavailable: nested repository requires separate recovery")
+        keys = {str(r.relative_to(workspace)) for r in repos}
+        if set(bases) - keys:
+            raise SurvivorUnavailable("survivor_unavailable: recorded repository missing")
         patches, refs, bundles, repositories = [], [], [], []
         for repo in repos:
             key = str(repo.relative_to(workspace))
