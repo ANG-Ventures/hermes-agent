@@ -297,6 +297,10 @@ def test_same_diff_different_base_fails_closed(board, tmp_path):
     git(tmp_path, "clone", "-b", "main", str(mirror), str(restored))
     assert not (restored / "unpublished.py").exists()
     assert "secret_work" in Path(survivor["path"]).read_text()
+    manifest = json.loads(Path(survivor["sidecar"]).read_text())
+    git(restored, "checkout", "--detach", manifest["repositories"][0]["base_sha"])
+    git(restored, "apply", survivor["path"])
+    assert (restored / "unpublished.py").read_text() == "secret_work = 1\n"
 
 
 def test_landed_claim_needs_a_live_tree_that_reaches_the_sha(board, tmp_path):
@@ -380,3 +384,15 @@ def test_landed_cleanup_rechecks_live_reachability(board, tmp_path):
     git(live, "reset", "--hard", "HEAD~1")
     assert not remove_workspace_dir(board, tid, ws)
     assert ws.exists()
+
+
+def test_diff_collision_over_attachment_limit_holds_workspace(board, tmp_path, monkeypatch):
+    """A matching patch-id cannot bypass the cap by claiming a durable ref."""
+    tid = kb.create_task(board, title="oversized divergent work")
+    ws, _, _, _ = divergent_history(tmp_path)
+    kb.set_workspace_path(board, tid, ws)
+    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 1)
+    with pytest.raises(ValueError, match="exceeds attachment limit"):
+        kb.complete_task(board, tid, metadata={"changed_files": ["unpublished.py"]})
+    assert kb.get_task(board, tid).status != "done"
+    assert (ws / "unpublished.py").read_text() == "secret_work = 1\n"
