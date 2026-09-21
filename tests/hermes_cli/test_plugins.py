@@ -1063,6 +1063,82 @@ class TestForceReloadSymmetry:
         hold.set()
         assert blocker_returned.wait(10), "abandoned hook worker never drained"
 
+    def test_timed_out_callback_does_not_corrupt_next_callback(
+        self, monkeypatch
+    ):
+        """An abandoned worker must not write into the NEXT callback's slot.
+
+        ``_runner`` binds ``done``/``outcome``/``failure`` as default arguments
+        so each worker keeps its own references. A closure resolves free
+        variables at CALL time, so without the binding the abandoned worker
+        reaches the loop's CURRENT objects once the loop has advanced: it
+        releases the next callback's ``done.wait()`` early and overwrites that
+        callback's result with its own. Re-creating the objects per iteration
+        does NOT fix this; only the binding does.
+
+        DETERMINISTIC ORDERING — no wall-clock bound. ``slow`` is released only
+        after ``fast`` is confirmed running, so the late write always lands
+        during ``fast``'s execution: exactly the corrupting interleaving.
+        """
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
+        )
+
+        slow_abandoned = threading.Event()
+        fast_running = threading.Event()
+        fast_may_finish = threading.Event()
+        slow_returned = threading.Event()
+
+        def slow(**_kwargs):
+            # Outlive the budget so invoke_hook abandons this worker, then
+            # wait until `fast` is mid-flight before returning, so the late
+            # write races `fast`'s slot rather than landing harmlessly.
+            assert slow_abandoned.wait(timeout=10.0)
+            assert fast_running.wait(timeout=10.0)
+            try:
+                return {"allow": False, "reason": "SLOW-LATE-BLOCK"}
+            finally:
+                slow_returned.set()
+
+        def fast(**_kwargs):
+            fast_running.set()
+            # Hold inside the budget-satisfying path until the abandoned
+            # worker has actually written back.
+            assert fast_may_finish.wait(timeout=10.0)
+            return {"allow": True, "reason": "FAST-ALLOW"}
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [slow, fast]
+
+        # Release `slow` as soon as `fast` starts; then let `fast` finish only
+        # after `slow`'s late return has completed.
+        def _release():
+            assert fast_running.wait(timeout=10.0)
+            slow_abandoned.set()
+            assert slow_returned.wait(timeout=10.0)
+            fast_may_finish.set()
+
+        # `slow` parks on slow_abandoned, so the 0.1s budget expires and its
+        # worker is abandoned before `fast` ever starts. _release then drives
+        # the interleaving from outside invoke_hook.
+        releaser = threading.Thread(target=_release, daemon=True)
+        releaser.start()
+
+        results = mgr.invoke_hook(
+            "pre_tool_call", tool_name="terminal", arguments={}
+        )
+        releaser.join(timeout=10.0)
+
+        reasons = [r.get("reason") for r in results if isinstance(r, dict)]
+        assert "FAST-ALLOW" in reasons, (
+            "the second callback's own decision was destroyed — an abandoned "
+            "worker released its done.wait() early and took its result slot"
+        )
+        assert "SLOW-LATE-BLOCK" not in reasons, (
+            "a timed-out callback's late write landed in a later callback's "
+            "slot — _runner is resolving done/outcome as free variables"
+        )
+
     def test_hook_callback_within_timeout_returns_value(self, monkeypatch):
         monkeypatch.setattr(
             "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 1.0

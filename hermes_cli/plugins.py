@@ -5693,20 +5693,34 @@ class PluginManager:
                     outcome: Dict[str, Any] = {}
                     failure: Dict[str, Exception] = {}
 
+                    # Every object the worker touches is bound as a default
+                    # argument, so it is snapshotted into the thread's own frame
+                    # at definition time. A closure resolves a free variable at
+                    # CALL time: a worker abandoned on timeout keeps running,
+                    # and by the time it writes back the loop has advanced, so
+                    # a free `done`/`outcome`/`failure` would resolve to the
+                    # NEXT callback's objects — releasing that callback's wait
+                    # early and overwriting its result with the abandoned one's.
+                    # Re-creating the objects per iteration (above) does not
+                    # help; only the binding does.
                     def _runner(
                         _cb: Callable[..., Any] = cb,
+                        _context: contextvars.Context = context,
+                        _done: threading.Event = done,
+                        _outcome: Dict[str, Any] = outcome,
+                        _failure: Dict[str, Exception] = failure,
                     ) -> None:
                         try:
                             # Route through _invoke_hook_callback so the
                             # additive-payload signature filtering (narrow
                             # legacy callbacks) applies on the worker too.
-                            outcome["value"] = context.run(
+                            _outcome["value"] = _context.run(
                                 self._invoke_hook_callback, _cb, kwargs
                             )
                         except Exception as exc:
-                            failure["exc"] = exc
+                            _failure["exc"] = exc
                         finally:
-                            done.set()
+                            _done.set()
 
                     thread = threading.Thread(
                         target=_runner,
