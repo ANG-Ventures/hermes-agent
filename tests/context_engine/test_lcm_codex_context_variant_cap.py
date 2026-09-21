@@ -54,6 +54,35 @@ def test_cap_never_exceeds_host_for_variant_end_to_end() -> None:
     assert effective == 900_000
 
 
+def test_shadow_table_matches_host_for_every_row() -> None:
+    """LCM's cap table is a shadow of the host fallback; any drift fails here.
+
+    This is the ratchet for the 372k incident: the shadow had silently diverged
+    on ONE row for six weeks. Every row must agree with what the host resolves
+    for the same bare slug on the Codex OAuth route.
+    """
+    drift = {}
+    for slug, cap in codex_routing._CODEX_OAUTH_CONTEXT_CAPS.items():
+        host = model_metadata.get_model_context_length(slug, provider="openai-codex")
+        if host != cap:
+            drift[slug] = (cap, host)
+    assert not drift, f"LCM shadow table drifted from host (lcm, host): {drift}"
+
+
+def test_every_host_context_variant_family_is_uncapped() -> None:
+    """Any base slug the shadow table knows must be uncapped in its variant form."""
+    suffix = model_metadata.CODEX_CONTEXT_VARIANT_SUFFIX
+    capped = {}
+    for slug in codex_routing._CODEX_OAUTH_CONTEXT_CAPS:
+        variant = f"{slug}{suffix}"
+        if not model_metadata.is_codex_context_variant(variant):
+            continue
+        cap = codex_routing._codex_oauth_context_cap(variant, "openai-codex")
+        if cap is not None:
+            capped[variant] = cap
+    assert not capped, f"variants clamped by LCM: {capped}"
+
+
 def test_non_codex_route_unaffected() -> None:
     assert codex_routing._codex_oauth_context_cap("gpt-5.6-sol-900k", "openrouter") is None
     assert codex_routing._codex_oauth_context_cap("gpt-5.6-sol", "openai-api") is None
