@@ -30,7 +30,8 @@ concurrency:
 jobs:
   generate:
     name: "Generate slices"
-    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    # Local Python + GitHub cache only; start hosted overflow without the pool.
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -193,7 +194,8 @@ jobs:
   save-durations:
     needs: test
     if: needs.test.result == 'success' && github.ref == 'refs/heads/main'
-    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    # Artifact/cache plumbing needs no LAN or self-hosted test slot.
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Download all slice durations
