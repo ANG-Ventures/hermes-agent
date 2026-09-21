@@ -8097,14 +8097,19 @@ class GatewaySlashCommandsMixin:
         out_billed = lt_out + lt_rsn  # fold reasoning into the output total
         out_label = fallback_label or "persisted; agent not resident"
         out_lines = [f"📊 **Last turn** ({out_label})"]
-        if in_billed:
+        from agent.usage_pricing import format_token_count, prompt_tokens_unknown
+        input_unknown = prompt_tokens_unknown(thin_snap)
+        output_unknown = bool(thin_snap.get("output_tokens_unknown") or thin_snap.get("usage_unknown"))
+        if input_unknown:
+            out_lines.append(f"• Tokens in: {format_token_count(in_billed, unknown=True)}")
+        elif in_billed:
             out_lines.append(
                 f"• Tokens in: {in_billed:,} billed "
                 f"({lt_cr:,} cache-read + {lt_cw:,} cache-write + {lt_in:,} uncached)"
             )
-        if out_billed:
-            out_lines.append(f"• Tokens out: {out_billed:,} billed")
-        out_lines.append(f"• Total (billed in+out): {in_billed + out_billed:,}")
+        if out_billed or output_unknown:
+            out_lines.append(f"• Tokens out: {format_token_count(out_billed, unknown=output_unknown)} billed")
+        out_lines.append(f"• Total (billed in+out): {format_token_count(in_billed + out_billed, unknown=input_unknown or output_unknown)}")
         return out_lines
 
     async def _handle_usage_command(self, event: MessageEvent) -> str:

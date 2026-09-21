@@ -905,6 +905,10 @@ def finalize_turn(
                     "output_tokens_unknown": any(
                         bool(c.get("output_tokens_unknown")) for c in _turn_calls
                     ),
+                    "input_tokens_unknown": any(bool(c.get("input_tokens_unknown")) for c in _turn_calls),
+                    "cache_read_tokens_unknown": any(bool(c.get("cache_read_tokens_unknown")) for c in _turn_calls),
+                    "cache_write_tokens_unknown": any(bool(c.get("cache_write_tokens_unknown")) for c in _turn_calls),
+                    "usage_unknown": any(bool(c.get("usage_unknown")) for c in _turn_calls),
                     "cache_read_tokens": sum(c["cache_read_tokens"] for c in _turn_calls),
                     "cache_write_tokens": sum(c["cache_write_tokens"] for c in _turn_calls),
                     "reasoning_tokens": sum(c["reasoning_tokens"] for c in _turn_calls),

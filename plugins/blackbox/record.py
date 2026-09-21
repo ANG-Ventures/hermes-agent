@@ -40,6 +40,10 @@ class TurnRecord:
     # stays an int for arithmetic; renderers MUST consult this flag and show
     # "unknown" rather than presenting the 0 as a measurement.
     output_tokens_unknown: bool = False
+    input_tokens_unknown: bool = False
+    cache_read_tokens_unknown: bool = False
+    cache_write_tokens_unknown: bool = False
+    usage_unknown: bool = False
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
     reasoning_tokens: int = 0

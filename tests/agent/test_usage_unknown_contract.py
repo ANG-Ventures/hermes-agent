@@ -265,7 +265,10 @@ def test_uc7_the_turn_ledger_persists_the_discriminator(tmp_path, monkeypatch):
     assert store.get_turn("turn_measured_contract")["output_tokens_unknown"] == 0
 
 
-def test_uc7b_the_turn_rollup_absorbs_an_unknown_call(monkeypatch):
+@pytest.mark.parametrize("flag", ["output_tokens_unknown", "input_tokens_unknown",
+                                  "cache_read_tokens_unknown", "cache_write_tokens_unknown",
+                                  "usage_unknown"])
+def test_uc7b_the_turn_rollup_absorbs_an_unknown_call(monkeypatch, flag):
     """The per-call -> per-turn roll-up in turn_finalizer is unknown-absorbing.
 
     A turn is several API calls. If ANY call's output was unmeasured, the turn's
@@ -287,7 +290,7 @@ def test_uc7b_the_turn_rollup_absorbs_an_unknown_call(monkeypatch):
         if not isinstance(node, ast.Dict):
             continue
         for key, value in zip(node.keys, node.values):
-            if isinstance(key, ast.Constant) and key.value == "output_tokens_unknown":
+            if isinstance(key, ast.Constant) and key.value == flag:
                 found.append(value)
 
     assert found, (
@@ -303,7 +306,7 @@ def test_uc7b_the_turn_rollup_absorbs_an_unknown_call(monkeypatch):
         )
 
     measured = {"output_tokens": 118}
-    unknown = {"output_tokens": 0, "output_tokens_unknown": True}
+    unknown = {"output_tokens": 0, flag: True}
     assert rollup([measured, measured]) is False
     assert rollup([measured, unknown]) is True, "unknown must absorb"
     assert rollup([unknown, measured]) is True, "order must not matter"
@@ -395,3 +398,132 @@ def test_uc8b_last_turn_card_renders_unknown_not_a_silent_omission():
         render_last_turn_record(dict(row, output_tokens=118, output_tokens_unknown=0))
     )
     assert "118" in measured
+
+
+@pytest.mark.parametrize("wire, input_unknown, output_unknown", [
+    ({"prompt_tokens": None, "completion_tokens": 50, "total_tokens": None,
+      "prompt_tokens_unavailable": True, "unavailable": True}, True, False),
+    ({"prompt_tokens": None, "completion_tokens": 50, "total_tokens": None,
+      "prompt_tokens_unavailable": True, "total_tokens_unavailable": True,
+      "unavailable": True,
+      "prompt_tokens_details": {"cached_tokens": None, "cache_creation_tokens": 0}}, True, False),
+    ({"prompt_tokens": None, "completion_tokens": None, "total_tokens": None,
+      "unavailable": True}, True, True),
+    ({"prompt_tokens": 150, "completion_tokens": None, "total_tokens": None,
+      "output_tokens_unavailable": True, "unavailable": True}, False, True),
+    ({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+      "prompt_tokens_details": {"cached_tokens": 0, "cache_creation_tokens": 0}}, False, False),
+])
+def test_bridge_input_and_full_unknown(wire, input_unknown, output_unknown, tmp_path, monkeypatch):
+    from dataclasses import asdict
+    import plugins.blackbox as bb
+    import plugins.blackbox.store as store
+    from plugins.blackbox.last_turn import render_last_turn_record
+
+    usage = normalize_usage(wire, api_mode="chat_completions")
+    assert usage.input_tokens_unknown is input_unknown
+    assert usage.output_tokens_unknown is output_unknown
+    assert usage.total_tokens_unknown is (input_unknown or output_unknown)
+    cost = estimate_usage_cost("claude-sonnet-4-5", usage, provider="anthropic")
+    assert (cost.amount_usd is None) is (input_unknown or output_unknown)
+    assert (usage + CanonicalUsage()).total_tokens_unknown is usage.total_tokens_unknown
+    call = asdict(usage)
+    rec = bb._build_record(session_id="bridge", interrupted=False, model="claude-sonnet-4-5",
+                           platform="cli", provider="anthropic", user_message="",
+                           final_response="", turn_usage={**call, "calls": [call]},
+                           cfg={"store_text": False}, kwargs={})
+    assert rec is not None
+    monkeypatch.setattr(store, "_db_path", lambda: tmp_path / "turns.db")
+    store.insert_turn(rec)
+    row = store.get_turn(rec.turn_id)
+    assert row is not None
+    assert bool(row["input_tokens_unknown"]) is input_unknown
+    assert bool(row["output_tokens_unknown"]) is output_unknown
+    assert (row["cost_usd"] is None) is (input_unknown or output_unknown)
+    block = "\n".join(render_last_turn_record(row))
+    if input_unknown:
+        assert "Tokens in: unknown" in block
+    if output_unknown:
+        assert "Tokens out: unknown" in block
+    if wire["completion_tokens"] == 50:
+        assert "Tokens out: 50" in block
+
+
+@pytest.mark.parametrize("key, flag", [
+    ("cached_tokens", "cache_read_tokens_unknown"),
+    ("cache_creation_tokens", "cache_write_tokens_unknown"),
+])
+def test_cache_null_is_not_a_measured_zero(key, flag):
+    usage = normalize_usage({"prompt_tokens": 150, "completion_tokens": 50,
+                             "prompt_tokens_details": {key: None}})
+    assert getattr(usage, flag) is True
+    assert usage.input_tokens_unknown is True
+    assert usage.total_tokens_unknown is True
+    assert estimate_usage_cost("claude-sonnet-4-5", usage, provider="anthropic").amount_usd is None
+
+
+@pytest.mark.parametrize("flag", ["input_tokens_unknown", "cache_read_tokens_unknown",
+                                  "cache_write_tokens_unknown", "usage_unknown"])
+def test_new_unknown_flags_survive_blackbox(flag, tmp_path, monkeypatch):
+    from dataclasses import asdict
+    import plugins.blackbox as bb
+    import plugins.blackbox.store as store
+    from plugins.blackbox.last_turn import render_last_turn_record
+
+    usage = CanonicalUsage(**{flag: True})
+    assert estimate_usage_cost("claude-sonnet-4-5", usage, provider="anthropic").amount_usd is None
+    call = asdict(usage)
+    rec = bb._build_record(session_id="s", interrupted=False, model="claude-sonnet-4-5",
+                           platform="cli", provider="anthropic", user_message="",
+                           final_response="", turn_usage={**call, "calls": [call]},
+                           cfg={"store_text": False}, kwargs={})
+    assert getattr(rec, flag) is True
+    assert rec.cost_usd is None
+    assert rec.cost_status == "unknown"
+    monkeypatch.setattr(store, "_db_path", lambda: tmp_path / "turns.db")
+    store.insert_turn(rec)
+    row = store.get_turn(rec.turn_id)
+    assert row[flag] == 1
+    assert "unknown" in "\n".join(render_last_turn_record(row))
+
+
+def test_sdk_absent_optional_fields_remain_legacy():
+    from openai.types.completion_usage import CompletionUsage
+    usage = normalize_usage(CompletionUsage.model_construct(
+        prompt_tokens=150, completion_tokens=50, total_tokens=200))
+    assert usage.total_tokens_unknown is False
+    assert usage.input_tokens == 150
+
+
+def test_explicit_null_cache_details_are_unknown():
+    usage = normalize_usage({"prompt_tokens": 150, "completion_tokens": 50,
+                             "prompt_tokens_details": None})
+    assert usage.cache_read_tokens_unknown is True
+    assert usage.cache_write_tokens_unknown is True
+    assert usage.input_tokens_unknown is True
+
+
+def test_sdk_null_cache_and_flag_only_input_are_unknown():
+    from openai.types.completion_usage import CompletionUsage, PromptTokensDetails
+    usage = normalize_usage(CompletionUsage.model_construct(
+        prompt_tokens=150, completion_tokens=50, total_tokens=None,
+        prompt_tokens_details=PromptTokensDetails.model_construct(cached_tokens=None)))
+    assert usage.cache_read_tokens_unknown is True
+    assert usage.input_tokens_unknown is True
+    flagged = normalize_usage(_ModelExtraUsage(prompt_tokens=0, completion_tokens=50,
+                              model_extra={"prompt_tokens_unavailable": True}))
+    assert flagged.input_tokens_unknown is True
+    assert flagged.output_tokens_unknown is False
+
+
+def test_input_unknown_renders_both_cards_without_losing_measured_output():
+    from plugins.blackbox.card import _tokens_in_label, _tokens_out_line, _cache_line
+    from plugins.blackbox.last_turn import render_last_turn_record
+    from plugins.blackbox.record import TurnRecord
+    rec = TurnRecord(turn_id="t", input_tokens_unknown=True, output_tokens=50)
+    assert _tokens_in_label(rec) == "unknown"
+    assert _tokens_out_line(rec) == "50 out"
+    assert _cache_line(rec) == "unknown"
+    block = "\n".join(render_last_turn_record({"input_tokens_unknown": True, "output_tokens": 50}))
+    assert "Tokens in: unknown" in block
+    assert "Tokens out: 50" in block

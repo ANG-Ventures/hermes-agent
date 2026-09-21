@@ -120,7 +120,7 @@ def _tokens_out_line(record: TurnRecord) -> str:
     # UNKNOWN != 0: the provider never measured this turn's output. The stored
     # 0 is absence of data, so neither the total nor a finished/unfinished split
     # derived from it may be shown as a measurement.
-    if getattr(record, "output_tokens_unknown", False):
+    if record.output_tokens_unknown or record.usage_unknown:
         return f"{humanize_tokens(0, unknown=True)} out"
     out = int(record.output_tokens or 0)
     raw = getattr(record, "comp_calls_json", None)
@@ -137,6 +137,11 @@ def _tokens_out_line(record: TurnRecord) -> str:
             f"({humanize_tokens(finished)} finished + {humanize_tokens(unfinished)} unfinished)"
         )
     return f"{humanize_tokens(out)} out"
+
+
+def _tokens_in_label(record: TurnRecord) -> str:
+    from agent.usage_pricing import prompt_tokens_unknown
+    return humanize_tokens(_prompt_total(record), unknown=prompt_tokens_unknown(record))
 
 
 def _prompt_total(record: TurnRecord) -> int:
@@ -156,6 +161,9 @@ def _prompt_total(record: TurnRecord) -> int:
 
 
 def _cache_line(record: TurnRecord) -> str:
+    from agent.usage_pricing import prompt_tokens_unknown
+    if prompt_tokens_unknown(record):
+        return humanize_tokens(0, unknown=True)
     cache_read = int(record.cache_read_tokens or 0)
     # Cache hit rate = fraction of the full prompt served from cache. The
     # denominator is the TOTAL prompt (fresh input + cache read + cache write),
@@ -184,7 +192,7 @@ def render_card(record: TurnRecord, threshold_usd: float) -> str:
             f"• Threshold: {_money(threshold_usd)}",
             f"• API Calls: {record.api_calls}",
             f"• Tool Calls: {len(record.tools)} ({tools_summary(record.tools)})",
-            f"• Tokens: {humanize_tokens(_prompt_total(record))} in + {_tokens_out_line(record)}",
+            f"• Tokens: {_tokens_in_label(record)} in + {_tokens_out_line(record)}",
             f"• Context: {_context_line(record)}",
             f"• Cached: {_cache_line(record)}",
             f"• Agent: {record.profile}",
