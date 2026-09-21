@@ -474,6 +474,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "--provider <name> to the worker). Requires "
                                "--model.")
     p_create.add_argument(
+        "--allow-flagship",
+        default=None,
+        metavar="REASON",
+        help="Allow an orchestrator-only flagship model for this task. "
+             "Requires a non-empty reason, recorded as a task comment.",
+    )
+    p_create.add_argument(
         "--reasoning",
         "--effort",
         default=None,
@@ -597,6 +604,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--provider", default=None,
         help="Provider the model belongs to (worker is spawned with "
              "--provider <name>). Cleared together with the model.",
+    )
+    p_set_model.add_argument(
+        "--allow-flagship",
+        default=None,
+        metavar="REASON",
+        help="Allow an orchestrator-only flagship model. Requires a non-empty "
+             "reason, recorded as a task comment.",
     )
     _effort_group = p_set_model.add_mutually_exclusive_group()
     _effort_group.add_argument(
@@ -1907,35 +1921,41 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    with kb.connect_closing() as conn:
-        task_id = kb.create_task(
-            conn,
-            title=args.title,
-            body=args.body,
-            assignee=args.assignee,
-            created_by=args.created_by or _profile_author(),
-            workspace_kind=ws_kind,
-            workspace_path=ws_path,
-            branch_name=branch_name,
-            project_id=getattr(args, "project", None),
-            tenant=args.tenant,
-            priority=args.priority,
-            parents=tuple(args.parent or ()),
-            parents_kind=getattr(args, "parent_kind", None),
-            triage=bool(getattr(args, "triage", False)),
-            idempotency_key=getattr(args, "idempotency_key", None),
-            max_runtime_seconds=max_runtime,
-            skills=getattr(args, "skills", None) or None,
-            max_retries=max_retries,
-            model_override=getattr(args, "model_override", None),
-            provider_override=getattr(args, "provider_override", None),
-            reasoning_effort=getattr(args, "reasoning_effort", None),
-            goal_mode=bool(getattr(args, "goal_mode", False)),
-            goal_max_turns=getattr(args, "goal_max_turns", None),
-            initial_status=getattr(args, "initial_status", "running"),
-        )
-        task = kb.get_task(conn, task_id)
-        auto_subscribed = _maybe_cli_auto_subscribe(conn, task_id)
+    try:
+        with kb.connect_closing() as conn:
+            task_id = kb.create_task(
+                conn,
+                title=args.title,
+                body=args.body,
+                assignee=args.assignee,
+                created_by=args.created_by or _profile_author(),
+                workspace_kind=ws_kind,
+                workspace_path=ws_path,
+                branch_name=branch_name,
+                project_id=getattr(args, "project", None),
+                tenant=args.tenant,
+                priority=args.priority,
+                parents=tuple(args.parent or ()),
+                parents_kind=getattr(args, "parent_kind", None),
+                triage=bool(getattr(args, "triage", False)),
+                idempotency_key=getattr(args, "idempotency_key", None),
+                max_runtime_seconds=max_runtime,
+                skills=getattr(args, "skills", None) or None,
+                max_retries=max_retries,
+                model_override=getattr(args, "model_override", None),
+                provider_override=getattr(args, "provider_override", None),
+                flagship_override_reason=getattr(args, "allow_flagship", None),
+                flagship_override_author=args.created_by or _profile_author(),
+                reasoning_effort=getattr(args, "reasoning_effort", None),
+                goal_mode=bool(getattr(args, "goal_mode", False)),
+                goal_max_turns=getattr(args, "goal_max_turns", None),
+                initial_status=getattr(args, "initial_status", "running"),
+            )
+            task = kb.get_task(conn, task_id)
+            auto_subscribed = _maybe_cli_auto_subscribe(conn, task_id)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
@@ -2301,6 +2321,7 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     if provider and not touch_model:
         print("kanban: --provider requires a model", file=sys.stderr)
         return 2
+    flagship_reason = getattr(args, "allow_flagship", None) if touch_model else None
     if effort is not None:
         # Validate BEFORE any write so `set-model <id> <model> --effort typo`
         # can't half-apply (model committed, effort rejected).
@@ -2319,7 +2340,12 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
         with kb.connect_closing() as conn:
             if touch_model:
                 ok = kb.set_model_override(
-                    conn, args.task_id, model, provider=provider,
+                    conn,
+                    args.task_id,
+                    model,
+                    provider=provider,
+                    flagship_override_reason=flagship_reason,
+                    flagship_override_author=_profile_author(),
                 )
                 if not ok:
                     print(f"no such task: {args.task_id}", file=sys.stderr)
@@ -3335,6 +3361,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "spawned_unwatched": spawned_unwatched,
             "skipped_unassigned": res.skipped_unassigned,
+            "flagship_refused": res.flagship_refused,
             "skipped_nonspawnable": res.skipped_nonspawnable,
             "stranded_by_triage": [
                 {"task_id": child, "parent_id": parent}
@@ -3380,6 +3407,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     print(f"Crashed:      {len(res.crashed)}")
     if res.crashed:
         print(f"  {', '.join(res.crashed)}")
+    print(f"Flagship refused: {len(res.flagship_refused)}")
+    if res.flagship_refused:
+        print(f"  {', '.join(res.flagship_refused)}")
     print(f"Timed out:    {len(res.timed_out)}")
     if res.timed_out:
         print(f"  {', '.join(res.timed_out)}")

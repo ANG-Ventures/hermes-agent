@@ -247,7 +247,7 @@ def test_vendor_prefixed_override_forces_provider_on_spawn(
 
     Regression: passing the whole ``provider/model`` value through ``-m`` let
     the CLI strip the prefix while retaining the profile's openai-codex
-    provider, routing ``claude-fable-5`` to the Codex endpoint.
+    provider, routing ``claude-sonnet-4-5`` to the Codex endpoint.
     """
     profile_home = kanban_home / "profiles" / "worker"
     profile_home.mkdir(parents=True)
@@ -258,9 +258,9 @@ def test_vendor_prefixed_override_forces_provider_on_spawn(
     with kb.connect() as conn:
         tid = kb.create_task(
             conn,
-            title="fable task",
+            title="sonnet task",
             assignee="worker",
-            model_override="claude-apx-6/claude-fable-5",
+            model_override="claude-apx-6/claude-sonnet-4-5",
         )
         task = kb.get_task(conn, tid)
 
@@ -269,8 +269,8 @@ def test_vendor_prefixed_override_forces_provider_on_spawn(
     assert argv.count("--provider") == 1
     assert argv[argv.index("--provider") + 1] == "claude-apx-6"
     assert argv.count("-m") == 1
-    assert argv[argv.index("-m") + 1] == "claude-fable-5"
-    assert "claude-apx-6/claude-fable-5" not in argv
+    assert argv[argv.index("-m") + 1] == "claude-sonnet-4-5"
+    assert "claude-apx-6/claude-sonnet-4-5" not in argv
 
 
 # ---------------------------------------------------------------------------

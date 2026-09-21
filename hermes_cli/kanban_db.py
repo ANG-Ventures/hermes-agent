@@ -4147,6 +4147,8 @@ def create_task(
     max_retries: Optional[int] = None,
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
+    flagship_override_reason: Optional[str] = None,
+    flagship_override_author: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
@@ -4208,6 +4210,12 @@ def create_task(
         raise ValueError("provider_override requires a model_override")
     model_override, provider_override = _resolve_stored_model_pair(
         model_override, provider_override
+    )
+    from hermes_cli.model_policy import validate_worker_model
+
+    flagship_override_reason = validate_worker_model(
+        model_override,
+        allow_flagship_reason=flagship_override_reason,
     )
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
@@ -4543,6 +4551,15 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if flagship_override_reason:
+                    from hermes_cli.model_policy import override_comment
+
+                    add_comment(
+                        conn,
+                        task_id,
+                        flagship_override_author or created_by or "operator",
+                        override_comment(flagship_override_reason),
+                    )
                 if task_status == "blocked":
                     # Tag the source so dependency resolution can distinguish
                     # this creation-time hold from a later explicit worker or
@@ -4744,6 +4761,9 @@ def set_model_override(
     task_id: str,
     model: Optional[str],
     provider: Optional[str] = None,
+    *,
+    flagship_override_reason: Optional[str] = None,
+    flagship_override_author: Optional[str] = None,
 ) -> bool:
     """Set (or clear) the per-task model/provider override.
 
@@ -4766,6 +4786,12 @@ def set_model_override(
     if not model:
         provider = None
     model, provider = _resolve_stored_model_pair(model, provider)
+    from hermes_cli.model_policy import validate_worker_model
+
+    flagship_override_reason = validate_worker_model(
+        model,
+        allow_flagship_reason=flagship_override_reason,
+    )
     with write_txn(conn):
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
@@ -4782,6 +4808,15 @@ def set_model_override(
             conn, task_id, "model_override_set",
             {"model": model, "provider": provider},
         )
+        if flagship_override_reason:
+            from hermes_cli.model_policy import override_comment
+
+            add_comment(
+                conn,
+                task_id,
+                flagship_override_author or "operator",
+                override_comment(flagship_override_reason),
+            )
     # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
     notify_task_updated(conn, task_id, ("model_override", "provider_override"))
     return True
@@ -10197,6 +10232,9 @@ def set_task_model(
     a real write from a no-op.
     """
     resolved_model, resolved_provider = _resolve_stored_model_pair(model, None)
+    from hermes_cli.model_policy import validate_worker_model
+
+    validate_worker_model(resolved_model)
     if not resolved_model:
         resolved_provider = None
     with write_txn(conn):
@@ -10671,6 +10709,10 @@ class DispatchResult:
     skipped_unassigned: list[str] = field(default_factory=list)
     """Ready task ids skipped because they have no assignee at all.
     Operator-actionable — usually a misfiled task waiting for routing."""
+    flagship_refused: list[str] = field(default_factory=list)
+    """Task ids whose model override matched the configured flagship ban and
+    lacked an explicit ``flagship override:`` audit comment. These tasks stay
+    ready/review and are reconsidered on the next tick."""
     auto_assigned_default: list[str] = field(default_factory=list)
     """Task ids that were unassigned in the DB and had
     ``kanban.default_assignee`` applied this tick before spawning (#27145).
@@ -13532,6 +13574,54 @@ def _dispatch_once_locked(
                 _append_event(conn, task_id, "deferred", payload)
         return True
 
+    try:
+        from hermes_cli.config import load_config as _load_dispatch_config
+
+        _model_policy_config = _load_dispatch_config()
+    except Exception:
+        _model_policy_config = {}
+
+    def flagship_refused(task_id: str) -> bool:
+        from hermes_cli.model_policy import (
+            FLAGSHIP_OVERRIDE_COMMENT_PREFIX,
+            FLAGSHIP_REFUSAL_COMMENT_PREFIX,
+            flagship_model_match,
+        )
+
+        task = get_task(conn, task_id)
+        if task is None or not flagship_model_match(
+            task.model_override, _model_policy_config
+        ):
+            return False
+        override = conn.execute(
+            "SELECT 1 FROM task_comments WHERE task_id = ? "
+            "AND lower(ltrim(body)) LIKE ? LIMIT 1",
+            (task_id, f"{FLAGSHIP_OVERRIDE_COMMENT_PREFIX}%"),
+        ).fetchone()
+        if override:
+            return False
+
+        result.flagship_refused.append(task_id)
+        if dry_run:
+            return True
+        body = (
+            f"{FLAGSHIP_REFUSAL_COMMENT_PREFIX} model "
+            f"{task.model_override!r} is orchestrator-only; add "
+            f"'{FLAGSHIP_OVERRIDE_COMMENT_PREFIX} <reason>' to authorize."
+        )
+        already_logged = conn.execute(
+            "SELECT 1 FROM task_comments WHERE task_id = ? AND body = ? LIMIT 1",
+            (task_id, body),
+        ).fetchone()
+        if not already_logged:
+            add_comment(conn, task_id, "dispatcher", body)
+            _log.warning(
+                "PHASE=kanban_flagship_refused task=%s model=%s",
+                task_id,
+                task.model_override,
+            )
+        return True
+
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
     # when this would push that assignee past the cap. Prevents
@@ -13653,6 +13743,8 @@ def _dispatch_once_locked(
                     (row["id"], row_assignee, current)
                 )
                 continue
+        if flagship_refused(row["id"]):
+            continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
@@ -13848,6 +13940,8 @@ def _dispatch_once_locked(
                     (row["id"], row["assignee"], current)
                 )
                 continue
+        if flagship_refused(row["id"]):
+            continue
         guard_detail = {}
         guard_reason = check_respawn_guard(
             conn, row["id"], lane="review", detail=guard_detail,
