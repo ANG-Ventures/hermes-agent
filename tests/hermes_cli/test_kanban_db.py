@@ -719,6 +719,19 @@ def test_delete_task_missing_returns_false_not_running_error(kanban_home):
 # A worker that redirected only HERMES_HOME believed it was sandboxed and
 # wrote six real cards to the production board.
 
+def _simulate_inherited_pin(monkeypatch, pin: Path, *, started_at: Path) -> None:
+    """Make the guard see an INHERITED pin under a later HERMES_HOME redirect.
+
+    The real shape is a dispatched worker: the dispatcher put
+    ``HERMES_KANBAN_DB`` in its env before the process started, and the worker
+    then moved ``HERMES_HOME`` to sandbox itself. Reproduce that by setting the
+    module's import-time snapshot to the pin plus the HERMES_HOME the process
+    "started" with, rather than relying on this test process's real startup env.
+    """
+    monkeypatch.setattr(kb, "_PIN_AT_IMPORT", str(pin))
+    monkeypatch.setattr(kb, "_HERMES_HOME_AT_IMPORT", str(started_at))
+
+
 def test_kanban_db_override_outranks_hermes_home_without_sandbox(tmp_path, monkeypatch):
     """The trap is now closed: HERMES_HOME alone does not sandbox, so we refuse.
 
@@ -732,6 +745,7 @@ def test_kanban_db_override_outranks_hermes_home_without_sandbox(tmp_path, monke
     monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
     monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
     monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
+    _simulate_inherited_pin(monkeypatch, live, started_at=tmp_path / "live")
     with pytest.raises(kb.KanbanPinDivergenceError):
         kb.kanban_db_path()
 
@@ -914,6 +928,7 @@ def test_override_escaping_hermes_home_REFUSES(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
     monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
+    _simulate_inherited_pin(monkeypatch, live, started_at=tmp_path / "live")
 
     with pytest.raises(kb.KanbanPinDivergenceError) as first:
         kb.kanban_db_path()
@@ -952,6 +967,7 @@ def test_diverged_pin_cannot_create_a_task_or_append_an_event(tmp_path, monkeypa
     # Now the incident: redirect HERMES_HOME to sandbox, pin still points live.
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "scratch"))
     monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
+    _simulate_inherited_pin(monkeypatch, live, started_at=live_root)
 
     with pytest.raises(kb.KanbanPinDivergenceError):
         kb.kanban_db_path()
@@ -1033,7 +1049,13 @@ _CONTRADICTION_MARKER = "outranks the board argument"
 
 @pytest.fixture
 def _pin_contradiction_env(tmp_path, monkeypatch):
-    """Worker-shaped env: a pin on one board, callers asking for another."""
+    """Worker-shaped env: an INHERITED pin on one board, callers asking another.
+
+    The pin is made to look inherited under a later ``HERMES_HOME`` redirect —
+    the dispatched-worker shape the guard exists for. A pin the process chose
+    itself is deliberately NOT a refusal (see
+    ``test_a_self_chosen_pin_outside_hermes_home_is_left_alone``).
+    """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
@@ -1042,7 +1064,60 @@ def _pin_contradiction_env(tmp_path, monkeypatch):
     monkeypatch.setattr(kb, "_CHECKED_PIN_BOARD_CONTRADICTIONS", set())
     pinned = kb.board_dir("pinned-board") / "kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
+    _simulate_inherited_pin(monkeypatch, pinned, started_at=tmp_path / "dispatcher-home")
     return pinned
+
+
+def test_a_self_chosen_pin_outside_hermes_home_is_left_alone(tmp_path, monkeypatch):
+    """The narrowing, stated as a test: choosing your own pin is not the bug.
+
+    Every kanban test fixture, and any tool that deliberately opens a specific
+    DB, pins ``HERMES_KANBAN_DB`` itself while ``HERMES_HOME`` points somewhere
+    else entirely. Nobody is being silently un-sandboxed there — the caller
+    named the file. A blanket refusal broke 33 such tests across 9 files, so
+    this shape must keep resolving, for both guards.
+    """
+    chosen = tmp_path / "my-own" / "kanban.db"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
+    monkeypatch.setattr(kb, "_CHECKED_PIN_BOARD_CONTRADICTIONS", set())
+    # Nothing inherited: this process set the pin itself.
+    monkeypatch.setattr(kb, "_PIN_AT_IMPORT", "")
+    monkeypatch.setattr(kb, "_HERMES_HOME_AT_IMPORT", str(tmp_path / "hermes_test"))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(chosen))
+
+    assert kb.kanban_db_path() == chosen          # escape guard: no refusal
+    assert kb.kanban_db_path("default") == chosen  # board guard: no refusal
+
+
+def test_a_pin_reaching_the_machines_real_hermes_home_always_refuses(
+    tmp_path, monkeypatch,
+):
+    """Shape 2 of the hazard: no in-process change, but the pin IS production.
+
+    ``HERMES_HOME=$(mktemp -d) HERMES_KANBAN_DB=~/.hermes/kanban.db cmd`` sets
+    both at once, so there is no redirect to detect — and it is still the
+    incident. Refusal must not depend on provenance when the target is the
+    machine's live board.
+    """
+    from hermes_constants import _get_platform_default_hermes_home
+
+    live = _get_platform_default_hermes_home() / "kanban.db"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "scratch"))
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
+    monkeypatch.setattr(kb, "_CHECKED_PIN_BOARD_CONTRADICTIONS", set())
+    # Deliberately NOT inherited — provenance must not excuse this.
+    monkeypatch.setattr(kb, "_PIN_AT_IMPORT", "")
+    monkeypatch.setattr(kb, "_HERMES_HOME_AT_IMPORT", str(tmp_path / "scratch"))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
+
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.kanban_db_path()
 
 
 def test_pin_contradicting_explicit_board_arg_REFUSES(_pin_contradiction_env):
