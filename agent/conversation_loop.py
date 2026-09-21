@@ -8012,6 +8012,25 @@ def run_conversation(
                             "execute_code with Python's open() for large "
                             "files, or to write in smaller sections."
                         )
+                    # ── Durable handoff at the cut (2026-09-21) ──────────
+                    # The chain is exhausted and this turn is about to die.
+                    # Persist what was in flight (the request, the tool calls
+                    # and their results, the half-written text, open todos) so
+                    # the next turn resumes instead of reconstructing from
+                    # chat scrollback. Never raises; see agent.turn_handoff.
+                    from agent.chat_completion_helpers import (
+                        _fallback_reason_text,
+                    )
+                    from agent.turn_handoff import capture_turn_handoff
+
+                    _handoff_notice = capture_turn_handoff(
+                        agent,
+                        messages,
+                        turn_start_idx=current_turn_user_idx,
+                        reason=_fallback_reason_text(classified.reason),
+                    )
+                    if _handoff_notice:
+                        _final_response += f"\n\n{_handoff_notice}"
                     return {
                         "final_response": _final_response,
                         "messages": messages,
@@ -8019,6 +8038,9 @@ def run_conversation(
                         "completed": False,
                         "failed": True,
                         "error": _final_summary,
+                        # True when a machine-readable handoff was persisted
+                        # for this session and will be injected next turn.
+                        "turn_handoff_saved": bool(_handoff_notice),
                         # Surface the classified reason so callers (notably the
                         # kanban worker path in cli.py) can distinguish a
                         # transient throttle from a real failure and choose a

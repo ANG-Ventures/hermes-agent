@@ -116,8 +116,13 @@ def _coerce_epoch(value: Any) -> Optional[float]:
     text = value.strip()
     if not text:
         return None
+    # Plain numeric strings are epoch seconds; everything else falls through
+    # to the ISO-8601 parser. The published registry uses ISO-8601 Z strings
+    # ("2026-09-24T16:00:00.000Z") — a numeric-only parse silently reads every
+    # exhausted sub as eligible and the gate prunes nothing (measured
+    # 2026-09-21 against the live payload).
     try:
-        return float(text) if text.replace(".", "", 1).isdigit() else None
+        return float(text)
     except ValueError:
         pass
     try:

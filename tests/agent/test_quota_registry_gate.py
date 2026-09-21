@@ -115,6 +115,35 @@ class TestProviderQuotaState:
         ]}}
         assert provider_quota_state("claude-apx-3", snap).eligible is True
 
+    def test_iso8601_reset_is_parsed(self):
+        """The REAL registry publishes ISO-8601 Z strings, not epoch floats.
+
+        Measured 2026-09-21 against var/usage-portal/site/usage.json: every
+        ``resets_at`` is e.g. "2026-09-24T16:00:00.000Z". A float-only parser
+        reads all 14 exhausted subs as eligible and the gate prunes NOTHING.
+        """
+        import datetime as _dt
+
+        far = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=3)
+        iso = far.isoformat().replace("+00:00", "Z")
+        snap = {"claude-apx-1": {"observed_at": time.time(), "windows": [
+            {"key": "seven_day", "pct": 100.0, "status": "rejected",
+             "resets_at": iso},
+        ]}}
+        state = provider_quota_state("claude-apx-1", snap)
+        assert state.eligible is False
+        assert state.reset_at == pytest.approx(far.timestamp(), abs=5)
+
+    def test_iso8601_observed_at_is_parsed_for_staleness(self):
+        import datetime as _dt
+
+        old = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=48)
+        snap = {"claude-apx-1": {
+            "observed_at": old.isoformat().replace("+00:00", "Z"),
+            "windows": [_win("seven_day", 100.0, "rejected", 3 * 86400)],
+        }}
+        assert provider_quota_state("claude-apx-1", snap).eligible is True
+
     def test_scoped_model_window_does_not_gate_the_whole_sub(self):
         """A Fable allowance rejection is NOT a subscription-wide cap."""
         snap = {"claude-apx-6": {"windows": [

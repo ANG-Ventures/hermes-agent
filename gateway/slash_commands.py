@@ -6984,6 +6984,32 @@ class GatewaySlashCommandsMixin:
             else:
                 return t("gateway.title.current_no_title", session_id=session_id)
 
+    async def _handle_resume_handoff_command(self, event: MessageEvent) -> str:
+        """Handle /resume-handoff — replay a turn cut by a provider failure.
+
+        The handoff was written by ``agent.turn_handoff.capture_turn_handoff``
+        at the cut and is keyed by the same session key the gateway resolves
+        for every other session command. Consuming it here is equivalent to
+        the automatic next-turn injection; the command exists so the user can
+        pull the context back deliberately (and see what was captured).
+        """
+        from gateway.turn_handoff_command import (
+            NO_HANDOFF_REPLY,
+            render_resume_handoff_reply,
+        )
+        from types import SimpleNamespace
+
+        source = await asyncio.to_thread(
+            self._normalize_source_for_session_key, event.source
+        )
+        session_key = self._session_key_for_source(source)
+        if not session_key:
+            return NO_HANDOFF_REPLY
+        return await asyncio.to_thread(
+            render_resume_handoff_reply,
+            SimpleNamespace(_gateway_session_key=session_key),
+        )
+
     async def _handle_resume_command(self, event: MessageEvent) -> str:
         """Handle /resume command — list or switch to a previous session."""
         if not self._session_db:
