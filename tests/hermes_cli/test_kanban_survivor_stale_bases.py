@@ -670,3 +670,152 @@ def test_the_carried_ref_is_never_recorded_twice(board, remote, tmp_path, monkey
 
     repos = [ref["repository"] for ref in out["refs"]]
     assert len(repos) == len(set(repos)), f"duplicate refs: {out['refs']}"
+
+
+# --- the relaxation's COVERAGE decision, pinned per input shape ------------
+#
+# `missing <= _vouched_repositories(previous)` is the whole of what lets a
+# reaper DELETE a workspace whose recorded repository is gone. The tests above
+# pin it for one shape only: a REF-shaped survivor under TOTAL loss. The three
+# below pin the rest of the matrix, because each unpinned cell is a mutation
+# that changes what may be deleted while the suite stays green:
+#
+#   ref     / total   -> test_reclamation_consults_the_recorded_survivor_...
+#   ref     / partial -> test_cleanup_partial_loss_...            (below)
+#   bundle  / total   -> test_cleanup_accepts_a_bundle_shaped_... (below)
+#   patch   / any     -> test_cleanup_rejects_a_patch_shaped_...  (below)
+#   none / wrong repo -> test_reclamation_still_holds_when_no_survivor_...
+
+
+def _seed_repo(git, path, bare):
+    """A repo with a real durable `origin` it has been pushed to."""
+    path.mkdir(parents=True)
+    git(path, "init", "-b", "main")
+    git(path, "config", "user.name", "Test")
+    git(path, "config", "user.email", "test@example.invalid")
+    (path / "a.py").write_text("value = 1\n")
+    git(path, "add", ".")
+    git(path, "commit", "-m", "base")
+    git(path, "init", "--bare", str(bare))
+    git(path, "remote", "add", "origin", str(bare))
+    git(path, "push", "origin", "HEAD:main")
+    return git(path, "rev-parse", "HEAD")
+
+
+def test_cleanup_partial_loss_keeps_the_recorded_ref_for_the_vanished_repo(
+        board, remote, tmp_path, monkeypatch):
+    """PARTIAL loss through the CLEANUP path, not the completion path.
+
+    `test_partial_loss_keeps_both_...` above drives the `explicit` branch and
+    reads the COMPLETION snapshot, so it passes with the cleanup relaxation's
+    `if repos: carried = [...]` disabled entirely. Nothing else reaches that
+    branch: every other cleanup test seeds no repo on disk, leaving `repos`
+    empty.
+
+    Disabled, the surviving repo resolves its own remote ref, that alone
+    satisfies the completion, and the RECORDED ref for the vanished repo is
+    silently dropped -- the reaper then deletes a workspace whose lost work is
+    pointed at nothing, and preserve() still SUCCEEDS.
+    """
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    def git(repo, *args):
+        return subprocess.run(["git", "-C", str(repo), *args],
+                              capture_output=True, check=True).stdout.decode().strip()
+
+    tid = kb.create_task(board, title="partial loss at cleanup")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    kept_head = _seed_repo(git, ws / "kept", tmp_path / "kept.git")
+    kb.set_workspace_path(board, tid, ws)
+    with kb.write_txn(board):
+        board.execute(
+            "INSERT INTO task_workspace_survivors(task_id, bases, survivor) VALUES (?, ?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET bases = excluded.bases, "
+            "survivor = excluded.survivor",
+            (tid, json.dumps({"kept": kept_head, "gone": STALE}),
+             json.dumps({"kind": "ref", "refs": [
+                 {"repository": "gone", "pr": PR, "sha": HEAD, "external": True}]})),
+        )
+
+    # No survivor_pr: exactly what `remove_workspace_dir` passes.
+    out = survivor.preserve(board, tid, cleanup=True, workspace=ws)
+
+    by_repo = {ref["repository"]: ref for ref in out["refs"]}
+    assert by_repo["gone"]["pr"] == PR, (
+        "the vanished repo lost its recorded ref -- its work points at nothing"
+    )
+    assert by_repo["kept"]["remote"] == "origin", "the surviving repo keeps its own ref"
+    assert len(out["refs"]) == 2, out["refs"]
+    assert set(by_repo) == {"gone", "kept"}, out["refs"]
+    assert board.execute(
+        "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["held_reason"] is None
+
+
+def test_cleanup_rejects_a_patch_shaped_survivor_for_the_vanished_repo(board, remote):
+    """A patch is keyed by base SHA against a checkout, so it cannot stand in
+    for a repository that is no longer on disk. `_vouched_repositories()`
+    therefore collects `refs` and `bundles` only -- never `repositories`.
+
+    That exclusion was prose in a docstring and nothing enforced it. Widening
+    the helper to also collect `repositories` turns this fail-CLOSED hold into
+    a reapable workspace whose only "survivor" is a patch against a base SHA
+    that no longer exists anywhere, with the suite still green.
+    """
+    from hermes_cli import kanban_survivor as survivor
+
+    tid, ws = stale_card(board, loose=False)
+    with kb.write_txn(board):
+        board.execute(
+            "INSERT INTO task_workspace_survivors(task_id, survivor) VALUES (?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET survivor = excluded.survivor",
+            (tid, json.dumps({"kind": "patch", "notice": "NOT PUSHED", "refs": [],
+                              "bundles": [], "path": "/nonexistent/x.patch",
+                              "repositories": [{"repository": ".", "base_sha": STALE}]})),
+        )
+
+    with pytest.raises(ValueError) as excinfo:
+        survivor.preserve(board, tid, cleanup=True, workspace=ws)
+
+    assert "recorded repository missing" in str(excinfo.value)
+    assert board.execute(
+        "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["held_reason"] is not None, "a patch must not clear the hold"
+    assert ws.is_dir(), "the held workspace must not be reapable"
+    # Teeth: the exclusion is about the SHAPE, not about `repositories` being
+    # unreadable. The same record with a ref for the same repo does satisfy.
+    assert survivor._vouched_repositories(
+        {"kind": "ref", "refs": [{"repository": "."}]}) == {"."}
+    assert survivor._vouched_repositories(
+        {"kind": "patch", "repositories": [{"repository": "."}]}) == set()
+
+
+def test_cleanup_accepts_a_bundle_shaped_survivor_for_the_vanished_repo(board, remote):
+    """The third shape `_vouched_repositories()` accepts, and the one no test
+    exercised at cleanup: a stored BUNDLE is self-contained, so unlike a patch
+    it does vouch for a repository that is gone from disk.
+
+    Without this, dropping `bundles` from the helper (or never adding it)
+    silently converts every bundle-backed reclamation into a permanent HOLD --
+    a workspace leak rather than a data loss, but equally invisible.
+    """
+    from hermes_cli import kanban_survivor as survivor
+
+    tid, ws = stale_card(board, loose=False)
+    with kb.write_txn(board):
+        board.execute(
+            "INSERT INTO task_workspace_survivors(task_id, survivor) VALUES (?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET survivor = excluded.survivor",
+            (tid, json.dumps({"kind": "bundle", "notice": "NOT PUSHED", "refs": [],
+                              "bundles": [{"repository": ".", "path": "/x.bundle",
+                                           "sha256": "0" * 64, "bytes": 1}]})),
+        )
+
+    out = survivor.preserve(board, tid, cleanup=True, workspace=ws)
+
+    assert out["kind"] == "bundle"
+    assert [b["repository"] for b in out["bundles"]] == ["."]
+    assert board.execute(
+        "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["held_reason"] is None
