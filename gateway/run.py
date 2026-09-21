@@ -124,11 +124,6 @@ _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT = 180.0
 # 180s budget (is_reconnect=True preserves the offline update queue, #46621).
 _TELEGRAM_INITIAL_CONNECT_TIMEOUT_SECS_DEFAULT = 45.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
-_RUNTIME_STATUS_WRITE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=1,
-    thread_name_prefix="gateway-runtime-status",
-)
-_RUNTIME_STATUS_SUBMIT_LOCK = threading.Lock()
 # How long the shutdown path waits for in-flight ThreadPoolExecutor workers
 # (agent turns) to finish before giving up and letting the CLI hard-exit
 # backstop finalize the process. Bounded so a wedged worker can't strand the
@@ -10610,9 +10605,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _dispatch_runtime_status_write(self, **kwargs) -> None:  # noqa: atomic-write-on-loop loop-conditional guard: ordered worker lane whenever a loop is running
         """Serialize runtime-status writes without blocking the active loop.
 
-        Non-terminal loop callers enter one dedicated FIFO worker. Terminal and
-        synchronous callers fence that lane, then write inline, so an older
+        Non-terminal loop callers enter the ordered lane owned by
+        ``gateway.status``. Terminal and synchronous callers go through the
+        public writer, which fences that same lane before writing, so an older
         deferred lifecycle update cannot overtake ``stopped`` at shutdown.
+
+        The lane deliberately lives in ``gateway.status``, not here: the three
+        direct ``startup_failed`` writers below (and the platform adapters'
+        ``_write_runtime_status_safe``) call the public writer directly, and a
+        runner-owned lane would leave all of them unordered.
         """
         def _write() -> None:
             try:
@@ -10631,21 +10632,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if on_loop and not terminal:
             try:
-                with _RUNTIME_STATUS_SUBMIT_LOCK:
-                    _RUNTIME_STATUS_WRITE_EXECUTOR.submit(_write)
+                from gateway.status import submit_runtime_status_write
+
+                submit_runtime_status_write(**kwargs)
                 return
             except Exception:
                 _write()
                 return
 
-        # Preserve the established inline contract for sync and terminal
-        # callers, but only after every earlier queued write has drained.
-        try:
-            with _RUNTIME_STATUS_SUBMIT_LOCK:
-                _RUNTIME_STATUS_WRITE_EXECUTOR.submit(lambda: None).result()
-                _write()
-        except Exception:
-            _write()
+        # Sync and terminal callers keep the established inline contract; the
+        # public writer fences the lane for them.
+        _write()
 
     def _persist_active_agents(self) -> None:
         """Persist the live in-flight agent count to ``gateway_state.json``.

@@ -11,6 +11,7 @@ that will be useful when we add named profiles (multiple agents running
 concurrently under distinct configurations).
 """
 
+import concurrent.futures
 import copy
 import hashlib
 import json
@@ -1330,6 +1331,71 @@ def _write_runtime_status_unlocked(
 # leaves direct writers able to clobber fields.
 _RUNTIME_STATUS_WRITE_LOCK = threading.Lock()
 
+# ...and in the same ORDERING boundary.  The merge lock alone only stops two
+# concurrent writers from losing each other's fields; it says nothing about
+# which one lands last.  A deferred ``running`` write queued off the event loop
+# could therefore still execute AFTER a direct terminal ``startup_failed`` /
+# ``stopped`` write and overwrite it -- the gateway's final state silently
+# reverting to ``running`` with no ``exit_reason``.
+#
+# The ordered lane lives HERE, not in ``GatewayRunner``, precisely so no public
+# lifecycle writer can bypass it: ``gateway/run.py``'s three direct
+# ``startup_failed`` writers, ``gateway/platforms/base.py``'s adapter health
+# writer and ``gateway/session_db_recovery.py`` all call ``write_runtime_status``
+# and are all ordered by construction.
+_RUNTIME_STATUS_LANE = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="gateway-runtime-status",
+)
+_RUNTIME_STATUS_LANE_LOCAL = threading.local()
+
+
+def _fence_runtime_status_lane() -> None:
+    """Block until every write already queued on the ordered lane has run.
+
+    Called by the synchronous public writer so a direct caller always lands
+    after work that was queued before it.  Skipped when we are already running
+    ON the lane: ordering is inherent there, and fencing from inside the single
+    lane worker would deadlock on itself.
+    """
+    if getattr(_RUNTIME_STATUS_LANE_LOCAL, "in_lane", False):
+        return
+    try:
+        _RUNTIME_STATUS_LANE.submit(lambda: None).result()
+    except Exception:
+        pass
+
+
+def submit_runtime_status_write(**kwargs: Any) -> None:
+    """Queue a runtime-status write on the ordered lane without blocking.
+
+    The non-terminal off-loop path: the caller returns immediately and the
+    write executes on the lane, in submission order, behind the same merge
+    lock as every direct writer.  Best-effort -- a failed status write must
+    never disrupt a turn.
+    """
+    def _run() -> None:
+        _RUNTIME_STATUS_LANE_LOCAL.in_lane = True
+        try:
+            # Module-global lookup, not a direct call: a dozen existing tests
+            # monkeypatch ``gateway.status.write_runtime_status`` as a spy and
+            # must still observe the lane's write.
+            globals()["write_runtime_status"](**kwargs)
+        except Exception:
+            pass
+        finally:
+            _RUNTIME_STATUS_LANE_LOCAL.in_lane = False
+
+    try:
+        _RUNTIME_STATUS_LANE.submit(_run)
+    except Exception:
+        # Executor refused the job (shutdown): fall back to an inline write so
+        # the update is not silently dropped.
+        try:
+            globals()["write_runtime_status"](**kwargs)
+        except Exception:
+            pass
+
 
 def write_runtime_status(
     *,
@@ -1348,7 +1414,13 @@ def write_runtime_status(
     session_store: Any = _UNSET,
     clear_profile_platforms: bool = False,
 ) -> None:
-    """Persist runtime status under the process-wide merge lock."""
+    """Persist runtime status under the process-wide merge lock.
+
+    Also FENCES the ordered lane first: any write queued before this call
+    lands before this one does, so a direct terminal write can never be
+    overtaken by an older deferred lifecycle update.
+    """
+    _fence_runtime_status_lane()
     with _RUNTIME_STATUS_WRITE_LOCK:
         _write_runtime_status_unlocked(
             gateway_state=gateway_state,

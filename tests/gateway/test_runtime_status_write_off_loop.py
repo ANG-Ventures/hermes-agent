@@ -224,29 +224,96 @@ async def test_terminal_states_are_written_inline_not_offloaded(sandbox_home):
 
 @pytest.mark.asyncio
 async def test_terminal_write_cannot_be_overtaken_by_older_deferred_write(
-    sandbox_home, monkeypatch,
+    sandbox_home,
 ):
-    """A queued ``running`` write must never land after terminal ``stopped``."""
-    runner = _make_runner()
-    loop = asyncio.get_running_loop()
-    queued = []
+    """A queued ``running`` write must never land after a terminal write.
 
-    def hold_executor_callback(executor, callback):
-        queued.append(callback)
-        return loop.create_future()
+    Exercises the REAL ordered lane in ``gateway.status`` (not a monkeypatched
+    executor): the single lane worker is occupied so the ``running`` write sits
+    QUEUED and unstarted -- stalled before it ever reaches the merge lock, so
+    this is an ordering assertion, not a lock-contention artifact.
 
-    monkeypatch.setattr(loop, "run_in_executor", hold_executor_callback)
-    runner._update_runtime_status("running")
-    runner._update_runtime_status("stopped", "sigterm")
-    # Replaying callbacks held by the old default-executor shape simulates the
-    # delayed ``running`` write that used to overtake terminal state.
-    for callback in queued:
-        callback()
-
+    The terminal write is issued through the *direct* public writer, which is
+    the production shape at ``gateway/run.py`` ``startup_failed`` sites (three
+    of them) and at ``gateway/platforms/base.py::_write_runtime_status_safe``.
+    Those callers never touch ``GatewayRunner._dispatch_runtime_status_write``,
+    which is exactly why the lane cannot live on the runner.
+    """
     from gateway import status as gwstatus
+
+    runner = _make_runner()
+
+    gate = threading.Event()
+    occupied = threading.Event()
+
+    # Occupy the lane's single worker: the next submission queues behind it.
+    gwstatus._RUNTIME_STATUS_LANE.submit(lambda: (occupied.set(), gate.wait(10)))
+    assert occupied.wait(5), "the ordered lane never started its worker"
+
+    try:
+        # Queued on the lane, unstarted.
+        runner._update_runtime_status("running")
+
+        # The direct production terminal writer.
+        gwstatus.write_runtime_status(
+            gateway_state="startup_failed", exit_reason="bad config",
+        )
+        after_terminal = (gwstatus.read_runtime_status() or {}).get("gateway_state")
+        assert after_terminal == "startup_failed"
+    finally:
+        gate.set()
+
+    # Drain: the older `running` write now runs. It must NOT win.
+    gwstatus._RUNTIME_STATUS_LANE.submit(lambda: None).result()
 
     record = gwstatus.read_runtime_status()
     assert record is not None
+    assert record["gateway_state"] == "startup_failed", (
+        "an older deferred `running` write overtook the terminal state"
+    )
+    assert record["exit_reason"] == "bad config"
+
+
+@pytest.mark.asyncio
+async def test_every_direct_terminal_writer_fences_the_ordered_lane(sandbox_home):
+    """CLASS-SWEEP: the ordering guarantee is a property of the PUBLIC writer.
+
+    ``gateway/run.py`` (3 ``startup_failed`` sites),
+    ``gateway/platforms/base.py::_write_runtime_status_safe`` and
+    ``gateway/session_db_recovery.py`` all call ``write_runtime_status``
+    directly. Rather than enumerate call sites (which rots), assert the
+    invariant that makes all of them safe: any write already queued on the
+    lane completes BEFORE a direct public write returns.
+    """
+    from gateway import status as gwstatus
+
+    order: list[str] = []
+    gate = threading.Event()
+    occupied = threading.Event()
+
+    real = gwstatus._write_runtime_status_unlocked
+
+    def recording(**kwargs):
+        order.append(str(kwargs.get("gateway_state") or kwargs.get("platform")))
+        return real(**kwargs)
+
+    gwstatus._write_runtime_status_unlocked = recording  # type: ignore[assignment]
+    gwstatus._RUNTIME_STATUS_LANE.submit(lambda: (occupied.set(), gate.wait(10)))
+    assert occupied.wait(5)
+    try:
+        gwstatus.submit_runtime_status_write(gateway_state="running")
+        gate.set()
+        # The direct writer must not return until the queued write has landed.
+        gwstatus.write_runtime_status(gateway_state="stopped", exit_reason="sigterm")
+    finally:
+        gate.set()
+        gwstatus._RUNTIME_STATUS_LANE.submit(lambda: None).result()
+        gwstatus._write_runtime_status_unlocked = real  # type: ignore[assignment]
+
+    assert order == ["running", "stopped"], (
+        f"the direct writer did not fence the queued lane work: {order}"
+    )
+    record = gwstatus.read_runtime_status() or {}
     assert record["gateway_state"] == "stopped"
     assert record["exit_reason"] == "sigterm"
 
