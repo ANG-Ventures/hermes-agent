@@ -19779,17 +19779,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
             timeout = effective_stop_drain_timeout(self)
-            # The watchdog was armed at the TOP of stop() with an ABSOLUTE
-            # deadline, but this drain is a RELATIVE budget starting only
-            # now — after the notify/mark/cancel phases logged above. Spend
-            # their elapsed time out of the drain, not out of the teardown
-            # reserve that sits between the drain and os._exit.
-            timeout = resolve_elapsed_adjusted_drain(
-                timeout,
-                getattr(self, "_launchd_exit_timeout_s", None),
-                signal_driven=getattr(self, "_stop_requested_by_signal", False),
-                elapsed_s=_phase_elapsed(),
-            )
             if timeout < self._restart_drain_timeout:
                 logger.warning(
                     "Shutdown drain capped to %.0fs (configured %.0fs) to fit "
@@ -19817,6 +19806,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await self._notify_restart_loop_suspended(_sk)
                 except Exception as _e:
                     logger.debug("pre-drain mark_resume_pending failed for %s: %s", _sk, _e)
+
+            # The watchdog was armed at the TOP of stop() with an ABSOLUTE
+            # deadline, but this drain is a RELATIVE budget that only starts
+            # HERE — after the notify/mark/cancel phases logged above AND
+            # after the pre-drain resume_pending marking loop just above
+            # (per-session SQLite writes plus notify sends, which under the
+            # load that produced the 09-21 SIGKILL is not a negligible term).
+            # Read the elapsed at the POINT OF USE, not at the top of the
+            # block: a snapshot taken before the marking loop charges that
+            # loop to neither the drain nor the teardown reserve, and the
+            # window between the drain and os._exit silently shrinks below
+            # the reserve. At the live geometry (clamp 60, drain 30, armed
+            # 50) an 8s marking loop left a 12s window for a 15s reserve.
+            # The cron branch below does the same thing for the same reason.
+            timeout = resolve_elapsed_adjusted_drain(
+                timeout,
+                getattr(self, "_launchd_exit_timeout_s", None),
+                signal_driven=getattr(self, "_stop_requested_by_signal", False),
+                elapsed_s=_phase_elapsed(),
+            )
 
             _cron_at_start = self._active_cron_job_count()
             _api_at_start = self._active_api_run_count()

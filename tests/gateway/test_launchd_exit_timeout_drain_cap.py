@@ -817,8 +817,19 @@ def test_stop_spends_pre_drain_elapsed_out_of_the_drain(monkeypatch, tmp_path):
     that the adjustment is called with the production arguments and a live
     elapsed reading. The arithmetic itself is pinned separately by
     ``test_pre_drain_elapsed_comes_out_of_the_drain_not_the_reserve``.
+
+    The elapsed must be read at the POINT OF USE, so the pre-drain
+    ``resume_pending`` marking loop falls INSIDE it. A snapshot taken
+    before that loop charges the loop's wall time to neither the drain
+    nor the teardown reserve: at the live geometry (clamp 60, drain 30,
+    armed 50) an 8s marking loop left a 12s window for a 15s reserve —
+    ``os._exit`` inside persistence, the 09-21 incident's failure mode.
+    The marking loop below therefore burns a measurable amount of time
+    and the assertion requires the elapsed to account for it, so moving
+    the reading back above the loop (or pinning ``elapsed_s=0.0``) is red.
     """
     import asyncio
+    import time
 
     from gateway import run as run_mod
     from tests.gateway.restart_test_helpers import make_restart_runner
@@ -832,6 +843,28 @@ def test_stop_spends_pre_drain_elapsed_out_of_the_drain(monkeypatch, tmp_path):
     runner._stop_requested_by_signal = True
     runner._last_shutdown_teardown_s = 22.0
     adapter.disconnect = AsyncMock()
+
+    # Give the pre-drain marking loop real sessions AND a measurable cost,
+    # so the elapsed reading can be distinguished from a pre-loop snapshot.
+    MARK_COST_S = 0.05
+    N_SESSIONS = 4
+    MARKING_LOOP_S = MARK_COST_S * N_SESSIONS
+
+    class _StubAgent:
+        pass
+
+    for _i in range(N_SESSIONS):
+        runner._running_agents[f"drain-sess-{_i}"] = _StubAgent()
+
+    def _slow_mark(_self, _session_key, **_kw):
+        time.sleep(MARK_COST_S)
+        return (True, "shutdown", False)
+
+    monkeypatch.setattr(
+        run_mod.GatewayRunner,
+        "_mark_resume_pending_for_shutdown",
+        _slow_mark,
+    )
 
     calls: list[dict] = []
     SENTINEL = 16.0
@@ -871,7 +904,20 @@ def test_stop_spends_pre_drain_elapsed_out_of_the_drain(monkeypatch, tmp_path):
     assert call["drain"] == 28.0
     assert call["clamp"] == 60.0
     assert call["signal_driven"] is True
-    assert isinstance(call["elapsed"], float) and call["elapsed"] >= 0.0
+    # The elapsed must be read at the POINT OF USE, which puts the
+    # pre-drain marking loop inside it. `>= 0.0` would pass for any
+    # snapshot position — including one taken before the loop, which
+    # charges the loop to neither the drain nor the teardown reserve.
+    # Requiring the marking loop's own cost is what distinguishes a
+    # working guard from a disabled one.
+    assert isinstance(call["elapsed"], float)
+    assert call["elapsed"] >= MARKING_LOOP_S, (
+        f"elapsed {call['elapsed']:.3f}s does not account for the "
+        f"{MARKING_LOOP_S:.3f}s pre-drain resume_pending marking loop; the "
+        f"reading is being taken before the loop, so its wall time is "
+        f"charged to neither the drain nor the teardown reserve and the "
+        f"window before os._exit silently shrinks below the reserve"
+    )
 
     # ...and the drain it actually ran is the adjusted value, not the raw
     # budget. This is what goes red if the wiring is removed.
