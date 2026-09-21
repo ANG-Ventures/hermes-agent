@@ -70,7 +70,8 @@ SYSTEMD_TIMEOUT_STOP_SEC_FLOOR = 60.0
 # ``restart_drain_timeout: 180`` vs live 60 → SIGKILL at +60s on every
 # busy restart).
 LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S = 60
-LAUNCHD_STOP_CLEANUP_RESERVE_S = 10.0
+LAUNCHD_STOP_CLEANUP_RESERVE_S = 15.0
+LAUNCHD_HARD_EXIT_RESERVE_S = 10.0
 
 _LAUNCHD_EXIT_TIMEOUT_RE = re.compile(r"^\s*exit timeout\s*=\s*(\d+)\s*$", re.MULTILINE)
 
@@ -141,17 +142,17 @@ def resolve_launchd_capped_drain(
     launchd_exit_timeout_s: float | None,
     *,
     cleanup_reserve_s: float = LAUNCHD_STOP_CLEANUP_RESERVE_S,
+    last_teardown_s: float | None = None,
 ) -> float:
     """Clamp a SIGTERM-driven stop drain to what launchd will actually allow.
 
     ``launchd_exit_timeout_s`` is the live ``exit timeout`` for this job (see
     :func:`read_launchd_exit_timeout_s`); ``None`` means no launchd budget
     applies and the configured drain is returned untouched. Otherwise the
-    drain may use at most ``exit_timeout - cleanup_reserve_s`` so the
-    post-drain teardown (interrupt agents, disconnect adapters, checkpoint
-    and close SQLite) still completes before launchd escalates to SIGKILL.
-    Never *extends* the drain — an operator who configured a short one
-    keeps it.
+    drain may use at most ``exit_timeout - max(cleanup_reserve_s,
+    last_teardown_s)`` so the post-drain teardown still completes before
+    launchd escalates to SIGKILL. Never *extends* the drain — an operator who
+    configured a short one keeps it.
     """
 
     def _seconds(value: object) -> float:
@@ -169,8 +170,39 @@ def resolve_launchd_capped_drain(
         return drain
     if budget <= 0.0:
         return drain
-    cap = max(budget - _seconds(cleanup_reserve_s), 0.0)
+    reserve = max(_seconds(cleanup_reserve_s), _seconds(last_teardown_s))
+    cap = max(budget - reserve, 0.0)
     return min(drain, cap)
+
+
+def resolve_launchd_shutdown_watchdog_delay(
+    watchdog_delay_s: float,
+    launchd_exit_timeout_s: float | None,
+    *,
+    signal_driven: bool,
+    hard_exit_reserve_s: float = LAUNCHD_HARD_EXIT_RESERVE_S,
+) -> float:
+    """Return the hard-exit deadline for a launchd-timed shutdown.
+
+    Signal-driven shutdown must stop itself before launchd's uncatchable
+    SIGKILL. The final reserve leaves launchd headroom even when persistence
+    or adapter teardown wedges. Other shutdown paths keep their normal
+    watchdog leash.
+    """
+    try:
+        watchdog = max(float(watchdog_delay_s), 0.0)
+    except (TypeError, ValueError):
+        watchdog = 0.0
+    if not signal_driven or launchd_exit_timeout_s is None:
+        return watchdog
+    try:
+        launchd_budget = float(launchd_exit_timeout_s)
+        reserve = max(float(hard_exit_reserve_s), 0.0)
+    except (TypeError, ValueError):
+        return watchdog
+    if launchd_budget <= 0.0:
+        return watchdog
+    return min(watchdog, max(launchd_budget - reserve, 0.0))
 
 
 def effective_stop_drain_timeout(runner: object) -> float:
@@ -186,7 +218,11 @@ def effective_stop_drain_timeout(runner: object) -> float:
     drain = getattr(runner, "_restart_drain_timeout", DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT)
     if not getattr(runner, "_stop_requested_by_signal", False):
         return drain
-    return resolve_launchd_capped_drain(drain, getattr(runner, "_launchd_exit_timeout_s", None))
+    return resolve_launchd_capped_drain(
+        drain,
+        getattr(runner, "_launchd_exit_timeout_s", None),
+        last_teardown_s=getattr(runner, "_last_shutdown_teardown_s", None),
+    )
 
 
 def is_gateway_supervisor_process(
