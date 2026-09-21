@@ -2048,7 +2048,24 @@ def cronjob(
             # "auto" that can't resolve (no agent model published) degrades to
             # leaving the job unpinned — it never guesses a model.
             if not _no_agent:
+                _requested_model = model
                 model, provider = _resolve_cron_llm_model(model, provider)
+                # DELEGATION != ELECTED PRIMARY (Ace 2026-09-21). The firepower
+                # guard governs a route the CALLER chose. An "auto"/config
+                # auto-pin inherits the creating agent's OWN elected model, and
+                # an agent legitimately running Fable/Astra as its primary must
+                # still be able to schedule its own crons. Supply the inherited
+                # route's justification here so the guard stays armed for every
+                # explicitly-requested flagship route and only there.
+                if (
+                    model
+                    and model != _requested_model
+                    and not str(firepower_reason or "").strip()
+                ):
+                    firepower_reason = (
+                        "auto-pin: inherited the creating agent's own elected "
+                        "model, not a caller-chosen flagship route"
+                    )
             # Job-shape validation differs by mode:
             #   - no_agent=True → script is the job; prompt/skills are optional
             #     (and irrelevant to execution).
