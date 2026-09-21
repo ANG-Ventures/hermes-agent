@@ -1972,6 +1972,7 @@ class GatewayKanbanWatchersMixin:
         # decision can legitimately sit for hours; warn every 5 min per board
         # rather than every tick.
         last_stranded_warn_at: dict[str, int] = {}
+        last_workspace_refusal_warn: dict[str, tuple[str, int]] = {}
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
@@ -2310,11 +2311,17 @@ class GatewayKanbanWatchersMixin:
                         if spawned:
                             any_spawned = True
                         if refused:
-                            logger.error(
-                                "kanban dispatcher tick [%s]: %s",
-                                slug,
-                                _format_workspace_refused_summary(refused),
+                            summary = _format_workspace_refused_summary(refused)
+                            now_s = int(time.time())
+                            previous_summary, previous_at = (
+                                last_workspace_refusal_warn.get(slug, ("", 0))
                             )
+                            if summary != previous_summary or now_s - previous_at >= 300:
+                                logger.error(
+                                    "kanban dispatcher tick [%s]: %s",
+                                    slug, summary,
+                                )
+                                last_workspace_refusal_warn[slug] = (summary, now_s)
                         if res is not None and (spawned or guarded or parent_satisfied_sticky):
                             # Quiet by default — log only actionable tick activity,
                             # including guarded tasks and satisfied dependency graphs

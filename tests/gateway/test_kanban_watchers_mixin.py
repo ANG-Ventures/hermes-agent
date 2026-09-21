@@ -149,6 +149,14 @@ def test_stall_early_spawn_failure_IS_bad_even_with_benign_sibling():
     assert _stall_streak_is_bad(True, False, [("A", early_fail), ("B", rate_limited)]) is True
 
 
+def test_stall_workspace_refusal_IS_bad_even_with_benign_sibling():
+    refused = _FakeResult(workspace_refused=[
+        ("t1", "workspaces_root_unmounted: /Volumes/ramscratch"),
+    ])
+    capped = _FakeResult(skipped_per_profile_capped=[("t2", "athena", 2)])
+    assert _stall_streak_is_bad(True, False, [("A", refused), ("B", capped)]) is True
+
+
 def test_stall_none_results_bare_stall_is_bad():
     # Defensive: a None board result contributes nothing; a bare stall still counts.
     assert _stall_streak_is_bad(True, False, [("b", None)]) is True
