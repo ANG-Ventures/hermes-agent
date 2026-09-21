@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 
 import pytest
 
@@ -67,12 +66,16 @@ async def test_record_async_does_not_wait_for_a_stalled_write(store_home, monkey
 
     monkeypatch.setattr(rich_sent_store.os, "replace", stalled_replace)
 
-    loop.call_later(0.2, release_write.set)
-    started = time.monotonic()
-    await rich_sent_store.record_async("12345", "678", "slow write")
-    elapsed = time.monotonic() - started
-    assert elapsed < 0.1, f"adapter waited {elapsed:.3f}s for best-effort persistence"
-    await asyncio.wait_for(write_started.wait(), timeout=1)
+    task = asyncio.create_task(
+        rich_sent_store.record_async("12345", "678", "slow write")
+    )
+    try:
+        await asyncio.wait_for(write_started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert task.done(), "adapter is still waiting for best-effort persistence"
+    finally:
+        release_write.set()
+        await task
     stored = store_home / "state" / "rich_sent_index.json"
     for _ in range(100):
         if stored.exists():
@@ -91,17 +94,17 @@ async def test_record_async_ignores_default_executor_saturation(store_home, monk
         return release
 
     monkeypatch.setattr(loop, "run_in_executor", saturated_run_in_executor)
-    started = time.monotonic()
+    task = asyncio.create_task(
+        rich_sent_store.record_async("12345", "saturated", "still returns")
+    )
     try:
-        await asyncio.wait_for(
-            rich_sent_store.record_async("12345", "saturated", "still returns"),
-            timeout=0.1,
-        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert task.done(), "record_async is coupled to the shared default executor"
     finally:
         if not release.done():
-            release.cancel()
-    elapsed = time.monotonic() - started
-    assert elapsed < 0.1
+            release.set_result(None)
+        await task
 
 
 @pytest.mark.asyncio
