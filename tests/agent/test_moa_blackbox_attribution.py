@@ -52,3 +52,26 @@ def test_build_moa_pricing_calls_appends_real_aggregator_after_advisors():
     assert all(calls[1][flag] is False for flag in USAGE_UNKNOWN_FIELDS)
     # The helper must not mutate the facade-owned pending list.
     assert len(advisor_calls) == 1
+
+
+def test_build_moa_pricing_calls_preserves_unknown_discriminators():
+    """Unknown flags must survive the aggregator -> physical-call seam."""
+    from agent.conversation_loop import _build_moa_pricing_calls
+
+    usage = CanonicalUsage(
+        input_tokens=200,
+        output_tokens=0,
+        output_tokens_unknown=True,
+        cache_read_tokens_unknown=True,
+    )
+    call = _build_moa_pricing_calls(
+        [],
+        usage,
+        aggregator_model="claude-sonnet-4-5",
+        aggregator_provider="anthropic",
+        aggregator_base_url=None,
+    )[0]
+    assert call["output_tokens_unknown"] is True
+    assert call["cache_read_tokens_unknown"] is True
+    assert call["input_tokens_unknown"] is False
+    assert call["usage_unknown"] is False

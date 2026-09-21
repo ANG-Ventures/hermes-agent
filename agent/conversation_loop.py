@@ -111,7 +111,13 @@ from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
 from agent.turn_finalizer import finalize_turn
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_pricing import (
+    USAGE_UNKNOWN_FIELDS,
+    CanonicalUsage,
+    estimate_usage_cost,
+    normalize_usage,
+    resolve_billing_route,
+)
 from agent import empty_response_guard as _empty_guard
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
@@ -508,6 +514,57 @@ def _build_moa_pricing_calls(
         "reasoning_tokens": aggregator_usage.reasoning_tokens,
     })
     return calls
+
+
+def _canonical_usage_from_response(
+    response: Any, *, provider: str | None, api_mode: str | None
+) -> CanonicalUsage:
+    """Normalize a response's usage; omission is UNKNOWN, never measured zero."""
+    response_usage = getattr(response, "usage", None)
+    if not response_usage:
+        return CanonicalUsage(usage_unknown=True)
+    return normalize_usage(response_usage, provider=provider, api_mode=api_mode)
+
+
+def _capture_measured_usage_anchor(usage: Any, messages: list[dict[str, Any]]) -> Any:
+    """Build an exact context anchor only from fully measured usage."""
+    if bool(getattr(usage, "total_tokens_unknown", False)):
+        return None
+    return capture_usage_anchor(usage.prompt_tokens, usage.output_tokens, messages)
+
+
+def _moa_session_cost_status(
+    cost_result: Any,
+    advisor_calls: list[dict[str, Any]],
+    advisor_cost: Any = None,
+) -> str:
+    """Reconcile the aggregator status with every physical MoA advisor.
+
+    A known-only advisor subtotal is not a complete cost when another advisor's
+    usage was unpriceable. Blackbox already reconciles physical calls worst-of;
+    the session lane must not downgrade the same turn back to ``estimated``.
+    """
+    any_unpriceable = False
+    any_known = cost_result.amount_usd is not None or advisor_cost is not None
+    for call in advisor_calls:
+        if not isinstance(call, dict):
+            continue
+        usage_unknown = any(bool(call.get(key)) for key in USAGE_UNKNOWN_FIELDS)
+        if not usage_unknown:
+            continue
+        route = resolve_billing_route(
+            call.get("model") or "",
+            provider=call.get("provider"),
+            base_url=call.get("base_url"),
+        )
+        # Included-route cost is known independently of missing token counts.
+        if route.billing_mode == "subscription_included":
+            any_known = True
+        else:
+            any_unpriceable = True
+    if any_unpriceable:
+        return "partial" if any_known else "unknown"
+    return cost_result.status
 
 
 def _is_auth_resolution_error(api_error: Exception) -> bool:
@@ -4621,10 +4678,14 @@ def run_conversation(
                             "error": "First response truncated due to output length limit"
                         }
                 
-                # Track actual token usage from response for context management
-                if hasattr(response, 'usage') and response.usage:
-                    canonical_usage = normalize_usage(
-                        response.usage,
+                # Track actual token usage from the response for context management.
+                # A successful provider response with no usage payload is not a
+                # measured zero: the provider gave us no counts. Feed an explicit
+                # aggregate UNKNOWN through the same accounting path so pricing,
+                # persistence, and renderers cannot silently invent zero usage.
+                if response is not None:
+                    canonical_usage = _canonical_usage_from_response(
+                        response,
                         provider=agent.provider,
                         api_mode=agent.api_mode,
                     )
@@ -4731,10 +4792,14 @@ def run_conversation(
                     # MoA note: use the pre-fold aggregator usage — the folded
                     # canonical figure adds advisor fan-out tokens that were
                     # never part of THIS conversation's prompt.
-                    _new_anchor = capture_usage_anchor(
-                        aggregator_usage.prompt_tokens,
-                        aggregator_usage.output_tokens,
-                        messages,
+                    # An anchor is exact only when BOTH prompt and completion
+                    # are measured. Installing an UNKNOWN placeholder as zero
+                    # makes anchored_context_tokens skip the assistant reply as
+                    # "already counted", underestimating the next request by the
+                    # entire generated payload. Keep the prior anchor instead;
+                    # its delta estimator will count this response normally.
+                    _new_anchor = _capture_measured_usage_anchor(
+                        aggregator_usage, messages
                     )
                     if _new_anchor is not None:
                         agent._usage_anchor = _new_anchor
@@ -4927,6 +4992,9 @@ def run_conversation(
                         base_url=_agg_cost_base_url,
                         api_key=getattr(agent, "api_key", ""),
                     )
+                    _cost_status = _moa_session_cost_status(
+                        cost_result, _moa_ref_pricing_calls, _moa_ref_cost
+                    )
                     if cost_result.amount_usd is not None:
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
                     # Add MoA advisor cost (already priced per-advisor at each
@@ -4936,7 +5004,7 @@ def run_conversation(
                             agent.session_estimated_cost_usd += float(_moa_ref_cost)
                         except (TypeError, ValueError):  # pragma: no cover - defensive
                             pass
-                    agent.session_cost_status = cost_result.status
+                    agent.session_cost_status = _cost_status
                     agent.session_cost_source = cost_result.source
 
                     # Persist token counts to session DB for /insights.
@@ -4981,7 +5049,7 @@ def run_conversation(
                                 cache_write_tokens=canonical_usage.cache_write_tokens,
                                 reasoning_tokens=canonical_usage.reasoning_tokens,
                                 estimated_cost_usd=_cost_delta,
-                                cost_status=cost_result.status,
+                                cost_status=_cost_status,
                                 cost_source=cost_result.source,
                                 billing_provider=agent.provider,
                                 billing_base_url=agent.base_url,

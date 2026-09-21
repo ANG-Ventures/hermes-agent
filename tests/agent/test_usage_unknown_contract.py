@@ -270,48 +270,26 @@ def test_uc7_the_turn_ledger_persists_the_discriminator(tmp_path, monkeypatch):
                                   "cache_read_tokens_unknown", "cache_write_tokens_unknown",
                                   "usage_unknown"])
 def test_uc7b_the_turn_rollup_absorbs_an_unknown_call(flag):
-    """The per-call -> per-turn roll-up in turn_finalizer is unknown-absorbing.
+    """The shipped per-call -> per-turn roll-up is unknown-absorbing."""
+    from agent.turn_finalizer import _rollup_turn_usage
 
-    A turn is several API calls. If ANY call's output was unmeasured, the turn's
-    SUMMED output is missing a term — so the sum is not a measurement. This pins
-    the exact expression turn_finalizer builds, lifted from source, rather than
-    re-implementing it here (which would test nothing).
-    """
-    import ast
-    import inspect
-    import textwrap
+    def call(**overrides):
+        return {
+            "input_tokens": 100,
+            "output_tokens": 118,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+            "total_tokens": 218,
+            **overrides,
+        }
 
-    import agent.turn_finalizer as tf
-
-    src = inspect.getsource(tf)
-    tree = ast.parse(src)
-
-    found = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Dict):
-            continue
-        for key, value in zip(node.keys, node.values):
-            if isinstance(key, ast.Constant) and key.value == flag:
-                found.append(value)
-
-    assert len(found) == 1, (
-        "turn_finalizer must roll the UNKNOWN discriminator up from the "
-        "per-call accumulator into the per-turn usage dict, or the blackbox "
-        "ledger records the turn's 0 output as a measurement"
-    )
-    expr = ast.unparse(found[0])
-    # Evaluate the SHIPPED expression against real call lists.
-    def rollup(calls):
-        return eval(  # noqa: S307 — evaluating our own source, not user input
-            textwrap.dedent(expr), {}, {"_turn_calls": calls}
-        )
-
-    measured = {"output_tokens": 118}
-    unknown = {"output_tokens": 0, flag: True}
-    assert rollup([measured, measured]) is False
-    assert rollup([measured, unknown]) is True, "unknown must absorb"
-    assert rollup([unknown, measured]) is True, "order must not matter"
-    assert rollup([]) is False
+    measured = call()
+    unknown = call(output_tokens=0, **{flag: True})
+    assert _rollup_turn_usage([measured, measured])[flag] is False
+    assert _rollup_turn_usage([measured, unknown])[flag] is True
+    assert _rollup_turn_usage([unknown, measured])[flag] is True
+    assert _rollup_turn_usage([])[flag] is False
 
 
 def test_uc7c_the_plugin_ingest_seam_reads_the_flag():
@@ -537,3 +515,89 @@ def test_input_unknown_renders_both_cards_without_losing_measured_output():
     block = "\n".join(render_last_turn_record({"input_tokens_unknown": True, "output_tokens": 50}))
     assert "Tokens in: unknown" in block
     assert "Tokens out: 50" in block
+
+
+def test_inactive_null_aliases_do_not_override_measured_counters():
+    """Unified schemas may serialize the unused API dialect as null."""
+    usage = normalize_usage(
+        {
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "input_tokens": 4000,
+            "output_tokens": 100,
+        },
+        provider="meta",
+        api_mode="chat_completions",
+    )
+    assert (usage.input_tokens, usage.output_tokens) == (4000, 100)
+    assert usage.input_tokens_unknown is False
+    assert usage.output_tokens_unknown is False
+
+
+def test_unset_sdk_optional_is_not_a_wire_null():
+    class Usage:
+        prompt_tokens = 500
+        completion_tokens = None
+        output_tokens = 100
+        model_fields_set = {"prompt_tokens", "output_tokens"}
+
+    usage = normalize_usage(Usage(), provider="custom", api_mode="chat_completions")
+    assert usage.output_tokens == 100
+    assert usage.output_tokens_unknown is False
+
+
+def test_null_aggregate_is_derived_from_measured_components():
+    usage = normalize_usage(
+        {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": None},
+        provider="openai",
+        api_mode="chat_completions",
+    )
+    assert usage.total_tokens == 120
+    assert usage.total_tokens_unknown is False
+    assert estimate_usage_cost("gpt-4o", usage, provider="openai").amount_usd is not None
+
+
+def test_missing_response_usage_is_unknown_but_normalizer_no_call_stays_zero():
+    """A real response omission differs from a known no-call normalization path."""
+    from types import SimpleNamespace
+    from agent.conversation_loop import _canonical_usage_from_response
+
+    omitted = _canonical_usage_from_response(
+        SimpleNamespace(usage=None), provider="custom", api_mode="chat_completions"
+    )
+    no_call = normalize_usage(None)
+    assert omitted.usage_unknown is True
+    assert omitted.total_tokens_unknown is True
+    assert no_call.usage_unknown is False
+    assert no_call.total_tokens == 0
+
+
+def test_unknown_usage_never_replaces_the_context_anchor():
+    from agent.conversation_loop import _capture_measured_usage_anchor
+
+    messages = [{"role": "user", "content": "hello"}]
+    unknown = CanonicalUsage(
+        input_tokens=1000, output_tokens=0, output_tokens_unknown=True
+    )
+    measured = CanonicalUsage(input_tokens=1000, output_tokens=40)
+    assert _capture_measured_usage_anchor(unknown, messages) is None
+    assert _capture_measured_usage_anchor(measured, messages)["completion_tokens"] == 40
+
+
+def test_unpriceable_moa_advisor_makes_known_subtotal_partial():
+    from agent.conversation_loop import _moa_session_cost_status
+
+    aggregator = estimate_usage_cost(
+        "claude-sonnet-4-5",
+        CanonicalUsage(input_tokens=100, output_tokens=20),
+        provider="anthropic",
+    )
+    advisor = {
+        "model": "claude-sonnet-4-5",
+        "provider": "anthropic",
+        "input_tokens": 100,
+        "output_tokens": 0,
+        "output_tokens_unknown": True,
+    }
+    assert aggregator.amount_usd is not None
+    assert _moa_session_cost_status(aggregator, [advisor]) == "partial"

@@ -242,6 +242,9 @@ def render_thin_last_turn_lines(thin_snap, fallback_label=None) -> list:
 
     input_unknown = prompt_tokens_unknown(thin_snap)
     output_unknown = bool(thin_snap.get("output_tokens_unknown") or thin_snap.get("usage_unknown"))
+    total_unknown = bool(
+        input_unknown or output_unknown or thin_snap.get("total_tokens_unknown")
+    )
     if input_unknown:
         out_lines.append(f"• Tokens in: {_tok(in_billed, unknown=True)}")
     elif in_billed:
@@ -253,7 +256,7 @@ def render_thin_last_turn_lines(thin_snap, fallback_label=None) -> list:
         out_lines.append(f"• Tokens out: {_tok(out_billed, unknown=output_unknown)} billed")
     out_lines.append(
         f"• Total (billed in+out): "
-        f"{_tok(in_billed + out_billed, unknown=input_unknown or output_unknown)}"
+        f"{_tok(in_billed + out_billed, unknown=total_unknown)}"
     )
     return out_lines
 

@@ -147,3 +147,37 @@ def test_thin_fallback_measured_values_keep_comma_formatting():
     assert "9,500" in text                                # out billed (8,000 + 1,500 reasoning)
     assert "Total (billed in+out): 241,500" in text       # not "241.5k"
     assert "unknown" not in text                          # nothing measured reads as unknown
+
+
+def test_thin_fallback_honors_aggregate_only_unknown_discriminator():
+    snap = {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+        "total_tokens_unknown": True,
+    }
+    text = "\n".join(render_thin_last_turn_lines(snap, "test"))
+    assert "Tokens in: 100 billed" in text
+    assert "Tokens out: 20 billed" in text
+    assert "Total (billed in+out): unknown" in text
+
+
+@pytest.mark.parametrize("used", [0, 12_345])
+def test_last_turn_context_window_never_formats_unknown_prompt_as_numeric(used):
+    from plugins.blackbox.last_turn import render_last_turn_record
+
+    text = "\n".join(
+        render_last_turn_record(
+            {
+                "input_tokens": 0,
+                "output_tokens": 40,
+                "input_tokens_unknown": True,
+                "context_used": used,
+                "context_length": 200_000,
+            }
+        )
+    )
+    assert "Context window (last call): unknown/200k" in text
+    assert "% of model max" not in text

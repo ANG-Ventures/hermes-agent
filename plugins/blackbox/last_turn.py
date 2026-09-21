@@ -343,7 +343,15 @@ def render_last_turn_record(rec: Dict[str, Any], compressions: "int | None" = No
         cpct = cache_r / prompt_total * 100
         lines.append(f"• Cached: {_humanize_tok(cache_r)}/{_humanize_tok(prompt_total)} {_cache_health(cpct)} {cpct:.0f}%")
 
-    if length > 0:
+    if input_unknown:
+        # ``context_used`` is the final call's provider prompt count. When that
+        # count is unmeasured, a normalized zero or partial cache component is
+        # not a context-window measurement and must not produce a numeric %.
+        suffix = f"/{_humanize_tok(length)}" if length > 0 else ""
+        lines.append(
+            f"• Context window (last call): {_humanize_tok(0, unknown=True)}{suffix}"
+        )
+    elif length > 0:
         # Clamp at 100%: last_prompt tokens can transiently overshoot the model
         # max during streaming or before compression fires — users must never
         # see >100% "of model max" (mirrors the clamp in agent/display.py,

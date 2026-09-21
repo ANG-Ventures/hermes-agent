@@ -343,13 +343,24 @@ def test_schema_migration_adds_columns_to_preexisting_table(tmp_path, monkeypatc
         )
         """
     )
+    legacy.execute(
+        "INSERT INTO turns (turn_id, input_tokens, output_tokens, cost_usd) "
+        "VALUES ('legacy-unpriced', 100, 0, NULL)"
+    )
     legacy.commit()
     legacy.close()
 
     # Re-open through the store: _ensure_schema must ALTER in the new columns.
     with store._connect() as conn:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(turns)").fetchall()}
+        legacy_unknown = conn.execute(
+            "SELECT usage_unknown FROM turns WHERE turn_id = 'legacy-unpriced'"
+        ).fetchone()[0]
     assert {"last_cache_read", "last_cache_write", "last_uncached"} <= cols
+    assert legacy_unknown == 1, (
+        "pre-discriminator unpriced rows are ambiguous and must not be repriced "
+        "as though every token component had been measured"
+    )
 
     # A new record round-trips through the migrated columns.
     store.insert_turn(make_record("post-migrate", last_cache_read_tokens=7,
@@ -358,6 +369,7 @@ def test_schema_migration_adds_columns_to_preexisting_table(tmp_path, monkeypatc
     assert row["last_cache_read_tokens"] == 7
     assert row["last_cache_write_tokens"] == 8
     assert row["last_uncached_tokens"] == 1
+    assert row["usage_unknown"] == 0, "new post-cutover rows use their real discriminator"
 
     # Idempotent: connecting again must not raise (columns already present).
     with store._connect() as conn:

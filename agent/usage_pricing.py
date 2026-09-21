@@ -1622,15 +1622,40 @@ USAGE_UNKNOWN_FIELDS = (
 )
 
 
+def _declared_null(obj: Any, key: str) -> bool:
+    """True when ``key`` is a WIRE null the provider actually wrote.
+
+    An SDK optional whose value is ``None`` only because nobody set it is not a
+    declaration — pydantic records the keys that arrived on the wire in
+    ``model_fields_set``, so honour that when it exists.
+    """
+    if not _usage_has(obj, key):
+        return False
+    fields = getattr(obj, "model_fields_set", None)
+    if fields is not None and key not in fields:
+        return False
+    return _usage_get(obj, key) is None
+
+
 def _bucket_is_unknown(obj: Any, keys: tuple[str, ...], flags: tuple[str, ...] = ()) -> bool:
+    """Did the provider declare this bucket UNMEASURED?
+
+    An explicit ``*_unavailable`` flag always wins. Otherwise a wire null on one
+    of ``keys`` is a declaration — UNLESS a SIBLING alias in the same bucket
+    carries a measured value. ``keys`` lists the aliases for ONE bucket across
+    API dialects (``prompt_tokens``/``input_tokens``), and a unified provider
+    schema routinely serializes the dialect it is not speaking as ``null``. A
+    measured alias is proof the bucket WAS measured, so the inactive dialect's
+    null must not turn a fully-measured call into an unpriceable UNKNOWN.
+    """
     extra = _usage_get(obj, "model_extra", {}) or {}
     if any(_usage_get(obj, key, False) or _usage_get(extra, key, False) for key in flags):
         return True
-    # SDK optional defaults are not wire declarations. Explicit nulls are.
-    fields = getattr(obj, "model_fields_set", None)
-    return any(
-        _usage_has(obj, key) and (fields is None or key in fields)
-        and _usage_get(obj, key) is None for key in keys
+    if not any(_declared_null(obj, key) for key in keys):
+        return False
+    # A present, non-null counter in the same bucket establishes measurement.
+    return not any(
+        _usage_has(obj, key) and _usage_get(obj, key) is not None for key in keys
     )
 
 
@@ -1657,8 +1682,11 @@ def _output_is_unknown(response_usage: Any) -> bool:
     1. An explicit discriminator flag (``output_tokens_unavailable`` /
        ``unavailable``) set truthy. This is the contract the claude-bpx bridge
        egresses, and it survives the OpenAI client as ``model_extra``.
-    2. A PRESENT output counter whose value is ``None``. A null the provider
-       deliberately wrote is an unknown even without the flag.
+    2. A PRESENT output counter whose value is a WIRE ``None`` — and no sibling
+       output alias carrying a measured value. A null the provider deliberately
+       wrote is an unknown even without the flag, but a null on the dialect the
+       provider is NOT speaking (``completion_tokens: null`` beside a measured
+       ``output_tokens``) is just an unused field.
 
     An ABSENT key is NOT an unknown — providers that never speak this dialect
     (every pre-existing one) must keep normalizing to integers, and a usage
@@ -1666,21 +1694,7 @@ def _output_is_unknown(response_usage: Any) -> bool:
     """
     if response_usage is None:
         return False
-    for flag in _OUTPUT_UNKNOWN_FLAGS:
-        if _usage_get(response_usage, flag, None):
-            return True
-    # The OpenAI python client parks unrecognised wire keys in ``model_extra``
-    # rather than on the model itself, so the bridge's discriminator arrives
-    # there on a typed response. Read it too, or the flag is invisible.
-    extra = _usage_get(response_usage, "model_extra", None)
-    if isinstance(extra, dict):
-        for flag in _OUTPUT_UNKNOWN_FLAGS:
-            if extra.get(flag):
-                return True
-    for key in _OUTPUT_COUNT_KEYS:
-        if _usage_has(response_usage, key) and _usage_get(response_usage, key, 0) is None:
-            return True
-    return False
+    return _bucket_is_unknown(response_usage, _OUTPUT_COUNT_KEYS, _OUTPUT_UNKNOWN_FLAGS)
 
 
 def format_token_count(
@@ -2438,10 +2452,29 @@ def normalize_usage(
     )
     if mode != "anthropic_messages" and provider_name != "anthropic":
         input_unknown = input_unknown or cache_read_unknown or cache_write_unknown
-    # Aggregate-only declarations must refuse pricing, but must not poison a
-    # measured input on an output-only miss (or vice versa).
-    usage_unknown = _bucket_is_unknown(response_usage, ("total_tokens",),
-                                       ("total_tokens_unavailable", "unavailable"))
+    # An aggregate count is derivable when BOTH component buckets carry usable
+    # numbers. A wire ``total_tokens: null`` beside measured prompt+completion
+    # is therefore not an unknown total; it is merely an omitted redundant
+    # field. An explicit unavailable flag still wins.
+    aggregate_unavailable = any(
+        bool(_usage_get(response_usage, key, False))
+        or bool(_usage_get(_usage_get(response_usage, "model_extra", {}) or {}, key, False))
+        for key in ("total_tokens_unavailable", "unavailable")
+    )
+    aggregate_null = _bucket_is_unknown(response_usage, ("total_tokens",))
+    input_measured = any(
+        _usage_has(response_usage, key) and _usage_get(response_usage, key) is not None
+        for key in ("prompt_tokens", "input_tokens")
+    )
+    output_measured = any(
+        _usage_has(response_usage, key) and _usage_get(response_usage, key) is not None
+        for key in _OUTPUT_COUNT_KEYS
+    )
+    usage_unknown = aggregate_unavailable or (
+        aggregate_null and not (input_measured and output_measured)
+    )
+    # Bucket-level discriminators already preserve the unknown state; keep the
+    # aggregate discriminator for the aggregate-only case.
     usage_unknown = usage_unknown and not (
         input_unknown or output_unknown or cache_read_unknown or cache_write_unknown
     )

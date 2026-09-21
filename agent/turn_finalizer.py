@@ -32,6 +32,37 @@ from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
 
 
+def _rollup_turn_usage(turn_calls: list[dict]) -> dict:
+    """Aggregate physical-call usage into the turn record.
+
+    UNKNOWN flags are absorbing: if any call lacks a measured term, the sum is
+    not a measurement. Kept as a callable seam so tests execute the shipped
+    behavior rather than extracting an expression from this module's AST.
+    """
+    return {
+        "api_calls": len(turn_calls),
+        "input_tokens": sum(c["input_tokens"] for c in turn_calls),
+        "output_tokens": sum(c["output_tokens"] for c in turn_calls),
+        "output_tokens_unknown": any(
+            bool(c.get("output_tokens_unknown")) for c in turn_calls
+        ),
+        "input_tokens_unknown": any(
+            bool(c.get("input_tokens_unknown")) for c in turn_calls
+        ),
+        "cache_read_tokens_unknown": any(
+            bool(c.get("cache_read_tokens_unknown")) for c in turn_calls
+        ),
+        "cache_write_tokens_unknown": any(
+            bool(c.get("cache_write_tokens_unknown")) for c in turn_calls
+        ),
+        "usage_unknown": any(bool(c.get("usage_unknown")) for c in turn_calls),
+        "cache_read_tokens": sum(c["cache_read_tokens"] for c in turn_calls),
+        "cache_write_tokens": sum(c["cache_write_tokens"] for c in turn_calls),
+        "reasoning_tokens": sum(c["reasoning_tokens"] for c in turn_calls),
+        "total_tokens": sum(c["total_tokens"] for c in turn_calls),
+    }
+
+
 def _assistant_row_missing_visible_text(msg: dict) -> bool:
     """True when an assistant row has no visible text (blank final or tool-only)."""
     if not isinstance(msg, dict) or msg.get("role") != "assistant":
@@ -894,25 +925,7 @@ def finalize_turn(
                     for c in _turn_calls
                 ]
                 _turn_usage = {
-                    "api_calls": len(_turn_calls),
-                    "input_tokens": sum(c["input_tokens"] for c in _turn_calls),
-                    "output_tokens": sum(c["output_tokens"] for c in _turn_calls),
-                    # UNKNOWN != 0 — absorbing across the turn's calls. If ANY
-                    # call's output was unmeasured the summed output above is
-                    # missing a term, so it is not a measurement and must not be
-                    # priced or rendered as one (see
-                    # CanonicalUsage.output_tokens_unknown).
-                    "output_tokens_unknown": any(
-                        bool(c.get("output_tokens_unknown")) for c in _turn_calls
-                    ),
-                    "input_tokens_unknown": any(bool(c.get("input_tokens_unknown")) for c in _turn_calls),
-                    "cache_read_tokens_unknown": any(bool(c.get("cache_read_tokens_unknown")) for c in _turn_calls),
-                    "cache_write_tokens_unknown": any(bool(c.get("cache_write_tokens_unknown")) for c in _turn_calls),
-                    "usage_unknown": any(bool(c.get("usage_unknown")) for c in _turn_calls),
-                    "cache_read_tokens": sum(c["cache_read_tokens"] for c in _turn_calls),
-                    "cache_write_tokens": sum(c["cache_write_tokens"] for c in _turn_calls),
-                    "reasoning_tokens": sum(c["reasoning_tokens"] for c in _turn_calls),
-                    "total_tokens": sum(c["total_tokens"] for c in _turn_calls),
+                    **_rollup_turn_usage(_turn_calls),
                     "latency_s": sum(c.get("latency_s", 0.0) for c in _turn_calls),
                     # Per-call breakdown so the plugin can price each call
                     # against tiered pricing and reconcile cost_status worst-of.

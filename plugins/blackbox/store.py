@@ -259,9 +259,21 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             except sqlite3.OperationalError as e:
                 if "duplicate column" not in str(e).lower():
                     raise
-    # UNKNOWN != 0 discriminator column. INT 0/1, defaulted 0 so every
-    # pre-existing row reads back as "measured" — correct, since no provider
-    # could declare an unknown before this column existed. Same guarded pattern.
+    # UNKNOWN != 0 discriminator columns. New rows default measured, but rows
+    # that PRE-DATE this schema are ambiguous: old Hermes collapsed an omitted
+    # provider usage payload into integer zeroes and had no discriminator with
+    # which to distinguish that from a measured zero. Conservatively latch
+    # ``usage_unknown`` on legacy unpriced rows so a later reprice pass cannot
+    # manufacture a complete-looking historical cost from potentially partial
+    # counts. Already-priced history is left untouched.
+    unknown_columns = {
+        "output_tokens_unknown",
+        "input_tokens_unknown",
+        "cache_read_tokens_unknown",
+        "cache_write_tokens_unknown",
+        "usage_unknown",
+    }
+    migrating_legacy_unknown_schema = not unknown_columns <= _existing
     if "output_tokens_unknown" not in _existing:
         try:
             conn.execute(
@@ -278,6 +290,13 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             except sqlite3.OperationalError as e:
                 if "duplicate column" not in str(e).lower():
                     raise
+    if migrating_legacy_unknown_schema:
+        conn.execute(
+            "UPDATE turns SET usage_unknown = 1 "
+            "WHERE cost_usd IS NULL "
+            "AND cost_uncached_usd IS NULL AND cost_cache_read_usd IS NULL "
+            "AND cost_cache_write_usd IS NULL AND cost_output_usd IS NULL"
+        )
     _ensure_turn_indexes(conn)
     conn.commit()
 
@@ -640,18 +659,15 @@ def reprice_unpriced(pricing_fn, *, apply: bool = False, limit: int | None = Non
         sel = (
             "SELECT turn_id, model, provider, "
             "COALESCE(input_tokens,0) AS i, COALESCE(output_tokens,0) AS o, "
-            "COALESCE(cache_read,0) AS cr, COALESCE(cache_write,0) AS cw "
+            "COALESCE(cache_read,0) AS cr, COALESCE(cache_write,0) AS cw, "
+            "COALESCE(output_tokens_unknown,0) AS ou, "
+            "COALESCE(input_tokens_unknown,0) AS iu, "
+            "COALESCE(cache_read_tokens_unknown,0) AS cru, "
+            "COALESCE(cache_write_tokens_unknown,0) AS cwu, "
+            "COALESCE(usage_unknown,0) AS uu "
             "FROM turns WHERE cost_usd IS NULL "
             "AND cost_uncached_usd IS NULL AND cost_cache_read_usd IS NULL "
-            "AND cost_cache_write_usd IS NULL AND cost_output_usd IS NULL "
-            # UNKNOWN != 0: a row whose output the provider never measured has
-            # no output term to price. Repricing it from its stored 0 would
-            # manufacture a measured-looking figure short by the whole output.
-            "AND COALESCE(output_tokens_unknown,0) = 0"
-            " AND COALESCE(input_tokens_unknown,0) = 0"
-            " AND COALESCE(cache_read_tokens_unknown,0) = 0"
-            " AND COALESCE(cache_write_tokens_unknown,0) = 0"
-            " AND COALESCE(usage_unknown,0) = 0"
+            "AND cost_cache_write_usd IS NULL AND cost_output_usd IS NULL"
         )
         if limit:
             sel += f" LIMIT {int(limit)}"
@@ -661,13 +677,25 @@ def reprice_unpriced(pricing_fn, *, apply: bool = False, limit: int | None = Non
         # (turn_id, cost, status, perclass, is_zero)
         candidates: list[tuple[str, float, str, dict, bool]] = []
         for r in rows:
+            route = resolve_billing_route(r["model"], provider=r["provider"])
+            usage_unknown = any(bool(r[key]) for key in ("ou", "iu", "cru", "cwu", "uu"))
+            if usage_unknown:
+                # Missing counts cannot be repriced from their integer-zero
+                # placeholders. The one exception is a route whose marginal
+                # cost is $0 independently of token counts. Either way, keep
+                # the row inside ``scanned`` so unresolved rows contribute to
+                # ``still_unknown`` instead of disappearing from the report.
+                if route.billing_mode == "subscription_included":
+                    candidates.append(
+                        (r["turn_id"], 0.0, "included", dict(_ZERO_PERCLASS), False)
+                    )
+                continue
             total = r["i"] + r["o"] + r["cr"] + r["cw"]
             if total == 0:
-                # Zero-token → costless → priced_zero, route-independent (M3 parity).
+                # Zero-token → costless → priced_zero, regardless of route.
                 candidates.append((r["turn_id"], 0.0, "priced_zero", dict(_ZERO_PERCLASS), True))
                 continue
             # Real-token: route-purity gate (INV-9 / RC-A).
-            route = resolve_billing_route(r["model"], provider=r["provider"])
             entry = get_pricing_entry(r["model"], provider=r["provider"])
             if route.billing_mode not in _PURE_BILLING_MODES:
                 # A notional relay (openai-codex → official_models_api) consults the
