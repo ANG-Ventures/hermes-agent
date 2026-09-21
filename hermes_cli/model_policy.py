@@ -13,9 +13,47 @@ from typing import Optional
 FIREPOWER_MODEL_SUBSTRINGS = ("gpt-6-astra", "claude-fable")
 
 
+def canonical_model_pair(
+    model: Optional[str], provider: Optional[str] = None
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve a short alias to its real model id before any policy decision.
+
+    A configured alias (``astra``) resolves to a concrete model id
+    (``gpt-6-astra-900k``). Classifying the *raw* input would let the alias
+    spelling walk straight past a substring guard, so every policy, audit, and
+    announcement decision must run on the resolved pair.
+
+    Best-effort: an unresolvable name is returned unchanged, which is also the
+    behaviour for a plain model id that needs no resolution.
+    """
+    if not model:
+        return model, provider
+    raw = str(model).strip()
+    if not raw:
+        return model, provider
+    # A "provider/model" route resolves on its model half.
+    prefix, sep, tail = raw.rpartition("/")
+    lookup = tail if sep else raw
+    try:
+        from hermes_cli.model_switch import resolve_alias
+
+        resolved = resolve_alias(lookup, provider or "")
+    except ImportError:  # pragma: no cover - upstream module must exist
+        raise
+    except Exception:
+        # An ambiguous or uncatalogued alias is not a policy decision; fall
+        # back to the literal input rather than failing the caller's write.
+        return model, provider
+    if not resolved:
+        return model, provider
+    resolved_provider, resolved_model, _alias = resolved
+    return resolved_model, (provider or resolved_provider)
+
+
 def is_firepower_model(model: Optional[str]) -> bool:
-    """Return whether *model* names a flagship/firepower-only family."""
-    normalized = str(model or "").strip().lower()
+    """Return whether *model* resolves to a flagship/firepower-only family."""
+    canonical_model, _ = canonical_model_pair(model)
+    normalized = str(canonical_model or "").strip().lower()
     return bool(normalized) and any(
         banned in normalized for banned in FIREPOWER_MODEL_SUBSTRINGS
     )
@@ -23,7 +61,7 @@ def is_firepower_model(model: Optional[str]) -> bool:
 
 def route_kind(route: Optional[str]) -> str:
     """Classify a route for dispatcher announcements."""
-    return "firepower-override" if is_firepower_model(route) else "standard"
+    return "firepower" if is_firepower_model(route) else "standard"
 
 
 def firepower_guard_error(
@@ -47,5 +85,10 @@ def format_firepower_audit(
     reason: str,
 ) -> str:
     """Stable human-readable audit comment/log payload."""
-    route = f"{provider}/{model}" if provider else model
+    canonical_model, canonical_provider = canonical_model_pair(model, provider)
+    route = (
+        f"{canonical_provider}/{canonical_model}"
+        if canonical_provider
+        else canonical_model
+    )
     return f"firepower override: route={route}; reason={reason.strip()}"

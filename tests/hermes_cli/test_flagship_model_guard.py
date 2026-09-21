@@ -44,7 +44,52 @@ def test_guard_does_not_restrict_sub_flagship():
     assert firepower_guard_error("gpt-5.6-sol-900k", None) is None
     assert firepower_guard_error("claude-opus-5", None) is None
     assert route_kind("openai-codex/gpt-5.6-sol-900k") == "standard"
-    assert route_kind("openai-codex/gpt-6-astra-900k") == "firepower-override"
+    assert route_kind("openai-codex/gpt-6-astra-900k") == "firepower"
+
+
+def _stub_alias(monkeypatch, mapping):
+    """Resolve only *mapping*; tests must not depend on ambient model config.
+
+    ``tests/conftest.py`` sandboxes ``HERMES_HOME`` away from the real root, so
+    asserting against live aliases would make these tests environment-dependent.
+    """
+    import hermes_cli.model_switch as model_switch
+
+    def fake_resolve_alias(raw_input, current_provider):
+        hit = mapping.get(str(raw_input).strip().lower())
+        return (hit[0], hit[1], raw_input) if hit else None
+
+    monkeypatch.setattr(model_switch, "resolve_alias", fake_resolve_alias)
+
+
+def test_route_kind_resolves_aliases_before_classifying(monkeypatch):
+    """An alias must not walk past the guard on spelling alone."""
+    _stub_alias(monkeypatch, {
+        "astra": ("openai-codex", "gpt-6-astra-900k"),
+        "fable": ("claude-apr", "claude-fable-5-1"),
+        "sol": ("openai-codex", "gpt-5.6-sol-900k"),
+    })
+    assert route_kind("openai-codex/astra") == "firepower"
+    assert route_kind("astra") == "firepower"
+    assert route_kind("fable") == "firepower"
+    assert route_kind("sol") == "standard"
+
+
+def test_guard_refuses_alias_spelling_without_a_reason(monkeypatch):
+    _stub_alias(monkeypatch, {
+        "astra": ("openai-codex", "gpt-6-astra-900k"),
+        "sol": ("openai-codex", "gpt-5.6-sol-900k"),
+    })
+    assert "--firepower" in (firepower_guard_error("astra", None) or "")
+    assert firepower_guard_error("astra", "hard adjudication") is None
+    assert firepower_guard_error("sol", None) is None
+
+
+def test_unresolvable_model_falls_back_to_the_literal_input(monkeypatch):
+    """An uncatalogued name must still be classified on its literal spelling."""
+    _stub_alias(monkeypatch, {})
+    assert route_kind("openai-codex/gpt-6-astra-900k") == "firepower"
+    assert route_kind("openai-codex/gpt-5.6-sol-900k") == "standard"
 
 
 def test_create_refuses_flagship_without_firepower_reason(kanban_home):
