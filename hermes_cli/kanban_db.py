@@ -4744,6 +4744,9 @@ def set_model_override(
     task_id: str,
     model: Optional[str],
     provider: Optional[str] = None,
+    *,
+    audit_comment_author: Optional[str] = None,
+    audit_comment_body: Optional[str] = None,
 ) -> bool:
     """Set (or clear) the per-task model/provider override.
 
@@ -4757,10 +4760,16 @@ def set_model_override(
     Allowed on any non-archived task, including ``running`` ones — the
     override only takes effect on the NEXT dispatch, so setting it on a
     running task that's about to be reclaimed/retried is the primary
-    rate-limit-recovery flow. Returns True on success.
+    rate-limit-recovery flow. ``audit_comment_author`` and
+    ``audit_comment_body`` must be supplied together; the comment is committed
+    atomically with the override. Returns True on success.
     """
     model = (model or "").strip() or None
     provider = (provider or "").strip() or None
+    if bool(audit_comment_author) != bool(audit_comment_body):
+        raise ValueError(
+            "audit_comment_author and audit_comment_body must be supplied together"
+        )
     if provider and not model:
         raise ValueError("provider_override requires a model_override")
     if not model:
@@ -4782,6 +4791,13 @@ def set_model_override(
             conn, task_id, "model_override_set",
             {"model": model, "provider": provider},
         )
+        if audit_comment_body:
+            add_comment(
+                conn,
+                task_id,
+                audit_comment_author or "",
+                audit_comment_body,
+            )
     # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
     notify_task_updated(conn, task_id, ("model_override", "provider_override"))
     return True
@@ -10634,6 +10650,8 @@ class DispatchResult:
     dead/gone worker). See the reconciliation pass for details."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
+    spawn_routes: dict[str, str] = field(default_factory=dict)
+    """Effective ``provider/model`` route for each task spawned this tick."""
     skipped_unassigned: list[str] = field(default_factory=list)
     """Ready task ids skipped because they have no assignee at all.
     Operator-actionable — usually a misfiled task waiting for routing."""
@@ -13540,6 +13558,7 @@ def _dispatch_once_locked(
             # counter is cleared only on successful completion (see
             # complete_task).
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
+            result.spawn_routes[claimed.id] = effective_worker_route(claimed)
             spawned += 1
             # Track the new in-flight count for this profile so later
             # iterations in this same tick respect the per-profile cap
@@ -13678,6 +13697,7 @@ def _dispatch_once_locked(
                 conn, claimed, str(workspace), pid, board=board,
             )
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
+            result.spawn_routes[claimed.id] = effective_worker_route(claimed)
             spawned += 1
             if _per_profile_cap is not None and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
@@ -14093,6 +14113,42 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _retagged_workspace_roots.add(workspaces_root_path)
     except Exception as exc:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
+
+
+def effective_worker_route(task: Task) -> str:
+    """Return the provider/model route a dispatcher spawn will use.
+
+    Card overrides win. Otherwise read the assignee profile's canonical model
+    block directly, matching the profile activated by ``_default_spawn``.
+    The helper is fail-soft because route announcement must never prevent a
+    worker from spawning.
+    """
+
+    model = task.model_override
+    provider = task.provider_override
+    if model:
+        try:
+            from hermes_cli.kanban_provider_health import model_override
+
+            model, provider = model_override(task)
+        except Exception:
+            pass
+    elif task.assignee:
+        try:
+            from pathlib import Path as _Path
+            from hermes_cli.profiles import _read_config_model, resolve_profile_env
+
+            model, provider = _read_config_model(
+                _Path(resolve_profile_env(task.assignee))
+            )
+        except Exception:
+            model = provider = None
+    model_label = str(model or "unknown").strip() or "unknown"
+    provider_label = str(provider or "unknown").strip() or "unknown"
+    qualified_prefix = f"{provider_label}/"
+    if provider_label != "unknown" and model_label.startswith(qualified_prefix):
+        model_label = model_label[len(qualified_prefix):]
+    return f"{provider_label}/{model_label}"
 
 
 def _default_spawn(

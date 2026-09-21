@@ -4164,6 +4164,9 @@ def delegate_task(
     inherit_context: Optional[bool] = None,
     skills: Optional[List[str]] = None,
     output_schema: Optional[Dict[str, Any]] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    firepower_reason: Optional[str] = None,
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
@@ -4206,6 +4209,26 @@ def delegate_task(
     if normalized_action and normalized_action != "spawn":
         return tool_error(
             f"Unknown action '{action}'. Use spawn (default), list, steer, or stop."
+        )
+
+    model = str(model or "").strip() or None
+    provider = str(provider or "").strip() or None
+    if provider and not model:
+        return tool_error("delegate_task provider requires a model override.")
+    from hermes_cli.model_policy import (
+        firepower_guard_error,
+        format_firepower_audit,
+        is_firepower_model,
+    )
+    guard_error = firepower_guard_error(
+        model, firepower_reason, reason_field="firepower_reason"
+    )
+    if guard_error:
+        return tool_error(guard_error)
+    if model and is_firepower_model(model):
+        logger.info(
+            "delegate_task %s",
+            format_firepower_audit(model, provider, firepower_reason or ""),
         )
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
@@ -4264,6 +4287,16 @@ def delegate_task(
                 _execution.get("max_iterations") or DEFAULT_MAX_ITERATIONS
             ),
         })
+    if model:
+        cfg = dict(cfg)
+        cfg["model"] = model
+        if provider:
+            cfg["provider"] = provider
+            # A per-call provider must resolve its own endpoint/credentials;
+            # inherited direct-endpoint values belong to the configured lane.
+            cfg["base_url"] = ""
+            cfg["api_key"] = ""
+            cfg["api_mode"] = ""
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
@@ -5710,6 +5743,28 @@ DELEGATE_TASK_SCHEMA = {
                     "can still browse/load ANY skill via skills_list/skill_view."
                 ),
             },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional per-call model override. Omit to inherit the "
+                    "configured delegation route. Flagship models require "
+                    "firepower_reason."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Provider for the per-call model override. Requires model; "
+                    "omit when the model alias/config already resolves it."
+                ),
+            },
+            "firepower_reason": {
+                "type": "string",
+                "description": (
+                    "Required non-empty justification when model selects a "
+                    "flagship/firepower-only family; written to the audit log."
+                ),
+            },
         },
         "required": [],
     },
@@ -5781,6 +5836,9 @@ registry.register(
         inherit_context=args.get("inherit_context"),
         skills=args.get("skills"),
         output_schema=args.get("output_schema"),
+        model=args.get("model"),
+        provider=args.get("provider"),
+        firepower_reason=args.get("firepower_reason"),
         action=args.get("action"),
         subagent_id=args.get("subagent_id"),
         message=args.get("message"),

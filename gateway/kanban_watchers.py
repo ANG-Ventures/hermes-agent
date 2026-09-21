@@ -302,6 +302,20 @@ _FAULT_FIELDS = (
 )
 
 
+def _format_spawn_routes(routes) -> str:
+    """Format one explicit provider/model announcement per spawned task."""
+
+    from hermes_cli.model_policy import route_kind
+
+    entries = dict(routes or {})
+    if not entries:
+        return "routes=-"
+    return "routes=" + "; ".join(
+        f"{task_id} route={route} kind={route_kind(route)}"
+        for task_id, route in entries.items()
+    )
+
+
 def _format_respawn_guarded_summary(guarded) -> str:
     """Format guarded task ids by reason for the per-tick gateway log."""
     entries = list(guarded or [])
@@ -2279,7 +2293,7 @@ class GatewayKanbanWatchersMixin:
                             # including guarded tasks that would otherwise be silent.
                             logger.info(
                                 "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
-                                "crashed=%d timed_out=%d promoted=%d auto_blocked=%d %s",
+                                "crashed=%d timed_out=%d promoted=%d auto_blocked=%d %s %s",
                                 slug,
                                 len(spawned or []),
                                 res.reclaimed,
@@ -2287,6 +2301,9 @@ class GatewayKanbanWatchersMixin:
                                 len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
                                 res.promoted,
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
+                                _format_spawn_routes(
+                                    getattr(res, "spawn_routes", None)
+                                ),
                                 _format_respawn_guarded_summary(guarded),
                             )
                         # Stranded subtrees: children held in ``todo`` behind a

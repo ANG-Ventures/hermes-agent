@@ -474,6 +474,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "--provider <name> to the worker). Requires "
                                "--model.")
     p_create.add_argument(
+        "--firepower",
+        default=None,
+        metavar="REASON",
+        help="Required justification when --model selects a flagship/firepower-only model; appended to the card as an audit comment.",
+    )
+    p_create.add_argument(
         "--reasoning",
         "--effort",
         default=None,
@@ -597,6 +603,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--provider", default=None,
         help="Provider the model belongs to (worker is spawned with "
              "--provider <name>). Cleared together with the model.",
+    )
+    p_set_model.add_argument(
+        "--firepower",
+        default=None,
+        metavar="REASON",
+        help="Required justification when selecting a flagship/firepower-only model; appended to the card as an audit comment.",
     )
     _effort_group = p_set_model.add_mutually_exclusive_group()
     _effort_group.add_argument(
@@ -1907,33 +1919,57 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    model_override = getattr(args, "model_override", None)
+    provider_override = getattr(args, "provider_override", None)
+    firepower_reason = getattr(args, "firepower", None)
+    from hermes_cli.model_policy import (
+        firepower_guard_error,
+        format_firepower_audit,
+        is_firepower_model,
+    )
+    guard_error = firepower_guard_error(model_override, firepower_reason)
+    if guard_error:
+        print(f"kanban: {guard_error}", file=sys.stderr)
+        return 2
     with kb.connect_closing() as conn:
-        task_id = kb.create_task(
-            conn,
-            title=args.title,
-            body=args.body,
-            assignee=args.assignee,
-            created_by=args.created_by or _profile_author(),
-            workspace_kind=ws_kind,
-            workspace_path=ws_path,
-            branch_name=branch_name,
-            project_id=getattr(args, "project", None),
-            tenant=args.tenant,
-            priority=args.priority,
-            parents=tuple(args.parent or ()),
-            parents_kind=getattr(args, "parent_kind", None),
-            triage=bool(getattr(args, "triage", False)),
-            idempotency_key=getattr(args, "idempotency_key", None),
-            max_runtime_seconds=max_runtime,
-            skills=getattr(args, "skills", None) or None,
-            max_retries=max_retries,
-            model_override=getattr(args, "model_override", None),
-            provider_override=getattr(args, "provider_override", None),
-            reasoning_effort=getattr(args, "reasoning_effort", None),
-            goal_mode=bool(getattr(args, "goal_mode", False)),
-            goal_max_turns=getattr(args, "goal_max_turns", None),
-            initial_status=getattr(args, "initial_status", "running"),
-        )
+        # The task and its mandatory firepower audit comment are one durable
+        # write: a comment failure must not leave an unaudited flagship card.
+        with kb.write_txn(conn):
+            task_id = kb.create_task(
+                conn,
+                title=args.title,
+                body=args.body,
+                assignee=args.assignee,
+                created_by=args.created_by or _profile_author(),
+                workspace_kind=ws_kind,
+                workspace_path=ws_path,
+                branch_name=branch_name,
+                project_id=getattr(args, "project", None),
+                tenant=args.tenant,
+                priority=args.priority,
+                parents=tuple(args.parent or ()),
+                parents_kind=getattr(args, "parent_kind", None),
+                triage=bool(getattr(args, "triage", False)),
+                idempotency_key=getattr(args, "idempotency_key", None),
+                max_runtime_seconds=max_runtime,
+                skills=getattr(args, "skills", None) or None,
+                max_retries=max_retries,
+                model_override=model_override,
+                provider_override=provider_override,
+                reasoning_effort=getattr(args, "reasoning_effort", None),
+                goal_mode=bool(getattr(args, "goal_mode", False)),
+                goal_max_turns=getattr(args, "goal_max_turns", None),
+                initial_status=getattr(args, "initial_status", "running"),
+            )
+            if is_firepower_model(model_override):
+                kb.add_comment(
+                    conn,
+                    task_id,
+                    args.created_by or _profile_author(),
+                    format_firepower_audit(
+                        model_override, provider_override, firepower_reason
+                    ),
+                )
         task = kb.get_task(conn, task_id)
         auto_subscribed = _maybe_cli_auto_subscribe(conn, task_id)
     if getattr(args, "json", False):
@@ -2292,6 +2328,12 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     provider = getattr(args, "provider", None)
     effort = getattr(args, "reasoning_effort", None)
     clear_effort = bool(getattr(args, "clear_effort", False))
+    firepower_reason = getattr(args, "firepower", None)
+    from hermes_cli.model_policy import (
+        firepower_guard_error,
+        format_firepower_audit,
+        is_firepower_model,
+    )
     # The two knobs are independent: with --effort/--clear-effort and no
     # positional model, the model override is left untouched (absent means
     # "unchanged" here, not "clear"). Without either effort flag the
@@ -2300,6 +2342,10 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     touch_model = args.model is not None or (effort is None and not clear_effort)
     if provider and not touch_model:
         print("kanban: --provider requires a model", file=sys.stderr)
+        return 2
+    guard_error = firepower_guard_error(model, firepower_reason)
+    if guard_error:
+        print(f"kanban: {guard_error}", file=sys.stderr)
         return 2
     if effort is not None:
         # Validate BEFORE any write so `set-model <id> <model> --effort typo`
@@ -2318,8 +2364,18 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     try:
         with kb.connect_closing() as conn:
             if touch_model:
+                firepower = is_firepower_model(model)
                 ok = kb.set_model_override(
-                    conn, args.task_id, model, provider=provider,
+                    conn,
+                    args.task_id,
+                    model,
+                    provider=provider,
+                    audit_comment_author=_profile_author() if firepower else None,
+                    audit_comment_body=(
+                        format_firepower_audit(model, provider, firepower_reason)
+                        if firepower
+                        else None
+                    ),
                 )
                 if not ok:
                     print(f"no such task: {args.task_id}", file=sys.stderr)
@@ -3321,6 +3377,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                     spawned_unwatched.append(_tid)
             except Exception:
                 pass
+    from hermes_cli.model_policy import route_kind
+
     if getattr(args, "json", False):
         print(json.dumps({
             "reclaimed": res.reclaimed,
@@ -3330,7 +3388,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "auto_blocked": res.auto_blocked,
             "promoted": res.promoted,
             "spawned": [
-                {"task_id": tid, "assignee": who, "workspace": ws}
+                {
+                    "task_id": tid,
+                    "assignee": who,
+                    "workspace": ws,
+                    "route": res.spawn_routes.get(tid),
+                    "route_kind": route_kind(res.spawn_routes.get(tid)),
+                }
                 for (tid, who, ws) in res.spawned
             ],
             "spawned_unwatched": spawned_unwatched,
@@ -3391,7 +3455,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
-        print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
+        route = res.spawn_routes.get(tid, "unknown/unknown")
+        print(
+            f"  - {tid}  ->  {who}  @ {ws or '-'}  route={route} "
+            f"kind={route_kind(route)}{tag}"
+        )
     collision_warnings = getattr(res, "collision_warnings", [])
     if collision_warnings:
         print("WARNING — pre-dispatch file collision(s); dispatch continued:")
