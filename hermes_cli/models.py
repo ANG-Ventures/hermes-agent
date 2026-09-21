@@ -7,6 +7,7 @@ Add, remove, or reorder entries here — both `hermes setup` and
 
 from __future__ import annotations
 
+import collections.abc
 import copy
 import json
 import http.client
@@ -1449,7 +1450,7 @@ def _extend_canonical_from_plugins() -> None:
         known_names = globals().get("_KNOWN_PROVIDER_NAMES")
         if known_names is not None:
             for entry in added:
-                set.add(known_names, entry.slug)
+                known_names.add(entry.slug)
 
 
 def _ensure_canonical_extended() -> None:
@@ -1550,38 +1551,51 @@ class _LazyProviderLabels(dict):
         return dict(dict.items(self))
 
 
-class _LazyKnownProviderNames(set):
-    """``set`` whose first read triggers the plugin auto-extend."""
+class _LazyKnownProviderNames(collections.abc.Set):
+    """Set of known provider names whose first read triggers the auto-extend.
 
-    __slots__ = ()
+    Deliberately a ``collections.abc.Set`` and NOT a ``set`` subclass.
+    CPython's ``set_update_internal`` takes a ``PyAnySet_Check`` fast path
+    that copies a real set's hash table directly, so ``set(x)`` /
+    ``frozenset(x)`` / ``s.update(x)`` / ``s | x`` NEVER call a subclass's
+    ``__iter__`` — the lazy trigger would be silently skipped and the copy
+    would be missing every plugin-registered provider. (Measured: with a
+    ``set`` subclass, ``PROBE in set(_KNOWN_PROVIDER_NAMES)`` was False while
+    ``PROBE in _KNOWN_PROVIDER_NAMES`` was True.) ``dict`` does not have this
+    problem — ``dict_merge`` checks that ``tp_iter`` is unchanged — which is
+    why ``_LazyProviderLabels`` can stay a ``dict`` subclass.
+    """
+
+    __slots__ = ("_names",)
+
+    def __init__(self, names) -> None:
+        self._names: set[str] = set(names)
+
+    def _get(self) -> set[str]:
+        _ensure_canonical_extended()
+        return self._names
+
+    # -- the three abstract methods; every other Set operation derives from
+    #    these, so each one goes through the lazy trigger.
+    def __contains__(self, item) -> bool:
+        return item in self._get()
 
     def __iter__(self):
-        _ensure_canonical_extended()
-        return set.__iter__(self)
+        return iter(self._get())
 
-    def __len__(self):
-        _ensure_canonical_extended()
-        return set.__len__(self)
+    def __len__(self) -> int:
+        return len(self._get())
 
-    def __contains__(self, item):
-        _ensure_canonical_extended()
-        return set.__contains__(self, item)
+    def __repr__(self) -> str:
+        return repr(self._get())
 
-    def __repr__(self):
-        _ensure_canonical_extended()
-        return set.__repr__(self)
+    def add(self, item: str) -> None:
+        """Used by the auto-extend to fold in a newly discovered provider."""
+        self._names.add(item)
 
-    def __or__(self, other):
-        _ensure_canonical_extended()
-        return set(set.__iter__(self)) | other
+    def copy(self) -> set[str]:
+        return set(self._get())
 
-    def union(self, *others):
-        _ensure_canonical_extended()
-        return set(set.__iter__(self)).union(*others)
-
-    def copy(self):
-        _ensure_canonical_extended()
-        return set(set.__iter__(self))
 
 
 CANONICAL_PROVIDERS = _LazyCanonicalProviders(CANONICAL_PROVIDERS)
@@ -3035,7 +3049,7 @@ def _fetch_novita_pricing(
 # All provider IDs and aliases that are valid for the provider:model syntax.
 # Lazy for the same reason as CANONICAL_PROVIDERS: it derives from
 # _PROVIDER_LABELS, which the plugin auto-extend tops up on first read.
-_KNOWN_PROVIDER_NAMES: set[str] = _LazyKnownProviderNames(
+_KNOWN_PROVIDER_NAMES: collections.abc.Set[str] = _LazyKnownProviderNames(
     set(dict.keys(_PROVIDER_LABELS))
     | set(_PROVIDER_ALIASES.keys())
     | {"openrouter", "custom"}

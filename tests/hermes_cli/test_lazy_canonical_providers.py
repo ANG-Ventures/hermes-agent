@@ -124,6 +124,47 @@ DRIVER = textwrap.dedent(
     """
 )
 
+# One read per process: whichever conversion is named on argv is the FIRST and
+# ONLY read of the lazy container, so a positive result cannot be credited to
+# some earlier unrelated read having already triggered the auto-extend.
+COPY_DRIVER = textwrap.dedent(
+    f"""
+    import json, sys
+
+    PROBE = {PLUGIN_NAME!r}
+    which = sys.argv[1]
+
+    import hermes_cli.models as models
+
+    C = models.CANONICAL_PROVIDERS
+    L = models._PROVIDER_LABELS
+    K = models._KNOWN_PROVIDER_NAMES
+
+    if which == "set":
+        found = PROBE in set(K)
+    elif which == "frozenset":
+        found = PROBE in frozenset(K)
+    elif which == "set-or":
+        found = PROBE in (set() | K)
+    elif which == "set-update":
+        acc = set()
+        acc.update(K)
+        found = PROBE in acc
+    elif which == "dict":
+        found = PROBE in dict(L)
+    elif which == "dict-splat":
+        found = PROBE in {{**L}}
+    elif which == "list":
+        found = PROBE in [p.slug for p in list(C)]
+    elif which == "list-splat":
+        found = PROBE in [p.slug for p in [*C]]
+    else:
+        raise SystemExit("unknown conversion: " + which)
+
+    print("PROBE_JSON " + json.dumps({{"which": which, "found": found}}))
+    """
+)
+
 
 def _run_order(tmp_path: Path, order: str, *, with_plugin: bool = True) -> dict:
     """Run the driver in a fresh interpreter under a temp HERMES_HOME.
@@ -333,4 +374,59 @@ def test_models_import_does_not_trigger_provider_discovery(tmp_path):
     assert not marker.exists(), (
         "importing hermes_cli.models ran provider plugin discovery — the "
         "auto-extend is not lazy"
+    )
+
+
+@pytest.mark.parametrize(
+    "which",
+    ["set", "frozenset", "set-or", "set-update", "dict", "dict-splat", "list", "list-splat"],
+)
+def test_copy_constructing_a_lazy_container_still_triggers_the_extend(tmp_path, which):
+    """Copying a lazy container must not bypass the auto-extend trigger.
+
+    The lazy surfaces are consumed by copy-construction in real call sites
+    (``dict(_PROVIDER_LABELS)`` in ``hermes_cli/main.py``, ``set(...)`` /
+    ``| ...`` unions elsewhere). CPython's ``set_update_internal`` takes a
+    ``PyAnySet_Check`` fast path that reads a real set's hash table directly
+    and NEVER calls ``__iter__`` — so a ``set`` SUBCLASS with a lazy
+    ``__iter__`` silently yields a copy missing every plugin provider, while
+    a direct ``in`` test on the same object answers correctly. That divergence
+    is exactly the bug class this file exists for, re-entering through the
+    copy path, and it is invisible to every other test here.
+
+    One conversion per subprocess, so the read under test is the first read.
+    """
+    home = tmp_path / f"hermes_home_{which}"
+    plugin_dir = home / "plugins" / "model-providers" / PLUGIN_NAME
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "__init__.py").write_text(PLUGIN_INIT)
+    (plugin_dir / "plugin.yaml").write_text(
+        f"name: {PLUGIN_NAME}\nkind: model-provider\nversion: 0.0.1\n"
+    )
+
+    driver = tmp_path / f"copy_{which}.py"
+    driver.write_text(COPY_DRIVER)
+
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(home)
+    env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    env[PROBE_KEY_ENV] = "sk-lazy-canonical-probe"
+
+    proc = subprocess.run(
+        [sys.executable, str(driver), which],
+        cwd=str(REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("PROBE_JSON ")]
+    assert lines, (
+        f"driver produced no verdict (rc={proc.returncode})\n"
+        f"--- stdout ---\n{proc.stdout[-4000:]}\n--- stderr ---\n{proc.stderr[-4000:]}"
+    )
+    result = json.loads(lines[-1][len("PROBE_JSON "):])
+    assert result["found"] is True, (
+        f"{which}(...) of a lazy container did not trigger the plugin "
+        f"auto-extend; the copy is missing {PLUGIN_NAME}"
     )
