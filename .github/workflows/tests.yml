@@ -243,7 +243,8 @@ jobs:
           key: test-durations-${{ github.run_id }}
 
   e2e:
-    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    # Self-hosted e2e requires X64; hosted fallback keeps its standard label.
+    runs-on: ${{ contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && fromJSON(format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","'))) || fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     steps:
       - name: Checkout code
@@ -295,7 +296,7 @@ jobs:
       - name: Run e2e tests
         run: |
           source .venv/bin/activate
-          python -m pytest tests/e2e/ -v --tb=short
+          python -m pytest tests/e2e/ -v --tb=short -o faulthandler_timeout=120
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

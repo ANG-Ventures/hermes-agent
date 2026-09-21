@@ -33,3 +33,20 @@ def test_every_workflow_parses():
     for path in paths:
         workflow = yaml.safe_load(path.read_text())
         assert isinstance(workflow.get("jobs"), dict), path.name
+
+
+def test_e2e_self_hosted_architecture_and_hosted_fallback_binding():
+    # Pin the declaration: injecting labels into a test would bypass this binding.
+    job = yaml.safe_load((WORKFLOWS / "tests.yml").read_text())["jobs"]["e2e"]
+    assert job["runs-on"] == (
+        "${{ contains(fromJSON(vars.CI_RUNNER_LABELS || '[\"ubuntu-latest\"]'), 'self-hosted') "
+        "&& fromJSON(format('[\"{0}\",\"X64\"]', join(fromJSON(vars.CI_RUNNER_LABELS), '\",\"'))) "
+        "|| fromJSON(vars.CI_RUNNER_LABELS || '[\"ubuntu-latest\"]') }}"
+    )
+
+
+def test_e2e_invocation_emits_stacks_before_job_cancellation():
+    job = yaml.safe_load((WORKFLOWS / "tests.yml").read_text())["jobs"]["e2e"]
+    step = next(step for step in job["steps"] if step.get("name") == "Run e2e tests")
+    assert "python -m pytest tests/e2e/ -v --tb=short -o faulthandler_timeout=120" in step["run"]
+    assert job["timeout-minutes"] * 60 > 120
