@@ -18,7 +18,6 @@ test pins that asymmetry so a future change can't quietly collapse the two.
 
 import json
 import threading
-import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -51,13 +50,8 @@ def _drain_all():
             break
 
 
-def _drain_one(timeout=10.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if not process_registry.completion_queue.empty():
-            return process_registry.completion_queue.get_nowait()
-        time.sleep(0.02)
-    return None
+def _drain_one():
+    return process_registry.completion_queue.get()
 
 
 def _interruptible_parent():
@@ -167,7 +161,7 @@ def test_background_child_survives_mid_turn_interrupt_and_delivers(monkeypatch):
         started.set()
         # Hold the child inside its run across the whole interrupt, then
         # record what the parent's turn state looked like from in here.
-        assert release.wait(timeout=10), "child never released"
+        release.wait()
         saw_interrupt_flag["parent_interrupt_requested"] = getattr(
             parent_agent, "_interrupt_requested", None
         )
@@ -187,7 +181,7 @@ def test_background_child_survives_mid_turn_interrupt_and_delivers(monkeypatch):
     ))
     assert out["status"] == "dispatched", out
     assert out["mode"] == "background"
-    assert started.wait(timeout=30), "background child never started"
+    started.wait()
 
     # The batch is detached: the parent's interrupt-propagation list must not
     # hold it, or the cascade below would abort it.
@@ -220,13 +214,14 @@ def test_background_batch_runs_with_parent_interrupt_already_set(monkeypatch):
     import concurrent.futures as _cf
 
     import run_agent
+    from tools.daemon_pool import DaemonThreadPoolExecutor
 
     started = threading.Event()
     release = threading.Event()
 
     def slow_child(task_index, goal, child=None, parent_agent=None, **kw):
         started.set()
-        assert release.wait(timeout=10), "child never released"
+        release.wait()
         return {
             "task_index": task_index, "status": "completed",
             "summary": f"done-{task_index}", "api_calls": 1,
@@ -239,23 +234,34 @@ def test_background_batch_runs_with_parent_interrupt_already_set(monkeypatch):
     # children right after interrupt() usually lets them finish inside that
     # wait, so the loop never re-checks the flag and the mutation
     # honor_parent_interrupt=True escapes (~50% of runs, measured).
-    # delegate_tool re-imports `wait` from the module on every iteration, so
-    # counting entries here observes the loop directly: two entries after the
-    # interrupt means at least one flag check provably ran with the flag set
-    # and futures still pending.
+    #
+    # delegate_tool re-imports `wait` on every iteration. Two entries after the
+    # interrupt therefore prove at least one flag check ran while futures were
+    # still pending. Observing the executor exit gives the mutant an immediate,
+    # semantic failure signal instead of making this test rely on a deadline.
     _real_cf_wait = _cf.wait
+    _real_pool_exit = DaemonThreadPoolExecutor.__exit__
     interrupt_set = threading.Event()
-    loop_rechecked = threading.Event()
-    waits_after_interrupt = []
+    handshake = threading.Condition()
+    state = {"waits_after_interrupt": 0, "loop_rechecked": False, "loop_exited": False}
 
     def _counting_wait(fs, timeout=None, return_when=_cf.ALL_COMPLETED):
         if interrupt_set.is_set():
-            waits_after_interrupt.append(time.time())
-            if len(waits_after_interrupt) >= 2:
-                loop_rechecked.set()
+            with handshake:
+                state["waits_after_interrupt"] += 1
+                if state["waits_after_interrupt"] >= 2:
+                    state["loop_rechecked"] = True
+                    handshake.notify_all()
         return _real_cf_wait(fs, timeout=timeout, return_when=return_when)
 
+    def _observing_pool_exit(pool, *args):
+        with handshake:
+            state["loop_exited"] = True
+            handshake.notify_all()
+        return _real_pool_exit(pool, *args)
+
     monkeypatch.setattr(_cf, "wait", _counting_wait)
+    monkeypatch.setattr(DaemonThreadPoolExecutor, "__exit__", _observing_pool_exit)
 
     dt = _patch_delegate(monkeypatch, slow_child)
     _bind_tui_session()
@@ -270,20 +276,19 @@ def test_background_batch_runs_with_parent_interrupt_already_set(monkeypatch):
         background=True, parent_agent=parent,
     ))
     assert out["status"] == "dispatched", out
-    assert started.wait(timeout=30)
+    started.wait()
 
     run_agent.AIAgent.interrupt(parent, "another message")
     interrupt_set.set()
-    # Hold the children until the poll loop has demonstrably gone round again
-    # with the flag set. A mutant that honors the flag BREAKS out instead of
-    # re-waiting, so the assertion fails. Always release in ``finally`` so the
-    # executor's bounded cleanup can complete on either path.
-    try:
-        assert loop_rechecked.wait(timeout=30), (
-            "batch poll loop did not re-check after the parent interrupt"
-        )
-    finally:
-        release.set()
+    # Do not release the children until either the pristine loop has re-checked
+    # the flag or the mutant has exited the poll loop. Both are direct lifecycle
+    # signals; the enclosing pytest timeout remains the sole hang guard.
+    with handshake:
+        while not state["loop_rechecked"] and not state["loop_exited"]:
+            handshake.wait()
+        loop_rechecked = state["loop_rechecked"]
+    release.set()
+    assert loop_rechecked, "batch poll loop exited after the parent interrupt"
 
     evt = _drain_one()
     assert evt is not None
@@ -310,7 +315,7 @@ def test_explicit_stop_still_cancels_the_background_batch(monkeypatch):
     def stoppable_child(task_index, goal, child=None, parent_agent=None, **kw):
         started.set()
         # The batch interrupt hard-interrupts the child; the double records it.
-        assert cancelled.wait(timeout=10), "batch interrupt never fired"
+        cancelled.wait()
         return {
             "task_index": task_index, "status": "interrupted",
             "summary": None, "api_calls": 1, "duration_seconds": 0.1,
@@ -331,7 +336,7 @@ def test_explicit_stop_still_cancels_the_background_batch(monkeypatch):
         background=True, parent_agent=parent,
     ))
     assert out["status"] == "dispatched", out
-    assert started.wait(timeout=30)
+    started.wait()
 
     n = async_delegation.interrupt_for_session(
         session_key="stop-sess",
