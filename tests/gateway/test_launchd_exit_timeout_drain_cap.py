@@ -790,7 +790,9 @@ def test_cron_branch_consumes_the_one_deadline_instead_of_the_sigkill_wall():
         "geometry drifted -- this row must still reproduce the overrun the "
         "fix removes"
     )
-    assert ELAPSED + re_derived == pytest.approx(50.0) == pytest.approx(armed)
+    assert ELAPSED + re_derived == pytest.approx(50.0)
+    # ...which is exactly the armed hard-exit instant: the whole reserve gone.
+    assert armed == pytest.approx(50.0)
 
     # The fix: consume the deadline. Ends at 35, reserve intact.
     consumed = resolve_cron_drain_budget(
@@ -1433,6 +1435,212 @@ def test_stop_arms_the_watchdog_with_the_measured_teardown_reserve(
     assert armed[0] < 300.0
     # The diagnostic snapshot reports the same deadline it armed with.
     assert snapshots and snapshots[0]["watchdog_delay_s"] == armed[0]
+
+
+def test_stop_rearms_the_watchdog_with_REMAINING_time_not_the_absolute_deadline(
+    monkeypatch, tmp_path
+):
+    """The re-arm must convert the absolute deadline to a relative delay.
+
+    ``_armed_shutdown_deadline_s`` and everything that consumes it (the
+    drain fit, the cron leash) are ABSOLUTE, measured from the start of
+    ``stop()``. ``arm_shutdown_watchdog`` is RELATIVE: it computes
+    ``deadline = time.monotonic() + delay``. At the top-of-stop() arming
+    (t=0) the two coincide, which is exactly why handing the absolute value
+    straight into a LATER re-arm is an easy and invisible mistake — it
+    charges the pre-drain elapsed a second time and schedules ``os._exit``
+    at ``elapsed + deadline``, past launchd's SIGKILL whenever the elapsed
+    exceeds the 10s hard-exit reserve. The backstop then never runs: no
+    forensic dump, no ordered lock/PID release, just an uncatchable SIGKILL
+    mid-teardown — the failure class this whole change closes.
+
+    This drives the REAL ``stop()`` with ``PYTEST_CURRENT_TEST`` cleared
+    (the re-arm returns early otherwise, which is why the pure-resolver
+    tests could not see this) and a genuine pre-drain cost, then reads both
+    values handed to ``arm_shutdown_watchdog``. The second must be the
+    REMAINING time, not the published absolute deadline.
+    """
+    import asyncio
+
+    from gateway import run as run_mod
+    from tests.gateway.restart_test_helpers import make_restart_runner
+
+    monkeypatch.setattr(run_mod, "_hermes_home", tmp_path)
+
+    # Clamp 300: system-domain launchd is not gui-clamped, and the inner
+    # leash binds here, so a re-arm has room to extend.
+    runner, adapter = make_restart_runner()
+    runner._restart_drain_timeout = 180.0
+    runner._cron_drain_timeout = 0.01
+    runner._launchd_exit_timeout_s = 300.0
+    runner._stop_requested_by_signal = True
+    runner._last_shutdown_teardown_s = 70.0
+    adapter.disconnect = AsyncMock()
+
+    # A real pre-drain cost, comfortably past the 0.5s re-arm hysteresis.
+    PRE_DRAIN_S = 0.9
+
+    async def _slow_notify():
+        await asyncio.sleep(PRE_DRAIN_S)
+
+    monkeypatch.setattr(
+        runner, "_notify_active_sessions_of_shutdown", _slow_notify
+    )
+
+    armed: list[float] = []
+
+    def _capture(delay, *, done_event=None, snapshot_fn=None, exit_code=None):
+        armed.append(delay)
+        return done_event if done_event is not None else threading.Event()
+
+    monkeypatch.setattr(run_mod, "arm_shutdown_watchdog", _capture)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    with patch("gateway.status.remove_pid_file"), \
+         patch("gateway.status.write_runtime_status"):
+        asyncio.run(runner.stop())
+
+    assert len(armed) == 2, (
+        f"expected the top-of-stop() arming plus one re-arm, got {armed} — "
+        f"if this is 1 the re-arm never fired and finding 4 is unwired"
+    )
+    first, second = armed
+
+    # Hand-computed, independent of the resolvers: capped drain 180, leash
+    # max(grace 60, reserve 70) = 70, so the t=0 arming is 250 and the
+    # re-arm's absolute deadline is min(elapsed + 250, 290).
+    assert first == pytest.approx(250.0), (
+        f"top-of-stop() arming {first} is not the inner-leash value 250 — "
+        f"the geometry no longer exercises the re-arm"
+    )
+    published = runner._armed_shutdown_deadline_s
+    assert published == pytest.approx(250.0 + PRE_DRAIN_S, abs=0.5), (
+        f"published absolute deadline {published} should be the t=0 value "
+        f"extended by the measured pre-drain cost"
+    )
+
+    # THE ASSERTION: what was ARMED is the remaining time, which is ~250 —
+    # the absolute deadline MINUS the elapsed already spent. Passing the
+    # absolute value through would arm ~250.9 and fire at ~251.8 from the
+    # stop start, i.e. the elapsed counted twice.
+    assert second == pytest.approx(250.0, abs=0.35), (
+        f"re-arm handed arm_shutdown_watchdog {second}; the absolute "
+        f"deadline is {published} and ~{PRE_DRAIN_S}s is already spent, so "
+        f"the RELATIVE delay must be ~250. Arming the absolute value "
+        f"double-counts the elapsed and pushes os._exit past the wall"
+    )
+    assert second < published, (
+        "the armed delay must be strictly less than the absolute deadline "
+        "once any time has been spent"
+    )
+
+    # And the firing instant, measured from the stop start, never reaches
+    # launchd's SIGKILL wall.
+    fires_at = PRE_DRAIN_S + second
+    assert fires_at <= 300.0 - 10.0 + 0.5, (
+        f"os._exit scheduled at stop()+{fires_at}s against a SIGKILL at 300"
+    )
+
+
+def test_stop_threads_the_one_deadline_into_both_the_drain_and_the_cron_leash(
+    monkeypatch, tmp_path
+):
+    """The call-site wiring, not the pure resolvers.
+
+    ``resolve_stop_drain_deadline_s`` being correct proves nothing if
+    ``gateway.run`` does not hand its result to BOTH consumers. Under
+    ``PYTEST_CURRENT_TEST`` the arming site returns early, so
+    ``_armed_shutdown_deadline_s`` stays ``None`` and every existing spy
+    sees ``armed_deadline_s=None`` / ``deadline_s=None`` — the wiring is
+    structurally invisible to them. This clears the marker so the real
+    values flow, then asserts both consumers received the SAME deadline the
+    watchdog was armed from.
+
+    Geometry (clamp 60, production): capped drain 28 (60 - 10 hard exit -
+    22 measured), armed = min(28 + max(60, 22), 50) = 50 (outer min binds),
+    deadline = 50 - 22 = 28. All hand-computed.
+    """
+    import asyncio
+
+    from gateway import run as run_mod
+    from tests.gateway.restart_test_helpers import make_restart_runner
+
+    monkeypatch.setattr(run_mod, "_hermes_home", tmp_path)
+
+    runner, adapter = make_restart_runner()
+    runner._restart_drain_timeout = 50.0
+    runner._cron_drain_timeout = 30.0
+    runner._launchd_exit_timeout_s = 60.0
+    runner._stop_requested_by_signal = True
+    runner._last_shutdown_teardown_s = 22.0
+    adapter.disconnect = AsyncMock()
+
+    # In-flight cron work, so the cron leash is actually exercised.
+    monkeypatch.setattr(
+        run_mod.GatewayRunner, "_active_cron_job_count", lambda _self: 1
+    )
+
+    drain_kwargs: list[dict] = []
+    real_drain_resolver = run_mod.resolve_elapsed_adjusted_drain
+
+    def _drain_spy(*a, **kw):
+        drain_kwargs.append(dict(kw))
+        return real_drain_resolver(*a, **kw)
+
+    cron_kwargs: list[dict] = []
+    real_cron_resolver = run_mod.resolve_cron_drain_budget
+
+    def _cron_spy(*a, **kw):
+        cron_kwargs.append(dict(kw))
+        return real_cron_resolver(*a, **kw)
+
+    monkeypatch.setattr(run_mod, "resolve_elapsed_adjusted_drain", _drain_spy)
+    monkeypatch.setattr(run_mod, "resolve_cron_drain_budget", _cron_spy)
+    monkeypatch.setattr(
+        run_mod,
+        "arm_shutdown_watchdog",
+        lambda delay, **kw: kw.get("done_event") or threading.Event(),
+    )
+
+    async def _fake_drain(_self, timeout, cron_timeout=None):
+        return ({}, False)
+
+    monkeypatch.setattr(
+        run_mod.GatewayRunner, "_drain_active_agents", _fake_drain
+    )
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    with patch("gateway.status.remove_pid_file"), \
+         patch("gateway.status.write_runtime_status"):
+        asyncio.run(runner.stop())
+
+    assert len(drain_kwargs) == 1, f"expected one drain fit, got {drain_kwargs}"
+    assert len(cron_kwargs) == 1, f"expected one cron leash, got {cron_kwargs}"
+
+    armed = drain_kwargs[0]["armed_deadline_s"]
+    assert armed is not None, (
+        "the drain fit received armed_deadline_s=None — it is re-deriving "
+        "the deadline instead of consuming the value the watchdog was "
+        "armed with, which is the #838 defect"
+    )
+    # Hand-computed: the outer min() binds at the production clamp.
+    assert armed == pytest.approx(50.0), (
+        f"armed deadline {armed} is not the hand-computed 50.0 "
+        f"(min(28 + max(60, 22), 60 - 10))"
+    )
+    assert armed == pytest.approx(runner._armed_shutdown_deadline_s)
+
+    deadline = cron_kwargs[0]["deadline_s"]
+    assert deadline is not None, (
+        "the cron leash received deadline_s=None — it is re-deriving from "
+        "the raw SIGKILL wall, which is finding 2 of the #838 review"
+    )
+    # armed 50 minus the measured 22s teardown reserve.
+    assert deadline == pytest.approx(28.0), (
+        f"cron deadline {deadline} is not armed(50) - reserve(22) = 28"
+    )
+    # Both consumers saw ONE deadline, derived from the same armed value.
+    assert deadline == pytest.approx(armed - 22.0)
 
 
 def test_hard_exit_backstop_ignores_blocked_daemon_threads(monkeypatch, tmp_path):

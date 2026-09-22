@@ -19755,15 +19755,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "restart_drain_timeout": self._restart_drain_timeout,
                     "effective_drain_timeout": effective_stop_drain_timeout(self),
                     "launchd_exit_timeout_s": getattr(self, "_launchd_exit_timeout_s", None),
-                    "watchdog_delay_s": resolve_armed_shutdown_watchdog_delay(
-                        effective_stop_drain_timeout(self),
-                        getattr(self, "_launchd_exit_timeout_s", None),
-                        signal_driven=getattr(
-                            self, "_stop_requested_by_signal", False
-                        ),
-                        last_teardown_s=getattr(
-                            self, "_last_shutdown_teardown_s", None
-                        ),
+                    # The deadline CURRENTLY in force, read from what the
+                    # arming site published — not re-derived. A re-arm moves
+                    # it, and a forensic dump that recomputed the t=0 value
+                    # would report the superseded deadline for the very
+                    # hard-exit it is documenting.
+                    "watchdog_delay_s": (
+                        getattr(self, "_armed_shutdown_deadline_s", None)
+                        if getattr(self, "_armed_shutdown_deadline_s", None)
+                        is not None
+                        else resolve_armed_shutdown_watchdog_delay(
+                            effective_stop_drain_timeout(self),
+                            getattr(self, "_launchd_exit_timeout_s", None),
+                            signal_driven=getattr(
+                                self, "_stop_requested_by_signal", False
+                            ),
+                            last_teardown_s=getattr(
+                                self, "_last_shutdown_teardown_s", None
+                            ),
+                        )
                     ),
                     "persistence_complete": False,
                     "phase_elapsed_s": (
@@ -19820,6 +19830,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 past ``exit_timeout - hard_exit_reserve_s`` (which launchd
                 would answer with SIGKILL anyway). When the wall already
                 binds there is nothing to extend and this is a no-op.
+
+                🔴 UNIT MISMATCH, handled here and nowhere else: ``delay_s``
+                and ``_armed_shutdown_deadline_s`` are ABSOLUTE, measured
+                from the start of ``stop()``, but ``arm_shutdown_watchdog``
+                takes a delay RELATIVE to the arming call
+                (``deadline = time.monotonic() + delay``). The top-of-stop()
+                arming happens at t=0, where the two coincide; a re-arm does
+                not. Handing the absolute value straight through charges the
+                pre-drain elapsed a SECOND time and schedules ``os._exit``
+                at ``elapsed + deadline`` — past launchd's SIGKILL whenever
+                the elapsed exceeds ``hard_exit_reserve_s``, which defeats
+                the backstop entirely (clamp 300 / drain 180 / teardown 70 /
+                elapsed 40: fires at 330 against a SIGKILL at 300). So the
+                absolute deadline is PUBLISHED for the drain and cron sites
+                and the REMAINING time is what gets armed.
                 """
                 if os.environ.get("PYTEST_CURRENT_TEST"):
                     return
@@ -19832,13 +19857,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # the same stop() start, so "later" is unambiguous.
                 if _cur is not None and _new <= float(_cur) + 0.5:
                     return
+                # Absolute -> relative. Measured from the same stop() start
+                # the deadline is expressed in; if that start is unknown the
+                # elapsed is 0 and this degrades to the old behaviour rather
+                # than arming something shorter than intended.
+                _started = _stop_started_at_box.get("t")
+                _elapsed_now = (
+                    max(time.monotonic() - _started, 0.0)
+                    if _started is not None
+                    else 0.0
+                )
+                _remaining = max(_new - _elapsed_now, 0.0)
+                if _remaining <= 0.0:
+                    # The deadline has already passed; arming a zero delay is
+                    # a silent no-op in arm_shutdown_watchdog, and replacing
+                    # a live backstop with nothing is strictly worse than
+                    # leaving the current one in force.
+                    return
                 _prev = self._shutdown_watchdog_done
                 _fresh = threading.Event()
                 self._shutdown_watchdog_done = _fresh
                 _watchdog_events.append(_fresh)
                 self._armed_shutdown_deadline_s = _new
                 arm_shutdown_watchdog(
-                    _new,
+                    _remaining,
                     done_event=_fresh,
                     snapshot_fn=_shutdown_watchdog_snapshot,
                     exit_code=1,
@@ -19848,11 +19890,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _prev is not None:
                     _prev.set()
                 logger.info(
-                    "Shutdown watchdog re-armed to +%.1fs (was +%.1fs) — "
+                    "Shutdown watchdog re-armed to stop()+%.1fs (was "
+                    "stop()+%.1fs; %.1fs from now at elapsed %.1fs) — "
                     "absorbing the measured pre-drain elapsed instead of "
                     "charging it to the post-drain teardown reserve",
                     _new,
                     float(_cur) if _cur is not None else -1.0,
+                    _remaining,
+                    _elapsed_now,
                 )
 
             try:
