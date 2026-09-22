@@ -532,34 +532,317 @@ def test_elapsed_adjusted_drain_never_runs_past_the_hard_exit_deadline():
     -- that is the invariant the whole card exists to protect, and it is
     what stops the "just give the drain more time" correction from
     re-opening the SIGKILL-mid-persistence failure.
+
+    The expected deadline is measured against the deadline the watchdog is
+    ACTUALLY ARMED with (``resolve_armed_shutdown_watchdog_delay``, the
+    value ``gateway/run.py`` hands ``arm_shutdown_watchdog``), NOT against
+    ``exit_timeout - hard_exit_reserve_s``. The two agree only when the
+    outer ``min()`` of the arming expression binds -- true at the
+    gui-clamped 60 and false on any clamp where the inner
+    ``drain + max(grace, reserve)`` leash binds. Re-deriving the hard-exit
+    expression here was finding 3 of the #838 review: the assertion
+    restated the implementation's own assumption and so held by
+    construction while the real window was being starved.
     """
     from gateway.restart import (
-        LAUNCHD_STOP_CLEANUP_RESERVE_S,
+        resolve_armed_shutdown_watchdog_delay,
         resolve_elapsed_adjusted_drain,
-        resolve_launchd_shutdown_watchdog_delay,
+        resolve_stop_teardown_reserve_s,
     )
 
     violations = []
     for clamp in (30.0, 45.0, 60.0, 90.0, 120.0, 300.0):
-        hard_exit = resolve_launchd_shutdown_watchdog_delay(
-            clamp, clamp, signal_driven=True
-        )
-        deadline = hard_exit - LAUNCHD_STOP_CLEANUP_RESERVE_S
         for configured in (5.0, 20.0, 30.0, 45.0, 60.0, 120.0):
-            for elapsed in (0.0, 2.0, 5.0, 12.0, 20.0, 35.0, 60.0):
-                drain = resolve_elapsed_adjusted_drain(
-                    resolve_launchd_capped_drain(configured, clamp),
-                    clamp,
-                    signal_driven=True,
-                    elapsed_s=elapsed,
+            for teardown in (None, 22.0, 70.0):
+                drain = resolve_launchd_capped_drain(
+                    configured, clamp, last_teardown_s=teardown
                 )
-                if drain > 0.0 and elapsed + drain > deadline + 1e-9:
-                    violations.append(
-                        f"clamp={clamp} configured={configured} "
-                        f"elapsed={elapsed} drain={drain} ends at "
-                        f"{elapsed + drain} > deadline {deadline}"
+                reserve = resolve_stop_teardown_reserve_s(
+                    clamp, last_teardown_s=teardown
+                )
+                for elapsed in (0.0, 2.0, 5.0, 12.0, 20.0, 35.0, 60.0):
+                    # The watchdog the process is running under, re-armed
+                    # with this elapsed exactly as _stop_impl_body does.
+                    armed = resolve_armed_shutdown_watchdog_delay(
+                        drain,
+                        clamp,
+                        signal_driven=True,
+                        last_teardown_s=teardown,
+                        elapsed_s=elapsed,
                     )
-    assert not violations, "drain runs past the hard exit:\n" + "\n".join(violations)
+                    adjusted = resolve_elapsed_adjusted_drain(
+                        drain,
+                        clamp,
+                        signal_driven=True,
+                        elapsed_s=elapsed,
+                        last_teardown_s=teardown,
+                        armed_deadline_s=armed,
+                    )
+                    if adjusted <= 0.0:
+                        continue
+                    window = armed - (elapsed + adjusted)
+                    if window < reserve - 1e-9:
+                        violations.append(
+                            f"clamp={clamp} configured={configured} "
+                            f"teardown={teardown} elapsed={elapsed} "
+                            f"drain={adjusted} ends at {elapsed + adjusted} "
+                            f"against armed {armed}: {window}s left for a "
+                            f"{reserve}s teardown"
+                        )
+    assert not violations, (
+        "drain runs into the teardown window the watchdog grants:\n"
+        + "\n".join(violations)
+    )
+
+
+def test_drain_deadline_is_the_armed_watchdog_at_the_inner_leash_geometry():
+    """Hard-coded oracle at the geometry where the two deadlines DIFFER.
+
+    Every number below is computed BY HAND from the review's worked
+    example, not from the functions under test -- that independence is the
+    point (finding 3). Geometry: ``ExitTimeOut`` 300 (system-domain
+    launchd is not gui-clamped to 60), configured drain 180, measured
+    teardown 70, watchdog grace 60.
+
+    By hand::
+
+        hard_exit = 300 - 10 (hard_exit_reserve)          = 290
+        reserve   = max(15, 70)                           =  70
+        capped    = min(180, 290 - 70)                    = 180
+        armed     = min(180 + max(60, 70), 290)           = 250   <- INNER binds
+        deadline  = 250 - 70                              = 180
+
+    The hard-exit derivation this replaces gives ``290 - 70`` = **220**,
+    40s later than the process actually has. Fitting the drain to 220
+    charged every second of pre-drain elapsed to the 70s teardown reserve,
+    which is the exact failure #838 was supposed to close.
+    """
+    from gateway.restart import (
+        resolve_armed_shutdown_watchdog_delay,
+        resolve_stop_drain_deadline_s,
+    )
+
+    CLAMP, CONFIGURED, TEARDOWN = 300.0, 180.0, 70.0
+
+    capped = resolve_launchd_capped_drain(
+        CONFIGURED, CLAMP, last_teardown_s=TEARDOWN
+    )
+    assert capped == pytest.approx(180.0)
+
+    armed = resolve_armed_shutdown_watchdog_delay(
+        capped, CLAMP, signal_driven=True, last_teardown_s=TEARDOWN
+    )
+    # The INNER leash binds here: 250, not the hard exit 290.
+    assert armed == pytest.approx(250.0), (
+        "the inner drain+max(grace,reserve) leash must bind at clamp 300 -- "
+        "if this is 290 the geometry no longer exercises the defect"
+    )
+    assert armed < 290.0
+
+    deadline = resolve_stop_drain_deadline_s(
+        capped,
+        CLAMP,
+        signal_driven=True,
+        last_teardown_s=TEARDOWN,
+        armed_deadline_s=armed,
+    )
+    # Hard-coded: 250 - 70. NOT 290 - 70 = 220.
+    assert deadline == pytest.approx(180.0), (
+        f"deadline {deadline} must be the armed watchdog (250) minus the "
+        f"measured reserve (70) = 180, not the hard-exit wall's 220"
+    )
+    assert deadline != pytest.approx(220.0)
+
+
+def test_rearmed_watchdog_preserves_the_teardown_reserve_across_elapsed():
+    """The re-arm (finding 4) buys the elapsed back from the WALL, not the reserve.
+
+    Hard-coded from the same clamp-300 geometry. The top-of-``stop()``
+    arming cannot know the pre-drain cost, so it arms at 250; the drain
+    then starts at ``elapsed`` and ends at ``elapsed + 180``, leaving
+    ``70 - elapsed`` for a teardown measured at 70. Re-arming once the
+    elapsed is measured moves ``os._exit`` out by exactly that elapsed
+    (bounded by the 290 hard-exit wall), so the window stays 70.
+
+    By hand, drain 180 / reserve 70 / hard exit 290::
+
+        elapsed  0 -> armed min(  0+250, 290) = 250, drain 180, ends 180, window 70
+        elapsed 20 -> armed min( 20+250, 290) = 270, drain 180, ends 200, window 70
+        elapsed 40 -> armed min( 40+250, 290) = 290, drain 180, ends 220, window 70
+        elapsed 60 -> armed                     290, drain 160, ends 220, window 70
+
+    At elapsed 40 the wall binds and the re-arm saturates; past that the
+    DRAIN gives way instead (160 at elapsed 60), which is the correct
+    trade -- the reserve is never the thing that pays.
+    """
+    from gateway.restart import (
+        resolve_armed_shutdown_watchdog_delay,
+        resolve_elapsed_adjusted_drain,
+    )
+
+    CLAMP, TEARDOWN, RESERVE = 300.0, 70.0, 70.0
+    capped = resolve_launchd_capped_drain(180.0, CLAMP, last_teardown_s=TEARDOWN)
+
+    expected = {
+        0.0: (250.0, 180.0),
+        20.0: (270.0, 180.0),
+        40.0: (290.0, 180.0),
+        60.0: (290.0, 160.0),
+    }
+    for elapsed, (want_armed, want_drain) in expected.items():
+        armed = resolve_armed_shutdown_watchdog_delay(
+            capped,
+            CLAMP,
+            signal_driven=True,
+            last_teardown_s=TEARDOWN,
+            elapsed_s=elapsed,
+        )
+        assert armed == pytest.approx(want_armed), (
+            f"elapsed={elapsed}: re-armed deadline {armed}, expected "
+            f"{want_armed}"
+        )
+        drain = resolve_elapsed_adjusted_drain(
+            capped,
+            CLAMP,
+            signal_driven=True,
+            elapsed_s=elapsed,
+            last_teardown_s=TEARDOWN,
+            armed_deadline_s=armed,
+        )
+        assert drain == pytest.approx(want_drain), (
+            f"elapsed={elapsed}: drain {drain}, expected {want_drain}"
+        )
+        # The invariant, stated against the armed value: the teardown
+        # window never shrinks below the measured reserve.
+        assert armed - (elapsed + drain) == pytest.approx(RESERVE), (
+            f"elapsed={elapsed}: only {armed - (elapsed + drain)}s left for "
+            f"a {RESERVE}s teardown"
+        )
+    # The re-arm only ever EXTENDS: never earlier than the original arming.
+    base = resolve_armed_shutdown_watchdog_delay(
+        capped, CLAMP, signal_driven=True, last_teardown_s=TEARDOWN
+    )
+    for elapsed in (0.0, 5.0, 20.0, 40.0, 90.0, 400.0):
+        assert (
+            resolve_armed_shutdown_watchdog_delay(
+                capped,
+                CLAMP,
+                signal_driven=True,
+                last_teardown_s=TEARDOWN,
+                elapsed_s=elapsed,
+            )
+            >= base
+        )
+
+
+def test_cron_branch_consumes_the_one_deadline_instead_of_the_sigkill_wall():
+    """The cron floor may not raise the budget past the drain deadline (finding 2).
+
+    Hard-coded at the PRODUCTION geometry, all by hand: ``ExitTimeOut`` 60,
+    ``restart_drain_timeout`` 30, ``cron_drain_timeout`` 30, default 15s
+    teardown reserve, 20s of pre-drain elapsed::
+
+        hard_exit = 60 - 10                     = 50
+        armed     = min(30 + max(60, 15), 50)   = 50   <- outer min binds
+        deadline  = 50 - 15                     = 35
+        drain     = min(30, 35 - 20)            = 15   (elapsed-adjusted)
+
+    The OLD cron leash clamped to the raw ``ExitTimeOut`` (60, launchd's
+    SIGKILL wall) and held back only the 10s ``CRON_DRAIN_CLEANUP_RESERVE_S``:
+    ceiling ``60 - 20 - 10`` = 30, so it returned 30 -- ending at +50
+    absolute, exactly when ``os._exit`` fires, with the entire 15s teardown
+    reserve consumed. Consuming the deadline yields 15, ending at +35.
+    """
+    from gateway.restart import (
+        resolve_armed_shutdown_watchdog_delay,
+        resolve_cron_drain_budget,
+        resolve_elapsed_adjusted_drain,
+        resolve_stop_drain_deadline_s,
+    )
+
+    CLAMP, CRON_FLOOR, ELAPSED = 60.0, 30.0, 20.0
+    capped = resolve_launchd_capped_drain(30.0, CLAMP)
+
+    armed = resolve_armed_shutdown_watchdog_delay(
+        capped, CLAMP, signal_driven=True, elapsed_s=ELAPSED
+    )
+    assert armed == pytest.approx(50.0)
+    deadline = resolve_stop_drain_deadline_s(
+        capped, CLAMP, signal_driven=True, armed_deadline_s=armed
+    )
+    assert deadline is not None
+    assert deadline == pytest.approx(35.0)
+
+    adjusted = resolve_elapsed_adjusted_drain(
+        capped,
+        CLAMP,
+        signal_driven=True,
+        elapsed_s=ELAPSED,
+        armed_deadline_s=armed,
+    )
+    assert adjusted == pytest.approx(15.0)
+
+    # The defect: re-deriving from the raw SIGKILL wall raises it back up.
+    re_derived = resolve_cron_drain_budget(
+        adjusted, CRON_FLOOR, watchdog_delay=CLAMP, elapsed=ELAPSED
+    )
+    assert re_derived == pytest.approx(30.0), (
+        "geometry drifted -- this row must still reproduce the overrun the "
+        "fix removes"
+    )
+    assert ELAPSED + re_derived == pytest.approx(50.0) == pytest.approx(armed)
+
+    # The fix: consume the deadline. Ends at 35, reserve intact.
+    consumed = resolve_cron_drain_budget(
+        adjusted,
+        CRON_FLOOR,
+        watchdog_delay=CLAMP,
+        elapsed=ELAPSED,
+        deadline_s=deadline,
+    )
+    assert consumed == pytest.approx(15.0), (
+        f"cron budget {consumed} must not exceed the {deadline - ELAPSED}s "
+        f"the deadline leaves"
+    )
+    assert ELAPSED + consumed == pytest.approx(35.0)
+    assert armed - (ELAPSED + consumed) == pytest.approx(15.0), (
+        "the full 15s teardown reserve must survive the cron wait"
+    )
+
+    # Sweep: the cron budget may never end past the deadline, at any
+    # elapsed or floor.
+    violations = []
+    for elapsed in (0.0, 5.0, 12.0, 20.0, 30.0, 45.0):
+        for floor in (0.0, 10.0, 30.0, 120.0):
+            _armed = resolve_armed_shutdown_watchdog_delay(
+                capped, CLAMP, signal_driven=True, elapsed_s=elapsed
+            )
+            _deadline = resolve_stop_drain_deadline_s(
+                capped, CLAMP, signal_driven=True, armed_deadline_s=_armed
+            )
+            assert _deadline is not None
+            _drain = resolve_elapsed_adjusted_drain(
+                capped,
+                CLAMP,
+                signal_driven=True,
+                elapsed_s=elapsed,
+                armed_deadline_s=_armed,
+            )
+            _cron = resolve_cron_drain_budget(
+                _drain,
+                floor,
+                watchdog_delay=CLAMP,
+                elapsed=elapsed,
+                deadline_s=_deadline,
+            )
+            if _cron > 0.0 and elapsed + _cron > _deadline + 1e-9:
+                violations.append(
+                    f"elapsed={elapsed} floor={floor} cron={_cron} ends at "
+                    f"{elapsed + _cron} > deadline {_deadline}"
+                )
+    assert not violations, "cron wait overruns the deadline:\n" + "\n".join(
+        violations
+    )
 
 
 def test_elapsed_adjustment_only_applies_to_launchd_timed_signal_stops():
@@ -1010,6 +1293,7 @@ def test_stop_spends_pre_drain_elapsed_out_of_the_drain(monkeypatch, tmp_path):
         signal_driven,
         elapsed_s,
         last_teardown_s=None,
+        armed_deadline_s=None,
     ):
         calls.append(
             {
@@ -1018,6 +1302,7 @@ def test_stop_spends_pre_drain_elapsed_out_of_the_drain(monkeypatch, tmp_path):
                 "signal_driven": signal_driven,
                 "elapsed": elapsed_s,
                 "last_teardown_s": last_teardown_s,
+                "armed_deadline_s": armed_deadline_s,
             }
         )
         return SENTINEL
