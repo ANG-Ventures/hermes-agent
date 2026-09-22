@@ -361,6 +361,7 @@ def resolve_armed_shutdown_watchdog_delay(
     cleanup_reserve_s: float = LAUNCHD_STOP_CLEANUP_RESERVE_S,
     grace_s: float | None = None,
     hard_exit_reserve_s: float = LAUNCHD_HARD_EXIT_RESERVE_S,
+    elapsed_s: float = 0.0,
 ) -> float:
     """Wall-clock deadline the shutdown watchdog is actually armed with.
 
@@ -387,6 +388,19 @@ def resolve_armed_shutdown_watchdog_delay(
     the reserve honours the measurement instead of discarding it, and it
     can never push the deadline past the hard exit because the outer
     ``min()`` still binds.
+
+    ``elapsed_s`` is the pre-drain cost ALREADY spent when the deadline is
+    (re-)computed. The inner leash sizes a RELATIVE drain budget that does
+    not begin until the pre-drain phases finish, so at ``elapsed_s = 0``
+    (the arming at the top of ``stop()``, before anything is known) the
+    armed window silently absorbs that cost and the post-drain teardown
+    reserve is what pays for it — finding 4 of the #838 review. Once the
+    elapsed is measured, passing it here shifts the inner leash out by
+    exactly that much so ``drain + leash`` still fits AFTER the pre-drain
+    phases. The outer ``min()`` is unchanged, so this can never reach past
+    ``exit_timeout - hard_exit_reserve_s``: on a clamp where the wall
+    already binds, a non-zero ``elapsed_s`` is simply absorbed and the
+    return value does not move.
     """
     from gateway.shutdown_watchdog import (
         DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S,
@@ -408,7 +422,8 @@ def resolve_armed_shutdown_watchdog_delay(
     )
     leash = max(_seconds(grace), reserve)
     return resolve_launchd_shutdown_watchdog_delay(
-        resolve_shutdown_watchdog_delay(drain_timeout, grace_s=leash),
+        _seconds(elapsed_s)
+        + resolve_shutdown_watchdog_delay(drain_timeout, grace_s=leash),
         launchd_exit_timeout_s,
         signal_driven=signal_driven,
         hard_exit_reserve_s=hard_exit_reserve_s,

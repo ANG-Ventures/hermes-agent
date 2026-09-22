@@ -19736,6 +19736,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # delayed hard-exit in the worker.
             _watchdog_done = threading.Event()
             self._shutdown_watchdog_done = _watchdog_done
+            # Every watchdog event armed on this stop path. A re-arm disarms
+            # the previous thread and appends a fresh event, so the `finally`
+            # below must set ALL of them or a superseded thread keeps running
+            # to its own deadline and hard-exits a shutdown that completed.
+            _watchdog_events: list[threading.Event] = [_watchdog_done]
             _stop_started_at_box: dict[str, float] = {}
 
             def _shutdown_watchdog_snapshot() -> dict:
@@ -19794,15 +19799,77 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exit_code=1,
                 )
 
+            def _rearm_shutdown_watchdog(delay_s: float) -> None:
+                """Re-arm the hard-exit backstop to a LATER absolute deadline.
+
+                The watchdog is armed at the TOP of ``stop()`` from
+                ``effective_drain + max(grace, reserve)``, but that drain is
+                a RELATIVE budget that does not start until the pre-drain
+                phases finish. So the armed window silently absorbs the
+                pre-drain elapsed and the teardown reserve is what pays for
+                it — finding 4 of the #838 review, and the original 02:49
+                incident. Re-arming once the elapsed is KNOWN pushes
+                ``os._exit`` out by exactly that elapsed instead of charging
+                it to the teardown.
+
+                EXTEND-ONLY, and still bounded by the launchd SIGKILL wall
+                via ``resolve_launchd_shutdown_watchdog_delay`` inside
+                ``resolve_armed_shutdown_watchdog_delay`` — a re-arm can
+                never move the deadline earlier (which would hard-exit a
+                healthy shutdown sooner than promised) and can never push it
+                past ``exit_timeout - hard_exit_reserve_s`` (which launchd
+                would answer with SIGKILL anyway). When the wall already
+                binds there is nothing to extend and this is a no-op.
+                """
+                if os.environ.get("PYTEST_CURRENT_TEST"):
+                    return
+                try:
+                    _new = max(float(delay_s), 0.0)
+                except (TypeError, ValueError):
+                    return
+                _cur = getattr(self, "_armed_shutdown_deadline_s", None)
+                # Compare against the deadline already armed, measured from
+                # the same stop() start, so "later" is unambiguous.
+                if _cur is not None and _new <= float(_cur) + 0.5:
+                    return
+                _prev = self._shutdown_watchdog_done
+                _fresh = threading.Event()
+                self._shutdown_watchdog_done = _fresh
+                _watchdog_events.append(_fresh)
+                self._armed_shutdown_deadline_s = _new
+                arm_shutdown_watchdog(
+                    _new,
+                    done_event=_fresh,
+                    snapshot_fn=_shutdown_watchdog_snapshot,
+                    exit_code=1,
+                )
+                # Disarm the superseded thread only AFTER the replacement is
+                # armed, so there is no instant with no backstop at all.
+                if _prev is not None:
+                    _prev.set()
+                logger.info(
+                    "Shutdown watchdog re-armed to +%.1fs (was +%.1fs) — "
+                    "absorbing the measured pre-drain elapsed instead of "
+                    "charging it to the post-drain teardown reserve",
+                    _new,
+                    float(_cur) if _cur is not None else -1.0,
+                )
+
             try:
                 await _stop_impl_body(
                     _kill_tool_subprocesses,
                     _stop_started_at_box,
+                    _rearm_shutdown_watchdog,
                 )
             finally:
-                _watchdog_done.set()
+                for _ev in _watchdog_events:
+                    _ev.set()
 
-        async def _stop_impl_body(_kill_tool_subprocesses, _stop_started_at_box) -> None:
+        async def _stop_impl_body(
+            _kill_tool_subprocesses,
+            _stop_started_at_box,
+            _rearm_shutdown_watchdog=None,
+        ) -> None:
             logger.info(
                 "Stopping gateway%s...",
                 " for restart" if self._restart_requested else "",
@@ -19900,6 +19967,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # consuming one deadline is the whole point of #838's close-out;
             # a site that re-derives it drifts from the instant os._exit
             # really fires.
+            #
+            # Re-arm FIRST, with the elapsed now measured: the top-of-stop()
+            # arming could not know the pre-drain cost, so it charged it to
+            # the teardown reserve (finding 4). Extend-only and still capped
+            # by the launchd wall, so this either buys back exactly the
+            # elapsed or is a no-op. It must precede the deadline read below
+            # so the deadline reflects the watchdog now in force.
+            _drain_elapsed_at_fit = _phase_elapsed()
+            if callable(_rearm_shutdown_watchdog):
+                _rearm_shutdown_watchdog(
+                    resolve_armed_shutdown_watchdog_delay(
+                        effective_stop_drain_timeout(self),
+                        getattr(self, "_launchd_exit_timeout_s", None),
+                        signal_driven=getattr(
+                            self, "_stop_requested_by_signal", False
+                        ),
+                        last_teardown_s=getattr(
+                            self, "_last_shutdown_teardown_s", None
+                        ),
+                        elapsed_s=_drain_elapsed_at_fit,
+                    )
+                )
             _stop_deadline_s = resolve_stop_drain_deadline_s(
                 effective_stop_drain_timeout(self),
                 getattr(self, "_launchd_exit_timeout_s", None),
@@ -19911,7 +20000,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 timeout,
                 getattr(self, "_launchd_exit_timeout_s", None),
                 signal_driven=getattr(self, "_stop_requested_by_signal", False),
-                elapsed_s=_phase_elapsed(),
+                elapsed_s=_drain_elapsed_at_fit,
                 # Same measured sample effective_stop_drain_timeout() fed the
                 # cap. Both derive the SAME deadline, so they must see the
                 # same teardown reserve or the drain is fitted against a
@@ -19951,7 +20040,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 timeout,
                 _cron_drain_cfg,
                 watchdog_delay=_cron_leash,
-                elapsed=_phase_elapsed(),
+                elapsed=_drain_elapsed_at_fit,
                 # Consumed, not re-derived. None off the launchd signal path
                 # (or in tests that never arm), where the watchdog_delay
                 # leash above remains the honest answer.
