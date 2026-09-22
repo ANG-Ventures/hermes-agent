@@ -390,11 +390,11 @@ def parse_pr_refs(
     return refs
 
 
-def _remotes_for(workspace_path: str) -> set[str]:
-    """Return the distinct ``owner/repo`` slugs a checkout's remotes point at."""
+def _git(workspace_path: str, *args: str) -> Optional[str]:
+    """Run a read-only git command in ``workspace_path``; None on any failure."""
     try:
         proc = subprocess.run(
-            ["git", "-C", workspace_path, "remote", "-v"],
+            ["git", "-C", workspace_path, *args],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -402,11 +402,54 @@ def _remotes_for(workspace_path: str) -> set[str]:
             check=False,
         )
     except (OSError, subprocess.SubprocessError, TimeoutError):
-        return set()
+        return None
     if proc.returncode != 0:
+        return None
+    return proc.stdout or ""
+
+
+def _is_repo_toplevel(workspace_path: str) -> bool:
+    """True only when ``workspace_path`` IS a checkout root, not inside one.
+
+    ``git -C <dir>`` WALKS UP to the first enclosing repository, so a directory
+    with no repo of its own silently answers for whatever contains it. Every
+    ``scratch``-kind kanban workspace lives under ``~/.hermes``, which is itself
+    a checkout — and its remotes all agree, so the walk-up produced a single
+    UNANIMOUS (and wrong) slug that the disagreeing-remotes fail-safe in
+    :func:`repo_context` cannot see. That is how card ``t_cb701eee`` was
+    unblocked two seconds after a verifier blocked it, on merge evidence from
+    ``ANG-Ventures/hermes-home`` (2026-09-21).
+
+    Toplevel identity, not ``.git`` presence, is the discriminator: a git
+    worktree's ``.git`` is a file, and its toplevel is itself, so a worktree
+    workspace still resolves normally.
+    """
+    out = _git(workspace_path, "rev-parse", "--show-toplevel")
+    if not out:
+        return False
+    toplevel = out.strip()
+    if not toplevel:
+        return False
+    try:
+        return Path(toplevel).resolve() == Path(workspace_path).resolve()
+    except OSError:
+        return False
+
+
+def _remotes_for(workspace_path: str) -> set[str]:
+    """Return the distinct ``owner/repo`` slugs a checkout's remotes point at.
+
+    Empty when ``workspace_path`` is not the checkout TOPLEVEL — see
+    :func:`_is_repo_toplevel`. ``repo_context`` then falls through to
+    body-based resolution, which yields the card's own repo or None.
+    """
+    if not _is_repo_toplevel(workspace_path):
+        return set()
+    stdout = _git(workspace_path, "remote", "-v")
+    if stdout is None:
         return set()
     slugs: set[str] = set()
-    for line in (proc.stdout or "").splitlines():
+    for line in stdout.splitlines():
         parts = line.split()
         if len(parts) < 2:
             continue
@@ -472,15 +515,70 @@ def _body_repo_choice(body: str) -> Optional[str]:
     return candidates[0] if len(candidates) == 1 else None
 
 
+def _body_corroborates(slug: str, body: Optional[str]) -> bool:
+    """True when the CARD's own text supports resolving bare ``#N`` in ``slug``.
+
+    A workspace's remotes describe a *directory*, not a card. Two live shapes
+    make that directory answer for a repository the card has nothing to do
+    with, and only one of them involves a walk-up:
+
+    * ``scratch``/nested — ``git -C`` inherits an ENCLOSING repo's remotes
+      (closed by :func:`_is_repo_toplevel`);
+    * ``dir``-at-toplevel — the workspace IS a checkout root, just not of the
+      card's repo. Four live cards point at ``~/.hermes`` itself, whose remotes
+      both read ``ANG-Ventures/hermes-home``. Geometry is perfect; the answer is
+      still wrong.
+
+    So the trust test is card IDENTITY, not geometry: the body must either name
+    the workspace's repo, or name no repo at all. A body that names repositories
+    and omits this one is evidence AGAINST it — which is exactly the 2026-09-21
+    ``t_cb701eee`` body, naming ``Kyzcreig/ace-media-homelab`` in prose with its
+    PR as a bare ``#160``.
+
+    Silence is allowed on purpose: a worktree card whose body names no repo
+    (``t_8e1f2cf3``) is the legitimate case bare-``#N`` resolution exists for.
+    The rule MATCHES mentions, it never RANKS them, so slash-bearing prose that
+    ``_body_repo_mentions`` cannot tell from a slug (``try/except``, ``30/31``)
+    can only DECLINE a resolution, never redirect one at a wrong repo. Measured
+    over all 48 gate-candidate blocked cards on all 65 board DBs, that cost is
+    zero: the rule dropped exactly the 4 ``dir``-at-``~/.hermes`` cards and all
+    11 genuine resolutions survived.
+    """
+    if not isinstance(body, str):
+        return True
+    corroborated = _corroborated_repos(body)
+    if corroborated:
+        # PR-attached refs are evidence, not a guess: they outrank bare mentions.
+        return any(named.lower() == slug.lower() for named in corroborated)
+    mentions = list(_body_repo_mentions(body))
+    if not mentions:
+        return True
+    return any(named.lower() == slug.lower() for named in mentions)
+
+
 def repo_context(
     *, workspace_path: Optional[str], body: Optional[str]
 ) -> Optional[str]:
     """Best-effort repository for resolving a bare ``#N``.
 
-    Order: the card's workspace remote (only when EVERY remote agrees — the
-    hermes-agent checkout has ``origin`` = upstream and ``fork`` = ours, so a
-    bare ``#787`` there is genuinely ambiguous), then the first ``owner/repo``
-    mentioned in the card body. None means "do not resolve bare numbers".
+    Order: the card's workspace remote (only when the workspace IS the
+    checkout toplevel AND every remote agrees — the hermes-agent checkout has
+    ``origin`` = upstream and ``fork`` = ours, so a bare ``#787`` there is
+    genuinely ambiguous), then the first ``owner/repo`` mentioned in the card
+    body. None means "do not resolve bare numbers".
+
+    Two fail-safes, both of which have to hold before a workspace answer is
+    trusted:
+
+    * **no walk-up** — :func:`_is_repo_toplevel` refuses an answer inherited
+      from an ENCLOSING repository (every ``scratch`` workspace sits under
+      ``~/.hermes``, itself a checkout);
+    * **body corroboration** — :func:`_body_corroborates` requires the card's
+      own text to name the workspace's repo, or to name none at all. Geometry
+      alone is not enough: a ``dir``-kind workspace pointing AT ``~/.hermes``
+      is a perfectly valid toplevel and still answers for the wrong repo.
+      Ambiguity detection cannot catch a confidently-wrong answer, and an
+      unblock reverts a human/verifier decision.
     """
     if workspace_path:
         try:
@@ -490,7 +588,13 @@ def repo_context(
         if exists:
             slugs = _remotes_for(workspace_path)
             if len(slugs) == 1:
-                return next(iter(slugs))
+                chosen = next(iter(slugs))
+                if not _body_corroborates(chosen, body):
+                    # The body names repositories and the workspace's is not
+                    # among them. Two incompatible answers, no way to rank
+                    # them: take no action.
+                    return None
+                return chosen
             if len(slugs) > 1 and isinstance(body, str):
                 # Ambiguous remotes: let an explicit body mention pick one.
                 lowered = {s.lower(): s for s in slugs}
