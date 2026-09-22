@@ -239,7 +239,7 @@ def _snapshot(repo, base, prefix):
         ).stdout
 
 
-_QUALIFIER = re.compile(r"(?:\.|[A-Za-z0-9_.][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_.-]+)*)=")
+_QUALIFIER = re.compile(r"[^:?#=]+=")
 
 
 def _split_qualifier(claim):
@@ -247,15 +247,43 @@ def _split_qualifier(claim):
 
     One `--survivor-pr` names ONE remote, so a multi-repository loss needs a
     way to say WHICH repository each claim covers. A bare claim keeps its
-    historical meaning (the single lost repository); the prefix grammar admits
-    only plain relative paths, so no claim shape can be swallowed by it -- a
-    URL (`https://`, `git@host:`) and a PR slug (`owner/repo#N`) all carry a
-    character the grammar excludes before any `=`.
+    historical meaning (the single lost repository).
+
+    The grammar is defined by EXCLUSION, not by a whitelist of tidy directory
+    names: every verifiable claim shape carries a `#` (`verify_ref` requires
+    `<url>#<sha>`, `verify_pr` requires `owner/repo#N` or a `/pull/N` URL), and
+    every URL shape additionally carries a `:` before any `=` it may hold in a
+    query string. Excluding `:`, `?` and `#` from the prefix therefore cannot
+    swallow a bare claim -- while admitting any real directory name, including
+    one with a space, `@`, `+`, `~` or non-ASCII characters. A whitelist could
+    not: it made the remedy the refusals PRINT (`--survivor-pr <key>=...`)
+    unparseable for exactly those names, leaving that state HELD with no
+    accepted input -- the unreachable-remedy bug this module exists to close.
     """
     match = _QUALIFIER.match(claim)
     if not match:
         return None, claim
     return claim[:match.end() - 1], claim[match.end():]
+
+
+def _qualified_hint(keys):
+    """The qualified remedy for `keys`, or an honest admission one has none.
+
+    The refusals interpolate a real repository key into the form the operator
+    is told to type. A key the qualifier grammar cannot express would print a
+    remedy that does not parse -- `_split_qualifier` would hand the whole
+    string to `verify_*`, the match would fail, and the state would be HELD
+    with no accepted input at all. Take the WHOLE set the operator must cover,
+    not just its first element: every one of them needs its own claim, so a
+    single unrepresentable key elsewhere in the set makes the state
+    unsatisfiable no matter how tidy the example is.
+    """
+    unrepresentable = sorted(k for k in keys if _split_qualifier(f"{k}=x") != (k, "x"))
+    if unrepresentable:
+        return (f"no qualified form exists for repository {unrepresentable[0]!r} (its name "
+                "contains ':', '?', '#' or '='); rename or re-clone it under a plain path "
+                "to recover")
+    return f"--survivor-pr {sorted(keys)[0]}=owner/repo#N"
 
 
 def _verified_explicit(survivor_ref, survivor_pr):
@@ -283,10 +311,20 @@ def _verified_explicit(survivor_ref, survivor_pr):
                     f"survivor_unavailable: could not verify {flag} {_ext.redact(claim)} against the remote"
                 )
             if key is None:
-                # Historical single-claim shape. Keep the FIRST one, exactly as
-                # before, so an unqualified --survivor-ref still wins over an
-                # unqualified --survivor-pr.
-                unqualified = ref if unqualified is None else unqualified
+                # An unqualified claim means "the one lost repository", so two
+                # of them are ambiguous in exactly the way the qualified/
+                # unqualified mix below is. Before the flags became repeatable
+                # this was unreachable (one value each), and keeping the first
+                # silently recorded A as the provenance for a repository whose
+                # survivor may have been B -- a false entry in the recovery
+                # index, with no diagnostic, after a remote verification had
+                # already been spent on both.
+                if unqualified is not None:
+                    raise SurvivorUnavailable(
+                        "survivor_unavailable: two unqualified operator survivors are ambiguous; "
+                        "qualify each claim as <repository>=<claim>"
+                    )
+                unqualified = ref
                 continue
             if key in resolved:
                 raise SurvivorUnavailable(
@@ -349,44 +387,78 @@ def _external(conn, task_id, metadata, evidence, urls, explicit, *, discover, cl
     return {"kind": "ref", "refs": [dict(ref, repository=".")]} if ref else None
 
 
+def _sidecar_repositories(survivor):
+    """Repository keys a stored PATCH accounts for, read from its own manifest.
+
+    A patch keys no repository in the recorded row -- only the
+    `implementation.json` sidecar this module writes beside it carries the
+    `repositories` list. Excluding patches entirely made an already-completed
+    card re-HOLD forever at reclamation: `absent` stayed empty, the relaxation
+    never ran, `missing` survived and the `if not explicit` raise fired on a
+    claim that a patch had already honoured -- and it is precisely the
+    uncommitted-work case where the patch is the ONLY copy.
+
+    Read the manifest rather than letting a patch vouch for anything: an
+    unreadable or malformed sidecar vouches for NOTHING, so the guard that
+    gates the relaxation stays keyed and fails closed.
+    """
+    path = (survivor or {}).get("sidecar")
+    if not path:
+        return set()
+    try:
+        manifest = json.loads(Path(path).read_bytes())
+    except (OSError, ValueError):
+        return set()
+    return {entry["repository"] for entry in (manifest.get("repositories") or ())
+            if isinstance(entry, dict) and isinstance(entry.get("repository"), str)}
+
+
 def _vouched_repositories(survivor):
     """Repository keys a RECORDED survivor actually accounts for.
 
     A survivor vouches for a repository through a ref (remote-verified, or an
-    operator flag) or through a stored bundle. A patch is not included: it is
-    keyed by base SHA against a checkout, so it cannot stand in for a
-    repository that is no longer on disk.
+    operator flag), through a stored bundle, or through a stored patch whose
+    sidecar manifest names it.
     """
     keys = set()
-    for entry in ((survivor or {}).get("refs") or ()):
-        if isinstance(entry, dict) and isinstance(entry.get("repository"), str):
-            keys.add(entry["repository"])
-    for entry in ((survivor or {}).get("bundles") or ()):
-        if isinstance(entry, dict) and isinstance(entry.get("repository"), str):
-            keys.add(entry["repository"])
-    return keys
+    for shape in ("refs", "bundles"):
+        for entry in ((survivor or {}).get(shape) or ()):
+            if isinstance(entry, dict) and isinstance(entry.get("repository"), str):
+                keys.add(entry["repository"])
+    return keys | _sidecar_repositories(survivor)
 
 
 def _unshrunk(previous, survivor):
     """Reclamation may KEEP or EXTEND the recovery index, never shrink it.
 
     `_record()` does `SET survivor = excluded.survivor`, so the cleanup pass
-    writes exactly what it re-captured. `_vouched_repositories()` covers the
-    ref/bundle shapes, but a PATCH keys no repository in the recorded row at
-    all (only the `implementation.json` sidecar's `repositories` list does), so
-    it can never be carried by a repository-keyed rule. When the re-capture
-    reproduces no patch -- the repo went clean, or was cloned after dispatch
-    and is now gone -- the `path`/`sha256`/`bytes`/`sidecar` pointers to the
-    ONLY copy of that uncommitted work would be dropped and the row relabelled
-    `kind: "ref"`, i.e. "everything is pushed". Carry them instead.
+    writes exactly what it re-captured. The repository-keyed carry-forward in
+    `preserve()` only fires for repositories ABSENT from disk, so it cannot
+    save either of the two shapes a re-capture can silently drop for a repo
+    that is STILL there:
+
+    - a PATCH keys no repository in the recorded row at all (only the
+      `implementation.json` sidecar's `repositories` list does), and
+    - a recorded BUNDLE for a repository whose re-capture now finds a
+      published base, so it emits a ref/patch and `bundles` comes back empty.
+
+    Either way the row would be relabelled `kind: "ref"` -- "everything is
+    pushed" -- while the only copy of that unpushed work is an orphaned
+    attachment. Carry both across instead.
     """
     if not survivor or not previous:
         return survivor
     carried = {key: previous[key] for key in ("path", "sha256", "bytes", "sidecar")
                if previous.get(key) and not survivor.get(key)}
-    if not carried:
+    kept = {b.get("repository") for b in (survivor.get("bundles") or ())
+            if isinstance(b, dict)}
+    bundles = [b for b in (previous.get("bundles") or ())
+               if isinstance(b, dict) and b.get("repository") not in kept]
+    if not carried and not bundles:
         return survivor
     survivor = dict(survivor, **carried, notice="NOT PUSHED")
+    if bundles:
+        survivor["bundles"] = list(survivor.get("bundles") or ()) + bundles
     survivor["kind"] = "bundle" if survivor.get("bundles") else "patch"
     return survivor
 
@@ -545,18 +617,35 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                     raise SurvivorUnavailable(
                         "survivor_unavailable: one operator survivor cannot vouch for multiple "
                         f"missing repositories ({', '.join(sorted(missing))}); qualify each claim "
-                        f"as <repository>=<claim>, e.g. --survivor-pr {sorted(missing)[0]}=owner/repo#N"
+                        f"as <repository>=<claim>, e.g. {_qualified_hint(missing)}"
                     )
                 explicit = {sorted(missing)[0]: explicit[None]}
-            elif uncovered:
-                # Qualified claims are per-repository provenance: every vanished
-                # repository needs its own, or the claim is incomplete and the
-                # uncovered ones would be silently dropped from the index.
-                raise SurvivorUnavailable(
-                    "survivor_unavailable: no operator survivor names the missing "
-                    f"repositories ({', '.join(sorted(uncovered))}); qualify each claim "
-                    f"as <repository>=<claim>, e.g. --survivor-pr {sorted(uncovered)[0]}=owner/repo#N"
-                )
+            else:
+                if uncovered:
+                    # Qualified claims are per-repository provenance: every vanished
+                    # repository needs its own, or the claim is incomplete and the
+                    # uncovered ones would be silently dropped from the index.
+                    raise SurvivorUnavailable(
+                        "survivor_unavailable: no operator survivor names the missing "
+                        f"repositories ({', '.join(sorted(uncovered))}); qualify each claim "
+                        f"as <repository>=<claim>, e.g. {_qualified_hint(uncovered)}"
+                    )
+                # ...and the converse, which the coverage test alone does not
+                # catch: a qualifier naming a repository that is STILL on disk
+                # (a plausible reading of the "qualify every claim" remedy the
+                # refusals above print). `carried` stamps every key in
+                # `explicit`, so the capture loop would then derive its own ref
+                # for that repo and record TWO contradictory provenances for
+                # it -- and this exit does not pass through `_merge_refs()`.
+                # An operator claim is authority about a repository we LOST; it
+                # is not a licence to overwrite one we can still read.
+                intruding = set(explicit) - missing
+                if intruding:
+                    raise SurvivorUnavailable(
+                        "survivor_unavailable: operator survivors name repositories that are "
+                        f"still present ({', '.join(sorted(intruding))}); qualify only the "
+                        f"missing ones ({', '.join(sorted(missing))})"
+                    )
             # A vanished recorded repository is an unmet claim. Force the
             # external path below so the verified survivor is actually recorded,
             # and so failing to produce one still HOLDS rather than completing
@@ -613,7 +702,11 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
             external = _external(conn, task_id, metadata, evidence, _remote_urls(repos), explicit,
                                  discover=not loose, cleanup=cleanup, previous=None if loose else previous)
             if external:
-                merged = dict(external, refs=_merge_refs(refs, external["refs"]))
+                # A `kind: "bundle"` row often carries no `refs` key at all --
+                # unpushed history lives only in `bundles` -- and `KeyError` is
+                # not in this function's `except` tuple, so it would escape
+                # past `_hold()` and skip the fail-closed contract entirely.
+                merged = dict(external, refs=_merge_refs(refs, external.get("refs") or []))
                 return _record(conn, task_id, _unshrunk(previous, merged) if cleanup else merged,
                                previous)
             if loose:
@@ -626,15 +719,19 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 f"verifiable external survivor; {_ext.HINT}"
             )
         else:
-            # Nothing in-tree, nothing claimed. On the completion pass that is
-            # genuinely non-code work and None is correct. On RECLAMATION it is
-            # not: `_record()` does `SET survivor = excluded.survivor`, so
-            # writing None here erases a recovery index that a previous
-            # completion had already published, and returns a survivor-less
-            # verdict that lets the caller `rmtree` the directory. Reclamation
-            # may only ever keep or extend the recorded survivor, never shrink
-            # it.
-            survivor = previous if cleanup else None
+            # Nothing in-tree, nothing claimed. With no survivor ever recorded
+            # that is genuinely non-code work and None is correct. Otherwise it
+            # is not, on EITHER pass: `_record()` does `SET survivor =
+            # excluded.survivor`, so writing None here erases a recovery index
+            # a previous completion already published and returns a
+            # survivor-less verdict that lets the caller `rmtree` the
+            # directory. Reclamation was guarded; the completion pass was not,
+            # and it is reachable -- re-complete a card whose workspace was
+            # missing (empty `bases`, `claimed` False, the dir since re-created
+            # empty) and the external ref that is the only pointer to that work
+            # became JSON `null` while `held_reason` was cleared. The invariant
+            # is not "reclamation may not shrink the index" but "nothing may".
+            survivor = previous
         return _record(conn, task_id, _unshrunk(previous, survivor) if cleanup else survivor,
                        previous)
     except (OSError, sqlite3.Error, subprocess.SubprocessError, ValueError) as exc:
