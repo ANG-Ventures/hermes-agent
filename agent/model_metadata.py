@@ -709,6 +709,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     # silently resolved at 256,000 — a HALF-SIZE window that never errors, it
     # just compacts ~2x too early forever. Keep each new frontier grok here on
     # the day it ships; the "grok-4" entry is for grok-4/grok-4-0709 only.
+    "grok-4.7": 500000,         # grok-4.7, grok-4.7-latest — 500K (docs.x.ai, GA 2026-09-21)
     "grok-4.6": 500000,         # grok-4.6, grok-4.6-latest — 500K (OpenRouter / docs.x.ai)
     "grok-4.5": 500000,         # grok-4.5, grok-4.5-latest — 500K context per docs.x.ai
     "grok-4.3": 1000000,        # grok-4.3, grok-4.3-latest — 1M context per docs.x.ai
@@ -2520,6 +2521,7 @@ _PRE_CATALOG_STALE_KEYS = frozenset({
     "minimax-m3",    # 1M; older builds persisted the "minimax" catch-all (204,800)
     "grok-4.3",      # 1M; pre-2026-05-15 builds persisted the "grok-4" catch-all (256,000)
     "grok-4.6",      # 500K; pre-catalog builds persisted the "grok-4" catch-all (256,000)
+    "grok-4.7",      # 500K; pre-catalog builds persisted the "grok-4" catch-all (256,000)
     "grok-4-fast",   # 2M; pre-2026-04-10 builds fell through to the 256K probe fallback
     "grok-4.20",     # 2M; pre-2026-04-10 builds fell through to the 256K probe fallback
     "qwen3.6-plus",  # 1M; pre-2026-05-17 builds persisted the "qwen" catch-all (131,072)
