@@ -301,18 +301,33 @@ def _verified_explicit(task_id, survivor_ref, survivor_pr, *, unbound=False):
     ):
         if not claim:
             continue
-        ref = verify(claim, mined_for=None if unbound else task_id, **extra)
-        if ref is None:
-            # The claim is unverified and may carry a token: echo it redacted only.
-            if not unbound and verify(claim, **extra) is not None:
-                raise _refusal(
-                    f"survivor_unavailable: {flag} {_ext.redact(claim)} is live but does not "
-                    f"name {task_id}, so it is not evidence of THIS card's work",
-                    hint=True,
+        # A remote that did not ANSWER is not evidence about the claim. Keep
+        # the two outcomes apart at the seam: ``None`` is a verdict from the
+        # remote, ``RemoteUnavailable`` is the absence of one. Collapsing them
+        # let a rate limit or network blip be reported -- and persisted to
+        # ``held_reason`` and the ``workspace_held`` event that ``kanban_show``
+        # replays -- as the false statement "is live but does not name <card>",
+        # whose offered remedy is to drop the very binding this path adds
+        # (kanban card t_de2e348e, Argus round 3).
+        try:
+            ref = verify(claim, mined_for=None if unbound else task_id, **extra)
+            if ref is None:
+                # The claim is unverified and may carry a token: echo it redacted only.
+                if not unbound and verify(claim, **extra) is not None:
+                    raise _refusal(
+                        f"survivor_unavailable: {flag} {_ext.redact(claim)} is live but does not "
+                        f"name {task_id}, so it is not evidence of THIS card's work",
+                        hint=True,
+                    )
+                raise SurvivorUnavailable(
+                    f"survivor_unavailable: could not verify {flag} {_ext.redact(claim)} "
+                    f"against the remote"
                 )
+        except _ext.RemoteUnavailable as exc:
             raise SurvivorUnavailable(
-                f"survivor_unavailable: could not verify {flag} {_ext.redact(claim)} against the remote"
-            )
+                f"survivor_unavailable: could not verify {flag} {_ext.redact(claim)} "
+                f"against the remote ({_ext.redact(str(exc))})"
+            ) from exc
         if unbound or ref.get("corroborated_by") in _WEAK_CORROBORATION:
             # Record WHO authorised an unbound claim and WHY it is unbound:
             # _record replays the survivor into the task's event log, so the

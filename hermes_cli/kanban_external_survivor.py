@@ -36,12 +36,31 @@ def _safe_url(url):
             and not (parsed.username and parsed.scheme != "ssh"))
 
 
+class RemoteUnavailable(Exception):
+    """The remote did not answer. This says NOTHING about the claim.
+
+    ``None`` from a ``verify_*`` means "the remote answered and the claim does
+    not hold up". A subprocess that exits non-zero, times out, or dies means
+    the question was never asked -- an ordinary rate limit, auth hiccup or
+    network blip. Collapsing the two lets a transient fault be reported, and
+    durably persisted, as a conclusion about relevance the kernel never
+    established (kanban card t_de2e348e, Argus round 3). Callers that only need
+    a candidate (:func:`discover`) treat this as "no", callers that state a
+    reason must say "could not verify" instead.
+    """
+
+
 def _query(args):
     try:
         result = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
-        return result.stdout.decode() if result.returncode == 0 else None
-    except (OSError, subprocess.SubprocessError, UnicodeError):
-        return None
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RemoteUnavailable(f"{args[0]} did not answer") from exc
+    if result.returncode != 0:
+        raise RemoteUnavailable(f"{args[0]} exited {result.returncode}")
+    try:
+        return result.stdout.decode()
+    except UnicodeError as exc:
+        raise RemoteUnavailable(f"{args[0]} returned undecodable output") from exc
 
 
 def verify_ref(claim, *, mined_for=None):
@@ -55,13 +74,15 @@ def verify_ref(claim, *, mined_for=None):
     cross-producted with every remote URL, and "branched from <sha>" names the
     base, not the deliverable -- so a mined ref must sit on a branch that
     names the task.
+
+    ``None`` means the remote answered and the claim does not hold up; a
+    remote that did not answer raises :class:`RemoteUnavailable` instead, so a
+    caller never reports a blip as a statement about relevance.
     """
     url, sep, sha = claim.rpartition("#")
     if not sep or not re.fullmatch(_SHA, sha) or not _safe_url(url):
         return None
     output = _query(["git", "ls-remote", "--heads", "--tags", "--", url])
-    if output is None:
-        return None
     matches = {}
     for line in output.splitlines():
         oid, _, ref = line.partition("\t")
@@ -104,6 +125,10 @@ def verify_pr(claim, shas=(), *, mined_for=None, corroborate=("headRefName",)):
     corroborated by a claimed SHA that is the PR head or squash merge, or --
     with no SHA claimed -- by the same naming test. A bare ``owner/repo#N``
     mention proves nothing about THIS card's work.
+
+    ``None`` means the remote answered and the claim does not hold up; a
+    remote that did not answer raises :class:`RemoteUnavailable` instead, so a
+    caller never reports a blip as a statement about relevance.
     """
     match = _PR.fullmatch(claim) or _PR_URL.fullmatch(claim)
     if not match:
@@ -111,8 +136,6 @@ def verify_pr(claim, shas=(), *, mined_for=None, corroborate=("headRefName",)):
     slug, number = match.groups()
     output = _query(["gh", "pr", "view", number, "--repo", slug,
                      "--json", "state,headRefOid,headRefName,mergeCommit,title,body"])
-    if output is None:
-        return None
     corroborated_by = None
     try:
         view = json.loads(output)
@@ -178,8 +201,15 @@ def discover(conn, task_id, metadata, evidence, urls):
             if len(seen) >= 6:
                 return None
             seen.add(key)
-            verified = (verify_pr(claim, shas, mined_for=task_id) if kind == "pr"
-                        else verify_ref(claim, mined_for=task_id))
+            try:
+                verified = (verify_pr(claim, shas, mined_for=task_id) if kind == "pr"
+                            else verify_ref(claim, mined_for=task_id))
+            except RemoteUnavailable:
+                # Mining only looks for a candidate; an unanswered remote is
+                # indistinguishable from "not this one" HERE, because discover
+                # states no reason. It is the reason-stating callers that must
+                # keep the two apart.
+                continue
             if verified:
                 return verified
     return None

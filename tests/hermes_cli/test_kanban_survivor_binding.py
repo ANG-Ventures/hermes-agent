@@ -219,6 +219,161 @@ def test_the_wider_corroboration_is_explicit_only(board, unrelated):
                             metadata={"changed_files": ["code.py"]})
 
 
+# --- a transient remote failure must not be stated as a fact about the claim -
+
+@pytest.fixture
+def flaky(monkeypatch):
+    """A remote that NAMES the card, with per-call failure injection.
+
+    The seam is ``subprocess.run`` -- strictly BELOW ``_query``, so the
+    function under test is never asked what it thinks, and the ground truth is
+    fixed by construction: the branch names the card, so the honest outcome is
+    ACCEPT. ``fail`` holds the 1-based call ordinals that exit non-zero, which
+    is exactly what an ordinary rate limit or auth hiccup looks like.
+    """
+    state = {"fail": set(), "calls": 0, "branch": None}
+    real = subprocess.run
+
+    def run(args, **kwargs):
+        if args[0] == "gh" or ("ls-remote" in args and "-C" not in args):
+            state["calls"] += 1
+            if state["calls"] in state["fail"]:
+                return subprocess.CompletedProcess(args, 1, b"", b"gh: API rate limit exceeded")
+            if args[0] == "gh":
+                view = {"state": "MERGED", "headRefOid": HEAD, "mergeCommit": {"oid": MERGE},
+                        "headRefName": state["branch"], "title": "work", "body": "work"}
+                return subprocess.CompletedProcess(args, 0, json.dumps(view).encode(), b"")
+            return subprocess.CompletedProcess(
+                args, 0, f"{HEAD}\trefs/heads/{state['branch']}\n".encode(), b"")
+        return real(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return state
+
+
+@pytest.mark.parametrize("fail,expect_bound", [
+    (set(), True),          # control A: nothing injected -> the claim is ACCEPTED
+    ({1}, False),           # the defect: the BOUND call blips
+    ({1, 2}, False),        # control C: nothing answers at all
+])
+def test_a_transient_remote_failure_is_never_reported_as_irrelevance(
+        board, flaky, fail, expect_bound):
+    """"The remote did not answer" and "the remote said no" are different facts.
+
+    ``_verified_explicit`` chose its refusal text by comparing two INDEPENDENT
+    round-trips, and ``_query`` returned ``None`` on any non-zero exit, OSError
+    or 15 s timeout. So a blip on the first call made the second one -- which
+    asks a WEAKER question -- succeed, and the kernel stated as fact that a
+    claim it had never checked "is live but does not name" the card. That
+    sentence is persisted to ``held_reason`` and to the ``workspace_held``
+    event ``kanban_show`` replays, and the remedy the CLI then offers is
+    ``--survivor-unbound`` -- so a network blip laundered a legitimately BOUND
+    claim into a recorded UNBOUND one, which ``_reusable`` refuses as
+    reclamation authority forever (Argus round 3).
+
+    Ground truth here is BOUND in every arm: the PR's head branch names the
+    card. Arms A and C are working controls, so the middle arm is signal.
+    """
+    tid = _claimed_card(board)
+    flaky["branch"] = f"kanban/{tid}-fix"
+    flaky["fail"] = fail
+
+    if expect_bound:
+        assert kb.complete_task(board, tid, survivor_pr=PR,
+                                metadata={"changed_files": ["code.py"]})
+        assert kb.latest_run(board, tid).metadata["survivor"]["refs"][0]["corroborated_by"] == "branch"
+        return
+
+    with pytest.raises(ValueError) as excinfo:
+        kb.complete_task(board, tid, survivor_pr=PR, metadata={"changed_files": ["code.py"]})
+
+    assert "could not verify" in str(excinfo.value)
+    assert "does not name" not in str(excinfo.value), (
+        "a remote that did not answer says NOTHING about the claim")
+    assert not excinfo.value.override_hint, (
+        "dropping the binding is not the remedy for a network blip")
+    # The channels a human and a redispatched worker actually read.
+    held = board.execute(
+        "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()
+    assert held and "could not verify" in (held[0] or "")
+    assert "does not name" not in (held[0] or "")
+    assert "does not name" not in json.dumps([e.payload for e in kb.list_events(board, tid)])
+    assert kb.get_task(board, tid).status != "done"
+
+
+def test_a_transient_failure_on_a_ref_claim_is_reported_as_unverifiable(board, flaky):
+    """Same seam on the other claim shape: ``--survivor-ref`` / git ls-remote."""
+    tid = _claimed_card(board)
+    flaky["branch"] = f"kanban/{tid}-fix"
+    flaky["fail"] = {1}
+
+    with pytest.raises(ValueError) as excinfo:
+        kb.complete_task(board, tid, survivor_ref=f"{URL}#{HEAD}",
+                         metadata={"changed_files": ["code.py"]})
+    assert "could not verify" in str(excinfo.value)
+    assert "does not name" not in str(excinfo.value)
+
+
+def test_a_transient_failure_while_MINING_is_not_a_crash(board, flaky):
+    """``discover`` states no reason, so it may still treat no-answer as "no".
+
+    The distinction is only load-bearing where a reason is stated. What must
+    not happen is the new signal escaping as an unhandled error out of a path
+    that previously just moved on to the next candidate.
+    """
+    tid = _claimed_card(board)
+    flaky["branch"] = "someone-elses/unrelated-work"
+    flaky["fail"] = {1}
+
+    with pytest.raises(ValueError, match="survivor-pr"):
+        kb.complete_task(board, tid, result=f"Shipped {PR}",
+                         metadata={"changed_files": ["code.py"]})
+    assert kb.get_task(board, tid).status != "done"
+
+
+def test_the_override_also_distinguishes_a_blip_from_a_verdict(board, flaky):
+    """``--survivor-unbound`` makes ONE round-trip; it must report it honestly."""
+    tid = _claimed_card(board)
+    flaky["branch"] = "someone-elses/unrelated-work"
+    flaky["fail"] = {1}
+
+    with pytest.raises(ValueError, match="could not verify"):
+        kb.complete_task(board, tid, survivor_pr=PR, survivor_unbound=True,
+                         metadata={"changed_files": ["code.py"]})
+    assert kb.get_task(board, tid).status != "done"
+
+
+# --- the help must describe the gate that will refuse the operator ----------
+
+@pytest.mark.parametrize("flag,metavar,ends_at", [
+    ("--survivor-ref", "URL#SHA", "--survivor-pr"),
+    ("--survivor-pr", "OWNER/REPO#N", "--survivor-unbound"),
+])
+def test_the_help_documents_the_task_naming_requirement(flag, metavar, ends_at, capsys):
+    """Both claim flags enforce the binding, so both must say so.
+
+    ``verify_ref`` gained the same ``mined_for`` enforcement ``verify_pr`` has,
+    but the ``--survivor-ref`` help still described the old contract ("verified
+    with git ls-remote") -- user-facing text promising acceptance from a gate
+    that now refuses. Asserted as a relation between the two flags rather than
+    as a snapshot of either one's wording: whichever flag the binding is
+    documented on, it must be documented on both. Read out of the RENDERED
+    help an operator sees, so argparse's own wrapping is included.
+    """
+    from hermes_cli import kanban as cli
+
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    cli.build_parser(parser.add_subparsers(dest="command"))
+    with pytest.raises(SystemExit):
+        parser.parse_args(["kanban", "complete", "--help"])
+    rendered = " ".join(capsys.readouterr().out.split())
+    # The option list entry is the LAST "<flag> <metavar>"; usage lists it too.
+    section = rendered.split(f"{flag} {metavar}")[-1].split(ends_at, 1)[0]
+    assert "name this task" in section, (
+        f"{flag} enforces the binding; its help must say so")
+
+
 # --- the escape hatch stays reachable, and is auditable ---------------------
 
 def test_operator_override_accepts_an_unrelated_branch_and_records_it(board, unrelated, monkeypatch):

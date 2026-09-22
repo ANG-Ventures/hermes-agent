@@ -746,8 +746,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                  '"tests_run": 12}\'). Stored on the closing run.')
     p_complete.add_argument("--survivor-ref", default=None, metavar="URL#SHA",
                             help="Name an external survivor when the implementation lives on a "
-                                 "remote, not in the workspace. Verified with git ls-remote; "
-                                 "an unverifiable claim refuses the completion.")
+                                 "remote, not in the workspace. Verified with git ls-remote "
+                                 "AND required to name this task: the SHA must resolve to a "
+                                 "single branch or tag tip whose ref name contains the task id. "
+                                 "An unverifiable claim, or one on an unrelated-looking ref, "
+                                 "refuses the completion (see --survivor-unbound).")
     p_complete.add_argument("--survivor-pr", default=None, metavar="OWNER/REPO#N",
                             help="Name an external survivor by pull request. Verified with "
                                  "gh pr view (state OPEN or MERGED) AND required to name this "
