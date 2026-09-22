@@ -77,7 +77,11 @@ def verify_ref(claim, *, mined_for=None):
 
     ``None`` means the remote answered and the claim does not hold up; a
     remote that did not answer raises :class:`RemoteUnavailable` instead, so a
-    caller never reports a blip as a statement about relevance.
+    caller never reports a blip as a statement about relevance. A SHA that is
+    the tip of more than one ref the binding cannot narrow to exactly one is
+    also ``None``: ``branch`` is recorded as this survivor's provenance, so
+    picking one of several would publish a recovery-index entry that is a
+    guess.
     """
     url, sep, sha = claim.rpartition("#")
     if not sep or not re.fullmatch(_SHA, sha) or not _safe_url(url):
@@ -87,12 +91,34 @@ def verify_ref(claim, *, mined_for=None):
     for line in output.splitlines():
         oid, _, ref = line.partition("\t")
         if re.fullmatch(r"[0-9a-f]{40}", oid) and oid.startswith(sha):
-            matches[oid] = ref
+            # One OID routinely carries SEVERAL tips: an ordinary fast-forward
+            # merge leaves the topic branch alive beside `main`, and a release
+            # tag points at the same commit. Keying this dict by oid alone kept
+            # only the LAST line, so `len(matches)` was still 1 and the binding
+            # below was evaluated against whichever refname `ls-remote` emitted
+            # last -- refname order puts `refs/heads/main` and `refs/tags/*`
+            # after `refs/heads/kanban/<task>-fix`, so a claim's verdict, and
+            # the `branch` recorded as its provenance, depended on emission
+            # order. Keep every tip and decide over all of them.
+            matches.setdefault(oid, []).append(ref)
     if len(matches) != 1:
         return None  # unknown or ambiguous abbreviation
-    oid, ref = next(iter(matches.items()))
-    if mined_for and mined_for not in ref:
+    oid, tips = next(iter(matches.items()))
+    if mined_for:
+        # The binding is the question being asked, so ask it of every tip, not
+        # of one drawn by emission order. A commit does not stop naming the
+        # card because it is also reachable as `main` or as a tag.
+        tips = [ref for ref in tips if mined_for in ref]
+    if len(tips) != 1:
+        # Still ambiguous after the binding narrowed it: REFUSE rather than
+        # pick. `branch` is persisted as this survivor's provenance and read by
+        # reclamation; choosing one of several candidates would write a
+        # recovery-index entry this module cannot stand behind -- the same harm
+        # as stamping one operator claim onto several missing repositories
+        # (`kanban_survivor.preserve`). A caller who knows which ref carries the
+        # work can name it with `--survivor-pr`.
         return None
+    ref = tips[0]
     verified = {"remote": url, "branch": ref, "sha": oid, "external": True}
     return dict(verified, corroborated_by="branch") if mined_for else verified
 

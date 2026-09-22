@@ -454,6 +454,41 @@ def _qualified_hint(keys):
     return f"--survivor-pr {sorted(keys)[0]}=owner/repo#N"
 
 
+def _unbound_keys(survivor_unbound):
+    """Normalise the override into ``(bare, keys)`` -- the claims it covers.
+
+    ``--survivor-unbound`` used to be a single invocation-wide boolean threaded
+    straight into :func:`_verified_explicit`, where it stripped the task-id
+    binding from EVERY claim. The multi-repository remedy this module works
+    hard to keep reachable is several claims in one invocation
+    (``--survivor-pr kept=owner/repo#1 --survivor-pr gone=owner/repo#2``), so
+    an operator overriding the ONE claim that landed on an unrelated-looking
+    branch silently accepted the others with no check that they name the card
+    -- a typo, a stale number or a pasted unrelated PR recorded as that
+    repository's provenance. That is the same recovery-index corruption this
+    file refuses elsewhere (one claim may not vouch for several missing
+    repositories; a qualifier may not name a repository still on disk).
+
+    ``bare`` is a BARE ``--survivor-unbound`` (the historical ``store_true``
+    spelling), which keeps its meaning for the single-claim shape it was
+    designed for and is refused by the caller on a multi-claim invocation.
+    ``keys`` are qualifier keys, where ``None`` is the key of the historical
+    unqualified claim.
+    """
+    if survivor_unbound is True:
+        return True, frozenset()
+    if not survivor_unbound:
+        return False, frozenset()
+    if isinstance(survivor_unbound, str):
+        survivor_unbound = [survivor_unbound]
+    entries = list(survivor_unbound)
+    if entries == [True]:
+        return True, frozenset()
+    return False, frozenset(
+        None if entry in (None, True, "") else str(entry) for entry in entries
+    )
+
+
 def _verified_explicit(task_id, survivor_ref, survivor_pr, *, unbound=False):
     """An operator-named survivor is a claim: verify it is real AND is THIS card's work.
 
@@ -497,83 +532,130 @@ def _verified_explicit(task_id, survivor_ref, survivor_pr, *, unbound=False):
     THIS completion and never becomes standing authority that a later
     reclamation reuses without re-testing.
 
-    NOT every corroboration is the same strength, and the weak ones are held
-    to the same bound as the override. ``verify_pr`` reports WHICH field
-    answered: a head branch or a claimed SHA ties the PR's *content* to the
-    card, but a substring in the PR title or body is only a MENTION -- an
-    umbrella changelog, a dependency note, even "does not address t_..."
-    satisfies it. Accepting a mention as a bound survivor would make it
-    standing delete authority via :func:`_reusable`, which is the very thing
-    this card closed. So a title/body match is recorded as an unbound claim:
-    it still completes the card, and it still never buys a later delete.
+    NOT every corroboration is the same strength, and a weak one is NOT a
+    binding. ``verify_pr`` reports WHICH field answered: a head branch or a
+    claimed SHA ties the PR's *content* to the card, but a substring in the PR
+    title or body is only a MENTION -- an umbrella changelog, a dependency
+    note, even "does not address t_..." satisfies it.
+
+    A mention therefore takes the SAME refusal an unrelated live claim takes,
+    and needs the SAME explicit override to proceed. Marking it `unbound` and
+    letting it complete anyway (the shape this function shipped with) closed
+    only half the hole: :func:`_reusable` guards the RECORDED row on the
+    `cleanup=True` pass, so it never sees a claim that reaches the completion
+    path through :func:`_external`'s ``explicit`` arm. ``preserve`` treats
+    that verified explicit survivor as authority on the workspace-missing exit
+    -- so "follow-up to t_...; does not address it" could delete unpushed work
+    in that moment, without any operator ever authorising it. The two paths
+    now answer "is this a tie to the card's work?" identically, and the
+    operator case keeps the one documented door.
+
+    The override is PER-CLAIM. It used to be a single invocation-wide boolean
+    applied to every claim, so an operator overriding the one repository whose
+    work landed on an odd branch silently accepted the others with no check
+    that they name the card -- and cost the correctly-bound ones their
+    reclamation authority, since all of them were stamped ``unbound``. See
+    :func:`_unbound_keys`.
     """
+    bare_override, override = _unbound_keys(unbound)
+    pending = [
+        (flag, verify, extra, claim)
+        for claims, flag, verify, extra in (
+            (survivor_ref, "--survivor-ref", _ext.verify_ref, {}),
+            (survivor_pr, "--survivor-pr", _ext.verify_pr,
+             {"corroborate": ("headRefName", "title", "body")}),
+        )
+        for claim in (claims if isinstance(claims, (list, tuple)) else [claims] if claims else [])
+        if claim
+    ]
+    if bare_override and len(pending) > 1:
+        # A bare flag cannot say WHICH claim is being vouched for, and guessing
+        # would reinstate exactly the invocation-wide behaviour this replaced.
+        raise SurvivorUnavailable(
+            "survivor_unavailable: --survivor-unbound is per-claim; with more than one "
+            "claim, name the repository it applies to (--survivor-unbound <repository>)"
+        )
+    unclaimed = override - {_split_qualifier(claim)[0] for _, _, _, claim in pending}
+    if unclaimed:
+        # A no-op override is an operator typo, and a silent one would leave
+        # the claim they meant to vouch for still refused -- or, worse, read
+        # as though the binding had been relaxed when it was not.
+        raise SurvivorUnavailable(
+            "survivor_unavailable: --survivor-unbound names no claim in this invocation "
+            f"({', '.join(sorted(str(k) for k in unclaimed))})"
+        )
     resolved, unqualified = {}, None
-    for claims, flag, verify, extra in (
-        (survivor_ref, "--survivor-ref", _ext.verify_ref, {}),
-        (survivor_pr, "--survivor-pr", _ext.verify_pr,
-         {"corroborate": ("headRefName", "title", "body")}),
-    ):
-        for claim in (claims if isinstance(claims, (list, tuple)) else [claims] if claims else []):
-            if not claim:
-                continue
-            key, value = _split_qualifier(claim)
-            # A remote that did not ANSWER is not evidence about the claim. Keep
-            # the two outcomes apart at the seam: ``None`` is a verdict from the
-            # remote, ``RemoteUnavailable`` is the absence of one. Collapsing them
-            # let a rate limit or network blip be reported -- and persisted to
-            # ``held_reason`` and the ``workspace_held`` event that ``kanban_show``
-            # replays -- as the false statement "is live but does not name <card>",
-            # whose offered remedy is to drop the very binding this path adds
-            # (kanban card t_de2e348e, Argus round 3).
-            try:
-                ref = verify(value, mined_for=None if unbound else task_id, **extra)
-                if ref is None:
-                    # The claim is unverified and may carry a token: echo it redacted only.
-                    if not unbound and verify(value, **extra) is not None:
-                        raise _refusal(
-                            f"survivor_unavailable: {flag} {_ext.redact(claim)} is live but does not "
-                            f"name {task_id}, so it is not evidence of THIS card's work",
-                            hint=True,
-                        )
-                    raise SurvivorUnavailable(
-                        f"survivor_unavailable: could not verify {flag} {_ext.redact(claim)} "
-                        f"against the remote"
+    for flag, verify, extra, claim in pending:
+        key, value = _split_qualifier(claim)
+        claim_unbound = bare_override or key in override
+        # A remote that did not ANSWER is not evidence about the claim. Keep
+        # the two outcomes apart at the seam: ``None`` is a verdict from the
+        # remote, ``RemoteUnavailable`` is the absence of one. Collapsing them
+        # let a rate limit or network blip be reported -- and persisted to
+        # ``held_reason`` and the ``workspace_held`` event that ``kanban_show``
+        # replays -- as the false statement "is live but does not name <card>",
+        # whose offered remedy is to drop the very binding this path adds
+        # (kanban card t_de2e348e, Argus round 3).
+        try:
+            ref = verify(value, mined_for=None if claim_unbound else task_id, **extra)
+            if ref is None:
+                # The claim is unverified and may carry a token: echo it redacted only.
+                if not claim_unbound and verify(value, **extra) is not None:
+                    raise _refusal(
+                        f"survivor_unavailable: {flag} {_ext.redact(claim)} is live but does not "
+                        f"name {task_id}, so it is not evidence of THIS card's work",
+                        hint=True,
                     )
-            except _ext.RemoteUnavailable as exc:
                 raise SurvivorUnavailable(
                     f"survivor_unavailable: could not verify {flag} {_ext.redact(claim)} "
-                    f"against the remote ({_ext.redact(str(exc))})"
-                ) from exc
-            if unbound or ref.get("corroborated_by") in _WEAK_CORROBORATION:
-                # Record WHO authorised an unbound claim and WHY it is unbound:
-                # _record replays the survivor into the task's event log, so the
-                # authorisation is auditable.
-                ref = dict(ref, unbound=True, claimed_by=_claimant())
-                _log.warning("Unbound survivor accepted for task %s by %s (%s): %s",
-                             task_id, ref["claimed_by"],
-                             ref.get("corroborated_by") or "operator override",
-                             _ext.redact(claim))
-            if key is None:
-                # An unqualified claim means "the one lost repository", so two
-                # of them are ambiguous in exactly the way the qualified/
-                # unqualified mix below is. Before the flags became repeatable
-                # this was unreachable (one value each), and keeping the first
-                # silently recorded A as the provenance for a repository whose
-                # survivor may have been B -- a false entry in the recovery
-                # index, with no diagnostic, after a remote verification had
-                # already been spent on both.
-                if unqualified is not None:
-                    raise SurvivorUnavailable(
-                        "survivor_unavailable: two unqualified operator survivors are ambiguous; "
-                        "qualify each claim as <repository>=<claim>"
-                    )
-                unqualified = ref
-                continue
-            if key in resolved:
-                raise SurvivorUnavailable(
-                    f"survivor_unavailable: two operator survivors name the same repository ({key})"
+                    f"against the remote"
                 )
-            resolved[key] = ref
+        except _ext.RemoteUnavailable as exc:
+            raise SurvivorUnavailable(
+                f"survivor_unavailable: could not verify {flag} {_ext.redact(claim)} "
+                f"against the remote ({_ext.redact(str(exc))})"
+            ) from exc
+        if not claim_unbound and ref.get("corroborated_by") in _WEAK_CORROBORATION:
+            # Same refusal as an unrelated live claim, because it is the same
+            # fact: the remote answered, and what it said is not a tie to this
+            # card's work. Naming the field keeps the diagnostic honest -- the
+            # operator can read the PR's own prose and decide.
+            raise _refusal(
+                f"survivor_unavailable: {flag} {_ext.redact(claim)} names {task_id} only in "
+                f"its {ref['corroborated_by']}, which is a mention, not a tie to THIS "
+                f"card's work",
+                hint=True,
+            )
+        if claim_unbound:
+            # Record WHO authorised an unbound claim and WHY it is unbound:
+            # _record replays the survivor into the task's event log, so the
+            # authorisation is auditable.
+            ref = dict(ref, unbound=True, claimed_by=_claimant())
+            _log.warning("Unbound survivor accepted for task %s by %s (%s): %s",
+                         task_id, ref["claimed_by"],
+                         ref.get("corroborated_by") or "operator override",
+                         _ext.redact(claim))
+        if key is None:
+            # An unqualified claim means "the one lost repository", so two
+            # of them are ambiguous in exactly the way the qualified/
+            # unqualified mix below is. Before the flags became repeatable
+            # this was unreachable (one value each), and keeping the first
+            # silently recorded A as the provenance for a repository whose
+            # survivor may have been B -- a false entry in the recovery
+            # index, with no diagnostic, after a remote verification had
+            # already been spent on both.
+            if unqualified is not None:
+                raise SurvivorUnavailable(
+                    "survivor_unavailable: two unqualified operator survivors are ambiguous; "
+                    "qualify each claim as <repository>=<claim>"
+                )
+            unqualified = ref
+            continue
+        if key in resolved:
+            raise SurvivorUnavailable(
+                f"survivor_unavailable: two operator survivors name the same repository ({key})"
+            )
+        resolved[key] = ref
     if unqualified is not None:
         if resolved:
             raise SurvivorUnavailable(
@@ -647,6 +729,31 @@ def _claimant():
         return f"uid {uid}"
 
 
+def _bound(survivor):
+    """True when EVERY ref in ``survivor`` is bound to the card.
+
+    The single place "is this survivor standing delete authority?" is decided,
+    so the completion path and the reclamation path cannot answer it
+    differently -- which is exactly what happened: :func:`_reusable` guarded
+    `cleanup=True` against a RECORDED row, and an unbound-by-MENTION claim
+    reached the completion path through :func:`_external`'s ``explicit`` arm,
+    which `_reusable` never sees.
+
+    The ``isinstance`` guard is not defensive decoration. Every other reader of
+    ``previous["refs"]`` in this module applies it (``_unshrunk``, the cleanup
+    carry-forward, ``_merge_refs``, ``_vouched_repositories``) because a
+    recorded row can hold a non-dict entry -- a hand-edited board, a partially
+    written or legacy row, a future writer. ``ref.get(...)`` on one raises
+    ``AttributeError``, which is NOT in ``preserve()``'s ``except`` tuple nor
+    in ``remove_workspace_dir``'s, so it escapes past ``_hold()`` and skips the
+    fail-closed contract entirely -- the same class of outage as the ``_repos``
+    PermissionError incident. A malformed entry vouches for nothing, so it is
+    treated as UNBOUND rather than skipped: fail closed on junk.
+    """
+    refs = (survivor or {}).get("refs") or ()
+    return not any(not isinstance(ref, dict) or ref.get("unbound") for ref in refs)
+
+
 def _reusable(previous):
     """Reclamation may reuse a RECORDED survivor only if it was bound to the card.
 
@@ -668,8 +775,7 @@ def _reusable(previous):
     must re-assert against the tree in front of them rather than inherit a
     stale authorisation.
     """
-    refs = (previous or {}).get("refs") or ()
-    return previous if not any(ref.get("unbound") for ref in refs) else None
+    return previous if _bound(previous) else None
 
 
 def _loose_files(workspace, repos):

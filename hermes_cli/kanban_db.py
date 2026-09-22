@@ -6820,7 +6820,7 @@ def complete_task(
     fire_lifecycle_hook: bool = True,
     survivor_ref: Optional[Union[str, Sequence[str]]] = None,
     survivor_pr: Optional[Union[str, Sequence[str]]] = None,
-    survivor_unbound: bool = False,
+    survivor_unbound: Union[bool, str, Sequence[Union[bool, str]], None] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
