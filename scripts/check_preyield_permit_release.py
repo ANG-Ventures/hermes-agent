@@ -29,13 +29,32 @@ lands at an await".
 
 This guard therefore asks the right question:
 
-  1. does any statement between the acquire and the first following ``yield``
-     contain a raise-capable node (``Call`` / ``Attribute`` / ``Subscript`` /
-     ``Await``)?  — not "is there an await?"
-  2. if so, is that node enclosed in a ``try`` whose ``except BaseException`` /
-     bare ``except`` handler, or whose ``finally``, calls ``.release()``?
+  1. does any raise-capable node (``Call`` / ``Attribute`` / ``Subscript`` /
+     ``Await``) sit between the acquire and the first following ``yield``?
+     — not "is there an await?"
+  2. if so, is that node enclosed in a ``try`` that hands back EVERY object
+     acquired in the window on EVERY exceptional exit — i.e. a ``finally`` that
+     releases them all, or a handler chain that (a) includes an
+     ``except BaseException`` / bare ``except`` and (b) releases all of them in
+     *every* arm?
 
 A raise-capable node that answers yes to (1) and no to (2) is a violation.
+
+Three sharpenings over the first landed version (FleetReview on PR #860):
+
+  * **The window is positional, not line-based.**  ``await sem.acquire();
+    _LOG.info(...)`` and ``_LOG.info(...); yield`` put a leaking statement on
+    the acquire's or the yield's own line; a ``lineno``-only comparison skipped
+    both.  A node that *contains* the yield is not an offender (the yield runs
+    first), so the wrapper of an expression-form yield is not a false positive.
+  * **Every acquired object must be released**, not just some object.  At a
+    multi-permit site (``self.total`` + ``self.internal``, as in
+    ``gateway/turn_admission.py``) an ``except`` arm that releases only one of
+    them used to satisfy the check.
+  * **Every handler arm must release.**  A sibling ``except ValueError:`` that
+    re-raises without releasing leaks, even when a later
+    ``except BaseException:`` arm does release — the narrow arm is the one that
+    runs.
 
 DOES NOT COVER (stated boundary, not a hidden gap)
 --------------------------------------------------
@@ -51,8 +70,16 @@ DOES NOT COVER (stated boundary, not a hidden gap)
     ``except BaseException`` this guard demands is not reported against itself
     (``Semaphore.release`` does not raise).
   * **Release through an alias** (``rel = sem.release`` then ``rel()``).  No
-    live site spells it that way; a new spelling is WONTFIX unless it appears
-    in production code.
+    live site spells it that way.  Measured: such a site is FLAGGED (the alias
+    assignment itself is a raise-capable node in the window), so this errs
+    toward a false positive, not a miss; a new spelling is WONTFIX unless it
+    appears in production code.
+
+NO LONGER A GAP: releasing the WRONG object used to satisfy the check, because
+matching was by method name.  Release is now matched by RECEIVER
+(``self.total.release()`` -> ``"self.total"``), so an unrelated object's
+release no longer counts — the same change that makes a partial multi-permit
+release a violation.
 
 Exemption: put ``noqa: preyield-permit`` in a comment on the acquiring line or
 within the four lines above it when a site genuinely must not release.
@@ -60,10 +87,14 @@ within the four lines above it when a site genuinely must not release.
 Exit codes:
   0 — no violations
   1 — violations found
-  2 — script error (including: ZERO sites enumerated, i.e. vacuously green)
+  2 — script error (including: a directory SWEEP that enumerated ZERO sites,
+      i.e. vacuously green).  A per-FILE invocation that enumerates nothing is
+      exit 0: most files legitimately hold no sites, and exit 2 there made the
+      documented ``[paths...]`` form unusable from pre-commit.
 
 Usage:
-  python scripts/check_preyield_permit_release.py [paths...]
+  python scripts/check_preyield_permit_release.py            # sweep the repo
+  python scripts/check_preyield_permit_release.py [paths...] # per-file / per-dir
 """
 
 from __future__ import annotations
@@ -125,14 +156,57 @@ def _own_body_nodes(fn: ast.AST):
             stack.append(child)
 
 
-def _calls_named(node: ast.AST, names: set[str]) -> bool:
+def _receiver_key(call: ast.Call) -> str | None:
+    """Normalized text of the object a ``x.acquire()`` / ``x.release()`` runs on.
+
+    ``self.total.release()`` -> ``"self.total"``.  Matching on this instead of
+    on the method name alone is what makes a PARTIAL release at a multi-permit
+    site (release ``self.total``, forget ``self.internal``) a violation.
+    """
+    if not isinstance(call.func, ast.Attribute):
+        return None
+    try:
+        return ast.unparse(call.func.value)
+    except Exception:  # pragma: no cover - unparse is total on parsed trees
+        return None
+
+
+def _objects_called(node: ast.AST, names: set[str]) -> set[str]:
+    """Receivers of every ``<obj>.<name>()`` call anywhere under ``node``."""
+    found: set[str] = set()
     for sub in ast.walk(node):
         if (
             isinstance(sub, ast.Call)
             and isinstance(sub.func, ast.Attribute)
             and sub.func.attr in names
         ):
+            key = _receiver_key(sub)
+            if key is not None:
+                found.add(key)
+    return found
+
+
+def _released_in(body: list[ast.stmt]) -> set[str]:
+    released: set[str] = set()
+    for stmt in body:
+        released |= _objects_called(stmt, _RELEASE_METHODS)
+    return released
+
+
+def _handler_exits(handler: ast.ExceptHandler) -> bool:
+    """True if this arm leaves the generator instead of falling through.
+
+    An arm that SWALLOWS (no ``raise``/``return``) continues on to the yield
+    with the permit still legitimately held — demanding a release there would
+    be a false positive, and acting on it would be a double release.  Only an
+    arm that exits owes the permit back.
+    """
+    for stmt in reversed(handler.body):
+        if isinstance(stmt, (ast.Raise, ast.Return)):
             return True
+        if isinstance(stmt, ast.Pass):
+            continue
+        break
     return False
 
 
@@ -176,16 +250,31 @@ def _is_baseexception_handler(handler: ast.ExceptHandler) -> bool:
     return False
 
 
-def _try_releases(node: ast.Try) -> bool:
-    for handler in node.handlers:
-        if _is_baseexception_handler(handler) and any(
-            _calls_named(stmt, _RELEASE_METHODS) for stmt in handler.body
-        ):
-            return True
-    return any(_calls_named(stmt, _RELEASE_METHODS) for stmt in node.finalbody)
+def _try_releases(node: ast.Try, required: set[str]) -> bool:
+    """True if ``node`` hands back EVERY object in ``required`` on any raise.
+
+    Two sound shapes:
+
+    * a ``finally`` that releases them all (runs on every exceptional exit), or
+    * a handler chain that covers ``BaseException`` and, in EVERY arm that
+      exits, releases them all.  A sibling ``except ValueError:`` arm that
+      re-raises without releasing is the leak an any-arm check missed.
+    """
+    if _released_in(node.finalbody) >= required:
+        return True
+
+    exiting = [h for h in node.handlers if _handler_exits(h)]
+    if not exiting:
+        return False
+    if not any(_is_baseexception_handler(h) for h in exiting):
+        # Nothing here catches a cancel; the window is still unprotected.
+        return False
+    return all(_released_in(h.body) >= required for h in exiting)
 
 
-def _releases_on_the_way_out(node: ast.AST, parents: dict[int, tuple[ast.AST, str]]) -> bool:
+def _releases_on_the_way_out(
+    node: ast.AST, parents: dict[int, tuple[ast.AST, str]], required: set[str]
+) -> bool:
     """True if ``node`` sits in the BODY of a try that releases on the way out."""
     current: ast.AST | None = node
     while current is not None:
@@ -193,13 +282,19 @@ def _releases_on_the_way_out(node: ast.AST, parents: dict[int, tuple[ast.AST, st
         if entry is None:
             return False
         parent, field = entry
-        if isinstance(parent, ast.Try) and field == "body" and _try_releases(parent):
+        if (
+            isinstance(parent, ast.Try)
+            and field == "body"
+            and _try_releases(parent, required)
+        ):
             return True
         current = parent
     return False
 
 
-def _in_release_machinery(node: ast.AST, parents: dict[int, tuple[ast.AST, str]]) -> bool:
+def _in_release_machinery(
+    node: ast.AST, parents: dict[int, tuple[ast.AST, str]], required: set[str]
+) -> bool:
     """True if ``node`` IS part of a releasing handler/finally — the guard itself.
 
     ``semaphore.release()`` inside the very ``except BaseException`` this check
@@ -216,7 +311,7 @@ def _in_release_machinery(node: ast.AST, parents: dict[int, tuple[ast.AST, str]]
         if (
             isinstance(parent, ast.Try)
             and field in {"handlers", "finalbody"}
-            and _try_releases(parent)
+            and _try_releases(parent, required)
         ):
             return True
         current = parent
@@ -279,6 +374,18 @@ def _exempt(lines: list[str], lineno: int) -> bool:
     return any(EXEMPT_MARKER in line for line in window)
 
 
+def _start(node: ast.AST) -> tuple[int, int]:
+    return (getattr(node, "lineno", 0), getattr(node, "col_offset", 0))
+
+
+def _end(node: ast.AST) -> tuple[int, int]:
+    """Source position just past ``node``, falling back to its start."""
+    end_lineno = getattr(node, "end_lineno", None)
+    if end_lineno is None:
+        return _start(node)
+    return (end_lineno, getattr(node, "end_col_offset", 0) or 0)
+
+
 def scan_source(source: str, filepath: str) -> tuple[list[dict], list[dict]]:
     """Return (sites, violations) for one module's text.
 
@@ -308,33 +415,44 @@ def scan_source(source: str, filepath: str) -> tuple[list[dict], list[dict]]:
         ]
         if not acquires:
             continue
-        acquire = min(acquires, key=lambda n: (n.lineno, n.col_offset))
+        acquire = min(acquires, key=_start)
 
         acquire_stmt = _enclosing_stmt(acquire, parents)
-        window_start = (
-            getattr(acquire_stmt, "end_lineno", None) or acquire.lineno
-            if acquire_stmt is not None
-            else acquire.lineno
-        )
+        # Positional, not line-based: `await sem.acquire(); _LOG.info(...)`
+        # puts a leaking statement on the acquire's OWN line, which a
+        # lineno-only bound skipped.
+        window_start = _end(acquire_stmt if acquire_stmt is not None else acquire)
         acquire_tries = _tries_wrapping(acquire, parents)
 
         yields = [
             node
             for node in body_nodes
             if isinstance(node, (ast.Yield, ast.YieldFrom))
-            and node.lineno > acquire.lineno
+            and _start(node) >= window_start
         ]
         if not yields:
             # No yield after the acquire: not the pre-yield window this guard
             # governs (the permit is not handed to a caller at all here).
             continue
-        first_yield = min(yields, key=lambda n: (n.lineno, n.col_offset))
+        first_yield = min(yields, key=_start)
+        yield_start = _start(first_yield)
+
+        # Every object acquired before the yield must be handed back, not just
+        # some object: a partial release at a multi-permit site still leaks.
+        required = {
+            key
+            for node in acquires
+            if _end(node) <= yield_start
+            for key in [_receiver_key(node)]
+            if key is not None
+        }
 
         site = {
             "file": filepath,
             "function": fn.name,
             "acquire_line": acquire.lineno,
             "yield_line": first_yield.lineno,
+            "acquired_objects": sorted(required),
             "exempt": _exempt(lines, acquire.lineno),
         }
         sites.append(site)
@@ -345,13 +463,17 @@ def scan_source(source: str, filepath: str) -> tuple[list[dict], list[dict]]:
         for node in body_nodes:
             if not isinstance(node, _RAISE_CAPABLE):
                 continue
-            if not (window_start < node.lineno < first_yield.lineno):
+            if _start(node) < window_start:
+                continue
+            # A node that CONTAINS the yield (the wrapper of an
+            # expression-form yield) is not an offender: the yield runs first.
+            if _end(node) > yield_start:
                 continue
             if _in_acquire_failure_path(node, parents, acquire_tries):
                 continue
-            if _in_release_machinery(node, parents):
+            if _in_release_machinery(node, parents, required):
                 continue
-            if _releases_on_the_way_out(node, parents):
+            if _releases_on_the_way_out(node, parents, required):
                 continue
             offenders.append(node)
 
@@ -386,6 +508,11 @@ def iter_python_files(roots: list[Path]) -> list[Path]:
 def main(argv: list[str]) -> int:
     repo_root = Path(__file__).resolve().parent.parent
     roots = [Path(a).resolve() for a in argv[1:]] or [repo_root]
+    # A named FILE is a per-file invocation (pre-commit / lint-staged): most
+    # files hold zero sites, so vacuity is normal there and exit 2 made the
+    # documented `[paths...]` usage unusable. A directory root is a SWEEP,
+    # where enumerating nothing means the discovery shape broke.
+    sweeping = any(not root.is_file() for root in roots)
 
     all_sites: list[dict] = []
     all_violations: list[dict] = []
@@ -410,7 +537,7 @@ def main(argv: list[str]) -> int:
         all_sites.extend(sites)
         all_violations.extend(violations)
 
-    if not all_sites:
+    if not all_sites and sweeping:
         print(
             "❌ enumerated ZERO acquire-before-yield sites across "
             f"{scanned} @asynccontextmanager module(s) — this guard is now "
