@@ -492,3 +492,69 @@ def test_a_fully_measured_session_never_acquires_the_latch(real_session_db):
     text = "\n".join(render_thin_last_turn_lines(snap, "resident"))
     assert "Total (billed in+out): 8,240" in text
     assert "unknown" not in text
+
+
+def _moa_client(agent, response, *, advisor_usage):
+    """Give the agent a client that speaks the real MoA accounting seam.
+
+    ``agent/conversation_loop.py`` folds advisor usage by duck-typing
+    ``consume_reference_usage`` on ``agent.client`` — the same contract
+    ``MoAChatCompletions`` implements — so a double carrying that one method
+    drives the real fold rather than a re-implementation of it.
+    """
+    client = MagicMock()
+    client.chat.completions.create.return_value = response
+    client.consume_reference_usage = lambda: (advisor_usage, None)
+    del client.consume_reference_pricing_calls
+    agent.client = client
+    return agent
+
+
+def test_one_unmeasured_advisor_does_not_blank_the_window_occupancy(real_session_db):
+    """r6 round-4 finding 2, pinned at the CALL SITE, through the real loop.
+
+    The unit pins on ``_compressor_usage_dict`` cannot see which usage the
+    conversation loop hands it: swapping ``aggregator_usage`` back to
+    ``canonical_usage`` at that site left every one of them green. This drives
+    ``run_conversation()`` with a MoA client whose advisor returned no payload,
+    so ``CanonicalUsage.__add__`` makes the fold's ``input_tokens_unknown``
+    absorbing — and asserts the compressor still received the AGGREGATOR's real
+    prompt count instead of skipping the update.
+    """
+    from agent.usage_pricing import CanonicalUsage
+
+    agent = _make_agent(real_session_db, _response(usage=_MEASURED))
+    _moa_client(agent, _response(usage=_MEASURED), advisor_usage=CanonicalUsage.fully_unknown())
+
+    agent.run_conversation("moa turn")
+
+    assert agent.context_compressor.last_prompt_tokens == 4000, (
+        "the aggregator measured this window; one unmeasured advisor must not "
+        "blank a real occupancy reading"
+    )
+
+
+def test_measured_advisor_fanout_is_not_counted_as_window_occupancy(real_session_db):
+    """NARROWNESS control: the fix must not swap one wrong number for another.
+
+    With every advisor MEASURED the gate passes either way, so this is the arm
+    that catches a 'fix' that simply fed the fold through — advisor fan-out
+    tokens were never part of THIS conversation's prompt.
+    """
+    from agent.usage_pricing import CanonicalUsage
+
+    agent = _make_agent(real_session_db, _response(usage=_MEASURED))
+    _moa_client(
+        agent,
+        _response(usage=_MEASURED),
+        advisor_usage=CanonicalUsage(input_tokens=90_000, output_tokens=2_000),
+    )
+
+    agent.run_conversation("moa turn")
+
+    assert agent.context_compressor.last_prompt_tokens == 4000, (
+        "advisor fan-out is not window occupancy"
+    )
+    # The turn's REPORTED counts still carry the advisor spend — the pre-fold
+    # read narrows the compressor's view only.
+    assert agent.session_input_tokens == 94_000

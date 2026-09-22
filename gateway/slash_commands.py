@@ -254,7 +254,16 @@ def _resident_thin_snapshot(agent, as_int=None) -> dict:
         "reasoning_tokens": as_int(getattr(agent, "session_reasoning_tokens", 0)),
     }
     for flag in _RESIDENT_UNKNOWN_FLAGS:
-        if getattr(agent, f"session_{flag}", False):
+        # `is True`, not truthiness. The latch is written as a real bool by
+        # `agent/agent_init.py` (False) and `agent/conversation_loop.py` (True),
+        # so any OTHER value means the attribute was never initialised on this
+        # object — and the dominant such object is a test double. A bare
+        # `getattr(..., False)` reads a `MagicMock`'s auto-created child
+        # attribute as TRUTHY, which collapsed every measured session counter to
+        # `unknown` on the resident lane (tests/gateway/test_usage_command.py).
+        # The five counters above are coerced through `as_int` for the same
+        # reason; this is the flags' half of that contract.
+        if getattr(agent, f"session_{flag}", False) is True:
             snap[flag] = True
     return snap
 

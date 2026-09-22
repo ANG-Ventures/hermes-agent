@@ -617,3 +617,58 @@ def test_control_fully_unknown_still_sets_every_discriminator():
     usage = CanonicalUsage.fully_unknown()
     for key in USAGE_UNKNOWN_FIELDS:
         assert getattr(usage, key) is True, key
+
+
+def test_control_an_uninitialised_latch_attribute_is_not_an_unknown():
+    """A non-bool `session_*_unknown` must read as NOT-unknown, not as truthy.
+
+    The latch is written as a real bool by `agent/agent_init.py` (False) and
+    `agent/conversation_loop.py` (True), so any other value means the attribute
+    was never initialised on this object. The dominant such object is a
+    `MagicMock`, which auto-creates every attribute access as a truthy child —
+    so the original `if getattr(agent, f"session_{flag}", False):` collapsed a
+    fully measured session to `unknown` on the resident lane and turned
+    `tests/gateway/test_usage_command.py` red in CI.
+
+    Every other pin in this file builds its agent from `SimpleNamespace` or a
+    real `AIAgent`, which is precisely why none of them could see this. The five
+    counters beside these flags are coerced through `as_int` for the same
+    reason; this is the flags' half of that contract.
+    """
+    from unittest.mock import MagicMock
+
+    from gateway.slash_commands import (
+        _resident_thin_snapshot, render_thin_last_turn_lines,
+    )
+
+    agent = MagicMock()
+    agent.session_input_tokens = 35_000
+    agent.session_output_tokens = 10_000
+    agent.session_cache_read_tokens = 5_000
+    agent.session_cache_write_tokens = 2_000
+    agent.session_reasoning_tokens = 0
+
+    snap = _resident_thin_snapshot(agent)
+    assert not any(k.endswith("_unknown") for k in snap), (
+        "a mock's auto-created attribute is not a declared UNKNOWN"
+    )
+    text = "\n".join(render_thin_last_turn_lines(snap, "resident"))
+    assert "35,000" in text
+    assert "unknown" not in text
+
+
+def test_control_the_latch_still_fires_for_a_real_declared_unknown():
+    """NARROWNESS: `is True` must not stop a genuine latch from being read."""
+    from unittest.mock import MagicMock
+
+    from gateway.slash_commands import _resident_thin_snapshot
+
+    agent = MagicMock()
+    agent.session_input_tokens = 35_000
+    agent.session_output_tokens = 10_000
+    agent.session_cache_read_tokens = 0
+    agent.session_cache_write_tokens = 0
+    agent.session_reasoning_tokens = 0
+    agent.session_usage_unknown = True
+
+    assert _resident_thin_snapshot(agent).get("usage_unknown") is True
