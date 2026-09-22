@@ -751,26 +751,298 @@ def test_a_recorded_survivor_with_nothing_loose_is_kept_and_reclaimable(
         (tid,)).fetchone()["held_reason"] is None
 
 
+def _seed_unpublished_empty_diff_repo(path, bare):
+    """A repo whose HEAD is UNPUBLISHED but whose tree equals the published base.
+
+    `_remote_survivor()` finds no published ancestor (HEAD is not on the
+    remote), and `_snapshot()` against that base is empty -- so the capture
+    loop appends no ref, no patch and no bundle for it. That is the only shape
+    that reaches the `elif claimed:` arm with `repos` non-empty, i.e. the shape
+    in which `carried` is actually populated.
+    """
+    def git(*args):
+        return subprocess.run(["git", "-C", str(path), *args],
+                              capture_output=True, check=True).stdout.decode().strip()
+
+    path.mkdir(parents=True)
+    git("init", "-b", "main")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.invalid")
+    (path / "a.py").write_text("value = 1\n")
+    git("add", ".")
+    git("commit", "-m", "base")
+    git("init", "--bare", str(bare))
+    git("remote", "add", "origin", str(bare))
+    git("push", "origin", "HEAD:main")
+    base = git("rev-parse", "HEAD")
+    # An unpublished commit with the SAME tree: not an ancestor of any remote
+    # tip, and `git diff base` is empty.
+    git("commit", "--allow-empty", "-m", "unpublished, empty tree delta")
+    assert git("rev-parse", "HEAD") != base
+    return base
+
+
 def test_the_carried_ref_is_never_recorded_twice(board, remote, tmp_path, monkeypatch):
-    """The carried entries seed `refs` AND are re-added by the external merge on
-    the `elif claimed:` arm. One repository must appear exactly once: a
-    duplicated entry makes the recovery index ambiguous about which is current.
+    """REGRESSION: the carried entries seed `refs` AND were re-added verbatim by
+    the external merge on the `elif claimed:` arm, so one repository was
+    recorded twice -- and a consumer reading the recovery index could not tell
+    which entry was current.
+
+    The previous version of this test left NOTHING on disk, which makes
+    `carried` provably empty (the carry-forward is gated on `if repos:`) and
+    the merge a no-op -- it could not fail. This drives the real path: `repos`
+    is non-empty but the in-tree capture yields nothing for it.
     """
     import hermes_cli.kanban_survivor as survivor
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
-    tid = kb.create_task(board, title="no in-tree capture, carried ref")
+    tid = kb.create_task(board, title="carried ref plus an empty in-tree capture")
     ws = kb.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
+    kept_base = _seed_unpublished_empty_diff_repo(ws / "kept", tmp_path / "dup-kept.git")
     recorded = {"kind": "ref", "refs": [
-        {"repository": "gone", "sha": HEAD, "pr": PR, "external": True}]}
-    # `gone` is in bases and vouched for; nothing at all is left on disk.
-    _seed_survivor(board, tid, ws, {"gone": STALE}, recorded)
-    with kb.write_txn(board):
-        board.execute("UPDATE task_runs SET metadata = ? WHERE task_id = ?",
-                      (json.dumps({"changed_files": ["a.py"]}), tid))
+        {"repository": "gone", "sha": HEAD, "pr": PR, "external": True},
+        {"repository": "kept", "sha": kept_base, "remote": "origin"}]}
+    _seed_survivor(board, tid, ws, {"kept": kept_base, "gone": STALE}, recorded)
 
     out = survivor.preserve(board, tid, cleanup=True, workspace=ws)
 
     repos = [ref["repository"] for ref in out["refs"]]
+    assert sorted(repos) == ["gone", "kept"], out["refs"]
     assert len(repos) == len(set(repos)), f"duplicate refs: {out['refs']}"
+    assert next(r for r in out["refs"] if r["repository"] == "gone")["pr"] == PR
+
+
+# --- reclamation must not shrink a PATCH-shaped recovery index -------------
+#
+# FleetReview P1 (#842 @ 7afe1b9e): `_vouched_repositories()` counts refs and
+# bundles, and deliberately NOT patches -- a patch keys no repository in the
+# recorded row at all (only the `implementation.json` sidecar does). So the
+# repository-keyed carry-forward can never reach a patch pointer, and the
+# cleanup re-capture rewrites the row as `kind: "ref"`, i.e. "everything is
+# pushed", while the only copy of that uncommitted work is an orphaned
+# attachment.
+
+
+def _patch_survivor(tmp_path, refs):
+    return {"kind": "patch", "notice": "NOT PUSHED", "bundles": [], "refs": list(refs),
+            "path": str(tmp_path / "implementation.patch"), "sha256": "e" * 64, "bytes": 512,
+            "sidecar": str(tmp_path / "implementation.json")}
+
+
+def test_reclamation_carries_a_patch_pointer_the_recapture_cannot_reproduce(
+        board, remote, tmp_path, monkeypatch):
+    """REGRESSION: `kept` was dirty at completion and captured as a patch; by
+    cleanup its tree is clean and published, so the re-capture produces only a
+    ref. The patch pointer must survive, not be relabelled away.
+    """
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    tid = kb.create_task(board, title="patch survivor, clean at cleanup")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws.mkdir(parents=True, exist_ok=True)
+    kept_head = _seed_published_repo(ws / "kept", tmp_path / "patch-kept.git")
+    recorded = _patch_survivor(tmp_path, [{"repository": "kept", "sha": kept_head,
+                                           "remote": "origin"}])
+    _seed_survivor(board, tid, ws, {"kept": kept_head}, recorded)
+
+    out = survivor.preserve(board, tid, cleanup=True, workspace=ws)
+
+    assert out["path"] == recorded["path"], "the stored patch pointer must survive"
+    assert out["sha256"] == recorded["sha256"] and out["bytes"] == recorded["bytes"]
+    assert out["sidecar"] == recorded["sidecar"]
+    assert out["kind"] == "patch", "a survivor still holding unpushed work must not become `ref`"
+    saved = json.loads(board.execute(
+        "SELECT survivor FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["survivor"])
+    assert saved["path"] == recorded["path"], saved
+
+
+def test_reclamation_carries_a_patch_pointer_for_a_repo_cloned_after_dispatch(
+        board, remote, tmp_path, monkeypatch):
+    """REGRESSION: same class via the other trigger. `extra/` was cloned AFTER
+    dispatch, so it is in no `bases` entry and in no repository-keyed part of
+    the survivor -- `missing` and `absent` are both empty, the relaxation never
+    runs, and the rewrite orphans the patch holding its only unpushed diff.
+    """
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    tid = kb.create_task(board, title="patch survivor, repo cloned after dispatch")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws.mkdir(parents=True, exist_ok=True)
+    kept_head = _seed_published_repo(ws / "kept", tmp_path / "late-patch-kept.git")
+    recorded = _patch_survivor(tmp_path, [{"repository": "kept", "sha": kept_head,
+                                           "remote": "origin"}])
+    # `bases` knew only `kept`; the patch covered `extra`, which is now gone.
+    _seed_survivor(board, tid, ws, {"kept": kept_head}, recorded)
+
+    out = survivor.preserve(board, tid, cleanup=True, workspace=ws)
+
+    assert out["path"] == recorded["path"] and out["sidecar"] == recorded["sidecar"], out
+    assert out["kind"] == "patch", out
+
+
+def test_a_clean_recapture_without_a_recorded_patch_stays_a_ref(
+        board, remote, tmp_path, monkeypatch):
+    """Teeth for the two tests above: the carry-forward keys on the RECORDED
+    survivor holding a patch pointer, never on `cleanup` itself. With nothing
+    unpushed recorded, reclamation still records a plain `ref`.
+    """
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    tid = kb.create_task(board, title="no recorded patch")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws.mkdir(parents=True, exist_ok=True)
+    kept_head = _seed_published_repo(ws / "kept", tmp_path / "plain-kept.git")
+    _seed_survivor(board, tid, ws, {"kept": kept_head},
+                   {"kind": "ref", "refs": [{"repository": "kept", "sha": kept_head,
+                                             "remote": "origin"}]})
+
+    out = survivor.preserve(board, tid, cleanup=True, workspace=ws)
+
+    assert out["kind"] == "ref", out
+    assert "path" not in out and "sidecar" not in out, out
+
+
+# --- a multi-repository loss must have a REACHABLE remedy ------------------
+#
+# FleetReview P1 (#842 @ 7afe1b9e): the `len(missing) > 1` refusal was correct
+# about the corruption (one flag names one remote) but left the state with no
+# exit at all -- the completion always raised and the workspace was HELD
+# forever, while the message still advertised `--survivor-pr`. The flags are
+# now repeatable and repository-qualified, so the operator can record TRUE
+# per-repository provenance instead of choosing between a lie and a dead end.
+
+
+def test_qualified_operator_survivors_cover_two_vanished_repositories(
+        board, remote, tmp_path, monkeypatch):
+    """REGRESSION: the state the `len(missing) > 1` guard made unreachable."""
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    tid = kb.create_task(board, title="two vanished repositories, qualified claims")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws.mkdir(parents=True, exist_ok=True)
+    kept_head = _seed_published_repo(ws / "kept", tmp_path / "qual-kept.git")
+    kb.set_workspace_path(board, tid, ws)
+    with kb.write_txn(board):
+        board.execute(
+            "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET bases = excluded.bases",
+            (tid, json.dumps({"kept": kept_head, "gone1": STALE, "gone2": STALE})),
+        )
+
+    out = survivor.preserve(board, tid, workspace=ws,
+                            survivor_pr=[f"gone1={PR}", "gone2=example/other#12"])
+
+    by_repo = {ref["repository"]: ref for ref in out["refs"]}
+    assert set(by_repo) == {"gone1", "gone2", "kept"}, out["refs"]
+    assert by_repo["gone1"]["pr"] == PR
+    assert by_repo["gone2"]["pr"] == "example/other#12", (
+        "each vanished repository must carry its OWN remote, not a copy of the first"
+    )
+    assert by_repo["kept"]["remote"] == "origin"
+    assert board.execute(
+        "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["held_reason"] is None
+
+
+def test_a_partially_qualified_claim_still_fails_closed(board, remote, tmp_path, monkeypatch):
+    """Teeth: the remedy is per-repository provenance, not a bypass. A claim
+    that names only one of two vanished repositories is INCOMPLETE and must
+    still hold -- the uncovered one would otherwise be dropped silently.
+    """
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    tid = kb.create_task(board, title="partially qualified claim")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws.mkdir(parents=True, exist_ok=True)
+    kept_head = _seed_published_repo(ws / "kept", tmp_path / "partial-qual-kept.git")
+    kb.set_workspace_path(board, tid, ws)
+    with kb.write_txn(board):
+        board.execute(
+            "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET bases = excluded.bases",
+            (tid, json.dumps({"kept": kept_head, "gone1": STALE, "gone2": STALE})),
+        )
+
+    with pytest.raises(ValueError) as excinfo:
+        survivor.preserve(board, tid, workspace=ws, survivor_pr=[f"gone1={PR}"])
+
+    assert "gone2" in str(excinfo.value) and "gone1" not in str(excinfo.value), str(excinfo.value)
+    assert board.execute(
+        "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["held_reason"] is not None
+
+
+def test_the_multi_repository_refusal_names_a_remedy_that_actually_works(
+        board, remote, tmp_path, monkeypatch):
+    """The unqualified refusal is preserved, but its hint must be usable: the
+    exact form it prints has to be the form that succeeds.
+    """
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    tid = kb.create_task(board, title="unqualified claim, two vanished repositories")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws.mkdir(parents=True, exist_ok=True)
+    kept_head = _seed_published_repo(ws / "kept", tmp_path / "hint-kept.git")
+    kb.set_workspace_path(board, tid, ws)
+    with kb.write_txn(board):
+        board.execute(
+            "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET bases = excluded.bases",
+            (tid, json.dumps({"kept": kept_head, "gone1": STALE, "gone2": STALE})),
+        )
+
+    with pytest.raises(ValueError) as excinfo:
+        survivor.preserve(board, tid, workspace=ws, survivor_pr=PR)
+
+    message = str(excinfo.value)
+    assert "gone1" in message and "gone2" in message
+    assert "<repository>=<claim>" in message, message
+    assert "--survivor-pr gone1=" in message, (
+        "the hint must name the qualified form, not a flag shape that cannot satisfy this state"
+    )
+
+    # And that form actually completes the card.
+    out = survivor.preserve(board, tid, workspace=ws,
+                            survivor_pr=[f"gone1={PR}", f"gone2={PR}"])
+    assert {ref["repository"] for ref in out["refs"]} == {"gone1", "gone2", "kept"}
+
+
+def test_a_repository_qualifier_never_swallows_a_bare_claim(board, remote):
+    """Teeth for the qualifier parser: a bare PR slug and a bare URL#sha both
+    contain characters the prefix grammar must refuse, or the historical
+    single-claim shape would be silently reinterpreted.
+    """
+    from hermes_cli import kanban_survivor as survivor
+
+    assert survivor._split_qualifier(PR) == (None, PR)
+    assert survivor._split_qualifier("https://github.com/o/r.git#" + HEAD) == (
+        None, "https://github.com/o/r.git#" + HEAD)
+    # The only cases that can actually be MIS-split are claims that contain an
+    # `=` of their own. The prefix grammar must refuse every one of them.
+    for bare in (f"https://host/p.git?trk=1#{HEAD}", f"ssh://git@host/p.git?a=b#{HEAD}",
+                 f"git@github.com:o/r.git?x=y#{HEAD}"):
+        assert survivor._split_qualifier(bare) == (None, bare), bare
+    assert survivor._split_qualifier(f"sub/dir={PR}") == ("sub/dir", PR)
+    assert survivor._split_qualifier(f".={PR}") == (".", PR)
+
+
+def test_mixing_a_qualified_and_an_unqualified_claim_is_refused(board, remote):
+    """An unqualified claim means "the one lost repository"; combining it with
+    a qualified one leaves which repository it covers ambiguous.
+    """
+    from hermes_cli import kanban_survivor as survivor
+
+    tid, ws = stale_card(board, loose=False)
+
+    with pytest.raises(ValueError) as excinfo:
+        survivor.preserve(board, tid, workspace=ws, survivor_pr=[PR, f"gone={PR}"])
+
+    assert "ambiguous" in str(excinfo.value), str(excinfo.value)

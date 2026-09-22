@@ -93,7 +93,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Union
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -6818,8 +6818,8 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
-    survivor_ref: Optional[str] = None,
-    survivor_pr: Optional[str] = None,
+    survivor_ref: Optional[Union[str, Sequence[str]]] = None,
+    survivor_pr: Optional[Union[str, Sequence[str]]] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
