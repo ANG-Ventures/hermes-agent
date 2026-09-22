@@ -3478,6 +3478,15 @@ def repair_db(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    # Same structural live-board guard connect() carries, at the OTHER
+    # read-write door to a kanban_db_path()-derived board. repair_db() opens
+    # the file rw through _sqlite_connect() without ever calling connect(),
+    # so the connect()-side gate never runs here. Placed immediately after
+    # the path is resolved — before the exists() probe, before
+    # _cross_process_init_lock — so a refusal creates no lock file, no
+    # quarantine .bak, and no directories: refuse before any filesystem
+    # effect, exactly like connect().
+    _assert_live_board_write_allowed(path)
     try:
         resolved = path.resolve()
     except OSError:
