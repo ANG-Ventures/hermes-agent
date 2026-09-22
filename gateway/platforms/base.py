@@ -8105,9 +8105,13 @@ class BasePlatformAdapter(ABC):
         self._expected_cancelled_tasks.clear()
         self._session_tasks.clear()
         # Flush pending messages to disk before clearing (#72680).
+        # Off-loop: each payload ends in an unbounded os.replace, and this
+        # runs while the other adapters are still draining.
         try:
-            from gateway.shutdown_flush import flush_pending_to_file
-            flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
+            from gateway.shutdown_flush import flush_pending_to_file_async
+            await flush_pending_to_file_async(
+                self._pending_messages, reason="adapter_shutdown"
+            )
         except Exception:
             pass
         self._pending_messages.clear()

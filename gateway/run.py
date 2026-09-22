@@ -20322,9 +20322,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # When FTS5 corruption prevents message persistence, the
             # in-memory pending text is the only surviving copy.  Clearing
             # without flushing causes permanent data loss.
+            # Off-loop: each payload ends in an unbounded os.replace, and
+            # this runs inside the timed shutdown path.
             try:
-                from gateway.shutdown_flush import flush_pending_to_file
-                flush_pending_to_file(dict(self._pending_messages), reason="shutdown")
+                from gateway.shutdown_flush import flush_pending_to_file_async
+                await flush_pending_to_file_async(
+                    dict(self._pending_messages), reason="shutdown"
+                )
             except Exception:
                 pass
             # On the real runner these are live SessionState views whose

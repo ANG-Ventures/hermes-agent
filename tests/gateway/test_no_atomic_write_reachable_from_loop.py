@@ -90,7 +90,6 @@ def _repo_root() -> Path:
 REACHABLE_BASELINE = frozenset({
     "gateway/lifecycle_ledger.py record_startup_async -> atomic_json_write",
     "gateway/platforms/api_server.py _handle_artifact_upload -> os.fsync",
-    "gateway/platforms/base.py cancel_background_tasks -> atomic_json_write",
     "gateway/platforms/weixin.py _poll_loop -> atomic_json_write",
     "gateway/platforms/weixin.py qr_login -> atomic_json_write",
     "gateway/run.py _finalize_shutdown_agents -> atomic_json_write",

@@ -261,6 +261,157 @@ def flush_pending_to_file(
     return flushed
 
 
+# ---------------------------------------------------------------------------
+# Off-loop shutdown-flush lane
+# ---------------------------------------------------------------------------
+#
+# Deliberately a SEPARATE executor from ``_SPOOL_LANE`` above, and deliberately
+# not ``asyncio.to_thread``:
+#
+# * not the loop's default executor (which is what ``to_thread`` uses) —
+#   that pool is shared with every other ``to_thread`` caller in the process,
+#   and the shutdown path is precisely when it is busiest.  Measured: with the
+#   default executor saturated, the flush was still QUEUED when the
+#   per-adapter deadline fired and the payload never reached disk
+#   (``payload files on disk: 0``).
+# * not the spool lane — that lane carries a FIFO backlog of cap-dropped
+#   transcript messages, and queueing shutdown behind it would couple the
+#   shutdown deadline to an unrelated arrival rate.
+_FLUSH_LANE: Optional[ThreadPoolExecutor] = None
+_FLUSH_LANE_LOCK = threading.Lock()
+_FLUSH_LANE_STATE = threading.local()
+_FLUSH_PROGRESS = threading.Condition(threading.Lock())
+_FLUSH_SUBMITTED = 0
+_FLUSH_COMPLETED = 0
+
+
+def _get_flush_lane() -> ThreadPoolExecutor:
+    """The single worker that owns every off-loop pending-message flush."""
+    global _FLUSH_LANE
+    with _FLUSH_LANE_LOCK:
+        if _FLUSH_LANE is None:
+            _FLUSH_LANE = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="shutdown-flush"
+            )
+        return _FLUSH_LANE
+
+
+def _on_flush_lane() -> bool:
+    return getattr(_FLUSH_LANE_STATE, "in_lane", False)
+
+
+def _run_on_flush_lane(pending: Dict[str, Any], reason: str) -> int:
+    """Lane body: perform the real flush, then publish completion."""
+    global _FLUSH_COMPLETED
+    _FLUSH_LANE_STATE.in_lane = True
+    try:
+        return flush_pending_to_file(pending, reason=reason)
+    finally:
+        _FLUSH_LANE_STATE.in_lane = False
+        with _FLUSH_PROGRESS:
+            _FLUSH_COMPLETED += 1
+            _FLUSH_PROGRESS.notify_all()
+
+
+def fence_flush_lane(timeout: float = 30.0) -> bool:
+    """Block until every flush queued BEFORE this call has landed.
+
+    Returns ``True`` when that work drained within *timeout*.  A no-op when
+    called from the lane thread itself, so a lane-initiated drain cannot
+    deadlock waiting on its own completion.
+    """
+    if _on_flush_lane():
+        return True
+    with _FLUSH_PROGRESS:
+        target = _FLUSH_SUBMITTED
+        return _FLUSH_PROGRESS.wait_for(
+            lambda: _FLUSH_COMPLETED >= target, timeout=timeout
+        )
+
+
+def _fence_flush_lane_at_exit() -> None:
+    """Drain queued pending-message flushes before the interpreter exits.
+
+    A flush that is still in the lane when the process goes away takes the
+    only surviving copy of those messages with it (#72680).  Registered at
+    import time so EVERY exit path is covered, including the one where the
+    awaiting coroutine was cancelled at its deadline and nobody is left to
+    wait for the write.
+    """
+    if not fence_flush_lane(timeout=10.0):
+        logger.warning(
+            "Pending-message flush lane did not drain within 10s at exit; "
+            "queued pending message(s) may be lost"
+        )
+
+
+atexit.register(_fence_flush_lane_at_exit)
+
+
+async def flush_pending_to_file_async(
+    pending: Dict[str, Any],
+    *,
+    reason: str = "shutdown",
+) -> int:
+    """Event-loop-safe :func:`flush_pending_to_file`.
+
+    Both production callers are coroutines on the shutdown path —
+    ``BasePlatformAdapter.cancel_background_tasks`` and the runner's
+    ``_stop_impl_body`` — and the flush runs one ``_write_payload`` per
+    pending session, each ending in an mkstemp + fsync + ``os.replace``
+    whose tail is unbounded under filesystem pressure.  On the loop thread
+    that stalls every other task in the process: the remaining adapters
+    still draining, the shutdown watchdog's heartbeat, the drain deadline
+    itself.  Measured with a single rename held for 0.3s, the on-loop
+    flush let the loop tick **0** times; on the lane, 31.
+
+    Unlike the transcript spool lane this does NOT queue and return.  These
+    payloads are the only surviving copy of user messages the DB could not
+    take (#72680), and the caller is about to ``.clear()`` the dict they
+    came from — so the caller must not resume until the write has landed.
+
+    Durability must survive cancellation.  ``cancel_background_tasks()`` is
+    awaited through ``_bounded_adapter_teardown`` /
+    ``_await_adapter_cleanup_with_timeout``, which ``task.cancel()``s it at
+    the per-adapter deadline — an await point the synchronous form never
+    had.  So the lane work is ``shield``-ed: the awaiter unwinds as
+    ``CancelledError`` (the deadline still forces shutdown forward), while
+    the already-snapshotted payload still reaches disk, fenced at exit.
+
+    Returns the number of sessions flushed; 0 if the offload itself fails,
+    matching the best-effort contract of the sync form.
+    """
+    if not pending:
+        return 0
+    # Snapshot on the caller's thread: the worker must not read a dict the
+    # caller may mutate (adapter teardown clears it right after this await),
+    # and the snapshot is what makes the shielded write safe to outlive us.
+    snapshot = dict(pending)
+    global _FLUSH_SUBMITTED, _FLUSH_COMPLETED
+    try:
+        with _FLUSH_PROGRESS:
+            _FLUSH_SUBMITTED += 1
+        future = _get_flush_lane().submit(
+            _run_on_flush_lane, snapshot, reason
+        )
+    except Exception as exc:
+        logger.debug("Pending-message flush offload failed: %s", exc)
+        with _FLUSH_PROGRESS:
+            _FLUSH_COMPLETED += 1
+            _FLUSH_PROGRESS.notify_all()
+        return 0
+    try:
+        return await asyncio.shield(asyncio.wrap_future(future))
+    except asyncio.CancelledError:
+        # The lane keeps the snapshot and finishes the write; the exit fence
+        # guarantees it lands.  Cancellation must still propagate so the
+        # shutdown deadline behaves exactly as it did pre-offload.
+        raise
+    except Exception as exc:
+        logger.debug("Pending-message flush failed: %s", exc)
+        return 0
+
+
 # Reason tag for transcript messages dropped by the in-memory pending cap
 # during live operation (#78182). These payloads carry the full transcript
 # message dict so they can be replayed verbatim once the DB recovers.
