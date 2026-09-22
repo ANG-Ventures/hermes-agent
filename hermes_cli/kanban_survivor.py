@@ -253,9 +253,28 @@ def _verified_explicit(task_id, survivor_ref, survivor_pr, *, unbound=False):
     The legitimate operator case -- a human who knows the work landed on a
     differently-named branch -- keeps a path: ``--survivor-unbound`` accepts
     the claim without the binding and records the override on the survivor, so
-    the authorisation is auditable rather than invisible. It is a CLI flag, so
-    a worker calling the ``kanban_complete`` tool cannot self-certify an
-    unrelated survivor.
+    the authorisation is auditable rather than invisible.
+
+    The override is NOT an identity gate, and must not be mistaken for one.
+    Argus's round-1 review asked for one: refuse the flag unless the caller is
+    not a dispatched worker, plus an interactive tty. Measured on this host
+    (kanban card t_de2e348e, probe_r2_signals.py) that is not implementable -- a worker
+    runs as the SAME uid as the operator (502) and can forge every
+    process-local signal available:
+
+      * ``is_dispatcher_owned_worker_context()`` fails OPEN with no
+        ``HERMES_KANBAN_OWNER_PID``, so dropping the grant (``env -u``) reads
+        as an operator: predicate False inherited, True stripped;
+      * process ancestry survives one double-fork: the daemonized grandchild
+        reports ``ppid = 1``, so nothing above it looks like a worker;
+      * ``sys.stdin.isatty()`` is False in this worker and True in a
+        ``pty.fork`` child it spawns itself.
+
+    So the flag cannot be bounded by WHO calls it, and pretending otherwise
+    would ship a gate that reads as security and is not. It is bounded by
+    CAPABILITY instead -- see :func:`_reusable`: an unbound claim authorises
+    THIS completion and never becomes standing authority that a later
+    reclamation reuses without re-testing.
     """
     for claim, flag, verify, extra in (
         (survivor_ref, "--survivor-ref", _ext.verify_ref, {}),
@@ -270,8 +289,8 @@ def _verified_explicit(task_id, survivor_ref, survivor_pr, *, unbound=False):
             if not unbound and verify(claim, **extra) is not None:
                 raise SurvivorUnavailable(
                     f"survivor_unavailable: {flag} {_ext.redact(claim)} is live but does not "
-                    f"name {task_id}, so it is not evidence of THIS card's work; re-run with "
-                    f"--survivor-unbound if the work really did land on an unrelated-looking branch"
+                    f"name {task_id}, so it is not evidence of THIS card's work"
+                    + _override_hint()
                 )
             raise SurvivorUnavailable(
                 f"survivor_unavailable: could not verify {flag} {_ext.redact(claim)} against the remote"
@@ -286,11 +305,55 @@ def _verified_explicit(task_id, survivor_ref, survivor_pr, *, unbound=False):
     return None
 
 
+def _override_hint():
+    """Name the override only in text a dispatched worker will not be reading.
+
+    The refusal is persisted as ``held_reason`` and forwarded to a worker's
+    model by the ``kanban_complete`` tool, so naming the flag there hands the
+    reader the exact command that converts its own refusal into a completion --
+    an instruction it is reasonable to follow and is not entitled to use. A
+    worker's environment carries the dispatcher's grant, so treat the mere
+    PRESENCE of that grant as "someone other than an operator is reading",
+    without asking whether the grant belongs to this process: for a hint,
+    unlike for an authority check, over-suppressing costs only an operator one
+    ``--help``.
+    """
+    if any(os.environ.get(key) for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID")):
+        return ""
+    return ("; re-run with --survivor-unbound if the work really did land on an "
+            "unrelated-looking branch")
+
+
 def _claimant():
     try:
         return getpass.getuser()
     except (KeyError, OSError):  # no passwd entry (containers, CI)
         return "unknown"
+
+
+def _reusable(previous):
+    """Reclamation may reuse a RECORDED survivor only if it was bound to the card.
+
+    This is the bound on the override, and the reason it needs no identity
+    check. An unbound claim is a human assertion that work landed somewhere the
+    kernel cannot corroborate; ``preserve(cleanup=True)`` does not re-verify,
+    it reuses whatever completion recorded. So an unbound claim recorded once
+    would otherwise become STANDING authority to discard this workspace on
+    every later reclamation, without the claim ever being re-tested.
+
+    Measured on the workspace-missing reclamation branch, where ``previous`` is
+    the SOLE authority (kanban card t_de2e348e, probe_r2_branches.py, P1): an unbound
+    recorded claim HELDs, a bound one is REUSED, and no claim HELDs -- so the
+    gate discriminates on exactly the field it names and can still say yes.
+
+    Refusing the reuse cuts the override down to what the legitimate operator
+    case needs -- closing a card whose workspace is already gone -- and keeps
+    the fail-closed HOLD otherwise. A caller who wants a workspace discarded
+    must re-assert against the tree in front of them rather than inherit a
+    stale authorisation.
+    """
+    refs = (previous or {}).get("refs") or ()
+    return previous if not any(ref.get("unbound") for ref in refs) else None
 
 
 def _loose_files(workspace, repos):
@@ -329,11 +392,17 @@ def _external(conn, task_id, metadata, evidence, urls, explicit, *, discover, cl
     a survivor is an error, and it never runs during reclamation -- cleanup
     reuses the survivor recorded at completion or holds. Re-mining a hint
     there would turn a fail-closed HOLD into a delete.
+
+    The recorded survivor is filtered through :func:`_reusable`: an UNBOUND
+    claim authorised one completion and is not standing authority to delete a
+    workspace a later reclamation can still see. This is the single place
+    ``previous`` becomes a delete authorisation, so the bound lives here rather
+    than at the two ``preserve`` call sites that pass it.
     """
     if explicit:
         ref = explicit
     elif cleanup:
-        return previous
+        return _reusable(previous)
     else:
         ref = _ext.discover(conn, task_id, metadata, evidence, urls) if discover else None
     return {"kind": "ref", "refs": [dict(ref, repository=".")]} if ref else None

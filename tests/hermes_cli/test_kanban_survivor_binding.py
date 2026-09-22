@@ -18,6 +18,7 @@ cannot self-certify an unrelated survivor.
 import argparse
 import contextlib
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -88,7 +89,13 @@ def _claimed_card(board, title="external implementation"):
     {"survivor_pr": PR},
     {"survivor_ref": f"{URL}#{HEAD}"},
 ])
-def test_unrelated_live_claim_is_refused(board, unrelated, kwargs):
+def test_unrelated_live_claim_is_refused(board, unrelated, kwargs, monkeypatch):
+    # The refusal names the override only for a caller with no dispatcher
+    # grant (see `_override_hint`). `tests/conftest.py` scrubs those vars, so
+    # this would pass implicitly -- assert the operator shape explicitly, so a
+    # change to that scrub list cannot silently flip what this test measures.
+    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
+        monkeypatch.delenv(key, raising=False)
     tid = _claimed_card(board)
     with pytest.raises(ValueError) as excinfo:
         kb.complete_task(board, tid, metadata={"changed_files": ["code.py"]}, **kwargs)
@@ -217,6 +224,11 @@ def test_the_tool_surface_cannot_express_the_override():
     and the handler must not name it. This holds both before and after PR #839
     (which adds ``survivor_pr``/``survivor_ref`` to that schema) -- #839 widens
     WHO can name a survivor; it must not widen who can name an UNBOUND one.
+
+    NOTE the bound of this test, which is why the tests below exist: it
+    inspects the TOOL schema, and a worker also has a shell. Argus measured a
+    dispatched worker reaching ``--survivor-unbound`` through the CLI in two
+    environment shapes, so tool-unreachability is necessary and not sufficient.
     """
     import inspect
 
@@ -224,6 +236,148 @@ def test_the_tool_surface_cannot_express_the_override():
 
     assert "survivor_unbound" not in json.dumps(kt.KANBAN_COMPLETE_SCHEMA)
     assert "survivor_unbound" not in inspect.getsource(kt._handle_complete)
+
+
+# --- the override cannot become STANDING deletion authority -----------------
+
+def _recorded(board, tid, *, unbound):
+    """Record a survivor directly, so the arms differ ONLY in ``unbound``."""
+    ref = {"remote": URL, "branch": "refs/pull/68/head", "sha": MERGE,
+           "pr": PR, "state": "MERGED", "external": True, "repository": "."}
+    if unbound:
+        ref = dict(ref, unbound=True, claimed_by="someone")
+    with kb.write_txn(board):
+        board.execute(
+            "INSERT INTO task_workspace_survivors(task_id, survivor, held_reason) "
+            "VALUES (?,?,NULL) ON CONFLICT(task_id) DO UPDATE SET "
+            "survivor = excluded.survivor, held_reason = NULL",
+            (tid, json.dumps({"kind": "ref", "refs": [ref]})))
+
+
+def _reclaimable(board, tid):
+    """The dir-ABSENT reclamation shape, where ``previous`` is the SOLE authority.
+
+    This is the branch the card names (``kanban_survivor.py`` stale-bases /
+    missing-workspace): nothing is left in-tree to capture, so whatever
+    completion recorded is the only thing standing between the card and a
+    delete. With the directory present, an in-tree capture answers first and
+    the recorded survivor is never consulted.
+    """
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    kb.set_workspace_path(board, tid, ws)
+    shutil.rmtree(ws, ignore_errors=True)
+    return ws
+
+
+def test_an_unbound_claim_is_not_reusable_as_reclamation_authority(board):
+    """The bound that makes the override safe without an identity check.
+
+    ``preserve(cleanup=True)`` does not re-verify: it reuses whatever
+    completion recorded. Without this, one unbound claim becomes STANDING
+    authority to discard the workspace on every later reclamation -- the claim
+    is never re-tested against the tree actually in front of the caller.
+
+    Scope, stated precisely because the probe measured it: on THIS branch the
+    directory is already gone, so what the gate protects here is the reuse of
+    an uncorroborated POINTER, not bytes. Where bytes are still on disk and
+    capturable, ``preserve`` captures them in-tree and never consults
+    ``previous`` at all (kanban card t_de2e348e, probe_r2_branches.py, P2).
+    """
+    from hermes_cli import kanban_survivor as ks
+
+    tid = _claimed_card(board)
+    ws = _reclaimable(board, tid)
+    _recorded(board, tid, unbound=True)
+
+    with pytest.raises(ValueError, match="no verifiable external survivor"):
+        ks.preserve(board, tid, cleanup=True, workspace=ws)
+
+
+def test_a_bound_claim_is_still_reusable_as_reclamation_authority(board):
+    """Anti-vacuity: the same rig, one field different, and it says YES.
+
+    Without this the test above passes for any reason at all -- including a
+    reclamation path that refuses everything.
+    """
+    from hermes_cli import kanban_survivor as ks
+
+    tid = _claimed_card(board)
+    ws = _reclaimable(board, tid)
+    _recorded(board, tid, unbound=False)
+
+    survivor = ks.preserve(board, tid, cleanup=True, workspace=ws)
+    assert survivor and survivor["refs"][0]["pr"] == PR
+
+
+def test_a_worker_using_the_cli_override_gains_no_reclamation_authority(
+        board, unrelated, monkeypatch):
+    """The test Argus named: a dispatched-worker CLI invocation must not buy a delete.
+
+    Argus measured a worker shelling out to
+    ``kanban complete <tid> --survivor-pr <unrelated live PR>
+    --survivor-unbound`` and COMPLETING the card, in two environment shapes.
+    That is not disputed and is not fixed by an identity check -- every
+    process-local signal is forgeable at the same uid
+    (kanban card t_de2e348e, probe_r2_signals.py: predicate fails open under ``env -u``,
+    ancestry under double-fork, ``isatty`` under ``pty.fork``).
+
+    What IS pinned here is the consequence. The worker may close its own card,
+    but the claim it recorded is not standing authority for the later
+    reclamation that would actually discard the workspace: that HOLDs, and the
+    hold is where the bytes are protected. Drop ``_reusable`` and this goes
+    red.
+    """
+    from hermes_cli import kanban_survivor as ks
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_whatever")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "4242")
+
+    tid = _claimed_card(board)
+    assert _cli(board, monkeypatch, ["complete", tid, "--result", "shipped",
+                                     "--survivor-pr", PR, "--survivor-unbound"]) == 0
+    # The worker did complete the card -- reported, not asserted away.
+    assert kb.get_task(board, tid).status == "done"
+    ref = kb.latest_run(board, tid).metadata["survivor"]["refs"][0]
+    assert ref["unbound"] is True
+
+    # ... and that is where its authority stops.
+    ws = _reclaimable(board, tid)
+    with pytest.raises(ValueError, match="no verifiable external survivor"):
+        ks.preserve(board, tid, cleanup=True, workspace=ws)
+
+
+# --- the refusal must not hand a worker the escape --------------------------
+
+def test_the_refusal_names_the_override_for_an_operator(board, unrelated, monkeypatch):
+    """An operator shell has no dispatcher grant: the hint is useful there."""
+    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
+        monkeypatch.delenv(key, raising=False)
+    tid = _claimed_card(board)
+    with pytest.raises(ValueError) as excinfo:
+        kb.complete_task(board, tid, survivor_pr=PR, metadata={"changed_files": ["code.py"]})
+    assert "--survivor-unbound" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("grant", ["HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"])
+def test_the_refusal_withholds_the_override_from_a_worker(board, unrelated, monkeypatch, grant):
+    """The refusal is forwarded to a worker's model and persisted as held_reason.
+
+    Argus measured #848's first refusal text telling a dispatched worker the
+    exact flag that converts its own refusal into a completion. The refusal
+    must still say WHY it refused -- it just must not hand over the command.
+    """
+    monkeypatch.setenv(grant, "t_whatever")
+    tid = _claimed_card(board)
+    with pytest.raises(ValueError) as excinfo:
+        kb.complete_task(board, tid, survivor_pr=PR, metadata={"changed_files": ["code.py"]})
+
+    message = str(excinfo.value)
+    assert "--survivor-unbound" not in message, "the escape must not be advertised to a worker"
+    assert "does not name" in message and tid in message, "it must still explain the refusal"
+    held = board.execute(
+        "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()
+    assert held and "--survivor-unbound" not in (held[0] or "")
 
 
 # --- redaction is unchanged on the new refusal branch -----------------------
