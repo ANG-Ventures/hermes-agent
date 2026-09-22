@@ -1603,10 +1603,6 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
 
-    # If the user removed the currently-active board, revert to default.
-    if get_current_board() == normed:
-        clear_current_board()
-
     # A board directory CONTAINS that board's workspaces/ -- retiring it
     # takes every card's scratch dir at once, the same blast radius as the
     # 2026-09-20 incident. BOTH branches do that: archive renames the tree
@@ -1619,7 +1615,12 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     #
     # Checked BEFORE the cache invalidation below: it opens the board DB
     # (which would re-populate _INITIALIZED_PATHS) and it can abort, so no
-    # state may be torn down ahead of it.
+    # state may be torn down ahead of it -- INCLUDING the active-board pin,
+    # which used to be cleared above this gate. A refused removal that had
+    # already unlinked <root>/kanban/current left get_current_board() falling
+    # through to DEFAULT_BOARD, so every later `kanban add` / `list` /
+    # `dispatch` silently addressed the default board with nothing saying the
+    # pin had moved (FleetReview on PR #785, measured).
     live = _board_has_live_cards(normed)
     if live:
         verb = "archive" if archive else "delete"
@@ -1634,6 +1635,12 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             f"{verb} its directory, which contains their workspaces. "
             "Wait for the cards to finish, or stop them first."
         )
+
+    # Remember the active pin while the board still exists. It is cleared only
+    # after the archive/delete succeeds; either operation has later failure
+    # boundaries (rename errors and survivor-held hard deletes) that must leave
+    # the operator pointed at the still-present board.
+    was_current_board = get_current_board() == normed
 
     # A concurrent connect(board=normed) after the rename/delete recreates
     # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
@@ -1685,6 +1692,8 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             detail=f"board={normed} action=archive dest={target}",
             board=normed,
         )
+        if was_current_board:
+            clear_current_board()
         return {"slug": normed, "action": "archived", "new_path": str(target)}
     else:
         from hermes_cli.kanban_survivor import remove_workspace_dir
@@ -1725,17 +1734,36 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             d, task_id=None, reason="remove_board", outcome=AUDIT_DELETE,
             detail=f"board={normed}", board=normed,
         )
+        if was_current_board:
+            clear_current_board()
         return {"slug": normed, "action": "deleted", "new_path": ""}
 
 
 def _board_has_live_cards(slug: str) -> list:
     """Return the ids of cards on *slug* that are running or claim-locked.
 
+    Opens that board's CANONICAL DB path directly rather than going through
+    ``connect_closing(board=slug)``: ``kanban_db_path`` gives an ambient
+    ``HERMES_KANBAN_DB`` pin precedence even over an explicit board argument,
+    and the dispatcher pins that variable into every worker env. Under a pin,
+    the board argument was silently ignored, so removing board B inspected
+    board A's tasks, concluded B was idle, and archived it out from under a
+    live worker -- the primary data-loss guard answering for the wrong
+    database (FleetReview on PR #785, measured).
+
     Fail-closed: if the board's DB cannot be read, return a sentinel so the
     caller refuses rather than deleting a board whose state is unknown.
     """
     try:
-        with connect_closing(board=slug) as conn:
+        db_path = _board_db_path_ignoring_pin(_normalize_board_slug(slug) or slug)
+    except Exception:
+        return ["<unreadable-board-db>"]
+    if not db_path.is_file():
+        # No DB on disk means no rows to be live. A board directory that
+        # exists without one is empty as far as cards are concerned.
+        return []
+    try:
+        with connect_closing(db_path=db_path) as conn:
             rows = conn.execute(
                 "SELECT id, status, claim_expires FROM tasks "
                 "WHERE status = 'running' OR claim_expires IS NOT NULL"
@@ -7340,6 +7368,34 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
 _TASK_DIR_NAME_RE = re.compile(r"^t_[0-9a-f]{4,}$")
 
 
+def _conn_is_board(conn: sqlite3.Connection, board: str) -> bool:
+    """True when *conn* is already open on *board*'s database file.
+
+    Asks the connection which file it is attached to (``PRAGMA
+    database_list``) rather than trusting what the caller believes: under an
+    ambient ``HERMES_KANBAN_DB`` pin a connection opened "for" one board can
+    be attached to another's file. Any uncertainty answers False, which costs
+    one redundant connection -- never a wrong reuse.
+    """
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+    except Exception:
+        return False
+    actual = ""
+    for row in rows:
+        # (seq, name, file) -- `main` is the connection's primary database.
+        if (row[1] if not isinstance(row, sqlite3.Row) else row["name"]) == "main":
+            actual = (row[2] if not isinstance(row, sqlite3.Row) else row["file"]) or ""
+            break
+    if not actual:
+        return False
+    try:
+        want = _board_db_path_ignoring_pin(_normalize_board_slug(board) or board)
+        return Path(actual).resolve(strict=False) == want.resolve(strict=False)
+    except Exception:
+        return False
+
+
 def _live_owners_of_path(
     path: Path,
     *,
@@ -7398,7 +7454,13 @@ def _live_owners_of_path(
         try:
             if is_managed and board:
                 # The directory's own board, which may not be the caller's.
-                conns.append(stack.enter_context(connect_closing(board=board)))
+                # Reuse the caller's connection when it is ALREADY that board:
+                # opening a second connection to the same database is pure
+                # cost on the completion path, which calls this while holding
+                # the completing task's connection (FleetReview on PR #785 --
+                # measured one redundant connection per call).
+                if not (conn is not None and _conn_is_board(conn, board)):
+                    conns.append(stack.enter_context(connect_closing(board=board)))
             elif conn is None:
                 conns.append(stack.enter_context(connect_closing()))
         except Exception:
@@ -7701,6 +7763,24 @@ def safe_remove_workspace_dir(
         )
         return False
 
+    # Nothing to remove. Checked BEFORE the liveness and owner scans, which
+    # are the expensive gates: `_live_owners_of_path` opens a second
+    # connection and full-scans `tasks`, resolving every row's path. In gc's
+    # steady state most archived cards' workspaces were already removed at
+    # completion, so leaving this check last turned `kanban gc` into O(M)
+    # extra connections plus O(M*N) path resolutions for zero removals -- and
+    # appended one permanent `REFUSED` line per already-clean row to an
+    # append-only log that `gc_worker_logs` is deliberately forbidden to reap,
+    # burying the DELETE/ATTEMPT records the audit exists to surface
+    # (FleetReview on PR #785, measured: 1 owner scan + 1 audit line for a
+    # path that does not exist).
+    #
+    # No audit line either: the log records deletions and refusals TO DELETE.
+    # A path with nothing at it was never a deletion, and a per-row entry that
+    # can never be reaped is exactly the noise the finding named.
+    if not resolved.is_dir():
+        return False
+
     if _task_has_live_run(conn, task_id):
         _audit_workspace_deletion(
             resolved, task_id=task_id, reason=reason, allowed=False,
@@ -7727,13 +7807,6 @@ def safe_remove_workspace_dir(
             "Refusing to remove workspace %s (caller task %s, reason %s): it "
             "is owned by live card(s) %s",
             resolved, task_id, reason, ",".join(owners),
-        )
-        return False
-
-    if not resolved.is_dir():
-        _audit_workspace_deletion(
-            resolved, task_id=task_id, reason=reason, allowed=False,
-            detail="not-a-directory",
         )
         return False
 
