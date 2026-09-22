@@ -667,27 +667,30 @@ def record_startup(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
 async def record_startup_async(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
     """Event-loop-safe :func:`record_startup`.
 
-    The attribution probe shells out to ``log show`` / ``journalctl``; running
-    it on the loop thread would stall platform heartbeats for up to
-    ``KILL_ATTRIBUTION_TIMEOUT_S`` at boot.  Offloaded via
-    ``asyncio.to_thread`` (the house pattern).  Never raises.
-    """
-    evidence: Optional[Dict[str, Any]] = None
-    try:
-        evidence = detect_unclean_exit(home)
-        if evidence is not None:
-            try:
-                attribution = await asyncio.to_thread(_probe_attribution, evidence)
-            except Exception:
-                logger.debug("Kill-attribution offload failed", exc_info=True)
-                attribution = {"killer": "unattributed", "reason": "offload_failed"}
-            _apply_attribution(evidence, attribution)
-            _emit_unclean_report(evidence, home)
-    except Exception:
-        logger.debug("Unclean-exit detection failed", exc_info=True)
+    EVERY step of the boot record is blocking, not just the probe:
 
-    _claim_sentinel(evidence, home)
-    return evidence
+    * ``detect_unclean_exit`` reads the sentinel and the heartbeat file, and
+      ``_pid_alive_with_start_time`` reaches psutil for the prior pid;
+    * the attribution probe shells out to ``log show`` / ``journalctl`` for up
+      to ``KILL_ATTRIBUTION_TIMEOUT_S``;
+    * ``_emit_unclean_report`` appends to ``gateway-exit-diag.log``;
+    * ``_claim_sentinel`` ends in ``atomic_json_write`` — ``mkstemp`` +
+      ``fsync`` + ``os.replace``, whose duration is unbounded under
+      filesystem pressure.
+
+    An earlier shape offloaded only the probe and left the other three on the
+    loop thread, so a stalled sentinel rename still starved every platform
+    heartbeat at boot (the 2026-09-20 incident class: a rename several
+    plain-``def`` frames below a coroutine).  The whole synchronous body is
+    therefore run in one worker thread via ``asyncio.to_thread`` (the house
+    pattern); :func:`record_startup` is that body verbatim, so the two paths
+    cannot drift.  Never raises.
+    """
+    try:
+        return await asyncio.to_thread(record_startup, home)
+    except Exception:
+        logger.debug("Lifecycle startup record offload failed", exc_info=True)
+        return None
 
 
 def mark_exited(
