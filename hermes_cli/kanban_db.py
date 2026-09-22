@@ -5284,6 +5284,32 @@ def add_comment(
             },
             run_id=run_id,
         )
+        # The CONTENT hook (card t_357330bf). The ``commented`` event above
+        # carries author + length, not the text. On 2026-09-21 the comment
+        # THREADS were the only part of the wiped subs-ace board that could
+        # not be reconstructed from any other source -- cards came back,
+        # discussion did not. Journaling the body is the single thing that
+        # would have saved them, so it is recorded explicitly rather than
+        # inferred from the event.
+        try:
+            from hermes_cli import kanban_journal
+
+            kanban_journal.append(
+                _journal_board_slug(),
+                task_id,
+                "comment_body",
+                {
+                    "author": author.strip(),
+                    "body": body.strip(),
+                    "session_ref": session_ref,
+                    "created_at": now,
+                    "comment_id": int(cur.lastrowid or 0),
+                },
+                actor=author.strip(),
+                run_id=run_id,
+            )
+        except Exception:  # pragma: no cover - never fail the comment write
+            pass
         return int(cur.lastrowid or 0)
 
 
@@ -5602,6 +5628,19 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     return out
 
 
+def _journal_board_slug() -> Optional[str]:
+    """Best-effort board slug for a journal record.
+
+    Resolution must never raise inside a write txn, and must never be the
+    reason a mutation fails, so every error degrades to ``None`` (which the
+    journal records under the ``default`` board).
+    """
+    try:
+        return get_current_board()
+    except Exception:
+        return None
+
+
 def _append_event(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5624,6 +5663,25 @@ def _append_event(
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+    # Append-only mutation journal (card t_357330bf). This is the single choke
+    # point every lifecycle mutation already flows through, so journaling here
+    # covers every event kind -- including ones added later -- without touching
+    # the ~119 call sites. Outside the kanban home on purpose: the 2026-09-21
+    # deleter took the whole kanban directory, so a journal inside it would
+    # have died with the data it protects. Best-effort by contract: a journal
+    # failure must never fail the board write.
+    try:
+        from hermes_cli import kanban_journal
+
+        kanban_journal.append(
+            _journal_board_slug(),
+            task_id,
+            kind,
+            payload,
+            run_id=run_id,
+        )
+    except Exception:  # pragma: no cover - the journal is a net, never a gate
+        pass
 
 
 def _end_run(
