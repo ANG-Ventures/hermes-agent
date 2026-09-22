@@ -51,10 +51,32 @@ Three sharpenings over the first landed version (FleetReview on PR #860):
     multi-permit site (``self.total`` + ``self.internal``, as in
     ``gateway/turn_admission.py``) an ``except`` arm that releases only one of
     them used to satisfy the check.
-  * **Every handler arm must release.**  A sibling ``except ValueError:`` that
-    re-raises without releasing leaks, even when a later
-    ``except BaseException:`` arm does release — the narrow arm is the one that
-    runs.
+  * **Every handler arm that CAN exit must release.**  A sibling
+    ``except ValueError:`` that re-raises without releasing leaks, even when a
+    later ``except BaseException:`` arm does release — the narrow arm is the
+    one that runs.
+
+Two further sharpenings (Argus runtime oracle on PR #863, filed as a
+pre-existing gap present on BOTH builds):
+
+  * **Exit is a REACHABILITY question, not a last-statement question.**  The
+    arm classifier used to accept only a BARE trailing ``raise``/``return``,
+    so an arm exiting through a compound statement (``if cond: raise``, a
+    ``raise`` inside an inner ``try``/``with``/``for``, ``if cond: return``)
+    was classified as swallowing and excused from releasing — five measured
+    1-permit leaks.  It now asks whether ANY path through the arm can leave.
+  * **An unreachable release does not count.**  Matching by ``ast.walk``
+    credited a release buried in a nested ``def``, under ``if False:``, in a
+    loop over an empty literal, or after an unconditional ``raise`` — four
+    more measured leaks.  Only statically-reachable statements are credited;
+    anything the compiler cannot settle still counts, so a release under a
+    runtime condition is not rejected.
+  * **A chain whose only arm SWALLOWS is safe.**  ``except BaseException:
+    pass`` falls through to the yield still legitimately holding the permit
+    (measured: no leak), but the ``BaseException`` coverage test used to be
+    asked of the *exiting* arms only, so an all-swallowing chain produced an
+    empty set and was reported as unprotected.  Coverage is now asked of the
+    whole chain and the release demand only of the arms that can exit.
 
 DOES NOT COVER (stated boundary, not a hidden gap)
 --------------------------------------------------
@@ -74,6 +96,13 @@ DOES NOT COVER (stated boundary, not a hidden gap)
     assignment itself is a raise-capable node in the window), so this errs
     toward a false positive, not a miss; a new spelling is WONTFIX unless it
     appears in production code.
+  * **A release whose REACHABILITY depends on runtime values.**  Two measured
+    1-permit leaks sit here and are not caught by any build of this guard: a
+    release that runs only in a nested ``except ValueError`` that never fires,
+    and a release under a runtime-false condition.  The check credits any path
+    the compiler cannot settle (see ``_released_in_stmt``); narrowing that
+    would reject the legitimate ``if acquired: release()`` shape the live
+    multi-permit site uses.  Static reachability is the declared line.
 
 NO LONGER A GAP: releasing the WRONG object used to satisfy the check, because
 matching was by method name.  Release is now matched by RECEIVER
@@ -171,43 +200,269 @@ def _receiver_key(call: ast.Call) -> str | None:
         return None
 
 
-def _objects_called(node: ast.AST, names: set[str]) -> set[str]:
-    """Receivers of every ``<obj>.<name>()`` call anywhere under ``node``."""
+def _static_truth(node: ast.AST) -> bool | None:
+    """``True``/``False`` for a test the compiler can settle; ``None`` otherwise."""
+    if isinstance(node, ast.Constant):
+        try:
+            return bool(node.value)
+        except Exception:  # pragma: no cover - bool() is total on constants
+            return None
+    return None
+
+
+def _statically_empty_iterable(node: ast.AST) -> bool:
+    """True for a literal that provably yields nothing (``[]``, ``()``, ``{}``)."""
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return not node.elts and not any(isinstance(e, ast.Starred) for e in node.elts)
+    if isinstance(node, ast.Dict):
+        return not node.keys
+    if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+        return len(node.value) == 0
+    return False
+
+
+def _direct_releases(node: ast.AST) -> set[str]:
+    """Release receivers in ``node``, NOT descending into a nested callable."""
     found: set[str] = set()
-    for sub in ast.walk(node):
-        if (
-            isinstance(sub, ast.Call)
-            and isinstance(sub.func, ast.Attribute)
-            and sub.func.attr in names
+    stack: list[ast.AST] = [node]
+    while stack:
+        current = stack.pop()
+        if current is not node and isinstance(
+            current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
         ):
-            key = _receiver_key(sub)
+            # Its body runs on its own lifecycle, if it is ever called at all.
+            continue
+        if (
+            isinstance(current, ast.Call)
+            and isinstance(current.func, ast.Attribute)
+            and current.func.attr in _RELEASE_METHODS
+        ):
+            key = _receiver_key(current)
             if key is not None:
                 found.add(key)
+        stack.extend(ast.iter_child_nodes(current))
     return found
 
 
+def _released_in_stmt(stmt: ast.stmt) -> set[str]:
+    """Release receivers reachable when ``stmt`` runs.
+
+    A textually-present release that can never execute must not satisfy the
+    check: ``ast.walk`` credited a release buried in a nested ``def``, under
+    ``if False:``, or in the body of a loop over an empty literal, none of
+    which ever hand the permit back.
+    """
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return set()
+    if isinstance(stmt, ast.If):
+        truth = _static_truth(stmt.test)
+        found = _direct_releases(stmt.test)
+        if truth is not False:
+            found |= _released_in(stmt.body)
+        if truth is not True:
+            found |= _released_in(stmt.orelse)
+        return found
+    if isinstance(stmt, (ast.For, ast.AsyncFor)):
+        found = _direct_releases(stmt.iter)
+        if not _statically_empty_iterable(stmt.iter):
+            found |= _released_in(stmt.body)
+        return found | _released_in(stmt.orelse)
+    if isinstance(stmt, ast.While):
+        found = _direct_releases(stmt.test)
+        if _static_truth(stmt.test) is not False:
+            found |= _released_in(stmt.body)
+        return found | _released_in(stmt.orelse)
+    if isinstance(stmt, ast.Try):
+        found = (
+            _released_in(stmt.body)
+            | _released_in(stmt.orelse)
+            | _released_in(stmt.finalbody)
+        )
+        for handler in stmt.handlers:
+            found |= _released_in(handler.body)
+        return found
+    if isinstance(stmt, (ast.With, ast.AsyncWith)):
+        found: set[str] = set()
+        for item in stmt.items:
+            found |= _direct_releases(item.context_expr)
+        return found | _released_in(stmt.body)
+    return _direct_releases(stmt)
+
+
 def _released_in(body: list[ast.stmt]) -> set[str]:
+    """Receivers released on some STATICALLY REACHABLE path through ``body``."""
     released: set[str] = set()
     for stmt in body:
-        released |= _objects_called(stmt, _RELEASE_METHODS)
+        released |= _released_in_stmt(stmt)
+        if not _falls_through(stmt):
+            # Everything after an unconditional raise/return is dead code.
+            break
     return released
 
 
-def _handler_exits(handler: ast.ExceptHandler) -> bool:
-    """True if this arm leaves the generator instead of falling through.
+def _body_falls_through(body: list[ast.stmt]) -> bool:
+    """True if control can reach the end of ``body``."""
+    for stmt in body:
+        if not _falls_through(stmt):
+            return False
+    return True
 
-    An arm that SWALLOWS (no ``raise``/``return``) continues on to the yield
-    with the permit still legitimately held — demanding a release there would
-    be a false positive, and acting on it would be a double release.  Only an
-    arm that exits owes the permit back.
+
+def _falls_through(stmt: ast.stmt) -> bool:
+    """True if control can continue past ``stmt`` to the next statement."""
+    if isinstance(stmt, (ast.Raise, ast.Return, ast.Break, ast.Continue)):
+        return False
+    if isinstance(stmt, ast.If):
+        truth = _static_truth(stmt.test)
+        if truth is True:
+            return _body_falls_through(stmt.body)
+        if truth is False:
+            return _body_falls_through(stmt.orelse)
+        return _body_falls_through(stmt.body) or _body_falls_through(stmt.orelse)
+    if isinstance(stmt, (ast.With, ast.AsyncWith)):
+        return _body_falls_through(stmt.body)
+    if isinstance(stmt, ast.Try):
+        if stmt.finalbody and not _body_falls_through(stmt.finalbody):
+            return False
+        through_body = _body_falls_through(stmt.body)
+        if through_body and stmt.orelse:
+            through_body = _body_falls_through(stmt.orelse)
+        return through_body or any(_body_falls_through(h.body) for h in stmt.handlers)
+    # Loops may run zero times or `break`; a match/other compound statement is
+    # assumed to fall through. Erring this way keeps an arm out of the
+    # "provably exits" class only when we cannot prove it, which is safe:
+    # `_handler_may_exit` below is what demands the release.
+    return True
+
+
+def _hashable_literal(node: ast.AST) -> bool:
+    """True only for a literal that provably hashes without raising.
+
+    A set display and a dict display HASH their elements/keys at construction
+    time, so inert elements are not enough: ``{[1]}`` and ``{[1]: 2}`` each
+    raise ``TypeError`` while every sub-expression in them is inert.
     """
-    for stmt in reversed(handler.body):
-        if isinstance(stmt, (ast.Raise, ast.Return)):
-            return True
-        if isinstance(stmt, ast.Pass):
-            continue
-        break
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.Tuple):
+        return all(_hashable_literal(e) for e in node.elts)
     return False
+
+
+def _inert_expr(node: ast.AST) -> bool:
+    """True only for an expression that provably cannot raise.
+
+    Deliberately a WHITELIST.  Anything not listed here — a call, an attribute
+    load, a subscript, an ``await``, arithmetic on a name, a bare NAME load —
+    can leave the arm by raising, and must therefore keep the arm in the
+    "may exit" class.
+    """
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return all(_inert_expr(e) for e in node.elts)
+    if isinstance(node, ast.Set):
+        return all(_hashable_literal(e) for e in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(k is not None and _hashable_literal(k) for k in node.keys) and all(
+            _inert_expr(v) for v in node.values
+        )
+    return False
+
+
+def _inert_target(node: ast.AST) -> bool:
+    """True only for an assignment target that provably cannot raise.
+
+    A target is not a value.  A ``Tuple``/``List`` target is an UNPACK, which
+    raises ``TypeError`` on a non-iterable and ``ValueError`` on an arity
+    mismatch even when every name in it is inert; an ``Attribute``/``Subscript``
+    target runs ``__setattr__``/``__setitem__``.  Only a bare local name is
+    safe, and only in ``Store`` context.
+    """
+    return isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+
+
+def _inert_signature(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """True only when executing this ``def`` statement evaluates nothing.
+
+    Only the BODY of a nested function is deferred.  Decorators, defaults,
+    keyword-only defaults, parameter annotations and the return annotation are
+    all evaluated when the ``def`` executes, so any of them can leave the arm.
+    """
+    if fn.decorator_list:
+        return False
+    if getattr(fn, "type_params", ()):
+        return False
+    args = fn.args
+    if not all(_inert_expr(d) for d in args.defaults):
+        return False
+    if not all(d is None or _inert_expr(d) for d in args.kw_defaults):
+        return False
+    if fn.returns is not None and not _inert_expr(fn.returns):
+        return False
+    slots = [*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg]
+    return all(
+        a is None or a.annotation is None or _inert_expr(a.annotation) for a in slots
+    )
+
+
+def _inert_stmt(stmt: ast.stmt) -> bool:
+    """True only for a statement that provably cannot leave the arm."""
+    if isinstance(stmt, (ast.Pass, ast.Break, ast.Continue, ast.Global, ast.Nonlocal)):
+        return True
+    if isinstance(stmt, ast.Expr):
+        return _inert_expr(stmt.value)
+    if isinstance(stmt, ast.Assign):
+        return all(_inert_target(t) for t in stmt.targets) and _inert_expr(stmt.value)
+    if isinstance(stmt, ast.AnnAssign):
+        # The annotation is evaluated at runtime unless the module carries
+        # `from __future__ import annotations`; we do not read the module's
+        # future-imports here, so an annotation that is not itself inert keeps
+        # the arm in the may-exit class.
+        return (
+            _inert_target(stmt.target)
+            and _inert_expr(stmt.annotation)
+            and (stmt.value is None or _inert_expr(stmt.value))
+        )
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        # Defining a nested callable does not run its BODY; its body is its own
+        # lifecycle.  The signature, however, runs now.
+        return _inert_signature(stmt)
+    return False
+
+
+def _handler_may_exit(handler: ast.ExceptHandler) -> bool:
+    """True unless every statement in this arm PROVABLY cannot leave it.
+
+    An arm that provably SWALLOWS continues on to the yield with the permit
+    still legitimately held — demanding a release there would be a false
+    positive, and acting on it would be a double release.
+
+    Two rules have been wrong here, in opposite directions:
+
+    * "is the LAST statement a bare ``raise``/``return``?" (scanning
+      ``reversed(handler.body)``, breaking on any other statement type) excused
+      every arm that exits through a compound statement — ``if cond: raise``,
+      ``raise`` inside an inner ``try``/``with``/``for``, ``if cond: return`` —
+      each a measured 1-permit leak.
+    * "does it contain an ``ast.Raise``/``ast.Return`` node?" excused every arm
+      that leaves for a reason that is not a ``raise`` STATEMENT: a call that
+      raises, an ``assert``, arithmetic that divides by zero, or a plain
+      logging call given a bad format argument.  All four are measured
+      1-permit leaks that the pre-#873 guard caught.
+
+    "This arm swallows" is not decidable from the AST — the SAME arm text is
+    safe with a benign logger and leaks with a bad format argument.  So the
+    question is inverted and answered on a whitelist: an arm is excused only
+    when every statement in it is provably inert (``pass``, a bare constant, an
+    assignment between names/constants, a nested ``def``).  Anything else keeps
+    the arm in the "may exit" class and owes the permit back.  That is a false
+    positive at worst; the other direction is a missed leak.
+
+    This makes the arm check ask the same question as the window check, which
+    has always treated a call/attribute/subscript/await as raise-capable.
+    """
+    return not all(_inert_stmt(stmt) for stmt in handler.body)
 
 
 def _build_parent_map(fn: ast.AST) -> dict[int, tuple[ast.AST, str]]:
@@ -256,20 +511,27 @@ def _try_releases(node: ast.Try, required: set[str]) -> bool:
     Two sound shapes:
 
     * a ``finally`` that releases them all (runs on every exceptional exit), or
-    * a handler chain that covers ``BaseException`` and, in EVERY arm that
-      exits, releases them all.  A sibling ``except ValueError:`` arm that
+    * a handler chain that covers ``BaseException`` and, in every arm that CAN
+      exit, releases them all.  A sibling ``except ValueError:`` arm that
       re-raises without releasing is the leak an any-arm check missed.
+
+    An arm that provably swallows owes nothing: control falls through to the
+    yield still holding the permit, which is correct.  That is why the
+    ``BaseException`` coverage question is asked of the WHOLE chain and not
+    only of the exiting arms — ``except BaseException: pass`` as the sole arm
+    is safe, and treating its empty exiting-set as "unprotected" flagged it.
     """
     if _released_in(node.finalbody) >= required:
         return True
 
-    exiting = [h for h in node.handlers if _handler_exits(h)]
-    if not exiting:
+    if not node.handlers:
         return False
-    if not any(_is_baseexception_handler(h) for h in exiting):
+    if not any(_is_baseexception_handler(h) for h in node.handlers):
         # Nothing here catches a cancel; the window is still unprotected.
         return False
-    return all(_released_in(h.body) >= required for h in exiting)
+    return all(
+        _released_in(h.body) >= required for h in node.handlers if _handler_may_exit(h)
+    )
 
 
 def _releases_on_the_way_out(

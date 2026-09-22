@@ -637,7 +637,13 @@ def test_guard_does_not_demand_a_release_from_a_swallowing_arm():
     """An arm that SWALLOWS falls through to the yield still holding the permit.
 
     Demanding a release there would be a false positive, and acting on it would
-    double-release — so only arms that exit (raise/return) owe the permit back.
+    double-release — so only arms that can exit owe the permit back.
+
+    The arm body must be PROVABLY inert.  This fixture used to hold
+    ``_LOG.warning("tolerated; still admitted")``, which is not: driven with a
+    benign logger that arm leaks 0, and with a bad format argument — identical
+    AST — it leaks 1.  A fixture whose safety depends on runtime values cannot
+    state the property, so it is narrowed to statements that cannot leave.
     """
     guard = _load_guard()
     source = textwrap.dedent(
@@ -650,7 +656,8 @@ def test_guard_does_not_demand_a_release_from_a_swallowing_arm():
             try:
                 _LOG.info("admitted %s", key)
             except ValueError:
-                _LOG.warning("tolerated; still admitted")
+                tolerated = True
+                pass
             except BaseException:
                 sem.release()
                 raise
@@ -662,6 +669,378 @@ def test_guard_does_not_demand_a_release_from_a_swallowing_arm():
     )
     _sites, violations = guard.scan_source(source, "new.py")
     assert violations == []
+
+
+@pytest.mark.parametrize(
+    "shape,arm",
+    [
+        ("a call that raises", "except BaseException:\n    _reraise()\n"),
+        ("an assert", "except BaseException:\n    assert surface\n"),
+        ("arithmetic", "except BaseException:\n    x = 1 / surface\n"),
+        ("a logging call", 'except BaseException:\n    _LOG.info("swallowed")\n'),
+        ("an attribute load", "except BaseException:\n    x = surface.depth\n"),
+        ("a subscript", "except BaseException:\n    x = surface[0]\n"),
+        ("an await", "except BaseException:\n    await _drain()\n"),
+        # A bare NAME load raises UnboundLocalError when the binding has not
+        # run yet — an ordinary possibility inside an except arm, and a
+        # measured 1-permit leak.
+        ("a name load", "except BaseException:\n    x = surface\n"),
+        # An assignment TARGET is not a value: a tuple/list target UNPACKS,
+        # which raises TypeError on a non-iterable and ValueError on an arity
+        # mismatch, even when every name in it is inert.
+        ("a tuple-target unpack", "except BaseException:\n    a, b = 0\n"),
+        ("a starred tuple-target unpack", "except BaseException:\n    a, *b = 0\n"),
+        ("a list-target unpack", "except BaseException:\n    [a, b] = 0\n"),
+        ("an attribute target", "except BaseException:\n    surface.x = 0\n"),
+        ("a subscript target", "except BaseException:\n    surface[0] = 0\n"),
+        # Only a nested def's BODY is deferred; its signature runs now.
+        (
+            "a nested def with a raising default",
+            "except BaseException:\n    def _later(x=_boom()):\n        pass\n",
+        ),
+        (
+            "a nested def with a raising kw-only default",
+            "except BaseException:\n    def _later(*, x=_boom()):\n        pass\n",
+        ),
+        (
+            "a nested def with a raising arg annotation",
+            "except BaseException:\n    def _later(x: _boom()):\n        pass\n",
+        ),
+        (
+            "a nested def with a raising return annotation",
+            "except BaseException:\n    def _later() -> _boom():\n        pass\n",
+        ),
+        # Set/dict displays HASH at construction, so inert elements are not
+        # enough to make the display inert.
+        ("an unhashable set literal", "except BaseException:\n    s = {[1]}\n"),
+        ("an unhashable dict key", "except BaseException:\n    d = {[1]: 2}\n"),
+        # AnnAssign evaluates its annotation at runtime without PEP 563.
+        ("a raising annotation", "except BaseException:\n    x: _boom() = 1\n"),
+    ],
+)
+def test_guard_flags_an_arm_that_can_leave_without_a_raise_statement(shape, arm):
+    """An arm leaves for many reasons that are not an ``ast.Raise`` node.
+
+    Asking "does this arm contain a ``raise``/``return`` STATEMENT?" excused a
+    call that raises, an ``assert``, arithmetic that divides by zero, and a
+    plain logging call given a bad format argument.  The first whitelist then
+    excused a second family: an unpacking assignment target, a nested ``def``
+    whose SIGNATURE (defaults / annotations) is evaluated at definition time, a
+    set/dict display that hashes an unhashable element, and a bare name load
+    that can be an unbound local.  Every shape here is a measured 1-permit
+    leak.  The window check has always treated a call / attribute / subscript /
+    await as raise-capable; the arm check now agrees, and additionally refuses
+    to excuse anything whose targets or signature can raise.
+    """
+    guard = _load_guard()
+    _sites, violations = guard.scan_source(_sibling_arm_source(arm), "new.py")
+    assert [v["function"] for v in violations] == ["gate"], (
+        f"an arm that can leave via {shape} must be asked to release"
+    )
+
+
+@pytest.mark.parametrize(
+    "shape,arm",
+    [
+        ("pass", "except BaseException:\n    pass\n"),
+        ("a bare constant", 'except BaseException:\n    "swallowed"\n'),
+        ("a constant assignment", "except BaseException:\n    x = 0\n"),
+        ("a constant tuple value", "except BaseException:\n    x = (1, 2)\n"),
+        ("a hashable set literal", "except BaseException:\n    s = {1, 2}\n"),
+        (
+            "a constant annotated assignment",
+            'except BaseException:\n    x: "int" = 0\n',
+        ),
+        (
+            "a nested def",
+            "except BaseException:\n    def _later():\n        sem.release()\n",
+        ),
+        (
+            "a nested def with a constant default",
+            "except BaseException:\n    def _later(x=0):\n        sem.release()\n",
+        ),
+    ],
+)
+def test_guard_still_excuses_a_provably_inert_arm(shape, arm):
+    """The other side: an arm that provably cannot leave still owes nothing.
+
+    Without this the swallow exemption would collapse to "never excuse
+    anything" and the finding-3 false-positive fix would be undone.
+    """
+    guard = _load_guard()
+    _sites, violations = guard.scan_source(_sibling_arm_source(arm), "new.py")
+    assert violations == [], f"an arm holding only {shape} cannot leave"
+
+
+# --------------------------------------------------------------------------
+# 3b. Reachability: "can control reach the end of this arm?", not "is the last
+#     statement a bare raise/return?".  Every shape below is a MEASURED
+#     1-permit leak (real asyncio.Semaphore, synchronous fault at the pre-yield
+#     log) that was CLEAN on both the #860 guard and the #863 candidate.
+# --------------------------------------------------------------------------
+
+
+def _sibling_arm_source(narrow_arm: str) -> str:
+    """A two-arm gate: a narrow arm under test + a correct BaseException arm.
+
+    The sibling matters: with only the narrow arm the try has no
+    ``BaseException`` coverage and is flagged for that reason instead, so the
+    fixture would pass for the wrong reason.  The correct sibling is what makes
+    the narrow arm's own classification the thing under test.
+    """
+    return textwrap.dedent(
+        """
+        from contextlib import asynccontextmanager, suppress
+
+        @asynccontextmanager
+        async def gate(sem, surface):
+            await sem.acquire()
+            try:
+                _LOG.info("admitted %s", surface)
+        {arm}
+            except BaseException:
+                sem.release()
+                raise
+            try:
+                yield
+            finally:
+                sem.release()
+        """
+    ).replace("{arm}", textwrap.indent(textwrap.dedent(narrow_arm), "    ").rstrip())
+
+
+@pytest.mark.parametrize(
+    "shape,arm",
+    [
+        ("if cond: raise", "except Boom:\n    if surface:\n        raise\n"),
+        (
+            "raise inside an inner try/finally",
+            "except Boom:\n    try:\n        raise\n    finally:\n        pass\n",
+        ),
+        (
+            "raise inside a with",
+            "except Boom:\n    with suppress(ValueError):\n        raise\n",
+        ),
+        ("raise inside a for", "except Boom:\n    for _ in (1,):\n        raise\n"),
+        ("if cond: return", "except Boom:\n    if surface:\n        return\n"),
+    ],
+)
+def test_guard_flags_a_conditionally_exiting_arm_that_does_not_release(shape, arm):
+    """FINDING 1: an arm that exits through a COMPOUND statement still owes.
+
+    The old rule read ``reversed(handler.body)`` and returned True only on a
+    BARE trailing ``Raise``/``Return``, breaking on any other statement type.
+    So each shape here was classified as swallowing and excused from
+    releasing, while the correct ``BaseException`` sibling made the chain look
+    satisfied.  All five are measured 1-permit leaks.
+    """
+    guard = _load_guard()
+    _sites, violations = guard.scan_source(_sibling_arm_source(arm), "new.py")
+    assert [v["function"] for v in violations] == ["gate"], (
+        f"an arm that exits via {shape} must be asked to release"
+    )
+
+
+def test_conditionally_exiting_arm_is_accepted_once_it_releases():
+    """The discriminator's other side: releasing first clears the same shape.
+
+    Argus's CONTROL I6 — measured NOT to leak — so the new rule must not flag
+    it, or the fixture above would pass by flagging everything.
+    """
+    guard = _load_guard()
+    releasing = "except Boom:\n    sem.release()\n    if surface:\n        raise\n"
+    _sites, violations = guard.scan_source(_sibling_arm_source(releasing), "new.py")
+    assert violations == []
+
+
+@pytest.mark.parametrize(
+    "shape,arm",
+    [
+        (
+            "nested def",
+            "except BaseException:\n    def _later():\n        sem.release()\n    raise\n",
+        ),
+        (
+            "nested def under a condition",
+            "except BaseException:\n    if surface:\n        def _later():\n            sem.release()\n    raise\n",
+        ),
+        (
+            "lambda under a condition",
+            "except BaseException:\n    if surface:\n        _later = lambda: sem.release()\n    raise\n",
+        ),
+        (
+            "if False",
+            "except BaseException:\n    if False:\n        sem.release()\n    raise\n",
+        ),
+        (
+            "loop over an empty literal",
+            "except BaseException:\n    for _ in []:\n        sem.release()\n    raise\n",
+        ),
+        (
+            "after an unconditional raise",
+            "except BaseException:\n    raise\n    sem.release()\n",
+        ),
+    ],
+)
+def test_guard_does_not_credit_an_unreachable_release(shape, arm):
+    """FINDING 2: ``ast.walk`` counted a release that can never run.
+
+    A release buried in a nested ``def`` (its own lifecycle), under
+    ``if False:``, or in the body of a loop over an empty literal is textually
+    present and never executes.  All three are measured 1-permit leaks.
+    """
+    guard = _load_guard()
+    source = textwrap.dedent(
+        """
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def gate(sem, surface):
+            await sem.acquire()
+            try:
+                _LOG.info("admitted %s", surface)
+        {arm}
+            try:
+                yield
+            finally:
+                sem.release()
+        """
+    ).replace("{arm}", textwrap.indent(textwrap.dedent(arm), "    ").rstrip())
+    _sites, violations = guard.scan_source(source, "new.py")
+    assert [v["function"] for v in violations] == ["gate"], (
+        f"a release reachable only via {shape} must not satisfy the check"
+    )
+
+
+@pytest.mark.parametrize(
+    "shape,arm",
+    [
+        ("under a runtime condition", "if surface:\n    sem.release()\n"),
+        ("in a loop over a non-empty literal", "for _ in (1,):\n    sem.release()\n"),
+        ("in a with body", "with suppress(ValueError):\n    sem.release()\n"),
+    ],
+)
+def test_guard_still_credits_a_conditionally_reachable_release(shape, arm):
+    """The reachability narrowing must not reject releases that CAN run.
+
+    Only statically-dead paths lose credit; anything the compiler cannot
+    settle stays creditable, or the finding-2 fixture would pass by rejecting
+    every non-trivial release.
+    """
+    guard = _load_guard()
+    source = textwrap.dedent(
+        """
+        from contextlib import asynccontextmanager, suppress
+
+        @asynccontextmanager
+        async def gate(sem, surface):
+            await sem.acquire()
+            try:
+                _LOG.info("admitted %s", surface)
+            except BaseException:
+        {arm}
+                raise
+            try:
+                yield
+            finally:
+                sem.release()
+        """
+    ).replace("{arm}", textwrap.indent(textwrap.dedent(arm), "        ").rstrip())
+    # Two releases: the one under test in the handler, and the finally around
+    # the yield. If the fixture ever loses one, it is no longer the shape.
+    assert source.count("sem.release()") == 2
+    _sites, violations = guard.scan_source(source, "new.py")
+    assert violations == [], f"a release {shape} is reachable and must count"
+
+
+def test_guard_does_not_flag_a_sole_swallowing_baseexception_arm():
+    """FINDING 3: ``except BaseException: pass`` as the ONLY arm is SAFE.
+
+    The arm swallows and control proceeds to the yield still legitimately
+    holding the permit — measured NOT to leak.  The old code asked for a
+    ``BaseException`` among the EXITING arms only, so a chain whose sole arm
+    swallows produced an empty exiting-set and was reported as unprotected,
+    contradicting the guard's own swallow rationale.
+    """
+    guard = _load_guard()
+    source = textwrap.dedent(
+        """
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def gate(sem, surface):
+            await sem.acquire()
+            try:
+                _LOG.info("admitted %s", surface)
+            except BaseException:
+                pass
+            try:
+                yield
+            finally:
+                sem.release()
+        """
+    )
+    _sites, violations = guard.scan_source(source, "new.py")
+    assert violations == []
+
+
+def test_guard_does_not_flag_a_narrow_releasing_arm_beside_a_swallowing_base():
+    """FINDING 3 (H2): narrow arm releases+raises, BaseException swallows.
+
+    Neither path leaks — the narrow arm hands the permit back before exiting,
+    and the BaseException arm falls through to the yield still holding it.
+    """
+    guard = _load_guard()
+    source = textwrap.dedent(
+        """
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def gate(sem, surface):
+            await sem.acquire()
+            try:
+                _LOG.info("admitted %s", surface)
+            except ValueError:
+                sem.release()
+                raise
+            except BaseException:
+                pass
+            try:
+                yield
+            finally:
+                sem.release()
+        """
+    )
+    _sites, violations = guard.scan_source(source, "new.py")
+    assert violations == []
+
+
+def test_swallowing_chain_still_needs_baseexception_coverage():
+    """A swallow-only chain that does NOT cover BaseException is still a leak.
+
+    ``except ValueError: pass`` catches nothing a cancel raises, so the window
+    remains unprotected — finding 3's relaxation must not extend to it.
+    """
+    guard = _load_guard()
+    source = textwrap.dedent(
+        """
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def gate(sem, surface):
+            await sem.acquire()
+            try:
+                _LOG.info("admitted %s", surface)
+            except ValueError:
+                pass
+            try:
+                yield
+            finally:
+                sem.release()
+        """
+    )
+    _sites, violations = guard.scan_source(source, "new.py")
+    assert [v["function"] for v in violations] == ["gate"]
 
 
 def test_guard_enumerates_both_permits_at_the_live_turn_admission_site():
